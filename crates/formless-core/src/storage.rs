@@ -1060,7 +1060,16 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         return json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
     }
     if m.role == "assistant" && meta["tool_calls"].is_array() {
-        return json!({"role": "assistant", "content": Value::Null, "tool_calls": meta["tool_calls"]});
+        let mut msg =
+            json!({"role": "assistant", "content": Value::Null, "tool_calls": meta["tool_calls"]});
+        // Echo reasoning back only when the provider emitted it (thinking
+        // mode requires it on tool-call turns; other endpoints never see it).
+        if let Some(r) = meta["reasoning_content"].as_str() {
+            if !r.is_empty() {
+                msg["reasoning_content"] = json!(r);
+            }
+        }
+        return msg;
     }
     json!({"role": m.role, "content": m.content})
 }

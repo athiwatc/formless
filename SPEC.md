@@ -123,6 +123,8 @@ Before the first Session, the wizard probes the endpoint: connectivity,
 streaming, and a **test tool-call**. If tool-calling is unsupported, session
 start is refused with a clear explanation. Native tool-calling is required
 in v1; a prompt-based (text/JSON) fallback is explicitly out (§17).
+Thinking-mode endpoints that reject a forced `tool_choice` are re-probed
+with `tool_choice` omitted; a voluntary test tool-call still passes.
 
 ### 4.4 Provider failure handling
 
@@ -422,8 +424,8 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - Versioned request/event protocol (`formless-protocol`): client requests
   (start/steer/queue/interrupt Run, approve, browse/manage Tools and
   Sessions, settings, export/import) and daemon→client streamed events
-  (model deltas, tool-call lifecycle, pending/stall notices, approval
-  requests, compaction notices, optimiser activity).
+  (model content and reasoning deltas, tool-call lifecycle, pending/stall
+  notices, approval requests, compaction notices, optimiser activity).
 - A client whose protocol version mismatches the daemon's **refuses to
   attach** with a clear message (no silent incompatibility).
 
@@ -514,9 +516,29 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   `Esc`: interrupt Run. `Ctrl+C`: detach client. `Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
-  `/model`, `/settings`, `/stop`, `/approve`. Plain text is always chat.
+  `/model`, `/settings`, `/stop`, `/approve`, `/thinking`, `/help`.
+  Plain text is always chat.
 - Terminal colours respected, `NO_COLOR` honoured. Narrow terminals remain
   usable (single-column-first design; no multi-pane dashboard in v1).
+
+### 10.6 Live feedback (v2)
+
+- **Colour:** roles, statuses, list selections, borders, and approval
+  prompts are colour-coded; the chat has a friendly empty state and
+  `/help` lists the shortcuts. `NO_COLOR` disables all colour.
+- **Real-time thinking:** when the endpoint streams reasoning deltas
+  (`reasoning_content`, or `reasoning` on some endpoints) the daemon
+  forwards them as `ReasoningDelta` events and the TUI shows them live in
+  a dimmed, separate "Thinking" block (`/thinking` toggles it). Reasoning
+  is never fabricated when the endpoint emits none, never shown as the
+  assistant's answer, and never persisted as message content; on
+  tool-call turns it is kept only as provider metadata so thinking-mode
+  endpoints that require it echoed back keep working.
+- **Agent activity:** while a Run is active the status line always shows
+  what the agent is doing — an animated spinner, the current step
+  (waiting for model, thinking, responding, running a named Tool,
+  awaiting approval), and elapsed time in that step — so silent waits
+  never look like a hang.
 
 ## 11. Compaction
 
@@ -677,6 +699,11 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - Distribution polish: signed release binaries, Homebrew/winget packages,
   any update mechanism (v1 installs via `cargo install` / source build).
 - Additional Capabilities (clipboard, notifications, sub-agents).
+- Remember startup options: relaunching restores the previous setup
+  (base URL, model, reasoning effort) and the saved API key, so the
+  wizard is skipped — or shown pre-filled with a "keep saved key" choice —
+  instead of asking the user to re-enter the key on every start. The key
+  is only requested again when it is changed, missing, or after a reset.
 
 ## 18. Roadmap and acceptance criteria
 

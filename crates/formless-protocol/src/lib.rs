@@ -216,6 +216,12 @@ pub enum Event {
         run_id: String,
         delta: String,
     },
+    /// Live model reasoning chunk (ephemeral; never the stored answer).
+    ReasoningDelta {
+        session_id: String,
+        run_id: String,
+        delta: String,
+    },
     MessageComplete {
         session_id: String,
         run_id: String,

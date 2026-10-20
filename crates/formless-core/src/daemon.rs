@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{load_api_key, Config};
-use crate::provider::{Provider, ToolCall, SYSTEM_PROMPT};
+use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
 use crate::storage::{build_context, Store};
 use crate::tools as toolreg;
 use crate::Paths;
@@ -514,19 +514,32 @@ impl Daemon {
             let defs = self.with_store(toolreg::tool_definitions)?;
             let (sid, rid) = (session_id.to_string(), run_id.to_string());
             let subs = self.subs.clone();
-            let chat_fut =
-                provider.chat_stream(&ctx, &defs, &model, effort.as_deref(), cancel, |delta| {
-                    let ev = Event::MessageDelta {
-                        session_id: sid.clone(),
-                        run_id: rid.clone(),
-                        delta: delta.to_string(),
+            let chat_fut = provider.chat_stream(
+                &ctx,
+                &defs,
+                &model,
+                effort.as_deref(),
+                cancel,
+                |kind, delta| {
+                    let ev = match kind {
+                        DeltaKind::Content => Event::MessageDelta {
+                            session_id: sid.clone(),
+                            run_id: rid.clone(),
+                            delta: delta.to_string(),
+                        },
+                        DeltaKind::Reasoning => Event::ReasoningDelta {
+                            session_id: sid.clone(),
+                            run_id: rid.clone(),
+                            delta: delta.to_string(),
+                        },
                     };
                     let subs2 = subs.clone();
                     tokio::spawn(async move {
                         let mut g = subs2.lock().await;
                         g.retain(|tx| tx.send(ServerMessage::Event(ev.clone())).is_ok());
                     });
-                });
+                },
+            );
             let mut chat_fut = std::pin::pin!(chat_fut);
             let result = tokio::select! {
                 r = &mut chat_fut => r?,
@@ -589,12 +602,19 @@ impl Daemon {
                     json!({"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": tc.arguments}})
                 })
                 .collect();
+            // Reasoning is kept only as provider metadata on tool-call turns
+            // (thinking-mode endpoints require it echoed back; §10.6) —
+            // it is never stored as the assistant's answer content.
+            let mut meta = json!({"tool_calls": calls_json});
+            if !result.reasoning.is_empty() {
+                meta["reasoning_content"] = json!(result.reasoning);
+            }
             self.with_store(|st| {
                 st.append_message_meta(
                     session_id,
                     "assistant",
                     &result.content,
-                    Some(json!({"tool_calls": calls_json}).to_string()),
+                    Some(meta.to_string()),
                 )
             })?;
             // Approval pre-pass: one prompt per unapproved sensitive Tool in

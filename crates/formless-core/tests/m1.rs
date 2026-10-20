@@ -8,7 +8,7 @@ use axum::{
 };
 use formless_core::config::{Config, ProviderCfg};
 use formless_core::provider::{probe, Provider};
-use formless_core::storage::{build_context, Store};
+use formless_core::storage::{build_context, provider_message, Store};
 use formless_core::Paths;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,6 +59,26 @@ fn storage_resume_is_byte_identical_and_compaction_flags() {
     assert!(!needs2);
 }
 
+#[test]
+fn provider_message_echoes_reasoning_only_on_tool_call_turns() {
+    let meta = json!({
+        "tool_calls": [{"id": "1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
+        "reasoning_content": "because reasons"
+    });
+    let m = formless_protocol::MessageInfo {
+        id: "m1".into(),
+        session_id: "s1".into(),
+        seq: 1,
+        role: "assistant".into(),
+        content: String::new(),
+        created_at: String::new(),
+        meta: Some(meta.to_string()),
+    };
+    let v = provider_message(&m);
+    assert_eq!(v["reasoning_content"], "because reasons");
+    assert_eq!(v["content"], Value::Null, "reasoning is never the answer");
+}
+
 struct MockState {
     effort_rejections: AtomicUsize,
 }
@@ -85,7 +105,8 @@ async fn mock_server() -> String {
                     let user = body["messages"].as_array().and_then(|m| m.last()).map(|m| m["content"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
                     if body["stream"].as_bool().unwrap_or(false) {
                         let sse = format!(
-                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices": [{"delta": {"reasoning_content": "pondering "}}]}),
                             json!({"choices": [{"delta": {"content": "echo: "}}]}),
                             json!({"choices": [{"delta": {"content": user}}]})
                         );
@@ -121,6 +142,7 @@ async fn provider_models_probe_stream_and_effort_retry() {
     assert!(probe.tool_calling);
 
     let mut deltas = String::new();
+    let mut reasoning_deltas = String::new();
     let out = p
         .chat_stream(
             &[serde_json::json!({"role": "user", "content": "hello"})],
@@ -128,16 +150,76 @@ async fn provider_models_probe_stream_and_effort_retry() {
             "mock-1",
             Some("high"),
             &CancellationToken::new(),
-            |d| deltas.push_str(d),
+            |kind, d| match kind {
+                formless_core::provider::DeltaKind::Content => deltas.push_str(d),
+                formless_core::provider::DeltaKind::Reasoning => reasoning_deltas.push_str(d),
+            },
         )
         .await
         .unwrap();
     assert_eq!(out.content, "echo: hello");
     assert_eq!(deltas, "echo: hello");
+    assert_eq!(out.reasoning, "pondering ");
+    assert_eq!(reasoning_deltas, "pondering ");
     assert!(
         out.dropped_reasoning_effort,
         "first request with effort must be rejected then retried without"
     );
+}
+
+/// Thinking-mode endpoints (e.g. DeepSeek reasoner) reject any forced
+/// `tool_choice` with 400 "Thinking mode does not support this tool_choice",
+/// yet still call tools when `tool_choice` is omitted. The probe must not
+/// turn that into a false "no tool-calling" failure.
+async fn mock_thinking_server() -> String {
+    let app = Router::new()
+        .route("/models", get(|| async { Json(json!({"data": [{"id": "seek-1"}]})) }))
+        .route("/chat/completions", post(|Json(body): Json<Value>| async move {
+            if body.get("tool_choice").is_some() {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(json!({
+                    "error": {"message": "Thinking mode does not support this tool_choice", "type": "invalid_request_error", "param": null, "code": "invalid_request_error"}
+                }))).into_response();
+            }
+            Json(json!({
+                "choices": [{"message": {"tool_calls": [{"id": "1", "type": "function", "function": {"name": "probe_ping", "arguments": "{}"}}]}}]
+            })).into_response()
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn probe_retries_without_tool_choice_when_thinking_mode_rejects_it() {
+    let base = mock_thinking_server().await;
+    let cfg = mock_cfg(&base);
+    let probe = probe(&cfg, "k", "seek-1").await.unwrap();
+    assert!(probe.tool_calling);
+    assert_eq!(probe.models, vec!["seek-1"]);
+}
+
+#[tokio::test]
+async fn probe_does_not_retry_on_other_provider_errors() {
+    // A permanent 400 unrelated to tool_choice must fail fast, not be
+    // masked by the thinking-mode fallback (which would succeed here).
+    let app = Router::new()
+        .route("/models", get(|| async { Json(json!({"data": [{"id": "seek-1"}]})) }))
+        .route("/chat/completions", post(|Json(body): Json<Value>| async move {
+            if body.get("tool_choice").is_some() {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(json!({
+                    "error": {"message": "model not found", "type": "invalid_request_error"}
+                }))).into_response();
+            }
+            Json(json!({
+                "choices": [{"message": {"tool_calls": [{"id": "1", "type": "function", "function": {"name": "probe_ping", "arguments": "{}"}}]}}]
+            })).into_response()
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = mock_cfg(&format!("http://{addr}"));
+    assert!(probe(&cfg, "k", "seek-1").await.is_err());
 }
 
 #[cfg(unix)]

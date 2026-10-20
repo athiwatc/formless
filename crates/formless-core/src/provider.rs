@@ -50,8 +50,17 @@ pub struct ToolCall {
 #[derive(Debug, Clone)]
 pub struct ChatResult {
     pub content: String,
+    /// Model reasoning emitted alongside the answer (`reasoning_content`
+    /// / `reasoning` deltas), empty when the endpoint emits none.
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub dropped_reasoning_effort: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaKind {
+    Content,
+    Reasoning,
 }
 
 impl Provider {
@@ -151,9 +160,10 @@ impl Provider {
         Err(anyhow!("provider request failed after retries: {last_err}"))
     }
 
-    /// Streaming chat with optional tools. Calls `on_delta` per content
-    /// chunk; honours cancel; assembles streamed tool_calls (SPEC §5/§7).
-    pub async fn chat_stream<F: FnMut(&str) + Send>(
+    /// Streaming chat with optional tools. Calls `on_delta(kind, text)`
+    /// per content or reasoning chunk; honours cancel; assembles streamed
+    /// tool_calls (SPEC §5/§7).
+    pub async fn chat_stream<F: FnMut(DeltaKind, &str) + Send>(
         &self,
         messages: &[Value],
         tools: &[Value],
@@ -169,6 +179,7 @@ impl Provider {
         let (resp, dropped) = self.post_chat_flagged(&mut body, effort).await?;
         let mut stream = resp.bytes_stream();
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut buf = String::new();
         loop {
@@ -189,7 +200,17 @@ impl Provider {
                                 if let Some(d) = delta["content"].as_str() {
                                     if !d.is_empty() {
                                         content.push_str(d);
-                                        on_delta(d);
+                                        on_delta(DeltaKind::Content, d);
+                                    }
+                                }
+                                // Thinking-mode endpoints stream reasoning separately
+                                // (`reasoning_content`, e.g. DeepSeek; some use `reasoning`).
+                                for key in ["reasoning_content", "reasoning"] {
+                                    if let Some(d) = delta[key].as_str() {
+                                        if !d.is_empty() {
+                                            reasoning.push_str(d);
+                                            on_delta(DeltaKind::Reasoning, d);
+                                        }
                                     }
                                 }
                                 if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -233,6 +254,7 @@ impl Provider {
         }
         Ok(ChatResult {
             content,
+            reasoning,
             tool_calls,
             dropped_reasoning_effort: dropped,
         })
@@ -306,8 +328,34 @@ pub struct ProbeResult {
     pub tool_calling: bool,
 }
 
+fn is_tool_choice_rejection(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("tool_choice") && (t.contains("support") || t.contains("thinking"))
+}
+
+async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) -> Result<bool> {
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Call the probe_ping tool now."}],
+        "tools": [tool],
+        "stream": false
+    });
+    if forced {
+        body["tool_choice"] = json!("required");
+    }
+    let (resp, _) = p.post_chat_flagged(&mut body, None).await?;
+    let v: Value = resp.json().await.context("parse probe response")?;
+    Ok(v["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false))
+}
+
 /// Probe (SPEC §4.3): connectivity via /models, then a required tool-call.
-/// Errors only on connectivity; tool-calling support reported in the result.
+/// Thinking-mode endpoints reject a forced `tool_choice`, so on that
+/// specific 400 the probe retries with `tool_choice` omitted (the model
+/// may still call the tool voluntarily). Errors only on connectivity;
+/// tool-calling support is reported in the result.
 pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<ProbeResult> {
     let p = Provider::new(cfg.clone(), api_key.to_string())?;
     let models = p.list_models().await.unwrap_or_default();
@@ -319,19 +367,13 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
             "parameters": {"type": "object", "properties": {}}
         }
     });
-    let mut body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "Call the probe_ping tool now."}],
-        "tools": [tool],
-        "tool_choice": "required",
-        "stream": false
-    });
-    let (resp, _) = p.post_chat_flagged(&mut body, None).await?;
-    let v: Value = resp.json().await.context("parse probe response")?;
-    let tool_calling = v["choices"][0]["message"]["tool_calls"]
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
+    let tool_calling = match probe_tool_call(&p, model, &tool, true).await {
+        Ok(v) => v,
+        Err(e) if is_tool_choice_rejection(&e.to_string()) => {
+            probe_tool_call(&p, model, &tool, false).await?
+        }
+        Err(e) => return Err(e),
+    };
     Ok(ProbeResult {
         models,
         streaming: true,

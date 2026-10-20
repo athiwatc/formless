@@ -16,9 +16,50 @@ use ratatui::widgets::*;
 use std::collections::HashMap;
 use std::io::stdout;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::DaemonClient;
+
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn colors_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
+fn fg(enabled: bool, color: Color) -> Style {
+    if enabled {
+        Style::default().fg(color)
+    } else {
+        Style::default()
+    }
+}
+
+fn bold_fg(enabled: bool, color: Color) -> Style {
+    fg(enabled, color).add_modifier(Modifier::BOLD)
+}
+
+fn role_style(enabled: bool, role: &str) -> Style {
+    let color = match role {
+        "user" => Color::Cyan,
+        "tool" => Color::Yellow,
+        "system-note" => Color::Blue,
+        _ => Color::Green,
+    };
+    bold_fg(enabled, color)
+}
+
+fn thinking_style(enabled: bool) -> Style {
+    fg(enabled, Color::Magenta).add_modifier(Modifier::ITALIC | Modifier::DIM)
+}
+
+fn format_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
 
 #[derive(PartialEq)]
 enum View {
@@ -106,6 +147,11 @@ impl Wizard {
     }
 }
 
+struct Activity {
+    label: String,
+    since: Instant,
+}
+
 struct App {
     paths: Paths,
     view: View,
@@ -117,6 +163,12 @@ struct App {
     current: Option<String>,
     messages: Vec<MessageInfo>,
     streaming: String,
+    /// Live reasoning for the current Run (ephemeral; never persisted).
+    thinking: String,
+    show_thinking: bool,
+    color: bool,
+    tick: u64,
+    activity: Option<Activity>,
     input: String,
     running: bool,
     notes: Vec<String>,
@@ -151,6 +203,11 @@ impl App {
             current: None,
             messages: Vec::new(),
             streaming: String::new(),
+            thinking: String::new(),
+            show_thinking: true,
+            color: colors_enabled(),
+            tick: 0,
+            activity: None,
             input: String::new(),
             running: false,
             notes: Vec::new(),
@@ -284,6 +341,35 @@ impl App {
         }
     }
 
+    fn set_activity(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        match &mut self.activity {
+            Some(a) if a.label == label => {}
+            slot => {
+                *slot = Some(Activity {
+                    label,
+                    since: Instant::now(),
+                })
+            }
+        }
+    }
+
+    fn spinner(&self) -> &'static str {
+        SPINNER[(self.tick / 2) as usize % SPINNER.len()]
+    }
+
+    /// Always-visible working state, e.g. `⠙ thinking… (12s)`.
+    fn activity_text(&self) -> Option<String> {
+        self.activity.as_ref().map(|a| {
+            format!(
+                "{} {}… ({})",
+                self.spinner(),
+                a.label,
+                format_elapsed(a.since.elapsed())
+            )
+        })
+    }
+
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::MessageAppended {
@@ -296,23 +382,38 @@ impl App {
                     self.messages.push(message);
                 }
             }
-            Event::MessageDelta { delta, .. } => self.streaming.push_str(&delta),
+            Event::MessageDelta { delta, .. } => {
+                self.set_activity("responding");
+                self.streaming.push_str(&delta);
+            }
+            Event::ReasoningDelta { delta, .. } => {
+                self.set_activity("thinking");
+                self.thinking.push_str(&delta);
+            }
             Event::MessageComplete {
                 session_id,
                 message,
                 ..
             } => {
                 self.streaming.clear();
+                self.thinking.clear();
                 if self.current.as_deref() == Some(&session_id)
                     && !self.messages.iter().any(|m| m.id == message.id)
                 {
                     self.messages.push(message);
                 }
             }
-            Event::RunStarted { .. } => self.running = true,
+            Event::RunStarted { .. } => {
+                self.running = true;
+                self.thinking.clear();
+                self.streaming.clear();
+                self.set_activity("waiting for model");
+            }
             Event::RunFinished { status, .. } => {
                 self.running = false;
+                self.activity = None;
                 self.streaming.clear();
+                self.thinking.clear();
                 if status != "completed" {
                     self.notes.push(format!("run {status}"));
                 }
@@ -320,6 +421,7 @@ impl App {
             }
             Event::RunPaused { error, .. } => {
                 self.running = false;
+                self.activity = None;
                 self.notes.push(format!("run paused: {error}"));
             }
             Event::CompactionNotice {
@@ -329,9 +431,13 @@ impl App {
             }
             Event::Note { text, .. } => self.notes.push(text),
             Event::ToolCallStarted { tool_name, .. } => {
+                self.set_activity(format!("running {tool_name}"));
                 self.notes.push(format!("running {tool_name}…"));
             }
             Event::ToolCallFinished { tool_name, ok, .. } => {
+                if self.running {
+                    self.set_activity("waiting for model");
+                }
                 self.notes
                     .push(format!("{tool_name}: {}", if ok { "ok" } else { "failed" }));
             }
@@ -343,6 +449,7 @@ impl App {
                 memory_mb,
                 ..
             } => {
+                self.set_activity("awaiting your approval");
                 self.approvals.push_back(ApprovalReq {
                     approval_id,
                     tool_name,
@@ -371,6 +478,7 @@ impl App {
                 capabilities,
                 memory_mb,
             } => {
+                self.set_activity("awaiting your approval");
                 self.promotions.push_back(ApprovalReq {
                     approval_id: promotion_id,
                     tool_name: format!("{tool_name} (promotion: {reason})"),
@@ -490,6 +598,16 @@ impl App {
                 }
             }
             "approve" => self.notes.push("Approvals arrive with Tools in M2.".into()),
+            "thinking" => {
+                self.show_thinking = !self.show_thinking;
+                self.notes.push(format!(
+                    "thinking display {}",
+                    if self.show_thinking { "on" } else { "off" }
+                ));
+            }
+            "help" => self.notes.push(
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab views · /new /sessions /tools /settings /model /thinking /stop /quit".into(),
+            ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
         }
@@ -812,7 +930,7 @@ impl App {
 
 fn draw(f: &mut Frame, app: &App) {
     if let Some(w) = &app.wizard {
-        draw_wizard(f, w);
+        draw_wizard(f, w, app.color);
         return;
     }
     let chunks = Layout::vertical([
@@ -838,8 +956,10 @@ fn draw(f: &mut Frame, app: &App) {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
+                            .border_style(fg(app.color, Color::Cyan))
                             .title("Sessions (Enter open, n new, d delete, r rename)"),
                     )
+                    .highlight_style(bold_fg(app.color, Color::Cyan))
                     .highlight_symbol("> "),
                 chunks[0],
                 &mut state,
@@ -872,24 +992,54 @@ fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(format!("{prompt}{}", app.input)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Message (Enter send/steer, Ctrl+Enter queue)"),
+                .border_style(fg(
+                    app.color,
+                    if app.running {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    },
+                ))
+                .title("Message (Enter send/steer, Ctrl+Enter queue, /help)"),
         ),
         chunks[1],
     );
     let note = app.notes.last().cloned().unwrap_or_default();
-    let status = format!(
-        "{}{}  Tab views · Esc stop/back · Ctrl+C detach  {}",
-        if app.running { "● running  " } else { "" },
+    let note_style =
+        if note.contains("paused") || note.contains("failed") || note.contains("denied") {
+            bold_fg(app.color, Color::Red)
+        } else {
+            fg(app.color, Color::Gray)
+        };
+    let mut status: Vec<Span> = Vec::new();
+    if let Some(activity) = app.activity_text() {
+        status.push(Span::styled(activity, bold_fg(app.color, Color::Yellow)));
+        status.push(Span::raw("  "));
+    } else if app.running {
+        status.push(Span::styled(
+            "● running  ",
+            bold_fg(app.color, Color::Yellow),
+        ));
+    } else {
+        status.push(Span::styled("● ready  ", fg(app.color, Color::Green)));
+    }
+    status.push(Span::styled(
         app.sessions
             .iter()
             .find(|s| Some(&s.id) == app.current.as_ref())
             .map(|s| s.name.as_str())
-            .unwrap_or("no session"),
-        note
-    );
-    f.render_widget(Paragraph::new(status), chunks[2]);
+            .unwrap_or("no session")
+            .to_string(),
+        bold_fg(app.color, Color::Cyan),
+    ));
+    status.push(Span::styled(
+        "  Tab views · Esc stop/back · Ctrl+C detach  ",
+        fg(app.color, Color::DarkGray),
+    ));
+    status.push(Span::styled(note, note_style));
+    f.render_widget(Paragraph::new(Line::from(status)), chunks[2]);
     if let Some(req) = app.approvals.front().or(app.promotions.front()) {
-        draw_approval(f, req);
+        draw_approval(f, req, app.color);
     }
 }
 
@@ -930,8 +1080,10 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(fg(app.color, Color::Yellow))
                     .title("Tools (Enter detail, x retire/restore, b rollback, p purge x2)"),
             )
+            .highlight_style(bold_fg(app.color, Color::Yellow))
             .highlight_symbol("> "),
         parts[0],
         &mut state,
@@ -970,7 +1122,7 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_approval(f: &mut Frame, req: &ApprovalReq) {
+fn draw_approval(f: &mut Frame, req: &ApprovalReq, color: bool) {
     let area = f.area();
     let w = area.width.saturating_mul(70) / 100;
     let h = 10u16.min(area.height);
@@ -1001,6 +1153,7 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(bold_fg(color, Color::Red))
                     .title("Approval required"),
             )
             .wrap(Wrap { trim: false }),
@@ -1022,45 +1175,78 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
         };
         lines.push(Line::styled(
             format!("{who}:"),
-            Style::default().add_modifier(Modifier::BOLD),
+            role_style(app.color, m.role.as_str()),
         ));
         for l in m.content.lines() {
             lines.push(Line::raw(l.to_string()));
         }
         lines.push(Line::raw(""));
     }
+    if app.messages.is_empty() && !app.running {
+        lines.push(Line::styled(
+            "Welcome to Formless.",
+            bold_fg(app.color, Color::Cyan),
+        ));
+        lines.push(Line::styled(
+            "Type a task below and press Enter — Formless builds the Tools it needs on demand.",
+            fg(app.color, Color::Gray),
+        ));
+        lines.push(Line::styled(
+            "Try /help for shortcuts, Tab to browse Sessions and Tools.",
+            fg(app.color, Color::DarkGray),
+        ));
+        lines.push(Line::raw(""));
+    }
+    // Live reasoning: dimmed and separate from the answer (/thinking hides it).
+    if app.show_thinking && !app.thinking.is_empty() {
+        lines.push(Line::styled("Thinking:", thinking_style(app.color)));
+        for l in app.thinking.lines() {
+            lines.push(Line::styled(l.to_string(), thinking_style(app.color)));
+        }
+        lines.push(Line::raw(""));
+    }
     if !app.streaming.is_empty() || app.running {
         lines.push(Line::styled(
             "Formless:",
-            Style::default().add_modifier(Modifier::BOLD),
+            role_style(app.color, "assistant"),
         ));
         for l in app.streaming.lines() {
             lines.push(Line::raw(l.to_string()));
         }
         if app.streaming.is_empty() {
-            lines.push(Line::raw("…"));
+            lines.push(Line::styled(
+                app.activity_text().unwrap_or_else(|| "…".into()),
+                bold_fg(app.color, Color::Yellow),
+            ));
         }
     }
     let height = area.height.saturating_sub(2) as usize;
     let scroll = (lines.len().saturating_sub(height)) as u16;
     f.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Chat"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(fg(app.color, Color::DarkGray))
+                    .title("Chat"),
+            )
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
         area,
     );
 }
 
-fn draw_wizard(f: &mut Frame, w: &Wizard) {
+fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     let area = f.area();
+    let status_style = if w.step == WizardStep::Failed {
+        bold_fg(color, Color::Red)
+    } else {
+        fg(color, Color::Gray)
+    };
     let mut text = vec![
-        Line::styled(
-            "Formless setup",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Line::styled("Formless setup", bold_fg(color, Color::Cyan)),
         Line::raw(""),
-        Line::raw(w.status.clone()),
+        Line::styled(w.status.clone(), status_style),
         Line::raw(""),
     ];
     match w.step {
@@ -1078,7 +1264,12 @@ fn draw_wizard(f: &mut Frame, w: &Wizard) {
             } else {
                 for (i, m) in w.models.iter().enumerate() {
                     let mark = if i == w.model_idx { "> " } else { "  " };
-                    text.push(Line::raw(format!("{mark}{m}")));
+                    let style = if i == w.model_idx {
+                        bold_fg(color, Color::Green)
+                    } else {
+                        Style::default()
+                    };
+                    text.push(Line::styled(format!("{mark}{m}"), style));
                 }
             }
         }
@@ -1086,10 +1277,15 @@ fn draw_wizard(f: &mut Frame, w: &Wizard) {
             text.push(Line::raw(format!("Model: {}", w.model())));
             for (i, e) in EFFORTS.iter().enumerate() {
                 let mark = if i == w.effort_idx { "> " } else { "  " };
-                text.push(Line::raw(format!(
-                    "{mark}{}",
-                    e.unwrap_or("default (provider)")
-                )));
+                let style = if i == w.effort_idx {
+                    bold_fg(color, Color::Green)
+                } else {
+                    Style::default()
+                };
+                text.push(Line::styled(
+                    format!("{mark}{}", e.unwrap_or("default (provider)")),
+                    style,
+                ));
             }
         }
         WizardStep::Probing | WizardStep::Failed => {
@@ -1103,6 +1299,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(fg(color, Color::Cyan))
                     .title("Onboarding (SPEC §10.1)"),
             )
             .wrap(Wrap { trim: false }),
@@ -1118,6 +1315,7 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     let result = (|| -> Result<()> {
         while !app.should_quit {
+            app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
             app.wizard_poll();
             terminal.draw(|f| draw(f, &app))?;
@@ -1132,4 +1330,125 @@ pub fn run(paths: Paths) -> Result<()> {
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let short = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::path::PathBuf::from(format!("/tmp/fl-tui-{short}"));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        App {
+            paths,
+            view: View::Chat,
+            wizard: None,
+            client: None,
+            inbox: None,
+            sessions: Vec::new(),
+            session_idx: 0,
+            current: Some("s1".into()),
+            messages: Vec::new(),
+            streaming: String::new(),
+            thinking: String::new(),
+            show_thinking: true,
+            color: true,
+            tick: 0,
+            activity: None,
+            input: String::new(),
+            running: false,
+            notes: Vec::new(),
+            pending: HashMap::new(),
+            tools: Vec::new(),
+            tool_idx: 0,
+            tool_detail: None,
+            approvals: std::collections::VecDeque::new(),
+            promotions: std::collections::VecDeque::new(),
+            purge_arm: None,
+            import_mode: None,
+            renaming: false,
+            should_quit: false,
+        }
+    }
+
+    #[test]
+    fn activity_and_thinking_follow_run_events() {
+        let mut app = test_app();
+        app.on_event(Event::RunStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+        });
+        assert!(app.running);
+        assert!(app.activity_text().unwrap().contains("waiting for model"));
+
+        app.on_event(Event::ReasoningDelta {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            delta: "think ".into(),
+        });
+        app.on_event(Event::ReasoningDelta {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            delta: "more".into(),
+        });
+        assert_eq!(app.thinking, "think more");
+        assert!(app.activity_text().unwrap().contains("thinking"));
+
+        app.on_event(Event::ToolCallStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            tool_name: "create_tool".into(),
+            version: 1,
+        });
+        assert!(app.activity_text().unwrap().contains("running create_tool"));
+
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "a1".into(),
+            session_id: "s1".into(),
+            tool_name: "create_tool".into(),
+            version: 1,
+            capabilities: vec![],
+            memory_mb: 256,
+        });
+        assert!(app
+            .activity_text()
+            .unwrap()
+            .contains("awaiting your approval"));
+
+        app.on_event(Event::RunFinished {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            status: "completed".into(),
+        });
+        assert!(!app.running);
+        assert!(app.activity_text().is_none());
+        assert!(app.thinking.is_empty(), "thinking is ephemeral per Run");
+    }
+
+    #[test]
+    fn thinking_toggle_and_elapsed_and_spinner() {
+        let mut app = test_app();
+        app.slash("thinking");
+        assert!(!app.show_thinking);
+        app.slash("thinking");
+        assert!(app.show_thinking);
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m05s");
+        let first = app.spinner();
+        app.tick += 2;
+        assert_ne!(first, app.spinner(), "spinner must animate with ticks");
+    }
+
+    #[test]
+    fn no_color_styles_carry_no_foreground() {
+        assert_eq!(fg(false, Color::Cyan).fg, None);
+        assert_eq!(role_style(false, "user").fg, None);
+        assert_eq!(fg(true, Color::Cyan).fg, Some(Color::Cyan));
+        assert_eq!(role_style(true, "user").fg, Some(Color::Cyan));
+        assert_eq!(role_style(true, "assistant").fg, Some(Color::Green));
+    }
 }
