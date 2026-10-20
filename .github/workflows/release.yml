@@ -1,0 +1,77 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            suffix: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            suffix: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="formless-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/formless" "$name/"
+          cp README.md SPEC.md "$name/"
+          # Optional signing: when the repository provides an Apple Developer ID
+          # certificate via the standard signing secrets, sign here before notarization.
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "formless-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory $name
+          Copy-Item "target/${{ matrix.target }}/release/formless.exe" $name
+          Copy-Item README.md,SPEC.md $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: formless-${{ matrix.target }}
+          path: |
+            formless-*.tar.gz
+            formless-*.zip
+            formless-*.sha256
+          if-no-files-found: ignore
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            formless-*.tar.gz
+            formless-*.zip
+            formless-*.sha256

@@ -1,0 +1,10 @@
+PackageIdentifier: athiwatc.formless
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: athiwatc
+PackageName: Formless
+PackageUrl: https://formless.athiwat.xyz
+License: Apache-2.0
+ShortDescription: A tool-building AI agent harness
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
