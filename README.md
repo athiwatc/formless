@@ -2,17 +2,69 @@
 
 > **A general-purpose agent harness that boots with one bootstrap tool and grows its own capabilities for any use case.**
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](Cargo.toml)
+[![Latest release](https://img.shields.io/github/v/release/athiwatc/formless?sort=semver)](https://github.com/athiwatc/formless/releases/latest)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#32-install)
+[![Telemetry](https://img.shields.io/badge/telemetry-none-success.svg)](#10-security-and-privacy)
+
 A fresh install of Formless exposes exactly one Tool: `create_tool`. Everything else — web access, file surgery, shell work, domain logic — is written on demand by the agent, persisted, versioned, measured and reused. Formless does not specialise in coding.
 
 A long-lived **Daemon Core** owns the agent loop, the Tools, the Sessions and all state. The TUI and the CLI are thin, interchangeable clients of that core: they render streamed events and send intents, and they can crash or disconnect without losing work.
+
+## Quick start
+
+```bash
+# macOS / Linux — prebuilt binary from the latest GitHub release, checksum-verified
+curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+formless          # first launch starts the daemon and walks the onboarding wizard
+```
+
+Then type a task and press **Enter**. Prerequisites, the other install paths (source build, Homebrew formula, Windows), headless use and every CLI subcommand are in [§3](#3-running-formless).
+
+## What a session looks like
+
+```text
+user   how many TODOs are left in this repo, and who touched them last?
+
+agent  ▸ find_tools("search files")        → nothing in the registry yet
+       ▸ create_tool("search_repo")        → v1 saved, capabilities: fs:read:$input.root
+       ▸ search_repo({pattern: "TODO"})    → 12 hits in 7 files (success rate 100%)
+       ▸ create_tool("git_last_author")    → v1 saved, capabilities: process:git
+       ▸ git_last_author({paths: […]})     → 7 authors
+       There are 12 TODOs across 7 files. The newest is yours, from this morning.
+```
+
+Illustrative, not scripted: the Tools an agent builds are whatever the task needs, and they stay in the registry for the next Session — measured, versioned and retireable.
 
 | Document | What it is |
 |---|---|
 | [SPEC.md](SPEC.md) | Normative specification (v1 plus v2 extensions) |
 | [GLOSSARY.md](GLOSSARY.md) | Canonical vocabulary — read this first |
 | [docs/adr/](docs/adr) | Architecture Decision Records |
+| [relay/README.md](relay/README.md) | The Worker that powers browser access |
+| [packaging/README.md](packaging/README.md) | Release process, installer, Homebrew/winget templates |
 | `Cargo.toml` | Rust workspace, edition 2021, Apache-2.0 |
-| **§3 [Running Formless](#3-running-formless)** | **Prerequisites, build, onboarding, TUI keys, headless CLI, daemon, relay** |
+
+---
+
+## Contents
+
+1. [Principles](#1-principles)
+2. [Architecture](#2-architecture) — [crate map](#21-crate-map)
+3. [Running Formless](#3-running-formless) — [requirements](#31-requirements) · [install](#32-install) · [onboarding](#33-first-run-the-onboarding-wizard) · [TUI](#34-using-the-tui) · [headless](#35-headless-runs-no-tui) · [daemon & doctor](#36-daemon-diagnostics-and-reset) · [relay](#37-browser-access-via-the-relay-v2) · [providers](#38-provider-options-v2) · [profiles & env](#39-profiles-and-environment-variables) · [troubleshooting](#310-troubleshooting) · [CLI reference](#311-cli-reference) · [updating](#312-updating)
+4. [Data, config and profiles](#4-data-config-and-profiles)
+5. [The Tool system](#5-the-tool-system) — [`create_tool`](#51-create_tool--the-bootstrap-tool) · [versioning](#52-lifecycle-and-versioning) · [capabilities](#53-capabilities-closed-taxonomy) · [host API](#54-the-host-api-inside-a-tool) · [composition](#55-composition-rules)
+6. [Invocations: async by design](#6-invocations-async-by-design)
+7. [Sessions, Runs and Steer](#7-sessions-runs-and-steer)
+8. [Life of a Run](#8-life-of-a-run)
+9. [Self-Optimisation](#9-self-optimisation)
+10. [Security and privacy](#10-security-and-privacy)
+11. [Repository layout](#11-repository-layout)
+12. [Development](#12-development)
+13. [Non-goals](#13-non-goals)
+14. [Further reading](#further-reading) · [License](#license)
 
 ---
 
@@ -66,25 +118,40 @@ A long-lived **Daemon Core** owns the agent loop, the Tools, the Sessions and al
 
 ## 3. Running Formless
 
-### 3.1 Prerequisites
+### 3.1 Requirements
 
 | Need | Why |
 |---|---|
-| A Rust stable toolchain (`rustup` recommended) | the app is one Rust workspace, edition 2021 |
-| A C compiler (`cc` / `clang` / `gcc`) | the QuickJS sandbox (`rquickjs`) is compiled from source |
-| An OpenAI-compatible Chat Completions endpoint that **supports tool calling** | it is the only provider Formless talks to |
+| A Rust stable toolchain (`rustup` recommended) — **source builds only** | the app is one Rust workspace, edition 2021 |
+| A C compiler (`cc` / `clang` / `gcc`) — **source builds only** | the QuickJS sandbox (`rquickjs`) is compiled from source |
+| An OpenAI-compatible endpoint that **supports tool calling** | it is the only provider Formless talks to |
 | A real terminal | the default client is a full-screen TUI |
 
-On Linux a Secret Service provider (GNOME Keyring, KWallet) keeps the API key in the OS keychain. If none is available, Formless falls back to a `0600` file in the config dir, so headless machines still work.
+Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Service provider (GNOME Keyring, KWallet) keeps the API key in the OS keychain; if none is available, Formless falls back to a `0600` file in the config dir, so headless machines still work.
 
-### 3.2 Build
+### 3.2 Install
+
+**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` and puts `formless` in `$PREFIX/bin` (default `~/.local`):
 
 ```bash
-git clone <this repo> && cd formless
+curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh | sh
+
+# overrides: PREFIX=/usr/local, FORMLESS_VERSION=v0.1.0, FORMLESS_FROM_SOURCE=1
+```
+
+**From source** (any platform with a toolchain):
+
+```bash
+git clone https://github.com/athiwatc/formless && cd formless
 cargo build --release          # binary at ./target/release/formless
 ```
 
-`cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code.
+`cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code. You can also `cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked`.
+
+**Homebrew / winget.** A source formula ships at [`packaging/homebrew/formless.rb`](packaging/homebrew/formless.rb) and winget templates at [`packaging/winget/`](packaging/winget); neither is published yet, so for now use the installer or a source build. **Windows:** download the release archive and unzip it, or build from source.
+
+> [!NOTE]
+> Release artifacts are checksummed but unsigned. On macOS you may need `xattr -d com.apple.quarantine formless` after installing by hand. `formless update check` reports newer releases but never rewrites the installed binary — updates stay with the installer and checksum verification ([§3.12](#312-updating)).
 
 ### 3.3 First run: the onboarding wizard
 
@@ -98,9 +165,9 @@ With no arguments `formless` launches the **TUI**, which auto-starts the daemon 
 2. **API key** — stored in the OS keychain plus a `0600` fallback file (`api_key`) in the config dir, so rebuilding a dev binary never loses it.
 3. **Model** — picked from the endpoint's model list, or typed by hand.
 4. **Reasoning effort** — for models that accept it.
-5. **Probe** — verifies connectivity, streaming and **tool calling**. If the endpoint cannot call tools the wizard refuses to continue, because the agent cannot build or run Tools without it.
+5. **Probe** — verifies connectivity, streaming and **tool calling**. If the endpoint cannot call tools the wizard refuses to continue: every Run would fail, and a prompt-mode fallback has to be chosen deliberately ([§3.8](#38-provider-options-v2)).
 
-The result is written to `config.toml` in the config dir (§4); you never need to edit it by hand.
+The result is written to `config.toml` in the config dir ([§4](#4-data-config-and-profiles)); you never need to edit it by hand. Re-run the wizard at any time with `formless doctor` for a diagnosis, or delete the config to go through it again.
 
 ### 3.4 Using the TUI
 
@@ -116,44 +183,48 @@ Type a task at the bottom and press **Enter**. Formless starts with only `create
 | `PgUp` / `PgDn` | scroll the transcript |
 | `Ctrl+C` | detach — the daemon keeps running, nothing is lost |
 
-Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /quit`. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui.multi_pane`). Reattaching later finds the same Sessions, because all state lives in the daemon, not in the client.
+Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /quit`. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
 
-Both clients render assistant replies as GitHub-flavoured Markdown: headings, nested and task lists, tables (with column alignment), quotes and `> [!NOTE]`-style alerts, rules, links, strikethrough and `$math$`. Fenced code is syntax-highlighted (Rust, JS/TS, Python, Go, shell, C-family, JSON, YAML/TOML, SQL, HTML, CSS) and ```` ```diff ```` blocks are coloured. ```` ```mermaid ```` blocks become diagrams: the web app renders every Mermaid type; the TUI draws flowcharts, state diagrams, sequence diagrams and pie charts as box-drawing art and shows the source for other types, or when a diagram is wider than the pane.
+Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.2](#52-lifecycle-and-versioning)).
 
 ### 3.5 Headless runs (no TUI)
 
+`formless run` is the scriptable entry point: it starts the daemon if needed, streams the answer to stdout, and exits.
+
 ```bash
-./target/release/formless run "summarise the CHANGELOG of this repo"        # ephemeral Session
-./target/release/formless run "now group those by author" --session 3f9c    # continue a Session
-./target/release/formless run "audit my Downloads folder" --json            # one JSON event per line
-./target/release/formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
+formless run "summarise the CHANGELOG of this repo"        # ephemeral Session
+formless run "now group those by author" --session 3f9c    # continue a Session
+formless run "audit my Downloads folder" --json            # one JSON event per line
+formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
 ```
 
-Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted.
+Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `130` interrupted.
 
 ### 3.6 Daemon, diagnostics and reset
 
 ```bash
-./target/release/formless daemon start     # start it if it is not already up
-./target/release/formless daemon status    # pid, protocol, session count
-./target/release/formless daemon stop
-./target/release/formless daemon serve     # foreground, for watching logs
-./target/release/formless doctor           # config, dirs, keychain, endpoint + tool-calling probe
-./target/release/formless tools list       # registry inspection (also export / import)
-./target/release/formless reset --force    # destructive: config, key, whole data dir
+formless daemon start     # start it if it is not already up
+formless daemon status    # pid, protocol, session count
+formless daemon stop
+formless daemon serve     # foreground, for watching logs
+formless doctor           # config, dirs, keychain, endpoint + tool-calling probe
+formless tools list       # registry inspection (also export / import)
+formless reset --force    # destructive: config, key, whole data dir
 ```
 
-There is one daemon per profile, reachable over a unix socket (`<data dir>/daemon.sock`) or a named pipe on Windows. It exits on its own after `daemon.idle_grace_secs` (default 60 s) with no clients and no pending Invocations, and the next `formless` command starts it again — Sessions live in SQLite (`formless.db`), so nothing is lost.
+There is one daemon per profile, reachable over a unix socket (`<data dir>/daemon.sock`) or a named pipe on Windows. It exits on its own after `daemon.idle_grace_secs` (default 60 s) with no clients and no pending Invocations, and the next client starts it again — so there is nothing to supervise.
 
 ### 3.7 Browser access via the relay (v2)
 
 ```bash
-./target/release/formless relay enable     # prints https://…#k=… — open that URL
-./target/release/formless relay status     # show it again
-./target/release/formless relay disable --forget
+formless relay enable     # prints https://…#k=… — open that URL
+formless relay status     # show it again
+formless relay disable --forget
 ```
 
-The daemon dials out to the relay, so nothing needs an inbound port; the browser holds the pairing key in the URL fragment and the relay only ever forwards AES-256-GCM ciphertext. The web app matches the TUI feature for feature (Sessions, chat with steer/queue/stop/edit, approvals, Tools with a code editor, Metrics, Proposals, Settings) and works on phones. The default endpoint is the Worker in [`relay/`](relay/README.md) — self-host it and point `relay.url` at your own deployment; `node relay/dev.mjs --mock-provider` runs the whole thing locally for frontend work.
+The daemon dials out to the relay, so nothing needs an inbound port; the browser holds the pairing key in the URL fragment and the relay only ever forwards AES-256-GCM ciphertext. The web app matches the TUI feature for feature (Sessions, chat with steer/queue/stop/edit, approvals, Tools with a code editor, Metrics, Proposals, Settings) and works on phones.
+
+The default endpoint is the Worker in [`relay/`](relay/README.md) — self-host it and point `relay.url` at your own deployment; `node relay/dev.mjs --mock-provider` runs the whole thing locally without a provider or an account.
 
 ### 3.8 Provider options (v2)
 
@@ -177,9 +248,9 @@ client_id = "your-public-client-id"
 ```
 
 ```bash
-./target/release/formless auth login     # opens the browser, listens on 127.0.0.1 for the callback
-./target/release/formless auth status    # mode and token expiry, never the token itself
-./target/release/formless auth logout
+formless auth login     # opens the browser, listens on 127.0.0.1 for the callback
+formless auth status    # mode and token expiry, never the token itself
+formless auth logout
 ```
 
 Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed automatically before each provider call.
@@ -189,7 +260,7 @@ Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed auto
 `--profile <name>` is a global flag: it gives an isolated daemon, data dir and config dir, which is the safe way to try dangerous Tools.
 
 ```bash
-./target/release/formless --profile sandbox
+formless --profile sandbox
 ```
 
 | Variable | Effect |
@@ -200,8 +271,8 @@ Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed auto
 | `FORMLESS_BASE_URL`, `FORMLESS_MODEL` | override the configured endpoint/model for this process |
 | `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR` | relocate state (also how the auto-started daemon inherits them) |
 | `FORMLESS_IDLE_GRACE_SECS` | how long an idle daemon lingers before exiting |
-| `FORMLESS_RELAY_SECRET` | pairing secret override (the `#k=` part of the browser URL) |
-| `RUST_LOG=debug` | verbose tracing on stderr |
+| `FORMLESS_RELAY_SECRET` | pairing secret override for the relay |
+| `RUST_LOG` | log filter for the daemon, e.g. `RUST_LOG=debug` |
 
 ### 3.10 Troubleshooting
 
@@ -212,6 +283,7 @@ Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed auto
 | TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
 | Daemon will not start | read `<data dir>/daemon.log`, then `formless doctor` and `formless daemon status` |
 | Keychain prompt on every launch | the `0600` `api_key` file in the config dir exists exactly for this; check it is present |
+| macOS refuses to run the binary | `xattr -d com.apple.quarantine formless` (releases are unsigned) |
 | Everything is wedged | `formless reset --force` (destroys config, key and data dir) |
 
 ### 3.11 CLI reference
@@ -229,7 +301,11 @@ Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed auto
 | `formless doctor` | Config validity, data dir, keychain reachability, endpoint + tool-calling probe |
 | `formless reset [--force]` | Full wipe of config, keychain entry and data dir |
 
-Headless approvals **fail closed**: an unapproved sensitive Invocation fails with a clear error unless `--yes` is passed. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `130` interrupted.
+Global flag: `--profile <name>`. Headless approvals **fail closed**: an unapproved sensitive Invocation fails with a clear error unless `--yes` is passed.
+
+### 3.12 Updating
+
+`formless update check` prints the newest GitHub release and its URL when it is newer than the running binary; it never downloads or replaces anything. Re-run `scripts/install.sh` (it always fetches the latest release and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
 
 ---
 
@@ -238,7 +314,7 @@ Headless approvals **fail closed**: an unapproved sensitive Invocation fails wit
 * **Data dir:** `~/Library/Application Support/formless` (macOS), `$XDG_DATA_HOME/formless` (Linux), `%APPDATA%\formless` (Windows). Config lives in the matching config dir (`config.toml` plus the OS keychain for secrets).
 * Contents: the SQLite DB (Sessions, Runs, Tool metadata and version index, Invocations, metric tallies, compaction checkpoints, approvals, audit events), Tool version files, artifacts, rotated daemon logs and the audit log.
 * The schema is versioned; the daemon auto-migrates on start and **takes a backup before migrating**. On corruption it refuses to guess: it stops, reports, and points at the backup.
-* `--profile <name>` gives an isolated daemon plus data/config dirs — intended for testing dangerous Tools.
+* `FORMLESS_DATA_DIR` / `FORMLESS_CONFIG_DIR` relocate both dirs; `--profile <name>` gives an isolated daemon plus data/config dirs — intended for testing dangerous Tools.
 
 ---
 
@@ -246,7 +322,7 @@ Headless approvals **fail closed**: an unapproved sensitive Invocation fails wit
 
 ### 5.1 `create_tool` — the Bootstrap Tool
 
-```
+```text
 create_tool(name, description, input_schema, output_schema,
             implementation_js, capabilities[], memory_mb?)
 ```
@@ -267,7 +343,7 @@ The other built-ins are the minimum the agent needs to grow and maintain its own
 
 Sub-agents are not a built-in: the agent builds a Tool with the `agent` Capability (`function run(i){ return agents.run(i.task); }`), so delegation is a measured, approval-gated Invocation. Several such calls in one turn run in parallel, and nesting is capped by `tools.max_agent_depth` (default 1).
 
-Up to `tools.inline_limit` (default 40) active Tools, every Session lists them all. Beyond that a Session lists the Tools it has loaded plus the most-used ones, and reaches the rest with `find_tools`, so the registry can grow without bound.
+Up to `tools.inline_limit` (default 40) active Tools, every Session lists them all. Beyond that a Session lists the Tools it has loaded plus the most-used ones, and reaches the rest with `find_tools`.
 
 ### 5.2 Lifecycle and versioning
 
@@ -280,17 +356,16 @@ Up to `tools.inline_limit` (default 40) active Tools, every Session lists them a
 
 | Capability | Scoping | Notes |
 |---|---|---|
-| `net` | optionally per-domain | Unscoped `net` is allowed but flagged broad at approval |
-| `fs:read` | path list | Canonicalised; symlink escapes denied |
-| `fs:write` | path list | Same containment rules |
-| `env` | named keys | Only the listed keys are visible |
-| `process` | named commands | Executed without a shell; unscoped is flagged broad |
-| `clipboard:read` / `clipboard:write` | boolean | v2; desktop clipboard access |
-| `notify` | boolean | v2; desktop notification |
-| `llm` | optionally per-model | v2; `llm.complete()` from inside a Tool |
-| `agent` | optionally per-model | v2; `agents.run()` sub-agents from inside a Tool |
+| `net` | optionally per-domain | per-host scopes are the norm; unscoped `net` is broader, so it is approval-gated |
+| `fs:read` / `fs:write` | absolute path or `$input.<field>` | an input-bound scope is granted per call for exactly the path(s) that field names |
+| `process` | one binary | `process.run` never goes through a shell |
+| `env` | one key | `env.get` only reveals keys the Tool declared |
+| `clipboard:read` / `clipboard:write` | — | v2 |
+| `notify` | — | v2 |
+| `llm` | optionally a model | v2 |
+| `agent` | optionally a model | v2 |
 
-`memory_mb` (default 256, daemon max default 4 GB) is declared and governed like a Capability: shown at approval, and widening it re-prompts. A Capability the runtime cannot enforce is never offered — the taxonomy is closed and grows only with the runtime.
+Capabilities are a **closed** list: no Tool can ask for a capability the runtime does not define, and nothing outside the declared set is reachable from the sandbox.
 
 ### 5.4 The host API inside a Tool
 
@@ -313,9 +388,7 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | `agents.run(task, {system, model})` | `agent` | v2; sub-agent over the same Tools (depth-limited, no step limit), returns its final text |
 | `requireModule(name)` | — | v2; load a shared module created with `create_module` |
 | `emit(chunk)` | — | Stream large output to an artifact file |
-| `console.log`, `sleep`, `setTimeout`, `JSON`, `cryptoRandom()`, `randomBytes(n)` | — | The rest of the surface — nothing else exists |
-
-The surface is deliberately near-minimal: it holds only effects JS cannot produce itself. Every data option takes `encoding: "utf8"` (default) or `"base64"`, so Tools can move any binary data. Anything higher-level (URL parsing, hashing, compression, file formats) the agent writes itself, usually as a shared module. `run` may be `async`. A Tool reports failure by **throwing**, and a returned `{error: …}` is counted as a failure anyway, so swallowed errors never inflate the success rate.
+| `console.log`, `sleep`, `setTimeout`, `JSON`, `cryptoRandom()`, `randomBytes(n)` | — | Logging, timing and entropy |
 
 A complete Tool:
 
@@ -335,7 +408,7 @@ function run(input) {
 * `tools.call` records and measures nested Invocations exactly like top-level ones.
 * Composition cannot launder permissions: the called Tool runs under **its own** declared Capabilities, and the outer Tool's Capabilities also apply. Depth is bounded and cycle-safe.
 * Shared code lives in versioned, immutable modules (`create_module`, loaded with `requireModule`); module loading is smoke-tested when a Tool is created.
-* In smoke tests the v2 side-effecting APIs are stubbed; in optimiser replay they are denied.
+* In smoke tests the v2 side-effecting APIs are stubbed, so creation never touches the clipboard, the network or the desktop.
 
 ---
 
@@ -400,7 +473,7 @@ Only the primary metric triggers; the rest inform the optimiser's context.
 * **Deny by default.** A Capability is a ceiling the runtime enforces; it is never exceeded.
 * **Approvals.** Broad or sensitive Capabilities prompt before first use — modal in the TUI, fail-closed in headless mode.
 * **Single-user trust boundary.** Local access control is the socket/pipe file permissions on the data dir (`0700`).
-* **Local-first.** Zero telemetry, no update checker, no phone-home: nothing leaves the machine except calls to the configured provider endpoint.
+* **Local-first.** Zero telemetry and no phone-home: nothing leaves the machine except calls to the configured provider endpoint, and `formless update check` only runs when you ask it to ([§3.12](#312-updating)).
 * **Imports are never auto-trusted.** Capabilities are displayed, approval applies, metrics start at zero, and the author is recorded as `import`.
 * **Data lifecycle.** `formless reset` wipes config, keychain entry and data dir; Session deletion removes payloads but keeps anonymised tallies; only a Tool purge deletes tallies.
 
@@ -408,18 +481,23 @@ Only the primary metric triggers; the rest inform the optimiser's context.
 
 ## 11. Repository layout
 
-```
+```text
 formless/
+├── Cargo.toml           workspace: edition 2021, Apache-2.0, version 0.1.0
 ├── SPEC.md              normative v1 specification — behaviour lives here
 ├── GLOSSARY.md          canonical vocabulary (Tool, Run, Invocation, Steer, …)
 ├── docs/adr/            ADRs: daemon core, single bootstrap tool,
 │                        QuickJS tool runtime, success-rate-gated optimisation
-└── crates/
-    ├── formless/        binary entrypoint: CLI subcommands, default TUI launch
-    ├── formless-core/   daemon, agent loop, provider client, tools, storage, optimiser
-    ├── formless-runtime/ QuickJS sandbox + Capability-gated host API
-    ├── formless-protocol/ shared daemon ↔ client types
-    └── formless-tui/    ratatui client
+├── crates/
+│   ├── formless/            binary entrypoint: CLI subcommands, default TUI launch
+│   ├── formless-core/       daemon, agent loop, provider client, tools, storage, optimiser
+│   ├── formless-runtime/    QuickJS sandbox + Capability-gated host API
+│   ├── formless-protocol/   shared daemon ↔ client types
+│   └── formless-tui/        ratatui client
+├── relay/               Cloudflare Worker + web frontend for browser access
+├── packaging/           release notes, Homebrew formula, winget templates
+├── scripts/install.sh   prebuilt-binary installer (or FORMLESS_FROM_SOURCE=1)
+└── .github/workflows/   release.yml — macOS arm64/x86_64, Linux x86_64, Windows x86_64
 ```
 
 ---
@@ -438,6 +516,15 @@ RUST_LOG=debug cargo run -- run "write a tool that converts a CSV to JSON"
 
 Rules of the road: **no behaviour may live only in a client** — the CLI and TUI are both clients of the daemon protocol. Every Tool is validated and smoke-tested at creation, and every behavioural change should be reflected in `SPEC.md` first.
 
+Where to start:
+
+* **Runtime / sandbox** — `crates/formless-runtime`: the host API table in [§5.4](#54-the-host-api-inside-a-tool) is the contract.
+* **Agent loop, tools, optimiser** — `crates/formless-core`; [§5](#5-the-tool-system) and [§9](#9-self-optimisation) describe the invariants.
+* **Protocol** — `crates/formless-protocol` is versioned; clients and daemon must be updated together.
+* **Clients** — `crates/formless-tui` and `crates/formless`; the relay's web UI lives in `relay/`.
+
+Release work is documented separately in [`packaging/README.md`](packaging/README.md).
+
 ---
 
 ## 13. Non-goals
@@ -446,7 +533,7 @@ Rules of the road: **no behaviour may live only in a client** — the CLI and TU
 * System services, localhost-TCP transport, cloud sync or telemetry.
 * Publishing signed/notarised binaries and submitting the Homebrew/winget packages (the workflow, installer and templates are in [`packaging/`](packaging/README.md); signing needs maintainer certificates).
 
-v2 shipped what v1 left out: the encrypted Relay and Web frontend (§3.7, [`relay/`](relay/README.md)), the Responses API, prompt-based tool calling, failover and measured routing, OAuth providers (§3.8), shared modules, sub-agents, prompt/memory self-optimisation, the Tool editor and the multi-pane TUI.
+v2 shipped what v1 left out: the encrypted Relay and Web frontend ([§3.7](#37-browser-access-via-the-relay-v2), [`relay/`](relay/README.md)), the Responses API, prompt-based tool calling, failover and measured routing, OAuth providers ([§3.8](#38-provider-options-v2)), shared modules, sub-agents, prompt/memory self-optimisation, the Tool editor and the multi-pane TUI.
 
 ---
 
@@ -457,3 +544,10 @@ v2 shipped what v1 left out: the encrypted Relay and Web frontend (§3.7, [`rela
 3. [SPEC.md](SPEC.md) §7 — the Tool system and host API.
 4. [SPEC.md](SPEC.md) §8 — metrics and Self-Optimisation.
 5. [docs/adr/](docs/adr) — why the core looks the way it does.
+6. [packaging/README.md](packaging/README.md) — releasing, installing, update checks.
+
+---
+
+## License
+
+Apache-2.0. See `Cargo.toml` and the license text referenced there.
