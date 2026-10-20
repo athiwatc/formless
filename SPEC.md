@@ -8,7 +8,7 @@ Tool (`create_tool`) and builds every other Tool it needs, for any use case —
 it does not specialise in coding. A Daemon Core owns the agent loop, Tools,
 Sessions, and state; a TUI (v1) and a headless CLI are clients of that core.
 The harness self-optimises its Tools, driven only by measured Tool Success
-Rate. A hosted Web frontend via an encrypted Relay is a v2 direction (see
+Rate. A hosted Web frontend via an encrypted Relay ships in v2 (see
 Non-Goals), and the Daemon Core is designed so that future frontends attach
 without redesign.
 
@@ -23,7 +23,9 @@ without redesign.
 4. **Deny by default.** Tools run sandboxed with only their declared
    Capabilities. The runtime offers nothing a Tool was not granted.
 5. **Local-first, zero telemetry.** Nothing leaves the machine except calls
-   to the user-configured provider endpoint. No update checker, no phone-home.
+   to the user-configured provider endpoint, the user-enabled Relay, and
+   explicit user-run commands (e.g. `formless update check`). No automatic
+   update checker, no phone-home.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI,
    CLI, and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config, and
@@ -82,7 +84,7 @@ without redesign.
 | Retired Tool | Agent-removed Tool: uncallable, retained, restorable; user-only purge. |
 | Compaction | Persisted summary checkpoint replacing old history/tool output. |
 | Daemon Core | Long-lived process owning loop, Tools, Sessions, state. |
-| Relay | Future encrypted intermediary for a hosted frontend. **Not v1.** |
+| Relay | Hosted encrypted intermediary for the Web frontend (v2, §12). |
 
 ## 4. Provider (v1: OpenAI-compatible only)
 
@@ -94,9 +96,28 @@ without redesign.
 - `base_url` is used **verbatim** (the daemon appends only `/chat/completions`
   and `/models`); non-`/v1` layouts work. Free-form extra headers (e.g.
   organisation/project) are configurable per provider and sent on every call.
-- Future (v2 log): every provider type, including subscription/OAuth-based
-  providers, and Responses-API-style endpoints. Provider quirks are expressed
-  as config, never provider-specific code paths in v1.
+- v2: `provider.api_style = "responses"` speaks the Responses API
+  (`POST {base_url}/responses`, converted input/tools, streamed
+  reasoning/function-call events). `provider.tool_mode = "prompt"` is a
+  prompt-based tool-calling fallback for models without native
+  tool-calling (tools are described in-band; replies are parsed for a
+  JSON tool-call object, buffered so the JSON never streams to the
+  user); the probe auto-detects it during onboarding.
+  `provider.fallback_models` lists models tried in order when the
+  selected model fails with a model/retryable error (failover routing).
+  With `provider.model = "auto"`, the daemon instead **auto-selects**
+  per Run from `provider.routing_models` (or the fallback list) using
+  only measured local outcomes — recorded provider successes/failures
+  and latency per model, smoothed toward a neutral prior with a small
+  exploration bonus for under-sampled models; optional
+  `routing_fast_models` / `routing_strong_models` subsets constrain
+  simple vs complex tasks (`routing_complex_chars`). No vendor ranking
+  is hard-coded. Stats are visible in the Metrics view and `doctor`.
+- v2 subscription/OAuth providers use the same OpenAI-compatible HTTP
+  surface with a Bearer access token obtained by OAuth2
+  authorization-code + PKCE (`provider.auth.mode = "oauth"`). This is a
+  credential mode, not a second provider protocol: Chat Completions,
+  Responses, probe, failover, and measured routing semantics are unchanged.
 
 ### 4.2 Configuration and selection
 
@@ -116,6 +137,33 @@ without redesign.
   Linux Secret Service) with a `0600`-permission file fallback. Keys are
   never written to `config.toml` in plaintext, never logged, never sent
   anywhere except the configured endpoint.
+- OAuth is CLI-led because authorization happens in a browser:
+  configure `[provider.auth]` (`mode`, `authorize_url`, `token_url`,
+  public `client_id`, optional `scopes`, localhost `redirect_port`, and
+  provider-specific extra authorize/token parameters), then run
+  `formless auth login`. Login binds only
+  `http://127.0.0.1:<port>/callback`, uses a fresh `state` and S256 PKCE
+  verifier/challenge, exchanges the code at the configured token
+  endpoint, and stores tokens via keychain + a `0600`
+  `oauth_tokens.json` fallback. `formless auth status|logout` inspect or
+  delete those tokens without printing them. Full reset deletes them too.
+- Before every provider construction (main Runs, sub-agents,
+  Tool-initiated `llm.complete`, optimiser calls, compaction through the
+  already-constructed provider, and `doctor` probes), the daemon/CLI
+  resolves the active credential. API-key mode preserves the existing
+  environment → fallback file → keychain load order. OAuth mode accepts
+  `FORMLESS_OAUTH_ACCESS_TOKEN` as an explicit override; otherwise it
+  returns a non-expired stored token or refreshes it before the call.
+  Refresh is serialized in-process, a rotated refresh token is persisted
+  before the new access token is used, and failures name
+  `formless auth login` rather than silently falling back to an API key.
+  A confidential OAuth client secret, when a provider requires one, is
+  read only from `FORMLESS_OAUTH_CLIENT_SECRET` and sent as HTTP Basic
+  credentials to the token endpoint; it is never stored in config.
+- Remote authorize/token endpoints must use HTTPS; HTTP is accepted only
+  for localhost test/provider deployments. Only bearer-style access
+  tokens are supported. An OAuth-configured but not-yet-logged-in profile skips the
+  TUI API-key wizard and shows the login command instead.
 
 ### 4.3 Endpoint probe (onboarding gate)
 
@@ -163,7 +211,7 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   resumable per §5.4/§9.5.
 - Multiple tool calls emitted in one model turn execute **in parallel**, each
   in its own isolated sandbox instance; results are returned together.
-  Approval gates (§10.3) are evaluated per Tool before the batch starts:
+  Approval gates (§10.3) are evaluated per call before the batch starts:
   approved calls run, held calls wait on one combined prompt.
 
 ### 5.3 Talking to a busy agent
@@ -230,13 +278,45 @@ pattern (§4.4).
 - Signature (conceptual): `create_tool(name, description, input_schema,
   output_schema, implementation_js, capabilities[], memory_mb?)`.
 - The **agent writes the JavaScript** (plain JS; QuickJS has no TypeScript).
-  Every session exposes `create_tool` **plus every active Tool** directly as
-  callable functions (name + description + input schema). There is no
-  catalog-search step.
+- **Built-ins (v2.2).** The minimal set the harness needs to grow itself:
+  `create_tool`, `create_module`, `retire_tool`,
+  `find_tools`, `read_tool`, `test_tool`, and the Pending Invocation
+  handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
+  former built-in; sub-agents are now the `agent` Capability, §7.6), so no
+  registry Tool can impersonate one.
+  - `find_tools(query, limit?)` — keyword search over active Tools (names
+    outrank descriptions; ties go to the more used, more reliable Tool).
+    Matches are **loaded** into the Session and become callable functions
+    from the next step.
+  - `read_tool(name, version?)` — the full definition (code, schemas,
+    Capabilities, `memory_mb`), version list, metrics and the last few
+    failures, so a new version is built from the real code.
+  - `test_tool(input, name? | draft)` — dry-runs a saved Tool or an
+    unsaved draft (the `create_tool` fields) live on a real input, with
+    approval as for a normal call. Neither saved nor recorded as an
+    Invocation; returns output or error, logs, and output-schema validity.
+- **Tool listing.** While the registry holds at most `tools.inline_limit`
+  (default 40) active Tools, every Session lists all of them as callable
+  functions (name + description + input schema). Past that, a Session
+  lists the Tools it has **loaded** (found, created or called there) plus
+  the most-used Tools up to the limit, **frozen** the first time the
+  Session lists Tools; `find_tools` reaches the rest, and its description
+  states how many exist. The listing is sorted by name and changes only
+  when the Session loads a Tool, so usage elsewhere never reshuffles it and
+  the request prefix stays cacheable. Found Tools are declared as real
+  functions (not called through a generic proxy) so the provider sees
+  their exact schemas. Registries may grow without bound; context cost
+  stays bounded.
 - **Validation gate at creation:** name rules (§7.3), both schemas validated
   (JSON Schema draft 2020-12), JS syntax-checked, and smoke-tested in the
-  replay-style sandbox (§8.4) with empty input. Any failure ⇒ creation is
-  rejected with the error; nothing broken is ever saved.
+  replay-style sandbox (§8.4) with a schema-minimal input. Any failure ⇒
+  creation is rejected with the error; nothing broken is ever saved. The
+  smoke test is conclusive only until the Tool is first handed a stub (a
+  stubbed fetch/process/llm/agent/env/clipboard result, `tools.call`, or
+  an input-bound scope it cannot bind): a failure after that point is
+  reported as **inconclusive** and the Tool is saved, since the fake data
+  rather than the Tool may be at fault. Failures before any stub, and
+  denials of undeclared Capabilities, still reject.
 - `create_tool` is **immutable, excluded from Self-Optimisation**, and cannot
   be retired, edited, or widened by the agent or the optimiser.
 
@@ -275,7 +355,20 @@ pattern (§4.4).
 | `clipboard:read` / `clipboard:write` (`clipboard` = both) | — | v2; OS clipboard |
 | `notify` | — | v2; desktop notifications |
 | `llm` | optionally per-model | v2; LLM completions from inside Tools (§7.5) |
+| `agent` | optionally per-model | v2; sub-agents from inside Tools (§7.6) |
 
+- **Input-bound scopes (v2.1).** `fs:read`, `fs:write` and `net` may be
+  scoped to an input field instead of a fixed value: `fs:read:$input.path`,
+  `fs:write:$input.out.dir`, `net:$input.url`. Per Invocation, after input
+  validation, the daemon binds each template to that field's value (a
+  string or array of strings; dotted paths allowed): paths are made
+  absolute and canonicalised, `net` values may be URLs (host taken) or bare
+  hosts. A missing or non-string field fails the Invocation as a
+  validation failure. Templates on any other Capability are rejected at
+  creation. The smoke test grants no bound scope; replay binds against the
+  recorded input. This lets one generic Tool keep least privilege: it gets
+  exactly the paths/hosts it was called with, never a project directory
+  baked in at creation.
 - `memory_mb` (default 256) is declared and governed like a Capability:
   shown at approval, widening re-prompts, bounded by a daemon max
   (default 4 GB).
@@ -285,19 +378,40 @@ pattern (§4.4).
 
 - Engine: QuickJS-NG via `rquickjs`, embedded in-process. Tools are
   single-file plain JS; the daemon provides the entire API surface (bare JS
-  has no ambient authority of any kind):
-  - `fetch(url, opts)` — gated by `net`; streamed response body supported.
-  - `fs.read/write` (whole-value, small data) and `fs.readChunks(path,size)` /
-    line iterator (streaming) — gated by `fs:*`.
-  - `env.get(key)` — gated by `env`. `process.run(cmd, args)` — gated by
-    `process`, no shell.
+  has no ambient authority of any kind). The surface is deliberately
+  **near-minimal**: it offers only effects JS cannot produce itself.
+  Everything else (URL parsing, base64-to-bytes, hashing, compression,
+  formats) is written by the agent, typically as shared modules.
+  - `run(input)` may be `async`; the returned Promise is settled before the
+    Invocation ends. A Tool reports failure by **throwing**. A returned
+    object whose `error` field is truthy is recorded as a failure too (§8.1),
+    so swallowed errors cannot inflate the success rate.
+  - Data options take `encoding: "utf8"` (default) or `"base64"`, so any
+    binary data crosses the boundary as a string. Text chunks never split a
+    UTF-8 character.
+  - `fetch(url, {method, headers, body, bodyEncoding, encoding})` →
+    `{status, ok, url, headers, body, text(), json()}` and
+    `fetchChunks(url, opts, size, cb)` (a truly streamed body in bounded
+    memory) — gated by `net`. http(s) only; redirects are followed, each hop
+    scope-checked; no request timeout.
+  - `fs.read/write/append` (whole-value), `fs.exists`, `fs.stat` (`{type,
+    size, modified_ms}` or null), `fs.list(dir, {details})`, and
+    `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines` (streaming)
+    — gated by `fs:read`; `fs.write/append/mkdir/remove/rename` — gated by
+    `fs:write` (both paths for rename). Writes create missing parent dirs.
+  - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
+    stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` —
+    gated by `process`, no shell, stdin closed unless given.
   - `tools.call(name, input)` — composition (§7.6).
   - v2: `clipboard.read/write` (gated by `clipboard:*`), `notify(title,
-    body)` (gated by `notify`), and `llm.complete(prompt, {system,
-    model})` (gated by `llm`; one non-streaming completion via the
-    daemon's configured provider). In smoke tests these are stubbed;
-    in optimiser replay they are denied.
-  - `console`, timers, `JSON`, crypto-random. Nothing else.
+    body)` (gated by `notify`), `llm.complete(prompt, {system, model})`
+    (gated by `llm`; one non-streaming completion via the daemon's
+    configured provider), `agents.run(task, {system, model})` (gated by
+    `agent`; §7.6 sub-agents), and `requireModule(name)` for shared JS
+    modules (§7.6). In smoke tests these are stubbed; in optimiser
+    replay the side-effecting ones are denied.
+  - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
+    (base64). Nothing else.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
   Exceeding it faults **only that Invocation**, tagged `resource`. The cap is
   a heap cap, not a data-size cap: streaming APIs exist so data Tools
@@ -315,18 +429,49 @@ pattern (§4.4).
   and the outer Tool's Capabilities also apply. Nesting depth is bounded by
   the sandbox implementation (cycle-safe), faults tagged as Invocation
   failures.
-- Out of v1: shared JS modules/libraries (every Tool is one self-contained
-  file; duplication is accepted to keep versioning/retirement atomic), and
-  LLM calls from inside Tools (only the agent loop talks to the provider).
+- Shared JS modules (v2): `create_module` stores versioned, immutable
+  module code (`module.exports = ...`) in the registry; Tools load the
+  current version with `requireModule(name)` (modules may require other
+  modules; loading is smoke-tested at creation). LLM calls from inside
+  Tools are §7.5's gated `llm` Capability.
+- Sub-agents (v2; v2.2 makes them a Capability only): a Tool with the
+  `agent` Capability calls `agents.run(task, {system, model})` to run a
+  sub-agent — its own provider loop over the same Tools, with no step
+  limit (it ends on a final answer, a fault or cancellation) — and
+  receives only its final text. There is no sub-agent built-in, so
+  delegation is always a measured, approval-gated Invocation; parallel
+  delegation is several such calls in one turn, which run concurrently.
+  The sub-agent's own Tool calls pass the same approval pre-pass as the
+  main agent's. Nesting is bounded by `tools.max_agent_depth` (default 1):
+  `agents.run` is refused inside a sub-agent at that depth, however its
+  Tools are composed.
 
 ### 7.7 Bootstrap system prompt
 
-- The daemon carries a **versioned bootstrap system prompt** (frozen in v1,
-  not optimised). It states: you have only `create_tool`; build small,
+- The daemon carries a **versioned bootstrap system prompt** (frozen in
+  v1; v2.1 is a deliberate version bump adding generic-Tool guidance and
+  input-bound scopes, §7.4). v2 adds prompt/memory **self-optimisation**: the optimiser
+  proposes one short learned-guidance (kind `prompt`) or memory-note
+  (kind `memory`) addendum from Tool metrics/failure patterns, measures
+  it against the current prompt on a fixed eval suite (baseline vs
+  candidate scores are stored), and only a measured proposal that beats
+  the baseline by the promotion margin can be applied — always by the
+  user's decision (`formless prompts`, TUI `/proposals`). Applied
+  proposals append to the bootstrap prompt in version order and can be
+  rolled back individually; the bootstrap text itself is never edited. It states: you have only `create_tool`; build small,
   single-purpose, minimally-Capabilitied Tools on demand; validate/test each
   after creating it; stream large data; prefer retiring broken Tools and
-  creating new versions over silent workarounds. The prompt documents the
-  exact host API of §7.5 so first-try Tool success is maximised.
+  creating new versions over silent workarounds. Since v2.1 it also
+  requires Tools to be **generic**: one kind of operation, with every
+  task- or project-specific value (paths, URLs, hosts, names, queries)
+  taken as input, never hardcoded in code, name, or description; check
+  existing Tools before creating one and generalise an existing Tool (a
+  backward-compatible new version) instead of adding a narrow one;
+  specialise only when the logic itself is project-specific. v2.2 adds:
+  search with `find_tools` before creating, `read_tool` before versioning,
+  `test_tool` before saving, and throw on failure. The prompt documents the
+  exact host API of §7.5 so first-try Tool success is maximised; the
+  optimiser's Candidate prompt carries the same host-API text.
 - No starter Tools ship. First-run UX is the wizard (§10.1) plus an optional
   unfilled first-message prompt.
 
@@ -352,6 +497,10 @@ pattern (§4.4).
    attributable per successful Invocation; optimiser context).
 4. **Validation Failure Rate:** share of Invocations rejected on input/output
    schema (points at a badly described Tool; optimiser context).
+5. **Session spread (v2.1):** distinct Sessions that invoked the Tool. A
+   Tool called ≥3 times but only ever from one Session is flagged to the
+   prompt-proposal generator (§7.7) as possibly over-specific (hardcoded
+   paths/hosts/names); shown in the Tools view.
 
 All thresholds in this section are **configurable** (§13); defaults stated.
 
@@ -494,7 +643,9 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - First execution of a Tool whose Capabilities are sensitive (`fs:write`,
   `net`, `process`, `env`, or any widening) requires approval. Approval is
   **per-Tool and survives version bumps; it re-prompts only when
-  Capabilities/`memory_mb` widen**, showing the capability diff (new items
+  Capabilities/`memory_mb` widen**. Input-bound scopes (§7.4) are approved
+  as their resolved values, per call: approving a path/host adds it to the
+  Tool's accumulated grant, and only an uncovered new path/host re-prompts, showing the capability diff (new items
   highlighted, broad unscoped grants flagged). Replay-limited promotions
   (§8.4) use the same modal. In parallel batches, one combined modal covers
   all held calls (§5.2). Modals are keyboard-driven, never lose scrollback.
@@ -511,7 +662,10 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   history (author, timestamps, replaced-version stats), Invocation tallies,
   optimiser history, `needs attention` flags. Actions: rollback, restore
   (retired), purge (confirmed, user-only), export/import, audit log view.
-  Tool JS is shown **read-only**; there is no in-TUI code editor in v1.
+  Tool JS is editable in the TUI (v2): `E` in the Tools view opens the
+  current version's code; Ctrl+S saves it as a new immutable version
+  (author `user`, same schemas/Capabilities) through the usual syntax +
+  smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
 - **Settings view:** edits file-backed config (§13) and per-Session
@@ -522,13 +676,19 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 ### 10.5 Input and keys
 
 - Enter: send / Steer while running (Ctrl+Enter: queue; configurable).
-  `Esc`: interrupt Run. `Ctrl+C`: detach client. `Tab` (and slash commands)
+  `Esc`: interrupt Run. `Ctrl+C`: detach client. `Tab`/`Shift+Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
-  `/model`, `/settings`, `/stop`, `/approve`, `/thinking`, `/help`.
-  Plain text is always chat.
+  `/model`, `/settings`, `/stop`, `/approve`, `/thinking`, `/help`
+  (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
+  `/propose`, `/panes`). Plain text is always chat.
 - Terminal colours respected, `NO_COLOR` honoured. Narrow terminals remain
-  usable (single-column-first design; no multi-pane dashboard in v1).
+  usable (single-column-first design).
+- Multi-pane layout (v2): `/panes` toggles a persistent dashboard —
+  Sessions and Tools on the left, chat in the centre, Metrics and status
+  on the right — saved as `tui.multi_pane` and restored on start. It is
+  used only when the terminal is at least 110 columns wide; narrower
+  terminals fall back to the single-column chat automatically.
 
 ### 10.6 Live feedback (v2)
 
@@ -603,6 +763,30 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - The CLI is a client of the same protocol; **no behaviour lives only in
   the CLI**.
 
+### Relay and Web frontend (v2)
+
+- `formless relay enable|disable|status` controls the hosted Relay: the
+  daemon dials out to `relay.url` (default
+  `wss://formless.athiwat.xyz`) and browsers meet it there — no inbound
+  ports. The Relay (a Cloudflare Worker + Durable Object room in
+  `relay/`) forwards only opaque AES-256-GCM ciphertext: the pairing
+  secret (32 random bytes, keychain + `0600` file, never in config) is
+  the key, and the room id is a truncated SHA-256 of it, so the Relay
+  can neither read traffic nor derive the key. The browser URL carries
+  the secret in the `#k=` fragment, which is never sent to a server.
+  `--rotate` invalidates old links. The hosted Web frontend is a full
+  client with TUI feature parity — Sessions (new, fork, rename, delete,
+  search, import/export), streaming chat with thinking and Tool calls,
+  send/steer/queue/stop and edit-and-rerun, approvals and promotions,
+  Tools (detail, code editor, optimise, retire/restore, rollback, purge,
+  import/export), Metrics, Proposals, and read-only Settings — over the
+  same daemon protocol, decrypted in the browser. `GetSettings` returns a
+  read-only configuration summary for remote clients and never includes
+  `provider.extra_headers` or any other credential-bearing field. The
+  page loads no inline script (`script-src 'self'`), because its URL
+  fragment carries the key, and it removes the key from the address bar
+  once connected.
+
 ## 13. Configuration (complete settings table)
 
 - File: `config.toml` in the OS config dir; sections `[daemon] [provider]
@@ -617,14 +801,24 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 | `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |
+| `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |
+| `relay.url` | `wss://formless.athiwat.xyz` | Relay websocket base URL |
 | `provider.extra_headers` | {} | Free-form headers per request (§4.1) |
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
+| `provider.api_style` | `chat` | `chat` or `responses` (§4.1) |
+| `provider.tool_mode` | `native` | `native` or prompt-based fallback (§4.1) |
+| `provider.fallback_models` | [] | Failover models, in order (§4.1) |
+| `provider.routing_models` | [] | Candidates for `model="auto"` measured routing |
+| `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
+| `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |
 | `tools.pending_threshold_secs` | 300 | Soft async handoff threshold (§6.2) |
 | `tools.default_memory_mb` | 256 | Default per-Invocation heap (§7.4) |
 | `tools.max_memory_mb` | 4096 | Daemon bound on declared memory (§7.4) |
 | `tools.artifact_preview_chars` | 2000 | Context preview of artifact outputs (§9.6) |
+| `tools.inline_limit` | 40 | Registry size listed whole; larger registries load lazily (§7.1) |
+| `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |
 | `metrics.success_window` | 100 | Rolling window for success rate (§8.3) |
 | `metrics.trigger_min_invocations` | 20 | Minimum sample before trigger (§8.3) |
 | `metrics.trigger_success_below` | 0.90 | Trigger threshold (§8.3) |
@@ -638,22 +832,29 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 | `compaction.model` | (session) | Optional separate compaction model (§11) |
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
 | `tui.queue_key` | Ctrl+Enter | Queue-vs-steer binding (§10.5) |
+| `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 
 ## 14. Security
 
 - **Trust boundary:** the daemon serves only the owning local user (socket/
   pipe ACL). Any local process running as that user is trusted; nothing
-  network-facing exists in v1.
+  listens on the network. The v2 Relay is outbound-only and carries
+  ciphertext keyed by the pairing secret (§12).
 - **Sandbox:** QuickJS has zero ambient authority. Every privileged effect
   goes through a daemon host call checked against the Tool version's declared
   Capabilities + approved state. JS interrupt support makes user
   cancellation actually stop executing code.
 - **Path containment:** `fs:*` scopes are canonicalised at approval and at
   each access; `..` and symlink escapes outside the granted roots are denied.
+  A not-yet-existing path resolves through its deepest existing ancestor;
+  a dangling symlink, or `..` in the missing part, is refused.
 - **Process:** `process.run` execs the named binary directly (no shell, no
-  string interpolation); only commands in the Tool's declared scope run.
+  string interpolation); only commands in the Tool's declared scope run. A
+  bare grant (`process:ls`) matches the bare name or a path to the same
+  file PATH resolves it to; a look-alike binary elsewhere never matches.
 - **Network:** `fetch` honours the `net` scope (domain allowlist when
-  scoped); redirects may not escape a domain scope.
+  scoped), http(s) only; redirects are followed but every hop is checked,
+  so they may not escape a domain scope.
 - **Approvals** (§10.3) are the human gate for sensitive first use and for
   any Capability widening (including Candidate/optimizer-originated changes).
 - **Audit log:** every approval decision, promotion, rollback, discard,
@@ -663,10 +864,11 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 
 ## 15. Privacy and data lifecycle
 
-- **Zero telemetry.** No analytics, no update checks, no crash reporting.
-  The only outbound traffic is to the user's configured provider endpoint
-  (sessions, optimiser, compaction) — always with redacted secrets in
-  optimiser paths (§8.3).
+- **Zero telemetry.** No analytics, no automatic update checks, no crash
+  reporting. Outbound traffic goes only to the user's configured provider
+  endpoint (sessions, optimiser, compaction), the user-enabled Relay
+  (ciphertext only, §12), and explicit user-run commands — always with
+  redacted secrets in optimiser paths (§8.3).
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
@@ -707,18 +909,13 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   schema (schemas requiring fields will fail empty input; the smoke test
   uses a schema-minimal generated input in that case).
 
-## 17. Non-goals (v2 log — explicitly out of v1)
+## 17. Non-goals (after v2)
 
-- Web frontend and encrypted **Relay** hosting (daemon→relay, hosted FE).
 - Hosted/multi-user mode, accounts, sharing servers.
-- Subscription/OAuth providers; Responses-API endpoints; prompt-based
-  tool-calling fallback for non-tool-calling models.
-- Prompt/memory self-optimisation (system prompt frozen in v1 §7.7);
-  routing/model auto-selection.
-- Shared JS modules; in-TUI Tool code editor; persistent multi-pane TUI.
-- Distribution polish: signed release binaries, Homebrew/winget packages,
-  any update mechanism (v1 installs via `cargo install` / source build).
-- Additional Capabilities (sub-agents).
+- Distribution publication: code-signing/notarisation with maintainer
+  certificates and submitting the prepared Homebrew/winget packages
+  (release workflow, installer, checksums, and update checks exist in
+  `packaging/`; see `packaging/README.md`).
 
 ## 18. Roadmap and acceptance criteria
 
@@ -768,6 +965,45 @@ finishing; daemon crash mid-Run recovers as Interrupted with no re-execution;
 `formless run --json` streams events and exits per §12; an exported Tool
 imports on a second profile untrusted, with fresh metrics and first-run
 approval; reset wipes everything incl. keychain.
+
+### v2 — Extensions
+
+Responses API, prompt-based tool-calling fallback, failover and measured
+model routing; OAuth/PKCE subscription credentials; `clipboard`, `notify`,
+`llm`, and `agent` Capabilities; shared JS modules; prompt/memory
+self-optimisation; Session fork/search/edit; in-TUI Tool editor, Metrics
+view, and persistent multi-pane layout; encrypted Relay + Web frontend;
+release workflow, installer, packaging templates, and `update check`.
+**Accept when:** Responses and prompt-mode endpoints stream, probe, and
+call Tools against the mock server, and failover reaches the next model
+(`v2_provider`); `model="auto"` selects only from measured outcomes and
+honours fast/strong subsets (`v2_routing`); OAuth login verifies `state`,
+sends the PKCE verifier, persists rotated refresh tokens, and refreshes
+mid-Run (`v2_auth`); each new Capability is denied without its grant and
+stubbed in smoke tests (`v2_caps`, `v2_tools_platform`); a prompt proposal
+applies only after a measured win and rolls back individually
+(`v2_selfopt`); Relay traffic round-trips encrypted and the room id cannot
+yield the key (`relay`).
+
+### v2.2 — Built-ins for self-expansion
+
+`find_tools` / `read_tool` / `test_tool` and lazy Tool listing (§7.1);
+honest outcomes (throw on failure, returned `{error}` counts as failure)
+and inconclusive-after-stub smoke tests; async `run`; binary encodings,
+`fs` append/stat/mkdir/remove/rename, `process.run` options, response
+headers, truly streamed `fetchChunks`, scope-checked redirects (§7.5);
+exact `process` scope matching and dangling-symlink refusal (§14);
+`spawn_subagent` removed in favour of the `agent` Capability, with a
+sub-agent depth guard, no sub-agent step cap, and approvals for
+sub-agent Tool calls (§7.6).
+**Accept when:** `v2_builtins` passes: a 46-Tool registry hides a Tool
+until `find_tools` loads it; `test_tool` runs drafts without saving or
+measuring; a generic `fs:read:$input.path` Tool is created while a Tool
+with a pre-stub bug is rejected; `process:ls` refuses a copied `ls`;
+chunked reads and streamed fetches never split UTF-8; redirects out of a
+`net` scope are denied; `agents.run` recursing through a sub-agent's
+own Tool call is refused at the depth limit; a sensitive Tool called
+without an approver fails closed.
 
 ### Cross-cutting acceptance (all milestones)
 

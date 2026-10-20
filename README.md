@@ -8,10 +8,11 @@ A long-lived **Daemon Core** owns the agent loop, the Tools, the Sessions and al
 
 | Document | What it is |
 |---|---|
-| [SPEC.md](SPEC.md) | Normative v1 specification |
+| [SPEC.md](SPEC.md) | Normative specification (v1 plus v2 extensions) |
 | [GLOSSARY.md](GLOSSARY.md) | Canonical vocabulary — read this first |
 | [docs/adr/](docs/adr) | Architecture Decision Records |
 | `Cargo.toml` | Rust workspace, edition 2021, Apache-2.0 |
+| **§3 [Running Formless](#3-running-formless)** | **Prerequisites, build, onboarding, TUI keys, headless CLI, daemon, relay** |
 
 ---
 
@@ -63,36 +64,168 @@ A long-lived **Daemon Core** owns the agent loop, the Tools, the Sessions and al
 
 ---
 
-## 3. Quick start
+## 3. Running Formless
+
+### 3.1 Prerequisites
+
+| Need | Why |
+|---|---|
+| A Rust stable toolchain (`rustup` recommended) | the app is one Rust workspace, edition 2021 |
+| A C compiler (`cc` / `clang` / `gcc`) | the QuickJS sandbox (`rquickjs`) is compiled from source |
+| An OpenAI-compatible Chat Completions endpoint that **supports tool calling** | it is the only provider Formless talks to |
+| A real terminal | the default client is a full-screen TUI |
+
+On Linux a Secret Service provider (GNOME Keyring, KWallet) keeps the API key in the OS keychain. If none is available, Formless falls back to a `0600` file in the config dir, so headless machines still work.
+
+### 3.2 Build
 
 ```bash
-# build
-cargo build --release
-
-# launch the TUI (auto-starts the daemon on first run + onboarding wizard)
-./target/release/formless
-
-# headless one-shot run (no TUI)
-./target/release/formless run "summarise the CHANGELOG of this repo"
-
-# continue an existing session, machine-readable event stream
-./target/release/formless run "now group those by author" --session 3f9c --json
-
-# daemon control and diagnostics
-./target/release/formless daemon status
-./target/release/formless doctor
+git clone <this repo> && cd formless
+cargo build --release          # binary at ./target/release/formless
 ```
 
-First run walks through an onboarding wizard: pick an OpenAI-compatible base URL, model and API key (stored in the OS keychain), then pass an endpoint probe that verifies both connectivity and tool-calling support.
+`cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code.
 
-### 3.1 CLI reference (v1)
+### 3.3 First run: the onboarding wizard
+
+```bash
+./target/release/formless
+```
+
+With no arguments `formless` launches the **TUI**, which auto-starts the daemon on first use (`formless daemon serve`, detached, logging to `<data dir>/daemon.log`) and then walks the wizard:
+
+1. **Base URL** — e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1`, or any compatible gateway.
+2. **API key** — stored in the OS keychain plus a `0600` fallback file (`api_key`) in the config dir, so rebuilding a dev binary never loses it.
+3. **Model** — picked from the endpoint's model list, or typed by hand.
+4. **Reasoning effort** — for models that accept it.
+5. **Probe** — verifies connectivity, streaming and **tool calling**. If the endpoint cannot call tools the wizard refuses to continue, because the agent cannot build or run Tools without it.
+
+The result is written to `config.toml` in the config dir (§4); you never need to edit it by hand.
+
+### 3.4 Using the TUI
+
+Type a task at the bottom and press **Enter**. Formless starts with only `create_tool` and builds whatever else the task needs.
+
+| Key | Action |
+|---|---|
+| `Enter` | send the message, or steer the Run that is in flight |
+| `Ctrl+Enter` | queue the message for after the current Run |
+| `Esc` | stop the current Run / leave a dialog |
+| `Tab` / `Shift+Tab` | cycle views (Chat, Sessions, Tools, Metrics, Proposals, Settings) — the bar at the top shows where you are |
+| `Shift+E` (Tools view) | edit the selected Tool's JS (open it with `Enter` first); `Ctrl+S` saves it as a new version through the smoke gate |
+| `PgUp` / `PgDn` | scroll the transcript |
+| `Ctrl+C` | detach — the daemon keeps running, nothing is lost |
+
+Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /quit`. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui.multi_pane`). Reattaching later finds the same Sessions, because all state lives in the daemon, not in the client.
+
+Both clients render assistant replies as GitHub-flavoured Markdown: headings, nested and task lists, tables (with column alignment), quotes and `> [!NOTE]`-style alerts, rules, links, strikethrough and `$math$`. Fenced code is syntax-highlighted (Rust, JS/TS, Python, Go, shell, C-family, JSON, YAML/TOML, SQL, HTML, CSS) and ```` ```diff ```` blocks are coloured. ```` ```mermaid ```` blocks become diagrams: the web app renders every Mermaid type; the TUI draws flowcharts, state diagrams, sequence diagrams and pie charts as box-drawing art and shows the source for other types, or when a diagram is wider than the pane.
+
+### 3.5 Headless runs (no TUI)
+
+```bash
+./target/release/formless run "summarise the CHANGELOG of this repo"        # ephemeral Session
+./target/release/formless run "now group those by author" --session 3f9c    # continue a Session
+./target/release/formless run "audit my Downloads folder" --json            # one JSON event per line
+./target/release/formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
+```
+
+Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted.
+
+### 3.6 Daemon, diagnostics and reset
+
+```bash
+./target/release/formless daemon start     # start it if it is not already up
+./target/release/formless daemon status    # pid, protocol, session count
+./target/release/formless daemon stop
+./target/release/formless daemon serve     # foreground, for watching logs
+./target/release/formless doctor           # config, dirs, keychain, endpoint + tool-calling probe
+./target/release/formless tools list       # registry inspection (also export / import)
+./target/release/formless reset --force    # destructive: config, key, whole data dir
+```
+
+There is one daemon per profile, reachable over a unix socket (`<data dir>/daemon.sock`) or a named pipe on Windows. It exits on its own after `daemon.idle_grace_secs` (default 60 s) with no clients and no pending Invocations, and the next `formless` command starts it again — Sessions live in SQLite (`formless.db`), so nothing is lost.
+
+### 3.7 Browser access via the relay (v2)
+
+```bash
+./target/release/formless relay enable     # prints https://…#k=… — open that URL
+./target/release/formless relay status     # show it again
+./target/release/formless relay disable --forget
+```
+
+The daemon dials out to the relay, so nothing needs an inbound port; the browser holds the pairing key in the URL fragment and the relay only ever forwards AES-256-GCM ciphertext. The web app matches the TUI feature for feature (Sessions, chat with steer/queue/stop/edit, approvals, Tools with a code editor, Metrics, Proposals, Settings) and works on phones. The default endpoint is the Worker in [`relay/`](relay/README.md) — self-host it and point `relay.url` at your own deployment; `node relay/dev.mjs --mock-provider` runs the whole thing locally for frontend work.
+
+### 3.8 Provider options (v2)
+
+All of these are plain config in `[provider]`; none is a vendor-specific code path.
+
+| Setting | Effect |
+|---|---|
+| `api_style = "responses"` | speak the Responses API (`POST {base_url}/responses`) instead of Chat Completions |
+| `tool_mode = "prompt"` | describe Tools in the prompt and parse a JSON tool call from the reply, for models without native tool calling (onboarding detects this) |
+| `fallback_models = [...]` | models to fail over to, in order, when the selected one errors |
+| `model = "auto"` + `routing_models = [...]` | pick a model per Run from **measured** local success and latency; `routing_fast_models` / `routing_strong_models` split simple from complex tasks |
+
+Subscription providers sign in with OAuth2 + PKCE instead of an API key:
+
+```toml
+[provider.auth]
+mode = "oauth"
+authorize_url = "https://provider.example/oauth/authorize"
+token_url = "https://provider.example/oauth/token"
+client_id = "your-public-client-id"
+```
+
+```bash
+./target/release/formless auth login     # opens the browser, listens on 127.0.0.1 for the callback
+./target/release/formless auth status    # mode and token expiry, never the token itself
+./target/release/formless auth logout
+```
+
+Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed automatically before each provider call.
+
+### 3.9 Profiles and environment variables
+
+`--profile <name>` is a global flag: it gives an isolated daemon, data dir and config dir, which is the safe way to try dangerous Tools.
+
+```bash
+./target/release/formless --profile sandbox
+```
+
+| Variable | Effect |
+|---|---|
+| `FORMLESS_API_KEY` | provider key; wins over the keychain and fallback file |
+| `FORMLESS_OAUTH_ACCESS_TOKEN` | OAuth mode: use this access token instead of stored tokens |
+| `FORMLESS_OAUTH_CLIENT_SECRET` | OAuth mode: client secret for providers that need one (never stored in config) |
+| `FORMLESS_BASE_URL`, `FORMLESS_MODEL` | override the configured endpoint/model for this process |
+| `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR` | relocate state (also how the auto-started daemon inherits them) |
+| `FORMLESS_IDLE_GRACE_SECS` | how long an idle daemon lingers before exiting |
+| `FORMLESS_RELAY_SECRET` | pairing secret override (the `#k=` part of the browser URL) |
+| `RUST_LOG=debug` | verbose tracing on stderr |
+
+### 3.10 Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `not configured; run formless for the wizard` | headless runs need a configured provider first — launch the TUI once |
+| "does not support tool-calling" during onboarding | pick another model or endpoint; tool calling is mandatory |
+| TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
+| Daemon will not start | read `<data dir>/daemon.log`, then `formless doctor` and `formless daemon status` |
+| Keychain prompt on every launch | the `0600` `api_key` file in the config dir exists exactly for this; check it is present |
+| Everything is wedged | `formless reset --force` (destroys config, key and data dir) |
+
+### 3.11 CLI reference
 
 | Command | Behaviour |
 |---|---|
-| `formless` | Launch the TUI, auto-starting the daemon |
+| `formless` (or `formless tui`) | Launch the TUI, auto-starting the daemon |
 | `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one; `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run |
-| `formless daemon start\|stop\|status` | Daemon lifecycle |
+| `formless daemon start\|stop\|status\|serve` | Daemon lifecycle |
+| `formless relay enable\|disable\|status` | Encrypted browser access (v2) |
 | `formless tools list\|export\|import` | Registry inspection and transfer (no secrets, no metrics) |
+| `formless auth login\|status\|logout` | OAuth sign-in for subscription providers (v2) |
+| `formless prompts list\|generate\|apply\|reject\|rollback` | Measured prompt/memory proposals (v2) |
+| `formless update check` | Compare with the latest GitHub release; never modifies the binary |
 | `formless doctor` | Config validity, data dir, keychain reachability, endpoint + tool-calling probe |
 | `formless reset [--force]` | Full wipe of config, keychain entry and data dir |
 
@@ -121,7 +254,20 @@ create_tool(name, description, input_schema, output_schema,
 * The **agent writes the JavaScript**: plain JS, one self-contained file, no TypeScript, no imports.
 * **Validation gate at creation:** name rules, both schemas validated against JSON Schema draft 2020-12, JS syntax-checked, then **smoke-tested** in the replay-style sandbox with empty input. Any failure rejects creation and nothing broken is saved.
 * `create_tool` is immutable, excluded from Self-Optimisation, and cannot be retired or widened.
-* Every Session exposes `create_tool` **plus every active Tool** directly as a callable function. There is no catalog-search step.
+* The smoke test is conclusive only until the Tool first meets a stub (fake fetch body, unbindable `$input` scope, …); a failure after that is reported as *inconclusive* and the Tool is saved.
+
+The other built-ins are the minimum the agent needs to grow and maintain its own registry:
+
+| Built-in | Purpose |
+|---|---|
+| `find_tools(query)` | Keyword search over the registry; matches become callable in this Session |
+| `read_tool(name, version?)` | Full code, schemas, Capabilities, versions, metrics and recent failures |
+| `test_tool(input, name \| draft)` | Dry-run a saved Tool or an unsaved draft on real input; not saved, not measured |
+| `create_module`, `retire_tool` | Shared JS modules, retirement |
+
+Sub-agents are not a built-in: the agent builds a Tool with the `agent` Capability (`function run(i){ return agents.run(i.task); }`), so delegation is a measured, approval-gated Invocation. Several such calls in one turn run in parallel, and nesting is capped by `tools.max_agent_depth` (default 1).
+
+Up to `tools.inline_limit` (default 40) active Tools, every Session lists them all. Beyond that a Session lists the Tools it has loaded plus the most-used ones, and reaches the rest with `find_tools`, so the registry can grow without bound.
 
 ### 5.2 Lifecycle and versioning
 
@@ -139,8 +285,12 @@ create_tool(name, description, input_schema, output_schema,
 | `fs:write` | path list | Same containment rules |
 | `env` | named keys | Only the listed keys are visible |
 | `process` | named commands | Executed without a shell; unscoped is flagged broad |
+| `clipboard:read` / `clipboard:write` | boolean | v2; desktop clipboard access |
+| `notify` | boolean | v2; desktop notification |
+| `llm` | optionally per-model | v2; `llm.complete()` from inside a Tool |
+| `agent` | optionally per-model | v2; `agents.run()` sub-agents from inside a Tool |
 
-`memory_mb` (default 256, daemon max default 4 GB) is declared and governed like a Capability: shown at approval, and widening it re-prompts. A Capability the runtime cannot enforce is never offered — there is no clipboard or notification permission in v1.
+`memory_mb` (default 256, daemon max default 4 GB) is declared and governed like a Capability: shown at approval, and widening it re-prompts. A Capability the runtime cannot enforce is never offered — the taxonomy is closed and grows only with the runtime.
 
 ### 5.4 The host API inside a Tool
 
@@ -148,16 +298,24 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 
 | API | Gated by | Purpose |
 |---|---|---|
-| `fetch(url, opts)` → `{status, ok, body, text(), json()}` | `net` | HTTP with streamed response bodies |
-| `fetchChunks(url, opts, size, cb)` | `net` | Download arbitrarily large bodies in bounded memory |
-| `fs.read(path)` / `fs.write(path, string)` | `fs:read` / `fs:write` | Whole-value access for small data |
-| `fs.exists(path)` / `fs.list(dir)` | `fs:read` | Existence and directory listing |
-| `fs.readChunks(path, size, cb)` / `fs.readLines(path, cb)` | `fs:read` | Streaming reads — never load large data whole |
+| `fetch(url, {method, headers, body, bodyEncoding, encoding})` → `{status, ok, url, headers, body, text(), json()}` | `net` | HTTP; redirects followed, every hop scope-checked |
+| `fetchChunks(url, opts, size, cb)` | `net` | Stream arbitrarily large bodies in bounded memory |
+| `fs.read(path, {encoding})` / `fs.write` / `fs.append` | `fs:read` / `fs:write` | Whole-value access for small data |
+| `fs.exists` / `fs.stat` / `fs.list(dir, {details})` | `fs:read` | Existence, metadata, directory listing |
+| `fs.mkdir` / `fs.remove(path, {recursive})` / `fs.rename(from, to)` | `fs:write` | Tree changes |
+| `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines(path, cb)` | `fs:read` | Streaming reads — never load large data whole |
 | `env.get(key)` | `env` | Read one declared key |
-| `process.run(cmd, argsArray)` → `{code, stdout, stderr}` | `process` | Execute a declared binary, no shell |
+| `process.run(cmd, args, {cwd, env, stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` | `process` | Execute a declared binary, no shell |
 | `tools.call(name, input)` | — | Composition (nested Invocations are recorded and measured) |
+| `clipboard.read()` / `clipboard.write(text)` | `clipboard:read` / `clipboard:write` | v2; OS clipboard |
+| `notify(title, body)` | `notify` | v2; desktop notification |
+| `llm.complete(prompt, {system, model})` | `llm` | v2; one non-streaming completion via the configured provider |
+| `agents.run(task, {system, model})` | `agent` | v2; sub-agent over the same Tools (depth-limited, no step limit), returns its final text |
+| `requireModule(name)` | — | v2; load a shared module created with `create_module` |
 | `emit(chunk)` | — | Stream large output to an artifact file |
-| `console.log`, `sleep`, `setTimeout`, `JSON`, `cryptoRandom()` | — | The rest of the surface — nothing else exists |
+| `console.log`, `sleep`, `setTimeout`, `JSON`, `cryptoRandom()`, `randomBytes(n)` | — | The rest of the surface — nothing else exists |
+
+The surface is deliberately near-minimal: it holds only effects JS cannot produce itself. Every data option takes `encoding: "utf8"` (default) or `"base64"`, so Tools can move any binary data. Anything higher-level (URL parsing, hashing, compression, file formats) the agent writes itself, usually as a shared module. `run` may be `async`. A Tool reports failure by **throwing**, and a returned `{error: …}` is counted as a failure anyway, so swallowed errors never inflate the success rate.
 
 A complete Tool:
 
@@ -176,7 +334,8 @@ function run(input) {
 
 * `tools.call` records and measures nested Invocations exactly like top-level ones.
 * Composition cannot launder permissions: the called Tool runs under **its own** declared Capabilities, and the outer Tool's Capabilities also apply. Depth is bounded and cycle-safe.
-* Out of v1: shared JS modules (every Tool is one file — duplication is accepted so versioning and retirement stay atomic) and LLM calls from inside Tools (only the agent loop talks to the provider).
+* Shared code lives in versioned, immutable modules (`create_module`, loaded with `requireModule`); module loading is smoke-tested when a Tool is created.
+* In smoke tests the v2 side-effecting APIs are stubbed; in optimiser replay they are denied.
 
 ---
 
@@ -232,6 +391,8 @@ The loop:
 
 Only the primary metric triggers; the rest inform the optimiser's context.
 
+**Prompt and memory (v2).** The optimiser can also propose one short guidance or memory addendum to the system prompt. Each proposal is scored against the current prompt on a fixed eval suite and can be applied only if it wins by the same promotion margin, and only by the user (`formless prompts`, TUI `/proposals`). Applied addenda are versioned and roll back individually; the bootstrap prompt itself is never edited.
+
 ---
 
 ## 10. Security and privacy
@@ -279,14 +440,13 @@ Rules of the road: **no behaviour may live only in a client** — the CLI and TU
 
 ---
 
-## 13. Non-goals in v1
+## 13. Non-goals
 
-* Hosted web frontend and the encrypted Relay (v2 direction).
-* Any provider that is not OpenAI-compatible Chat Completions.
-* Shared JS modules or libraries between Tools.
-* LLM calls from inside Tools — only the agent loop talks to the provider.
-* Clipboard or notification capabilities, and any Capability the runtime cannot enforce.
+* Hosted or multi-user mode, accounts, sharing servers.
 * System services, localhost-TCP transport, cloud sync or telemetry.
+* Publishing signed/notarised binaries and submitting the Homebrew/winget packages (the workflow, installer and templates are in [`packaging/`](packaging/README.md); signing needs maintainer certificates).
+
+v2 shipped what v1 left out: the encrypted Relay and Web frontend (§3.7, [`relay/`](relay/README.md)), the Responses API, prompt-based tool calling, failover and measured routing, OAuth providers (§3.8), shared modules, sub-agents, prompt/memory self-optimisation, the Tool editor and the multi-pane TUI.
 
 ---
 
