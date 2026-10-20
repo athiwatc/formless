@@ -213,6 +213,9 @@ fn write_cfg(paths: &Paths, base: &str, pending_secs: u64, server_compact: bool,
     cfg.daemon.idle_grace_secs = 3600;
     cfg.tools.pending_threshold_secs = pending_secs;
     cfg.compaction.server_side = server_compact;
+    // These tests assert exact event streams; keep the namer (and its
+    // model download) out of them.
+    cfg.naming.enabled = false;
     cfg.save(paths).unwrap();
 }
 
@@ -574,4 +577,98 @@ async fn server_side_compaction_uses_compact_endpoint() {
         .unwrap()
         .expect("checkpoint saved");
     assert_eq!(summary, "SERVER SUMMARY");
+}
+
+/// Wait for the SessionUpdated event the namer broadcasts after a Run.
+#[cfg(unix)]
+async fn next_session_update(client: &mut Client) -> formless_protocol::SessionInfo {
+    use formless_protocol::{Event, ServerMessage};
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let line = tokio::time::timeout_at(deadline, client.lines.next_line())
+            .await
+            .expect("no SessionUpdated within 30s")
+            .unwrap()
+            .expect("daemon closed");
+        if let Ok(ServerMessage::Event(Event::SessionUpdated { session })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            return session;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn untitled_session_is_auto_named_after_first_run_but_user_names_stick() {
+    use axum::{
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode, SessionInfo};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4naming");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(_b): Json<Value>| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    sse_text("done"),
+                )
+                    .into_response()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &format!("http://{addr}"), 300, false, 100_000);
+    // Heuristic namer only: no model id, so nothing is downloaded or loaded.
+    let mut cfg = formless_core::Config::load(&paths).unwrap();
+    cfg.naming.enabled = true;
+    cfg.naming.model = String::new();
+    cfg.save(&paths).unwrap();
+    let server = start_daemon(&paths).await;
+    let mut client = Client::connect(&paths).await;
+
+    let s: SessionInfo =
+        serde_json::from_value(client.rpc(Request::CreateSession { name: None }).await).unwrap();
+    assert_eq!(s.name, "Untitled");
+    client
+        .send(Request::SendMessage {
+            session_id: s.id.clone(),
+            content: "Convert my CSV exports into JSON files please\nthanks".into(),
+            mode: SendMode::Send,
+        })
+        .await;
+    client.run_to_finish().await;
+    let named = next_session_update(&mut client).await;
+    assert_eq!(named.id, s.id);
+    assert_eq!(named.name, "Convert my CSV exports into JSON…");
+
+    // A name the user chose is never replaced by the namer.
+    let mine: SessionInfo = serde_json::from_value(
+        client
+            .rpc(Request::CreateSession {
+                name: Some("Mine".into()),
+            })
+            .await,
+    )
+    .unwrap();
+    client
+        .send(Request::SendMessage {
+            session_id: mine.id.clone(),
+            content: "hello there".into(),
+            mode: SendMode::Send,
+        })
+        .await;
+    client.run_to_finish().await;
+    server.abort();
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(store.get_session(&mine.id).unwrap().unwrap().name, "Mine");
 }

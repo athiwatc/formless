@@ -10,8 +10,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, ProviderCfg};
+use crate::namer::{self, ModelSpec};
 use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
-use crate::storage::{build_context, Store};
+use crate::storage::{build_context, Store, DEFAULT_SESSION_NAME};
 use crate::tools as toolreg;
 use crate::Paths;
 
@@ -63,6 +64,12 @@ pub struct Daemon {
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
     subs: Subs,
+    /// One naming inference at a time: bounds CPU and keeps at most one
+    /// copy of the model in memory.
+    naming: Arc<tokio::sync::Semaphore>,
+    /// Set while (or after a failed) naming-model download, so it is
+    /// attempted once per daemon lifetime.
+    model_download: Arc<AtomicBool>,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -79,6 +86,8 @@ impl Daemon {
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
+            naming: Arc::new(tokio::sync::Semaphore::new(1)),
+            model_download: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
         })
     }
@@ -563,6 +572,7 @@ impl Daemon {
             run_id: run_id.clone(),
             status: final_status.to_string(),
         });
+        self.maybe_name_session(&session_id);
         // Queued messages start fresh Runs, in order (SPEC §5.3).
         let next = {
             let mut q = self.queued.lock().await;
@@ -584,6 +594,100 @@ impl Daemon {
                 let _ = self.start_run(session_id);
             }
         }
+    }
+
+    /// Title an "Untitled" Session from its first user message once a Run
+    /// ends. Fire-and-forget: inference is CPU-bound, so it runs on the
+    /// blocking pool behind the one-permit `naming` semaphore and a
+    /// timeout, and nothing awaits it, so Runs and requests never wait on
+    /// the model. The result lands as a SessionUpdated event.
+    fn maybe_name_session(self: &Arc<Self>, session_id: &str) {
+        let Ok(cfg) = Config::load(&self.paths) else {
+            return;
+        };
+        if !cfg.naming.enabled {
+            return;
+        }
+        let first_user = self.with_store(|st| {
+            if !st
+                .get_session(session_id)?
+                .is_some_and(|s| s.name == DEFAULT_SESSION_NAME)
+            {
+                return Ok(None);
+            }
+            Ok(st
+                .list_messages(session_id)?
+                .into_iter()
+                .find(|m| m.role == "user" && !m.content.trim().is_empty())
+                .map(|m| m.content))
+        });
+        let Ok(Some(user)) = first_user else {
+            return;
+        };
+        let spec = cfg.naming.spec();
+        if let Some(spec) = spec {
+            if cfg.naming.auto_download
+                && namer::embedded_available()
+                && !spec.installed(&self.paths)
+            {
+                self.spawn_model_download(spec);
+            }
+        }
+        let timeout = std::time::Duration::from_secs(cfg.naming.timeout_secs.max(1));
+        let this = self.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let Ok(permit) = this.naming.clone().acquire_owned().await else {
+                return;
+            };
+            let fallback = namer::heuristic_title(&user);
+            let paths = this.paths.clone();
+            // The permit moves into the blocking job: a timed-out job keeps
+            // it until it really finishes, so jobs never pile up.
+            let job = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                namer::title(&paths, spec.as_ref(), &user)
+            });
+            let name = match tokio::time::timeout(timeout, job).await {
+                Ok(Ok(name)) => name,
+                Ok(Err(e)) => {
+                    tracing::warn!("session naming panicked: {e}");
+                    fallback
+                }
+                Err(_) => {
+                    tracing::warn!("session naming timed out after {timeout:?}");
+                    fallback
+                }
+            };
+            let Some(name) = name else {
+                return;
+            };
+            if let Ok(Some(s)) = this.with_store(|st| st.auto_name_session(&session_id, &name)) {
+                this.broadcast(Event::SessionUpdated { session: s });
+            }
+        });
+    }
+
+    fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {
+        if self.model_download.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                "downloading session-naming model {} ({} MB)",
+                spec.id,
+                spec.gguf_bytes / 1_000_000
+            );
+            match namer::download(&this.paths, &spec).await {
+                Ok(()) => {
+                    tracing::info!("session-naming model {} installed", spec.id);
+                    this.model_download.store(false, Ordering::SeqCst);
+                }
+                // Stays set: no retry storm on every new Session.
+                Err(e) => tracing::warn!("session-naming model download failed: {e:#}"),
+            }
+        });
     }
 
     async fn run_step(

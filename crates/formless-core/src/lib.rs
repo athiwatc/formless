@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod daemon;
+pub mod namer;
 pub mod optimiser;
 pub mod paths;
 pub mod provider;

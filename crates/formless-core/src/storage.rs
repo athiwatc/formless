@@ -62,6 +62,9 @@ fn make_snippet(content: &str, needle_lower: &str) -> String {
     )
 }
 
+/// Name of a Session nobody has named yet; auto-naming replaces it.
+pub const DEFAULT_SESSION_NAME: &str = "Untitled";
+
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, name TEXT NOT NULL,
@@ -271,7 +274,7 @@ impl Store {
         let t = now();
         let name = name
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "Untitled".into());
+            .unwrap_or_else(|| DEFAULT_SESSION_NAME.into());
         self.conn.execute(
             "INSERT INTO sessions(id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",
             params![id, name, t],
@@ -303,6 +306,21 @@ impl Store {
             "UPDATE sessions SET name=?2, updated_at=?3 WHERE id=?1",
             params![id, name, now()],
         )?;
+        self.get_session(id)
+    }
+
+    /// Auto-naming: rename only while the Session still has the default
+    /// name, so a user rename that raced the namer always wins. Leaves
+    /// `updated_at` alone (naming is not activity). Returns the Session
+    /// when the rename applied.
+    pub fn auto_name_session(&self, id: &str, name: &str) -> Result<Option<SessionInfo>> {
+        let n = self.conn.execute(
+            "UPDATE sessions SET name=?2 WHERE id=?1 AND name=?3",
+            params![id, name, DEFAULT_SESSION_NAME],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
         self.get_session(id)
     }
 

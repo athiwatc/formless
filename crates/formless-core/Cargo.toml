@@ -4,7 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["embedded-llm"]
+# In-process session-naming model (candle, CPU). Without it, sessions are
+# named heuristically from the first message.
+embedded-llm = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
+
 [dependencies]
+candle-core = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
 aes-gcm.workspace = true
 anyhow.workspace = true
 base64.workspace = true

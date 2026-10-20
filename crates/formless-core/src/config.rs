@@ -16,6 +16,7 @@ pub struct Config {
     pub tools: ToolsCfg,
     pub compaction: CompactionCfg,
     pub tui: TuiCfg,
+    pub naming: NamingCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +318,38 @@ impl Default for TuiCfg {
     }
 }
 
+/// Automatic Session naming by a small embedded model (see `namer`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamingCfg {
+    /// Rename "Untitled" Sessions after their first Run.
+    pub enabled: bool,
+    /// Embedded model id ("qwen2.5-0.5b" or "lfm2.5-350m"); empty uses
+    /// the heuristic title only.
+    pub model: String,
+    /// Fetch the model into the data dir on first use (once, in the
+    /// background). Off: install with `formless naming pull`.
+    pub auto_download: bool,
+    /// Give up on a single inference after this long and use the
+    /// heuristic title instead.
+    pub timeout_secs: u64,
+}
+impl Default for NamingCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: crate::namer::QWEN2_5_0_5B.id.into(),
+            auto_download: true,
+            timeout_secs: 30,
+        }
+    }
+}
+impl NamingCfg {
+    pub fn spec(&self) -> Option<crate::namer::ModelSpec> {
+        crate::namer::spec(&self.model)
+    }
+}
+
 impl Config {
     /// Read-only settings for remote clients (the Web frontend's Settings
     /// view). Mirrors what the TUI shows; deliberately omits
@@ -338,6 +371,11 @@ impl Config {
                 "queue_key": self.tui.queue_key,
             },
             "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
+            "naming": {
+                "enabled": self.naming.enabled,
+                "model": self.naming.model,
+                "installed": self.naming.spec().is_some_and(|m| m.installed(paths)),
+            },
             "paths": {
                 "config": paths.config_file().display().to_string(),
                 "data": paths.data_dir.display().to_string(),

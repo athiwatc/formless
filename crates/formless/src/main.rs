@@ -57,6 +57,11 @@ enum Cmd {
         #[command(subcommand)]
         action: ToolsAction,
     },
+    /// Embedded session-naming model: status, install, try it out
+    Naming {
+        #[command(subcommand)]
+        action: NamingAction,
+    },
     /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
     Reset {
         #[arg(long)]
@@ -149,6 +154,19 @@ enum ToolsAction {
 }
 
 #[derive(Subcommand)]
+enum NamingAction {
+    /// Show the configured model and whether it is installed
+    Status,
+    /// Download the model (default: the configured one)
+    Pull {
+        /// Model id: qwen2.5-0.5b or lfm2.5-350m
+        model: Option<String>,
+    },
+    /// Print the title the namer would give a first message
+    Test { text: String },
+}
+
+#[derive(Subcommand)]
 enum DaemonAction {
     /// Run the daemon (used by client auto-start; blocks)
     Serve,
@@ -174,6 +192,7 @@ fn main() -> Result<()> {
         Some(Cmd::Prompts { action }) => prompts_cmd(paths, action),
         Some(Cmd::Update { .. }) => update_check(),
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
+        Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
         Some(Cmd::Run {
             task,
@@ -628,6 +647,7 @@ fn doctor(paths: Paths) -> Result<()> {
     if let Err(error) = &credential {
         println!("auth error: {error:#}");
     }
+    println!("naming:     {}", naming_model_status(&paths, &cfg));
     println!(
         "daemon:     {}",
         if daemon_reachable(&paths) {
@@ -785,6 +805,61 @@ fn run_headless(
         }
     }
     Ok(code)
+}
+
+fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
+    use formless_core::namer;
+    let cfg = Config::load(&paths)?;
+    match action {
+        NamingAction::Status => {
+            println!("enabled:    {}", cfg.naming.enabled);
+            println!("model:      {}", naming_model_status(&paths, &cfg));
+            println!("models dir: {}", namer::models_dir(&paths).display());
+            println!(
+                "available:  {}",
+                namer::MODELS
+                    .iter()
+                    .map(|m| format!("{} ({} MB)", m.id, m.gguf_bytes / 1_000_000))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        NamingAction::Pull { model } => {
+            let id = model.unwrap_or_else(|| cfg.naming.model.clone());
+            let spec = namer::spec(&id).with_context(|| format!("unknown naming model '{id}'"))?;
+            if spec.installed(&paths) {
+                println!("{} already installed", spec.id);
+                return Ok(());
+            }
+            println!("downloading {} ({} MB)…", spec.id, spec.gguf_bytes / 1_000_000);
+            tokio::runtime::Runtime::new()?.block_on(namer::download(&paths, &spec))?;
+            println!("installed {}", spec.gguf_path(&paths).display());
+            if !id.eq_ignore_ascii_case(&cfg.naming.model) {
+                println!("set `[naming] model = \"{}\"` in config.toml to use it", spec.id);
+            }
+        }
+        NamingAction::Test { text } => {
+            let spec = cfg.naming.spec();
+            let started = std::time::Instant::now();
+            let title = namer::title(&paths, spec.as_ref(), &text);
+            println!(
+                "{}  ({:.2?}, {})",
+                title.as_deref().unwrap_or("(none)"),
+                started.elapsed(),
+                naming_model_status(&paths, &cfg)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn naming_model_status(paths: &Paths, cfg: &Config) -> String {
+    match cfg.naming.spec() {
+        _ if !formless_core::namer::embedded_available() => "heuristic (built without embedded-llm)".into(),
+        Some(spec) if spec.installed(paths) => format!("{} (installed)", spec.id),
+        Some(spec) => format!("{} (not installed: `formless naming pull`)", spec.id),
+        None => format!("heuristic (unknown model '{}')", cfg.naming.model),
+    }
 }
 
 fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
