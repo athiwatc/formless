@@ -147,8 +147,9 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 - Many Sessions run concurrently against one daemon, including two clients
   attached to the *same* Session (§10.4). Sessions never see each other's
   transcripts; Tools and metrics are shared (§7, §8).
-- Out of v1: Session fork, cross-Session search, edit-and-retry of past
-  messages (§17).
+- v2: Sessions can be forked (full copy, or a prefix up to a message),
+  searched across all Sessions, and a past user message can be edited —
+  everything after it is dropped and the Run retries from there.
 
 ### 5.2 Run lifecycle
 
@@ -271,12 +272,14 @@ pattern (§4.4).
 | `fs:write` | path list | Same containment rules |
 | `env` | named keys | Only listed keys visible |
 | `process` | named commands | Executed without a shell; unscoped flagged “broad” |
+| `clipboard:read` / `clipboard:write` (`clipboard` = both) | — | v2; OS clipboard |
+| `notify` | — | v2; desktop notifications |
+| `llm` | optionally per-model | v2; LLM completions from inside Tools (§7.5) |
 
 - `memory_mb` (default 256) is declared and governed like a Capability:
   shown at approval, widening re-prompts, bounded by a daemon max
   (default 4 GB).
-- No clipboard/notification capabilities in v1. A Capability the runtime
-  cannot enforce is never offered.
+- A Capability the runtime cannot enforce is never offered.
 
 ### 7.5 QuickJS runtime and host API
 
@@ -289,6 +292,11 @@ pattern (§4.4).
   - `env.get(key)` — gated by `env`. `process.run(cmd, args)` — gated by
     `process`, no shell.
   - `tools.call(name, input)` — composition (§7.6).
+  - v2: `clipboard.read/write` (gated by `clipboard:*`), `notify(title,
+    body)` (gated by `notify`), and `llm.complete(prompt, {system,
+    model})` (gated by `llm`; one non-streaming completion via the
+    daemon's configured provider). In smoke tests these are stubbed;
+    in optimiser replay they are denied.
   - `console`, timers, `JSON`, crypto-random. Nothing else.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
   Exceeding it faults **only that Invocation**, tagged `resource`. The cap is
@@ -504,7 +512,8 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   optimiser history, `needs attention` flags. Actions: rollback, restore
   (retired), purge (confirmed, user-only), export/import, audit log view.
   Tool JS is shown **read-only**; there is no in-TUI code editor in v1.
-  There is no standalone metrics dashboard in v1 — metrics live here.
+  A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
+  invocations and success rate, with the selected Tool's detail.
 - **Settings view:** edits file-backed config (§13) and per-Session
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
@@ -539,6 +548,19 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   (waiting for model, thinking, responding, running a named Tool,
   awaiting approval), and elapsed time in that step — so silent waits
   never look like a hang.
+- **Visible tool calls:** every Tool call (including `create_tool`) is
+  shown inline in the chat as it happens — Tool name/version, input,
+  running status with elapsed time, then its result or error — and stays
+  in the transcript after the Run (persisted assistant/tool messages).
+- **Scrolling:** the chat scrolls with the mouse wheel, PageUp/PageDown,
+  and arrow keys; live output auto-follows only at the bottom, and
+  End/PageDown back to the bottom resumes following.
+- **Remembered startup:** relaunching restores the saved base URL, model,
+  reasoning effort, and API key, so the wizard is skipped. If the key
+  cannot be loaded, the wizard resumes pre-filled from the saved config.
+  The key is kept in the OS keychain and a `0600` file so it survives
+  rebuilds of an unsigned dev binary (whose keychain ACL would otherwise
+  orphan the entry).
 
 ## 11. Compaction
 
@@ -693,17 +715,10 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   tool-calling fallback for non-tool-calling models.
 - Prompt/memory self-optimisation (system prompt frozen in v1 §7.7);
   routing/model auto-selection.
-- Shared JS modules; LLM calls from inside Tools; in-TUI Tool code editor;
-  standalone metrics dashboard; persistent multi-pane TUI.
-- Session fork, cross-Session search, edit-and-retry.
+- Shared JS modules; in-TUI Tool code editor; persistent multi-pane TUI.
 - Distribution polish: signed release binaries, Homebrew/winget packages,
   any update mechanism (v1 installs via `cargo install` / source build).
-- Additional Capabilities (clipboard, notifications, sub-agents).
-- Remember startup options: relaunching restores the previous setup
-  (base URL, model, reasoning effort) and the saved API key, so the
-  wizard is skipped — or shown pre-filled with a "keep saved key" choice —
-  instead of asking the user to re-enter the key on every start. The key
-  is only requested again when it is changed, missing, or after a reset.
+- Additional Capabilities (sub-agents).
 
 ## 18. Roadmap and acceptance criteria
 

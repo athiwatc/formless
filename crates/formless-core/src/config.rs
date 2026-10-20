@@ -9,6 +9,7 @@ use crate::Paths;
 #[serde(default)]
 pub struct Config {
     pub daemon: DaemonCfg,
+    pub relay: RelayCfg,
     pub provider: ProviderCfg,
     pub optimiser: OptimiserCfg,
     pub metrics: MetricsCfg,
@@ -33,6 +34,37 @@ impl Default for DaemonCfg {
             log_max_bytes: 10_000_000,
             log_keep: 5,
         }
+    }
+}
+
+/// Hosted relay (SPEC §17 v2): the daemon dials out to `url`; browsers
+/// meet it there. The pairing secret itself is never in config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelayCfg {
+    pub enabled: bool,
+    pub url: String,
+}
+impl Default for RelayCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: "wss://formless.athiwat.xyz".into(),
+        }
+    }
+}
+impl RelayCfg {
+    /// Browser-facing base URL derived from the websocket URL.
+    pub fn web_url(&self) -> String {
+        if let Some(rest) = self.url.strip_prefix("wss://") {
+            format!("https://{rest}")
+        } else if let Some(rest) = self.url.strip_prefix("ws://") {
+            format!("http://{rest}")
+        } else {
+            self.url.clone()
+        }
+        .trim_end_matches('/')
+        .to_string()
     }
 }
 
@@ -211,18 +243,30 @@ fn keyring_user(paths: &Paths) -> String {
 }
 
 pub fn save_api_key(paths: &Paths, key: &str) -> Result<()> {
-    match keyring::Entry::new(KEYRING_SERVICE, &keyring_user(paths)) {
-        Ok(entry) if entry.set_password(key).is_ok() => Ok(()),
-        _ => {
-            let file = paths.key_fallback_file();
-            std::fs::write(&file, key)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
-            }
-            Ok(())
+    // Always write the 0600 fallback file as well as the OS keychain:
+    // keychain entries created by an unsigned dev binary can become
+    // unreadable after a rebuild (ACL is tied to the binary identity),
+    // which would otherwise force re-entering the key on every start.
+    let file = paths.key_fallback_file();
+    let file_result = (|| -> Result<()> {
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        std::fs::write(&file, key)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &keyring_user(paths))
+        .map(|entry| entry.set_password(key).is_ok())
+        .unwrap_or(false);
+    if file_result.is_ok() || keyring_ok {
+        Ok(())
+    } else {
+        file_result
     }
 }
 
@@ -232,6 +276,13 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
             return Some(v);
         }
     }
+    if let Some(k) = std::fs::read_to_string(paths.key_fallback_file())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(k);
+    }
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &keyring_user(paths)) {
         if let Ok(k) = entry.get_password() {
             if !k.is_empty() {
@@ -239,22 +290,99 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
             }
         }
     }
-    std::fs::read_to_string(paths.key_fallback_file())
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    None
 }
 
 /// Full reset (SPEC §15): keychain entry, config, and the entire data dir.
 /// Caller must stop the daemon first.
 pub fn reset_all(paths: &Paths) -> Result<()> {
     delete_api_key(paths);
+    delete_relay_secret(paths);
     for dir in [&paths.data_dir, &paths.config_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
         }
     }
     Ok(())
+}
+
+// --- Relay pairing secret: 32 random bytes, base64url. It *is* the
+// AES-256-GCM key (decoded) and grants full remote control, so it is
+// stored like the API key (keychain + 0600 file), never in config.toml. ---
+
+fn relay_keyring_user(paths: &Paths) -> String {
+    format!("relay-secret-{}", paths.profile)
+}
+
+pub fn generate_relay_secret() -> String {
+    use base64::Engine;
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn save_relay_secret(paths: &Paths, secret: &str) -> Result<()> {
+    let file = paths.relay_secret_file();
+    let file_result = (|| -> Result<()> {
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&file, secret)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &relay_keyring_user(paths))
+        .map(|entry| entry.set_password(secret).is_ok())
+        .unwrap_or(false);
+    if file_result.is_ok() || keyring_ok {
+        Ok(())
+    } else {
+        file_result
+    }
+}
+
+pub fn load_relay_secret(paths: &Paths) -> Option<String> {
+    if let Ok(v) = std::env::var("FORMLESS_RELAY_SECRET") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if let Some(k) = std::fs::read_to_string(paths.relay_secret_file())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(k);
+    }
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &relay_keyring_user(paths)) {
+        if let Ok(k) = entry.get_password() {
+            if !k.is_empty() {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Load the pairing secret, generating and saving one on first use.
+pub fn ensure_relay_secret(paths: &Paths) -> Result<String> {
+    if let Some(s) = load_relay_secret(paths) {
+        return Ok(s);
+    }
+    let s = generate_relay_secret();
+    save_relay_secret(paths, &s)?;
+    Ok(s)
+}
+
+pub fn delete_relay_secret(paths: &Paths) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &relay_keyring_user(paths)) {
+        let _ = entry.delete_credential();
+    }
+    let _ = std::fs::remove_file(paths.relay_secret_file());
 }
 
 pub fn delete_api_key(paths: &Paths) {

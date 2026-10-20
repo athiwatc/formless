@@ -16,6 +16,17 @@ pub struct SessionInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub session_name: String,
+    pub message_id: String,
+    pub seq: i64,
+    pub role: String,
+    pub snippet: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessageInfo {
     pub id: String,
     pub session_id: String,
@@ -122,6 +133,23 @@ pub enum Request {
     },
     GetSession {
         id: String,
+    },
+    ForkSession {
+        id: String,
+        name: Option<String>,
+        #[serde(default)]
+        up_to_seq: Option<i64>,
+    },
+    SearchSessions {
+        query: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Edit a past user message, drop everything after it, and re-run.
+    EditMessage {
+        session_id: String,
+        message_id: String,
+        content: String,
     },
     SetSessionModel {
         id: String,
@@ -251,17 +279,26 @@ pub enum Event {
     SessionDeleted {
         id: String,
     },
+    /// Transcript was edited/truncated; clients should reload the session.
+    MessagesEdited {
+        session_id: String,
+    },
     ToolCallStarted {
         session_id: String,
         run_id: String,
         tool_name: String,
         version: i64,
+        /// Raw JSON arguments (display only; empty for older daemons).
+        #[serde(default)]
+        arguments: String,
     },
     ToolCallFinished {
         session_id: String,
         run_id: String,
         tool_name: String,
         ok: bool,
+        #[serde(default)]
+        elapsed_ms: i64,
     },
     ApprovalRequested {
         approval_id: String,

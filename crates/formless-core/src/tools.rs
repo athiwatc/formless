@@ -130,7 +130,7 @@ pub fn create_tool_definition() -> Value {
                     "input_schema": {"type": "object", "description": "JSON Schema (draft 2020-12) for run(input)"},
                     "output_schema": {"type": "object", "description": "JSON Schema for the return value"},
                     "implementation_js": {"type": "string", "description": "Plain JS defining global function run(input)"},
-                    "capabilities": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"net\", \"fs:read:/abs\", \"fs:write:/abs\", \"env:KEY\", \"process:cmd\"]"},
+                    "capabilities": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"net\", \"fs:read:/abs\", \"fs:write:/abs\", \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"notify\", \"llm\"]"},
                     "memory_mb": {"type": "integer", "description": "Optional JS heap cap (default 256)"}
                 },
                 "required": ["name", "description", "input_schema", "output_schema", "implementation_js", "capabilities"]

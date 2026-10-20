@@ -12,6 +12,11 @@ pub struct Capabilities {
     pub env: Vec<String>,
     /// None = no process. Some(empty) = unscoped. Some(list) = those commands.
     pub process: Option<Vec<String>>,
+    pub clipboard_read: bool,
+    pub clipboard_write: bool,
+    pub notify: bool,
+    /// None = no LLM calls. Some(empty) = any configured model. Some(list) = those models.
+    pub llm: Option<Vec<String>>,
 }
 
 impl Capabilities {
@@ -42,6 +47,22 @@ impl Capabilities {
                 c.process = Some(Vec::new());
             } else if let Some(cmd) = s.strip_prefix("process:") {
                 c.process.get_or_insert_with(Vec::new).push(cmd.to_string());
+            } else if s == "clipboard" {
+                c.clipboard_read = true;
+                c.clipboard_write = true;
+            } else if s == "clipboard:read" {
+                c.clipboard_read = true;
+            } else if s == "clipboard:write" {
+                c.clipboard_write = true;
+            } else if s == "notify" {
+                c.notify = true;
+            } else if s == "llm" {
+                c.llm = Some(Vec::new());
+            } else if let Some(m) = s.strip_prefix("llm:") {
+                if m.is_empty() {
+                    return Err("llm needs a model name".into());
+                }
+                c.llm.get_or_insert_with(Vec::new).push(m.to_string());
             } else {
                 return Err(format!("unknown capability: {s}"));
             }
@@ -64,6 +85,24 @@ impl Capabilities {
             Some(v) => out.extend(v.iter().map(|c| format!("process:{c}"))),
             None => {}
         }
+        if self.clipboard_read && self.clipboard_write {
+            out.push("clipboard".into());
+        } else {
+            if self.clipboard_read {
+                out.push("clipboard:read".into());
+            }
+            if self.clipboard_write {
+                out.push("clipboard:write".into());
+            }
+        }
+        if self.notify {
+            out.push("notify".into());
+        }
+        match &self.llm {
+            Some(v) if v.is_empty() => out.push("llm".into()),
+            Some(v) => out.extend(v.iter().map(|m| format!("llm:{m}"))),
+            None => {}
+        }
         out
     }
 
@@ -73,6 +112,10 @@ impl Capabilities {
             || self.process.is_some()
             || !self.fs_write.is_empty()
             || !self.env.is_empty()
+            || self.clipboard_read
+            || self.clipboard_write
+            || self.notify
+            || self.llm.is_some()
     }
 
     /// Does `self` (approved) fully cover `other` (requested)?
@@ -83,6 +126,10 @@ impl Capabilities {
             && path_covers(&self.fs_write, &other.fs_write)
             && other.env.iter().all(|k| self.env.contains(k))
             && scoped_covers(&self.process, &other.process, |a, b| a == b)
+            && (!other.clipboard_read || self.clipboard_read)
+            && (!other.clipboard_write || self.clipboard_write)
+            && (!other.notify || self.notify)
+            && scoped_covers(&self.llm, &other.llm, |a, b| a == b)
     }
 }
 

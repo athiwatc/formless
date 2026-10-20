@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use formless_protocol::{MessageInfo, SessionInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo};
+use formless_protocol::{
+    MessageInfo, SearchHit, SessionInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
+};
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -37,6 +39,26 @@ pub struct AttemptRecord {
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn make_snippet(content: &str, needle_lower: &str) -> String {
+    let flat: String = content
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    let chars: Vec<char> = flat.chars().collect();
+    let lower: String = flat.to_lowercase();
+    let byte_at = lower.find(needle_lower).unwrap_or(0);
+    let char_at = lower[..byte_at].chars().count();
+    let start = char_at.saturating_sub(40);
+    let end = (char_at + needle_lower.chars().count() + 60).min(chars.len());
+    let core: String = chars[start..end].iter().collect();
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        core,
+        if end < chars.len() { "…" } else { "" }
+    )
 }
 
 const SCHEMA_V1: &str = "
@@ -314,6 +336,121 @@ impl Store {
             self.save_checkpoint(&s.id, summary, *up_to)?;
         }
         self.get_session(&s.id).map(|o| o.unwrap_or(s))
+    }
+
+    /// Fork a session: copy its messages (optionally only up to `up_to_seq`)
+    /// and checkpoints into a new independent session.
+    pub fn fork_session(
+        &self,
+        id: &str,
+        name: Option<String>,
+        up_to_seq: Option<i64>,
+    ) -> Result<Option<SessionInfo>> {
+        let Some(orig) = self.get_session(id)? else {
+            return Ok(None);
+        };
+        let limit = up_to_seq.unwrap_or(i64::MAX);
+        let messages: Vec<(String, String, Option<String>)> = self
+            .list_messages(id)?
+            .into_iter()
+            .filter(|m| m.seq <= limit)
+            .map(|m| (m.role, m.content, m.meta))
+            .collect();
+        let checkpoints: Vec<(String, i64)> = self
+            .list_checkpoints(id)?
+            .into_iter()
+            .filter(|(_, up_to)| *up_to <= limit)
+            .collect();
+        let name = name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{} (fork)", orig.name));
+        Ok(Some(self.import_session(
+            &name,
+            orig.model,
+            orig.reasoning_effort,
+            &messages,
+            &checkpoints,
+        )?))
+    }
+
+    /// Case-insensitive substring search across all sessions' messages.
+    pub fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 200) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+             FROM messages m JOIN sessions s ON s.id = m.session_id \
+             WHERE instr(lower(m.content), lower(?1)) > 0 \
+             ORDER BY m.created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        let needle = query.to_lowercase();
+        let mut hits = Vec::new();
+        for row in rows {
+            let (session_id, session_name, message_id, seq, role, content, created_at) = row?;
+            hits.push(SearchHit {
+                session_id,
+                session_name,
+                message_id,
+                seq,
+                role,
+                snippet: make_snippet(&content, &needle),
+                created_at,
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Edit a user message in place and delete everything after it
+    /// (later messages and checkpoints that covered them), for edit-and-retry.
+    /// Returns the edited message, or `None` if not found / not a user message.
+    pub fn edit_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<Option<MessageInfo>> {
+        let found = self
+            .list_messages(session_id)?
+            .into_iter()
+            .find(|m| m.id == message_id);
+        let Some(mut msg) = found else {
+            return Ok(None);
+        };
+        if msg.role != "user" {
+            return Ok(None);
+        }
+        self.conn.execute(
+            "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
+            params![session_id, message_id, content],
+        )?;
+        self.conn.execute(
+            "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
+            params![session_id, msg.seq],
+        )?;
+        self.conn.execute(
+            "DELETE FROM checkpoints WHERE session_id=?1 AND up_to_seq>=?2",
+            params![session_id, msg.seq],
+        )?;
+        self.conn.execute(
+            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+            params![session_id, now()],
+        )?;
+        msg.content = content.to_string();
+        Ok(Some(msg))
     }
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {

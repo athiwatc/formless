@@ -62,6 +62,9 @@ impl Paths {
     pub fn key_fallback_file(&self) -> PathBuf {
         self.config_dir.join("api_key")
     }
+    pub fn relay_secret_file(&self) -> PathBuf {
+        self.config_dir.join("relay_secret")
+    }
     pub fn lock_file(&self) -> PathBuf {
         self.data_dir.join("daemon.lock")
     }

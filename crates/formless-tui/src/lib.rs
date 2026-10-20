@@ -67,6 +67,8 @@ enum View {
     Sessions,
     Settings,
     Tools,
+    Metrics,
+    Search,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,6 +76,8 @@ enum Pending {
     ListSessions,
     GetSession,
     CreateSession,
+    ForkSession,
+    SearchSessions,
     ListTools,
     GetTool,
     ExportTool,
@@ -100,7 +104,7 @@ enum WizardJob {
     Probe(Result<ProbeResult, String>),
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum WizardStep {
     BaseUrl,
     ApiKey,
@@ -120,6 +124,8 @@ struct Wizard {
     manual_model: bool,
     effort_idx: usize,
     status: String,
+    /// Previously saved model, pre-selected when the list arrives (§17).
+    saved_model: String,
     jobs: mpsc::Receiver<WizardJob>,
     job_tx: mpsc::Sender<WizardJob>,
 }
@@ -129,15 +135,36 @@ const EFFORTS: [Option<&str>; 4] = [None, Some("low"), Some("medium"), Some("hig
 impl Wizard {
     fn new(cfg: &Config) -> Self {
         let (job_tx, jobs) = mpsc::channel();
+        // Remember previous startup options: a saved config starts at the
+        // API-key step (Esc returns to the URL), with model/effort restored.
+        let has_saved = !cfg.provider.base_url.trim().is_empty();
+        let (step, status) = if has_saved {
+            (
+                WizardStep::ApiKey,
+                "Saved setup found. Re-enter your API key to restore it (Esc to edit the base URL).".into(),
+            )
+        } else {
+            (
+                WizardStep::BaseUrl,
+                "Welcome to Formless. Enter your provider base URL.".into(),
+            )
+        };
+        let effort_idx = cfg
+            .provider
+            .reasoning_effort
+            .as_deref()
+            .and_then(|e| EFFORTS.iter().position(|x| *x == Some(e)))
+            .unwrap_or(0);
         Self {
-            step: WizardStep::BaseUrl,
+            step,
             base_url: cfg.provider.base_url.clone(),
             api_key: String::new(),
             models: Vec::new(),
             model_idx: 0,
             manual_model: false,
-            effort_idx: 0,
-            status: "Welcome to Formless. Enter your provider base URL.".into(),
+            effort_idx,
+            status,
+            saved_model: cfg.provider.model.clone(),
             jobs,
             job_tx,
         }
@@ -150,6 +177,43 @@ impl Wizard {
 struct Activity {
     label: String,
     since: Instant,
+}
+
+#[derive(Clone)]
+struct LiveToolCall {
+    name: String,
+    version: i64,
+    arguments: String,
+    status: String,
+    started: Instant,
+    elapsed_ms: Option<i64>,
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    }
+}
+
+/// Render persisted assistant tool-call metadata as display lines.
+fn tool_call_lines(meta: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) else {
+        return Vec::new();
+    };
+    let Some(calls) = v["tool_calls"].as_array() else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .map(|c| {
+            let name = c["function"]["name"].as_str().unwrap_or("tool");
+            let args = c["function"]["arguments"].as_str().unwrap_or_default();
+            format!("⚙ {name}({})", truncate_chars(args, 220))
+        })
+        .collect()
 }
 
 struct App {
@@ -169,6 +233,11 @@ struct App {
     color: bool,
     tick: u64,
     activity: Option<Activity>,
+    live_tools: Vec<LiveToolCall>,
+    /// Absolute chat scroll top; `None` means follow the live bottom.
+    chat_scroll_top: Option<usize>,
+    chat_view_height: usize,
+    chat_line_count: usize,
     input: String,
     running: bool,
     notes: Vec<String>,
@@ -181,6 +250,10 @@ struct App {
     purge_arm: Option<String>,
     import_mode: Option<ImportKind>,
     renaming: bool,
+    search_hits: Vec<SearchHit>,
+    search_idx: usize,
+    search_mode: bool,
+    editing_id: Option<String>,
     should_quit: bool,
 }
 
@@ -208,6 +281,10 @@ impl App {
             color: colors_enabled(),
             tick: 0,
             activity: None,
+            live_tools: Vec::new(),
+            chat_scroll_top: None,
+            chat_view_height: 10,
+            chat_line_count: 0,
             input: String::new(),
             running: false,
             notes: Vec::new(),
@@ -220,6 +297,10 @@ impl App {
             purge_arm: None,
             import_mode: None,
             renaming: false,
+            search_hits: Vec::new(),
+            search_idx: 0,
+            search_mode: false,
+            editing_id: None,
             should_quit: false,
         };
         if app.wizard.is_none() {
@@ -300,6 +381,25 @@ impl App {
                                 self.current = Some(s.id.clone());
                                 self.sessions.insert(0, s);
                                 self.messages.clear();
+                                self.live_tools.clear();
+                                self.follow_chat_bottom();
+                            }
+                        }
+                        Pending::ForkSession => {
+                            if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
+                                self.current = Some(s.id.clone());
+                                self.sessions.insert(0, s.clone());
+                                self.request(Pending::GetSession, Request::GetSession { id: s.id });
+                                self.view = View::Chat;
+                                self.notes.push("session forked".into());
+                            }
+                        }
+                        Pending::SearchSessions => {
+                            if let Ok(v) = serde_json::from_value::<Vec<SearchHit>>(result) {
+                                self.notes.push(format!("{} search hit(s)", v.len()));
+                                self.search_hits = v;
+                                self.search_idx = 0;
+                                self.view = View::Search;
                             }
                         }
                         Pending::ListTools => {
@@ -331,6 +431,8 @@ impl App {
                             if let Some(msgs) = result.get("messages").cloned() {
                                 if let Ok(v) = serde_json::from_value::<Vec<MessageInfo>>(msgs) {
                                     self.messages = v;
+                                    self.live_tools.clear();
+                                    self.follow_chat_bottom();
                                 }
                             }
                         }
@@ -370,6 +472,31 @@ impl App {
         })
     }
 
+    fn chat_max_top(&self) -> usize {
+        self.chat_line_count.saturating_sub(self.chat_view_height)
+    }
+
+    fn scroll_chat_up(&mut self, lines: usize) {
+        let max_top = self.chat_max_top();
+        let cur = self.chat_scroll_top.unwrap_or(max_top);
+        self.chat_scroll_top = Some(cur.saturating_sub(lines));
+    }
+
+    fn scroll_chat_down(&mut self, lines: usize) {
+        if let Some(top) = self.chat_scroll_top {
+            let next = top + lines;
+            self.chat_scroll_top = if next >= self.chat_max_top() {
+                None // back at the bottom: follow live output again
+            } else {
+                Some(next)
+            };
+        }
+    }
+
+    fn follow_chat_bottom(&mut self) {
+        self.chat_scroll_top = None;
+    }
+
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::MessageAppended {
@@ -407,6 +534,7 @@ impl App {
                 self.running = true;
                 self.thinking.clear();
                 self.streaming.clear();
+                self.live_tools.clear();
                 self.set_activity("waiting for model");
             }
             Event::RunFinished { status, .. } => {
@@ -430,11 +558,42 @@ impl App {
                 self.notes.push(format!("compacted: {summary_preview}"));
             }
             Event::Note { text, .. } => self.notes.push(text),
-            Event::ToolCallStarted { tool_name, .. } => {
+            Event::ToolCallStarted {
+                tool_name,
+                version,
+                arguments,
+                ..
+            } => {
                 self.set_activity(format!("running {tool_name}"));
+                self.live_tools.push(LiveToolCall {
+                    name: tool_name.clone(),
+                    version,
+                    arguments,
+                    status: "running".into(),
+                    started: Instant::now(),
+                    elapsed_ms: None,
+                });
                 self.notes.push(format!("running {tool_name}…"));
             }
-            Event::ToolCallFinished { tool_name, ok, .. } => {
+            Event::ToolCallFinished {
+                tool_name,
+                ok,
+                elapsed_ms,
+                ..
+            } => {
+                if let Some(call) = self
+                    .live_tools
+                    .iter_mut()
+                    .rev()
+                    .find(|c| c.name == tool_name && c.status == "running")
+                {
+                    call.status = if ok { "ok".into() } else { "failed".into() };
+                    call.elapsed_ms = Some(if elapsed_ms > 0 {
+                        elapsed_ms
+                    } else {
+                        call.started.elapsed().as_millis() as i64
+                    });
+                }
                 if self.running {
                     self.set_activity("waiting for model");
                 }
@@ -500,6 +659,13 @@ impl App {
             Event::SessionUpdated { session } => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session.id) {
                     *s = session;
+                } else {
+                    self.sessions.insert(0, session);
+                }
+            }
+            Event::MessagesEdited { session_id } => {
+                if self.current.as_deref() == Some(&session_id) {
+                    self.request(Pending::GetSession, Request::GetSession { id: session_id });
                 }
             }
             Event::SessionDeleted { id } => {
@@ -544,6 +710,29 @@ impl App {
             }
             return;
         }
+        if self.search_mode {
+            self.search_mode = false;
+            self.request(
+                Pending::SearchSessions,
+                Request::SearchSessions {
+                    query: text,
+                    limit: Some(50),
+                },
+            );
+            return;
+        }
+        if let Some(message_id) = self.editing_id.take() {
+            if let Some(session_id) = self.current.clone() {
+                self.follow_chat_bottom();
+                self.fire(Request::EditMessage {
+                    session_id,
+                    message_id,
+                    content: text,
+                });
+                self.notes.push("editing and retrying…".into());
+            }
+            return;
+        }
         if let Some(cmd) = text.strip_prefix('/') {
             self.slash(cmd.trim());
             return;
@@ -558,6 +747,7 @@ impl App {
         } else {
             SendMode::Send
         };
+        self.follow_chat_bottom();
         self.fire(Request::SendMessage {
             session_id,
             content: text,
@@ -572,6 +762,36 @@ impl App {
                 Request::CreateSession { name: None },
             ),
             "sessions" => self.view = View::Sessions,
+            "fork" => {
+                if let Some(id) = self.current.clone() {
+                    self.request(
+                        Pending::ForkSession,
+                        Request::ForkSession {
+                            id,
+                            name: None,
+                            up_to_seq: None,
+                        },
+                    );
+                }
+            }
+            "search" => {
+                self.search_mode = true;
+                self.notes
+                    .push("Type a search query, then Enter (searches all sessions).".into());
+            }
+            "edit" | "retry" => match self.messages.iter().rev().find(|m| m.role == "user") {
+                Some(m) => {
+                    self.editing_id = Some(m.id.clone());
+                    self.input = m.content.clone();
+                    self.notes
+                        .push("Editing your last message — Enter retries from there.".into());
+                }
+                None => self.notes.push("no user message to edit".into()),
+            },
+            "metrics" => {
+                self.view = View::Metrics;
+                self.request(Pending::ListTools, Request::ListTools);
+            }
             "tools" => {
                 self.view = View::Tools;
                 self.request(Pending::ListTools, Request::ListTools);
@@ -606,7 +826,7 @@ impl App {
                 ));
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab views · /new /sessions /tools /settings /model /thinking /stop /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /settings /model /thinking /stop /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -619,6 +839,7 @@ impl App {
             while let Ok(job) = w.jobs.try_recv() {
                 match job {
                     WizardJob::Models(Ok(models)) if !models.is_empty() => {
+                        w.model_idx = models.iter().position(|m| *m == w.saved_model).unwrap_or(0);
                         w.models = models;
                         w.step = WizardStep::PickModel;
                         w.status = "Pick a model (Up/Down, Enter).".into();
@@ -679,6 +900,10 @@ impl App {
                 _ => {}
             },
             WizardStep::ApiKey => match key.code {
+                KeyCode::Esc => {
+                    w.step = WizardStep::BaseUrl;
+                    w.status = "Enter your provider base URL.".into();
+                }
                 KeyCode::Enter => {
                     w.step = WizardStep::FetchModels;
                     w.status = "Fetching models…".into();
@@ -752,6 +977,18 @@ impl App {
         }
     }
 
+    fn mouse(&mut self, kind: crossterm::event::MouseEventKind) {
+        use crossterm::event::MouseEventKind;
+        if self.wizard.is_some() || self.view != View::Chat {
+            return;
+        }
+        match kind {
+            MouseEventKind::ScrollUp => self.scroll_chat_up(3),
+            MouseEventKind::ScrollDown => self.scroll_chat_down(3),
+            _ => {}
+        }
+    }
+
     fn key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
@@ -792,6 +1029,25 @@ impl App {
             }
         }
         match self.view {
+            View::Search => match key.code {
+                KeyCode::Up => self.search_idx = self.search_idx.saturating_sub(1),
+                KeyCode::Down => {
+                    self.search_idx =
+                        (self.search_idx + 1).min(self.search_hits.len().saturating_sub(1))
+                }
+                KeyCode::Enter => {
+                    if let Some(hit) = self.search_hits.get(self.search_idx).cloned() {
+                        self.current = Some(hit.session_id.clone());
+                        self.request(
+                            Pending::GetSession,
+                            Request::GetSession { id: hit.session_id },
+                        );
+                        self.view = View::Chat;
+                    }
+                }
+                KeyCode::Esc | KeyCode::Tab => self.view = View::Chat,
+                _ => {}
+            },
             View::Sessions => match key.code {
                 KeyCode::Up => self.session_idx = self.session_idx.saturating_sub(1),
                 KeyCode::Down => {
@@ -809,6 +1065,18 @@ impl App {
                     Pending::CreateSession,
                     Request::CreateSession { name: None },
                 ),
+                KeyCode::Char('f') => {
+                    if let Some(s) = self.sessions.get(self.session_idx).cloned() {
+                        self.request(
+                            Pending::ForkSession,
+                            Request::ForkSession {
+                                id: s.id,
+                                name: None,
+                                up_to_seq: None,
+                            },
+                        );
+                    }
+                }
                 KeyCode::Char('d') => {
                     if let Some(s) = self.sessions.get(self.session_idx).cloned() {
                         self.fire(Request::DeleteSession { id: s.id });
@@ -897,6 +1165,17 @@ impl App {
                 _ => {}
             },
             _ => match key.code {
+                KeyCode::PageUp => {
+                    let page = self.chat_view_height.saturating_sub(1).max(1);
+                    self.scroll_chat_up(page);
+                }
+                KeyCode::PageDown => {
+                    let page = self.chat_view_height.saturating_sub(1).max(1);
+                    self.scroll_chat_down(page);
+                }
+                KeyCode::Up => self.scroll_chat_up(3),
+                KeyCode::Down => self.scroll_chat_down(3),
+                KeyCode::End => self.follow_chat_bottom(),
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.submit_chat(true)
                 }
@@ -915,8 +1194,12 @@ impl App {
                         View::Chat => View::Sessions,
                         View::Sessions => View::Settings,
                         View::Settings => View::Tools,
-                        View::Tools => View::Chat,
+                        View::Tools => View::Metrics,
+                        View::Metrics | View::Search => View::Chat,
                     };
+                    if self.view == View::Metrics {
+                        self.request(Pending::ListTools, Request::ListTools);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
@@ -928,7 +1211,7 @@ impl App {
     }
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn draw(f: &mut Frame, app: &mut App) {
     if let Some(w) = &app.wizard {
         draw_wizard(f, w, app.color);
         return;
@@ -957,7 +1240,7 @@ fn draw(f: &mut Frame, app: &App) {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(fg(app.color, Color::Cyan))
-                            .title("Sessions (Enter open, n new, d delete, r rename)"),
+                            .title("Sessions (Enter open, n new, f fork, d delete, r rename)"),
                     )
                     .highlight_style(bold_fg(app.color, Color::Cyan))
                     .highlight_symbol("> "),
@@ -980,9 +1263,15 @@ fn draw(f: &mut Frame, app: &App) {
             );
         }
         View::Tools => draw_tools(f, chunks[0], app),
+        View::Metrics => draw_metrics(f, chunks[0], app),
+        View::Search => draw_search(f, chunks[0], app),
     }
     let prompt = if app.renaming {
         "Rename> "
+    } else if app.search_mode {
+        "Search> "
+    } else if app.editing_id.is_some() {
+        "Edit> "
     } else if app.running {
         "Steer> "
     } else {
@@ -1041,6 +1330,130 @@ fn draw(f: &mut Frame, app: &App) {
     if let Some(req) = app.approvals.front().or(app.promotions.front()) {
         draw_approval(f, req, app.color);
     }
+}
+
+fn draw_search(f: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<ListItem> = if app.search_hits.is_empty() {
+        vec![ListItem::new("No hits. /search to try again.")]
+    } else {
+        app.search_hits
+            .iter()
+            .map(|h| {
+                ListItem::new(format!(
+                    "{} #{} {}: {}",
+                    h.session_name, h.seq, h.role, h.snippet
+                ))
+            })
+            .collect()
+    };
+    let mut state = ListState::default();
+    if !app.search_hits.is_empty() {
+        state.select(Some(app.search_idx.min(app.search_hits.len() - 1)));
+    }
+    f.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(fg(app.color, Color::Magenta))
+                    .title("Search (Enter open session, Esc back)"),
+            )
+            .highlight_style(bold_fg(app.color, Color::Magenta))
+            .highlight_symbol("> "),
+        area,
+        &mut state,
+    );
+}
+
+fn metrics_lines(tools: &[ToolInfo]) -> Vec<String> {
+    let total_calls: i64 = tools.iter().map(|t| t.invocations).sum();
+    let attention = tools.iter().filter(|t| t.needs_attention).count();
+    let retired = tools.iter().filter(|t| t.retired).count();
+    let mut lines = vec![
+        format!(
+            "Tools: {} ({} retired, {} need attention) · Total invocations: {}",
+            tools.len(),
+            retired,
+            attention,
+            total_calls
+        ),
+        String::new(),
+        format!(
+            "{:<24} {:>5} {:>7} {:>9}",
+            "TOOL", "VER", "CALLS", "SUCCESS"
+        ),
+    ];
+    let mut sorted: Vec<&ToolInfo> = tools.iter().collect();
+    sorted.sort_by_key(|t| std::cmp::Reverse(t.invocations));
+    for t in sorted {
+        let rate = t
+            .success_rate
+            .map(|r| format!("{:.0}%", r * 100.0))
+            .unwrap_or_else(|| "-".into());
+        lines.push(format!(
+            "{:<24} {:>5} {:>7} {:>9}{}",
+            truncate_chars(&t.name, 24),
+            t.current_version,
+            t.invocations,
+            rate,
+            if t.needs_attention {
+                "  (!needs attention)"
+            } else if t.retired {
+                "  (retired)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if tools.is_empty() {
+        lines.push("(no Tools yet — the agent builds them via create_tool)".into());
+    }
+    lines
+}
+
+fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = metrics_lines(&app.tools)
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+    if let Some(d) = &app.tool_detail {
+        let m = &d.metrics;
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("Selected: {}", d.tool.name),
+            bold_fg(app.color, Color::Yellow),
+        ));
+        lines.push(Line::raw(format!(
+            "total={} success={} failure={} denied={} cancelled={} validation={}",
+            m.total, m.success, m.failure, m.denied, m.cancelled, m.validation_failures
+        )));
+        lines.push(Line::raw(format!(
+            "rate={} retry={} p50={} p95={} (select in Tools view for detail)",
+            m.success_rate
+                .map(|r| format!("{:.1}%", r * 100.0))
+                .unwrap_or_else(|| "-".into()),
+            m.retry_rate
+                .map(|r| format!("{:.1}%", r * 100.0))
+                .unwrap_or_else(|| "-".into()),
+            m.p50_ms
+                .map(|v| format!("{v:.0}ms"))
+                .unwrap_or_else(|| "-".into()),
+            m.p95_ms
+                .map(|v| format!("{v:.0}ms"))
+                .unwrap_or_else(|| "-".into()),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(fg(app.color, Color::Green))
+                    .title("Metrics"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
@@ -1161,11 +1574,30 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, color: bool) {
     );
 }
 
-fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
+fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     for m in &app.messages {
-        if m.role == "assistant" && m.content.is_empty() && m.meta.is_some() {
-            continue;
+        // Assistant tool-call turns: show the call(s) inline (§17 v2).
+        if m.role == "assistant" {
+            if let Some(meta) = &m.meta {
+                let calls = tool_call_lines(meta);
+                if !calls.is_empty() {
+                    if !m.content.is_empty() {
+                        lines.push(Line::styled(
+                            "Formless:",
+                            role_style(app.color, "assistant"),
+                        ));
+                        for l in m.content.lines() {
+                            lines.push(Line::raw(l.to_string()));
+                        }
+                    }
+                    for call in calls {
+                        lines.push(Line::styled(call, bold_fg(app.color, Color::Yellow)));
+                    }
+                    lines.push(Line::raw(""));
+                    continue;
+                }
+            }
         }
         let who = match m.role.as_str() {
             "user" => "You",
@@ -1178,8 +1610,29 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
             role_style(app.color, m.role.as_str()),
         ));
         for l in m.content.lines() {
-            lines.push(Line::raw(l.to_string()));
+            lines.push(Line::raw(truncate_chars(l, 500)));
         }
+        lines.push(Line::raw(""));
+    }
+    // Currently-running Tool calls (persisted lines above keep the history).
+    for call in app.live_tools.iter().filter(|c| c.status == "running") {
+        let version = if call.version > 0 {
+            format!(" v{}", call.version)
+        } else {
+            String::new()
+        };
+        lines.push(Line::styled(
+            format!(
+                "⚙ running {}{} ({}) {}",
+                call.name,
+                version,
+                format_elapsed(call.started.elapsed()),
+                truncate_chars(&call.arguments, 160)
+            ),
+            bold_fg(app.color, Color::Yellow),
+        ));
+    }
+    if app.live_tools.iter().any(|c| c.status == "running") {
         lines.push(Line::raw(""));
     }
     if app.messages.is_empty() && !app.running {
@@ -1220,18 +1673,32 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
     }
-    let height = area.height.saturating_sub(2) as usize;
-    let scroll = (lines.len().saturating_sub(height)) as u16;
+    let height = (area.height.saturating_sub(2) as usize).max(1);
+    app.chat_view_height = height;
+    app.chat_line_count = lines.len();
+    let max_top = lines.len().saturating_sub(height);
+    let scroll_top = match app.chat_scroll_top {
+        Some(top) => top.min(max_top),
+        None => max_top,
+    };
+    if app.chat_scroll_top == Some(scroll_top) && scroll_top >= max_top {
+        app.chat_scroll_top = None;
+    }
+    let title = if app.chat_scroll_top.is_some() {
+        "Chat (scrolled — End/PageDown to follow live)"
+    } else {
+        "Chat"
+    };
     f.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(fg(app.color, Color::DarkGray))
-                    .title("Chat"),
+                    .title(title),
             )
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .scroll((scroll_top as u16, 0)),
         area,
     );
 }
@@ -1312,22 +1779,26 @@ pub fn run(paths: Paths) -> Result<()> {
     enable_raw_mode()?;
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
+    out.execute(crossterm::event::EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     let result = (|| -> Result<()> {
         while !app.should_quit {
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
             app.wizard_poll();
-            terminal.draw(|f| draw(f, &app))?;
+            terminal.draw(|f| draw(f, &mut app))?;
             if event::poll(Duration::from_millis(50))? {
-                if let CtEvent::Key(k) = event::read()? {
-                    app.key(k);
+                match event::read()? {
+                    CtEvent::Key(k) => app.key(k),
+                    CtEvent::Mouse(m) => app.mouse(m.kind),
+                    _ => {}
                 }
             }
         }
         Ok(())
     })();
     disable_raw_mode()?;
+    let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
     result
 }
@@ -1359,6 +1830,10 @@ mod tests {
             color: true,
             tick: 0,
             activity: None,
+            live_tools: Vec::new(),
+            chat_scroll_top: None,
+            chat_view_height: 10,
+            chat_line_count: 100,
             input: String::new(),
             running: false,
             notes: Vec::new(),
@@ -1371,6 +1846,10 @@ mod tests {
             purge_arm: None,
             import_mode: None,
             renaming: false,
+            search_hits: Vec::new(),
+            search_idx: 0,
+            search_mode: false,
+            editing_id: None,
             should_quit: false,
         }
     }
@@ -1403,8 +1882,20 @@ mod tests {
             run_id: "r1".into(),
             tool_name: "create_tool".into(),
             version: 1,
+            arguments: "{\"name\":\"writer\"}".into(),
         });
         assert!(app.activity_text().unwrap().contains("running create_tool"));
+        assert_eq!(app.live_tools.len(), 1);
+        assert_eq!(app.live_tools[0].status, "running");
+        app.on_event(Event::ToolCallFinished {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            tool_name: "create_tool".into(),
+            ok: true,
+            elapsed_ms: 42,
+        });
+        assert_eq!(app.live_tools[0].status, "ok");
+        assert_eq!(app.live_tools[0].elapsed_ms, Some(42));
 
         app.on_event(Event::ApprovalRequested {
             approval_id: "a1".into(),
@@ -1441,6 +1932,112 @@ mod tests {
         let first = app.spinner();
         app.tick += 2;
         assert_ne!(first, app.spinner(), "spinner must animate with ticks");
+    }
+
+    #[test]
+    fn chat_scrolling_pins_and_refollows_at_bottom() {
+        let mut app = test_app(); // 100 lines, view height 10 -> max top 90
+        assert_eq!(app.chat_max_top(), 90);
+        app.scroll_chat_up(30);
+        assert_eq!(app.chat_scroll_top, Some(60));
+        app.scroll_chat_up(100);
+        assert_eq!(app.chat_scroll_top, Some(0));
+        app.scroll_chat_down(50);
+        assert_eq!(app.chat_scroll_top, Some(50));
+        app.scroll_chat_down(50);
+        assert_eq!(app.chat_scroll_top, None, "reaching bottom refollows live");
+        app.scroll_chat_up(5);
+        app.follow_chat_bottom();
+        assert_eq!(app.chat_scroll_top, None);
+    }
+
+    #[test]
+    fn persisted_tool_calls_render_from_meta() {
+        let meta = serde_json::json!({"tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": "create_tool", "arguments": "{\"name\":\"w\"}"}},
+            {"id": "2", "type": "function", "function": {"name": "writer", "arguments": "{}"}}
+        ]});
+        let lines = tool_call_lines(&meta.to_string());
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("create_tool"), "{lines:?}");
+        assert!(tool_call_lines("not json").is_empty());
+        assert!(tool_call_lines("{}").is_empty());
+    }
+
+    #[test]
+    fn wizard_remembers_saved_startup_options() {
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "https://api.deepseek.com".into();
+        cfg.provider.model = "deepseek-flash".into();
+        cfg.provider.reasoning_effort = Some("high".into());
+        let w = Wizard::new(&cfg);
+        assert_eq!(w.step, WizardStep::ApiKey);
+        assert_eq!(w.base_url, "https://api.deepseek.com");
+        assert_eq!(w.saved_model, "deepseek-flash");
+        assert_eq!(EFFORTS[w.effort_idx], Some("high"));
+
+        let fresh = Wizard::new(&Config::default());
+        assert_eq!(fresh.step, WizardStep::BaseUrl);
+    }
+
+    #[test]
+    fn metrics_lines_summarise_tools() {
+        let tools = vec![
+            ToolInfo {
+                id: "1".into(),
+                name: "writer".into(),
+                description: String::new(),
+                retired: false,
+                current_version: 2,
+                capabilities: vec![],
+                memory_mb: 256,
+                invocations: 10,
+                success_rate: Some(0.9),
+                needs_attention: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            ToolInfo {
+                id: "2".into(),
+                name: "old".into(),
+                description: String::new(),
+                retired: true,
+                current_version: 1,
+                capabilities: vec![],
+                memory_mb: 256,
+                invocations: 2,
+                success_rate: None,
+                needs_attention: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        ];
+        let lines = metrics_lines(&tools);
+        assert!(lines[0].contains("Total invocations: 12"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("90%")));
+        assert!(metrics_lines(&[])
+            .iter()
+            .any(|l| l.contains("no Tools yet")));
+    }
+
+    #[test]
+    fn edit_slash_prefills_last_user_message() {
+        let mut app = test_app();
+        let mk = |id: &str, role: &str, content: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s1".into(),
+            seq: 1,
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+            meta: None,
+        };
+        app.messages.push(mk("u1", "user", "first"));
+        app.messages.push(mk("a1", "assistant", "reply"));
+        app.messages.push(mk("u2", "user", "second"));
+        app.slash("edit");
+        assert_eq!(app.editing_id.as_deref(), Some("u2"));
+        assert_eq!(app.input, "second");
     }
 
     #[test]

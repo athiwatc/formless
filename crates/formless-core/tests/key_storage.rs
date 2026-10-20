@@ -51,6 +51,10 @@ fn api_key_saved_in_one_process_is_loadable_in_another() {
     assert!(status.success(), "child save process failed: {status}");
 
     let loaded = load_api_key(&paths);
+    assert!(
+        paths.key_fallback_file().exists(),
+        "0600 fallback file is always written so rebuilds keep the key"
+    );
     delete_api_key(&paths);
     assert_eq!(
         loaded.as_deref(),

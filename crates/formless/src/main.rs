@@ -27,6 +27,11 @@ enum Cmd {
     },
     /// Diagnostics: config, dirs, keychain, endpoint probe
     Doctor,
+    /// Hosted relay + web frontend (SPEC §17 v2)
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
     Tools {
         #[command(subcommand)]
@@ -51,6 +56,26 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum RelayAction {
+    /// Enable the relay (generates a pairing secret on first use) and print the browser URL
+    Enable {
+        /// Relay websocket base URL
+        #[arg(long, default_value = "wss://formless.athiwat.xyz")]
+        url: String,
+        /// Generate a fresh pairing secret (invalidates old browser links)
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Disable the relay (pairing secret is kept unless --forget)
+    Disable {
+        #[arg(long)]
+        forget: bool,
+    },
+    /// Show relay config and the browser URL
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -90,6 +115,7 @@ fn main() -> Result<()> {
         None | Some(Cmd::Tui) => formless_tui::run(paths),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Doctor) => doctor(paths),
+        Some(Cmd::Relay { action }) => relay_cmd(paths, action),
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
         Some(Cmd::Run {
@@ -100,6 +126,65 @@ fn main() -> Result<()> {
         }) => {
             let code = run_headless(paths, task, session, yes, json)?;
             std::process::exit(code);
+        }
+    }
+}
+
+fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
+    use formless_core::config::{
+        delete_relay_secret, ensure_relay_secret, generate_relay_secret, load_relay_secret,
+        save_relay_secret,
+    };
+    let mut cfg = Config::load(&paths)?;
+    match action {
+        RelayAction::Enable { url, rotate } => {
+            let secret = if rotate {
+                let s = generate_relay_secret();
+                save_relay_secret(&paths, &s)?;
+                s
+            } else {
+                ensure_relay_secret(&paths)?
+            };
+            cfg.relay.enabled = true;
+            cfg.relay.url = url.trim_end_matches('/').to_string();
+            cfg.save(&paths)?;
+            println!("relay:      enabled ({})", cfg.relay.url);
+            println!(
+                "browser:    {}",
+                formless_core::relay::browser_url(&cfg.relay, &secret)
+            );
+            println!("            (the #k= secret never leaves your machines; the relay only forwards ciphertext)");
+            if daemon_reachable(&paths) {
+                println!("daemon:     running — restart it to connect: formless daemon stop, then any formless command");
+            } else {
+                println!("daemon:     not running — it will connect on next start (any formless command)");
+            }
+            Ok(())
+        }
+        RelayAction::Disable { forget } => {
+            cfg.relay.enabled = false;
+            cfg.save(&paths)?;
+            if forget {
+                delete_relay_secret(&paths);
+            }
+            println!("relay:      disabled{}", if forget { " (pairing secret deleted)" } else { "" });
+            Ok(())
+        }
+        RelayAction::Status => {
+            println!("enabled:    {}", cfg.relay.enabled);
+            println!("url:        {}", cfg.relay.url);
+            match load_relay_secret(&paths) {
+                Some(secret) => println!(
+                    "browser:    {}",
+                    formless_core::relay::browser_url(&cfg.relay, &secret)
+                ),
+                None => println!("secret:     none yet (run: formless relay enable)"),
+            }
+            println!(
+                "daemon:     {}",
+                if daemon_reachable(&paths) { "running" } else { "not running" }
+            );
+            Ok(())
         }
     }
 }

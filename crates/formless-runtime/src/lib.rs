@@ -43,6 +43,15 @@ pub trait HostOps: Send + Sync {
     fn emit(&self, _chunk: &str) -> Result<(), String> {
         Ok(())
     }
+    /// One non-streaming LLM completion via the daemon's provider.
+    fn llm_complete(
+        &self,
+        _prompt: &str,
+        _system: Option<&str>,
+        _model: Option<&str>,
+    ) -> Result<String, String> {
+        Err("llm.complete is not available in this context".into())
+    }
 }
 
 pub struct NoHostOps;
@@ -145,6 +154,15 @@ globalThis.fs = {
 globalThis.env = { get: (k) => __call("env_get", { key: String(k) }) };
 globalThis.process = { run: (cmd, args) => __call("process_run", { cmd: String(cmd), args: args || [] }) };
 globalThis.tools = { call: (name, input) => __call("tools_call", { name: String(name), input: input || {} }) };
+globalThis.clipboard = {
+  read: () => __call("clipboard_read", {}),
+  write: (t) => __call("clipboard_write", { text: String(t) }),
+};
+globalThis.notify = (title, body) => __call("notify", { title: String(title || ""), body: String(body || "") });
+globalThis.notifications = { send: globalThis.notify };
+globalThis.llm = {
+  complete: (prompt, opts) => __call("llm_complete", { prompt: String(prompt), system: (opts && opts.system) || null, model: (opts && opts.model) || null }),
+};
 globalThis.emit = (chunk) => __call("emit", { chunk: String(chunk) });
 globalThis.sleep = (ms) => __call("sleep", { ms: ms | 0 });
 globalThis.setTimeout = (fn, ms) => { sleep(ms || 0); if (fn) fn(); return 0; };
@@ -182,6 +200,73 @@ impl State {
                 }
                 self.ops
                     .call_tool(a["name"].as_str().unwrap_or_default(), a["input"].clone())
+            }
+            "clipboard_read" => {
+                if !self.caps.clipboard_read {
+                    return Err(denied("clipboard:read not declared"));
+                }
+                match self.mode {
+                    HostMode::Smoke => Ok(json!("")),
+                    HostMode::Replay => Err(denied("clipboard denied in replay")),
+                    HostMode::Live => Ok(json!(clipboard_read()?)),
+                }
+            }
+            "clipboard_write" => {
+                if !self.caps.clipboard_write {
+                    return Err(denied("clipboard:write not declared"));
+                }
+                match self.mode {
+                    HostMode::Smoke => Ok(Value::Null),
+                    HostMode::Replay => Err(denied("clipboard denied in replay")),
+                    HostMode::Live => {
+                        clipboard_write(a["text"].as_str().unwrap_or_default())?;
+                        Ok(Value::Null)
+                    }
+                }
+            }
+            "notify" => {
+                if !self.caps.notify {
+                    return Err(denied("notify not declared"));
+                }
+                match self.mode {
+                    HostMode::Smoke => Ok(Value::Null),
+                    HostMode::Replay => Err(denied("notify denied in replay")),
+                    HostMode::Live => {
+                        notify(
+                            a["title"].as_str().unwrap_or_default(),
+                            a["body"].as_str().unwrap_or_default(),
+                        )?;
+                        Ok(Value::Null)
+                    }
+                }
+            }
+            "llm_complete" => {
+                let allowed = self
+                    .caps
+                    .llm
+                    .as_ref()
+                    .ok_or_else(|| denied("llm not declared"))?;
+                let requested = a["model"].as_str();
+                // Scoped `llm:<model>` grants: an explicit model must be in
+                // scope; no explicit model means the first granted model.
+                let model = if allowed.is_empty() {
+                    requested
+                } else {
+                    match requested {
+                        Some(m) if allowed.iter().any(|x| x == m) => Some(m),
+                        Some(m) => return Err(denied(format!("llm:{m} not in scope"))),
+                        None => allowed.first().map(String::as_str),
+                    }
+                };
+                match self.mode {
+                    HostMode::Smoke => Ok(json!("")),
+                    HostMode::Replay => Err(denied("llm denied in replay")),
+                    HostMode::Live => Ok(json!(self.ops.llm_complete(
+                        a["prompt"].as_str().unwrap_or_default(),
+                        a["system"].as_str(),
+                        model,
+                    )?)),
+                }
             }
             "env_get" => {
                 let key = a["key"].as_str().unwrap_or_default();
@@ -436,6 +521,105 @@ impl State {
             }
         }
         Err(denied(format!("path outside granted roots: {raw}")))
+    }
+}
+
+fn run_capture(cmd: &str, args: &[&str], stdin_text: Option<&str>) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd}: {e}"))?;
+    if let Some(text) = stdin_text {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn clipboard_read() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        run_capture("pbpaste", &[], None)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        run_capture(
+            "powershell",
+            &["-NoProfile", "-Command", "Get-Clipboard"],
+            None,
+        )
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        run_capture("wl-paste", &[], None)
+            .or_else(|_| run_capture("xclip", &["-selection", "clipboard", "-o"], None))
+            .or_else(|_| run_capture("xsel", &["--clipboard", "--output"], None))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err("clipboard unsupported on this platform".into())
+    }
+}
+
+fn clipboard_write(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        run_capture("pbcopy", &[], Some(text)).map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        run_capture(
+            "powershell",
+            &["-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+            Some(text),
+        )
+        .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        run_capture("wl-copy", &[], Some(text))
+            .or_else(|_| run_capture("xclip", &["-selection", "clipboard"], Some(text)))
+            .or_else(|_| run_capture("xsel", &["--clipboard", "--input"], Some(text)))
+            .map(|_| ())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = text;
+        Err("clipboard unsupported on this platform".into())
+    }
+}
+
+fn notify(title: &str, body: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            esc(body),
+            esc(title)
+        );
+        run_capture("osascript", &["-e", &script], None).map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        run_capture("notify-send", &[title, body], None).map(|_| ())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (title, body);
+        Err("notifications unsupported on this platform".into())
     }
 }
 

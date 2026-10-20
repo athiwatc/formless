@@ -3,6 +3,7 @@ pub mod daemon;
 pub mod optimiser;
 pub mod paths;
 pub mod provider;
+pub mod relay;
 pub mod storage;
 pub mod tools;
 

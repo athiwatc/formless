@@ -133,6 +133,41 @@ impl Daemon {
                 })?;
                 Ok(json!({"session": session, "messages": messages}))
             }
+            Request::ForkSession {
+                id,
+                name,
+                up_to_seq,
+            } => {
+                let s = self
+                    .with_store(|st| st.fork_session(&id, name, up_to_seq))?
+                    .context("session not found")?;
+                self.broadcast(Event::SessionUpdated { session: s.clone() });
+                Ok(serde_json::to_value(s)?)
+            }
+            Request::SearchSessions { query, limit } => {
+                Ok(serde_json::to_value(self.with_store(|st| {
+                    st.search_sessions(&query, limit.unwrap_or(50))
+                })?)?)
+            }
+            Request::EditMessage {
+                session_id,
+                message_id,
+                content,
+            } => {
+                if self.runs.lock().unwrap().contains_key(&session_id) {
+                    return Err(anyhow!(
+                        "session has an active run; interrupt it before editing"
+                    ));
+                }
+                let msg = self
+                    .with_store(|st| st.edit_message(&session_id, &message_id, &content))?
+                    .context("user message not found")?;
+                self.broadcast(Event::MessagesEdited {
+                    session_id: session_id.clone(),
+                });
+                self.start_run(session_id)?;
+                Ok(serde_json::to_value(msg)?)
+            }
             Request::SetSessionModel {
                 id,
                 model,
@@ -609,7 +644,7 @@ impl Daemon {
             if !result.reasoning.is_empty() {
                 meta["reasoning_content"] = json!(result.reasoning);
             }
-            self.with_store(|st| {
+            let call_msg = self.with_store(|st| {
                 st.append_message_meta(
                     session_id,
                     "assistant",
@@ -617,6 +652,11 @@ impl Daemon {
                     Some(meta.to_string()),
                 )
             })?;
+            // Clients render the tool call(s) inline from this message.
+            self.broadcast(Event::MessageAppended {
+                session_id: session_id.to_string(),
+                message: call_msg,
+            });
             // Approval pre-pass: one prompt per unapproved sensitive Tool in
             // the batch, before anything runs (SPEC §5.2/§10.3).
             let mut denied: HashMap<String, bool> = HashMap::new();
@@ -706,7 +746,27 @@ impl Daemon {
                 );
             }
         };
-        match tc.name.as_str() {
+        // Bootstrap/meta tools don't pass through execute_tool_value, so
+        // broadcast their lifecycle here (registry Tools broadcast there).
+        let bootstrap = matches!(
+            tc.name.as_str(),
+            toolreg::CREATE_TOOL
+                | toolreg::RETIRE_TOOL
+                | toolreg::AWAIT_INVOCATION
+                | toolreg::CHECK_INVOCATION
+                | toolreg::ABANDON_INVOCATION
+        );
+        let started = std::time::Instant::now();
+        if bootstrap {
+            self.broadcast(Event::ToolCallStarted {
+                session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                tool_name: tc.name.clone(),
+                version: 0,
+                arguments: tc.arguments.clone(),
+            });
+        }
+        let text = match tc.name.as_str() {
             toolreg::CREATE_TOOL => match self.create_tool_impl(&args, cfg).await {
                 Ok(text) => text,
                 Err(e) => format!("error: create_tool failed: {e}"),
@@ -784,7 +844,17 @@ impl Daemon {
                 self.dispatch_pending(session_id, run_id, name, args, cfg, cancel_flag, cancel)
                     .await
             }
+        };
+        if bootstrap {
+            self.broadcast(Event::ToolCallFinished {
+                session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                tool_name: tc.name.clone(),
+                ok: !text.starts_with("error:"),
+                elapsed_ms: started.elapsed().as_millis() as i64,
+            });
         }
+        text
     }
 
     fn pending_get(&self, handle: &str) -> Option<Arc<PendingEntry>> {
@@ -1324,6 +1394,7 @@ impl Daemon {
                 run_id: run_id.clone(),
                 tool_name: name.clone(),
                 version: ver.version,
+                arguments: input_text.clone(),
             });
             let inv_id = match self.with_store(|st| {
                 st.start_invocation(
@@ -1372,6 +1443,7 @@ impl Daemon {
                     run_id: run_id.clone(),
                     tool_name: name.clone(),
                     ok,
+                    elapsed_ms: elapsed,
                 });
             };
             match outcome {
@@ -1520,7 +1592,7 @@ impl Daemon {
         Ok(())
     }
 
-    async fn handle_conn<S>(self: Arc<Self>, stream: S)
+    pub(crate) async fn handle_conn<S>(self: Arc<Self>, stream: S)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -1640,7 +1712,12 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.optimiser_loop().await })
         };
+        let relay = {
+            let this = self.clone();
+            tokio::spawn(async move { crate::relay::relay_loop(this).await })
+        };
         let result = self.accept_loop().await;
+        relay.abort();
         optimiser.abort();
         watcher.abort();
         let _ = std::fs::remove_file(self.paths.lock_file());
@@ -1779,6 +1856,32 @@ struct NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn llm_complete(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        model: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        if self.cancel.is_cancelled() {
+            return Err("interrupted".into());
+        }
+        let api_key = load_api_key(&self.daemon.paths).unwrap_or_default();
+        let provider =
+            Provider::new(self.cfg.provider.clone(), api_key).map_err(|e| e.to_string())?;
+        let model = model
+            .map(str::to_string)
+            .unwrap_or_else(|| self.cfg.provider.model.clone());
+        let mut messages = Vec::new();
+        if let Some(sys) = system {
+            messages.push(json!({"role": "system", "content": sys}));
+        }
+        messages.push(json!({"role": "user", "content": prompt}));
+        let effort = self.cfg.provider.reasoning_effort.clone();
+        self.handle
+            .block_on(provider.complete(&messages, &model, effort.as_deref()))
+            .map_err(|e| e.to_string())
+    }
+
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
         let daemon = self.daemon.clone();
         let (sid, rid, name) = (

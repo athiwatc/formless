@@ -79,6 +79,55 @@ fn provider_message_echoes_reasoning_only_on_tool_call_turns() {
     assert_eq!(v["content"], Value::Null, "reasoning is never the answer");
 }
 
+#[test]
+fn fork_search_and_edit_message() {
+    let paths = temp_paths("forksearch");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(Some("Orig".into())).unwrap();
+    let m1 = store
+        .append_message(&s.id, "user", "alpha needle one")
+        .unwrap();
+    store.append_message(&s.id, "assistant", "reply").unwrap();
+    store
+        .append_message(&s.id, "user", "second Needle")
+        .unwrap();
+    store.save_checkpoint(&s.id, "sum", 3).unwrap();
+
+    // Fork a prefix; edits in fork/original stay independent.
+    let fork = store.fork_session(&s.id, None, Some(2)).unwrap().unwrap();
+    assert_eq!(fork.name, "Orig (fork)");
+    assert_eq!(store.list_messages(&fork.id).unwrap().len(), 2);
+    let full = store
+        .fork_session(&s.id, Some("Copy".into()), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.list_messages(&full.id).unwrap().len(), 3);
+    assert!(store.fork_session("missing", None, None).unwrap().is_none());
+
+    // Search across sessions, case-insensitive, with snippets.
+    let hits = store.search_sessions("NEEDLE", 50).unwrap();
+    assert!(hits.len() >= 3, "hits across orig+forks: {hits:?}");
+    assert!(hits
+        .iter()
+        .all(|h| h.snippet.to_lowercase().contains("needle")));
+    assert!(store.search_sessions("  ", 50).unwrap().is_empty());
+
+    // Edit-and-retry: later messages and covering checkpoint are dropped.
+    let edited = store
+        .edit_message(&s.id, &m1.id, "edited text")
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.content, "edited text");
+    let after = store.list_messages(&s.id).unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(store.latest_checkpoint(&s.id).unwrap().is_none());
+    assert!(store.edit_message(&s.id, &m1.id, "x").unwrap().is_some());
+    let a = store
+        .append_message(&s.id, "assistant", "not editable")
+        .unwrap();
+    assert!(store.edit_message(&s.id, &a.id, "x").unwrap().is_none());
+}
+
 struct MockState {
     effort_rejections: AtomicUsize,
 }
