@@ -1,0 +1,22 @@
+name = "formless-relay"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[routes]]
+pattern = "formless.athiwat.xyz"
+custom_domain = true
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "RelayRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayRoom"]
+
+# Web frontend: served by the worker (run first so every response gets
+# SECURITY_HEADERS from worker.js).
+[assets]
+directory = "./web"
+binding = "ASSETS"
+run_worker_first = true

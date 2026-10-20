@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Formless</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 3 29 16 16 29 3 16Z' fill='none' stroke='%2357c785' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<!-- Pairing -->
+<section id="pair" class="pair hidden" aria-labelledby="pair-title">
+  <div class="pair-card">
+    <div class="brand big"><span class="mark" aria-hidden="true">◇</span> Formless</div>
+    <h1 id="pair-title">Connect to your daemon</h1>
+    <p class="muted">Open the link printed by <code>formless relay enable</code>, or paste its pairing secret (the part after <code>#k=</code>). Traffic is end-to-end encrypted in this browser; the relay only forwards ciphertext.</p>
+    <form id="pair-form" autocomplete="off">
+      <label for="secret" class="sr-only">Pairing secret</label>
+      <input id="secret" type="password" placeholder="Pairing secret" spellcheck="false">
+      <button class="btn primary" type="submit">Connect</button>
+    </form>
+    <p id="pair-error" class="error" role="alert"></p>
+  </div>
+</section>
+
+<!-- App -->
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <button class="icon-btn only-mobile" id="menu-btn" type="button" aria-label="Sessions">☰</button>
+    <div class="brand"><span class="mark" aria-hidden="true">◇</span> Formless</div>
+    <nav class="tabs" id="tabs" aria-label="Views">
+      <button type="button" data-view="chat">Chat</button>
+      <button type="button" data-view="tools">Tools</button>
+      <button type="button" data-view="metrics">Metrics</button>
+      <button type="button" data-view="proposals">Proposals</button>
+      <button type="button" data-view="settings">Settings</button>
+    </nav>
+    <div class="spacer"></div>
+    <span id="conn" class="pill" aria-live="polite">connecting…</span>
+    <button class="icon-btn" id="notes-btn" type="button" aria-label="Activity log">◔<span id="notes-badge" class="badge hidden"></span></button>
+    <button class="btn ghost small" id="disconnect" type="button">Disconnect</button>
+  </header>
+
+  <div class="body">
+    <!-- Sessions sidebar (Chat view) -->
+    <aside id="sidebar" class="sidebar" aria-label="Sessions">
+      <div class="sidebar-head">
+        <button class="btn primary small grow" id="new-session" type="button">+ New session</button>
+        <button class="icon-btn" id="import-session" type="button" title="Import session bundle" aria-label="Import session">⇪</button>
+      </div>
+      <form id="search-form" class="search" role="search">
+        <input id="search" type="search" placeholder="Search all sessions" aria-label="Search all sessions">
+      </form>
+      <div id="search-results" class="search-results hidden"></div>
+      <ul id="sessions" class="session-list"></ul>
+    </aside>
+
+    <main class="main">
+      <!-- Chat -->
+      <section id="view-chat" class="view chat-view" aria-label="Chat">
+        <div class="chat-head">
+          <h2 id="session-title" class="session-title">No session</h2>
+          <div class="chat-head-actions">
+            <label class="toggle"><input type="checkbox" id="show-thinking" checked> thinking</label>
+            <button class="btn ghost small" id="fork-btn" type="button" title="Fork this session (/fork)">Fork</button>
+            <button class="btn ghost small" id="export-session" type="button" title="Download session bundle">Export</button>
+          </div>
+        </div>
+        <div id="transcript" class="transcript" tabindex="0" aria-live="polite"></div>
+        <button id="jump" class="jump hidden" type="button">↓ New output</button>
+        <form id="composer" class="composer">
+          <div id="compose-mode" class="compose-mode hidden"></div>
+          <div class="compose-row">
+            <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message"></textarea>
+            <button class="btn danger" id="stop-btn" type="button" hidden>Stop</button>
+            <button class="btn primary" id="send-btn" type="submit">Send</button>
+          </div>
+          <div class="compose-hint muted">Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · /help</div>
+        </form>
+      </section>
+
+      <!-- Tools -->
+      <section id="view-tools" class="view hidden" aria-label="Tools">
+        <div class="view-head">
+          <h2>Tools <span id="tools-count" class="muted"></span></h2>
+          <div class="actions">
+            <button class="btn ghost small" id="import-tool" type="button">Import</button>
+            <button class="btn ghost small" id="export-tools" type="button">Export all</button>
+            <button class="btn ghost small" id="optimise-all" type="button">Run optimiser</button>
+          </div>
+        </div>
+        <div class="split">
+          <div class="table-wrap"><table class="table" id="tools-table"></table></div>
+          <div id="tool-detail" class="detail"></div>
+        </div>
+      </section>
+
+      <!-- Metrics -->
+      <section id="view-metrics" class="view hidden" aria-label="Metrics">
+        <div class="view-head"><h2>Metrics</h2></div>
+        <div id="metric-cards" class="cards"></div>
+        <div class="table-wrap"><table class="table" id="metrics-table"></table></div>
+        <div id="metric-detail"></div>
+        <h3>Model routing <span class="muted">(measured)</span></h3>
+        <div class="table-wrap"><table class="table" id="routing-table"></table></div>
+      </section>
+
+      <!-- Proposals -->
+      <section id="view-proposals" class="view hidden" aria-label="Prompt proposals">
+        <div class="view-head">
+          <h2>Prompt proposals</h2>
+          <div class="actions"><button class="btn primary small" id="generate-proposal" type="button">Generate measured proposal</button></div>
+        </div>
+        <p class="muted">A proposal can be applied only after it beats the current prompt on the eval suite by the promotion margin. Applied proposals roll back individually.</p>
+        <div id="proposals" class="proposal-list"></div>
+      </section>
+
+      <!-- Settings -->
+      <section id="view-settings" class="view hidden" aria-label="Settings">
+        <div class="view-head"><h2>Settings</h2></div>
+        <div id="settings"></div>
+      </section>
+    </main>
+
+    <aside id="notes-panel" class="notes-panel hidden" aria-label="Activity log">
+      <div class="notes-head"><h3>Activity</h3><button class="icon-btn" id="notes-close" type="button" aria-label="Close">✕</button></div>
+      <ol id="notes" class="notes"></ol>
+    </aside>
+  </div>
+
+  <footer class="statusbar">
+    <span id="state" class="state">● ready</span>
+    <span class="sep">│</span><span id="status-session" class="strong"></span>
+    <span class="sep">│</span><span id="status-model" class="muted"></span>
+    <span id="status-approvals" class="warn hidden"></span>
+    <span class="spacer"></span>
+    <span id="status-note" class="muted note"></span>
+  </footer>
+</div>
+
+<!-- Approval dialog -->
+<div id="modal-backdrop" class="backdrop hidden">
+  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <span id="modal-more" class="muted"></span>
+      <span class="spacer"></span>
+      <button class="btn danger" id="modal-deny" type="button"><kbd>n</kbd> Deny</button>
+      <button class="btn primary" id="modal-approve" type="button"><kbd>y</kbd> Approve</button>
+    </div>
+  </div>
+</div>
+
+<!-- Generic prompt/confirm dialog -->
+<div id="ask-backdrop" class="backdrop hidden">
+  <form class="modal" id="ask-form">
+    <h2 id="ask-title"></h2>
+    <p id="ask-text" class="muted"></p>
+    <input id="ask-input" type="text" spellcheck="false">
+    <div class="modal-actions">
+      <span class="spacer"></span>
+      <button class="btn ghost" id="ask-cancel" type="button">Cancel</button>
+      <button class="btn primary" id="ask-ok" type="submit">OK</button>
+    </div>
+  </form>
+</div>
+
+<input id="file-input" type="file" accept="application/json,.json" class="hidden">
+<div id="toasts" class="toasts" aria-live="assertive"></div>
+</body>
+</html>
