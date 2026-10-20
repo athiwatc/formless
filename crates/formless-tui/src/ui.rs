@@ -1,0 +1,135 @@
+//! Pure rendering helpers: panels, colour scales and compact formatting.
+//! Markdown lives in `markdown`. Colours always go through `fg` so `NO_COLOR` holds.
+
+use chrono::{DateTime, Local, Utc};
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, BorderType, Borders};
+
+use super::{bold_fg, fg};
+
+/// Rounded, titled panel used by every view.
+pub(crate) fn panel<'a>(title: impl Into<Line<'a>>, color: bool, border: Color) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(fg(color, border))
+        .title(title)
+}
+
+/// Bottom-right key hint for a panel.
+pub(crate) fn hint(text: &str, color: bool) -> Line<'static> {
+    Line::styled(format!(" {text} "), dim(color)).right_aligned()
+}
+
+/// Secondary text: grey with colour, terminal-dim without.
+pub(crate) fn dim(color: bool) -> Style {
+    if color {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+}
+
+pub(crate) fn rate_text(rate: Option<f64>) -> String {
+    rate.map(|r| format!("{:.0}%", r * 100.0))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// Green at or above the optimiser trigger (90%), yellow above 70%, red below.
+pub(crate) fn rate_style(color: bool, rate: Option<f64>) -> Style {
+    match rate {
+        None => dim(color),
+        Some(r) if r >= 0.9 => fg(color, Color::Green),
+        Some(r) if r >= 0.7 => fg(color, Color::Yellow),
+        Some(_) => bold_fg(color, Color::Red),
+    }
+}
+
+pub(crate) fn bar(rate: f64, width: usize) -> String {
+    let filled = ((rate.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// Fit `s` into exactly `width` columns (char-based), with an ellipsis.
+pub(crate) fn pad(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n > width {
+        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    } else {
+        format!("{s}{}", " ".repeat(width - n))
+    }
+}
+
+pub(crate) fn relative_time(ts: &str, now: DateTime<Utc>) -> String {
+    let Ok(t) = DateTime::parse_from_rfc3339(ts) else {
+        return ts.to_string();
+    };
+    let secs = (now - t.with_timezone(&Utc)).num_seconds().max(0);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        86_400..=604_799 => format!("{}d ago", secs / 86_400),
+        _ => t.with_timezone(&Local).format("%Y-%m-%d").to_string(),
+    }
+}
+
+/// Local `HH:MM` for an RFC 3339 timestamp.
+pub(crate) fn clock_time(ts: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|t| t.with_timezone(&Local).format("%H:%M").to_string())
+}
+
+/// One-line `key=value` summary of a JSON tool-call argument object.
+pub(crate) fn summarize_args(args: &str, max: usize) -> String {
+    let flat = |s: &str| super::truncate_chars(s, max);
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(args) else {
+        return flat(args);
+    };
+    // Keys arrive sorted; `name` is the most telling, so it leads.
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(k, _)| *k != "name");
+    let parts: Vec<String> = entries
+        .into_iter()
+        .map(|(k, v)| match v {
+            serde_json::Value::String(s) => format!("{k}={:?}", super::truncate_chars(s, 40)),
+            serde_json::Value::Array(a) => format!("{k}=[{}]", a.len()),
+            serde_json::Value::Object(_) => format!("{k}={{…}}"),
+            other => format!("{k}={other}"),
+        })
+        .collect();
+    flat(&parts.join("  "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formatting_helpers() {
+        assert_eq!(pad("abc", 5), "abc  ");
+        assert_eq!(pad("abcdef", 4), "abc…");
+        assert_eq!(bar(0.5, 4), "██░░");
+        assert_eq!(bar(1.7, 3), "███");
+        assert_eq!(rate_text(Some(0.904)), "90%");
+        assert_eq!(rate_style(true, Some(0.95)).fg, Some(Color::Green));
+        assert_eq!(rate_style(true, Some(0.5)).fg, Some(Color::Red));
+        assert_eq!(rate_style(false, Some(0.5)).fg, None);
+        let now = DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(relative_time("2026-10-21T11:59:30Z", now), "just now");
+        assert_eq!(relative_time("2026-10-21T11:15:00Z", now), "45m ago");
+        assert_eq!(relative_time("2026-10-21T09:00:00Z", now), "3h ago");
+        assert_eq!(relative_time("2026-10-19T12:00:00Z", now), "2d ago");
+        assert_eq!(relative_time("garbage", now), "garbage");
+        assert_eq!(
+            summarize_args(r#"{"name":"page_title","code":"x","tags":[1,2]}"#, 200),
+            r#"name="page_title"  code="x"  tags=[2]"#
+        );
+        assert_eq!(summarize_args("not json", 200), "not json");
+    }
+}
