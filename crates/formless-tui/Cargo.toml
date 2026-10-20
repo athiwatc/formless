@@ -1,0 +1,13 @@
+[package]
+name = "formless-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm = "0.28"
+formless-core = { path = "../formless-core" }
+formless-protocol = { path = "../formless-protocol" }
+ratatui = "0.29"
+serde_json.workspace = true
