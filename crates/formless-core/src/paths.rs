@@ -65,6 +65,9 @@ impl Paths {
     pub fn relay_secret_file(&self) -> PathBuf {
         self.config_dir.join("relay_secret")
     }
+    pub fn oauth_tokens_file(&self) -> PathBuf {
+        self.config_dir.join("oauth_tokens.json")
+    }
     pub fn lock_file(&self) -> PathBuf {
         self.data_dir.join("daemon.lock")
     }

@@ -79,6 +79,9 @@ pub struct ToolMetricsInfo {
     pub retry_rate: Option<f64>,
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
+    /// Distinct Sessions that invoked the Tool: a reuse/generality signal.
+    #[serde(default)]
+    pub sessions: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +95,46 @@ pub struct OptimiserAttemptInfo {
     pub replay_total: i64,
     pub regressions: i64,
     pub created_at: String,
+}
+
+/// One shared JS module in the registry (v2). Tools load the current
+/// version's code via `requireModule(name)` at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModuleInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub current_version: i64,
+    pub retired: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A versioned prompt/memory self-optimisation proposal (v2). Status:
+/// proposed -> measured -> applied | rejected | rolled_back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromptProposalInfo {
+    pub id: String,
+    /// "prompt" (bootstrap addendum) or "memory" (learned note).
+    pub kind: String,
+    pub content: String,
+    pub rationale: String,
+    pub status: String,
+    pub baseline_score: Option<f64>,
+    pub candidate_score: Option<f64>,
+    pub eval_total: i64,
+    pub est_tokens: i64,
+    pub created_at: String,
+    pub applied_at: Option<String>,
+}
+
+/// Measured provider outcome for one model (routing, v2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelStatInfo {
+    pub model: String,
+    pub successes: i64,
+    pub failures: i64,
+    pub total_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +162,8 @@ pub enum SendMode {
 pub enum Request {
     Ping,
     Status,
+    /// Read-only configuration summary for remote clients (no secrets).
+    GetSettings,
     Shutdown,
     ListSessions,
     CreateSession {
@@ -165,8 +210,14 @@ pub enum Request {
         session_id: String,
     },
     ListTools,
+    ListModules,
     GetTool {
         id: String,
+    },
+    /// Save edited Tool JS as a new version (in-TUI editor, v2).
+    UpdateToolCode {
+        id: String,
+        code: String,
     },
     RetireTool {
         id: String,
@@ -191,6 +242,16 @@ pub enum Request {
     },
     RunOptimiser {
         tool_id: Option<String>,
+    },
+    ListProposals,
+    ListModelStats,
+    GenerateProposal,
+    ProposalDecision {
+        id: String,
+        approved: bool,
+    },
+    RollbackProposal {
+        id: String,
     },
     ExportTool {
         id: String,
@@ -310,6 +371,12 @@ pub enum Event {
     },
     ToolUpdated {
         tool: ToolInfo,
+    },
+    ModuleUpdated {
+        module: ModuleInfo,
+    },
+    ProposalUpdated {
+        proposal: PromptProposalInfo,
     },
     ToolDeleted {
         id: String,

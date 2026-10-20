@@ -12,6 +12,9 @@ members = [
 edition = "2021"
 license = "Apache-2.0"
 version = "0.1.0"
+description = "A tool-building AI agent harness"
+homepage = "https://formless.athiwat.xyz"
+repository = "https://github.com/athiwatc/formless"
 
 [workspace.dependencies]
 anyhow = "1"

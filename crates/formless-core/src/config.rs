@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::Paths;
@@ -78,6 +78,80 @@ pub struct ProviderCfg {
     pub context_tokens: u32,
     pub model_context_tokens: HashMap<String, u32>,
     pub max_retries: usize,
+    /// "chat" (Chat Completions, default) or "responses" (Responses API).
+    #[serde(default = "default_api_style")]
+    pub api_style: String,
+    /// "native" tool-calling (default) or "prompt" fallback for
+    /// endpoints/models without native tool-calling.
+    #[serde(default = "default_tool_mode")]
+    pub tool_mode: String,
+    /// Extra models tried, in order, when the selected model fails with
+    /// a retryable/model error (model routing/failover).
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
+    /// Candidate models for measured auto-selection when `model = "auto"`.
+    /// Falls back to `fallback_models` when empty.
+    #[serde(default)]
+    pub routing_models: Vec<String>,
+    /// Optional user-labelled subsets of routing candidates for simple tasks.
+    #[serde(default)]
+    pub routing_fast_models: Vec<String>,
+    /// Optional user-labelled subsets of routing candidates for complex tasks.
+    #[serde(default)]
+    pub routing_strong_models: Vec<String>,
+    /// Estimated context characters at/above which routing treats a task as complex.
+    #[serde(default = "default_routing_complex_chars")]
+    pub routing_complex_chars: usize,
+    /// Credential mode: API key (default) or OAuth2 subscription login.
+    #[serde(default)]
+    pub auth: AuthCfg,
+}
+
+/// OAuth2 authorization-code + PKCE settings for subscription providers.
+/// Tokens are stored like the API key (keychain +0600 file), never here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthCfg {
+    /// "api_key" (default) or "oauth".
+    pub mode: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    /// Space- or comma-separated scope string, sent verbatim.
+    pub scopes: String,
+    /// Localhost callback port for `formless auth login` (0 = any free port).
+    pub redirect_port: u16,
+    /// Provider-specific authorization parameters (for example
+    /// `access_type=offline`, `prompt=consent`, or an Auth0 `audience`).
+    #[serde(default)]
+    pub extra_authorize_params: BTreeMap<String, String>,
+    /// Provider-specific token-endpoint form parameters.
+    #[serde(default)]
+    pub extra_token_params: BTreeMap<String, String>,
+}
+impl Default for AuthCfg {
+    fn default() -> Self {
+        Self {
+            mode: "api_key".into(),
+            authorize_url: String::new(),
+            token_url: String::new(),
+            client_id: String::new(),
+            scopes: String::new(),
+            redirect_port: 8977,
+            extra_authorize_params: BTreeMap::new(),
+            extra_token_params: BTreeMap::new(),
+        }
+    }
+}
+
+fn default_api_style() -> String {
+    "chat".into()
+}
+fn default_tool_mode() -> String {
+    "native".into()
+}
+fn default_routing_complex_chars() -> usize {
+    20_000
 }
 impl Default for ProviderCfg {
     fn default() -> Self {
@@ -89,10 +163,45 @@ impl Default for ProviderCfg {
             context_tokens: 128_000,
             model_context_tokens: HashMap::new(),
             max_retries: 5,
+            api_style: default_api_style(),
+            tool_mode: default_tool_mode(),
+            fallback_models: Vec::new(),
+            routing_models: Vec::new(),
+            routing_fast_models: Vec::new(),
+            routing_strong_models: Vec::new(),
+            routing_complex_chars: default_routing_complex_chars(),
+            auth: AuthCfg::default(),
         }
     }
 }
 impl ProviderCfg {
+    pub fn responses(&self) -> bool {
+        self.api_style.eq_ignore_ascii_case("responses")
+    }
+    pub fn prompt_tools(&self) -> bool {
+        self.tool_mode.eq_ignore_ascii_case("prompt")
+    }
+    pub fn oauth(&self) -> bool {
+        self.auth.mode.eq_ignore_ascii_case("oauth")
+    }
+    pub fn routing_candidates(&self) -> Vec<String> {
+        let source = if self.routing_models.is_empty() {
+            &self.fallback_models
+        } else {
+            &self.routing_models
+        };
+        let mut out: Vec<String> = Vec::new();
+        for m in source {
+            let m = m.trim().to_string();
+            if !m.is_empty() && !m.eq_ignore_ascii_case("auto") && !out.contains(&m) {
+                out.push(m);
+            }
+        }
+        out
+    }
+    pub fn is_auto_model(model: &str) -> bool {
+        model.trim().eq_ignore_ascii_case("auto")
+    }
     pub fn context_for(&self, model: &str) -> u32 {
         self.model_context_tokens
             .get(model)
@@ -155,6 +264,12 @@ pub struct ToolsCfg {
     pub default_memory_mb: u32,
     pub max_memory_mb: u32,
     pub artifact_preview_chars: usize,
+    /// Registry size up to which every Tool is listed to the model; past
+    /// it, Sessions see loaded + most-used Tools and use find_tools.
+    pub inline_limit: usize,
+    /// How deep `agents.run` sub-agents may nest (1 = the main agent's
+    /// Tools may spawn sub-agents; theirs may not).
+    pub max_agent_depth: usize,
 }
 impl Default for ToolsCfg {
     fn default() -> Self {
@@ -163,6 +278,8 @@ impl Default for ToolsCfg {
             default_memory_mb: 256,
             max_memory_mb: 4096,
             artifact_preview_chars: 2000,
+            inline_limit: 40,
+            max_agent_depth: 1,
         }
     }
 }
@@ -186,16 +303,48 @@ impl CompactionCfg {
 #[serde(default)]
 pub struct TuiCfg {
     pub queue_key: String,
+    /// Persistent multi-pane layout (sessions/tools beside chat) on wide
+    /// terminals. Toggled with `/panes` and remembered across starts.
+    #[serde(default)]
+    pub multi_pane: bool,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
         Self {
             queue_key: "ctrl+enter".into(),
+            multi_pane: false,
         }
     }
 }
 
 impl Config {
+    /// Read-only settings for remote clients (the Web frontend's Settings
+    /// view). Mirrors what the TUI shows; deliberately omits
+    /// `extra_headers` and every other field that can carry credentials.
+    pub fn settings_summary(&self, paths: &Paths) -> serde_json::Value {
+        serde_json::json!({
+            "provider": {
+                "base_url": self.provider.base_url,
+                "model": self.provider.model,
+                "reasoning_effort": self.provider.reasoning_effort,
+                "api_style": self.provider.api_style,
+                "tool_mode": self.provider.tool_mode,
+                "auth_mode": self.provider.auth.mode,
+                "context_tokens": self.provider.context_tokens,
+                "fallback_models": self.provider.fallback_models,
+            },
+            "tui": {
+                "multi_pane": self.tui.multi_pane,
+                "queue_key": self.tui.queue_key,
+            },
+            "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
+            "paths": {
+                "config": paths.config_file().display().to_string(),
+                "data": paths.data_dir.display().to_string(),
+            },
+        })
+    }
+
     pub fn load(paths: &Paths) -> Result<Self> {
         Self::load_from(&paths.config_file())
     }
@@ -297,6 +446,7 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
 /// Caller must stop the daemon first.
 pub fn reset_all(paths: &Paths) -> Result<()> {
     delete_api_key(paths);
+    crate::auth::delete_oauth_tokens(paths);
     delete_relay_secret(paths);
     for dir in [&paths.data_dir, &paths.config_dir] {
         if dir.exists() {

@@ -22,6 +22,7 @@ fn run_js(
         mode: HostMode::Live,
         overlay: None,
         activity: None,
+        modules: Vec::new(),
         cancel: Arc::new(AtomicBool::new(false)),
     };
     execute(&req, Arc::new(NoHostOps)).map(|o| o.output)

@@ -11,7 +11,17 @@ use std::sync::Arc;
 fn temp_paths(tag: &str) -> Paths {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-{tag}-{short}"));
-    Paths::from_dirs(base.join("d"), base.join("c")).unwrap()
+    // Unique profile per test dir: keychain users derive from the profile,
+    // so tests must never touch the developer's real "default" entries
+    // (which can also block on a macOS Keychain access prompt).
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-{tag}-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    paths
 }
 
 #[test]

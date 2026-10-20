@@ -5,12 +5,26 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderCfg;
+use crate::Paths;
 
-/// Bootstrap system prompt (SPEC §7.7). Versioned; frozen in v1.
-pub const SYSTEM_PROMPT: &str = "You are Formless, a general-purpose agent.\n\
-You start with only `create_tool` (and `retire_tool`). Build small, single-purpose, minimally-capabled Tools on demand with create_tool, test each by calling it, and reuse Tools across tasks. Never expect a Tool to exist - build it.\n\
-Tool code is plain JavaScript defining `function run(input) { ... }` returning the output value. Host API (all Capability-gated): fetch(url, opts) -> {status, ok, body, text(), json()}; fetchChunks(url, opts, size, cb); fs.read(path), fs.write(path, string), fs.exists(path), fs.list(dir), fs.readChunks(path, size, cb), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray) -> {code, stdout, stderr}; tools.call(name, input); clipboard.read(), clipboard.write(text); notify(title, body); llm.complete(prompt, {system, model}) -> text; emit(chunk) streams large output to an artifact; console.log, sleep(ms), setTimeout, cryptoRandom(). Nothing else exists.\n\
-Stream anything large (fs.readChunks / fetchChunks / emit); never load it whole. Declare only the Capabilities a Tool needs, as strings like \"net\", \"net:example.com\", \"fs:read:/abs/path\", \"fs:write:/abs/path\", \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"clipboard:write\", \"notify\", \"llm\" (or \"llm:model\"). Prefer retiring a broken Tool and creating a new version over silent workarounds.";
+/// The Tool authoring contract and host API (SPEC §7.5), shared by the
+/// bootstrap prompt and the optimiser so they never drift apart.
+macro_rules! host_api_doc {
+    () => {
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure anyway, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding}) -> {code, signal, stdout, stderr} (no shell); tools.call(name, input); clipboard.read(), clipboard.write(text); notify(title, body); llm.complete(prompt, {system, model}) -> text; agents.run(task, {system, model}) -> text; requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; console.log, sleep(ms), setTimeout, cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+    };
+}
+pub(crate) use host_api_doc;
+
+/// Bootstrap system prompt (SPEC §7.7). Versioned; v2.1 adds generic-Tool
+/// guidance and input-bound Capability scopes; v2.2 adds the find/read/test
+/// built-ins, throw-on-failure and the extended host API.
+pub const SYSTEM_PROMPT: &str = concat!("You are Formless, a general-purpose agent.\n\
+You start with only built-ins: `create_tool`, `create_module`, `retire_tool`, `find_tools`, `read_tool` and `test_tool`. Everything else you build yourself: small, minimally-capabled Tools created with create_tool, persisted and reused across tasks and projects. Never expect a Tool to exist - find it or build it.\n\
+The registry can hold far more Tools than are listed to you as functions. Before creating a Tool, find_tools for it; matches become callable. To change a Tool, read_tool it first and create a new version (same name) from its real code. Test a draft with test_tool on real input before saving it, then call the saved Tool. Shared JS helpers (parsers, encoders, hashing, URL handling) belong in modules via create_module, loaded inside Tools with requireModule(name). To delegate a focused task to a sub-agent with the same Tools, build a Tool with the \"agent\" Capability, e.g. `function run(i){ return agents.run(i.task, {model: i.model}); }`; several such calls in one turn run in parallel.\n\
+Make Tools generic: a Tool does one kind of thing (read_text_file, http_get_json, csv_column_sum), and everything task- or project-specific - paths, URLs, hosts, queries, names, column/field names - comes in through its input. Never hardcode such values in implementation_js, the Tool name, or its description. If an existing Tool nearly fits, create a more general new version of it (existing input fields keep working, new ones optional) rather than a new narrow Tool. Specialise only when the logic itself is inherently specific to one project.\n\
+", host_api_doc!(), "\n\
+Stream anything large (fs.readChunks / fetchChunks / fs.append / emit); never load it whole. Declare only the Capabilities a Tool needs, as strings like \"net\", \"net:example.com\", \"fs:read:/abs/path\", \"fs:write:/abs/path\", input-bound scopes \"fs:read:$input.path\", \"fs:write:$input.out\", \"net:$input.url\" (granted per call for exactly the path(s)/host named by that input field - string or array of strings - so a generic Tool stays least-privilege; prefer these over fixed project paths), \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"clipboard:write\", \"notify\", \"llm\", \"agent\" (or \"llm:model\"/\"agent:model\"). Prefer retiring a broken Tool and creating a new version over silent workarounds.");
 
 const SUMMARIZE_PROMPT: &str = "Summarise the following conversation excerpt \
 faithfully and compactly, preserving facts, decisions, names, and open \
@@ -37,6 +51,9 @@ fn apply_headers(
 pub struct Provider {
     cfg: ProviderCfg,
     api_key: String,
+    /// When set, credentials are re-resolved before each HTTP request so
+    /// an OAuth token expiring during a long Run is refreshed in place.
+    credential_paths: Option<Paths>,
     http: reqwest::Client,
 }
 
@@ -55,6 +72,8 @@ pub struct ChatResult {
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub dropped_reasoning_effort: bool,
+    /// Model that actually served the request (failover routing).
+    pub model_used: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,10 +82,202 @@ pub enum DeltaKind {
     Reasoning,
 }
 
+/// Convert Chat-Completions messages to Responses-API input items.
+pub fn responses_input(messages: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or_default();
+        if role == "tool" {
+            out.push(json!({
+                "type": "function_call_output",
+                "call_id": m["tool_call_id"].as_str().unwrap_or_default(),
+                "output": m["content"].as_str().unwrap_or_default(),
+            }));
+            continue;
+        }
+        if let Some(calls) = m["tool_calls"].as_array() {
+            for c in calls {
+                out.push(json!({
+                    "type": "function_call",
+                    "call_id": c["id"].as_str().unwrap_or_default(),
+                    "name": c["function"]["name"].as_str().unwrap_or_default(),
+                    "arguments": c["function"]["arguments"].as_str().unwrap_or_default(),
+                }));
+            }
+            continue;
+        }
+        let text = m["content"].as_str().unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        let ctype = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        out.push(json!({"role": role, "content": [{"type": ctype, "text": text}]}));
+    }
+    out
+}
+
+/// Convert Chat-Completions tool definitions to Responses-API tools.
+pub fn responses_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            let f = &t["function"];
+            json!({
+                "type": "function",
+                "name": f["name"].as_str().unwrap_or_default(),
+                "description": f["description"].as_str().unwrap_or_default(),
+                "parameters": f["parameters"].clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn responses_text(v: &Value) -> String {
+    if let Some(t) = v["output_text"].as_str() {
+        return t.to_string();
+    }
+    let mut out = String::new();
+    if let Some(items) = v["output"].as_array() {
+        for item in items {
+            if let Some(content) = item["content"].as_array() {
+                for c in content {
+                    if let Some(t) = c["text"].as_str() {
+                        out.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn responses_tool_calls(v: &Value) -> Vec<ToolCall> {
+    let mut out = Vec::new();
+    if let Some(items) = v["output"].as_array() {
+        for item in items {
+            if item["type"].as_str() == Some("function_call") {
+                out.push(ToolCall {
+                    id: item["call_id"]
+                        .as_str()
+                        .or_else(|| item["id"].as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: item["name"].as_str().unwrap_or_default().to_string(),
+                    arguments: item["arguments"].as_str().unwrap_or_default().to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Instruction appended for prompt-based tool calling (no native tools).
+pub fn prompt_tool_instruction(tools: &[Value]) -> String {
+    format!(
+        "\n\nTool call format: this endpoint has no native tool-calling. When you need a tool, reply with ONLY a JSON object (no prose): {{\"tool_calls\": [{{\"name\": \"<tool>\", \"arguments\": {{}}}}]}} using one of these tools: {}. When you are done, reply with plain text only.",
+        serde_json::to_string(tools).unwrap_or_default()
+    )
+}
+
+/// Parse prompt-mode tool calls out of model text. Returns the remaining
+/// plain text and any parsed calls (ids synthesised when absent).
+pub fn parse_prompt_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
+    let Some(start) = content.find('{') else {
+        return (content.to_string(), Vec::new());
+    };
+    let Some(end) = content.rfind('}') else {
+        return (content.to_string(), Vec::new());
+    };
+    if end <= start {
+        return (content.to_string(), Vec::new());
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&content[start..=end]) else {
+        return (content.to_string(), Vec::new());
+    };
+    let raw_calls: Vec<&Value> = if let Some(arr) = v["tool_calls"].as_array() {
+        arr.iter().collect()
+    } else if v.get("tool_call").is_some() {
+        vec![&v["tool_call"]]
+    } else if v["name"].is_string() {
+        vec![&v]
+    } else {
+        return (content.to_string(), Vec::new());
+    };
+    let mut calls = Vec::new();
+    for (i, c) in raw_calls.iter().enumerate() {
+        let name = c["name"].as_str().unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let arguments = match &c["arguments"] {
+            Value::String(s) => s.clone(),
+            Value::Null => "{}".to_string(),
+            other => other.to_string(),
+        };
+        calls.push(ToolCall {
+            id: c["id"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{}", i + 1)),
+            name: name.to_string(),
+            arguments,
+        });
+    }
+    if calls.is_empty() {
+        return (content.to_string(), Vec::new());
+    }
+    let mut clean = content[..start].trim().to_string();
+    let suffix = content[end + 1..].trim();
+    if !suffix.is_empty() {
+        if !clean.is_empty() {
+            clean.push(' ');
+        }
+        clean.push_str(suffix);
+    }
+    (
+        clean
+            .replace("```json", "")
+            .replace("```", "")
+            .trim()
+            .to_string(),
+        calls,
+    )
+}
+
 impl Provider {
     pub fn new(cfg: ProviderCfg, api_key: String) -> Result<Self> {
         let http = reqwest::Client::builder().build()?;
-        Ok(Self { cfg, api_key, http })
+        Ok(Self {
+            cfg,
+            api_key,
+            credential_paths: None,
+            http,
+        })
+    }
+
+    /// Construct a provider whose credential is resolved from a profile
+    /// before every request. The initial resolution also fails fast for a
+    /// missing OAuth login rather than deferring that to the first POST.
+    pub async fn for_profile(cfg: ProviderCfg, paths: Paths) -> Result<Self> {
+        let api_key = crate::auth::resolve_provider_token(&paths, &cfg).await?;
+        let http = reqwest::Client::builder().build()?;
+        Ok(Self {
+            cfg,
+            api_key,
+            credential_paths: Some(paths),
+            http,
+        })
+    }
+
+    async fn credential(&self) -> Result<String> {
+        match &self.credential_paths {
+            Some(paths) => crate::auth::resolve_provider_token(paths, &self.cfg).await,
+            None => Ok(self.api_key.clone()),
+        }
     }
 
     pub fn model(&self) -> &str {
@@ -74,10 +285,11 @@ impl Provider {
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        let credential = self.credential().await?;
         let req = apply_headers(
             self.http.get(url(&self.cfg.base_url, "models")),
             &self.cfg,
-            &self.api_key,
+            &credential,
         );
         let resp = req.send().await.context("GET /models")?;
         let status = resp.status();
@@ -98,9 +310,16 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<String> {
-        let mut body = json!({"model": model, "messages": messages, "stream": false});
+        let mut body = if self.cfg.responses() {
+            json!({"model": model, "input": responses_input(messages), "stream": false})
+        } else {
+            json!({"model": model, "messages": messages, "stream": false})
+        };
         let resp = self.post_chat(&mut body, effort).await?;
         let v: Value = resp.json().await.context("parse chat completion")?;
+        if self.cfg.responses() {
+            return Ok(responses_text(&v));
+        }
         Ok(v["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or_default()
@@ -112,49 +331,89 @@ impl Provider {
     /// rejection and reasoning_effort was set, retries once without it and
     /// flags `dropped` via the returned marker in ChatResult paths.
     async fn post_chat(&self, body: &mut Value, effort: Option<&str>) -> Result<reqwest::Response> {
-        self.post_chat_flagged(body, effort).await.map(|(r, _)| r)
+        self.post_chat_flagged(body, effort)
+            .await
+            .map(|(r, _, _)| r)
     }
 
     async fn post_chat_flagged(
         &self,
         body: &mut Value,
         effort: Option<&str>,
-    ) -> Result<(reqwest::Response, bool)> {
-        let mut dropped = false;
-        let mut with_effort = effort.is_some();
-        let mut last_err = String::new();
-        for attempt in 0..=self.cfg.max_retries {
-            let mut b = body.clone();
-            if with_effort {
-                b["reasoning_effort"] = json!(effort.unwrap());
+    ) -> Result<(reqwest::Response, bool, String)> {
+        self.post_provider(body, effort, true).await
+    }
+
+    async fn post_provider(
+        &self,
+        body: &mut Value,
+        effort: Option<&str>,
+        allow_failover: bool,
+    ) -> Result<(reqwest::Response, bool, String)> {
+        let endpoint = if self.cfg.responses() {
+            "responses"
+        } else {
+            "chat/completions"
+        };
+        let requested = body["model"].as_str().unwrap_or_default().to_string();
+        let mut models = vec![requested.clone()];
+        if allow_failover {
+            for m in &self.cfg.fallback_models {
+                if !m.trim().is_empty() && !models.contains(m) {
+                    models.push(m.clone());
+                }
             }
-            let req = apply_headers(
-                self.http.post(url(&self.cfg.base_url, "chat/completions")),
-                &self.cfg,
-                &self.api_key,
-            )
-            .json(&b);
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        return Ok((resp, dropped));
-                    }
-                    let text = resp.text().await.unwrap_or_default();
-                    if status.as_u16() == 400 && with_effort && is_unknown_param(&text) {
-                        with_effort = false;
-                        dropped = true;
-                        continue;
-                    }
-                    last_err = format!("{status}: {text}");
-                    if !(status.as_u16() == 429 || status.is_server_error()) {
-                        return Err(anyhow!("provider error: {last_err}"));
+        }
+        let mut dropped = false;
+        let mut last_err = String::new();
+        for model in &models {
+            let mut with_effort = effort.is_some();
+            for attempt in 0..=self.cfg.max_retries {
+                let mut b = body.clone();
+                b["model"] = json!(model);
+                if with_effort {
+                    if self.cfg.responses() {
+                        b["reasoning"] = json!({"effort": effort.unwrap()});
+                    } else {
+                        b["reasoning_effort"] = json!(effort.unwrap());
                     }
                 }
-                Err(e) => last_err = e.to_string(),
+                let credential = self.credential().await?;
+                let req = apply_headers(
+                    self.http.post(url(&self.cfg.base_url, endpoint)),
+                    &self.cfg,
+                    &credential,
+                )
+                .json(&b);
+                match req.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            return Ok((resp, dropped, model.clone()));
+                        }
+                        let text = resp.text().await.unwrap_or_default();
+                        if status.as_u16() == 400 && with_effort && is_unknown_param(&text) {
+                            with_effort = false;
+                            dropped = true;
+                            continue;
+                        }
+                        last_err = format!("{status}: {text}");
+                        if is_model_error(status.as_u16(), &text) && models.len() > 1 {
+                            break; // fail over to the next model
+                        }
+                        if !(status.as_u16() == 429 || status.is_server_error()) {
+                            return Err(anyhow!("provider error: {last_err}"));
+                        }
+                    }
+                    Err(e) => last_err = e.to_string(),
+                }
+                if attempt < self.cfg.max_retries {
+                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
+                }
             }
-            if attempt < self.cfg.max_retries {
-                tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
+            // Retryable failures exhausted for this model: fail over.
+            if !last_err.is_empty() && models.len() > 1 {
+                tracing::warn!("provider model {model} failed ({last_err}); failing over");
             }
         }
         Err(anyhow!("provider request failed after retries: {last_err}"))
@@ -172,11 +431,46 @@ impl Provider {
         cancel: &CancellationToken,
         mut on_delta: F,
     ) -> Result<ChatResult> {
-        let mut body = json!({"model": model, "messages": messages, "stream": true});
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
-        let (resp, dropped) = self.post_chat_flagged(&mut body, effort).await?;
+        // Prompt-based fallback: describe tools in-band, send none natively,
+        // and buffer content so tool-call JSON never streams to the user.
+        let prompt_mode = self.cfg.prompt_tools() && !tools.is_empty();
+        let augmented: Vec<Value>;
+        let messages: &[Value] = if prompt_mode {
+            let instr = prompt_tool_instruction(tools);
+            let mut msgs: Vec<Value> = messages.to_vec();
+            if let Some(first) = msgs.first_mut() {
+                if first["role"].as_str() == Some("system") {
+                    let cur = first["content"].as_str().unwrap_or_default().to_string();
+                    first["content"] = json!(format!("{cur}{instr}"));
+                    augmented = msgs;
+                    &augmented
+                } else {
+                    msgs.insert(0, json!({"role": "system", "content": instr.trim_start()}));
+                    augmented = msgs;
+                    &augmented
+                }
+            } else {
+                augmented = vec![json!({"role": "system", "content": instr.trim_start()})];
+                &augmented
+            }
+        } else {
+            messages
+        };
+        let effective_tools: &[Value] = if prompt_mode { &[] } else { tools };
+        let mut body = if self.cfg.responses() {
+            let mut b = json!({"model": model, "input": responses_input(messages), "stream": true});
+            if !effective_tools.is_empty() {
+                b["tools"] = json!(responses_tools(effective_tools));
+            }
+            b
+        } else {
+            let mut b = json!({"model": model, "messages": messages, "stream": true});
+            if !effective_tools.is_empty() {
+                b["tools"] = json!(effective_tools);
+            }
+            b
+        };
+        let (resp, dropped, model_used) = self.post_chat_flagged(&mut body, effort).await?;
         let mut stream = resp.bytes_stream();
         let mut content = String::new();
         let mut reasoning = String::new();
@@ -196,11 +490,77 @@ impl Provider {
                             let data = data.trim();
                             if data == "[DONE]" { continue; }
                             if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                if self.cfg.responses() {
+                                    match v["type"].as_str().unwrap_or_default() {
+                                        "response.output_text.delta" => {
+                                            if let Some(d) = v["delta"].as_str() {
+                                                content.push_str(d);
+                                                if !prompt_mode {
+                                                    on_delta(DeltaKind::Content, d);
+                                                }
+                                            }
+                                        }
+                                        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                                            if let Some(d) = v["delta"].as_str() {
+                                                reasoning.push_str(d);
+                                                on_delta(DeltaKind::Reasoning, d);
+                                            }
+                                        }
+                                        "response.output_item.added" | "response.output_item.done" => {
+                                            let item = &v["item"];
+                                            if item["type"].as_str() == Some("function_call") {
+                                                let idx = v["output_index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
+                                                while tool_calls.len() <= idx {
+                                                    tool_calls.push(ToolCall::default());
+                                                }
+                                                let slot = &mut tool_calls[idx];
+                                                if let Some(id) = item["call_id"].as_str().or_else(|| item["id"].as_str()) {
+                                                    slot.id = id.to_string();
+                                                }
+                                                if let Some(n) = item["name"].as_str() {
+                                                    slot.name = n.to_string();
+                                                }
+                                                if let Some(a) = item["arguments"].as_str() {
+                                                    if !a.is_empty() {
+                                                        slot.arguments = a.to_string();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        "response.function_call_arguments.delta" => {
+                                            let idx = v["output_index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
+                                            while tool_calls.len() <= idx {
+                                                tool_calls.push(ToolCall::default());
+                                            }
+                                            if let Some(d) = v["delta"].as_str() {
+                                                tool_calls[idx].arguments.push_str(d);
+                                            }
+                                        }
+                                        "response.completed" => {
+                                            if content.is_empty() {
+                                                let t = responses_text(&v["response"]);
+                                                if !t.is_empty() {
+                                                    content.push_str(&t);
+                                                    if !prompt_mode {
+                                                        on_delta(DeltaKind::Content, &t);
+                                                    }
+                                                }
+                                            }
+                                            if tool_calls.iter().all(|c| c.name.is_empty()) {
+                                                tool_calls = responses_tool_calls(&v["response"]);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
                                 let delta = &v["choices"][0]["delta"];
                                 if let Some(d) = delta["content"].as_str() {
                                     if !d.is_empty() {
                                         content.push_str(d);
-                                        on_delta(DeltaKind::Content, d);
+                                        if !prompt_mode {
+                                            on_delta(DeltaKind::Content, d);
+                                        }
                                     }
                                 }
                                 // Thinking-mode endpoints stream reasoning separately
@@ -247,6 +607,16 @@ impl Provider {
                 }
             }
         }
+        if prompt_mode {
+            let (clean, calls) = parse_prompt_tool_calls(&content);
+            if !clean.is_empty() {
+                on_delta(DeltaKind::Content, &clean);
+            }
+            content = clean;
+            if !calls.is_empty() {
+                tool_calls = calls;
+            }
+        }
         for (i, tc) in tool_calls.iter_mut().enumerate() {
             if tc.id.is_empty() {
                 tc.id = format!("call_{i}");
@@ -257,6 +627,7 @@ impl Provider {
             reasoning,
             tool_calls,
             dropped_reasoning_effort: dropped,
+            model_used,
         })
     }
 
@@ -264,10 +635,11 @@ impl Provider {
     /// {model, input}; accepts {summary}|{output}|{content} responses.
     pub async fn compact_server(&self, text: &str, model: &str) -> Result<String> {
         let body = json!({"model": model, "input": text});
+        let credential = self.credential().await?;
         let req = apply_headers(
             self.http.post(url(&self.cfg.base_url, "compact")),
             &self.cfg,
-            &self.api_key,
+            &credential,
         )
         .json(&body);
         let resp = req.send().await.context("POST /compact")?;
@@ -313,9 +685,22 @@ fn parse_models(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn is_model_error(status: u16, text: &str) -> bool {
+    if status == 404 {
+        return true;
+    }
+    let t = text.to_lowercase();
+    t.contains("model")
+        && (t.contains("not found")
+            || t.contains("does not exist")
+            || t.contains("not available")
+            || t.contains("invalid model"))
+}
+
 fn is_unknown_param(text: &str) -> bool {
     let t = text.to_lowercase();
     t.contains("reasoning_effort")
+        || t.contains("reasoning")
         || t.contains("unknown")
         || t.contains("unrecognized")
         || t.contains("unsupported")
@@ -326,6 +711,9 @@ pub struct ProbeResult {
     pub models: Vec<String>,
     pub streaming: bool,
     pub tool_calling: bool,
+    /// True when native tool-calling failed but the prompt-based
+    /// fallback works (wizard then saves tool_mode = "prompt").
+    pub prompt_fallback: bool,
 }
 
 fn is_tool_choice_rejection(text: &str) -> bool {
@@ -334,28 +722,61 @@ fn is_tool_choice_rejection(text: &str) -> bool {
 }
 
 async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) -> Result<bool> {
-    let mut body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "Call the probe_ping tool now."}],
-        "tools": [tool],
-        "stream": false
-    });
-    if forced {
-        body["tool_choice"] = json!("required");
-    }
-    let (resp, _) = p.post_chat_flagged(&mut body, None).await?;
+    let mut body = if p.cfg.responses() {
+        let mut b = json!({
+            "model": model,
+            "input": responses_input(&[json!({"role": "user", "content": "Call the probe_ping tool now."})]),
+            "tools": responses_tools(std::slice::from_ref(tool)),
+            "stream": false
+        });
+        if forced {
+            b["tool_choice"] = json!("required");
+        }
+        b
+    } else {
+        let mut b = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Call the probe_ping tool now."}],
+            "tools": [tool],
+            "stream": false
+        });
+        if forced {
+            b["tool_choice"] = json!("required");
+        }
+        b
+    };
+    let (resp, _, _) = p.post_provider(&mut body, None, false).await?;
     let v: Value = resp.json().await.context("parse probe response")?;
+    if p.cfg.responses() {
+        return Ok(!responses_tool_calls(&v).is_empty());
+    }
     Ok(v["choices"][0]["message"]["tool_calls"]
         .as_array()
         .map(|a| !a.is_empty())
         .unwrap_or(false))
 }
 
+async fn probe_prompt_tool_call(p: &Provider, model: &str, tool: &Value) -> Result<bool> {
+    let instr = prompt_tool_instruction(std::slice::from_ref(tool));
+    let text = p
+        .complete(
+            &[
+                json!({"role": "system", "content": format!("You are a tool-using agent.{instr}")}),
+                json!({"role": "user", "content": "Call the probe_ping tool now."}),
+            ],
+            model,
+            None,
+        )
+        .await?;
+    let (_, calls) = parse_prompt_tool_calls(&text);
+    Ok(calls.iter().any(|c| c.name == "probe_ping"))
+}
+
 /// Probe (SPEC §4.3): connectivity via /models, then a required tool-call.
 /// Thinking-mode endpoints reject a forced `tool_choice`, so on that
-/// specific 400 the probe retries with `tool_choice` omitted (the model
-/// may still call the tool voluntarily). Errors only on connectivity;
-/// tool-calling support is reported in the result.
+/// specific 400 the probe retries with `tool_choice` omitted. If native
+/// tool-calling still fails, the prompt-based fallback is probed; success
+/// there sets `prompt_fallback` so onboarding can save tool_mode=prompt.
 pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<ProbeResult> {
     let p = Provider::new(cfg.clone(), api_key.to_string())?;
     let models = p.list_models().await.unwrap_or_default();
@@ -367,18 +788,56 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
             "parameters": {"type": "object", "properties": {}}
         }
     });
-    let tool_calling = match probe_tool_call(&p, model, &tool, true).await {
-        Ok(v) => v,
+    if cfg.prompt_tools() {
+        let ok = probe_prompt_tool_call(&p, model, &tool).await?;
+        return Ok(ProbeResult {
+            models,
+            streaming: true,
+            tool_calling: ok,
+            prompt_fallback: ok,
+        });
+    }
+    let native = match probe_tool_call(&p, model, &tool, true).await {
+        Ok(v) => Ok(v),
         Err(e) if is_tool_choice_rejection(&e.to_string()) => {
-            probe_tool_call(&p, model, &tool, false).await?
+            probe_tool_call(&p, model, &tool, false).await
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     };
-    Ok(ProbeResult {
-        models,
-        streaming: true,
-        tool_calling,
-    })
+    match native {
+        Ok(true) => Ok(ProbeResult {
+            models,
+            streaming: true,
+            tool_calling: true,
+            prompt_fallback: false,
+        }),
+        Ok(false) => {
+            let ok = probe_prompt_tool_call(&p, model, &tool)
+                .await
+                .unwrap_or(false);
+            Ok(ProbeResult {
+                models,
+                streaming: true,
+                tool_calling: ok,
+                prompt_fallback: ok,
+            })
+        }
+        Err(e) => {
+            if probe_prompt_tool_call(&p, model, &tool)
+                .await
+                .unwrap_or(false)
+            {
+                Ok(ProbeResult {
+                    models,
+                    streaming: true,
+                    tool_calling: true,
+                    prompt_fallback: true,
+                })
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 // --- Blocking wrappers for the synchronous TUI wizard (§10.1). ---

@@ -5,9 +5,9 @@
 //! a truncated SHA-256 of the key, so the relay cannot read traffic or
 //! derive the key from the room it routes.
 
-use anyhow::{anyhow, Context, Result};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -87,6 +87,12 @@ pub async fn connect_once(
     secret: &str,
     shutdown: &CancellationToken,
 ) -> Result<()> {
+    // The workspace enables both ring and aws-lc-rs via other deps, so
+    // rustls cannot pick a process provider itself (it panics on wss://).
+    static CRYPTO: std::sync::Once = std::sync::Once::new();
+    CRYPTO.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
     let key = key_from_secret(secret)?;
     let url = relay_ws_url(base_url, secret)?;
     let (ws, _resp) = tokio_tungstenite::connect_async(&url)

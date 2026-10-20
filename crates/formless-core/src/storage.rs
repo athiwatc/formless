@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use formless_protocol::{
-    MessageInfo, SearchHit, SessionInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
+    MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, ToolInfo, ToolMetricsInfo,
+    ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection};
@@ -118,6 +119,64 @@ CREATE TABLE IF NOT EXISTS optimiser_attempts (
 CREATE INDEX IF NOT EXISTS idx_attempts_tool ON optimiser_attempts(tool_id, created_at);
 ";
 
+const SCHEMA_V4: &str = "
+CREATE TABLE IF NOT EXISTS modules (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, name_lower TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '', retired INTEGER NOT NULL DEFAULT 0,
+  current_version INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS module_versions (
+  id TEXT PRIMARY KEY, module_id TEXT NOT NULL REFERENCES modules(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL, code TEXT NOT NULL,
+  author TEXT NOT NULL DEFAULT 'agent', created_at TEXT NOT NULL, UNIQUE(module_id, version));
+";
+
+const SCHEMA_V5: &str = "
+CREATE TABLE IF NOT EXISTS prompt_proposals (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, content TEXT NOT NULL,
+  rationale TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'proposed',
+  baseline_score REAL, candidate_score REAL, eval_total INTEGER NOT NULL DEFAULT 0,
+  est_tokens INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, applied_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_proposals_status ON prompt_proposals(status, created_at);
+";
+
+const SCHEMA_V6: &str = "
+CREATE TABLE IF NOT EXISTS model_stats (
+  model TEXT PRIMARY KEY, successes INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0, total_ms INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL);
+";
+
+const SCHEMA_V7: &str = "
+CREATE TABLE IF NOT EXISTS session_tools (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  tool_id TEXT NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+  source TEXT NOT NULL DEFAULT 'found', loaded_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, tool_id));
+";
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModelStat {
+    pub model: String,
+    pub successes: i64,
+    pub failures: i64,
+    pub total_ms: i64,
+}
+
+impl ModelStat {
+    pub fn samples(&self) -> i64 {
+        self.successes + self.failures
+    }
+    pub fn success_rate(&self) -> Option<f64> {
+        let n = self.samples();
+        (n > 0).then_some(self.successes as f64 / n as f64)
+    }
+    pub fn avg_ms(&self) -> Option<f64> {
+        let n = self.samples();
+        (n > 0).then_some(self.total_ms as f64 / n as f64)
+    }
+}
+
 fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -147,6 +206,22 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
         );
         conn.execute_batch(SCHEMA_V3)?;
         conn.execute_batch("PRAGMA user_version=3;")?;
+    }
+    if version < 4 {
+        conn.execute_batch(SCHEMA_V4)?;
+        conn.execute_batch("PRAGMA user_version=4;")?;
+    }
+    if version < 5 {
+        conn.execute_batch(SCHEMA_V5)?;
+        conn.execute_batch("PRAGMA user_version=5;")?;
+    }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6)?;
+        conn.execute_batch("PRAGMA user_version=6;")?;
+    }
+    if version < 7 {
+        conn.execute_batch(SCHEMA_V7)?;
+        conn.execute_batch("PRAGMA user_version=7;")?;
     }
     Ok(())
 }
@@ -696,6 +771,294 @@ impl Store {
         Ok(out)
     }
 
+    fn module_info(&self, id: &str) -> Result<Option<ModuleInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id,name,description,current_version,retired,created_at,updated_at FROM modules WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(ModuleInfo {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        description: r.get(2)?,
+                        current_version: r.get(3)?,
+                        retired: r.get::<_, i64>(4)? != 0,
+                        created_at: r.get(5)?,
+                        updated_at: r.get(6)?,
+                    })
+                },
+            )
+            .ok())
+    }
+
+    pub fn create_module_version(
+        &self,
+        name: &str,
+        description: &str,
+        code: &str,
+        author: &str,
+    ) -> Result<(ModuleInfo, i64)> {
+        let lower = name.to_lowercase();
+        let existing: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT id, retired FROM modules WHERE name_lower=?1",
+                params![lower],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok();
+        let t = now();
+        let (module_id, version) = match existing {
+            Some((_, 1)) => {
+                return Err(anyhow::anyhow!(
+                    "a retired module named '{name}' exists; restore or purge it first"
+                ))
+            }
+            Some((mid, _)) => {
+                let v: i64 = self.conn.query_row(
+                    "SELECT COALESCE(MAX(version),0)+1 FROM module_versions WHERE module_id=?1",
+                    params![mid],
+                    |r| r.get(0),
+                )?;
+                (mid, v)
+            }
+            None => {
+                let mid = uuid::Uuid::new_v4().to_string();
+                self.conn.execute(
+                    "INSERT INTO modules(id,name,name_lower,description,current_version,created_at,updated_at) VALUES(?1,?2,?3,?4,0,?5,?5)",
+                    params![mid, name, lower, description, t],
+                )?;
+                (mid, 1)
+            }
+        };
+        self.conn.execute(
+            "INSERT INTO module_versions(id,module_id,version,code,author,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![uuid::Uuid::new_v4().to_string(), module_id, version, code, author, t],
+        )?;
+        self.conn.execute(
+            "UPDATE modules SET description=?2, current_version=?3, updated_at=?4 WHERE id=?1",
+            params![module_id, description, version, t],
+        )?;
+        Ok((
+            self.module_info(&module_id)?.context("module vanished")?,
+            version,
+        ))
+    }
+
+    pub fn get_module_by_name(&self, name: &str) -> Result<Option<(ModuleInfo, String)>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM modules WHERE name_lower=?1",
+                params![name.to_lowercase()],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(id) = id else { return Ok(None) };
+        let Some(info) = self.module_info(&id)? else {
+            return Ok(None);
+        };
+        let code: String = self.conn.query_row(
+            "SELECT code FROM module_versions WHERE module_id=?1 AND version=?2",
+            params![id, info.current_version],
+            |r| r.get(0),
+        )?;
+        Ok(Some((info, code)))
+    }
+
+    pub fn list_modules(&self) -> Result<Vec<ModuleInfo>> {
+        let ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM modules ORDER BY name_lower")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(info) = self.module_info(&id)? {
+                out.push(info);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Current code of every live module, for the runtime's `requireModule`.
+    pub fn list_module_code(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for info in self.list_modules()? {
+            if info.retired {
+                continue;
+            }
+            if let Some((_, code)) = self.get_module_by_name(&info.name)? {
+                out.push((info.name, code));
+            }
+        }
+        Ok(out)
+    }
+
+    fn proposal_row(r: &rusqlite::Row) -> rusqlite::Result<PromptProposalInfo> {
+        Ok(PromptProposalInfo {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            content: r.get(2)?,
+            rationale: r.get(3)?,
+            status: r.get(4)?,
+            baseline_score: r.get(5)?,
+            candidate_score: r.get(6)?,
+            eval_total: r.get(7)?,
+            est_tokens: r.get(8)?,
+            created_at: r.get(9)?,
+            applied_at: r.get(10)?,
+        })
+    }
+
+    pub fn create_proposal(
+        &self,
+        kind: &str,
+        content: &str,
+        rationale: &str,
+        est_tokens: i64,
+    ) -> Result<PromptProposalInfo> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO prompt_proposals(id,kind,content,rationale,status,est_tokens,created_at) VALUES(?1,?2,?3,?4,'proposed',?5,?6)",
+            params![id, kind, content, rationale, est_tokens, now()],
+        )?;
+        self.get_proposal(&id)?.context("proposal vanished")
+    }
+
+    pub fn get_proposal(&self, id: &str) -> Result<Option<PromptProposalInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE id=?1",
+                params![id],
+                Self::proposal_row,
+            )
+            .ok())
+    }
+
+    pub fn list_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::proposal_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn applied_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
+        Ok(self
+            .list_proposals()?
+            .into_iter()
+            .filter(|p| p.status == "applied")
+            .rev()
+            .collect())
+    }
+
+    pub fn update_proposal_eval(
+        &self,
+        id: &str,
+        baseline: f64,
+        candidate: f64,
+        total: i64,
+    ) -> Result<Option<PromptProposalInfo>> {
+        self.conn.execute(
+            "UPDATE prompt_proposals SET status='measured', baseline_score=?2, candidate_score=?3, eval_total=?4 WHERE id=?1 AND status IN ('proposed','measured')",
+            params![id, baseline, candidate, total],
+        )?;
+        self.get_proposal(id)
+    }
+
+    /// Status transitions: apply (only from measured), reject, roll back
+    /// (only from applied). Returns the updated proposal if it applied.
+    pub fn set_proposal_status(
+        &self,
+        id: &str,
+        status: &str,
+    ) -> Result<Option<PromptProposalInfo>> {
+        let (from, applied) = match status {
+            "applied" => ("status='measured'", true),
+            "rejected" => ("status IN ('proposed','measured')", false),
+            "rolled_back" => ("status='applied'", false),
+            other => return Err(anyhow::anyhow!("unknown proposal status '{other}'")),
+        };
+        let changed = if applied {
+            self.conn.execute(
+                &format!("UPDATE prompt_proposals SET status='applied', applied_at=?2 WHERE id=?1 AND {from}"),
+                params![id, now()],
+            )?
+        } else {
+            self.conn.execute(
+                &format!("UPDATE prompt_proposals SET status=?2 WHERE id=?1 AND {from}"),
+                params![id, status],
+            )?
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_proposal(id)
+    }
+
+    /// Effective system prompt: frozen bootstrap + applied proposals as
+    /// versioned learned guidance/memory sections (oldest first).
+    pub fn effective_system_prompt(&self, base: &str) -> Result<String> {
+        let applied = self.applied_proposals()?;
+        if applied.is_empty() {
+            return Ok(base.to_string());
+        }
+        let mut out = base.to_string();
+        for (i, p) in applied.iter().enumerate() {
+            let label = if p.kind == "memory" {
+                "Learned memory"
+            } else {
+                "Learned guidance"
+            };
+            out.push_str(&format!("\n\n{label} (v{}): {}", i + 1, p.content.trim()));
+        }
+        Ok(out)
+    }
+
+    pub fn record_model_outcome(&self, model: &str, ok: bool, elapsed_ms: i64) -> Result<()> {
+        if model.trim().is_empty() || model.eq_ignore_ascii_case("auto") {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO model_stats(model,successes,failures,total_ms,updated_at) VALUES(?1,?2,?3,?4,?5) \
+             ON CONFLICT(model) DO UPDATE SET successes=successes+excluded.successes, failures=failures+excluded.failures, total_ms=total_ms+excluded.total_ms, updated_at=excluded.updated_at",
+            params![
+                model,
+                if ok { 1 } else { 0 },
+                if ok { 0 } else { 1 },
+                elapsed_ms.max(0),
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_model_stats(&self) -> Result<Vec<ModelStat>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT model,successes,failures,total_ms FROM model_stats ORDER BY model")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ModelStat {
+                    model: r.get(0)?,
+                    successes: r.get(1)?,
+                    failures: r.get(2)?,
+                    total_ms: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn tool_detail(&self, id: &str) -> Result<Option<formless_protocol::ToolDetail>> {
         let Some(tool) = self.tool_info(id)? else {
             return Ok(None);
@@ -729,6 +1092,63 @@ impl Store {
             metrics,
             optimiser_attempts,
         }))
+    }
+
+    /// Mark Tools as loaded into a Session's function list (SPEC §7.1).
+    /// `source` is `found`, `created` or `filler` (the most-used Tools
+    /// frozen in when the Session first listed a large registry).
+    pub fn load_session_tools(
+        &self,
+        session_id: &str,
+        tool_ids: &[String],
+        source: &str,
+    ) -> Result<()> {
+        for id in tool_ids {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, id, source, now()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Has this Session frozen its most-used filler Tools yet?
+    pub fn session_has_filler(&self, session_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_tools WHERE session_id=?1 AND source='filler')",
+            params![session_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Tools a Session has loaded: found or created there, or called there.
+    pub fn session_tool_ids(&self, session_id: &str) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_id FROM session_tools WHERE session_id=?1
+             UNION SELECT DISTINCT tool_id FROM invocations WHERE session_id=?1",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Most recent failed Invocations of a Tool: (version, tag, input, error).
+    pub fn recent_failures(
+        &self,
+        tool_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT version, tag, input, error FROM invocations
+             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![tool_id, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn set_tool_retired(&self, id: &str, retired: bool) -> Result<Option<ToolInfo>> {
@@ -891,6 +1311,11 @@ impl Store {
                 Some(durations[idx] as f64)
             }
         };
+        let sessions: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT session_id) FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2)",
+            params![tool_id, version],
+            |r| r.get(0),
+        )?;
         let denom = success + failure;
         Ok(ToolMetricsInfo {
             total,
@@ -911,6 +1336,7 @@ impl Store {
             },
             p50_ms: pct(0.50),
             p95_ms: pct(0.95),
+            sessions,
         })
     }
 

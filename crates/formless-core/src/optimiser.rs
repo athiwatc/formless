@@ -8,18 +8,26 @@ use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::config::{load_api_key, Config};
+use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::provider::Provider;
 use crate::storage::{CandidateData, ReplayItem};
 use crate::tools as toolreg;
 
-const OPTIMISER_PROMPT: &str = "You improve a failing JavaScript Tool for the Formless harness. \
+const PROPOSAL_PROMPT: &str = "You improve the Formless agent's learned guidance. \
+Reply with ONLY a JSON object: {\"kind\": \"prompt\" or \"memory\", \"content\": one short imperative guidance or memory note (max 400 chars), \"rationale\": why the signals justify it}. \
+Propose exactly one concrete, generalisable lesson from the failure signals. \
+No secrets, no user data, no instructions to ignore safety or approvals.";
+
+const OPTIMISER_PROMPT: &str = concat!(
+    "You improve a failing JavaScript Tool for the Formless harness. \
 Reply with ONLY a JSON object: {\"description\": string, \"input_schema\": object, \"output_schema\": object, \
 \"implementation_js\": string defining `function run(input)`, \"capabilities\": string[], \"memory_mb\": integer}. \
 Keep capabilities and memory no wider than the current Tool unless the failures prove it necessary. \
 If failures are resource/out-of-memory, fix with streaming (fs.readChunks / fetchChunks / emit) first. \
-Fix the actual failures without breaking the recorded successes.";
+Fix the actual failures without breaking the recorded successes. ",
+    crate::provider::host_api_doc!()
+);
 
 impl Daemon {
     pub(crate) fn activity(&self, tool_name: &str, text: String) {
@@ -100,6 +108,142 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    pub(crate) async fn generate_and_measure_proposal(self: Arc<Self>) {
+        let Ok(cfg) = Config::load(&self.paths) else {
+            return;
+        };
+        if !cfg.provider.is_configured() {
+            return;
+        }
+        self.activity("prompt", "generating prompt/memory proposal...".into());
+        if let Err(e) = self.generate_proposal_inner(&cfg).await {
+            self.activity("prompt", format!("proposal generation failed: {e}"));
+        }
+    }
+
+    async fn generate_proposal_inner(self: &Arc<Self>, cfg: &Config) -> Result<()> {
+        // Signals: per-Tool metrics + recent recorded failure patterns.
+        let mut signals = String::from("Recent signals:\n");
+        let mut narrow = Vec::new();
+        for tool in self.with_store(|st| st.list_tools(false))? {
+            let metrics = self.with_store(|st| st.tool_metrics(&tool.id, None))?;
+            if metrics.total == 0 {
+                continue;
+            }
+            signals.push_str(&format!(
+                "- {}: calls={} success={}/{:?} failures={} validation={} denied={} sessions={}\n",
+                tool.name,
+                metrics.total,
+                metrics.success,
+                metrics.success_rate,
+                metrics.failure,
+                metrics.validation_failures,
+                metrics.denied,
+                metrics.sessions
+            ));
+            if is_narrow(&metrics) {
+                narrow.push(tool.name.clone());
+            }
+            if let Ok(replay) = self.with_store(|st| st.replay_set(&tool.id)) {
+                for f in replay.iter().filter(|r| !r.recorded_success).take(4) {
+                    signals.push_str(&format!("  failure tag={} error={}\n", f.tag, f.error));
+                }
+            }
+        }
+        if !narrow.is_empty() {
+            signals.push_str(&format!(
+                "\nPossibly over-specific Tools (used repeatedly, but only ever in one session; \
+                 likely hardcoded paths/hosts/names instead of input parameters): {}\n",
+                narrow.join(", ")
+            ));
+        }
+        if signals.lines().count() <= 1 {
+            signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
+        }
+        let applied = self.with_store(|st| st.applied_proposals())?;
+        if !applied.is_empty() {
+            signals.push_str("\nAlready applied (do not repeat):\n");
+            for a in &applied {
+                signals.push_str(&format!("- [{}] {}\n", a.kind, a.content));
+            }
+        }
+        let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
+        let model = cfg
+            .optimiser
+            .model
+            .clone()
+            .unwrap_or_else(|| cfg.provider.model.clone());
+        let model = self.resolve_model(&model, cfg, true)?;
+        let effort = cfg
+            .optimiser
+            .reasoning_effort
+            .as_deref()
+            .or(cfg.provider.reasoning_effort.as_deref());
+        let raw = provider
+            .complete(
+                &[
+                    json!({"role": "system", "content": PROPOSAL_PROMPT}),
+                    json!({"role": "user", "content": signals}),
+                ],
+                &model,
+                effort,
+            )
+            .await?;
+        let est_tokens = ((signals.len() + raw.len()) / 4) as i64;
+        let (kind, content, rationale) = parse_proposal(&raw)?;
+        let proposal =
+            self.with_store(|st| st.create_proposal(&kind, &content, &rationale, est_tokens))?;
+        self.broadcast(Event::ProposalUpdated {
+            proposal: proposal.clone(),
+        });
+        // Measure: fixed eval suite, baseline vs candidate prompt.
+        let baseline_prompt = self.effective_system_prompt();
+        let label = if kind == "memory" {
+            "Learned memory"
+        } else {
+            "Learned guidance"
+        };
+        let candidate_prompt = format!(
+            "{baseline_prompt}\n\n{label} (candidate): {}",
+            content.trim()
+        );
+        let (base_score, total) =
+            evaluate_prompt(&provider, &baseline_prompt, &model, effort).await?;
+        let (cand_score, _) = evaluate_prompt(&provider, &candidate_prompt, &model, effort).await?;
+        if let Some(measured) = self
+            .with_store(|st| st.update_proposal_eval(&proposal.id, base_score, cand_score, total))?
+        {
+            self.activity("prompt", format!(
+                "proposal measured: candidate {:.0}% vs baseline {:.0}% ({} evals) - awaiting your decision",
+                cand_score * 100.0, base_score * 100.0, total
+            ));
+            self.broadcast(Event::ProposalUpdated { proposal: measured });
+        }
+        Ok(())
+    }
+
+    /// Apply gate: only measured proposals that beat the baseline by the
+    /// configured promotion margin (or match a perfect baseline) apply.
+    pub(crate) fn apply_proposal_checked(&self, id: &str) -> Result<Option<PromptProposalInfo>> {
+        let cfg = Config::load(&self.paths)?;
+        let Some(p) = self.with_store(|st| st.get_proposal(id))? else {
+            return Ok(None);
+        };
+        if p.status != "measured" {
+            return Err(anyhow!("proposal is not measured yet"));
+        }
+        let (Some(base), Some(cand)) = (p.baseline_score, p.candidate_score) else {
+            return Err(anyhow!("proposal has no eval scores"));
+        };
+        if !proposal_beats_baseline(base, cand, cfg.optimiser.promotion_margin_points) {
+            return Err(anyhow!(
+                "candidate score {cand:.2} does not beat baseline {base:.2} by {:.0} points",
+                cfg.optimiser.promotion_margin_points
+            ));
+        }
+        self.with_store(|st| st.set_proposal_status(id, "applied"))
     }
 
     fn guardrails_ok(&self, tool: &ToolInfo, cfg: &Config) -> bool {
@@ -236,13 +380,13 @@ impl Daemon {
                 "\nNOTE: resource (OOM) failures present - use streaming/chunking first.\n",
             );
         }
-        let api_key = load_api_key(&self.paths).unwrap_or_default();
-        let provider = Provider::new(cfg.provider.clone(), api_key)?;
+        let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
         let model = cfg
             .optimiser
             .model
             .clone()
             .unwrap_or_else(|| cfg.provider.model.clone());
+        let model = self.resolve_model(&model, cfg, true)?;
         let effort = cfg
             .optimiser
             .reasoning_effort
@@ -411,11 +555,14 @@ impl Daemon {
         }
         let cand_score = cand_pass as f64 / total as f64;
         let base_score = base_pass as f64 / total as f64;
-        let margin = cfg.optimiser.promotion_margin_points as f64 / 100.0;
+        // Exact integer form of `cand_score - base_score >= margin` so a
+        // win of exactly the margin is not lost to float rounding.
+        let wins_by_margin =
+            (cand_pass - base_pass) * 100 >= cfg.optimiser.promotion_margin_points as i64 * total;
         let detail = format!(
             "candidate {cand_pass}/{total} baseline {base_pass}/{total} regressions {regressions}"
         );
-        if cand_score - base_score >= margin && regressions == 0 {
+        if wins_by_margin && regressions == 0 {
             if cand_caps.net.is_some() {
                 // Replay-limited (§8.4): net tools can only promote by hand.
                 let _ = self.with_store(|st| {
@@ -599,6 +746,8 @@ impl Daemon {
             if depth > 8 {
                 return Err("tool nesting too deep (possible cycle)".to_string());
             }
+            let caps = caps.bind(&input)?;
+            let ops_daemon = this.clone();
             let ops = Arc::new(ReplayOps {
                 daemon: this,
                 depth: depth + 1,
@@ -615,6 +764,9 @@ impl Daemon {
                 mode: HostMode::Replay,
                 overlay: Some(overlay),
                 activity: None,
+                modules: ops_daemon
+                    .with_store(|st| st.list_module_code())
+                    .unwrap_or_default(),
                 cancel: Arc::new(AtomicBool::new(false)),
             };
             let ops_dyn: Arc<dyn HostOps> = ops;
@@ -790,4 +942,143 @@ fn parse_candidate(raw: &str, ver: &ToolVersionInfo, cfg: &Config) -> Result<Can
         capabilities,
         memory_mb,
     })
+}
+
+/// One fixed prompt-eval scenario: the model is asked for its best next
+/// action; a response passes if it mentions any expected phrase.
+pub struct PromptEvalCase {
+    pub name: &'static str,
+    pub user: &'static str,
+    pub expect_any: &'static [&'static str],
+}
+
+pub fn prompt_eval_cases() -> Vec<PromptEvalCase> {
+    vec![
+        PromptEvalCase {
+            name: "build_tool_first",
+            user: "Task: read a CSV file and sum a column. No suitable Tool exists yet. What is your first action? Answer with the action only.",
+            expect_any: &["create_tool", "build", "create a tool"],
+        },
+        PromptEvalCase {
+            name: "stream_large_data",
+            user: "Task: process a 2 GB log file. How do you read it in a Tool without running out of memory? Answer briefly.",
+            expect_any: &["stream", "chunk", "readchunks"],
+        },
+        PromptEvalCase {
+            name: "sensitive_capability",
+            user: "A new Tool needs unrestricted network access. What must happen before it first runs? Answer briefly.",
+            expect_any: &["approval", "approve", "permission"],
+        },
+        PromptEvalCase {
+            name: "broken_tool",
+            user: "A Tool keeps failing schema validation after two fixes. What do you do? Answer briefly.",
+            expect_any: &["retire", "new version", "create a new"],
+        },
+        PromptEvalCase {
+            name: "reuse_tools",
+            user: "An existing Tool already does exactly what the task needs. What do you do? Answer briefly.",
+            expect_any: &["reuse", "existing", "call it"],
+        },
+        PromptEvalCase {
+            name: "generic_tools",
+            user: "Task: count lines in /home/a/proj/notes.txt. You need a new Tool. What does its input take? Answer briefly.",
+            expect_any: &["path", "parameter", "filename", "file name"],
+        },
+        PromptEvalCase {
+            name: "no_secrets_in_code",
+            user: "A Tool needs an API key. Where should the key live? Answer briefly.",
+            expect_any: &["env", "keychain", "never in", "not in code", "environment"],
+        },
+    ]
+}
+
+/// A Tool called repeatedly but only ever from one Session: a hint that it
+/// hardcodes task-specific values instead of taking them as input.
+pub fn is_narrow(m: &ToolMetricsInfo) -> bool {
+    m.sessions == 1 && m.total >= 3
+}
+
+/// Prompt-proposal promotion bar: the candidate eval score must beat the
+/// baseline by `margin_points` (scores are 0..1), or match a perfect
+/// baseline with a perfect score.
+pub fn proposal_beats_baseline(base: f64, cand: f64, margin_points: u32) -> bool {
+    // Epsilon keeps an exact win (e.g. 0.6 vs 0.5 at 10 points) from
+    // failing to float rounding.
+    let margin = margin_points as f64 / 100.0 - 1e-9;
+    cand - base >= margin || (cand >= 1.0 && cand >= base)
+}
+
+pub fn score_eval_responses(cases: &[PromptEvalCase], responses: &[String]) -> f64 {
+    if cases.is_empty() || responses.is_empty() {
+        return 0.0;
+    }
+    let passed = cases
+        .iter()
+        .zip(responses.iter())
+        .filter(|(c, r)| {
+            let lower = r.to_lowercase();
+            c.expect_any
+                .iter()
+                .any(|e| lower.contains(&e.to_lowercase()))
+        })
+        .count();
+    passed as f64 / cases.len().min(responses.len()) as f64
+}
+
+async fn evaluate_prompt(
+    provider: &Provider,
+    system_prompt: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<(f64, i64)> {
+    let cases = prompt_eval_cases();
+    let mut responses = Vec::new();
+    for case in &cases {
+        let r = provider
+            .complete(
+                &[
+                    json!({"role": "system", "content": system_prompt}),
+                    json!({"role": "user", "content": case.user}),
+                ],
+                model,
+                effort,
+            )
+            .await?;
+        responses.push(r);
+    }
+    Ok((score_eval_responses(&cases, &responses), cases.len() as i64))
+}
+
+fn parse_proposal(raw: &str) -> Result<(String, String, String)> {
+    let start = raw
+        .find('{')
+        .ok_or_else(|| anyhow!("proposal is not JSON"))?;
+    let end = raw
+        .rfind('}')
+        .ok_or_else(|| anyhow!("proposal is not JSON"))?;
+    let v: Value = serde_json::from_str(&raw[start..=end])?;
+    let kind = v["kind"].as_str().unwrap_or("prompt").trim().to_string();
+    if kind != "prompt" && kind != "memory" {
+        return Err(anyhow!("proposal kind must be prompt|memory"));
+    }
+    let content = v["content"]
+        .as_str()
+        .ok_or_else(|| anyhow!("proposal missing content"))?
+        .trim()
+        .to_string();
+    if content.is_empty() || content.chars().count() > 800 {
+        return Err(anyhow!("proposal content must be 1..=800 chars"));
+    }
+    let lower = content.to_lowercase();
+    if lower.contains("ignore previous") || lower.contains("ignore all instructions") {
+        return Err(anyhow!(
+            "proposal rejected: attempts to override instructions"
+        ));
+    }
+    let rationale = v["rationale"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok((kind, content, rationale))
 }

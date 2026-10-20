@@ -9,13 +9,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{load_api_key, Config};
+use crate::config::{Config, ProviderCfg};
 use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
 use crate::storage::{build_context, Store};
 use crate::tools as toolreg;
 use crate::Paths;
 
-type Subs = Arc<Mutex<Vec<mpsc::UnboundedSender<ServerMessage>>>>;
+// A std mutex (never held across .await) so broadcast() sends synchronously
+// and every subscriber sees events in emission order.
+type Subs = Arc<StdMutex<Vec<mpsc::UnboundedSender<ServerMessage>>>>;
 type ExecFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = std::result::Result<(Value, String), String>> + Send>,
 >;
@@ -29,6 +31,13 @@ pub(crate) struct PendingEntry {
     stalled_noted: AtomicBool,
     activity: Arc<std::sync::atomic::AtomicU64>,
     notify: tokio::sync::Notify,
+}
+
+/// Fan an event out to every live subscriber, dropping disconnected ones.
+fn send_all(subs: &Subs, ev: Event) {
+    subs.lock()
+        .unwrap()
+        .retain(|tx| tx.send(ServerMessage::Event(ev.clone())).is_ok());
 }
 
 pub(crate) fn epoch_ms() -> u64 {
@@ -69,17 +78,13 @@ impl Daemon {
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
-            subs: Arc::new(Mutex::new(Vec::new())),
+            subs: Arc::new(StdMutex::new(Vec::new())),
             shutdown: CancellationToken::new(),
         })
     }
 
     pub(crate) fn broadcast(&self, ev: Event) {
-        let subs = self.subs.clone();
-        tokio::spawn(async move {
-            let mut guard = subs.lock().await;
-            guard.retain(|tx| tx.send(ServerMessage::Event(ev.clone())).is_ok());
-        });
+        send_all(&self.subs, ev);
     }
 
     pub(crate) fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
@@ -92,10 +97,23 @@ impl Daemon {
             Request::Ping => Ok(json!({"pong": true, "protocol": PROTOCOL_VERSION})),
             Request::Status => {
                 let sessions = self.with_store(|s| Ok(s.list_sessions()?.len()))?;
-                Ok(
-                    json!({"protocol": PROTOCOL_VERSION, "sessions": sessions, "pid": std::process::id()}),
-                )
+                let auth = Config::load(&self.paths).map(|cfg| {
+                    let status = crate::auth::auth_status(&self.paths, &cfg.provider);
+                    json!({
+                        "mode": status.mode,
+                        "credential_present": status.credential_present,
+                        "has_refresh_token": status.has_refresh_token,
+                        "expires_at": status.expires_at,
+                    })
+                });
+                Ok(json!({
+                    "protocol": PROTOCOL_VERSION,
+                    "sessions": sessions,
+                    "pid": std::process::id(),
+                    "auth": auth.ok(),
+                }))
             }
+            Request::GetSettings => Ok(Config::load(&self.paths)?.settings_summary(&self.paths)),
             Request::Shutdown => {
                 let token = self.shutdown.clone();
                 tokio::spawn(async move {
@@ -196,6 +214,29 @@ impl Daemon {
             Request::ListTools => Ok(serde_json::to_value(
                 self.with_store(|s| s.list_tools(true))?,
             )?),
+            Request::ListModules => Ok(serde_json::to_value(
+                self.with_store(|s| s.list_modules())?,
+            )?),
+            Request::UpdateToolCode { id, code } => {
+                // In-TUI editor save: a new immutable version with the same
+                // schemas/capabilities/memory as the current version, run
+                // through the same syntax + smoke gate as agent edits.
+                let (info, ver) = self
+                    .with_store(|st| st.get_tool_current(&id))?
+                    .context("tool not found")?;
+                let cfg = Config::load(&self.paths)?;
+                let args = json!({
+                    "name": info.name,
+                    "description": info.description,
+                    "input_schema": serde_json::from_str::<Value>(&ver.input_schema).unwrap_or_else(|_| json!({"type":"object"})),
+                    "output_schema": serde_json::from_str::<Value>(&ver.output_schema).unwrap_or_else(|_| json!({"type":"object"})),
+                    "implementation_js": code,
+                    "capabilities": ver.capabilities,
+                    "memory_mb": ver.memory_mb,
+                });
+                let (info, version, _) = self.create_tool_as(&args, &cfg, "user").await?;
+                Ok(json!({"tool": info, "version": version}))
+            }
             Request::GetTool { id } => {
                 let d = self
                     .with_store(|st| st.tool_detail(&id))?
@@ -338,6 +379,56 @@ impl Daemon {
                     this.run_optimiser_now(tool_id).await;
                 });
                 Ok(json!({"started": true}))
+            }
+            Request::ListProposals => Ok(serde_json::to_value(
+                self.with_store(|s| s.list_proposals())?,
+            )?),
+            Request::ListModelStats => {
+                let stats: Vec<ModelStatInfo> = self
+                    .with_store(|s| s.list_model_stats())?
+                    .into_iter()
+                    .map(|s| ModelStatInfo {
+                        model: s.model,
+                        successes: s.successes,
+                        failures: s.failures,
+                        total_ms: s.total_ms,
+                    })
+                    .collect();
+                Ok(serde_json::to_value(stats)?)
+            }
+            Request::GenerateProposal => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.generate_and_measure_proposal().await;
+                });
+                Ok(json!({"started": true}))
+            }
+            Request::ProposalDecision { id, approved } => {
+                let status = if approved { "applied" } else { "rejected" };
+                // Applying requires a measured improvement (gate in optimiser
+                // module checks scores before this status transition).
+                let p = if approved {
+                    self.apply_proposal_checked(&id)?
+                } else {
+                    self.with_store(|st| st.set_proposal_status(&id, status))?
+                }
+                .context("proposal not found or not in an actionable state")?;
+                let _ = self
+                    .with_store(|st| st.audit("user", &format!("proposal.{status}"), &p.content));
+                self.broadcast(Event::ProposalUpdated {
+                    proposal: p.clone(),
+                });
+                Ok(serde_json::to_value(p)?)
+            }
+            Request::RollbackProposal { id } => {
+                let p = self
+                    .with_store(|st| st.set_proposal_status(&id, "rolled_back"))?
+                    .context("proposal not found or not applied")?;
+                let _ = self.with_store(|st| st.audit("user", "proposal.rolled_back", &p.content));
+                self.broadcast(Event::ProposalUpdated {
+                    proposal: p.clone(),
+                });
+                Ok(serde_json::to_value(p)?)
             }
             Request::ApprovalDecision {
                 approval_id,
@@ -508,15 +599,40 @@ impl Daemon {
                 "provider not configured; run the onboarding wizard"
             ));
         }
-        let api_key = load_api_key(&self.paths).unwrap_or_default();
-        let provider = Provider::new(cfg.provider.clone(), api_key)?;
+        let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
         let session = self
             .with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
-        let model = session
+        let requested_model = session
             .model
             .clone()
             .unwrap_or_else(|| cfg.provider.model.clone());
+        let (context_chars, tool_count) = self.with_store(|st| {
+            let chars = st
+                .list_messages(session_id)
+                .map(|msgs| {
+                    msgs.iter()
+                        .map(|m| m.content.chars().count())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+            let tools = toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                .map(|d| d.len())
+                .unwrap_or(0);
+            anyhow::Ok((chars, tools))
+        })?;
+        let complex = crate::routing::is_complex_task(
+            context_chars,
+            tool_count,
+            cfg.provider.routing_complex_chars,
+        );
+        let model = self.resolve_model(&requested_model, &cfg, complex)?;
+        if ProviderCfg::is_auto_model(&requested_model) {
+            self.broadcast(Event::Note {
+                session_id: Some(session_id.to_string()),
+                text: format!("Routed to model {model} (measured auto-selection)."),
+            });
+        }
         let effort = session
             .reasoning_effort
             .clone()
@@ -536,17 +652,20 @@ impl Daemon {
             }
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
+            let prompt = self.effective_system_prompt();
             let ctx = self.with_store(|st| {
                 build_context(
                     st,
                     session_id,
-                    SYSTEM_PROMPT,
+                    &prompt,
                     context_tokens,
                     cfg.compaction.fraction(),
                 )
                 .map(|(c, _, _)| c)
             })?;
-            let defs = self.with_store(toolreg::tool_definitions)?;
+            let defs = self.with_store(|st| {
+                toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+            })?;
             let (sid, rid) = (session_id.to_string(), run_id.to_string());
             let subs = self.subs.clone();
             let chat_fut = provider.chat_stream(
@@ -568,22 +687,31 @@ impl Daemon {
                             delta: delta.to_string(),
                         },
                     };
-                    let subs2 = subs.clone();
-                    tokio::spawn(async move {
-                        let mut g = subs2.lock().await;
-                        g.retain(|tx| tx.send(ServerMessage::Event(ev.clone())).is_ok());
-                    });
+                    send_all(&subs, ev);
                 },
             );
             let mut chat_fut = std::pin::pin!(chat_fut);
-            let result = tokio::select! {
-                r = &mut chat_fut => r?,
+            let started = std::time::Instant::now();
+            let outcome = tokio::select! {
+                r = &mut chat_fut => r,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(cfg.tools.pending_threshold_secs)) => {
                     self.broadcast(Event::Note {
                         session_id: Some(session_id.to_string()),
                         text: "Provider request still pending; waiting (not terminated).".into(),
                     });
-                    (&mut chat_fut).await?
+                    (&mut chat_fut).await
+                }
+            };
+            let result = match outcome {
+                Ok(r) => {
+                    self.record_model_outcome(&r.model_used, true, started);
+                    r
+                }
+                Err(e) => {
+                    if !cancel.is_cancelled() {
+                        self.record_model_outcome(&model, false, started);
+                    }
+                    return Err(e);
                 }
             };
             if result.dropped_reasoning_effort {
@@ -657,38 +785,9 @@ impl Daemon {
                 session_id: session_id.to_string(),
                 message: call_msg,
             });
-            // Approval pre-pass: one prompt per unapproved sensitive Tool in
-            // the batch, before anything runs (SPEC §5.2/§10.3).
-            let mut denied: HashMap<String, bool> = HashMap::new();
-            for tc in &result.tool_calls {
-                if tc.name == toolreg::CREATE_TOOL || tc.name == toolreg::RETIRE_TOOL {
-                    continue;
-                }
-                if let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? {
-                    if !self
-                        .ensure_approval(&cfg, session_id, &info, &ver, cancel)
-                        .await
-                    {
-                        denied.insert(info.id.clone(), true);
-                        let caps = Capabilities::parse(&ver.capabilities).unwrap_or_default();
-                        let _ = caps;
-                        self.record_inv(
-                            &info,
-                            ver.version,
-                            session_id,
-                            run_id,
-                            None,
-                            "denied",
-                            "approval",
-                            &tc.arguments,
-                            "",
-                            "approval denied",
-                            0,
-                            &cfg,
-                        );
-                    }
-                }
-            }
+            let denied = self
+                .approve_calls(&cfg, session_id, run_id, &result.tool_calls, cancel)
+                .await?;
             // Execute the batch in parallel (isolated sandboxes).
             let mut futs = Vec::new();
             for tc in &result.tool_calls {
@@ -724,6 +823,57 @@ impl Daemon {
         }
     }
 
+    /// Approval pre-pass (SPEC §5.2/§10.3): one prompt per unapproved
+    /// sensitive registry Tool call in a batch, before anything runs.
+    /// Keyed by call id: input-bound scopes differ per call. Every path that
+    /// dispatches model tool calls (main loop, sub-agents, direct calls)
+    /// goes through here, because dispatch itself treats calls as approved.
+    async fn approve_calls(
+        self: &Arc<Self>,
+        cfg: &Config,
+        session_id: &str,
+        run_id: &str,
+        calls: &[ToolCall],
+        cancel: &CancellationToken,
+    ) -> Result<HashMap<String, bool>> {
+        let mut denied: HashMap<String, bool> = HashMap::new();
+        for tc in calls {
+            if toolreg::is_builtin(&tc.name) {
+                continue;
+            }
+            if let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? {
+                // Unbindable input fails at execution with a clear error.
+                let Ok(caps) = serde_json::from_str::<Value>(&tc.arguments)
+                    .map_err(|e| e.to_string())
+                    .and_then(|input| bound_caps(&ver, &input))
+                else {
+                    continue;
+                };
+                if !self
+                    .ensure_approval(cfg, session_id, &info, &ver, &caps, cancel)
+                    .await
+                {
+                    denied.insert(tc.id.clone(), true);
+                    self.record_inv(
+                        &info,
+                        ver.version,
+                        session_id,
+                        run_id,
+                        None,
+                        "denied",
+                        "approval",
+                        &tc.arguments,
+                        "",
+                        "approval denied",
+                        0,
+                        cfg,
+                    );
+                }
+            }
+        }
+        Ok(denied)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_call(
         self: &Arc<Self>,
@@ -734,6 +884,22 @@ impl Daemon {
         cancel_flag: &Arc<AtomicBool>,
         cancel: &CancellationToken,
         denied: &HashMap<String, bool>,
+    ) -> String {
+        self.dispatch_call_inner(session_id, run_id, tc, cfg, cancel_flag, cancel, denied, 0)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_call_inner(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+        tc: &ToolCall,
+        cfg: &Config,
+        cancel_flag: &Arc<AtomicBool>,
+        cancel: &CancellationToken,
+        denied: &HashMap<String, bool>,
+        agent_depth: usize,
     ) -> String {
         let args: Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
@@ -748,14 +914,7 @@ impl Daemon {
         };
         // Bootstrap/meta tools don't pass through execute_tool_value, so
         // broadcast their lifecycle here (registry Tools broadcast there).
-        let bootstrap = matches!(
-            tc.name.as_str(),
-            toolreg::CREATE_TOOL
-                | toolreg::RETIRE_TOOL
-                | toolreg::AWAIT_INVOCATION
-                | toolreg::CHECK_INVOCATION
-                | toolreg::ABANDON_INVOCATION
-        );
+        let bootstrap = toolreg::is_builtin(&tc.name);
         let started = std::time::Instant::now();
         if bootstrap {
             self.broadcast(Event::ToolCallStarted {
@@ -768,8 +927,39 @@ impl Daemon {
         }
         let text = match tc.name.as_str() {
             toolreg::CREATE_TOOL => match self.create_tool_impl(&args, cfg).await {
-                Ok(text) => text,
+                Ok((text, tool_id)) => {
+                    let _ = self
+                        .with_store(|st| st.load_session_tools(session_id, &[tool_id], "created"));
+                    text
+                }
                 Err(e) => format!("error: create_tool failed: {e}"),
+            },
+            toolreg::FIND_TOOLS => match self.find_tools_impl(session_id, &args) {
+                Ok(text) => text,
+                Err(e) => format!("error: find_tools failed: {e}"),
+            },
+            toolreg::READ_TOOL => match self.read_tool_impl(&args) {
+                Ok(text) => text,
+                Err(e) => format!("error: read_tool failed: {e}"),
+            },
+            toolreg::TEST_TOOL => match self
+                .test_tool_impl(
+                    session_id,
+                    run_id,
+                    &args,
+                    cfg,
+                    cancel_flag,
+                    cancel,
+                    agent_depth,
+                )
+                .await
+            {
+                Ok(text) => text,
+                Err(e) => format!("error: test_tool failed: {e}"),
+            },
+            toolreg::CREATE_MODULE => match self.create_module_impl(&args, cfg).await {
+                Ok(text) => text,
+                Err(e) => format!("error: create_module failed: {e}"),
             },
             toolreg::RETIRE_TOOL => {
                 let name = args["name"].as_str().unwrap_or_default();
@@ -836,13 +1026,20 @@ impl Daemon {
             }
             name => {
                 // Denied in the approval pre-pass?
-                if let Ok(Some((info, _))) = self.with_store(|st| st.get_tool_by_name(name)) {
-                    if denied.contains_key(&info.id) {
-                        return format!("error: user denied approval for tool '{name}'");
-                    }
+                if denied.contains_key(&tc.id) {
+                    return format!("error: user denied approval for tool '{name}'");
                 }
-                self.dispatch_pending(session_id, run_id, name, args, cfg, cancel_flag, cancel)
-                    .await
+                self.dispatch_pending(
+                    session_id,
+                    run_id,
+                    name,
+                    args,
+                    cfg,
+                    cancel_flag,
+                    cancel,
+                    agent_depth,
+                )
+                .await
             }
         };
         if bootstrap {
@@ -855,6 +1052,50 @@ impl Daemon {
             });
         }
         text
+    }
+
+    /// Run one built-in or registry Tool call outside a model turn, as the
+    /// agent would (approvals fail closed without a client).
+    pub async fn call_tool_direct(
+        self: &Arc<Self>,
+        session_id: &str,
+        name: &str,
+        args: Value,
+    ) -> String {
+        let cfg = match Config::load(&self.paths) {
+            Ok(c) => c,
+            Err(e) => return format!("error: {e}"),
+        };
+        let tc = ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            arguments: args.to_string(),
+        };
+        let cancel = CancellationToken::new();
+        let denied = match self
+            .approve_calls(
+                &cfg,
+                session_id,
+                "direct",
+                std::slice::from_ref(&tc),
+                &cancel,
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => return format!("error: {e}"),
+        };
+        self.dispatch_call_inner(
+            session_id,
+            "direct",
+            &tc,
+            &cfg,
+            &Arc::new(AtomicBool::new(false)),
+            &cancel,
+            &denied,
+            0,
+        )
+        .await
     }
 
     fn pending_get(&self, handle: &str) -> Option<Arc<PendingEntry>> {
@@ -898,6 +1139,7 @@ impl Daemon {
         cfg: &Config,
         cancel_flag: &Arc<AtomicBool>,
         cancel: &CancellationToken,
+        agent_depth: usize,
     ) -> String {
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
@@ -924,7 +1166,7 @@ impl Daemon {
             tokio::spawn(async move {
                 let res = this
                     .clone()
-                    .execute_tool_value(
+                    .execute_tool_at(
                         sid.clone(),
                         rid.clone(),
                         nm.clone(),
@@ -936,6 +1178,7 @@ impl Daemon {
                         tok,
                         cfg2.clone(),
                         true,
+                        agent_depth,
                     )
                     .await;
                 let (ok, text) = match res {
@@ -1077,65 +1320,235 @@ impl Daemon {
         }
         let mut args = bundle.clone();
         args["name"] = json!(name);
-        let (info, _v) = self.create_tool_as(&args, cfg, "import").await?;
+        let (info, _v, _) = self.create_tool_as(&args, cfg, "import").await?;
         Ok(info)
     }
 
-    async fn create_tool_impl(self: &Arc<Self>, args: &Value, cfg: &Config) -> Result<String> {
-        let (info, version) = self.create_tool_as(args, cfg, "agent").await?;
-        Ok(json!({"created": info.name, "version": version}).to_string())
+    /// Resolve a requested model name, expanding "auto" via measured
+    /// routing (recorded successes/failures/latency). Errors only when
+    /// auto is requested without any configured candidates.
+    pub(crate) fn resolve_model(
+        &self,
+        requested: &str,
+        cfg: &Config,
+        complex: bool,
+    ) -> Result<String> {
+        if !ProviderCfg::is_auto_model(requested) {
+            return Ok(requested.to_string());
+        }
+        let stats = self
+            .with_store(|st| st.list_model_stats())
+            .unwrap_or_default();
+        crate::routing::select_model(&cfg.provider, &stats, complex).context(
+            "provider.model is \"auto\" but no routing candidates are configured; set provider.routing_models (or fallback_models)",
+        )
     }
 
+    pub(crate) fn record_model_outcome(&self, model: &str, ok: bool, started: std::time::Instant) {
+        let ms = started.elapsed().as_millis() as i64;
+        let _ = self.with_store(|st| st.record_model_outcome(model, ok, ms));
+    }
+
+    pub(crate) fn effective_system_prompt(&self) -> String {
+        self.with_store(|st| st.effective_system_prompt(SYSTEM_PROMPT))
+            .unwrap_or_else(|_| SYSTEM_PROMPT.to_string())
+    }
+
+    fn module_code(&self) -> Vec<(String, String)> {
+        self.with_store(|st| st.list_module_code())
+            .unwrap_or_default()
+    }
+
+    async fn create_module_impl(self: &Arc<Self>, args: &Value, cfg: &Config) -> Result<String> {
+        let name = args["name"]
+            .as_str()
+            .context("create_module: name required")?;
+        toolreg::validate_name(name)?;
+        let description = args["description"].as_str().unwrap_or_default().to_string();
+        let code = args["implementation_js"]
+            .as_str()
+            .context("implementation_js required")?
+            .to_string();
+        formless_runtime::check_syntax(&format!("const module = {{exports:{{}}}};\n{code}"))
+            .map_err(|e| anyhow!("syntax check failed: {e}"))?;
+        // Smoke: actually load the candidate through requireModule.
+        let mut modules = self.module_code();
+        modules.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        modules.push((name.to_string(), code.clone()));
+        let probe = format!(
+            "function run() {{ const m = requireModule({}); return {{ ok: typeof m }}; }}",
+            serde_json::to_string(name)?
+        );
+        let req = ExecRequest {
+            code: probe,
+            input: json!({}),
+            caps: Capabilities::default(),
+            memory_mb: cfg.tools.default_memory_mb,
+            mode: HostMode::Smoke,
+            overlay: None,
+            activity: None,
+            modules,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let smoke = tokio::task::spawn_blocking(move || {
+            formless_runtime::execute(&req, Arc::new(formless_runtime::NoHostOps))
+        })
+        .await
+        .map_err(|e| anyhow!("module smoke test panicked: {e}"))?;
+        if let Err(e) = smoke {
+            if !e.after_stub {
+                return Err(anyhow!("module smoke test failed: {}", e.message));
+            }
+        }
+        let (info, version) =
+            self.with_store(|st| st.create_module_version(name, &description, &code, "agent"))?;
+        let _ =
+            self.with_store(|st| st.audit("agent", "module.create", &format!("{name} v{version}")));
+        self.broadcast(Event::ModuleUpdated { module: info });
+        Ok(json!({"created_module": name, "version": version}).to_string())
+    }
+
+    /// Run a sub-agent for JS `agents.run` (the `agent` Capability): its own
+    /// provider loop over the same Tools, one level deeper (`agent_depth`),
+    /// returning its final text.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_subagent_text<'a>(
+        self: &'a Arc<Self>,
+        session_id: &'a str,
+        run_id: &'a str,
+        task: &'a str,
+        system: Option<&'a str>,
+        model: Option<&'a str>,
+        cfg: &'a Config,
+        cancel_flag: &'a Arc<AtomicBool>,
+        cancel: &'a CancellationToken,
+        agent_depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            if task.trim().is_empty() {
+                return Err(anyhow!("sub-agent task is empty"));
+            }
+            let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
+            let requested = model
+                .map(str::to_string)
+                .unwrap_or_else(|| cfg.provider.model.clone());
+            let sub_defs = || -> Result<Vec<Value>> {
+                self.with_store(|st| {
+                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                })
+            };
+            let tool_count = sub_defs()?.len();
+            let model = self
+                .resolve_model(
+                    &requested,
+                    cfg,
+                    crate::routing::is_complex_task(
+                        task.chars().count(),
+                        tool_count,
+                        cfg.provider.routing_complex_chars,
+                    ),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut messages = vec![json!({
+                "role": "system",
+                "content": "You are a Formless sub-agent. Complete the single task you are given, building and using Tools as needed, then return a concise final result."
+            })];
+            if let Some(sys) = system {
+                messages.push(json!({"role": "system", "content": sys}));
+            }
+            messages.push(json!({"role": "user", "content": task}));
+            // No step limit (SPEC principle 3): it ends on a final answer,
+            // a fault, or cancellation.
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(anyhow!("interrupted"));
+                }
+                // Rebuilt each step: find_tools/create_tool load new Tools.
+                let defs = sub_defs()?;
+                let result = provider
+                    .chat_stream(
+                        &messages,
+                        &defs,
+                        &model,
+                        cfg.provider.reasoning_effort.as_deref(),
+                        cancel,
+                        |_, _| {},
+                    )
+                    .await?;
+                if result.tool_calls.is_empty() {
+                    return Ok(result.content);
+                }
+                let calls_json: Vec<Value> = result
+                    .tool_calls
+                    .iter()
+                    .map(|c| {
+                        json!({"id": c.id, "type": "function",
+                           "function": {"name": c.name, "arguments": c.arguments}})
+                    })
+                    .collect();
+                let mut assistant =
+                    json!({"role": "assistant", "content": Value::Null, "tool_calls": calls_json});
+                if !result.reasoning.is_empty() {
+                    assistant["reasoning_content"] = json!(result.reasoning);
+                }
+                messages.push(assistant);
+                let denied = self
+                    .approve_calls(cfg, session_id, run_id, &result.tool_calls, cancel)
+                    .await?;
+                for tc in &result.tool_calls {
+                    let text = self
+                        .dispatch_call_inner(
+                            session_id,
+                            run_id,
+                            tc,
+                            cfg,
+                            cancel_flag,
+                            cancel,
+                            &denied,
+                            agent_depth,
+                        )
+                        .await;
+                    messages.push(json!({"role": "tool", "tool_call_id": tc.id, "content": text}));
+                }
+            }
+        })
+    }
+
+    async fn create_tool_impl(
+        self: &Arc<Self>,
+        args: &Value,
+        cfg: &Config,
+    ) -> Result<(String, String)> {
+        let (info, version, smoke_note) = self.create_tool_as(args, cfg, "agent").await?;
+        let mut out = json!({"created": info.name, "version": version});
+        if let Some(note) = smoke_note {
+            out["smoke_test"] = json!(note);
+        }
+        Ok((out.to_string(), info.id))
+    }
+
+    /// Create a Tool version through the validation gate (SPEC §7.1).
+    /// Returns a note when the smoke test was inconclusive: the Tool failed
+    /// only after a stubbed effect (fake fetch body, unbound input scope,
+    /// ...), which says more about the stub than about the Tool.
     async fn create_tool_as(
         self: &Arc<Self>,
         args: &Value,
         cfg: &Config,
         author: &str,
-    ) -> Result<(ToolInfo, i64)> {
-        let name = args["name"]
-            .as_str()
-            .context("create_tool: name required")?;
-        toolreg::validate_name(name)?;
-        let description = args["description"].as_str().unwrap_or_default();
-        let input_schema = &args["input_schema"];
-        let output_schema = &args["output_schema"];
-        if !input_schema.is_object() || !output_schema.is_object() {
-            return Err(anyhow!(
-                "input_schema and output_schema must be JSON Schema objects"
-            ));
-        }
-        toolreg::compile_schema(input_schema)?;
-        toolreg::compile_schema(output_schema)?;
-        let code = args["implementation_js"]
-            .as_str()
-            .context("implementation_js required")?
-            .to_string();
-        let cap_specs: Vec<String> = args["capabilities"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let caps = Capabilities::parse(&cap_specs).map_err(|e| anyhow!(e))?;
-        let memory_mb = args["memory_mb"]
-            .as_u64()
-            .unwrap_or(cfg.tools.default_memory_mb as u64) as u32;
-        if memory_mb == 0 || memory_mb > cfg.tools.max_memory_mb {
-            return Err(anyhow!("memory_mb must be 1..={}", cfg.tools.max_memory_mb));
-        }
-        formless_runtime::check_syntax(&code).map_err(|e| anyhow!("syntax check failed: {e}"))?;
+    ) -> Result<(ToolInfo, i64, Option<String>)> {
+        let d = ToolDraft::parse(args, cfg, true)?;
         // Smoke test in the stubbed sandbox with a schema-minimal input.
-        let smoke_input = toolreg::minimal_input(input_schema);
+        // Input-bound scopes stay as templates: the runtime stubs them.
         let req = ExecRequest {
-            code: code.clone(),
-            input: smoke_input,
-            caps: caps.clone(),
-            memory_mb,
+            code: d.code.clone(),
+            input: toolreg::minimal_input(&d.input_schema),
+            caps: d.caps.clone(),
+            memory_mb: d.memory_mb,
             mode: HostMode::Smoke,
             overlay: None,
             activity: None,
+            modules: self.module_code(),
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let smoke = tokio::task::spawn_blocking(move || {
@@ -1143,25 +1556,243 @@ impl Daemon {
         })
         .await
         .map_err(|e| anyhow!("smoke test panicked: {e}"))?;
-        if let Err(e) = smoke {
-            return Err(anyhow!("smoke test failed: {}", e.message));
-        }
+        let smoke_note = match smoke {
+            Ok(_) => None,
+            Err(e) if e.after_stub && e.kind != ExecErrorKind::Resource => Some(format!(
+                "inconclusive (failed after a stubbed effect: {}); call the Tool or test_tool it with real input",
+                e.message.lines().next().unwrap_or_default()
+            )),
+            Err(e) => return Err(anyhow!("smoke test failed: {}", e.message)),
+        };
         let (info, version) = self.with_store(|st| {
             st.create_tool_version(
-                name,
-                description,
-                &input_schema.to_string(),
-                &output_schema.to_string(),
-                &code,
-                &caps,
-                memory_mb,
+                &d.name,
+                &d.description,
+                &d.input_schema.to_string(),
+                &d.output_schema.to_string(),
+                &d.code,
+                &d.caps,
+                d.memory_mb,
                 author,
             )
         })?;
-        let _ =
-            self.with_store(|st| st.audit(author, "tool.create", &format!("{name} v{version}")));
+        let _ = self
+            .with_store(|st| st.audit(author, "tool.create", &format!("{} v{version}", d.name)));
         self.broadcast(Event::ToolUpdated { tool: info.clone() });
-        Ok((info, version))
+        Ok((info, version, smoke_note))
+    }
+
+    fn find_tools_impl(&self, session_id: &str, args: &Value) -> Result<String> {
+        let query = args["query"].as_str().unwrap_or_default();
+        let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
+        let hits = self.with_store(|st| toolreg::search_tools(st, query, limit))?;
+        let ids: Vec<String> = hits.iter().map(|t| t.id.clone()).collect();
+        self.with_store(|st| st.load_session_tools(session_id, &ids, "found"))?;
+        let tools: Vec<Value> = hits
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "capabilities": t.capabilities,
+                    "invocations": t.invocations,
+                    "success_rate": t.success_rate,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "tools": tools,
+            "note": if tools.is_empty() {
+                "No matching Tool; create one."
+            } else {
+                "These Tools are now callable functions (from your next step); read_tool shows their code."
+            }
+        })
+        .to_string())
+    }
+
+    fn read_tool_impl(&self, args: &Value) -> Result<String> {
+        let name = args["name"].as_str().context("name required")?;
+        let (info, _) = self
+            .with_store(|st| st.get_tool_by_name(name))?
+            .with_context(|| format!("no tool named '{name}'"))?;
+        let detail = self
+            .with_store(|st| st.tool_detail(&info.id))?
+            .context("tool vanished")?;
+        let want = args["version"].as_i64().unwrap_or(info.current_version);
+        let ver = detail
+            .versions
+            .iter()
+            .find(|v| v.version == want)
+            .with_context(|| format!("'{name}' has no version {want}"))?;
+        let failures = self.with_store(|st| st.recent_failures(&info.id, 5))?;
+        let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or(json!(s));
+        Ok(json!({
+            "name": info.name,
+            "description": info.description,
+            "version": ver.version,
+            "current_version": info.current_version,
+            "versions": detail.versions.iter().map(|v| json!({"version": v.version, "author": v.author, "created_at": v.created_at})).collect::<Vec<_>>(),
+            "input_schema": parse(&ver.input_schema),
+            "output_schema": parse(&ver.output_schema),
+            "capabilities": ver.capabilities,
+            "memory_mb": ver.memory_mb,
+            "implementation_js": ver.code,
+            "metrics": {"invocations": info.invocations, "success_rate": info.success_rate, "needs_attention": info.needs_attention},
+            "recent_failures": failures.iter().map(|(v, tag, input, error)| json!({
+                "version": v, "tag": tag, "input": parse(input),
+                "error": error.lines().next().unwrap_or_default(),
+            })).collect::<Vec<_>>(),
+        })
+        .to_string())
+    }
+
+    /// Dry-run a saved Tool or an unsaved draft: live, approval-gated, but
+    /// neither saved nor recorded as an Invocation (SPEC §7.1).
+    #[allow(clippy::too_many_arguments)]
+    async fn test_tool_impl(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+        args: &Value,
+        cfg: &Config,
+        cancel_flag: &Arc<AtomicBool>,
+        cancel: &CancellationToken,
+        agent_depth: usize,
+    ) -> Result<String> {
+        let input = args.get("input").cloned().unwrap_or(json!({}));
+        let existing = match args["name"].as_str() {
+            Some(n) => self.with_store(|st| st.get_tool_by_name(n))?,
+            None => None,
+        };
+        let d = if args["implementation_js"].is_string() {
+            ToolDraft::parse(args, cfg, false)?
+        } else {
+            let (info, ver) = existing.clone().with_context(|| {
+                "give the name of an existing Tool, or a draft with implementation_js".to_string()
+            })?;
+            ToolDraft {
+                name: info.name,
+                description: info.description,
+                input_schema: serde_json::from_str(&ver.input_schema)?,
+                output_schema: serde_json::from_str(&ver.output_schema)?,
+                code: ver.code,
+                caps: Capabilities::parse(&ver.capabilities).map_err(|e| anyhow!(e))?,
+                memory_mb: ver.memory_mb,
+            }
+        };
+        if let Err(e) =
+            toolreg::validate_against(&toolreg::compile_schema(&d.input_schema)?, &input)
+        {
+            return Ok(json!({"ok": false, "stage": "input_validation", "error": e}).to_string());
+        }
+        let caps = match d.caps.bind(&input) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(
+                    json!({"ok": false, "stage": "input_validation", "error": e}).to_string(),
+                )
+            }
+        };
+        // Approval as for a real call: an existing Tool's grant applies; a
+        // new draft is asked about each time (nothing is persisted for it).
+        let info = existing.map(|(i, _)| i).unwrap_or_else(|| ToolInfo {
+            id: format!("test:{}", d.name),
+            name: format!("{} (test)", d.name),
+            description: d.description.clone(),
+            retired: false,
+            current_version: 0,
+            capabilities: d.caps.to_specs(),
+            memory_mb: d.memory_mb,
+            invocations: 0,
+            success_rate: None,
+            needs_attention: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        });
+        let ver = ToolVersionInfo {
+            version: 0,
+            author: "test".into(),
+            created_at: String::new(),
+            capabilities: d.caps.to_specs(),
+            memory_mb: d.memory_mb,
+            input_schema: d.input_schema.to_string(),
+            output_schema: d.output_schema.to_string(),
+            code: d.code.clone(),
+        };
+        if !self
+            .ensure_approval(cfg, session_id, &info, &ver, &caps, cancel)
+            .await
+        {
+            return Ok(
+                json!({"ok": false, "stage": "approval", "error": "user denied approval"})
+                    .to_string(),
+            );
+        }
+        let ops = Arc::new(NestedOps {
+            daemon: self.clone(),
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            parent_inv: None,
+            activity: None,
+            depth: 1,
+            agent_depth,
+            cancel_flag: cancel_flag.clone(),
+            cancel: cancel.clone(),
+            cfg: cfg.clone(),
+            handle: tokio::runtime::Handle::current(),
+            emitted: StdMutex::new(None),
+            artifact_dir: self.paths.data_dir.join("artifacts"),
+        });
+        let req = ExecRequest {
+            code: d.code.clone(),
+            input,
+            caps,
+            memory_mb: d.memory_mb,
+            mode: HostMode::Live,
+            overlay: None,
+            activity: None,
+            modules: self.module_code(),
+            cancel: cancel_flag.clone(),
+        };
+        let ops_dyn: Arc<dyn HostOps> = ops.clone();
+        let started = std::time::Instant::now();
+        let outcome = tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn))
+            .await
+            .map_err(|e| anyhow!("test run panicked: {e}"))?;
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        let emitted = ops.emitted.lock().unwrap().take();
+        Ok(match outcome {
+            Ok(out) => {
+                let schema_error = toolreg::compile_schema(&d.output_schema)
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| toolreg::validate_against(&v, &out.output))
+                    .err();
+                let mut res = json!({
+                    "ok": schema_error.is_none(),
+                    "output": out.output,
+                    "output_matches_schema": schema_error.is_none(),
+                    "logs": out.logs,
+                    "elapsed_ms": elapsed_ms,
+                });
+                if let Some(e) = schema_error {
+                    res["stage"] = json!("output_validation");
+                    res["error"] = json!(e);
+                }
+                if let Some((path, bytes)) = emitted {
+                    res["emitted"] = json!({"path": path, "bytes": bytes});
+                }
+                self.model_text(session_id, &res, cfg)
+            }
+            Err(e) => json!({
+                "ok": false,
+                "stage": "run",
+                "error_kind": format!("{:?}", e.kind).to_lowercase(),
+                "error": e.message,
+                "elapsed_ms": elapsed_ms,
+            })
+            .to_string(),
+        })
     }
 
     async fn ensure_approval(
@@ -1170,21 +1801,25 @@ impl Daemon {
         session_id: &str,
         info: &ToolInfo,
         ver: &ToolVersionInfo,
+        caps: &Capabilities,
         cancel: &CancellationToken,
     ) -> bool {
-        let caps = Capabilities::parse(&ver.capabilities).unwrap_or_default();
         let needs = caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb;
         if !needs {
             return true;
         }
-        if let Ok(Some((approved, mem))) = self.with_store(|st| st.get_approval(&info.id)) {
-            if approved.covers(&caps) && ver.memory_mb <= mem {
+        let prior = self
+            .with_store(|st| st.get_approval(&info.id))
+            .ok()
+            .flatten();
+        if let Some((approved, mem)) = &prior {
+            if approved.covers(caps) && ver.memory_mb <= *mem {
                 return true;
             }
         }
         // Fail closed when nobody can answer (SPEC §12 headless rule).
-        self.subs.lock().await.retain(|tx| !tx.is_closed());
-        if self.subs.lock().await.is_empty() {
+        self.subs.lock().unwrap().retain(|tx| !tx.is_closed());
+        if self.subs.lock().unwrap().is_empty() {
             return false;
         }
         let approval_id = uuid::Uuid::new_v4().to_string();
@@ -1198,7 +1833,7 @@ impl Daemon {
             session_id: session_id.to_string(),
             tool_name: info.name.clone(),
             version: ver.version,
-            capabilities: ver.capabilities.clone(),
+            capabilities: caps.to_specs(),
             memory_mb: ver.memory_mb,
         });
         let approved = tokio::select! {
@@ -1207,7 +1842,12 @@ impl Daemon {
         };
         self.approvals.lock().unwrap().remove(&approval_id);
         if approved {
-            let _ = self.with_store(|st| st.set_approval(&info.id, &caps, ver.memory_mb));
+            // Accumulate: approving a new bound path keeps earlier ones.
+            let (grant, mem) = match &prior {
+                Some((p, m)) => (p.union(caps), ver.memory_mb.max(*m)),
+                None => (caps.clone(), ver.memory_mb),
+            };
+            let _ = self.with_store(|st| st.set_approval(&info.id, &grant, mem));
             let _ = self.with_store(|st| st.audit("user", "tool.approve", &info.name));
         } else {
             let _ = self.with_store(|st| st.audit("user", "tool.deny", &info.name));
@@ -1327,6 +1967,40 @@ impl Daemon {
         cfg: Config,
         preapproved: bool,
     ) -> ExecFuture {
+        self.execute_tool_at(
+            session_id,
+            run_id,
+            name,
+            input,
+            depth,
+            parent,
+            cancel_flag,
+            activity,
+            cancel,
+            cfg,
+            preapproved,
+            0,
+        )
+    }
+
+    /// [`Self::execute_tool_value`] on behalf of a sub-agent `agent_depth`
+    /// levels down, so `agents.run` inside it is depth-checked.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_tool_at(
+        self: Arc<Self>,
+        session_id: String,
+        run_id: String,
+        name: String,
+        input: Value,
+        depth: usize,
+        parent: Option<String>,
+        cancel_flag: Arc<AtomicBool>,
+        activity: Option<Arc<std::sync::atomic::AtomicU64>>,
+        cancel: CancellationToken,
+        cfg: Config,
+        preapproved: bool,
+        agent_depth: usize,
+    ) -> ExecFuture {
         Box::pin(async move {
             if depth > 8 {
                 return Err("tool nesting too deep (possible cycle)".to_string());
@@ -1367,9 +2041,29 @@ impl Daemon {
                 }
                 Err(e) => return Err(format!("tool has invalid input schema: {e}")),
             }
+            let caps = match bound_caps(&ver, &input) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.record_inv(
+                        &info,
+                        ver.version,
+                        &session_id,
+                        &run_id,
+                        parent.as_deref(),
+                        "failure",
+                        "validation",
+                        &input_text,
+                        "",
+                        &e,
+                        dur(&started),
+                        &cfg,
+                    );
+                    return Err(e);
+                }
+            };
             if !preapproved
                 && !self
-                    .ensure_approval(&cfg, &session_id, &info, &ver, &cancel)
+                    .ensure_approval(&cfg, &session_id, &info, &ver, &caps, &cancel)
                     .await
             {
                 self.record_inv(
@@ -1388,7 +2082,6 @@ impl Daemon {
                 );
                 return Err(format!("user denied approval for tool '{name}'"));
             }
-            let caps = Capabilities::parse(&ver.capabilities).unwrap_or_default();
             self.broadcast(Event::ToolCallStarted {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
@@ -1416,6 +2109,7 @@ impl Daemon {
                 parent_inv: Some(inv_id.clone()),
                 activity: activity.clone(),
                 depth: depth + 1,
+                agent_depth,
                 cancel_flag: cancel_flag.clone(),
                 cancel: cancel.clone(),
                 cfg: cfg.clone(),
@@ -1431,6 +2125,7 @@ impl Daemon {
                 mode: HostMode::Live,
                 overlay: None,
                 activity: activity.clone(),
+                modules: self.module_code(),
                 cancel: cancel_flag.clone(),
             };
             let ops_dyn: Arc<dyn HostOps> = ops.clone();
@@ -1531,11 +2226,12 @@ impl Daemon {
         model: &str,
         context_tokens: u32,
     ) -> Result<()> {
+        let prompt = self.effective_system_prompt();
         let (_ctx, needs, compact_up_to) = self.with_store(|st| {
             build_context(
                 st,
                 session_id,
-                SYSTEM_PROMPT,
+                &prompt,
                 context_tokens,
                 cfg.compaction.fraction(),
             )
@@ -1598,7 +2294,7 @@ impl Daemon {
     {
         let (read_half, mut write_half) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
-        self.subs.lock().await.push(tx.clone());
+        self.subs.lock().unwrap().push(tx.clone());
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let Ok(line) = serde_json::to_string(&msg) {
@@ -1656,7 +2352,7 @@ impl Daemon {
                 continue; // idle-close disabled (used by explicit foreground serve in tests)
             }
             // Prune subscribers whose client disconnected (receiver dropped).
-            self.subs.lock().await.retain(|tx| !tx.is_closed());
+            self.subs.lock().unwrap().retain(|tx| !tx.is_closed());
             let pending_running = self
                 .pending
                 .lock()
@@ -1688,7 +2384,7 @@ impl Daemon {
             }
             let busy = pending_running
                 || !self.runs.lock().unwrap().is_empty()
-                || !self.subs.lock().await.is_empty();
+                || !self.subs.lock().unwrap().is_empty();
             if busy {
                 idle_since = None;
             } else {
@@ -1764,6 +2460,84 @@ impl Daemon {
         }
         Ok(())
     }
+}
+
+/// A Tool version's Capabilities with `$input.<field>` scopes resolved
+/// against this Invocation's input (SPEC §7.4).
+/// A Tool definition as passed to create_tool/test_tool, validated.
+struct ToolDraft {
+    name: String,
+    description: String,
+    input_schema: Value,
+    output_schema: Value,
+    code: String,
+    caps: Capabilities,
+    memory_mb: u32,
+}
+
+impl ToolDraft {
+    /// Validate the create_tool fields (SPEC §7.1). A test draft may omit
+    /// name, description and schemas.
+    fn parse(args: &Value, cfg: &Config, strict: bool) -> Result<Self> {
+        let name = match args["name"].as_str() {
+            Some(n) => n,
+            None if !strict => "draft",
+            None => return Err(anyhow!("create_tool: name required")),
+        };
+        toolreg::validate_name(name)?;
+        let schema = |key: &str, default: Value| -> Result<Value> {
+            match &args[key] {
+                Value::Null if !strict => Ok(default),
+                v if v.is_object() => {
+                    toolreg::compile_schema(v)?;
+                    Ok(v.clone())
+                }
+                _ => Err(anyhow!(
+                    "input_schema and output_schema must be JSON Schema objects"
+                )),
+            }
+        };
+        let input_schema = schema("input_schema", json!({"type": "object"}))?;
+        let output_schema = schema("output_schema", json!({}))?;
+        let code = args["implementation_js"]
+            .as_str()
+            .context("implementation_js required")?
+            .to_string();
+        let cap_specs: Vec<String> = args["capabilities"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let caps = Capabilities::parse(&cap_specs).map_err(|e| anyhow!(e))?;
+        let memory_mb = args["memory_mb"]
+            .as_u64()
+            .unwrap_or(cfg.tools.default_memory_mb as u64) as u32;
+        if memory_mb == 0 || memory_mb > cfg.tools.max_memory_mb {
+            return Err(anyhow!("memory_mb must be 1..={}", cfg.tools.max_memory_mb));
+        }
+        formless_runtime::check_syntax(&code).map_err(|e| anyhow!("syntax check failed: {e}"))?;
+        Ok(Self {
+            name: name.to_string(),
+            description: args["description"].as_str().unwrap_or_default().to_string(),
+            input_schema,
+            output_schema,
+            code,
+            caps,
+            memory_mb,
+        })
+    }
+}
+
+pub(crate) fn bound_caps(
+    ver: &ToolVersionInfo,
+    input: &Value,
+) -> std::result::Result<Capabilities, String> {
+    Capabilities::parse(&ver.capabilities)
+        .unwrap_or_default()
+        .bind(input)
 }
 
 /// Is a daemon already answering on this transport?
@@ -1847,6 +2621,8 @@ struct NestedOps {
     parent_inv: Option<String>,
     activity: Option<Arc<std::sync::atomic::AtomicU64>>,
     depth: usize,
+    /// Sub-agent nesting of the Run this Tool serves (0 = the main agent).
+    agent_depth: usize,
     cancel_flag: Arc<AtomicBool>,
     cancel: CancellationToken,
     cfg: Config,
@@ -1856,6 +2632,56 @@ struct NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn run_subagent(
+        &self,
+        task: &str,
+        system: Option<&str>,
+        model: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        if self.depth > 1 {
+            return Err("sub-agents cannot be spawned from nested tools".into());
+        }
+        // A sub-agent's own Tool calls restart at tool depth 0, so tool
+        // depth alone cannot stop agents.run recursing through them.
+        if self.agent_depth >= self.cfg.tools.max_agent_depth {
+            return Err(format!(
+                "denied: sub-agent depth limit ({}) reached",
+                self.cfg.tools.max_agent_depth
+            ));
+        }
+        if self.cancel.is_cancelled() {
+            return Err("interrupted".into());
+        }
+        let agent_depth = self.agent_depth + 1;
+        let daemon = self.daemon.clone();
+        let (session_id, run_id) = (self.session_id.clone(), self.run_id.clone());
+        let cfg = self.cfg.clone();
+        let cancel_flag = self.cancel_flag.clone();
+        let cancel = self.cancel.clone();
+        let (task, system, model) = (
+            task.to_string(),
+            system.map(str::to_string),
+            model.map(str::to_string),
+        );
+        self.handle
+            .block_on(async move {
+                daemon
+                    .run_subagent_text(
+                        &session_id,
+                        &run_id,
+                        &task,
+                        system.as_deref(),
+                        model.as_deref(),
+                        &cfg,
+                        &cancel_flag,
+                        &cancel,
+                        agent_depth,
+                    )
+                    .await
+            })
+            .map_err(|e| e.to_string())
+    }
+
     fn llm_complete(
         &self,
         prompt: &str,
@@ -1865,12 +2691,28 @@ impl HostOps for NestedOps {
         if self.cancel.is_cancelled() {
             return Err("interrupted".into());
         }
-        let api_key = load_api_key(&self.daemon.paths).unwrap_or_default();
-        let provider =
-            Provider::new(self.cfg.provider.clone(), api_key).map_err(|e| e.to_string())?;
-        let model = model
+        let provider = self
+            .handle
+            .block_on(Provider::for_profile(
+                self.cfg.provider.clone(),
+                self.daemon.paths.clone(),
+            ))
+            .map_err(|e| e.to_string())?;
+        let requested = model
             .map(str::to_string)
             .unwrap_or_else(|| self.cfg.provider.model.clone());
+        let model = self
+            .daemon
+            .resolve_model(
+                &requested,
+                &self.cfg,
+                crate::routing::is_complex_task(
+                    prompt.chars().count(),
+                    0,
+                    self.cfg.provider.routing_complex_chars,
+                ),
+            )
+            .map_err(|e| e.to_string())?;
         let mut messages = Vec::new();
         if let Some(sys) = system {
             messages.push(json!({"role": "system", "content": sys}));
@@ -1889,18 +2731,30 @@ impl HostOps for NestedOps {
             self.run_id.clone(),
             name.to_string(),
         );
-        let (flag, tok, cfg, depth, parent, activity) = (
+        let (flag, tok, cfg, depth, parent, activity, agent_depth) = (
             self.cancel_flag.clone(),
             self.cancel.clone(),
             self.cfg.clone(),
             self.depth,
             self.parent_inv.clone(),
             self.activity.clone(),
+            self.agent_depth,
         );
         self.handle.block_on(async move {
             daemon
-                .execute_tool_value(
-                    sid, rid, name, input, depth, parent, flag, activity, tok, cfg, false,
+                .execute_tool_at(
+                    sid,
+                    rid,
+                    name,
+                    input,
+                    depth,
+                    parent,
+                    flag,
+                    activity,
+                    tok,
+                    cfg,
+                    false,
+                    agent_depth,
                 )
                 .await
                 .map(|(v, _inv)| v)
