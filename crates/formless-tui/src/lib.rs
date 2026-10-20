@@ -330,7 +330,8 @@ struct App {
     chat_view_height: usize,
     chat_line_count: usize,
     input: String,
-    running: bool,
+    /// Sessions with a Run in flight; run state is per session, not global.
+    running_sessions: std::collections::HashSet<String>,
     notes: Vec<String>,
     pending: HashMap<u64, Pending>,
     tools: Vec<ToolInfo>,
@@ -411,7 +412,7 @@ impl App {
             chat_view_height: 10,
             chat_line_count: 0,
             input: String::new(),
-            running: false,
+            running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
             tools: Vec::new(),
@@ -497,7 +498,7 @@ impl App {
                                 self.sessions = v;
                                 if self.current.is_none() {
                                     if let Some(first) = self.sessions.first().cloned() {
-                                        self.current = Some(first.id.clone());
+                                        self.switch_session(first.id.clone());
                                         self.request(
                                             Pending::GetSession,
                                             Request::GetSession { id: first.id },
@@ -513,16 +514,15 @@ impl App {
                         }
                         Pending::CreateSession => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
-                                self.current = Some(s.id.clone());
+                                self.switch_session(s.id.clone());
                                 self.sessions.insert(0, s);
                                 self.messages.clear();
-                                self.live_tools.clear();
-                                self.follow_chat_bottom();
+                                self.view = View::Chat;
                             }
                         }
                         Pending::ForkSession => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
-                                self.current = Some(s.id.clone());
+                                self.switch_session(s.id.clone());
                                 self.sessions.insert(0, s.clone());
                                 self.request(Pending::GetSession, Request::GetSession { id: s.id });
                                 self.view = View::Chat;
@@ -664,6 +664,32 @@ impl App {
         self.chat_scroll_top = None;
     }
 
+    fn is_current(&self, session_id: &str) -> bool {
+        self.current.as_deref() == Some(session_id)
+    }
+
+    /// Whether the session on screen has a Run in flight.
+    fn running(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|id| self.running_sessions.contains(id))
+    }
+
+    /// Make `id` the session on screen, dropping the previous one's live
+    /// Run state so it cannot bleed into this one.
+    fn switch_session(&mut self, id: String) {
+        self.current = Some(id);
+        self.streaming.clear();
+        self.thinking.clear();
+        self.live_tools.clear();
+        self.editing_id = None;
+        self.activity = None;
+        if self.running() {
+            self.set_activity("working");
+        }
+        self.follow_chat_bottom();
+    }
+
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::MessageAppended {
@@ -683,11 +709,21 @@ impl App {
                     }
                 }
             }
-            Event::MessageDelta { delta, .. } => {
+            Event::MessageDelta {
+                session_id, delta, ..
+            } => {
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 self.set_activity("responding");
                 self.streaming.push_str(&delta);
             }
-            Event::ReasoningDelta { delta, .. } => {
+            Event::ReasoningDelta {
+                session_id, delta, ..
+            } => {
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 self.set_activity("thinking");
                 self.thinking.push_str(&delta);
             }
@@ -696,23 +732,34 @@ impl App {
                 message,
                 ..
             } => {
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 self.streaming.clear();
                 self.thinking.clear();
-                if self.current.as_deref() == Some(&session_id)
-                    && !self.messages.iter().any(|m| m.id == message.id)
-                {
+                if !self.messages.iter().any(|m| m.id == message.id) {
                     self.messages.push(message);
                 }
             }
-            Event::RunStarted { .. } => {
-                self.running = true;
+            Event::RunStarted { session_id, .. } => {
+                self.running_sessions.insert(session_id.clone());
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 self.thinking.clear();
                 self.streaming.clear();
                 self.live_tools.clear();
                 self.set_activity("waiting for model");
             }
-            Event::RunFinished { status, .. } => {
-                self.running = false;
+            Event::RunFinished {
+                session_id, status, ..
+            } => {
+                self.running_sessions.remove(&session_id);
+                // Refresh names/order even when the Run was elsewhere.
+                self.request(Pending::ListSessions, Request::ListSessions);
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 self.activity = None;
                 self.streaming.clear();
                 self.thinking.clear();
@@ -721,10 +768,14 @@ impl App {
                 if status != "completed" {
                     self.notes.push(format!("run {status}"));
                 }
-                self.request(Pending::ListSessions, Request::ListSessions);
             }
-            Event::RunPaused { error, .. } => {
-                self.running = false;
+            Event::RunPaused {
+                session_id, error, ..
+            } => {
+                self.running_sessions.remove(&session_id);
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 self.activity = None;
                 self.notes.push(format!("run paused: {error}"));
             }
@@ -735,11 +786,15 @@ impl App {
             }
             Event::Note { text, .. } => self.notes.push(text),
             Event::ToolCallStarted {
+                session_id,
                 tool_name,
                 version,
                 arguments,
                 ..
             } => {
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 self.set_activity(format!("running {tool_name}"));
                 self.live_tools.push(LiveToolCall {
                     name: tool_name.clone(),
@@ -752,11 +807,15 @@ impl App {
                 self.notes.push(format!("running {tool_name}…"));
             }
             Event::ToolCallFinished {
+                session_id,
                 tool_name,
                 ok,
                 elapsed_ms,
                 ..
             } => {
+                if !self.is_current(&session_id) {
+                    return;
+                }
                 if let Some(call) = self
                     .live_tools
                     .iter_mut()
@@ -770,13 +829,14 @@ impl App {
                         call.started.elapsed().as_millis() as i64
                     });
                 }
-                if self.running {
+                if self.running() {
                     self.set_activity("waiting for model");
                 }
                 self.notes
                     .push(format!("{tool_name}: {}", if ok { "ok" } else { "failed" }));
             }
             Event::ApprovalRequested {
+                session_id,
                 approval_id,
                 tool_name,
                 version,
@@ -784,7 +844,10 @@ impl App {
                 memory_mb,
                 ..
             } => {
-                self.set_activity("awaiting your approval");
+                // Approvals stay global: a backgrounded Run still needs one.
+                if self.is_current(&session_id) {
+                    self.set_activity("awaiting your approval");
+                }
                 self.approvals.push_back(ApprovalReq {
                     approval_id,
                     tool_name,
@@ -865,9 +928,14 @@ impl App {
             }
             Event::SessionDeleted { id } => {
                 self.sessions.retain(|s| s.id != id);
-                if self.current.as_deref() == Some(&id) {
+                self.running_sessions.remove(&id);
+                if self.is_current(&id) {
                     self.current = None;
                     self.messages.clear();
+                    self.streaming.clear();
+                    self.thinking.clear();
+                    self.live_tools.clear();
+                    self.activity = None;
                 }
             }
         }
@@ -937,7 +1005,7 @@ impl App {
         };
         let mode = if queued {
             SendMode::Queue
-        } else if self.running {
+        } else if self.running() {
             SendMode::Steer
         } else {
             SendMode::Send
@@ -1348,7 +1416,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(hit) = self.search_hits.get(self.search_idx).cloned() {
-                        self.current = Some(hit.session_id.clone());
+                        self.switch_session(hit.session_id.clone());
                         self.request(
                             Pending::GetSession,
                             Request::GetSession { id: hit.session_id },
@@ -1401,7 +1469,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(s) = self.sessions.get(self.session_idx).cloned() {
-                        self.current = Some(s.id.clone());
+                        self.switch_session(s.id.clone());
                         self.request(Pending::GetSession, Request::GetSession { id: s.id });
                         self.view = View::Chat;
                     }
@@ -1553,7 +1621,7 @@ impl App {
                 }
                 KeyCode::Enter => self.submit_chat(false),
                 KeyCode::Esc => {
-                    if self.running {
+                    if self.running() {
                         if let Some(id) = self.current.clone() {
                             self.fire(Request::InterruptRun { session_id: id });
                         }
@@ -1656,7 +1724,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         ("import path › ", Color::Magenta)
     } else if app.editing_id.is_some() {
         ("edit › ", Color::Magenta)
-    } else if app.running {
+    } else if app.running() {
         ("steer › ", Color::Yellow)
     } else {
         ("› ", Color::Cyan)
@@ -1667,7 +1735,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     let chars: Vec<char> = app.input.chars().collect();
     let shown: String = chars[chars.len().saturating_sub(avail)..].iter().collect();
     let mut spans = vec![Span::styled(prompt, bold_fg(app.color, color))];
-    if shown.is_empty() && !app.running && prompt == "› " && show_cursor {
+    if shown.is_empty() && !app.running() && prompt == "› " && show_cursor {
         spans.push(Span::styled(
             "Ask Formless to do something…",
             ui::dim(app.color),
@@ -1678,7 +1746,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     let mut block = ui::panel(" Message ", app.color, color);
     if area.width > 64 {
         block = block.title(ui::hint(
-            if app.running {
+            if app.running() {
                 "Enter steer · Ctrl+Enter queue · Esc stop"
             } else {
                 "Enter send · Ctrl+Enter queue · /help"
@@ -1698,7 +1766,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let mut left: Vec<Span> = vec![Span::raw(" ")];
     if let Some(activity) = app.activity_text() {
         left.push(Span::styled(activity, bold_fg(app.color, Color::Yellow)));
-    } else if app.running {
+    } else if app.running() {
         left.push(Span::styled("● running", bold_fg(app.color, Color::Yellow)));
     } else {
         left.push(Span::styled("● ready", fg(app.color, Color::Green)));
@@ -1915,7 +1983,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
             ));
         }
     }
-    if app.messages.is_empty() && !app.running {
+    if app.messages.is_empty() && !app.running() {
         return welcome_lines(app.color, height);
     }
     // Live reasoning: dimmed, separate from the answer, and capped to the
@@ -1938,7 +2006,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
         }
         group = None;
     }
-    if !app.streaming.is_empty() || app.running {
+    if !app.streaming.is_empty() || app.running() {
         open_group(&mut lines, &mut group, "assistant", None);
         lines.extend(markdown::render(&app.streaming, app.color, "  ", width));
         if app.streaming.is_empty() {
@@ -3080,7 +3148,7 @@ mod tests {
             chat_view_height: 10,
             chat_line_count: 100,
             input: String::new(),
-            running: false,
+            running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
             tools: Vec::new(),
@@ -3106,13 +3174,67 @@ mod tests {
     }
 
     #[test]
+    fn new_session_mid_run_is_isolated_from_the_old_run() {
+        let mut app = test_app();
+        app.on_event(Event::RunStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+        });
+        app.on_event(Event::MessageDelta {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            delta: "old ".into(),
+        });
+        // `/new` while s1 is still working.
+        app.switch_session("s2".into());
+        assert!(!app.running());
+        assert!(app.streaming.is_empty() && app.activity.is_none());
+
+        // The old Run keeps streaming; none of it shows up in s2.
+        app.on_event(Event::MessageDelta {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            delta: "more".into(),
+        });
+        app.on_event(Event::ToolCallStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            tool_name: "t".into(),
+            version: 1,
+            arguments: "{}".into(),
+        });
+        assert!(app.streaming.is_empty() && app.live_tools.is_empty());
+        assert!(app.activity.is_none());
+
+        // A message in s2 starts a fresh Run rather than steering s1's.
+        app.input = "hi".into();
+        app.submit_chat(false);
+        app.on_event(Event::RunFinished {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            status: "completed".into(),
+        });
+        assert!(!app.running_sessions.contains("s1"));
+
+        // Switching back to a still-running session shows it as running.
+        app.on_event(Event::RunStarted {
+            session_id: "s2".into(),
+            run_id: "r2".into(),
+        });
+        app.switch_session("s1".into());
+        assert!(!app.running());
+        app.switch_session("s2".into());
+        assert!(app.running() && app.activity.is_some());
+    }
+
+    #[test]
     fn activity_and_thinking_follow_run_events() {
         let mut app = test_app();
         app.on_event(Event::RunStarted {
             session_id: "s1".into(),
             run_id: "r1".into(),
         });
-        assert!(app.running);
+        assert!(app.running());
         assert!(app.activity_text().unwrap().contains("waiting for model"));
 
         app.on_event(Event::ReasoningDelta {
@@ -3166,7 +3288,7 @@ mod tests {
             run_id: "r1".into(),
             status: "completed".into(),
         });
-        assert!(!app.running);
+        assert!(!app.running());
         assert!(app.activity_text().is_none());
         assert!(app.thinking.is_empty(), "thinking is ephemeral per Run");
     }
