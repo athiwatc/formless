@@ -296,6 +296,26 @@ impl Daemon {
         if info.name.starts_with(crate::mcp::PREFIX) || !self.guardrails_ok(&info, cfg) {
             return;
         }
+        // Failures that are only denied Capabilities are a grant decision
+        // for the user, not a code problem (§8.3): surface, don't rewrite.
+        let replay = self
+            .with_store(|st| st.replay_set(tool_id))
+            .unwrap_or_default();
+        if let FixPlan::NeedsCapability(n) = fix_plan(&replay) {
+            let text = format!(
+                "needs a capability: {n} recent calls of {} were denied a Capability; widen its grant or create a new version with the Capability it needs (your decision)",
+                info.name
+            );
+            self.activity(&info.name, text.clone());
+            self.broadcast(Event::Note {
+                session_id: None,
+                text,
+            });
+            let _ =
+                self.with_store(|st| st.audit("optimiser", "tool.needs_capability", &info.name));
+            self.set_cooldown_now(tool_id, cfg);
+            return;
+        }
         self.activity(&info.name, "generating candidate…".into());
         match self.generate_candidate(&info, &ver, cfg).await {
             Ok((cand, est_tokens)) => {
@@ -385,7 +405,9 @@ impl Daemon {
         for s in &successes {
             prompt.push_str(&format!("- input={}\n", s.input));
         }
-        if resource {
+        if let FixPlan::Rewrite(strategy) = fix_plan(&replay) {
+            prompt.push_str(&strategy);
+        } else if resource {
             prompt.push_str(
                 "\nNOTE: resource (OOM) failures present - use streaming/chunking first.\n",
             );
@@ -1125,6 +1147,67 @@ pub fn significant_improvement(base: f64, cand: f64, n: i64) -> bool {
     let pooled = (base + cand) / 2.0;
     let se = (pooled * (1.0 - pooled) * 2.0 / n).sqrt();
     se == 0.0 || (cand - base) / se >= 1.645
+}
+
+/// What the optimiser does about a Tool's failures (SPEC §8.3).
+#[derive(Debug, PartialEq)]
+pub enum FixPlan {
+    /// Every failure is a denied Capability: the user's call (count).
+    NeedsCapability(usize),
+    /// Rewrite, guided by this per-tag strategy (for the prompt).
+    Rewrite(String),
+}
+
+/// Failure counts per tag ("js" for untagged exceptions), most first.
+pub fn tag_breakdown(replay: &[ReplayItem]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in replay.iter().filter(|r| !r.recorded_success) {
+        let tag = if r.tag.is_empty() {
+            "js"
+        } else {
+            r.tag.as_str()
+        };
+        *counts.entry(tag.to_string()).or_default() += 1;
+    }
+    let mut out: Vec<_> = counts.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// Rank fixes by failure tag: validation failures mean the description
+/// or schema misleads the model; resource failures want streaming;
+/// exceptions want code fixes; denied Capabilities are never fixed by
+/// widening (only the user grants).
+pub fn fix_plan(replay: &[ReplayItem]) -> FixPlan {
+    let tags = tag_breakdown(replay);
+    let total: usize = tags.iter().map(|(_, n)| n).sum();
+    let denied = tags
+        .iter()
+        .find(|(t, _)| t == "denied-capability")
+        .map_or(0, |(_, n)| *n);
+    if total > 0 && denied == total {
+        return FixPlan::NeedsCapability(denied);
+    }
+    let mut out = String::from("\nFailure tags (most first): ");
+    out.push_str(
+        &tags
+            .iter()
+            .map(|(t, n)| format!("{t}={n}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    out.push_str("\nStrategy, in order:\n");
+    for (tag, _) in &tags {
+        out.push_str(match tag.as_str() {
+            "validation" => "- validation: callers send input the schema rejects (or the output breaks the output schema). Fix the description and input_schema first: clearer field names and descriptions, optional fields with defaults, accept common variants. Change the code only as needed to match.\n",
+            "resource" => "- resource (out of memory/time): stream with fs.readChunks / fetchChunks / emit instead of loading whole.\n",
+            "denied-capability" => "- denied-capability: do not widen Capabilities; handle the denial with a clear thrown error. Grants are the user's decision.\n",
+            "js" => "- js (exceptions): fix the failing code paths shown in the errors, keeping recorded successes working.\n",
+            "user-cancelled" => "- user-cancelled: often too slow; make it faster or report progress with emit.\n",
+            _ => "",
+        });
+    }
+    FixPlan::Rewrite(out)
 }
 
 /// A Tool called repeatedly but only ever from one Session: a hint that it

@@ -213,3 +213,45 @@ fn applied_memory_proposals_migrate_into_the_memory_store() {
     store.set_proposal_status("p1", "rolled_back").unwrap();
     assert!(store.list_memories().unwrap().is_empty());
 }
+
+#[test]
+fn optimiser_fix_plan_follows_failure_tags() {
+    use formless_core::optimiser::{fix_plan, tag_breakdown, FixPlan};
+    use formless_core::storage::ReplayItem;
+    let item = |tag: &str, ok: bool| ReplayItem {
+        input: "{}".into(),
+        error: String::new(),
+        tag: tag.into(),
+        recorded_success: ok,
+    };
+    let denied = vec![
+        item("denied-capability", false),
+        item("denied-capability", false),
+        item("", true),
+    ];
+    assert_eq!(fix_plan(&denied), FixPlan::NeedsCapability(2));
+
+    let mixed = vec![
+        item("validation", false),
+        item("validation", false),
+        item("", false),
+        item("denied-capability", false),
+        item("", true),
+    ];
+    assert_eq!(
+        tag_breakdown(&mixed),
+        vec![
+            ("validation".to_string(), 2),
+            ("denied-capability".to_string(), 1),
+            ("js".to_string(), 1)
+        ]
+    );
+    let FixPlan::Rewrite(s) = fix_plan(&mixed) else {
+        panic!("expected a rewrite")
+    };
+    assert!(s.contains("validation=2, denied-capability=1, js=1"), "{s}");
+    let v = s.find("- validation").unwrap();
+    assert!(v < s.find("- js").unwrap(), "most frequent tag first");
+    assert!(s.contains("Fix the description and input_schema first"));
+    assert!(s.contains("do not widen Capabilities"));
+}
