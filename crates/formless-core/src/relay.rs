@@ -29,7 +29,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{load_relay_secret, RelayCfg};
 use crate::daemon::Daemon;
-use crate::Config;
 
 pub fn key_from_secret(secret: &str) -> Result<[u8; 32]> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -369,7 +368,7 @@ pub async fn relay_loop(daemon: Arc<Daemon>) {
         if shutdown.is_cancelled() {
             return;
         }
-        let cfg = match Config::load(&daemon.paths) {
+        let cfg = match daemon.config() {
             Ok(c) if c.relay.enabled => c.relay,
             Ok(_) => return,
             Err(_) => return,

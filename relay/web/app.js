@@ -1664,6 +1664,9 @@
         }
         break;
       }
+      case "settings_changed":
+        refreshSettings();
+        break;
       case "subagent_started":
         if (here) note("sub-agent started: " + truncate(ev.subagent.task, 80));
         break;

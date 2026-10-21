@@ -487,6 +487,8 @@ pub enum Event {
         session_id: String,
         subagent: SubagentInfo,
     },
+    /// config.toml changed on disk; the daemon now uses the new settings.
+    SettingsChanged,
     /// A stalled Invocation is active again (clears the stall flag).
     InvocationActivity {
         session_id: String,
@@ -533,7 +535,8 @@ impl Event {
             Event::Note { session_id, .. } => session_id.as_deref(),
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
-            Event::ToolUpdated { .. }
+            Event::SettingsChanged
+            | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }
             | Event::ProposalUpdated { .. }
             | Event::ToolDeleted { .. }

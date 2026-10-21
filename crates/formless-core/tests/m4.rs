@@ -1459,3 +1459,38 @@ async fn subagents_emit_events_and_keep_a_transcript() {
     assert_eq!(got["subagent"]["steps"], 1);
     server.abort();
 }
+
+/// The daemon caches config.toml but picks up edits to it (and says so).
+#[cfg(unix)]
+#[tokio::test]
+async fn config_edits_are_picked_up_and_announced() {
+    use formless_protocol::{Event, Request, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4cfg");
+    write_cfg(&paths, "http://127.0.0.1:9/v1", 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let before = c.rpc(Request::GetSettings).await;
+    assert_eq!(before["provider"]["model"], "mock-1");
+    let mut cfg = formless_core::Config::load(&paths).unwrap();
+    cfg.provider.model = "mock-two".into();
+    cfg.save(&paths).unwrap();
+    c.send(Request::GetSettings).await;
+    let (mut model, mut announced) = (None, false);
+    while model.is_none() || !announced {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), c.lines.next_line())
+            .await
+            .expect("settings change not seen")
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(&line) {
+            Ok(ServerMessage::Event(Event::SettingsChanged)) => announced = true,
+            Ok(ServerMessage::Response {
+                result: Some(r), ..
+            }) => model = r["provider"]["model"].as_str().map(str::to_string),
+            _ => {}
+        }
+    }
+    assert_eq!(model.as_deref(), Some("mock-two"));
+    server.abort();
+}
