@@ -894,6 +894,10 @@ impl Daemon {
                             run_id: rid.clone(),
                             delta: delta.to_string(),
                         },
+                        DeltaKind::Restart => Event::StreamRestarted {
+                            session_id: sid.clone(),
+                            run_id: rid.clone(),
+                        },
                     };
                     send_all(&subs, ev);
                 },

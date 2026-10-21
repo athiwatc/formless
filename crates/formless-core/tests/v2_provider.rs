@@ -403,3 +403,72 @@ async fn stream_failure_events_fail_loudly_or_retry() {
     let err = stream_once(c).await.unwrap_err().to_string();
     assert!(err.contains("nope"), "{err}");
 }
+
+/// A stream that drops mid-response is re-sent instead of failing the Run;
+/// the partial output is discarded and a Restart delta tells clients so.
+#[tokio::test]
+async fn dropped_stream_is_retried_and_partial_output_discarded() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let line = |t: &str| {
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices": [{"delta": {"content": t}}]})
+                    )
+                };
+                let chunks: Vec<Result<String, std::io::Error>> = if n == 0 {
+                    vec![
+                        Ok(line("half an ans")),
+                        Err(std::io::Error::other("connection reset")),
+                    ]
+                } else {
+                    vec![Ok(line("the whole answer")), Ok("data: [DONE]\n\n".into())]
+                };
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(futures_util::stream::unfold(
+                        chunks.into_iter(),
+                        |mut it| async move {
+                            let next = it.next()?;
+                            // Flush each chunk before the next (or the drop).
+                            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                            Some((next, it))
+                        },
+                    )))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    let p = Provider::new(c, "k".into()).unwrap();
+    let mut shown = String::new();
+    let mut restarts = 0;
+    let out = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "go"})],
+            &[],
+            "good",
+            None,
+            &CancellationToken::new(),
+            |kind, d| match kind {
+                DeltaKind::Restart => {
+                    restarts += 1;
+                    shown.clear();
+                }
+                _ => shown.push_str(d),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(restarts, 1);
+    assert_eq!(out.content, "the whole answer");
+    assert_eq!(shown, "the whole answer");
+}
