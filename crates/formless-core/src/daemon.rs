@@ -355,6 +355,8 @@ impl Daemon {
                         "session has an active run; interrupt it before editing"
                     ));
                 }
+                // Editing and re-running says the last Run missed (§8.7).
+                let _ = self.with_store(|st| st.mark_last_run_followup(&session_id, "edited"));
                 let msg = self
                     .with_store(|st| st.edit_message(&session_id, &message_id, &content))?
                     .context("user message not found")?;
@@ -482,6 +484,11 @@ impl Daemon {
                 let files = crate::skills::files(&dir)?;
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
+            }
+            Request::RunMetrics { limit } => {
+                let runs = self.with_reader(|st| st.run_metrics(limit.unwrap_or(200)))?;
+                let summary = crate::runs::summarize(&runs);
+                Ok(json!({"runs": runs, "summary": summary}))
             }
             Request::ListMemories => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_memories())?,
@@ -967,6 +974,10 @@ impl Daemon {
                 Ok(json!({"steered": true}))
             }
             (false, _) => {
+                if crate::runs::is_correction(&content) {
+                    let _ =
+                        self.with_store(|st| st.mark_last_run_followup(&session_id, "corrected"));
+                }
                 let msg = self.with_store(|st| st.append_message(&session_id, "user", &content))?;
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
@@ -1480,6 +1491,7 @@ impl Daemon {
             let result = match outcome {
                 Ok(r) => {
                     self.record_model_outcome(&r.model_used, true, started);
+                    let _ = self.with_store(|st| st.bump_run_steps(run_id));
                     if let Some(usage) = &r.usage {
                         let _ = self.with_store(|st| {
                             st.record_usage(session_id, run_id, &r.model_used, usage)

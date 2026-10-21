@@ -110,6 +110,42 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// One Run's metrics (SPEC §8.7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunMetricsInfo {
+    pub run_id: String,
+    pub session_id: String,
+    /// completed, interrupted, paused, resumed, running.
+    pub status: String,
+    /// The status, or `edited` / `corrected` when the user's next move
+    /// says the Run missed its goal.
+    pub outcome: String,
+    /// Model calls.
+    pub steps: i64,
+    /// Registry Tool Invocations.
+    pub tool_calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub duration_ms: i64,
+    pub created_at: String,
+}
+
+/// Run metrics rolled up (SPEC §8.7).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RunSummary {
+    pub runs: i64,
+    /// Share of finished Runs per outcome (0..1).
+    pub completed: f64,
+    pub interrupted: f64,
+    pub paused: f64,
+    pub edited: f64,
+    pub corrected: f64,
+    pub avg_steps: f64,
+    pub avg_tool_calls: f64,
+    pub avg_tokens: f64,
+    pub avg_duration_ms: f64,
+}
+
 /// A user-memory note (SPEC §7.11).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryInfo {
@@ -358,6 +394,12 @@ pub enum Request {
     /// A skill with its SKILL.md body and file list, for review.
     GetSkill {
         name: String,
+    },
+    /// Recent Runs' metrics and their summary (SPEC §8.7):
+    /// `{"runs": [RunMetricsInfo], "summary": RunSummary}`.
+    RunMetrics {
+        #[serde(default)]
+        limit: Option<usize>,
     },
     /// User-memory notes (SPEC §7.11).
     ListMemories,

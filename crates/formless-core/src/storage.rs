@@ -209,7 +209,7 @@ const SKILL_COLS: &str = "s.*,
   (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads,
   (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l WHERE l.skill_id=s.id AND l.run_id IS NOT NULL) AS runs,
   (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l JOIN runs r ON r.id=l.run_id
-     WHERE l.skill_id=s.id AND r.status='completed') AS runs_completed";
+     WHERE l.skill_id=s.id AND r.status='completed' AND r.followup='') AS runs_completed";
 
 const SCHEMA_V16: &str = "
 CREATE TABLE IF NOT EXISTS skills (
@@ -270,7 +270,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -285,7 +285,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 18] = [
+const MIGRATIONS: [(i64, MigrationStep); 19] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -327,6 +327,11 @@ const MIGRATIONS: [(i64, MigrationStep); 18] = [
     (18, |c| {
         add_column(c, "memories", "proposal_id TEXT")?;
         Ok(c.execute_batch(SCHEMA_V18)?)
+    }),
+    // Run-level metrics (SPEC §8.7).
+    (19, |c| {
+        add_column(c, "runs", "steps INTEGER NOT NULL DEFAULT 0")?;
+        add_column(c, "runs", "followup TEXT NOT NULL DEFAULT ''")
     }),
 ];
 
@@ -759,6 +764,68 @@ impl Store {
             )
             .ok())
     }
+    /// One model call made in a Run (a step).
+    pub fn bump_run_steps(&self, run_id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE runs SET steps=steps+1 WHERE id=?1", params![run_id])?;
+        Ok(())
+    }
+
+    /// Mark a Session's latest finished Run as not having met the user's
+    /// goal: `edited` (the user edited and re-ran) or `corrected` (the next
+    /// message reads like "that's wrong"). The first follow-up wins.
+    pub fn mark_last_run_followup(&self, session_id: &str, followup: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET followup=?2 WHERE id=(SELECT id FROM runs WHERE session_id=?1
+               ORDER BY created_at DESC, rowid DESC LIMIT 1) AND followup=''",
+            params![session_id, followup],
+        )?;
+        Ok(())
+    }
+
+    /// Per-Run metrics, newest first.
+    pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.session_id, r.status, r.followup, r.steps,
+               (SELECT COUNT(*) FROM invocations i WHERE i.run_id=r.id),
+               (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
+               (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
+               r.created_at, r.updated_at
+             FROM runs r ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
+                let duration_ms = match (
+                    chrono::DateTime::parse_from_rfc3339(&created),
+                    chrono::DateTime::parse_from_rfc3339(&updated),
+                ) {
+                    (Ok(a), Ok(b)) => (b - a).num_milliseconds().max(0),
+                    _ => 0,
+                };
+                let status: String = r.get(2)?;
+                let followup: String = r.get(3)?;
+                Ok(formless_protocol::RunMetricsInfo {
+                    run_id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    outcome: if followup.is_empty() {
+                        status.clone()
+                    } else {
+                        followup
+                    },
+                    status,
+                    steps: r.get(4)?,
+                    tool_calls: r.get(5)?,
+                    prompt_tokens: r.get(6)?,
+                    completion_tokens: r.get(7)?,
+                    duration_ms,
+                    created_at: created,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn set_run_status(&self, run_id: &str, status: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET status=?2, updated_at=?3 WHERE id=?1",
