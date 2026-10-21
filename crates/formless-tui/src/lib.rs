@@ -3100,6 +3100,37 @@ fn is_queue_key(key: &KeyEvent) -> bool {
     }
 }
 
+/// Rows the live thinking block always takes (SPEC §10.6).
+const THINKING_ROWS: usize = 4;
+
+/// The last `rows` display rows of `text` wrapped at `width` columns
+/// (wide characters count double), padded with empty rows: always exactly
+/// `rows` rows, each fitting the width.
+fn thinking_rows(text: &str, width: usize, rows: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut wrapped: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut row = String::new();
+        let mut used = 0;
+        for c in line.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width {
+                wrapped.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += w;
+        }
+        wrapped.push(row);
+    }
+    let mut out: Vec<String> = wrapped[wrapped.len().saturating_sub(rows)..].to_vec();
+    while out.len() < rows {
+        out.push(String::new());
+    }
+    out
+}
+
 /// How soon a second Ctrl+C must follow the first to detach.
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -3410,17 +3441,16 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
         if group.is_some() {
             lines.push(Line::raw(""));
         }
-        lines.push(Line::styled("▍Thinking", thinking_style(app.color)));
-        let all: Vec<&str> = app.thinking.lines().collect();
-        const KEEP: usize = 6;
-        if all.len() > KEEP {
-            lines.push(Line::styled(
-                format!("  … {} earlier lines", all.len() - KEEP),
-                thinking_style(app.color),
-            ));
-        }
-        for l in &all[all.len().saturating_sub(KEEP)..] {
-            lines.push(Line::styled(format!("  {l}"), thinking_style(app.color)));
+        // A fixed-height block (header + THINKING_ROWS rendered rows,
+        // pre-wrapped so the paragraph never re-wraps them): nothing below
+        // it moves while reasoning streams.
+        let n = app.thinking.lines().count();
+        lines.push(Line::styled(
+            format!("▍Thinking · {n} line{}", if n == 1 { "" } else { "s" }),
+            thinking_style(app.color),
+        ));
+        for row in thinking_rows(&app.thinking, width.saturating_sub(2), THINKING_ROWS) {
+            lines.push(Line::styled(format!("  {row}"), thinking_style(app.color)));
         }
         group = None;
     }
@@ -5481,5 +5511,29 @@ mod tests {
         assert!(code_blocks("no code").is_empty());
         let seq = osc52("hi");
         assert!(seq.contains("]52;c;aGk="), "{seq:?}");
+    }
+
+    #[test]
+    fn thinking_block_has_a_fixed_height_at_any_width() {
+        for text in [
+            "",
+            "one",
+            "a\nb\nc\nd\ne\nf\ng",
+            &"x".repeat(500),
+            "漢字漢字漢字漢字",
+        ] {
+            for width in [1, 5, 20, 80] {
+                let rows = thinking_rows(text, width, THINKING_ROWS);
+                assert_eq!(rows.len(), THINKING_ROWS, "{text:?} at {width}");
+                assert!(rows
+                    .iter()
+                    .all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= width.max(2)));
+            }
+        }
+        assert_eq!(
+            thinking_rows("a\nb\nc\nd\ne", 10, 4),
+            vec!["b", "c", "d", "e"],
+            "keeps the latest rows"
+        );
     }
 }
