@@ -336,6 +336,17 @@ pub enum Request {
     GetSkill {
         name: String,
     },
+    /// A skill's files as a `formless.skill/1` bundle (no metrics).
+    ExportSkill {
+        name: String,
+    },
+    /// Every skill, as `formless.skills/1`.
+    ExportSkills,
+    /// Install a `formless.skill/1` or `formless.skills/1` bundle: author
+    /// `import`, installed disabled for review.
+    ImportSkill {
+        bundle: serde_json::Value,
+    },
     /// One MCP prompt rendered to text (for the composer).
     GetMcpPrompt {
         server: String,

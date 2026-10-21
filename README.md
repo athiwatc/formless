@@ -445,6 +445,8 @@ formless skills add https://github.com/example/skills.git --subdir pdf
 formless skills show pdf      # review: new installs start disabled
 formless skills enable pdf
 formless skills list
+formless skills export pdf -o pdf.skill.json   # files only, no metrics
+formless skills import pdf.skill.json          # imported disabled, contents printed
 ```
 
 ## 6. Invocations: async by design

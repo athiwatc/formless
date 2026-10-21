@@ -511,6 +511,10 @@ pattern (§4.4).
 - Imports are **never auto-trusted**: Capabilities displayed, first-run
   approval applies (§10.3), metrics start at zero, author recorded as
   `import`. A name collision imports as a new Tool, never a silent overwrite.
+- Skills export the same way (`formless skills export <name>|--all`,
+  `formless.skill/1`: the files only, no loads or history). An import is
+  author `import`, becomes the next version of a same-named skill, and is
+  installed **disabled**; the CLI prints its contents to review first.
 
 ### 7.9 External MCP servers
 

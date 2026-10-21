@@ -305,6 +305,75 @@ pub fn install(
     commit(paths, store, &staged, author)
 }
 
+/// Export a skill's current version as a `formless.skill/1` bundle: its
+/// files only (base64), never metrics, loads or history (SPEC §7.8).
+pub fn export(store: &Store, name: &str) -> Result<serde_json::Value> {
+    use base64::Engine;
+    let info = store
+        .get_skill(name)?
+        .with_context(|| format!("no skill named '{name}'"))?;
+    let dir = current_dir(store, name)?;
+    let mut out = Vec::new();
+    for rel in files(&dir)? {
+        let bytes = std::fs::read(dir.join(&rel))?;
+        out.push(serde_json::json!({
+            "path": rel,
+            "content_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }));
+    }
+    Ok(serde_json::json!({
+        "format": "formless.skill/1",
+        "name": info.name,
+        "description": info.description,
+        "files": out,
+    }))
+}
+
+/// Unpack a `formless.skill/1` bundle and validate it like any other
+/// source. Paths may not be absolute or leave the skill folder.
+pub fn prepare_bundle(paths: &Paths, bundle: &serde_json::Value) -> Result<Staged> {
+    use base64::Engine;
+    if bundle["format"].as_str() != Some("formless.skill/1") {
+        bail!("not a formless.skill/1 bundle");
+    }
+    let unpack = paths
+        .data_dir
+        .join("skills")
+        .join(".staging")
+        .join(uuid::Uuid::new_v4().to_string());
+    let result = (|| {
+        let mut total = 0u64;
+        for f in bundle["files"].as_array().into_iter().flatten() {
+            let rel = f["path"].as_str().context("bundle file without a path")?;
+            let rel_path = Path::new(rel);
+            if rel_path.is_absolute()
+                || rel_path
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                bail!("bundle path '{rel}' leaves the skill folder");
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(f["content_b64"].as_str().unwrap_or_default())
+                .with_context(|| format!("bad content for '{rel}'"))?;
+            total += bytes.len() as u64;
+            if total > MAX_BYTES {
+                bail!("skill is larger than {} MB", MAX_BYTES / 1_000_000);
+            }
+            let dst = unpack.join(rel_path);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(dst, bytes)?;
+        }
+        let mut staged = prepare(paths, &unpack.to_string_lossy(), None, None)?;
+        staged.source = "import".into();
+        Ok(staged)
+    })();
+    let _ = std::fs::remove_dir_all(&unpack);
+    result
+}
+
 /// The installed directory of a skill's current version.
 pub fn current_dir(store: &Store, name: &str) -> Result<PathBuf> {
     store
