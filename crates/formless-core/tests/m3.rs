@@ -513,3 +513,68 @@ fn process_children_do_not_inherit_daemon_secrets() {
     .unwrap();
     assert!(!out.as_str().unwrap().contains("leak-1"));
 }
+
+/// Runs `code` live and sets the cancel flag after `after`; returns the
+/// error and how long the Invocation took.
+fn run_cancelled(
+    code: &str,
+    caps: &[&str],
+    after: std::time::Duration,
+) -> (formless_runtime::ExecError, std::time::Duration) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let req = ExecRequest {
+        code: code.to_string(),
+        input: json!({}),
+        caps: Capabilities::parse(&caps.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
+        memory_mb: 256,
+        mode: HostMode::Live,
+        overlay: None,
+        activity: None,
+        modules: Vec::new(),
+        cancel: cancel.clone(),
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(after);
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let started = std::time::Instant::now();
+    let err = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+    (err, started.elapsed())
+}
+
+#[cfg(unix)]
+#[test]
+fn cancel_stops_a_running_process_and_its_children() {
+    let marker = format!("/tmp/fl-m3-kill-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    // The shell's child would create the marker after 1s if it survived.
+    let script = format!("sleep 1 && touch {marker} & sleep 30");
+    let (err, took) = run_cancelled(
+        &format!("function run(i){{ return process.run('sh', ['-c', {script:?}]); }}"),
+        &["process:sh"],
+        std::time::Duration::from_millis(200),
+    );
+    assert_eq!(err.kind, ExecErrorKind::Cancelled, "{}", err.message);
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        !std::path::Path::new(&marker).exists(),
+        "grandchild must be killed with the group"
+    );
+}
+
+#[test]
+fn cancel_stops_a_fetch_that_never_answers() {
+    // Accepts connections but never replies.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let _held: Vec<_> = listener.incoming().collect();
+    });
+    let (err, took) = run_cancelled(
+        &format!("function run(i){{ return fetch('http://{addr}/'); }}"),
+        &["net"],
+        std::time::Duration::from_millis(200),
+    );
+    assert_eq!(err.kind, ExecErrorKind::Cancelled, "{}", err.message);
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+}
