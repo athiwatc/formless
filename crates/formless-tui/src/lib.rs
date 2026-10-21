@@ -125,6 +125,7 @@ enum Pending {
     RunControl,
     ListSubagents,
     GetSubagent,
+    ListMcpServers,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -733,6 +734,35 @@ impl App {
                                     .push("/agents <n> shows that sub-agent's transcript".into());
                             }
                         }
+                        Pending::ListMcpServers => {
+                            let list: Vec<McpServerInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push(
+                                    "no MCP servers (add one with `formless mcp add`)".into(),
+                                );
+                            }
+                            for s in list {
+                                let state = if s.disabled {
+                                    "disabled"
+                                } else if s.running {
+                                    "running"
+                                } else {
+                                    "idle"
+                                };
+                                self.notes.push(format!(
+                                    "mcp {} [{}] {} · {} tools · {}{}",
+                                    s.name,
+                                    s.transport,
+                                    state,
+                                    s.tool_count,
+                                    truncate_chars(&s.target, 50),
+                                    s.last_error
+                                        .map(|e| format!(" · error: {}", truncate_chars(&e, 80)))
+                                        .unwrap_or_default()
+                                ));
+                            }
+                        }
                         Pending::GetSubagent => {
                             let lines: Vec<String> = result["messages"]
                                 .as_array()
@@ -1053,6 +1083,7 @@ impl App {
                 self.notes.push(format!("compacted: {summary_preview}"));
             }
             Event::Note { text, .. } => self.notes.push(text),
+            Event::McpServersChanged => {}
             Event::SettingsChanged => {
                 if let Ok(cfg) = Config::load(&self.paths) {
                     self.model_label = cfg.provider.model;
@@ -1471,6 +1502,12 @@ impl App {
                     if self.show_thinking { "on" } else { "off" }
                 ));
             }
+            "mcp" => self.request(Pending::ListMcpServers, Request::ListMcpServers),
+            cmd if cmd.starts_with("mcp restart ") => {
+                let name = cmd["mcp restart ".len()..].trim().to_string();
+                self.fire(Request::RestartMcpServer { name: name.clone() });
+                self.notes.push(format!("restarting MCP server {name}…"));
+            }
             "agents" => {
                 if let Some(session_id) = self.current.clone() {
                     self.request(Pending::ListSubagents, Request::ListSubagents { session_id });
@@ -1527,7 +1564,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

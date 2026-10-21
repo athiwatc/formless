@@ -416,6 +416,55 @@ impl Daemon {
                 );
                 Ok(json!({"diff": crate::diff::version_diff(a, b)}))
             }
+            Request::ListMcpServers => Ok(serde_json::to_value(self.mcp_servers().await?)?),
+            Request::AddMcpServer { name, server } => {
+                let server: crate::config::McpServerCfg =
+                    serde_json::from_value(server).context("invalid MCP server config")?;
+                if name.is_empty()
+                    || name.contains("__")
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!(
+                        "MCP server names use letters, digits, '-' and '_' (no '__')"
+                    ));
+                }
+                let mut cfg = self.config()?;
+                cfg.mcp.servers.insert(name.clone(), server);
+                cfg.save(&self.paths)?;
+                let _ = self.with_store(|st| st.audit("user", "mcp.add", &name));
+                self.mcp.stop(&name).await;
+                let tools = self.sync_mcp_server(&cfg, &name).await;
+                self.mcp
+                    .set_error(&name, tools.as_ref().err().map(|e| format!("{e:#}")));
+                self.broadcast(Event::McpServersChanged);
+                Ok(json!({"added": name, "tools": tools.ok(), "error": self.mcp.last_error(&name)}))
+            }
+            Request::RemoveMcpServer { name } => {
+                let mut cfg = self.config()?;
+                if cfg.mcp.servers.remove(&name).is_none() {
+                    return Err(anyhow!("no MCP server '{name}'"));
+                }
+                cfg.save(&self.paths)?;
+                self.mcp.stop(&name).await;
+                // Its tools stay in the registry, retired (metrics are kept).
+                let retired = self.with_store(|st| crate::mcp::sync_registry(st, &name, &[]))?;
+                let _ = self.with_store(|st| st.audit("user", "mcp.remove", &name));
+                self.broadcast(Event::McpServersChanged);
+                Ok(json!({"removed": name, "retired_tools": retired}))
+            }
+            Request::RestartMcpServer { name } => {
+                let cfg = self.config()?;
+                self.mcp.stop(&name).await;
+                let tools = self.sync_mcp_server(&cfg, &name).await;
+                self.mcp
+                    .set_error(&name, tools.as_ref().err().map(|e| format!("{e:#}")));
+                self.broadcast(Event::McpServersChanged);
+                Ok(
+                    json!({"restarted": name, "tools": tools.ok(), "error": self.mcp.last_error(&name)}),
+                )
+            }
             Request::ListSubagents { session_id } => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_subagents(&session_id))?,
             )?),
@@ -3179,6 +3228,38 @@ impl Daemon {
             }
             self.mcp.reap_idle(cfg.mcp.idle_secs).await;
         }
+    }
+
+    /// Configured MCP servers with their live state.
+    async fn mcp_servers(&self) -> Result<Vec<McpServerInfo>> {
+        let cfg = self.config()?;
+        let tools = self.with_reader(|st| st.list_tools(false))?;
+        let mut out = Vec::new();
+        for (name, s) in &cfg.mcp.servers {
+            let prefix = crate::mcp::registry_name(name, "").to_lowercase();
+            let http = s.transport == "http";
+            out.push(McpServerInfo {
+                name: name.clone(),
+                transport: if http { "http" } else { "stdio" }.into(),
+                target: if http {
+                    s.url.clone()
+                } else {
+                    std::iter::once(s.command.clone())
+                        .chain(s.args.clone())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+                disabled: s.disabled,
+                running: self.mcp.is_running(name).await,
+                tool_count: tools
+                    .iter()
+                    .filter(|t| t.name.to_lowercase().starts_with(&prefix))
+                    .count(),
+                last_error: self.mcp.last_error(name),
+                logged_in: http && crate::mcp_auth::has_login(&self.paths, name),
+            });
+        }
+        Ok(out)
     }
 
     /// Fetch one server's tool list and mirror it into the registry.

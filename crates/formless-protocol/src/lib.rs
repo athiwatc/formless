@@ -110,6 +110,23 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// A configured MCP server and its state (SPEC §7.9).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// "stdio" or "http".
+    pub transport: String,
+    /// stdio: command line; http: URL.
+    pub target: String,
+    pub disabled: bool,
+    pub running: bool,
+    /// Active registry tools from this server.
+    pub tool_count: usize,
+    pub last_error: Option<String>,
+    /// http: whether OAuth tokens are stored.
+    pub logged_in: bool,
+}
+
 /// A sub-agent started by `agents.run` (its transcript is stored apart
 /// from the Session's). Status: running | completed | failed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -260,6 +277,21 @@ pub enum Request {
     },
     ListSubagents {
         session_id: String,
+    },
+    ListMcpServers,
+    /// Add (or replace) a server: `server` is its `[mcp.servers.<name>]`
+    /// table as JSON. Its tools are listed into the registry at once.
+    AddMcpServer {
+        name: String,
+        server: serde_json::Value,
+    },
+    /// Remove a server; its tools are retired (kept for metrics).
+    RemoveMcpServer {
+        name: String,
+    },
+    /// Stop the server's process (if any) and list its tools again.
+    RestartMcpServer {
+        name: String,
     },
     /// What changed between two versions of a Tool, as diff text.
     DiffToolVersions {
@@ -522,6 +554,8 @@ pub enum Event {
     },
     /// config.toml changed on disk; the daemon now uses the new settings.
     SettingsChanged,
+    /// MCP servers were added, removed or changed state.
+    McpServersChanged,
     /// A stalled Invocation is active again (clears the stall flag).
     InvocationActivity {
         session_id: String,
@@ -569,6 +603,7 @@ impl Event {
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
             Event::SettingsChanged
+            | Event::McpServersChanged
             | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }
             | Event::ProposalUpdated { .. }

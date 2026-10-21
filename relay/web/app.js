@@ -1292,6 +1292,21 @@
         ["credential", auth.credential_present ? "present" : "missing"], ["auth mode", auth.mode],
         ["token expires", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : ""]]));
     }
+    const mcp = S.mcpServers || [];
+    grid.append(h("section", null, h("h3", null, "MCP servers"),
+      mcp.length ? h("table", { class: "table" },
+        h("tbody", null, mcp.map((m) => h("tr", null,
+          h("td", null, h("strong", null, m.name), h("div", { class: "muted" }, m.transport + " · " + m.target),
+            m.last_error ? h("div", { class: "error" }, m.last_error) : null),
+          h("td", null, m.disabled ? "disabled" : m.running ? "running" : "idle"),
+          h("td", { class: "num" }, m.tool_count + " tools"),
+          h("td", null,
+            h("button", { class: "btn small", type: "button", onclick: () => act({ type: "restart_mcp_server", name: m.name }, "Restarted " + m.name).then(refreshSettings) }, "Restart"),
+            h("button", { class: "btn small danger", type: "button", onclick: async () => {
+              const ok = await ask({ title: "Remove MCP server " + m.name + "?", text: "Its tools are retired (metrics kept).", ok: "Remove", danger: true });
+              if (ok) { await act({ type: "remove_mcp_server", name: m.name }, "Removed " + m.name); refreshSettings(); }
+            } }, "Remove"))))))
+        : h("p", { class: "muted" }, "None. Add one with formless mcp add NAME -- COMMAND, or --url URL.")));
     const thinking = h("input", { type: "checkbox", onchange: (e) => setThinking(e.target.checked) });
     thinking.checked = S.showThinking;
     grid.append(h("section", null, h("h3", null, "This browser"),
@@ -1332,6 +1347,7 @@
     renderView();
   }
   async function refreshSettings() {
+    S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
     try {
       S.settings = await request({ type: "get_settings" });
     } catch (e) {
@@ -1697,6 +1713,7 @@
         break;
       }
       case "settings_changed":
+      case "mcp_servers_changed":
         refreshSettings();
         break;
       case "subagent_started":

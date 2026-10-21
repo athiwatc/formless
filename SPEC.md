@@ -551,6 +551,14 @@ None ship by default (principle 1).
   `Bearer`, refreshed when expired or on a 401 (rotation kept), and never
   shown to the model or Tools; a server needing a login fails with the
   command to run.
+- **Management** goes through the daemon (no client-only behaviour):
+  `ListMcpServers`, `AddMcpServer {name, server}` (writes `config.toml`
+  and lists the tools at once), `RemoveMcpServer` (its tools are retired,
+  metrics kept), `RestartMcpServer`, and the `McpServersChanged` event.
+  CLI: `formless mcp add NAME -- CMD [ARGS]` / `add NAME --url URL
+  [--header K=V]`, `remove`, `list` (state, tool count, last error),
+  `test`, `login`, `logout`; TUI `/mcp` (and `/mcp restart NAME`); the web
+  Settings view lists servers with Restart/Remove.
 - `mcp:<server>` is sensitive: calls need approval (§10.3) and headless
   calls fail closed.
 
