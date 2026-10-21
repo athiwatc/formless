@@ -31,6 +31,9 @@ pub(crate) fn validate_len(text: &str, max: usize) -> Result<()> {
     if text.is_empty() {
         bail!("memory text is empty");
     }
+    if let Some(what) = find_secret(&text) {
+        bail!("refused: memory looks like it contains a secret ({what}); memory is sent to the model every Session, so never store credentials");
+    }
     if text.chars().count() > max {
         bail!("memory text is longer than {max} characters; keep notes short");
     }
@@ -43,6 +46,112 @@ pub(crate) fn validate_scope(scope: &str) -> Result<()> {
         Some(path) if path.starts_with('/') || path.contains(":\\") => Ok(()),
         _ => bail!("scope must be \"global\" or \"project:<absolute path>\""),
     }
+}
+
+/// What kind of secret `text` seems to contain, if any: known key and
+/// token formats, private keys, bearer tokens, JWTs, `password: …`-style
+/// assignments and long random-looking strings.
+pub fn find_secret(text: &str) -> Option<&'static str> {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("sk-", "API key"),
+        ("sk_live_", "API key"),
+        ("sk_test_", "API key"),
+        ("rk_live_", "API key"),
+        ("ghp_", "GitHub token"),
+        ("gho_", "GitHub token"),
+        ("ghu_", "GitHub token"),
+        ("ghs_", "GitHub token"),
+        ("github_pat_", "GitHub token"),
+        ("glpat-", "GitLab token"),
+        ("xoxb-", "Slack token"),
+        ("xoxp-", "Slack token"),
+        ("AIza", "Google API key"),
+        ("AKIA", "AWS access key"),
+        ("ASIA", "AWS access key"),
+    ];
+    if text.contains("PRIVATE KEY-----") {
+        return Some("private key");
+    }
+    let lower = text.to_lowercase();
+    if lower.contains("bearer ") {
+        let after = &lower[lower.find("bearer ").unwrap() + 7..];
+        if after
+            .split_whitespace()
+            .next()
+            .is_some_and(|t| t.len() >= 16)
+        {
+            return Some("bearer token");
+        }
+    }
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
+        .filter(|w| !w.is_empty())
+        .collect();
+    for w in &words {
+        for (prefix, what) in PREFIXES {
+            if w.starts_with(prefix) && w.len() >= prefix.len() + 16 {
+                return Some(what);
+            }
+        }
+        if w.starts_with("eyJ") && w.matches('.').count() == 2 && w.len() > 40 {
+            return Some("JWT");
+        }
+        if looks_random(w.trim_end_matches(['.', ':'])) {
+            return Some("random-looking token");
+        }
+    }
+    // "password is hunter2", "api_key=…", "token: …"
+    for (i, w) in words.iter().enumerate() {
+        let lw = w.to_lowercase();
+        let (key, inline) = match lw.split_once(['=', ':']) {
+            Some((k, v)) => (k.to_string(), (!v.is_empty()).then(|| v.to_string())),
+            None => (lw.clone(), None),
+        };
+        let key = key.trim_matches(|c: char| !c.is_alphanumeric());
+        let secretish = matches!(
+            key,
+            "password"
+                | "passwd"
+                | "pwd"
+                | "passphrase"
+                | "secret"
+                | "token"
+                | "apikey"
+                | "api_key"
+                | "api-key"
+                | "pin"
+        );
+        if !secretish {
+            continue;
+        }
+        let value = inline.or_else(|| {
+            let next = words.get(i + 1)?;
+            let next = if matches!(*next, "is" | "=" | ":") {
+                words.get(i + 2)?
+            } else if lw.ends_with([':', '=']) {
+                next
+            } else {
+                return None;
+            };
+            Some(next.to_string())
+        });
+        if value.is_some_and(|v| v.len() >= 4) {
+            return Some("credential");
+        }
+    }
+    None
+}
+
+/// A long run of mixed-case letters and digits with no structure: an
+/// API key or token rather than a word, path or hash-like id in prose.
+fn looks_random(w: &str) -> bool {
+    w.len() >= 32
+        && !w.contains('/')
+        && w.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_+=".contains(c))
+        && w.chars().any(|c| c.is_ascii_digit())
+        && w.chars().any(|c| c.is_ascii_lowercase())
+        && w.chars().any(|c| c.is_ascii_uppercase())
 }
 
 /// The "User memory" block for the system prompt (empty without notes):

@@ -680,6 +680,17 @@ suite cannot measure preferences.
   - web: the Settings "Memory" section.
   Memory is never part of Tool or skill bundles, and `formless reset`
   wipes it with the rest of the data.
+- **No secrets.** Memory is sent to the provider every Session, so every
+  write is refused when it looks like it contains a secret. That covers
+  writes from the agent, the user and the optimiser, and edits too.
+  Detection covers:
+  - known key and token formats (`sk-`, `ghp_`, `AKIA`, `xoxb-`, …)
+  - private keys, bearer tokens and JWTs
+  - `password/token/api_key is|:|= …` assignments
+  - long mixed-case random-looking strings
+  `remember` also refuses text of 40 or more characters copied verbatim
+  from the Session's recent Tool results; the agent must restate the
+  preference in its own words.
 - Every change is audit-logged and broadcasts `MemoryUpdated`.
 - Optimiser notes (author `optimiser`, up to 800 characters) come from
   applied memory-kind proposals (§8). Schema v18 migrated the applied
