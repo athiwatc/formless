@@ -77,6 +77,38 @@ pub struct ChatResult {
     /// Output stopped at the token limit (`finish_reason: "length"`): the
     /// answer or the tool-call arguments are cut off.
     pub truncated: bool,
+    /// Token usage as reported by the provider (None when it sends none).
+    pub usage: Option<Usage>,
+}
+
+/// Provider-reported token counts for one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Part of `completion_tokens` spent on reasoning.
+    pub reasoning_tokens: u64,
+    /// Part of `prompt_tokens` served from the provider's prompt cache.
+    pub cached_tokens: u64,
+}
+
+impl Usage {
+    /// Chat Completions (`prompt_tokens`, …) or Responses (`input_tokens`,
+    /// …) usage object.
+    pub fn parse(u: &Value) -> Option<Self> {
+        if !u.is_object() {
+            return None;
+        }
+        let n = |v: &Value| v.as_u64().unwrap_or(0);
+        Some(Self {
+            prompt_tokens: n(&u["prompt_tokens"]).max(n(&u["input_tokens"])),
+            completion_tokens: n(&u["completion_tokens"]).max(n(&u["output_tokens"])),
+            reasoning_tokens: n(&u["completion_tokens_details"]["reasoning_tokens"])
+                .max(n(&u["output_tokens_details"]["reasoning_tokens"])),
+            cached_tokens: n(&u["prompt_tokens_details"]["cached_tokens"])
+                .max(n(&u["input_tokens_details"]["cached_tokens"])),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +482,15 @@ impl Provider {
                         }
                         server_wait = retry_after(resp.headers());
                         let text = resp.text().await.unwrap_or_default();
+                        if status.as_u16() == 400
+                            && body.get("stream_options").is_some()
+                            && text.to_lowercase().contains("stream_options")
+                        {
+                            if let Some(o) = body.as_object_mut() {
+                                o.remove("stream_options");
+                            }
+                            continue;
+                        }
                         if status.as_u16() == 400 && with_effort && is_unknown_param(&text) {
                             with_effort = false;
                             dropped = true;
@@ -538,7 +579,10 @@ impl Provider {
             }
             b
         } else {
-            let mut b = json!({"model": model, "messages": messages, "stream": true});
+            // Ask for real token counts in the final chunk (dropped again if
+            // the endpoint rejects the option).
+            let mut b = json!({"model": model, "messages": messages, "stream": true,
+                "stream_options": {"include_usage": true}});
             if !effective_tools.is_empty() {
                 b["tools"] = json!(effective_tools);
             }
@@ -548,6 +592,7 @@ impl Provider {
         let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut truncated = false;
+        let mut usage = None;
         let mut attempt = 0;
         let (dropped, model_used) = 'request: loop {
             // Waiting for the response headers is cancellable too (a slow or
@@ -579,6 +624,7 @@ impl Provider {
                                 reasoning.clear();
                                 tool_calls.clear();
                                 truncated = false;
+                                usage = None;
                                 tokio::time::sleep(self.backoff(attempt, None)).await;
                                 attempt += 1;
                                 continue 'request;
@@ -665,6 +711,7 @@ impl Provider {
                                                 }
                                             }
                                             "response.completed" => {
+                                                usage = Usage::parse(&v["response"]["usage"]).or(usage);
                                                 if content.is_empty() {
                                                     let t = responses_text(&v["response"]);
                                                     if !t.is_empty() {
@@ -682,6 +729,9 @@ impl Provider {
                                         }
                                         continue;
                                     }
+                                    // With include_usage the last chunk carries usage
+                                    // (and usually no choices).
+                                    usage = Usage::parse(&v["usage"]).or(usage);
                                     if v["choices"][0]["finish_reason"].as_str() == Some("length") {
                                         truncated = true;
                                     }
@@ -762,6 +812,7 @@ impl Provider {
             dropped_reasoning_effort: dropped,
             model_used,
             truncated,
+            usage,
         })
     }
 

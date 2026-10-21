@@ -191,6 +191,17 @@ CREATE TABLE IF NOT EXISTS subagent_messages (
   PRIMARY KEY (subagent_id, seq));
 ";
 
+const SCHEMA_V11: &str = "
+CREATE TABLE IF NOT EXISTS run_usage (
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL, model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
+  reasoning_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL,
+  created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_run_usage_session ON run_usage(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_run_usage_run ON run_usage(run_id);
+";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -214,7 +225,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -229,7 +240,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 10] = [
+const MIGRATIONS: [(i64, MigrationStep); 11] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -252,6 +263,7 @@ const MIGRATIONS: [(i64, MigrationStep); 10] = [
     (8, |c| Ok(c.execute_batch(SCHEMA_V8)?)),
     (9, |c| Ok(c.execute_batch(SCHEMA_V9)?)),
     (10, |c| Ok(c.execute_batch(SCHEMA_V10)?)),
+    (11, |c| Ok(c.execute_batch(SCHEMA_V11)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1749,6 +1761,62 @@ impl Store {
         Ok(())
     }
 
+    /// Record one provider request's reported token usage (one Run step).
+    pub fn record_usage(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        model: &str,
+        usage: &crate::provider::Usage,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                session_id,
+                run_id,
+                model,
+                usage.prompt_tokens as i64,
+                usage.completion_tokens as i64,
+                usage.reasoning_tokens as i64,
+                usage.cached_tokens as i64,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Summed usage of a Run's provider requests.
+    pub fn run_usage(&self, run_id: &str) -> Result<crate::provider::Usage> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0) FROM run_usage WHERE run_id=?1",
+            params![run_id],
+            |r| {
+                Ok(crate::provider::Usage {
+                    prompt_tokens: r.get::<_, i64>(0)? as u64,
+                    completion_tokens: r.get::<_, i64>(1)? as u64,
+                    reasoning_tokens: r.get::<_, i64>(2)? as u64,
+                    cached_tokens: r.get::<_, i64>(3)? as u64,
+                })
+            },
+        )?)
+    }
+
+    /// The Session's latest real prompt size, if one was reported since its
+    /// latest compaction checkpoint (older ones describe a longer context).
+    pub fn last_prompt_tokens(&self, session_id: &str) -> Result<Option<u64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT prompt_tokens FROM run_usage WHERE session_id=?1 \
+                 AND created_at > COALESCE((SELECT MAX(created_at) FROM checkpoints WHERE session_id=?1), '') \
+                 ORDER BY rowid DESC LIMIT 1",
+                params![session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|n| n as u64))
+    }
+
     /// (id, path, bytes, created_at) of every artifact, oldest first.
     pub fn list_artifacts(&self) -> Result<Vec<(String, String, i64, String)>> {
         let mut stmt = self.conn.prepare(
@@ -2036,6 +2104,26 @@ pub struct ContextCache {
 }
 
 impl ContextCache {
+    /// Use the provider's last real prompt size (when known) for the
+    /// compaction decision instead of the chars/4 estimate, whichever is
+    /// larger: code, JSON and CJK text are far off four chars per token.
+    pub fn with_known_tokens(
+        &self,
+        built: BuiltContext,
+        known_prompt_tokens: Option<u64>,
+        context_tokens: u32,
+        trigger_fraction: f64,
+    ) -> BuiltContext {
+        let (ctx, needs, up_to) = built;
+        let live = &self.live_seqs;
+        let over = known_prompt_tokens
+            .is_some_and(|n| n as f64 > context_tokens as f64 * trigger_fraction);
+        if needs || !over || live.len() <= 4 {
+            return (ctx, needs, up_to);
+        }
+        (ctx, true, live[live.len() / 2])
+    }
+
     pub fn build(
         &mut self,
         store: &Store,
