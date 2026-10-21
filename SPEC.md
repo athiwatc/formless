@@ -623,6 +623,23 @@ Tools fill capability gaps; skills say how to use them well.
   the agent reads it and ports it to a Tool with `create_tool` (sandboxed,
   approval applies), or creates a Tool that runs it via `process.run` with
   a `process:` capability the user approves.
+- **Automatic skills** (`[skills]` in `config.toml`). After a Run
+  completes with at least `min_tool_calls` (5) registry Tool calls, or
+  with at least 3 calls in the same order as a completed Run in another
+  Session, and that Run loaded no skill, a background job asks the model
+  (`skills.model`, else the Session's) to distil a generic `SKILL.md`
+  (when to use, steps, pitfalls, Tools; no user data, no secrets) or
+  reply NONE. The existing skills are in the prompt for dedup: reusing an
+  auto skill's name makes a new version, and a user or imported skill is
+  never replaced. Auto skills have author `auto` and are enabled at once.
+  One distillation runs at a time; `skills.auto_create = false` turns
+  this off.
+- **Measured and retired.** Each skill reports loads, the Runs that
+  loaded it and how many of those completed. After every Run, auto skills
+  not loaded for `auto_retire_days` (30; 0 = never) or whose Runs
+  complete less than `min_success_rate` (0.5, once loaded in
+  `min_runs_for_rate` = 5 Runs) are **retired**: disabled, kept, and
+  restored by enabling them. Creation and retirement are audit-logged.
 - **Management** goes through the daemon: `ListSkills`, `AddSkill`,
   `RemoveSkill`, `SetSkillEnabled`, `GetSkill`, the `SkillsChanged` event;
   CLI `formless skills add|remove|list|enable|disable|show`; TUI `/skills`

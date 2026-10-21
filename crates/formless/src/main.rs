@@ -1062,18 +1062,29 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
             }
             for s in skills {
                 println!(
-                    "{:<24} v{:<3} {:<8} {:>4} loads  {}{}",
+                    "{:<24} v{:<3} {:<8} {:>4} loads {:>5}  {}{}{}",
                     s["name"].as_str().unwrap_or_default(),
                     s["version"],
-                    if s["enabled"] == true {
+                    if s["retired"] == true {
+                        "retired"
+                    } else if s["enabled"] == true {
                         "enabled"
                     } else {
                         "disabled"
                     },
                     s["loads"],
+                    match (s["runs"].as_i64(), s["runs_completed"].as_i64()) {
+                        (Some(r), Some(c)) if r > 0 => format!("{}%", 100 * c / r),
+                        _ => "-".into(),
+                    },
                     s["description"].as_str().unwrap_or_default(),
                     if s["has_scripts"] == true {
                         "  [scripts]"
+                    } else {
+                        ""
+                    },
+                    if s["author"] == "auto" {
+                        "  [auto]"
                     } else {
                         ""
                     },

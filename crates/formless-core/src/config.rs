@@ -19,6 +19,39 @@ pub struct Config {
     pub naming: NamingCfg,
     pub artifacts: ArtifactsCfg,
     pub mcp: McpCfg,
+    pub skills: SkillsCfg,
+}
+
+/// Automatic skills (SPEC §7.10): distilled from successful Runs,
+/// measured, and retired when unused or unhelpful.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsCfg {
+    /// Distil a skill after a successful, non-trivial Run.
+    pub auto_create: bool,
+    /// Tool calls a Run needs before it is worth a skill (a Tool sequence
+    /// already seen in another Session needs only 3).
+    pub min_tool_calls: usize,
+    /// Model for distilling; unset uses the Session's.
+    pub model: Option<String>,
+    /// Retire auto skills not loaded for this many days (0: never).
+    pub auto_retire_days: u64,
+    /// Retire auto skills whose Runs complete less often than this…
+    pub min_success_rate: f64,
+    /// …once they have been loaded in at least this many Runs.
+    pub min_runs_for_rate: i64,
+}
+impl Default for SkillsCfg {
+    fn default() -> Self {
+        Self {
+            auto_create: true,
+            min_tool_calls: 5,
+            model: None,
+            auto_retire_days: 30,
+            min_success_rate: 0.5,
+            min_runs_for_rate: 5,
+        }
+    }
 }
 
 /// External MCP servers ((SPEC §7.9)). None ship by default.

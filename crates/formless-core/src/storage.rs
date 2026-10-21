@@ -204,6 +204,13 @@ CREATE INDEX IF NOT EXISTS idx_run_usage_run ON run_usage(run_id);
 
 /// Tool definitions as a Session last listed them (pinned for the prompt
 /// cache until that Session refreshes them).
+/// Columns for [`Store::row_skill`]: the row plus usage metrics.
+const SKILL_COLS: &str = "s.*,
+  (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads,
+  (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l WHERE l.skill_id=s.id AND l.run_id IS NOT NULL) AS runs,
+  (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l JOIN runs r ON r.id=l.run_id
+     WHERE l.skill_id=s.id AND r.status='completed') AS runs_completed";
+
 const SCHEMA_V16: &str = "
 CREATE TABLE IF NOT EXISTS skills (
   id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL,
@@ -2029,15 +2036,17 @@ impl Store {
             has_scripts: r.get::<_, i64>("has_scripts")? != 0,
             retired: r.get::<_, i64>("retired")? != 0,
             loads: r.get("loads")?,
+            runs: r.get("runs")?,
+            runs_completed: r.get("runs_completed")?,
             created_at: r.get("created_at")?,
             updated_at: r.get("updated_at")?,
         })
     }
 
     pub fn list_skills(&self) -> Result<Vec<formless_protocol::SkillInfo>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.*, (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads FROM skills s ORDER BY s.name",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SKILL_COLS} FROM skills s ORDER BY s.name"
+        ))?;
         let rows = stmt
             .query_map([], Self::row_skill)?
             .collect::<rusqlite::Result<_>>()?;
@@ -2048,7 +2057,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT s.*, (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads FROM skills s WHERE s.name=?1",
+                &format!("SELECT {SKILL_COLS} FROM skills s WHERE s.name=?1"),
                 params![name],
                 Self::row_skill,
             )
@@ -2067,9 +2076,10 @@ impl Store {
             .ok())
     }
 
+    /// Enabling also restores a retired skill.
     pub fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
         Ok(self.conn.execute(
-            "UPDATE skills SET enabled=?2, updated_at=?3 WHERE name=?1",
+            "UPDATE skills SET enabled=?2, retired=CASE WHEN ?2 THEN 0 ELSE retired END, updated_at=?3 WHERE name=?1",
             params![name, enabled, now()],
         )? > 0)
     }
@@ -2081,6 +2091,90 @@ impl Store {
             params![name, session_id, run_id, now()],
         )?;
         Ok(())
+    }
+
+    /// Retire auto-created skills that are unused (no load since `cutoff`,
+    /// counting from their latest version) or unhelpful (Runs that loaded
+    /// them complete less often than `min_rate`, once there are `min_runs`).
+    /// Returns the retired names; they stay restorable.
+    pub fn retire_auto_skills(
+        &self,
+        cutoff: Option<&str>,
+        min_rate: f64,
+        min_runs: i64,
+    ) -> Result<Vec<String>> {
+        let mut retired = Vec::new();
+        for s in self.list_skills()? {
+            if s.author != "auto" || s.retired {
+                continue;
+            }
+            let idle = match cutoff {
+                Some(c) => {
+                    s.updated_at.as_str() < c
+                        && !self.conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM skill_loads l JOIN skills k ON k.id=l.skill_id WHERE k.name=?1 AND l.created_at>=?2)",
+                            params![s.name, c],
+                            |r| r.get::<_, bool>(0),
+                        )?
+                }
+                None => false,
+            };
+            let unhelpful =
+                s.runs >= min_runs.max(1) && (s.runs_completed as f64) < min_rate * s.runs as f64;
+            if idle || unhelpful {
+                self.conn.execute(
+                    "UPDATE skills SET retired=1, enabled=0, updated_at=?2 WHERE name=?1",
+                    params![s.name, now()],
+                )?;
+                retired.push(s.name);
+            }
+        }
+        Ok(retired)
+    }
+
+    /// Registry Tools a Run called, in order, with input and status.
+    pub fn run_invocations(&self, run_id: &str) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.name, i.input, i.status FROM invocations i JOIN tools t ON t.id=i.tool_id
+             WHERE i.run_id=?1 ORDER BY i.created_at, i.rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Whether a completed Run in another Session called the same Tools in
+    /// the same order (a repeated pattern worth a skill).
+    pub fn tool_sequence_seen_elsewhere(&self, session_id: &str, seq: &[String]) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id FROM runs r WHERE r.session_id!=?1 AND r.status='completed'
+               AND EXISTS(SELECT 1 FROM invocations i WHERE i.run_id=r.id)
+             ORDER BY r.created_at DESC LIMIT 500",
+        )?;
+        let runs: Vec<String> = stmt
+            .query_map(params![session_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for run in runs {
+            let other: Vec<String> = self
+                .run_invocations(&run)?
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect();
+            if other == seq {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether a Run loaded any skill (then it was already guided by one).
+    pub fn run_loaded_skill(&self, run_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM skill_loads WHERE run_id=?1)",
+            params![run_id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Delete a skill's rows; returns its version folders to remove.
