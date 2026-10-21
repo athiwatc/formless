@@ -604,6 +604,58 @@ impl Store {
         )?;
         Ok(())
     }
+    /// The Session's most recent Run as (run id, status).
+    pub fn last_run(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, status FROM runs WHERE session_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok())
+    }
+
+    /// Tool calls of the latest assistant tool-call turn that never got a
+    /// result (the Run stopped mid-batch), as (call id, tool name).
+    pub fn dangling_tool_calls(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        let msgs = self.list_messages(session_id)?;
+        let Some(pos) = msgs.iter().rposition(|m| {
+            m.role == "assistant"
+                && m.meta
+                    .as_deref()
+                    .is_some_and(|meta| meta.contains("\"tool_calls\""))
+        }) else {
+            return Ok(Vec::new());
+        };
+        let meta: Value = serde_json::from_str(msgs[pos].meta.as_deref().unwrap_or("{}"))?;
+        let answered: std::collections::HashSet<String> = msgs[pos + 1..]
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| {
+                let meta: Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+                meta["tool_call_id"].as_str().map(str::to_string)
+            })
+            .collect();
+        Ok(meta["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                let id = c["id"].as_str()?;
+                (!answered.contains(id)).then(|| {
+                    (
+                        id.to_string(),
+                        c["function"]["name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+            })
+            .collect())
+    }
+
     /// On daemon startup, runs left 'running' were interrupted by a crash (SPEC §9.5).
     pub fn mark_orphan_runs_interrupted(&self) -> Result<usize> {
         // In-flight invocations: outcome unknown, never re-executed (§9.5).

@@ -1413,7 +1413,7 @@
     if (S.view === "settings") renderSettings();
   }
 
-  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /help";
+  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /resume /abandon /help";
   async function slash(cmd) {
     const [name, ...rest] = cmd.split(/\s+/);
     const arg = rest.join(" ");
@@ -1430,6 +1430,15 @@
       case "propose": act({ type: "generate_proposal" }); return note("generating a measured proposal…");
       case "thinking": setThinking(!S.showThinking); return note("thinking display " + (S.showThinking ? "on" : "off"));
       case "stop": return stop();
+      case "resume":
+        if (S.current) await act({ type: "resume_run", session_id: S.current });
+        return;
+      case "abandon": {
+        if (!S.current) return;
+        const r = await act({ type: "abandon_run", session_id: S.current });
+        if (r) note(r.abandoned ? "abandoned the interrupted run" : "nothing to abandon");
+        return;
+      }
       case "panes": return note("The web layout always shows Sessions beside the chat.");
       case "model": {
         const s = S.sessions.find((x) => x.id === S.current);

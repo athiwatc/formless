@@ -121,6 +121,8 @@ enum Pending {
     GetTool,
     ExportTool,
     ExportSession,
+    /// Resume/abandon: the answer is a note (errors already are).
+    RunControl,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -582,6 +584,11 @@ impl App {
                                 self.tool_detail = Some(d);
                             }
                         }
+                        Pending::RunControl => match result["abandoned"].as_bool() {
+                            Some(true) => self.notes.push("abandoned the interrupted run".into()),
+                            Some(false) => self.notes.push("nothing to abandon".into()),
+                            None => {}
+                        },
                         Pending::ExportTool | Pending::ExportSession => {
                             let dir = self.paths.data_dir.join("exports");
                             let _ = std::fs::create_dir_all(&dir);
@@ -1134,8 +1141,18 @@ impl App {
                     if self.show_thinking { "on" } else { "off" }
                 ));
             }
+            "resume" | "abandon" => {
+                if let Some(session_id) = self.current.clone() {
+                    let req = if cmd == "resume" {
+                        Request::ResumeRun { session_id }
+                    } else {
+                        Request::AbandonRun { session_id }
+                    };
+                    self.request(Pending::RunControl, req);
+                }
+            }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /resume /abandon /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
