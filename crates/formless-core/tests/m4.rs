@@ -1556,3 +1556,83 @@ async fn provider_connections_are_reused_across_runs() {
     );
     server.abort();
 }
+
+/// A client that subscribes to one Session gets no transcript or token
+/// traffic for others (global events still arrive); others still get all.
+#[cfg(unix)]
+#[tokio::test]
+async fn subscriptions_scope_live_events_per_client() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4subs");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route("/chat/completions", post(|| async { sse_text("hello") }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut watcher = Client::connect(&paths).await;
+    let mut all = Client::connect(&paths).await;
+    let one = watcher.rpc(Request::CreateSession { name: None }).await;
+    let two = watcher.rpc(Request::CreateSession { name: None }).await;
+    let (one, two) = (
+        one["id"].as_str().unwrap().to_string(),
+        two["id"].as_str().unwrap().to_string(),
+    );
+    watcher
+        .rpc(Request::Subscribe {
+            sessions: Some(vec![one.clone()]),
+            deltas: true,
+        })
+        .await;
+    all.send(Request::SendMessage {
+        session_id: two.clone(),
+        content: "hi".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    assert_eq!(
+        all.run_to_finish().await,
+        "hello",
+        "unfiltered client sees deltas"
+    );
+    // The watcher saw the Run start and finish, but none of its traffic.
+    let mut kinds = Vec::new();
+    loop {
+        let line =
+            tokio::time::timeout(std::time::Duration::from_secs(5), watcher.lines.next_line())
+                .await
+                .expect("timed out")
+                .unwrap()
+                .unwrap();
+        if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
+            let done = matches!(ev, Event::RunFinished { .. });
+            kinds.push(
+                serde_json::to_value(&ev).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            if done {
+                break;
+            }
+        }
+    }
+    assert!(kinds.contains(&"run_started".to_string()), "{kinds:?}");
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| k == "message_delta" || k == "message_appended" || k == "message_complete"),
+        "{kinds:?}"
+    );
+    server.abort();
+}

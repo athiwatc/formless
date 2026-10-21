@@ -235,6 +235,17 @@ pub enum Request {
     AbandonRun {
         session_id: String,
     },
+    /// Choose which events this connection receives. `sessions: None` =
+    /// every Session; otherwise only those Sessions' transcript and live
+    /// events. `deltas: false` drops streamed answer/reasoning tokens.
+    /// Global events (Tools, approvals, Session list and Run start/end)
+    /// always arrive. A connection starts subscribed to everything.
+    Subscribe {
+        #[serde(default)]
+        sessions: Option<Vec<String>>,
+        #[serde(default = "default_true")]
+        deltas: bool,
+    },
     ListSubagents {
         session_id: String,
     },
@@ -312,6 +323,10 @@ pub enum Request {
     ImportSession {
         bundle: serde_json::Value,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// How long an approval lasts (SPEC §10.3).

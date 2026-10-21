@@ -1342,6 +1342,9 @@
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
     rendered.clear(); // a reload may carry edited messages
+    // Live traffic only for the Session on screen: the relay then carries
+    // (and bills) one Session's tokens, not every Session's.
+    request({ type: "subscribe", sessions: [id], deltas: true }).catch(() => {});
     prefs.set("session", id);
     S.streaming = "";
     S.thinking = "";

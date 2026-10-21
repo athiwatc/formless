@@ -18,7 +18,47 @@ use crate::Paths;
 
 // A std mutex (never held across .await) so broadcast() sends synchronously
 // and every subscriber sees events in emission order.
-type Subs = Arc<StdMutex<Vec<mpsc::UnboundedSender<ServerMessage>>>>;
+type Subs = Arc<StdMutex<Vec<Subscriber>>>;
+
+/// A connected client and the events it asked for (`Request::Subscribe`).
+struct Subscriber {
+    tx: mpsc::UnboundedSender<ServerMessage>,
+    filter: Arc<StdMutex<EventFilter>>,
+}
+
+struct EventFilter {
+    /// None = every Session.
+    sessions: Option<std::collections::HashSet<String>>,
+    deltas: bool,
+}
+
+impl Default for EventFilter {
+    fn default() -> Self {
+        Self {
+            sessions: None,
+            deltas: true,
+        }
+    }
+}
+
+impl EventFilter {
+    fn wants(&self, ev: &Event) -> bool {
+        match ev {
+            // Session lists, running dots and approvals stay global.
+            Event::RunStarted { .. }
+            | Event::RunFinished { .. }
+            | Event::RunPaused { .. }
+            | Event::SessionUpdated { .. }
+            | Event::SessionDeleted { .. }
+            | Event::ApprovalRequested { .. } => true,
+            Event::MessageDelta { .. } | Event::ReasoningDelta { .. } if !self.deltas => false,
+            _ => match (ev.session_id(), &self.sessions) {
+                (Some(id), Some(wanted)) => wanted.contains(id),
+                _ => true,
+            },
+        }
+    }
+}
 type ExecFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = std::result::Result<(Value, String), String>> + Send>,
 >;
@@ -38,9 +78,10 @@ pub(crate) struct PendingEntry {
 
 /// Fan an event out to every live subscriber, dropping disconnected ones.
 fn send_all(subs: &Subs, ev: Event) {
-    subs.lock()
-        .unwrap()
-        .retain(|tx| tx.send(ServerMessage::Event(ev.clone())).is_ok());
+    subs.lock().unwrap().retain(|sub| {
+        !sub.filter.lock().unwrap().wants(&ev)
+            || sub.tx.send(ServerMessage::Event(ev.clone())).is_ok()
+    });
 }
 
 /// Tool result for a call whose arguments hit the output token limit.
@@ -153,7 +194,7 @@ impl Daemon {
     /// Connected clients that receive events (and can answer approvals).
     pub fn subscriber_count(&self) -> usize {
         let mut subs = self.subs.lock().unwrap();
-        subs.retain(|tx| !tx.is_closed());
+        subs.retain(|sub| !sub.tx.is_closed());
         subs.len()
     }
 
@@ -353,6 +394,8 @@ impl Daemon {
                 };
                 Ok(json!({"abandoned": abandoned}))
             }
+            // Only meaningful per connection (see `handle_conn`).
+            Request::Subscribe { .. } => Err(anyhow!("subscribe applies to a client connection")),
             Request::ListSubagents { session_id } => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_subagents(&session_id))?,
             )?),
@@ -2801,7 +2844,11 @@ impl Daemon {
     {
         let (read_half, mut write_half) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
-        self.subs.lock().unwrap().push(tx.clone());
+        let filter = Arc::new(StdMutex::new(EventFilter::default()));
+        self.subs.lock().unwrap().push(Subscriber {
+            tx: tx.clone(),
+            filter: filter.clone(),
+        });
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let Ok(line) = serde_json::to_string(&msg) {
@@ -2829,6 +2876,13 @@ impl Daemon {
                                 env.protocol
                             ),
                         )
+                    } else if let Request::Subscribe { sessions, deltas } = env.request {
+                        // Per connection, so handled here rather than in `handle`.
+                        *filter.lock().unwrap() = EventFilter {
+                            sessions: sessions.map(|s| s.into_iter().collect()),
+                            deltas,
+                        };
+                        ServerMessage::ok(env.id, json!({"subscribed": true}))
                     } else {
                         match self.handle(env.request).await {
                             Ok(v) => ServerMessage::ok(env.id, v),
