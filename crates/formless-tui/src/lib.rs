@@ -442,6 +442,9 @@ struct App {
     /// Open rollback version picker (Tools view, `b`).
     rollback_pick: Option<RollbackPick>,
     approvals: std::collections::VecDeque<ApprovalReq>,
+    /// Open `ask_user` questions: (id, session, options). The next typed
+    /// line answers the current Session's oldest one.
+    questions: Vec<(String, String, Vec<String>)>,
     promotions: std::collections::VecDeque<ApprovalReq>,
     purge_arm: Option<String>,
     /// Session id armed for deletion by a first `d` press.
@@ -558,6 +561,7 @@ impl App {
             tool_detail: None,
             rollback_pick: None,
             approvals: std::collections::VecDeque::new(),
+            questions: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,
@@ -1238,6 +1242,26 @@ impl App {
                 self.notes
                     .push(format!("{tool_name}: {}", if ok { "ok" } else { "failed" }));
             }
+            Event::UserQuestion {
+                question_id,
+                session_id,
+                question,
+                options,
+            } => {
+                let mut text = format!("question: {question}");
+                for (i, o) in options.iter().enumerate() {
+                    text.push_str(&format!("\n  {}) {o}", i + 1));
+                }
+                text.push_str("\n  type your answer (or an option number) and press Enter");
+                self.notes.push(text);
+                if self.is_current(&session_id) {
+                    self.set_activity("awaiting your answer");
+                }
+                self.questions.push((question_id, session_id, options));
+            }
+            Event::UserQuestionClosed { question_id } => {
+                self.questions.retain(|(id, _, _)| *id != question_id);
+            }
             Event::ApprovalRequested {
                 session_id,
                 approval_id,
@@ -1473,6 +1497,22 @@ impl App {
         let Some(session_id) = self.current.clone() else {
             return;
         };
+        // An open ask_user question takes the next line as its answer.
+        if let Some(i) = self.questions.iter().position(|(_, s, _)| *s == session_id) {
+            let (question_id, _, options) = self.questions.remove(i);
+            let answer = text
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| options.get(n.wrapping_sub(1)).cloned())
+                .unwrap_or(text);
+            self.notes.push(format!("answered: {answer}"));
+            self.fire(Request::AnswerQuestion {
+                question_id,
+                answer,
+            });
+            return;
+        }
         let mode = if queued {
             SendMode::Queue
         } else if self.running() {
@@ -4025,6 +4065,7 @@ mod tests {
             tool_detail: None,
             rollback_pick: None,
             approvals: std::collections::VecDeque::new(),
+            questions: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,

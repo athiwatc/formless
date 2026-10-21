@@ -50,7 +50,8 @@ impl EventFilter {
             | Event::RunPaused { .. }
             | Event::SessionUpdated { .. }
             | Event::SessionDeleted { .. }
-            | Event::ApprovalRequested { .. } => true,
+            | Event::ApprovalRequested { .. }
+            | Event::UserQuestion { .. } => true,
             Event::MessageDelta { .. } | Event::ReasoningDelta { .. } if !self.deltas => false,
             _ => match (ev.session_id(), &self.sessions) {
                 (Some(id), Some(wanted)) => wanted.contains(id),
@@ -144,6 +145,8 @@ pub struct Daemon {
     readers: Vec<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
+    /// Open `ask_user` questions, by id.
+    questions: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
@@ -192,6 +195,7 @@ impl Daemon {
             readers,
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
+            questions: Arc::new(StdMutex::new(HashMap::new())),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
@@ -484,6 +488,15 @@ impl Daemon {
                 let files = crate::skills::files(&dir)?;
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
+            }
+            Request::AnswerQuestion {
+                question_id,
+                answer,
+            } => {
+                // First answer wins; the others find it gone.
+                let tx = self.questions.lock().unwrap().remove(&question_id);
+                let answered = tx.is_some_and(|tx| tx.send(answer).is_ok());
+                Ok(json!({"answered": answered}))
             }
             Request::ListBuiltinStats => Ok(serde_json::to_value(
                 self.with_reader(|st| st.builtin_stats())?,
@@ -1777,6 +1790,10 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: load_skill failed: {e}"),
             },
+            toolreg::ASK_USER => match self.ask_user_impl(session_id, &args, cancel).await {
+                Ok(text) => text,
+                Err(e) => format!("error: ask_user failed: {e}"),
+            },
             toolreg::REMEMBER => match self.remember_impl(session_id, &args) {
                 Ok(text) => text,
                 Err(e) => format!("error: remember failed: {e}"),
@@ -2769,6 +2786,55 @@ impl Daemon {
         self.with_store(|st| st.get_skill(name))?
             .filter(|s| s.enabled && !s.retired)
             .with_context(|| format!("no enabled skill named '{name}'"))
+    }
+
+    /// `ask_user` (SPEC §5.5): ask the user mid-Run and wait for the
+    /// answer, keeping in-flight state. With nobody connected it fails at
+    /// once so the agent can proceed on a stated assumption.
+    async fn ask_user_impl(
+        &self,
+        session_id: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let question = args["question"]
+            .as_str()
+            .filter(|q| !q.trim().is_empty())
+            .context("question required")?
+            .to_string();
+        let options: Vec<String> = args["options"]
+            .as_array()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self.subscriber_count() == 0 {
+            return Err(anyhow!(
+                "no user is connected to answer (headless run); continue with your best assumption and state it"
+            ));
+        }
+        let question_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel::<String>();
+        self.questions
+            .lock()
+            .unwrap()
+            .insert(question_id.clone(), tx);
+        self.broadcast(Event::UserQuestion {
+            question_id: question_id.clone(),
+            session_id: session_id.to_string(),
+            question,
+            options,
+        });
+        let answer = tokio::select! {
+            _ = cancel.cancelled() => None,
+            r = rx => r.ok(),
+        };
+        self.questions.lock().unwrap().remove(&question_id);
+        self.broadcast(Event::UserQuestionClosed { question_id });
+        let answer = answer.context("interrupted before the user answered")?;
+        Ok(json!({"answer": answer}).to_string())
     }
 
     /// `remember` (SPEC §7.11): save (or refresh) a user-memory note.

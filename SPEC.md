@@ -232,6 +232,25 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 - Resuming a Session (same or later daemon lifetime) restores transcript,
   pending handles (§6.4), and compaction checkpoints exactly.
 
+### 5.5 Asking the user mid-Run
+
+`ask_user({question, options?})` lets the agent ask a clarifying
+question without ending its Run, so pending Invocations and other
+in-flight state carry on.
+
+- The daemon broadcasts `UserQuestion` (global, like approvals) and waits
+  for the first `AnswerQuestion`. The answer comes back as the tool result
+  (`{"answer": …}`), and `UserQuestionClosed` tells the other clients to
+  close their prompt. Interrupting the Run abandons the question.
+- **Clients:**
+  - TUI: the question appears in the chat, and the next typed line
+    answers it (an option number picks that option).
+  - web: a modal prompt.
+  - `formless run`: `--answer TEXT`, else a terminal prompt, else a
+    reply telling the agent that nobody can answer.
+- With no client connected, `ask_user` fails at once with an error
+  telling the agent to proceed on a stated assumption.
+
 ## 6. Invocations: async by design
 
 ### 6.1 Execution model
@@ -292,7 +311,7 @@ pattern (§4.4).
 - **Built-ins (v2.2).** The minimal set the harness needs to grow itself:
   `create_tool`, `create_module`, `retire_tool`,
   `find_tools`, `read_tool`, `read_module`, `read_artifact`, `test_tool`,
-  `unload_tools`, `remember`, `forget` (§7.11),
+  `unload_tools`, `remember`, `forget` (§7.11), `ask_user` (§5.5),
   and the Pending Invocation handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
   former built-in; sub-agents are now the `agent` Capability, §7.6), so no
   registry Tool can impersonate one.

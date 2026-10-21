@@ -29,7 +29,8 @@ pub const LOAD_SKILL: &str = "load_skill";
 pub const READ_SKILL_FILE: &str = "read_skill_file";
 pub const REMEMBER: &str = "remember";
 pub const FORGET: &str = "forget";
-pub const RESERVED: [&str; 21] = [
+pub const ASK_USER: &str = "ask_user";
+pub const RESERVED: [&str; 22] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -51,6 +52,7 @@ pub const RESERVED: [&str; 21] = [
     READ_SKILL_FILE,
     REMEMBER,
     FORGET,
+    ASK_USER,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -362,6 +364,24 @@ fn remember_definition() -> Value {
                     "scope": {"type": "string", "description": "\"global\" (default) or \"project:<absolute path>\" for one project"}
                 },
                 "required": ["text"]
+            }
+        }
+    })
+}
+
+fn ask_user_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": ASK_USER,
+            "description": "Ask the user a clarifying question and wait for the answer, without ending your Run (pending work keeps going). Use only when a wrong guess would waste real work; offer options when the choices are known. Fails at once when no user is connected: then proceed on your best assumption and say so.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "Suggested answers; the user may still type their own"}
+                },
+                "required": ["question"]
             }
         }
     })
@@ -735,6 +755,7 @@ pub fn tool_definitions(
         read_skill_file_definition(),
         remember_definition(),
         forget_definition(),
+        ask_user_definition(),
         list_mcp_resources_definition(),
         read_mcp_resource_definition(),
         test_tool_definition(),
