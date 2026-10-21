@@ -204,6 +204,16 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 - v2: Sessions can be forked (full copy, or a prefix up to a message),
   searched across all Sessions, and a past user message can be edited —
   everything after it is dropped and the Run retries from there.
+  **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
+  It is hidden at once from lists, search and `GetSession`
+  (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it
+  back. When the window ends it is deleted for good, with its artifacts,
+  and a window that ended while the daemon was down is finished at the
+  next start. Every destructive action asks first:
+  - Session delete: TUI `d` twice, then `/undo`; web dialog, then a toast
+    with Undo.
+  - Tool purge: TUI `p` twice; web needs the Tool name typed.
+  - `formless reset`: needs `reset` typed.
   Search uses an FTS5 index over message content (schema v24, with
   `unicode61` tokens and diacritics folded). Triggers keep the index
   current through inserts, edits and deletes. Every query word must match
@@ -1425,6 +1435,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
 | `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
+| `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
 | `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |

@@ -331,18 +331,44 @@ impl Daemon {
             }
             Request::DeleteSession { id } => {
                 self.stop_session_work(&id).await;
-                // Stored outputs go with their Session (SPEC §15).
-                self.with_store(|st| crate::artifacts::remove_for_session(st, &id))?;
-                let existed = self.with_store(|st| st.delete_session(&id))?;
-                self.contexts.lock().unwrap().remove(&id);
+                // Hidden now, gone after the undo window (SPEC §5.1).
+                let existed = self.with_store(|st| st.soft_delete_session(&id))?;
                 if existed {
                     self.broadcast(Event::SessionDeleted { id: id.clone() });
+                    let undo = self
+                        .config()
+                        .map(|c| c.daemon.delete_undo_secs)
+                        .unwrap_or(30);
+                    let this = self.clone();
+                    let sid = id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(undo)).await;
+                        if this
+                            .with_store(|st| st.session_deleted(&sid))
+                            .unwrap_or(false)
+                        {
+                            let _ = this.purge_session(&sid);
+                        }
+                    });
+                    let _ = self.with_store(|st| st.audit("user", "session.delete", &id));
+                    return Ok(json!({"deleted": true, "undo_secs": undo}));
                 }
-                Ok(json!({"deleted": existed}))
+                Ok(json!({"deleted": false}))
+            }
+            Request::RestoreSession { id } => {
+                let s = self
+                    .with_store(|st| st.restore_session(&id))?
+                    .context("nothing to restore (the undo window has passed)")?;
+                let _ = self.with_store(|st| st.audit("user", "session.restore", &id));
+                self.broadcast(Event::SessionUpdated { session: s.clone() });
+                Ok(serde_json::to_value(s)?)
             }
             Request::GetSession { id } => {
                 let (session, messages, queued, last) = self.with_reader(|st| {
-                    let s = st.get_session(&id)?.context("session not found")?;
+                    let s = st
+                        .get_session(&id)?
+                        .filter(|_| !st.session_deleted(&id).unwrap_or(false))
+                        .context("session not found")?;
                     let m = st.list_messages(&id)?;
                     let q = st.list_queued_messages(&id)?;
                     let l = st.unfinished_last_run(&id)?;
@@ -3201,6 +3227,14 @@ impl Daemon {
             .with_context(|| format!("no enabled skill named '{name}'"))
     }
 
+    /// Delete a Session for good, with its stored outputs (SPEC §15).
+    fn purge_session(&self, id: &str) -> Result<()> {
+        self.with_store(|st| crate::artifacts::remove_for_session(st, id))?;
+        self.with_store(|st| st.delete_session(id))?;
+        self.contexts.lock().unwrap().remove(id);
+        Ok(())
+    }
+
     /// The model and reasoning effort a Session runs with: its overrides,
     /// else the configured defaults. Sub-agents and `llm.complete` use them
     /// too, so a Session switched to a local model stays local.
@@ -5094,6 +5128,18 @@ impl Daemon {
 
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         std::fs::write(self.paths.lock_file(), std::process::id().to_string())?;
+        // Deletes whose undo window passed while the daemon was down.
+        let undo = self
+            .config()
+            .map(|c| c.daemon.delete_undo_secs)
+            .unwrap_or(30);
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(undo as i64)).to_rfc3339();
+        for id in self
+            .with_store(|st| st.sessions_deleted_before(&cutoff))
+            .unwrap_or_default()
+        {
+            let _ = self.purge_session(&id);
+        }
         let watcher = {
             let this = self.clone();
             tokio::spawn(async move { this.idle_watcher().await })

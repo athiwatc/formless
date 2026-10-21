@@ -161,3 +161,63 @@ async fn approval_grants_show_in_tool_detail_and_revoke_per_item() {
         .unwrap();
     assert!(detail["approval"].is_null());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_delete_has_an_undo_window() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-undo-{short}"));
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-undo-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut cfg = Config::default();
+    cfg.daemon.delete_undo_secs = 1;
+    cfg.save(&paths).unwrap();
+    let store = formless_core::Store::open(&paths.db_file()).unwrap();
+    let id = store.create_session(Some("keep me?".into())).unwrap().id;
+    store
+        .append_message(&id, "user", "a searchable phrase")
+        .unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let listed = |d: Arc<formless_core::daemon::Daemon>| async move {
+        d.handle(Request::ListSessions)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let r = daemon
+        .handle(Request::DeleteSession { id: id.clone() })
+        .await
+        .unwrap();
+    assert_eq!(
+        (r["deleted"].as_bool(), r["undo_secs"].as_u64()),
+        (Some(true), Some(1))
+    );
+    assert_eq!(listed(daemon.clone()).await, 0, "hidden at once");
+    assert!(store.search_sessions("searchable", 10).unwrap().is_empty());
+    assert!(daemon
+        .handle(Request::GetSession { id: id.clone() })
+        .await
+        .is_err());
+    daemon
+        .handle(Request::RestoreSession { id: id.clone() })
+        .await
+        .unwrap();
+    assert_eq!(listed(daemon.clone()).await, 1, "undo brings it back");
+
+    daemon
+        .handle(Request::DeleteSession { id: id.clone() })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    assert!(
+        store.get_session(&id).unwrap().is_none(),
+        "gone after the window"
+    );
+    assert!(daemon.handle(Request::RestoreSession { id }).await.is_err());
+}
