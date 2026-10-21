@@ -2805,6 +2805,23 @@ struct NestedOps {
     artifact_dir: std::path::PathBuf,
 }
 
+impl NestedOps {
+    /// Block the sandbox thread on provider work, returning "interrupted"
+    /// as soon as the Run is cancelled instead of waiting the call out.
+    fn block_cancellable<T>(
+        &self,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> std::result::Result<T, String> {
+        let cancel = self.cancel.clone();
+        self.handle.block_on(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => Err("interrupted".to_string()),
+                r = work => r.map_err(|e| e.to_string()),
+            }
+        })
+    }
+}
+
 impl HostOps for NestedOps {
     fn run_subagent(
         &self,
@@ -2837,23 +2854,21 @@ impl HostOps for NestedOps {
             system.map(str::to_string),
             model.map(str::to_string),
         );
-        self.handle
-            .block_on(async move {
-                daemon
-                    .run_subagent_text(
-                        &session_id,
-                        &run_id,
-                        &task,
-                        system.as_deref(),
-                        model.as_deref(),
-                        &cfg,
-                        &cancel_flag,
-                        &cancel,
-                        agent_depth,
-                    )
-                    .await
-            })
-            .map_err(|e| e.to_string())
+        self.block_cancellable(async move {
+            daemon
+                .run_subagent_text(
+                    &session_id,
+                    &run_id,
+                    &task,
+                    system.as_deref(),
+                    model.as_deref(),
+                    &cfg,
+                    &cancel_flag,
+                    &cancel,
+                    agent_depth,
+                )
+                .await
+        })
     }
 
     fn llm_complete(
@@ -2893,9 +2908,7 @@ impl HostOps for NestedOps {
         }
         messages.push(json!({"role": "user", "content": prompt}));
         let effort = self.cfg.provider.reasoning_effort.clone();
-        self.handle
-            .block_on(provider.complete(&messages, &model, effort.as_deref()))
-            .map_err(|e| e.to_string())
+        self.block_cancellable(provider.complete(&messages, &model, effort.as_deref()))
     }
 
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
