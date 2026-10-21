@@ -470,7 +470,12 @@ impl Provider {
             }
             b
         };
-        let (resp, dropped, model_used) = self.post_chat_flagged(&mut body, effort).await?;
+        // Waiting for the response headers is cancellable too (a slow or
+        // stuck endpoint must not outlive an interrupt).
+        let (resp, dropped, model_used) = tokio::select! {
+            _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+            r = self.post_chat_flagged(&mut body, effort) => r?,
+        };
         let mut stream = resp.bytes_stream();
         let mut content = String::new();
         let mut reasoning = String::new();
