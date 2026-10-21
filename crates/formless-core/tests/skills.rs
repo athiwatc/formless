@@ -230,6 +230,12 @@ async fn the_agent_loads_enabled_skills() {
         serde_json::json!(["reference.md", "scripts/fix.py"])
     );
     assert_eq!(store.get_skill("report-writer").unwrap().unwrap().loads, 1);
+    // Bundled scripts are listed with how (not) to run them.
+    assert_eq!(loaded["scripts"], serde_json::json!(["scripts/fix.py"]));
+    assert!(loaded["scripts_note"]
+        .as_str()
+        .unwrap()
+        .contains("never runs them on the host"));
     let file = call(
         "read_skill_file",
         serde_json::json!({"name": "report-writer", "path": "reference.md"}),

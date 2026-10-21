@@ -1073,6 +1073,14 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
         SkillsAction::Show { name } => {
             let r = daemon(Request::GetSkill { name })?;
             println!("{}", r["body"].as_str().unwrap_or_default());
+            if let Some(scripts) = r["scripts"].as_array().filter(|s| !s.is_empty()) {
+                println!(
+                    "\nscripts (never run on the host; the agent ports them to sandboxed Tools):"
+                );
+                for s in scripts {
+                    println!("  {}", s.as_str().unwrap_or_default());
+                }
+            }
             println!("\nfiles:");
             for f in r["files"].as_array().into_iter().flatten() {
                 println!("  {}", f.as_str().unwrap_or_default());

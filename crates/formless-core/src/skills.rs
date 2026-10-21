@@ -117,13 +117,27 @@ pub fn files(dir: &Path) -> Result<Vec<String>> {
 /// Whether a skill bundles runnable scripts (they never run on the host;
 /// see SPEC §7.10).
 pub fn has_scripts(files: &[String]) -> bool {
+    !scripts(files).is_empty()
+}
+
+/// The bundled files that are runnable scripts.
+pub fn scripts(files: &[String]) -> Vec<String> {
     const EXT: &[&str] = &[
         ".py", ".sh", ".bash", ".js", ".mjs", ".ts", ".rb", ".pl", ".ps1", ".bat", ".cmd",
     ];
     files
         .iter()
-        .any(|f| EXT.iter().any(|e| f.to_lowercase().ends_with(e)))
+        .filter(|f| EXT.iter().any(|e| f.to_lowercase().ends_with(e)))
+        .cloned()
+        .collect()
 }
+
+/// What the agent is told about a skill's scripts (SPEC §7.10): they are
+/// never executed on the host directly.
+pub const SCRIPTS_NOTE: &str = "This skill bundles scripts. Formless never runs them on the host. \
+To use one, read it with read_skill_file and port it to a Tool with create_tool \
+(sandboxed, approval applies), or create a Tool that runs it through process.run \
+with a process: capability the user approves.";
 
 fn copy_dir(from: &Path, to: &Path) -> Result<u64> {
     let mut total = 0;
