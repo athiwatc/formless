@@ -2977,6 +2977,10 @@ pub fn daemon_reachable(paths: &Paths) -> bool {
 
 /// Spawn `formless daemon serve` detached (client auto-start, SPEC §9.1).
 pub fn spawn_daemon(paths: &Paths) -> Result<()> {
+    spawn_daemon_child(paths).map(|_| ())
+}
+
+fn spawn_daemon_child(paths: &Paths) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("locate formless binary")?;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -3003,8 +3007,12 @@ pub fn spawn_daemon(paths: &Paths) -> Result<()> {
             Ok(())
         });
     }
-    cmd.spawn().context("spawn daemon")?;
-    Ok(())
+    let child = cmd.spawn().context("spawn daemon")?;
+    // Claim the start at once (serve rewrites the same pid): a second
+    // client that arrives during a slow first start waits for this daemon
+    // instead of spawning another.
+    let _ = std::fs::write(paths.lock_file(), child.id().to_string());
+    Ok(child)
 }
 
 #[cfg(unix)]
@@ -3015,21 +3023,84 @@ fn libc_setsid() -> i32 {
     unsafe { setsid() }
 }
 
-/// Connect, auto-starting the daemon if needed. Waits up to ~5s.
+/// Whether a daemon start is in progress: the lock file is fresher than
+/// `within` (a stale one, e.g. from before a reboot, may name a reused pid)
+/// and names a live process.
+fn daemon_starting(paths: &Paths, within: std::time::Duration) -> bool {
+    let fresh = std::fs::metadata(paths.lock_file())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < within);
+    if !fresh {
+        return false;
+    }
+    let Some(pid) = std::fs::read_to_string(paths.lock_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // Signal 0 only checks that the process exists.
+        unsafe { kill(pid, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// The last `n` lines of the daemon log, for start-up errors.
+fn log_tail(paths: &Paths, n: usize) -> String {
+    let text = std::fs::read_to_string(paths.log_file()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Connect, auto-starting the daemon if needed. Waits up to
+/// `daemon.start_timeout_secs` for it to accept connections, joining a
+/// start already in progress rather than racing a second spawn, and fails
+/// early (with the log's last lines) if the new daemon exits.
 pub fn ensure_daemon(paths: &Paths) -> Result<()> {
     if daemon_reachable(paths) {
         return Ok(());
     }
-    spawn_daemon(paths)?;
-    for _ in 0..50 {
+    let timeout = Config::load(paths)
+        .map(|c| c.daemon.start_timeout_secs)
+        .unwrap_or(60)
+        .max(1);
+    let mut child = if daemon_starting(paths, std::time::Duration::from_secs(timeout)) {
+        None
+    } else {
+        Some(spawn_daemon_child(paths)?)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    while std::time::Instant::now() < deadline {
         if daemon_reachable(paths) {
             return Ok(());
+        }
+        if let Some(c) = child.as_mut() {
+            if let Ok(Some(status)) = c.try_wait() {
+                return Err(anyhow!(
+                    "daemon exited during start-up ({status}); last log lines from {}:\n{}",
+                    paths.log_file().display(),
+                    log_tail(paths, 10)
+                ));
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Err(anyhow!(
-        "daemon did not come up; see {}",
-        paths.log_file().display()
+        "daemon did not accept connections within {timeout}s (daemon.start_timeout_secs); \
+         last log lines from {}:\n{}",
+        paths.log_file().display(),
+        log_tail(paths, 10)
     ))
 }
 
