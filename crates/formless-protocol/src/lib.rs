@@ -170,6 +170,9 @@ pub struct ToolDetail {
     pub metrics: ToolMetricsInfo,
     #[serde(default)]
     pub optimiser_attempts: Vec<OptimiserAttemptInfo>,
+    /// Metrics of each version, as (version, metrics).
+    #[serde(default)]
+    pub version_metrics: Vec<(i64, ToolMetricsInfo)>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
