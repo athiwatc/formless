@@ -150,6 +150,8 @@ pub struct Daemon {
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
     /// Hook commands the user approved this daemon lifetime (SPEC §9.8).
     hook_approvals: StdMutex<std::collections::HashSet<String>>,
+    /// The opt-in localhost web UI, while running (SPEC §12).
+    web: tokio::sync::Mutex<Option<Arc<crate::webui::WebUi>>>,
     /// Files attached to each Session's next user message (SPEC §5.6).
     attachments: StdMutex<HashMap<String, Vec<Value>>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
@@ -202,6 +204,7 @@ impl Daemon {
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
+            web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
@@ -508,6 +511,30 @@ impl Daemon {
             } => {
                 let r = self.attach_file(&session_id, &name, &data_b64, mime)?;
                 Ok(r)
+            }
+            Request::StartWebUi { port } => {
+                let mut web = self.web.lock().await;
+                let running = web
+                    .as_ref()
+                    .filter(|w| port.is_none_or(|p| p == 0 || p == w.port));
+                let ui = match running {
+                    Some(ui) => ui.clone(),
+                    None => {
+                        if let Some(old) = web.take() {
+                            old.stop();
+                        }
+                        let ui = crate::webui::start(self.clone(), port.unwrap_or(0)).await?;
+                        let _ = self
+                            .with_store(|st| st.audit("user", "web.start", &ui.port.to_string()));
+                        *web = Some(ui.clone());
+                        ui
+                    }
+                };
+                Ok(json!({"url": ui.login_url(), "port": ui.port}))
+            }
+            Request::StopWebUi => {
+                let stopped = self.web.lock().await.take().map(|w| w.stop()).is_some();
+                Ok(json!({"stopped": stopped}))
             }
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,

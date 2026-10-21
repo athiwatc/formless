@@ -39,6 +39,18 @@ enum Cmd {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Open the web UI from this machine's daemon on 127.0.0.1 (SPEC §12)
+    Web {
+        /// Port (default: a free one)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the one-time link instead of opening a browser
+        #[arg(long)]
+        no_open: bool,
+        /// Stop serving the web UI
+        #[arg(long)]
+        stop: bool,
+    },
     /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
     Jobs {
         #[command(subcommand)]
@@ -355,6 +367,11 @@ fn main() -> Result<()> {
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs { limit, json }) => runs_cmd(paths, limit, json),
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
+        Some(Cmd::Web {
+            port,
+            no_open,
+            stop,
+        }) => web_cmd(paths, port, no_open, stop),
         Some(Cmd::Gc) => {
             let cfg = Config::load(&paths)?;
             let store = formless_core::Store::open(&paths.db_file())?;
@@ -1264,6 +1281,34 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
                 }
                 println!("enable it with `formless skills enable {name}`\n");
             }
+        }
+    }
+    Ok(())
+}
+
+fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result<()> {
+    formless_core::daemon::ensure_daemon(&paths)?;
+    if stop {
+        formless_tui::client::request_once(&paths, Request::StopWebUi)?;
+        println!("web UI stopped");
+        return Ok(());
+    }
+    let r = formless_tui::client::request_once(&paths, Request::StartWebUi { port })?;
+    let url = r["url"].as_str().unwrap_or_default().to_string();
+    println!("Web UI on 127.0.0.1:{} (this link works once):", r["port"]);
+    println!("{url}");
+    if !no_open {
+        let opener = if cfg!(target_os = "macos") {
+            std::process::Command::new("open").arg(&url).status()
+        } else if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", &url])
+                .status()
+        } else {
+            std::process::Command::new("xdg-open").arg(&url).status()
+        };
+        if opener.map(|s| !s.success()).unwrap_or(true) {
+            println!("(could not open a browser; open the link above)");
         }
     }
     Ok(())

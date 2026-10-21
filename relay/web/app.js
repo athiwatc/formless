@@ -164,7 +164,10 @@
       // Serialised so frames leave in sequence-number order.
       const ws = S.ws;
       S.sendChain = S.sendChain
-        .then(() => encrypt(JSON.stringify({ id, protocol: PROTOCOL, request: req })))
+        .then(() => {
+          const text = JSON.stringify({ id, protocol: PROTOCOL, request: req });
+          return S.local ? text : encrypt(text);
+        })
         .then((frame) => ws.send(frame))
         .catch((e) => { S.pending.delete(id); clearTimeout(timer); reject(e); });
     });
@@ -1908,12 +1911,7 @@
       }
       let msg;
       try { msg = JSON.parse(await decrypt(frame)); } catch (_) { return; }
-      if (msg.kind === "response") {
-        const p = S.pending.get(msg.id);
-        if (!p) return; // timed out already
-        S.pending.delete(msg.id);
-        if (msg.ok) p.resolve(msg.result); else p.reject(new Error(msg.error || "daemon error"));
-      } else if (msg.kind === "event") onEvent(msg);
+      onMessage(msg);
     }
     ws.onclose = () => {
       if (S.ws !== ws) return;
@@ -1927,6 +1925,66 @@
       if (S.userClosed) return;
       // Reconnect with backoff; the relay and daemon are both stateless here.
       setTimeout(() => { if (!S.userClosed && S.ws === ws) connect(S.secret); }, S.backoff);
+      S.backoff = Math.min(S.backoff * 2, 15000);
+    };
+  }
+
+  function onMessage(msg) {
+    if (msg.kind === "response") {
+      const p = S.pending.get(msg.id);
+      if (!p) return; // timed out already
+      S.pending.delete(msg.id);
+      if (msg.ok) p.resolve(msg.result); else p.reject(new Error(msg.error || "daemon error"));
+    } else if (msg.kind === "event") onEvent(msg);
+  }
+
+  // Local mode (SPEC §12): `formless web` serves this page on 127.0.0.1
+  // and the protocol runs over a same-origin WebSocket, no relay crypto.
+  async function connectLocal(token) {
+    S.local = true;
+    S.userClosed = false;
+    if (token) {
+      history.replaceState(null, "", location.pathname);
+      const r = await fetch("auth", { method: "POST", body: token, credentials: "same-origin" }).catch(() => null);
+      if (!r || !r.ok) {
+        $("pair-error").textContent = r ? await r.text() : "Could not reach the local daemon.";
+        showPair();
+        return;
+      }
+    }
+    const ws = new WebSocket((location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/ws");
+    S.ws = ws;
+    ws.onopen = () => {
+      S.backoff = 1000;
+      S.channel = { local: true };
+      S.daemonOnline = true;
+      $("pair").classList.add("hidden");
+      $("app").classList.remove("hidden");
+      renderAll();
+      note("connected to the local daemon");
+      loadAll();
+    };
+    ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(String(e.data)); } catch (_) { return; }
+      onMessage(msg);
+    };
+    ws.onclose = () => {
+      if (S.ws !== ws) return;
+      const wasOpen = S.channel != null;
+      S.daemonOnline = false;
+      S.channel = null;
+      S.running.clear();
+      for (const p of S.pending.values()) p.reject(new Error("local daemon connection closed"));
+      S.pending.clear();
+      if (S.userClosed) return;
+      if (!wasOpen) {
+        $("pair-error").textContent = "Not signed in to the local daemon: run formless web for a new link.";
+        showPair();
+        return;
+      }
+      renderAll();
+      setTimeout(() => { if (!S.userClosed && S.ws === ws) connectLocal(null); }, S.backoff);
       S.backoff = Math.min(S.backoff * 2, 15000);
     };
   }
@@ -2028,6 +2086,10 @@
   setInterval(renderSessions, 60000);
 
   (function init() {
+    if (document.querySelector('meta[name="formless-local"]')) {
+      connectLocal(location.hash.startsWith("#local=") ? decodeURIComponent(location.hash.slice(7)) : null);
+      return;
+    }
     let fromHash = "";
     if (location.hash.startsWith("#k=")) fromHash = decodeURIComponent(location.hash.slice(3));
     let saved = "";
