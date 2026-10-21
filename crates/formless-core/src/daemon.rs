@@ -4981,8 +4981,15 @@ impl Daemon {
     async fn accept_loop(self: &Arc<Self>) -> Result<()> {
         use tokio::net::windows::named_pipe::ServerOptions;
         let name = self.paths.pipe_name();
+        // Owner-only DACL and no remote clients (SPEC §2.3/§14), the named
+        // pipe counterpart of the 0600 Unix socket.
+        let security = crate::win_pipe::OwnerOnly::new()?;
         loop {
-            let server = ServerOptions::new().create(&name)?;
+            let server = unsafe {
+                ServerOptions::new()
+                    .reject_remote_clients(true)
+                    .create_with_security_attributes_raw(&name, security.as_raw())
+            }?;
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 r = server.connect() => {
@@ -5122,6 +5129,16 @@ fn spawn_daemon_child(paths: &Paths) -> Result<std::process::Child> {
             }
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        // Detached, in its own process group, without a console window: a
+        // closed terminal never takes the daemon with it.
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     let child = cmd.spawn().context("spawn daemon")?;
     // Claim the start at once (serve rewrites the same pid): a second

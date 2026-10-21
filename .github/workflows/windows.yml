@@ -1,0 +1,16 @@
+name: windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pipe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Named pipe security and round trip
+        run: cargo test -p formless-core --test windows_pipe

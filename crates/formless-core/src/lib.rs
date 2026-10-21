@@ -20,6 +20,8 @@ pub mod runs;
 pub mod skills;
 pub mod storage;
 pub mod tools;
+#[cfg(windows)]
+pub mod win_pipe;
 
 pub use config::Config;
 pub use paths::Paths;
