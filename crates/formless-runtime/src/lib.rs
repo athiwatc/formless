@@ -81,11 +81,18 @@ pub trait HostOps: Send + Sync {
 /// Process-wide sandbox limits the daemon sets from its config.
 static MAX_SLEEP_MS: AtomicU64 = AtomicU64::new(60_000);
 static MAX_RANDOM_BYTES: AtomicU64 = AtomicU64::new(1 << 20);
+static MAX_PARALLEL_CALLS: AtomicU64 = AtomicU64::new(8);
 
 /// Set the longest `sleep` and the largest `randomBytes` a Tool may use.
 pub fn set_limits(max_sleep_ms: u64, max_random_bytes: u64) {
     MAX_SLEEP_MS.store(max_sleep_ms, Ordering::Relaxed);
     MAX_RANDOM_BYTES.store(max_random_bytes, Ordering::Relaxed);
+}
+
+/// Set how many `tools.callAsync` Invocations one sandbox may have in
+/// flight at once; the rest queue (SPEC §7.12, `scripts.max_parallel`).
+pub fn set_max_parallel_calls(n: u64) {
+    MAX_PARALLEL_CALLS.store(n.max(1), Ordering::Relaxed);
 }
 
 pub struct NoHostOps;
@@ -163,6 +170,23 @@ struct State {
     cancel: Arc<AtomicBool>,
     /// Smoke/Replay key-value store: in memory, gone after the run.
     kv_overlay: Mutex<std::collections::BTreeMap<(String, String), Value>>,
+    /// `tools.callAsync` bookkeeping: each call runs on its own thread.
+    calls: Mutex<AsyncCalls>,
+    settled_tx: std::sync::mpsc::Sender<Settled>,
+    settled_rx: Mutex<std::sync::mpsc::Receiver<Settled>>,
+}
+
+/// A finished `tools.callAsync`: its id and result.
+type Settled = (u64, Result<Value, String>);
+
+/// Async nested calls: those running, and those waiting for a slot under
+/// the parallelism cap. Calls still running when the sandbox ends are
+/// left to finish on their own; their results are discarded.
+#[derive(Default)]
+struct AsyncCalls {
+    next_id: u64,
+    running: usize,
+    queued: std::collections::VecDeque<(u64, String, Value)>,
 }
 
 const PRELUDE: &str = r#"
@@ -238,7 +262,22 @@ globalThis.process = {
       stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null });
   },
 };
-globalThis.tools = { call: (name, input) => __call("tools_call", { name: String(name), input: input || {} }) };
+// tools.call blocks until the nested Tool returns; tools.callAsync returns
+// a Promise, so Promise.all runs nested Tools in parallel (SPEC §7.12).
+const __pendingCalls = new Map();
+globalThis.tools = {
+  call: (name, input) => __call("tools_call", { name: String(name), input: input || {} }),
+  callAsync: (name, input) => new Promise((resolve, reject) => {
+    const id = __call("tools_call_start", { name: String(name), input: input || {} });
+    __pendingCalls.set(id, { resolve, reject });
+  }),
+};
+globalThis.__settleCall = (id, r) => {
+  const p = __pendingCalls.get(id);
+  if (!p) return;
+  __pendingCalls.delete(id);
+  if (r.ok) p.resolve(r.value); else p.reject(new Error(r.error));
+};
 globalThis.clipboard = {
   read: () => __call("clipboard_read", {}),
   write: (t) => __call("clipboard_write", { text: String(t) }),
@@ -611,6 +650,18 @@ impl State {
                 }
                 self.ops
                     .call_tool(a["name"].as_str().unwrap_or_default(), a["input"].clone())
+            }
+            "tools_call_start" => {
+                if self.mode == HostMode::Smoke {
+                    return Err(self.stub(denied("tools.call in smoke test")));
+                }
+                let mut calls = self.calls.lock().unwrap();
+                calls.next_id += 1;
+                let id = calls.next_id;
+                let name = a["name"].as_str().unwrap_or_default().to_string();
+                calls.queued.push_back((id, name, a["input"].clone()));
+                self.start_queued(&mut calls);
+                Ok(json!(id))
             }
             "clipboard_read" => {
                 if !self.caps.clipboard_read {
@@ -1031,6 +1082,63 @@ impl State {
             }
             std::thread::sleep(left.min(std::time::Duration::from_millis(25)));
         }
+    }
+
+    /// Start queued async calls while there are free slots.
+    fn start_queued(&self, calls: &mut AsyncCalls) {
+        let cap = MAX_PARALLEL_CALLS.load(Ordering::Relaxed) as usize;
+        while calls.running < cap {
+            let Some((id, name, input)) = calls.queued.pop_front() else {
+                break;
+            };
+            calls.running += 1;
+            let (ops, tx) = (self.ops.clone(), self.settled_tx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send((id, ops.call_tool(&name, input)));
+            });
+        }
+    }
+
+    /// Async calls not yet settled (running or queued).
+    fn outstanding_calls(&self) -> usize {
+        let calls = self.calls.lock().unwrap();
+        calls.running + calls.queued.len()
+    }
+
+    /// Wait up to `wait` (forever when None) for async calls to finish,
+    /// returning those that did; "interrupted" once cancelled.
+    fn wait_settled(&self, wait: Option<std::time::Duration>) -> Result<Vec<Settled>, String> {
+        let until = wait.map(|w| std::time::Instant::now() + w);
+        let rx = self.settled_rx.lock().unwrap();
+        let mut done = Vec::new();
+        loop {
+            if self.cancel.load(Ordering::SeqCst) {
+                return Err("interrupted".into());
+            }
+            let slice = match until {
+                Some(u) => u
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(std::time::Duration::from_millis(25)),
+                None => std::time::Duration::from_millis(25),
+            };
+            match rx.recv_timeout(slice) {
+                Ok(s) => {
+                    done.push(s);
+                    done.extend(rx.try_iter());
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if until.is_some_and(|u| std::time::Instant::now() >= u) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let mut calls = self.calls.lock().unwrap();
+        calls.running -= done.len().min(calls.running);
+        self.start_queued(&mut calls);
+        Ok(done)
     }
 
     /// Run blocking work on its own thread, returning early with
@@ -1580,6 +1688,7 @@ const RUNNER: &str = r#"
 
 /// Execute one Tool Invocation. Blocking; run on a dedicated thread.
 pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, ExecError> {
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
     let state = Arc::new(State {
         caps: req.caps.clone(),
         mode: req.mode,
@@ -1592,6 +1701,9 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         stubbed: AtomicBool::new(false),
         cancel: req.cancel.clone(),
         kv_overlay: Mutex::new(Default::default()),
+        calls: Mutex::new(AsyncCalls::default()),
+        settled_tx,
+        settled_rx: Mutex::new(settled_rx),
     });
     let cancelled = req.cancel.clone();
     let err = |e: &dyn std::fmt::Display| {
@@ -1635,8 +1747,9 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         ctx.eval::<(), _>(RUNNER).map_err(|e| err(&e))
     })?;
     // Event loop: drain the job queue (an async run() settles through it),
-    // then fire due timers, sleeping until the next one. It ends when the
-    // result is set (leftover timers are dropped) or nothing is left to run.
+    // then fire due timers, waiting until the next one or an async call's
+    // result. It ends when the result is set (leftover timers are dropped,
+    // running async calls abandoned) or nothing is left to run.
     let result_json: Option<String> = loop {
         while runtime.is_job_pending() {
             if runtime.execute_pending_job().is_err() {
@@ -1657,13 +1770,28 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         if result.is_some() {
             break result;
         }
-        if next_timer < 0 && !runtime.is_job_pending() {
+        let outstanding = state.outstanding_calls();
+        if next_timer < 0 && outstanding == 0 && !runtime.is_job_pending() {
             break None;
         }
-        if next_timer > 0
-            && !state.sleep_cancellable(std::time::Duration::from_millis(next_timer as u64))
-        {
-            return Err(err(&"interrupted"));
+        let next = (next_timer >= 0).then(|| std::time::Duration::from_millis(next_timer as u64));
+        if outstanding > 0 {
+            let settled = state.wait_settled(next).map_err(|e| err(&e))?;
+            ctx.with(|ctx| -> Result<(), ExecError> {
+                for (id, result) in settled {
+                    let r = match result {
+                        Ok(v) => json!({"ok": true, "value": v}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    };
+                    ctx.eval::<(), _>(format!("__settleCall({id}, {r})"))
+                        .map_err(|e| err(&e))?;
+                }
+                Ok(())
+            })?;
+        } else if let Some(next) = next.filter(|n| !n.is_zero()) {
+            if !state.sleep_cancellable(next) {
+                return Err(err(&"interrupted"));
+            }
         }
     };
     let result_json =
@@ -1715,6 +1843,67 @@ mod tests {
         assert_eq!(seen_zero, [0xff; 16]);
         assert_eq!(random_bytes(5).len(), 5);
         assert!(random_bytes(0).is_empty());
+    }
+
+    /// Nested Tools that each take 300 ms; "bad" fails.
+    struct SlowOps;
+    impl HostOps for SlowOps {
+        fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if name == "bad" {
+                return Err("bad tool".into());
+            }
+            Ok(json!({"name": name, "n": input["n"]}))
+        }
+    }
+
+    fn live(code: &str) -> ExecRequest {
+        ExecRequest {
+            code: code.into(),
+            input: json!({}),
+            caps: Capabilities::default(),
+            memory_mb: 64,
+            mode: HostMode::Live,
+            cancel: Arc::new(AtomicBool::new(false)),
+            overlay: None,
+            activity: None,
+            modules: Arc::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn call_async_runs_nested_tools_in_parallel() {
+        let req = live(
+            "async function run() {
+               const xs = await Promise.all([1, 2, 3, 4].map(n => tools.callAsync('t', {n})));
+               return xs.map(x => x.n);
+             }",
+        );
+        let started = std::time::Instant::now();
+        let out = execute(&req, Arc::new(SlowOps)).unwrap();
+        assert_eq!(out.output, json!([1, 2, 3, 4]));
+        // Four 300 ms calls one after another would take 1.2 s.
+        assert!(started.elapsed() < std::time::Duration::from_millis(900));
+    }
+
+    #[test]
+    fn call_async_rejects_with_the_nested_error() {
+        let req = live(
+            "async function run() {
+               try { await tools.callAsync('bad', {}); return 'no'; }
+               catch (e) { return e.message; }
+             }",
+        );
+        let out = execute(&req, Arc::new(SlowOps)).unwrap();
+        assert_eq!(out.output, json!("bad tool"));
+    }
+
+    #[test]
+    fn call_async_is_stubbed_in_smoke_tests() {
+        let mut req = live("async function run() { return await tools.callAsync('t', {}); }");
+        req.mode = HostMode::Smoke;
+        let e = execute(&req, Arc::new(SlowOps)).unwrap_err();
+        assert!(e.after_stub, "{}", e.message);
     }
 
     #[test]

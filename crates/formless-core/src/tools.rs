@@ -32,7 +32,8 @@ pub const FORGET: &str = "forget";
 pub const ASK_USER: &str = "ask_user";
 pub const SCHEDULE_RUN: &str = "schedule_run";
 pub const READ_METRICS: &str = "read_metrics";
-pub const RESERVED: [&str; 24] = [
+pub const RUN_SCRIPT: &str = "run_script";
+pub const RESERVED: [&str; 25] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -57,6 +58,7 @@ pub const RESERVED: [&str; 24] = [
     ASK_USER,
     SCHEDULE_RUN,
     READ_METRICS,
+    RUN_SCRIPT,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -552,6 +554,36 @@ fn test_tool_definition() -> Value {
     })
 }
 
+fn run_script_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": RUN_SCRIPT,
+            "description": "Run a short JavaScript script that calls existing Tools, to loop, filter, branch or fan out in one step instead of one call per step; only its return value comes back. The script is the body of an async function: use await and return at top level. `tools` holds only the Tools named in uses, as async functions (`await tools.search_repo({pattern})`), plus tools.call(name, input); Promise.all runs them in parallel. The script itself has no Capabilities: no fetch, fs, process, env, store, llm or agents - anything that reads or changes the world must be a Tool. `input` is the input object. Pass save_as to save a successful script as a Tool; save any script you would run twice.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Script body (plain JS, top-level await and return)"},
+                    "uses": {"type": "array", "items": {"type": "string"}, "description": "Registry Tools the script may call; approval is asked for these before it runs"},
+                    "input": {"type": "object", "description": "Optional; available to the script as `input`"},
+                    "save_as": {
+                        "type": "object",
+                        "description": "Optional: save the script as a Tool if it succeeds (its input is `input`)",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "input_schema": {"type": "object"},
+                            "output_schema": {"type": "object"}
+                        },
+                        "required": ["name", "description", "input_schema", "output_schema"]
+                    }
+                },
+                "required": ["code", "uses"]
+            }
+        }
+    })
+}
+
 fn tokens(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
@@ -804,6 +836,7 @@ pub fn tool_definitions(
         list_mcp_resources_definition(),
         read_mcp_resource_definition(),
         test_tool_definition(),
+        run_script_definition(),
         pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
         pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),
         pending_definition(ABANDON_INVOCATION, "Abandon a Pending Invocation handle: it still finishes and is recorded, but its result will not be delivered."),

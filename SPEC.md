@@ -363,6 +363,7 @@ pattern (§4.4).
 - **Built-ins (v2.2).** The minimal set the harness needs to grow itself:
   `create_tool`, `create_module`, `retire_tool`,
   `find_tools`, `read_tool`, `read_module`, `read_artifact`, `test_tool`,
+  `run_script` (v2.3, §7.12),
   `unload_tools`, `remember`, `forget` (§7.11), `ask_user` (§5.5),
   `schedule_run` (§9.7), `read_metrics` (§8.9),
   and the Pending Invocation handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
@@ -509,7 +510,9 @@ pattern (§4.4).
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
     stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` —
     gated by `process`, no shell, stdin closed unless given.
-  - `tools.call(name, input)` — composition (§7.6).
+  - `tools.call(name, input)` — composition (§7.6); blocks until the
+    nested Tool returns. `tools.callAsync(name, input)` (v2.3) returns a
+    Promise instead, so several run in parallel (§7.12).
   - v2: `clipboard.read/write` (gated by `clipboard:*`), `notify(title,
     body)` (gated by `notify`), `llm.complete(prompt, {system, model})`
     (gated by `llm`; one non-streaming completion via the daemon's
@@ -596,7 +599,9 @@ pattern (§4.4).
   backward-compatible new version) instead of adding a narrow one;
   specialise only when the logic itself is project-specific. v2.2 adds:
   search with `find_tools` before creating, `read_tool` before versioning,
-  `test_tool` before saving, and throw on failure. The prompt documents the
+  `test_tool` before saving, and throw on failure. v2.3 adds `run_script`
+  to connect existing Tools, saving any script worth repeating (§7.12).
+  The prompt documents the
   exact host API of §7.5 so first-try Tool success is maximised; the
   optimiser's Candidate prompt carries the same host-API text.
 - No starter Tools ship. First-run UX is the wizard (§10.1) plus an optional
@@ -792,76 +797,99 @@ suite cannot measure preferences.
   applied memory-kind proposals (§8). Schema v18 migrated the applied
   ones, and rolling such a proposal back deletes its note.
 
-### 7.12 Orchestration scripts (`run_script`) — DRAFT
+### 7.12 Orchestration scripts (`run_script`, v2.3)
 
-> **Status: proposed** ([ADR 0005](docs/adr/0005-run-script-orchestration.md)).
-> Nothing here is implemented. The settings below are not yet in §13.
+Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
 
 - **Purpose.** One step can call many Tools with loops, filters, branches
   and parallel fan-out. Intermediate results stay in the sandbox and only
   the script's return value reaches model context. Scripts **connect**
   Tools; they never replace them.
-- **Built-in.** `run_script(code, uses[], save_as?)`. The name is
-  reserved (§7.1). `code` is plain JS whose top level may `await`, and its
-  final `return` value is the result. `uses` names the registry Tools the
-  script may call.
-- **No ambient authority, and no Capabilities.** The script global scope
-  has the Tools in `uses` as async functions (`await tools.search_repo({…})`
-  or `await tools.call("search_repo", {…})`), plus `console`, timers,
-  `JSON`, `cryptoRandom()` and `requireModule` (§7.6). These are **absent**:
-  `fetch`, `fs`, `process`, `env`, `clipboard`, `notify`, `llm`, `agents`
-  and `store`. The script itself has no side effects. Every effect is a
-  nested Invocation of a Tool, under that Tool's own Capabilities.
-- **Approval.** Before execution, the `uses` set goes through the normal
-  approval pre-pass (§5.2/§10.3): one prompt per unapproved Tool, and
-  input-bound scopes (§7.4) still bind per nested call. A call to a Tool
-  outside `uses`, or to a retired or unknown Tool, rejects that call's
-  Promise with an error. It never prompts partway through a script.
-  Built-ins are not callable from scripts, `run_script` included, so
-  scripts do not nest.
-- **Async host calls.** Nested `tools.call` returns a Promise that the
-  daemon settles when the nested Invocation ends. Each nested Invocation
-  runs on its own sandbox thread (§6.1), so `Promise.all` truly runs in
-  parallel. At most `scripts.max_parallel` (default 8) nested Invocations
-  per script are in flight, and the rest queue. This change to `tools.call`
-  applies to composed registry Tools too (§7.6).
+- **Built-in.** `run_script(code, uses[], input?, save_as?)`. The name is
+  reserved (§7.1).
+  - `code` is the body of an async `run(input)`, so it may `await` and
+    `return` at its top level.
+  - `uses` names the registry Tools the script may call.
+  - `input` (an object, default `{}`) is the script's `input`.
+- **No ambient authority, and no Capabilities.**
+  - Inside the script, `tools` holds the Tools in `uses` as async
+    functions (`await tools.search_repo({…})`) plus `tools.call(name,
+    input)`, which also returns a Promise.
+  - Also available: `console`, timers, `sleep`, `JSON`, `cryptoRandom()`,
+    `randomBytes()` and `requireModule` (§7.6).
+  - Absent: `fetch`, `fetchChunks`, `fs`, `process`, `env`, `clipboard`,
+    `notify`, `llm`, `agents`, `store` and `emit`.
+  - The script runs with no declared Capabilities, so the host denies
+    those effects even through the raw bridge. Every effect is a nested
+    Invocation of a Tool, under that Tool's own Capabilities.
+- **Approval.**
+  - **Before execution:** each Tool in `uses` passes the approval check
+    (§10.3) with its fixed Capabilities. One denial stops the script
+    before anything runs.
+  - **Per call:** a Tool with input-bound scopes (§7.4) is still approved
+    per call for the paths or hosts it binds, so it may ask while the
+    script runs.
+  - **Refused:** a call to a Tool outside `uses`, through the script's
+    `tools` or the global `tools` bridge, rejects with an error. The
+    daemon enforces this. Built-ins can't be listed in `uses`, so
+    scripts don't nest.
+  - Tools a script calls run at the top level: they may start sub-agents
+    (§7.6), as if the model had called them.
+- **Parallel calls.**
+  - `tools.callAsync(name, input)` returns a Promise that the runtime
+    settles when the nested Invocation ends. Each call runs on its own
+    thread (§6.1), so `Promise.all` really runs them in parallel.
+  - At most `scripts.max_parallel` (8) calls per sandbox are in flight;
+    the rest queue.
+  - `tools.callAsync` exists in every Tool. `tools.call` stays
+    synchronous in Tools, so existing composed Tools keep working.
 - **Bounds.**
-  - Source is capped at `scripts.max_source_kb` (default 64).
-  - The script heap is capped at `scripts.memory_mb` (default 256).
+  - Source is capped at `scripts.max_source_kb` (64).
+  - The script heap is capped at `scripts.memory_mb` (256).
   - The script ends on its return value, a thrown error, the Run being
-    cancelled, or `scripts.timeout_secs` (default 600) of wall time.
-    Nested Invocations are not timed out; when the script ends, any still
-    running are **abandoned** (§6.3), not cancelled.
-  - The soft threshold and Pending Invocation handle (§6.2) apply to the
-    script as a whole.
-- **Output.** The return value is JSON-serialised. A large result becomes
-  an artifact (§9.6) with a bounded preview, as for Tool output. Console
-  output is kept with the Invocation and is not sent to the model unless
-  the script fails.
-- **Recording.** Each run is an Invocation of `run_script` with its source,
-  `uses`, result and duration. Nested Invocations record it as their
-  `parent`, so the live tree (§10.6) and `/invocations` show them as
-  children. The model step's tokens are attributed across the nested Tool
-  calls by the §8.1 rule; the script absorbs none. `run_script` is excluded
-  from Self-Optimisation, is never replayed, and has no success-rate
-  trigger.
+    cancelled, or `scripts.timeout_secs` (600) of wall time.
+  - Nested Invocations follow the Run, not the script. Any still running
+    when the script ends or times out are left to finish and are recorded
+    normally; they are not cancelled.
+  - The soft threshold (§6.2) does not apply to `run_script`;
+    `scripts.timeout_secs` bounds it instead.
+- **Output.** The result is `{"result": …}`, with `saved`/`save_error`
+  and `hint` when they apply. A large result becomes an artifact (§9.6)
+  with a bounded preview, as for Tool output. Console output is
+  discarded. Syntax errors give line numbers that include the wrapper
+  lines, and the error says how many those are.
+- **Recording.**
+  - Each run is a row in the `scripts` table (schema v27): source, `uses`,
+    a fingerprint, status, error, duration, and the saved Tool's name.
+  - Nested Invocations record `parent_id` = `script:<id>`. The live tree
+    (§10.6) shows them under the `run_script` call.
+  - Token attribution (§8.1): the step's share for the `run_script` call
+    is split evenly over the Tools it called. The script itself absorbs
+    none.
+  - `run_script` is a built-in: it is excluded from Self-Optimisation and
+    never replayed.
 - **Promotion to a Tool.** `save_as: {name, description, input_schema,
   output_schema}` saves a successful script as a registry Tool through the
-  full `create_tool` gate (§7.1):
-  - The script body becomes `run(input)`, with `input` replacing literals
-    the agent marks as parameters.
-  - Its Capabilities are those needed for `tools.call` composition (§7.6),
-    and its author is `agent`.
-  - A failed gate leaves the script result intact and reports why the save
-    was refused.
-- **Recurrence signal.** The daemon hashes each script's normalised source
-  (whitespace and string/number literals stripped). When one hash is run in
-  `scripts.recurrence_threshold` (default 3) distinct Sessions, the
-  prompt-proposal generator (§7.7) and the Tools view flag it as "save as
-  a Tool", in the same way §8.1 #5 flags over-specific Tools.
-- **Bootstrap prompt.** A version bump adds: use `run_script` to connect
-  existing Tools; anything that reads or changes the world is a Tool, not
-  script code; save with `save_as` any script you would run twice.
+  full `create_tool` gate (§7.1).
+  - The saved code is the same wrapper the script ran in, with `input` as
+    its parameters.
+  - It declares no Capabilities: the Tools it calls each check their own
+    (§7.6 composition).
+  - Its smoke test is usually inconclusive (nested calls are stubbed).
+  - A failed gate keeps the script result and reports `save_error`.
+- **Recurrence signal.**
+  - Each script is fingerprinted: SHA-256 over its tokens, with
+    whitespace and comments dropped and string, template and number
+    literals blanked.
+  - Once one fingerprint has run successfully in
+    `scripts.recurrence_threshold` (3) distinct Sessions, the
+    `run_script` result carries a `hint` to save it.
+  - Fingerprints that recur but were never saved go to the
+    prompt-proposal generator (§7.7) as signals.
+- **Bootstrap prompt v2.3** adds `run_script` to the built-ins and adds
+  three rules: use it to connect existing Tools; anything that reads or
+  changes the world is a Tool, not script code; save with `save_as` any
+  script you would run twice.
 
 ## 8. Metrics and Self-Optimisation
 
@@ -1513,6 +1541,11 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
 | `tools.smoke_timeout_secs` | 10 | Creation smoke-test bound (§7.1) |
 | `tools.replay_timeout_secs` | 60 | Optimiser replay bound per Invocation (§8.4) |
+| `scripts.max_parallel` | 8 | Nested `tools.callAsync` Invocations in flight per sandbox; the rest queue (§7.12) |
+| `scripts.max_source_kb` | 64 | Largest `run_script` source (§7.12) |
+| `scripts.memory_mb` | 256 | `run_script` heap cap (§7.12) |
+| `scripts.timeout_secs` | 600 | A script running longer is stopped; its nested Invocations finish on their own (§7.12) |
+| `scripts.recurrence_threshold` | 3 | Distinct Sessions running one script before it is flagged "save as a Tool" (§7.12) |
 | `metrics.success_window` | 100 | Rolling window for success rate (§8.3) |
 | `metrics.trigger_min_invocations` | 20 | Minimum sample before trigger (§8.3) |
 | `metrics.trigger_success_below` | 0.90 | Trigger threshold (§8.3) |

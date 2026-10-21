@@ -181,6 +181,23 @@ impl Daemon {
                 narrow.join(", ")
             ));
         }
+        // Scripts run again and again but never saved (§7.12).
+        let recurring = self
+            .with_store(|st| st.recurring_scripts(cfg.scripts.recurrence_threshold, 5))
+            .unwrap_or_default();
+        if !recurring.is_empty() {
+            signals.push_str(
+                "\nRecurring run_script scripts never saved as a Tool (save_as would make them reusable and measured):\n",
+            );
+            for (sessions, uses, source) in &recurring {
+                let head: String = source.lines().take(3).collect::<Vec<_>>().join(" / ");
+                signals.push_str(&format!(
+                    "- {sessions} sessions, uses [{}]: {}\n",
+                    uses.join(", "),
+                    head.chars().take(160).collect::<String>()
+                ));
+            }
+        }
         if signals.lines().count() <= 1 {
             signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
         }
