@@ -929,6 +929,26 @@ are:
 
 `limit` defaults to 50, with a maximum of 200.
 
+### 8.10 Near-duplicate Tools
+
+Generic-Tool guidance helps, but registries still collect near-duplicates
+such as `read_file`, `read_text_file` and `file_read`.
+
+- **Scoring:** a pair of active, non-MCP Tools scores 1.0 for identical
+  code, ignoring whitespace. Otherwise the score is 0.4 × the name-token
+  overlap + 0.3 × the description-word overlap + 0.3 × the input-field
+  overlap (all Jaccard, with simple plural folding). Pairs scoring at
+  least 0.6 are flagged, with a reason.
+- **Surfacing:**
+  - `find_tools` gives a matching Tool `similar_tools` and a
+    `merge_hint`: write one general new version, then retire the others.
+  - `read_metrics` has a `duplicates` kind.
+  - Hourly, the daemon flags each new pair to the user once, as a note
+    suggesting the merge. It audit-logs `tool.duplicate` and never flags
+    the same pair twice.
+- Merging is always a deliberate step by the agent or the user. Nothing
+  is merged automatically.
+
 ## 9. Daemon Core
 
 ### 9.1 Lifecycle

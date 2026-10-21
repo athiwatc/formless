@@ -2918,6 +2918,13 @@ impl Daemon {
         let ids: Vec<String> = hits.iter().map(|t| t.id.clone()).collect();
         self.with_store(|st| st.load_session_tools(session_id, &ids, "found"))?;
         let upgraded = self.refresh_pins(session_id, &ids)?;
+        let dupes = if hits.is_empty() {
+            Vec::new()
+        } else {
+            self.with_reader(|st| st.current_tools())
+                .map(|all| crate::dupes::near_duplicates(&all))
+                .unwrap_or_default()
+        };
         let tools: Vec<Value> = hits
             .iter()
             .map(|t| {
@@ -2928,6 +2935,17 @@ impl Daemon {
                     "invocations": t.invocations,
                     "success_rate": t.success_rate,
                 });
+                // Near-duplicates (§8.10): prefer merging over adding a third.
+                let similar: Vec<&str> = dupes
+                    .iter()
+                    .filter_map(|p| {
+                        (p.a == t.name).then_some(p.b.as_str()).or((p.b == t.name).then_some(p.a.as_str()))
+                    })
+                    .collect();
+                if !similar.is_empty() {
+                    v["similar_tools"] = json!(similar);
+                    v["merge_hint"] = json!("near-duplicates: consider one general new version of this Tool covering them, then retire the others");
+                }
                 // Measured unreliability is worth saying out loud: the agent
                 // may do better building its own Tool (e.g. for an MCP tool
                 // that keeps failing, which the optimiser cannot rewrite).
@@ -3060,7 +3078,14 @@ impl Daemon {
                 Ok(json!({"summary": crate::runs::summarize(&runs)}))
             }
             "builtins" => Ok(json!({"builtins": st.builtin_stats()?})),
-            other => Err(anyhow!("unknown kind '{other}' (tools, audit, models, runs, builtins)")),
+            "duplicates" => Ok(json!({"duplicates": crate::dupes::near_duplicates(&st.current_tools()?)
+                .into_iter()
+                .take(limit)
+                .map(|p| json!({"tools": [p.a, p.b], "score": (p.score * 100.0).round() / 100.0, "reason": p.reason}))
+                .collect::<Vec<_>>()})),
+            other => Err(anyhow!(
+                "unknown kind '{other}' (tools, audit, models, runs, builtins, duplicates)"
+            )),
         })
     }
 
@@ -3190,13 +3215,51 @@ impl Daemon {
 
     /// Start due jobs (SPEC §9.7), every 20 s. A job missed while the
     /// daemon was down runs once, then continues from now.
+    /// Flag new near-duplicate Tool pairs to the user, once each (§8.10).
+    pub fn flag_duplicates(&self) -> usize {
+        let Ok(pairs) = self.with_reader(|st| {
+            st.current_tools()
+                .map(|t| crate::dupes::near_duplicates(&t))
+        }) else {
+            return 0;
+        };
+        let flagged: std::collections::HashSet<String> = self
+            .with_reader(|st| st.recent_audit(Some("tool.duplicate"), 10_000))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, _, detail, _)| detail)
+            .collect();
+        let mut n = 0;
+        for p in pairs {
+            let key = format!("{}|{}", p.a, p.b);
+            if flagged.contains(&key) {
+                continue;
+            }
+            let _ = self.with_store(|st| st.audit("optimiser", "tool.duplicate", &key));
+            self.broadcast(Event::Note {
+                session_id: None,
+                text: format!(
+                    "Possible duplicate Tools: {} and {} ({}). Ask the agent to merge them into one general version and retire the other.",
+                    p.a, p.b, if p.reason.is_empty() { "similar overall" } else { &p.reason }
+                ),
+            });
+            n += 1;
+        }
+        n
+    }
+
     async fn job_loop(self: Arc<Self>) {
+        let mut last_dupe_check: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {}
             }
             self.run_due_jobs().await;
+            if last_dupe_check.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3600)) {
+                last_dupe_check = Some(std::time::Instant::now());
+                self.flag_duplicates();
+            }
         }
     }
 
