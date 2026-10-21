@@ -126,6 +126,11 @@ pub struct SkillInfo {
     pub retired: bool,
     /// Times a Session loaded it.
     pub loads: i64,
+    /// Runs that loaded it, and how many of those completed.
+    #[serde(default)]
+    pub runs: i64,
+    #[serde(default)]
+    pub runs_completed: i64,
     pub created_at: String,
     pub updated_at: String,
 }

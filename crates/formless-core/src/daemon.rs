@@ -162,6 +162,8 @@ pub struct Daemon {
     /// One naming inference at a time: bounds CPU and keeps at most one
     /// copy of the model in memory.
     naming: Arc<tokio::sync::Semaphore>,
+    /// One skill distillation at a time (SPEC §7.10).
+    auto_skill: Arc<tokio::sync::Semaphore>,
     /// Set while (or after a failed) naming-model download, so it is
     /// attempted once per daemon lifetime.
     model_download: Arc<AtomicBool>,
@@ -199,6 +201,7 @@ impl Daemon {
             modules: StdMutex::new(None),
             http: reqwest::Client::builder().build()?,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
+            auto_skill: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
         })
@@ -1007,6 +1010,7 @@ impl Daemon {
             status: final_status.to_string(),
         });
         self.maybe_name_session(&session_id);
+        self.maybe_auto_skill(&session_id, &run_id, final_status);
         // Queued messages start fresh Runs, in order (SPEC §5.3).
         let next = self
             .with_store(|st| st.pop_queued_message(&session_id))
@@ -1094,6 +1098,147 @@ impl Daemon {
                 this.broadcast(Event::SessionUpdated { session: s });
             }
         });
+    }
+
+    /// After a Run: retire unused or unhelpful auto skills, and distil a
+    /// new one from a successful, non-trivial Run (SPEC §7.10). In the
+    /// background; at most one distillation at a time, skipped when busy.
+    fn maybe_auto_skill(self: &Arc<Self>, session_id: &str, run_id: &str, status: &str) {
+        let Ok(cfg) = self.config() else {
+            return;
+        };
+        let s = &cfg.skills;
+        let cutoff = (s.auto_retire_days > 0).then(|| {
+            (chrono::Utc::now() - chrono::Duration::days(s.auto_retire_days as i64)).to_rfc3339()
+        });
+        if let Ok(retired) = self.with_store(|st| {
+            st.retire_auto_skills(cutoff.as_deref(), s.min_success_rate, s.min_runs_for_rate)
+        }) {
+            for name in &retired {
+                let _ = self.with_store(|st| st.audit("daemon", "skill.auto_retire", name));
+            }
+            if !retired.is_empty() {
+                self.broadcast(Event::SkillsChanged);
+            }
+        }
+        if !s.auto_create || status != "completed" {
+            return;
+        }
+        let Ok(permit) = self.auto_skill.clone().try_acquire_owned() else {
+            return;
+        };
+        let gathered = self.with_store(|st| {
+            if st.run_loaded_skill(run_id)? {
+                return Ok(None);
+            }
+            let calls = st.run_invocations(run_id)?;
+            let seq: Vec<String> = calls.iter().map(|(n, _, _)| n.clone()).collect();
+            let worth = calls.len() >= s.min_tool_calls.max(1)
+                || (calls.len() >= 3 && st.tool_sequence_seen_elsewhere(session_id, &seq)?);
+            if !worth {
+                return Ok(None);
+            }
+            let msgs = st.list_messages(session_id)?;
+            let last = |role: &str| {
+                msgs.iter()
+                    .rev()
+                    .find(|m| m.role == role && !m.content.trim().is_empty())
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default()
+            };
+            let model = st.get_session(session_id)?.and_then(|s| s.model);
+            Ok(Some((
+                last("user"),
+                calls,
+                last("assistant"),
+                st.list_skills()?,
+                model,
+            )))
+        });
+        let Ok(Some((task, calls, outcome, existing, session_model))) = gathered else {
+            return;
+        };
+        let this = self.clone();
+        let run_id = run_id.to_string();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = this
+                .distil_skill(
+                    &cfg,
+                    &run_id,
+                    &task,
+                    &calls,
+                    &outcome,
+                    &existing,
+                    session_model,
+                )
+                .await
+            {
+                tracing::warn!("auto skill from run {run_id}: {e:#}");
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn distil_skill(
+        self: &Arc<Self>,
+        cfg: &Config,
+        run_id: &str,
+        task: &str,
+        calls: &[(String, String, String)],
+        outcome: &str,
+        existing: &[formless_protocol::SkillInfo],
+        session_model: Option<String>,
+    ) -> Result<()> {
+        let requested = cfg
+            .skills
+            .model
+            .clone()
+            .or(session_model)
+            .unwrap_or_else(|| cfg.provider.model.clone());
+        let model = self.resolve_model(&requested, cfg, false)?;
+        let input = crate::skills::distil_input(task, calls, outcome, existing);
+        let reply = self
+            .provider(cfg)
+            .await?
+            .complete(
+                &[
+                    json!({"role": "system", "content": crate::skills::DISTIL_PROMPT}),
+                    json!({"role": "user", "content": input}),
+                ],
+                &model,
+                None,
+            )
+            .await?;
+        let Some((meta, text)) = crate::skills::parse_distilled(&reply) else {
+            return Ok(());
+        };
+        // Never replace a skill the user installed or imported.
+        if existing
+            .iter()
+            .any(|s| s.name == meta.name && s.author != "auto")
+        {
+            return Ok(());
+        }
+        let info = self.with_store(|st| {
+            let info = crate::skills::install_text(
+                &self.paths,
+                st,
+                &text,
+                &format!("auto:run {run_id}"),
+                "auto",
+            )?;
+            st.set_skill_enabled(&info.name, true)?;
+            st.audit(
+                "daemon",
+                "skill.auto_create",
+                &format!("{} v{}", info.name, info.version),
+            )?;
+            Ok(info)
+        })?;
+        tracing::info!("auto-created skill {} v{}", info.name, info.version);
+        self.broadcast(Event::SkillsChanged);
+        Ok(())
     }
 
     fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {

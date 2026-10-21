@@ -778,13 +778,21 @@ impl App {
                             }
                             for s in list {
                                 self.notes.push(format!(
-                                    "skill {} v{} {} · {} loads · {}{}",
+                                    "skill {} v{} {} · {} loads{} · {}{}{}",
                                     s.name,
                                     s.version,
-                                    if s.enabled { "enabled" } else { "disabled" },
+                                    if s.retired {
+                                        "retired"
+                                    } else if s.enabled {
+                                        "enabled"
+                                    } else {
+                                        "disabled"
+                                    },
                                     s.loads,
+                                    skill_success(&s),
                                     truncate_chars(&s.description, 70),
-                                    if s.has_scripts { " · scripts" } else { "" }
+                                    if s.has_scripts { " · scripts" } else { "" },
+                                    if s.author == "auto" { " · auto" } else { "" }
                                 ));
                             }
                         }
@@ -3814,6 +3822,18 @@ pub fn run(paths: Paths) -> Result<()> {
     let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
     result
+}
+
+/// " · 80% of 5 Runs completed" for a skill loaded in Runs, else "".
+fn skill_success(s: &formless_protocol::SkillInfo) -> String {
+    if s.runs == 0 {
+        return String::new();
+    }
+    format!(
+        " · {}% of {} Runs completed",
+        100 * s.runs_completed / s.runs,
+        s.runs
+    )
 }
 
 #[cfg(test)]

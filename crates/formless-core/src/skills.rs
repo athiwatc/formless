@@ -374,6 +374,105 @@ pub fn prepare_bundle(paths: &Paths, bundle: &serde_json::Value) -> Result<Stage
     result
 }
 
+/// Install a skill from SKILL.md text alone (auto-created skills).
+pub fn install_text(
+    paths: &Paths,
+    store: &Store,
+    skill_md: &str,
+    source: &str,
+    author: &str,
+) -> Result<formless_protocol::SkillInfo> {
+    let dir = paths
+        .data_dir
+        .join("skills")
+        .join(".staging")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir)?;
+    let result = (|| {
+        std::fs::write(dir.join("SKILL.md"), skill_md)?;
+        let mut staged = prepare(paths, &dir.to_string_lossy(), None, None)?;
+        staged.source = source.into();
+        commit(paths, store, &staged, author)
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// System prompt for distilling a skill from a successful Run.
+pub const DISTIL_PROMPT: &str = "You turn a successfully completed agent task into a reusable \
+skill: a SKILL.md that helps an agent do the same kind of task well next time.
+
+Reply with the SKILL.md only, in this exact form:
+---
+name: lowercase-words-with-hyphens
+description: One or two sentences: what the skill does and when to use it.
+---
+# Title
+## When to use
+## Steps
+## Pitfalls
+## Tools
+
+Rules:
+- Generic: describe the kind of task, not this instance. No names, paths, \
+URLs, numbers, file contents or other user data from the transcript.
+- Never include secrets, tokens, passwords or keys.
+- Mention the Tools by name where they help.
+- If an existing skill listed below already covers this, reuse its exact \
+name to improve it; if the task is trivial or not reusable, reply NONE.";
+
+/// The user message for [`DISTIL_PROMPT`]: the task, the Tool calls and
+/// the outcome, each clipped, plus the existing skills for dedup.
+pub fn distil_input(
+    task: &str,
+    calls: &[(String, String, String)],
+    outcome: &str,
+    existing: &[formless_protocol::SkillInfo],
+) -> String {
+    fn clip(s: &str, n: usize) -> String {
+        let mut out: String = s.chars().take(n).collect();
+        if out.len() < s.len() {
+            out.push('…');
+        }
+        out
+    }
+    let mut text = format!("Task:\n{}\n\nTool calls:\n", clip(task, 2000));
+    for (i, (tool, input, status)) in calls.iter().enumerate().take(60) {
+        text.push_str(&format!(
+            "{}. {tool} [{status}] {}\n",
+            i + 1,
+            clip(input, 300)
+        ));
+    }
+    text.push_str(&format!(
+        "\nOutcome:\n{}\n\nExisting skills:\n",
+        clip(outcome, 2000)
+    ));
+    if existing.is_empty() {
+        text.push_str("(none)\n");
+    }
+    for s in existing {
+        text.push_str(&format!("- {}: {}\n", s.name, s.description));
+    }
+    text
+}
+
+/// The SKILL.md in a distillation reply, or `None` for NONE or anything
+/// that does not parse as a valid skill.
+pub fn parse_distilled(reply: &str) -> Option<(SkillMeta, String)> {
+    let mut text = reply.trim();
+    if let Some(rest) = text.strip_prefix("```") {
+        // Drop a code fence (and its language tag) around the reply.
+        text = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
+        text = text.trim_end().trim_end_matches("```").trim();
+    }
+    if text.eq_ignore_ascii_case("none") || !text.starts_with("---") {
+        return None;
+    }
+    let meta = parse_skill_md(text).ok()?;
+    (!meta.body.trim().is_empty()).then(|| (meta, format!("{text}\n")))
+}
+
 /// The installed directory of a skill's current version.
 pub fn current_dir(store: &Store, name: &str) -> Result<PathBuf> {
     store

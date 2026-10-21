@@ -290,3 +290,120 @@ fn skills_export_and_import_bundles() {
     evil["files"][0]["path"] = "../escape.md".into();
     assert!(prepare_bundle(&other, &evil).is_err());
 }
+
+#[test]
+fn distilled_skills_parse_and_install_as_auto() {
+    use formless_core::skills::{distil_input, install_text, parse_distilled};
+    assert!(parse_distilled("NONE").is_none());
+    assert!(parse_distilled("Sure! here is a skill").is_none());
+    let reply = "```markdown\n---\nname: csv-cleanup\ndescription: Clean a CSV before analysis.\n---\n# CSV cleanup\n## Steps\n1. Read it.\n```";
+    let (meta, text) = parse_distilled(reply).unwrap();
+    assert_eq!(meta.name, "csv-cleanup");
+    assert!(text.starts_with("---\nname: csv-cleanup") && !text.contains("```"));
+
+    let calls = vec![(
+        "read_file".to_string(),
+        "{\"path\":\"x\"}".to_string(),
+        "success".to_string(),
+    )];
+    let input = distil_input("tidy the sheet", &calls, "done", &[]);
+    assert!(input.contains("1. read_file [success]") && input.contains("(none)"));
+
+    let paths = temp_paths("autoskill");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let info = install_text(&paths, &store, &text, "auto:run r1", "auto").unwrap();
+    assert_eq!((info.author.as_str(), info.version), ("auto", 1));
+    let again = install_text(&paths, &store, &text, "auto:run r2", "auto").unwrap();
+    assert_eq!(again.version, 2, "a repeat becomes a new version");
+}
+
+#[test]
+fn auto_skills_are_measured_and_retired() {
+    use formless_core::skills::install_text;
+    let paths = temp_paths("retire");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let md = |n: &str| format!("---\nname: {n}\ndescription: d\n---\nbody\n");
+    install_text(&paths, &store, &md("idle-skill"), "auto", "auto").unwrap();
+    install_text(&paths, &store, &md("bad-skill"), "auto", "auto").unwrap();
+    install_text(&paths, &store, &md("user-skill"), "x", "user").unwrap();
+    for n in ["idle-skill", "bad-skill", "user-skill"] {
+        store.set_skill_enabled(n, true).unwrap();
+    }
+    // bad-skill: loaded in 2 Runs, one completed, one interrupted.
+    let session = store.create_session(None).unwrap().id;
+    for status in ["completed", "interrupted"] {
+        let run = store.create_run(&session).unwrap();
+        store.set_run_status(&run, status).unwrap();
+        store
+            .record_skill_load("bad-skill", &session, &run)
+            .unwrap();
+        assert!(store.run_loaded_skill(&run).unwrap());
+    }
+    let bad = store.get_skill("bad-skill").unwrap().unwrap();
+    assert_eq!((bad.loads, bad.runs, bad.runs_completed), (2, 2, 1));
+
+    // Nothing is idle yet against an old cutoff; 50% < 60% retires bad-skill.
+    let retired = store
+        .retire_auto_skills(Some("2000-01-01T00:00:00+00:00"), 0.6, 2)
+        .unwrap();
+    assert_eq!(retired, vec!["bad-skill".to_string()]);
+    // A cutoff in the future: idle-skill was never loaded; user skills are
+    // never auto-retired.
+    let retired = store
+        .retire_auto_skills(Some("2999-01-01T00:00:00+00:00"), 0.0, 2)
+        .unwrap();
+    assert_eq!(retired, vec!["idle-skill".to_string()]);
+    let idle = store.get_skill("idle-skill").unwrap().unwrap();
+    assert!(idle.retired && !idle.enabled);
+    // Retired skills are restorable.
+    store.set_skill_enabled("idle-skill", true).unwrap();
+    assert!(!store.get_skill("idle-skill").unwrap().unwrap().retired);
+}
+
+#[test]
+fn run_tool_sequences_are_compared_across_sessions() {
+    let paths = temp_paths("toolseq");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let mut ids = Vec::new();
+    for n in ["fetch_page", "summarize"] {
+        let (t, v) = store
+            .create_tool_version(
+                n,
+                "d",
+                "{}",
+                "{}",
+                "function run(i){return i;}",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap();
+        ids.push((t.id, v));
+    }
+    let run_in = |session: &str| {
+        let run = store.create_run(session).unwrap();
+        for (id, v) in &ids {
+            store
+                .start_invocation(id, *v, Some(session), Some(&run), None, "{}")
+                .unwrap();
+        }
+        store.set_run_status(&run, "completed").unwrap();
+        run
+    };
+    let (a, b) = (
+        store.create_session(None).unwrap().id,
+        store.create_session(None).unwrap().id,
+    );
+    let run_b = run_in(&b);
+    let seq: Vec<String> = store
+        .run_invocations(&run_b)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(seq, ["fetch_page", "summarize"]);
+    assert!(!store.tool_sequence_seen_elsewhere(&b, &seq).unwrap());
+    run_in(&a);
+    assert!(store.tool_sequence_seen_elsewhere(&b, &seq).unwrap());
+}
