@@ -277,6 +277,10 @@ struct LiveToolCall {
     status: String,
     started: Instant,
     elapsed_ms: Option<i64>,
+    /// Invocation handle once the daemon names it (pending or stalled).
+    handle: Option<String>,
+    /// Seconds without activity, while the daemon flags it stalled.
+    stalled_secs: Option<u64>,
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -626,6 +630,17 @@ impl App {
         }
     }
 
+    /// The current Session's newest running call of `tool_name`.
+    fn running_call(&mut self, session_id: &str, tool_name: &str) -> Option<&mut LiveToolCall> {
+        if !self.is_current(session_id) {
+            return None;
+        }
+        self.live_tools
+            .iter_mut()
+            .rev()
+            .find(|c| c.name == tool_name && c.status == "running")
+    }
+
     fn set_activity(&mut self, label: impl Into<String>) {
         let label = label.into();
         match &mut self.activity {
@@ -838,6 +853,8 @@ impl App {
                     status: "running".into(),
                     started: Instant::now(),
                     elapsed_ms: None,
+                    handle: None,
+                    stalled_secs: None,
                 });
                 self.notes.push(format!("running {tool_name}…"));
             }
@@ -939,9 +956,38 @@ impl App {
                     memory_mb,
                 });
             }
-            Event::InvocationPending { tool_name, .. } => {
+            Event::InvocationPending {
+                session_id,
+                tool_name,
+                handle,
+                ..
+            } => {
+                if let Some(call) = self.running_call(&session_id, &tool_name) {
+                    call.handle = Some(handle);
+                }
                 self.notes
                     .push(format!("{tool_name} still running (pending)"));
+            }
+            Event::InvocationStalled {
+                session_id,
+                handle,
+                tool_name,
+                silent_secs,
+            } => {
+                if let Some(call) = self.running_call(&session_id, &tool_name) {
+                    call.handle = Some(handle);
+                    call.stalled_secs = Some(silent_secs);
+                    self.notes.push(format!(
+                        "{tool_name}: no activity for {silent_secs}s; /cancel stops just this tool"
+                    ));
+                }
+            }
+            Event::InvocationActivity { handle, .. } => {
+                for call in &mut self.live_tools {
+                    if call.handle.as_deref() == Some(&handle) {
+                        call.stalled_secs = None;
+                    }
+                }
             }
             Event::InvocationCompleted { tool_name, ok, .. } => {
                 self.notes.push(format!(
@@ -1166,6 +1212,23 @@ impl App {
                     if self.show_thinking { "on" } else { "off" }
                 ));
             }
+            "cancel" => {
+                let handle = self
+                    .live_tools
+                    .iter()
+                    .rev()
+                    .filter(|c| c.status == "running")
+                    .find_map(|c| c.handle.clone());
+                match handle {
+                    Some(handle) => self.request(
+                        Pending::RunControl,
+                        Request::CancelInvocation { handle },
+                    ),
+                    None => self.notes.push(
+                        "no pending or stalled tool to cancel (Esc stops the whole run)".into(),
+                    ),
+                }
+            }
             "resend" => {
                 if let Some(session_id) = self.current.clone() {
                     self.request(
@@ -1185,7 +1248,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /resend /resume /abandon /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -2048,17 +2111,27 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
             } else {
                 String::new()
             };
-            lines.push(Line::styled(
+            let mut spans = vec![Span::styled(
                 format!(
-                    "  {} {}{} · {}  {}",
+                    "  {} {}{} · {}  ",
                     app.spinner(),
                     call.name,
                     version,
                     format_elapsed(call.started.elapsed()),
-                    ui::summarize_args(&call.arguments, 160)
                 ),
                 bold_fg(app.color, Color::Yellow),
+            )];
+            if let Some(secs) = call.stalled_secs {
+                spans.push(Span::styled(
+                    format!("stalled {secs}s · /cancel  "),
+                    bold_fg(app.color, Color::Red),
+                ));
+            }
+            spans.push(Span::styled(
+                ui::summarize_args(&call.arguments, 160),
+                bold_fg(app.color, Color::Yellow),
             ));
+            lines.push(Line::from(spans));
         }
     }
     if app.messages.is_empty() && !app.running() {

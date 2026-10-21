@@ -32,6 +32,8 @@ pub(crate) struct PendingEntry {
     stalled_noted: AtomicBool,
     activity: Arc<std::sync::atomic::AtomicU64>,
     notify: tokio::sync::Notify,
+    /// Cancels just this Invocation (a child of the Run's token).
+    cancel: CancellationToken,
 }
 
 /// Fan an event out to every live subscriber, dropping disconnected ones.
@@ -275,6 +277,14 @@ impl Daemon {
                     None => false,
                 };
                 Ok(json!({"abandoned": abandoned}))
+            }
+            Request::CancelInvocation { handle } => {
+                let entry = self
+                    .pending_get(&handle)
+                    .filter(|e| e.result.lock().unwrap().is_none())
+                    .context("no running invocation with that handle")?;
+                entry.cancel.cancel();
+                Ok(json!({"cancelled": true}))
             }
             Request::RetryProviderRequest { session_id } => {
                 let runs = self.runs.lock().unwrap();
@@ -1485,6 +1495,7 @@ impl Daemon {
             stalled_noted: AtomicBool::new(false),
             activity: Arc::new(std::sync::atomic::AtomicU64::new(epoch_ms())),
             notify: tokio::sync::Notify::new(),
+            cancel: cancel.child_token(),
         });
         self.pending
             .lock()
@@ -1496,8 +1507,22 @@ impl Daemon {
             let handle2 = handle.clone();
             let (sid, rid, nm) = (session_id.to_string(), run_id.to_string(), name.to_string());
             let activity = entry.activity.clone();
-            let (flag, tok, cfg2) = (cancel_flag.clone(), cancel.clone(), cfg.clone());
+            // The sandbox polls a flag; raise it when this Invocation's token
+            // is cancelled (by the Run's interrupt or CancelInvocation).
+            let flag = Arc::new(AtomicBool::new(cancel_flag.load(Ordering::SeqCst)));
+            let done = CancellationToken::new();
+            {
+                let (tok, flag, done) = (entry.cancel.clone(), flag.clone(), done.clone());
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = tok.cancelled() => flag.store(true, Ordering::SeqCst),
+                        _ = done.cancelled() => {}
+                    }
+                });
+            }
+            let (tok, cfg2) = (entry.cancel.clone(), cfg.clone());
             tokio::spawn(async move {
+                let _done = done.drop_guard();
                 let res = this
                     .clone()
                     .execute_tool_at(
@@ -2704,14 +2729,24 @@ impl Daemon {
                     .iter()
                     .map(|(h, e)| (h.clone(), e.clone()))
                     .collect();
-                for (_h, e) in entries {
-                    if e.result.lock().unwrap().is_none()
-                        && now.saturating_sub(e.activity.load(Ordering::SeqCst)) >= stall_ms
-                        && !e.stalled_noted.swap(true, Ordering::SeqCst)
-                    {
-                        self.broadcast(Event::Note {
-                            session_id: Some(e.session_id.clone()),
-                            text: format!("tool {} possibly stalled (no activity)", e.tool_name),
+                for (handle, e) in entries {
+                    if e.result.lock().unwrap().is_some() {
+                        continue;
+                    }
+                    let silent_ms = now.saturating_sub(e.activity.load(Ordering::SeqCst));
+                    if silent_ms >= stall_ms {
+                        if !e.stalled_noted.swap(true, Ordering::SeqCst) {
+                            self.broadcast(Event::InvocationStalled {
+                                session_id: e.session_id.clone(),
+                                handle,
+                                tool_name: e.tool_name.clone(),
+                                silent_secs: silent_ms / 1000,
+                            });
+                        }
+                    } else if e.stalled_noted.swap(false, Ordering::SeqCst) {
+                        self.broadcast(Event::InvocationActivity {
+                            session_id: e.session_id.clone(),
+                            handle,
                         });
                     }
                 }

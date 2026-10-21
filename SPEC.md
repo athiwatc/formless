@@ -243,6 +243,11 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   call/output counts as activity). After a configurable silence period
   (default 5 min) an Invocation is visually flagged `possibly stalled` in
   the TUI. The flag is advisory only — **nothing is ever auto-killed**.
+  Protocol: `InvocationStalled {handle, tool_name, silent_secs}` sets the
+  flag on that Tool call, `InvocationActivity {handle}` clears it, and the
+  user may stop just that Invocation with `CancelInvocation {handle}`
+  (`/cancel`, or the chip's Cancel button): it is recorded user-cancelled
+  and the agent gets the error result while the Run carries on.
 
 ### 6.2 Soft threshold → Pending Invocation
 
