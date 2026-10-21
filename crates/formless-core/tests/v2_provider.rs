@@ -323,3 +323,83 @@ async fn sse_keeps_multibyte_chars_split_across_chunks() {
     assert_eq!(out.content, "hi 😀 ok");
     assert_eq!(out.tool_calls[0].arguments, "{\"x\":\"日本\"}");
 }
+
+/// Serves each scripted SSE body in turn (the last one repeats).
+async fn scripted_sse(endpoint: &'static str, bodies: Vec<String>) -> String {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new().route(
+        endpoint,
+        post(move || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = bodies[n.min(bodies.len() - 1)].clone();
+            async move {
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+async fn stream_once(c: ProviderCfg) -> anyhow::Result<String> {
+    let p = Provider::new(c, "k".into()).unwrap();
+    p.chat_stream(
+        &[json!({"role": "user", "content": "hi"})],
+        &[],
+        "good",
+        None,
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .map(|r| r.content)
+}
+
+#[tokio::test]
+async fn stream_failure_events_fail_loudly_or_retry() {
+    let ev = |v: Value| format!("data: {v}\n\n");
+    let ok = ev(json!({"type": "response.output_text.delta", "delta": "fine"}))
+        + &ev(json!({"type": "response.completed", "response": {}}));
+    let responses = |base: &str| {
+        let mut c = cfg(base);
+        c.api_style = "responses".into();
+        c.fallback_models.clear();
+        c
+    };
+
+    // A non-retryable failure is an error, not an empty answer.
+    let failed = ev(json!({"type": "response.failed", "response": {"error":
+        {"code": "invalid_prompt", "message": "bad input"}}}));
+    let base = scripted_sse("/responses", vec![failed]).await;
+    let err = stream_once(responses(&base)).await.unwrap_err().to_string();
+    assert!(
+        err.contains("invalid_prompt") && err.contains("bad input"),
+        "{err}"
+    );
+
+    // Incomplete responses surface their reason.
+    let incomplete = ev(json!({"type": "response.incomplete", "response":
+        {"incomplete_details": {"reason": "max_output_tokens"}}}));
+    let base = scripted_sse("/responses", vec![incomplete]).await;
+    let err = stream_once(responses(&base)).await.unwrap_err().to_string();
+    assert!(err.contains("max_output_tokens"), "{err}");
+
+    // A rate-limit `error` before any output is retried.
+    let limited =
+        ev(json!({"type": "error", "code": "rate_limit_exceeded", "message": "slow down"}));
+    let base = scripted_sse("/responses", vec![limited, ok]).await;
+    assert_eq!(stream_once(responses(&base)).await.unwrap(), "fine");
+
+    // Chat Completions: a bare error chunk fails the stream too.
+    let chat_err = ev(json!({"error": {"type": "invalid_request_error", "message": "nope"}}));
+    let base = scripted_sse("/chat/completions", vec![chat_err]).await;
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    let err = stream_once(c).await.unwrap_err().to_string();
+    assert!(err.contains("nope"), "{err}");
+}
