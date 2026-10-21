@@ -330,7 +330,11 @@ fn temp_paths(tag: &str) -> Paths {
 /// Runs the scripted build+use flow once against a fresh daemon; the client
 /// answers approvals with `approve`. Returns (final assistant text, paths).
 #[cfg(unix)]
-async fn scripted_flow(tag: &str, approve: bool) -> (String, Paths, String) {
+async fn scripted_flow(
+    tag: &str,
+    approve: bool,
+    scope: formless_protocol::ApprovalScope,
+) -> (String, Paths, String) {
     use formless_core::daemon::Daemon;
     use formless_core::Config;
     use formless_protocol::*;
@@ -421,6 +425,7 @@ async fn scripted_flow(tag: &str, approve: bool) -> (String, Paths, String) {
                         request: Request::ApprovalDecision {
                             approval_id,
                             approved: approve,
+                            scope,
                         },
                     };
                     write_half
@@ -445,7 +450,8 @@ async fn scripted_flow(tag: &str, approve: bool) -> (String, Paths, String) {
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_builds_and_uses_tool_with_approval() {
-    let (final_text, paths, workdir) = scripted_flow("m2a", true).await;
+    let (final_text, paths, workdir) =
+        scripted_flow("m2a", true, formless_protocol::ApprovalScope::Always).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(
         std::fs::read_to_string(format!("{workdir}/out.txt")).unwrap(),
@@ -465,8 +471,24 @@ async fn daemon_builds_and_uses_tool_with_approval() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn approve_once_runs_the_tool_without_storing_a_grant() {
+    let (final_text, paths, workdir) =
+        scripted_flow("m2o", true, formless_protocol::ApprovalScope::Once).await;
+    assert!(final_text.contains("hello-m2"), "final text: {final_text}");
+    assert!(std::path::Path::new(&format!("{workdir}/out.txt")).exists());
+    let store = Store::open(&paths.db_file()).unwrap();
+    let (info, _) = store.get_tool_by_name("echo_write").unwrap().unwrap();
+    assert!(
+        store.get_approval(&info.id).unwrap().is_none(),
+        "a once-approval must not persist"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
-    let (final_text, paths, workdir) = scripted_flow("m2d", false).await;
+    let (final_text, paths, workdir) =
+        scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;
     assert!(
         final_text.to_lowercase().contains("denied"),
         "final text: {final_text}"

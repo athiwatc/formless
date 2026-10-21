@@ -235,6 +235,9 @@ pub enum Request {
     ApprovalDecision {
         approval_id: String,
         approved: bool,
+        /// How long an approval lasts; older clients omit it (`Always`).
+        #[serde(default)]
+        scope: ApprovalScope,
     },
     PromotionDecision {
         promotion_id: String,
@@ -266,6 +269,17 @@ pub enum Request {
     ImportSession {
         bundle: serde_json::Value,
     },
+}
+
+/// How long an approval lasts (SPEC §10.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    /// This call only; nothing is stored.
+    Once,
+    /// Stored for the Tool until its Capabilities widen.
+    #[default]
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

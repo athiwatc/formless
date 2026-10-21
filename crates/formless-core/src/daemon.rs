@@ -48,6 +48,9 @@ pub(crate) fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Answers a waiting approval: (approved, scope).
+type ApprovalReply = oneshot::Sender<(bool, ApprovalScope)>;
+
 pub(crate) struct RunCtl {
     cancel: CancellationToken,
     cancel_flag: Arc<AtomicBool>,
@@ -59,7 +62,7 @@ pub struct Daemon {
     pub(crate) store: Arc<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
     queued: Arc<Mutex<HashMap<String, Vec<String>>>>,
-    approvals: Arc<StdMutex<HashMap<String, oneshot::Sender<bool>>>>,
+    approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
@@ -449,11 +452,12 @@ impl Daemon {
             Request::ApprovalDecision {
                 approval_id,
                 approved,
+                scope,
             } => {
                 // First answer wins (SPEC §10.4): removing the sender resolves it.
                 let tx = self.approvals.lock().unwrap().remove(&approval_id);
                 let resolved = match tx {
-                    Some(tx) => tx.send(approved).is_ok(),
+                    Some(tx) => tx.send((approved, scope)).is_ok(),
                     None => false,
                 };
                 Ok(json!({"resolved": resolved}))
@@ -1933,7 +1937,7 @@ impl Daemon {
             return false;
         }
         let approval_id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel::<bool>();
+        let (tx, rx) = oneshot::channel::<(bool, ApprovalScope)>();
         self.approvals
             .lock()
             .unwrap()
@@ -1946,12 +1950,14 @@ impl Daemon {
             capabilities: caps.to_specs(),
             memory_mb: ver.memory_mb,
         });
-        let approved = tokio::select! {
-            _ = cancel.cancelled() => false,
-            r = rx => r.unwrap_or(false),
+        let (approved, scope) = tokio::select! {
+            _ = cancel.cancelled() => (false, ApprovalScope::Once),
+            r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.lock().unwrap().remove(&approval_id);
-        if approved {
+        if approved && scope == ApprovalScope::Once {
+            let _ = self.with_store(|st| st.audit("user", "tool.approve_once", &info.name));
+        } else if approved {
             // Accumulate: approving a new bound path keeps earlier ones.
             let (grant, mem) = match &prior {
                 Some((p, m)) => (p.union(caps), ver.memory_mb.max(*m)),

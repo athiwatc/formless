@@ -291,7 +291,7 @@ formless --profile sandbox
 | Command | Behaviour |
 |---|---|
 | `formless` (or `formless tui`) | Launch the TUI, auto-starting the daemon |
-| `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one; `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run |
+| `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one; `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run (nothing is stored) |
 | `formless daemon start\|stop\|status\|serve` | Daemon lifecycle |
 | `formless relay enable\|disable\|status` | Encrypted browser access (v2) |
 | `formless tools list\|export\|import` | Registry inspection and transfer (no secrets, no metrics) |
