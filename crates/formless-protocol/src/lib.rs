@@ -451,6 +451,13 @@ pub enum Request {
         #[serde(default)]
         mime: Option<String>,
     },
+    /// Serve the web UI on 127.0.0.1 (SPEC §12); returns a one-time
+    /// login `url`. `port` 0 or unset picks a free one.
+    StartWebUi {
+        #[serde(default)]
+        port: Option<u16>,
+    },
+    StopWebUi,
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
     /// Add a job as the user (approved): `cron` for recurring, else `at`.

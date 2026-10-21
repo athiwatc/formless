@@ -68,8 +68,10 @@ without redesign.
   detached (`DETACHED_PROCESS`, its own process group, no console
   window), so closing the launching terminal never stops it.
 - Identical framed protocol over both transports. No localhost-TCP fallback
-  in v1. Local access control = OS filesystem/pipe permissions only (single-
-  user trust boundary; see Security, §14).
+  for clients. Local access control = OS filesystem/pipe permissions only
+  (single-user trust boundary; see Security, §14). The one TCP listener is
+  the opt-in local web UI (§12, `formless web`). It binds 127.0.0.1 only,
+  is off by default, and bridges into the socket or pipe.
 
 ## 3. Concepts (summary; GLOSSARY.md is canonical)
 
@@ -1272,6 +1274,19 @@ run_tool = "network_policy"     # a registry Tool, or…
   usage/config error, `130` interrupted.
 - `formless daemon start|stop|status` — daemon management (same lifecycle
   rules as §9.1).
+- `formless web [--port N] [--no-open] [--stop]` — the opt-in **local web
+  UI**. The daemon serves the relay web app, embedded in the binary, on
+  `127.0.0.1` only (`StartWebUi`/`StopWebUi`), and the protocol runs over
+  a same-origin WebSocket bridged to the local socket or pipe, without the
+  relay crypto layer. It stops when the daemon exits.
+  - **Login:** the printed link carries a one-time random token in its
+    URL fragment, which the page exchanges for an `HttpOnly`,
+    `SameSite=Strict` session cookie. The link works once.
+  - **Request checks:** every request must name `127.0.0.1:<port>` or
+    `localhost:<port>` in `Host` (DNS-rebinding protection). The login
+    and the WebSocket must also come from that `Origin`, and the
+    WebSocket needs the cookie.
+  - Responses carry the same CSP as the hosted relay.
 - `formless tools list|export|import …` — registry inspection/transfer
   (same trust rules as §7.8).
 - `formless doctor` — diagnostics: config validity, data dir, keychain
@@ -1388,7 +1403,8 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 - **Trust boundary:** the daemon serves only the owning local user (socket/
   pipe ACL). Any local process running as that user is trusted; nothing
-  listens on the network. The v2 Relay is outbound-only and carries
+  listens on the network (the opt-in web UI listens on 127.0.0.1 only,
+  behind a one-time token, a session cookie and Host/Origin checks, §12). The v2 Relay is outbound-only and carries
   ciphertext keyed by the pairing secret (§12).
 - **Sandbox:** QuickJS has zero ambient authority. Every privileged effect
   goes through a daemon host call checked against the Tool version's declared
