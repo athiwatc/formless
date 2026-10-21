@@ -529,6 +529,10 @@ pub enum Request {
     SessionUsage {
         session_id: String,
     },
+    /// Undo a Session delete within its window (`daemon.delete_undo_secs`).
+    RestoreSession {
+        id: String,
+    },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
     /// Add a job as the user (approved): `cron` for recurring, else `at`.

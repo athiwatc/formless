@@ -322,7 +322,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -337,7 +337,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 26] = [
+const MIGRATIONS: [(i64, MigrationStep); 27] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -402,6 +402,8 @@ const MIGRATIONS: [(i64, MigrationStep); 26] = [
     (26, |c| {
         add_column(c, "runs", "error TEXT NOT NULL DEFAULT ''")
     }),
+    // Session delete with an undo window (SPEC §5.1).
+    (27, |c| add_column(c, "sessions", "deleted_at TEXT")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -520,7 +522,7 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM sessions ORDER BY updated_at DESC")?;
+            .prepare("SELECT * FROM sessions WHERE deleted_at IS NULL ORDER BY updated_at DESC")?;
         let rows = stmt
             .query_map([], Self::row_session)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -575,6 +577,49 @@ impl Store {
     fn note_rewrite(&self) {
         self.rewrites
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Hide a Session for its undo window (SPEC §5.1).
+    pub fn soft_delete_session(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE sessions SET deleted_at=?2 WHERE id=?1 AND deleted_at IS NULL",
+            params![id, now()],
+        )? > 0)
+    }
+
+    /// Undo a soft delete still in its window.
+    pub fn restore_session(&self, id: &str) -> Result<Option<SessionInfo>> {
+        if self.conn.execute(
+            "UPDATE sessions SET deleted_at=NULL WHERE id=?1 AND deleted_at IS NOT NULL",
+            params![id],
+        )? == 0
+        {
+            return Ok(None);
+        }
+        self.get_session(id)
+    }
+
+    /// Whether a Session is soft-deleted (waiting out its undo window).
+    pub fn session_deleted(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT deleted_at IS NOT NULL FROM sessions WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false))
+    }
+
+    /// Soft-deleted Sessions whose window ended before `cutoff` (RFC 3339).
+    pub fn sessions_deleted_before(&self, cutoff: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM sessions WHERE deleted_at IS NOT NULL AND deleted_at <= ?1")?;
+        let rows = stmt
+            .query_map(params![cutoff], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn delete_session(&self, id: &str) -> Result<bool> {
@@ -746,12 +791,12 @@ impl Store {
         let sql = if fts.is_some() {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
-             JOIN sessions s ON s.id = m.session_id \
+             JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE messages_fts MATCH ?1 \
              ORDER BY bm25(messages_fts), m.created_at DESC LIMIT ?2"
         } else {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
-             FROM messages m JOIN sessions s ON s.id = m.session_id \
+             FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE instr(lower(m.content), lower(?1)) > 0 \
              ORDER BY m.created_at DESC LIMIT ?2"
         };

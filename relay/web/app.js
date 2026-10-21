@@ -276,10 +276,12 @@
     renderNotes();
     renderStatus();
   }
-  function toast(text, err) {
-    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text);
+  /** A toast; `action` ({label, run, ms}) adds a button and keeps it up for `ms`. */
+  function toast(text, err, action) {
+    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text,
+      action ? h("button", { class: "btn small", type: "button", onclick: () => { t.remove(); action.run(); } }, action.label) : null);
     $("toasts").append(t);
-    setTimeout(() => t.remove(), err ? 6000 : 3500);
+    setTimeout(() => t.remove(), action ? action.ms : err ? 6000 : 3500);
   }
 
   // -------------------------------------------------------- ask dialogs
@@ -1597,8 +1599,14 @@
     if (s && s.id) openSession(s.id);
   }
   async function deleteSession(s) {
-    const ok = await ask({ title: "Delete “" + s.name + "”?", text: "This permanently deletes the session and its transcript.", ok: "Delete", danger: true });
-    if (ok) await act({ type: "delete_session", id: s.id }, "Session deleted");
+    const ok = await ask({ title: "Delete “" + s.name + "”?", text: "The session and its transcript are deleted (you can undo for a short while).", ok: "Delete", danger: true });
+    if (!ok) return;
+    const r = await act({ type: "delete_session", id: s.id });
+    if (r && r.deleted) {
+      toast("Deleted “" + s.name + "”", false, { label: "Undo", ms: (r.undo_secs || 30) * 1000, run: async () => {
+        if (await act({ type: "restore_session", id: s.id }, "Restored “" + s.name + "”")) refreshSessions();
+      } });
+    }
   }
 
   function beginEdit(msg) {
