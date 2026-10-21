@@ -209,6 +209,15 @@ pub enum Request {
     InterruptRun {
         session_id: String,
     },
+    /// Continue a Session whose last Run was interrupted or paused, from
+    /// its persisted transcript (SPEC §9.5).
+    ResumeRun {
+        session_id: String,
+    },
+    /// Give up on a Session's interrupted or paused Run.
+    AbandonRun {
+        session_id: String,
+    },
     ListTools,
     ListModules,
     GetTool {

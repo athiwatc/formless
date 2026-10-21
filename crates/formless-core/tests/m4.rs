@@ -924,3 +924,98 @@ async fn interrupt_releases_a_tool_waiting_on_llm_complete() {
     assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
     server.abort();
 }
+
+/// Resume continues an interrupted Run from its transcript: the dangling
+/// tool call gets an "interrupted, not retried" result and the agent is
+/// told how the previous Run stopped.
+#[cfg(unix)]
+#[tokio::test]
+async fn resume_continues_an_interrupted_run_and_abandon_drops_it() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::Request;
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4resume");
+    let session_id = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let s = store.create_session(None).unwrap();
+        store.append_message(&s.id, "user", "do it").unwrap();
+        let calls = json!({"tool_calls": [{"id": "c9", "type": "function",
+            "function": {"name": "sleeper", "arguments": "{\"ms\":1}"}}]});
+        store
+            .append_message_meta(&s.id, "assistant", "", Some(calls.to_string()))
+            .unwrap();
+        let run = store.create_run(&s.id).unwrap();
+        store.set_run_status(&run, "running").unwrap();
+        // Daemon restart marks it interrupted.
+        s.id
+    };
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let seen = seen.clone();
+                move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(body["messages"].clone());
+                        sse_text("picked up where I left off")
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+
+    let r = c
+        .rpc(Request::ResumeRun {
+            session_id: session_id.clone(),
+        })
+        .await;
+    assert_eq!(r["started"], true);
+    let text = c.run_to_finish().await;
+    assert_eq!(text, "picked up where I left off");
+    let msgs = seen.lock().unwrap()[0].clone();
+    let tool = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("dangling call answered");
+    assert_eq!(tool["tool_call_id"], "c9");
+    assert!(tool["content"].as_str().unwrap().contains("not retried"));
+    assert!(msgs.to_string().contains("previous run was interrupted"));
+
+    // The resumed Run completed: nothing left to resume or abandon.
+    let r = c
+        .rpc(Request::AbandonRun {
+            session_id: session_id.clone(),
+        })
+        .await;
+    assert_eq!(r["abandoned"], false);
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let run = store.create_run(&session_id).unwrap();
+        store.set_run_status(&run, "paused").unwrap();
+    }
+    let r = c
+        .rpc(Request::AbandonRun {
+            session_id: session_id.clone(),
+        })
+        .await;
+    assert_eq!(r["abandoned"], true);
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(store.last_run(&session_id).unwrap().unwrap().1, "abandoned");
+    server.abort();
+}

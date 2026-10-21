@@ -231,6 +231,41 @@ impl Daemon {
                 content,
                 mode,
             } => self.send_message(session_id, content, mode).await,
+            Request::ResumeRun { session_id } => {
+                if self.runs.lock().unwrap().contains_key(&session_id) {
+                    return Err(anyhow!("a run is already active in this session"));
+                }
+                let (run_id, status) = self
+                    .with_store(|st| st.last_run(&session_id))?
+                    .filter(|(_, s)| s == "interrupted" || s == "paused")
+                    .context("nothing to resume: the last run was not interrupted or paused")?;
+                self.with_store(|st| st.set_run_status(&run_id, "resumed"))?;
+                let note = format!(
+                    "The previous run was {status} before it finished. Continue the user's \
+                     task from where it stopped; do not repeat work already done above."
+                );
+                let msg =
+                    self.with_store(|st| st.append_message(&session_id, "system-note", &note))?;
+                self.broadcast(Event::MessageAppended {
+                    session_id: session_id.clone(),
+                    message: msg,
+                });
+                self.start_run(session_id)?;
+                Ok(json!({"started": true}))
+            }
+            Request::AbandonRun { session_id } => {
+                let last = self
+                    .with_store(|st| st.last_run(&session_id))?
+                    .filter(|(_, s)| s == "interrupted" || s == "paused");
+                let abandoned = match last {
+                    Some((run_id, _)) => {
+                        self.with_store(|st| st.set_run_status(&run_id, "abandoned"))?;
+                        true
+                    }
+                    None => false,
+                };
+                Ok(json!({"abandoned": abandoned}))
+            }
             Request::InterruptRun { session_id } => {
                 let runs = self.runs.lock().unwrap();
                 if let Some(ctl) = runs.get(&session_id) {
@@ -500,6 +535,28 @@ impl Daemon {
         tracing::warn!("run for deleted session {session_id} did not stop within 5s");
     }
 
+    /// A Run that stopped mid-batch leaves tool calls without results,
+    /// which providers reject. Answer them (never re-run: the outcome is
+    /// unknown, SPEC §9.5) before the next Run builds its context.
+    fn close_dangling_tool_calls(&self, session_id: &str) -> Result<()> {
+        for (call_id, name) in self.with_store(|st| st.dangling_tool_calls(session_id))? {
+            let msg = self.with_store(|st| {
+                st.append_message_meta(
+                    session_id,
+                    "tool",
+                    "error: the run stopped before this call finished; it was not retried. \
+                     Run it again if it is still needed.",
+                    Some(json!({"tool_call_id": call_id, "name": name}).to_string()),
+                )
+            })?;
+            self.broadcast(Event::MessageAppended {
+                session_id: session_id.to_string(),
+                message: msg,
+            });
+        }
+        Ok(())
+    }
+
     async fn send_message(
         self: &Arc<Self>,
         session_id: String,
@@ -544,6 +601,7 @@ impl Daemon {
     }
 
     fn start_run(self: &Arc<Self>, session_id: String) -> Result<()> {
+        self.close_dangling_tool_calls(&session_id)?;
         let run_id = self.with_store(|st| st.create_run(&session_id))?;
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));

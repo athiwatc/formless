@@ -614,7 +614,13 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   re-executed** (side effects unknowable). On reattach the TUI offers
   **Resume** (continue from the last completed tool call, with the
   interruption visible to the agent in context) or **Abandon**. All other
-  Sessions/history are untouched.
+  Sessions/history are untouched. Protocol: `ResumeRun {session_id}`
+  (allowed when the Session's last Run is `interrupted` or `paused`; marks
+  it `resumed`, adds a harness note saying how it stopped, and starts a new
+  Run from the transcript) and `AbandonRun {session_id}` (marks it
+  `abandoned`). Before any Run starts, tool calls left without a result are
+  answered with "the run stopped before this call finished; it was not
+  retried", so the transcript stays valid for the provider.
 
 ### 9.6 Artifacts
 
@@ -686,7 +692,8 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   `Esc`: interrupt Run. `Ctrl+C`: detach client. `Tab`/`Shift+Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
-  `/model`, `/settings`, `/stop`, `/approve`, `/thinking`, `/help`
+  `/model`, `/settings`, `/stop`, `/resume`, `/abandon`, `/approve`,
+  `/thinking`, `/help`
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`). Plain text is always chat.
 - Terminal colours respected, `NO_COLOR` honoured. Narrow terminals remain
