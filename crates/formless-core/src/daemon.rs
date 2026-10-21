@@ -1389,6 +1389,24 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: find_tools failed: {e}"),
             },
+            toolreg::UNLOAD_TOOLS => {
+                let names: Vec<String> = args["names"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect();
+                let ids: Vec<String> = names
+                    .iter()
+                    .filter_map(|n| self.with_store(|st| st.get_tool_by_name(n)).ok().flatten())
+                    .map(|(info, _)| info.id)
+                    .collect();
+                match self.with_store(|st| st.request_unload(session_id, &ids)) {
+                    Ok(n) => json!({"will_unload": n, "when": "at the next context compaction"})
+                        .to_string(),
+                    Err(e) => format!("error: unload_tools failed: {e}"),
+                }
+            }
             toolreg::READ_TOOL => match self.read_tool_impl(session_id, &args) {
                 Ok(text) => text,
                 Err(e) => format!("error: read_tool failed: {e}"),
@@ -2913,8 +2931,9 @@ impl Daemon {
             format!("{previous}\n\n{}", summary.trim())
         };
         self.with_store(|st| st.save_checkpoint(session_id, &summary, compact_up_to))?;
-        // The cached prefix is rebuilt anyway: list current Tool definitions
-        // and adopt the current guidance.
+        // The cached prefix is rebuilt anyway: apply unloads and the cap,
+        // list current Tool definitions and adopt the current guidance.
+        self.with_store(|st| st.apply_unloads(session_id, cfg.tools.session_max_loaded))?;
         self.with_store(|st| st.unpin_definitions(session_id, None))?;
         let current = self.effective_system_prompt();
         if self.session_prompt(session_id)? != current {

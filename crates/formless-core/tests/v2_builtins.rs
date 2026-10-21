@@ -888,3 +888,53 @@ fn bm25_search_finds_tools_by_meaning_not_exact_words() {
         "the eval should be harder than exact words"
     );
 }
+
+/// Unloading takes effect at compaction only; loading again revives a
+/// Tool; the per-Session cap drops the oldest loaded Tools first.
+#[test]
+fn session_tools_unload_at_compaction_and_respect_the_cap() {
+    let store = Store::open_in_memory().unwrap();
+    let mut ids = Vec::new();
+    for name in ["alpha", "beta", "gamma", "delta"] {
+        let (info, _) = store
+            .create_tool_version(
+                name,
+                name,
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){ return 1; }",
+                &Capabilities::default(),
+                256,
+                "agent",
+            )
+            .unwrap();
+        ids.push(info.id);
+    }
+    let s = store.create_session(None).unwrap().id;
+    for id in &ids {
+        store
+            .load_session_tools(&s, std::slice::from_ref(id), "found")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(store.request_unload(&s, &ids[..1]).unwrap(), 1);
+    assert!(
+        store.session_tool_ids(&s).unwrap().contains(&ids[0]),
+        "not before compaction"
+    );
+    assert_eq!(store.apply_unloads(&s, 60).unwrap(), 1);
+    let listed = store.session_tool_ids(&s).unwrap();
+    assert!(!listed.contains(&ids[0]));
+    assert_eq!(listed.len(), 3);
+    // find_tools loads it again.
+    store.load_session_tools(&s, &ids[..1], "found").unwrap();
+    assert!(store.session_tool_ids(&s).unwrap().contains(&ids[0]));
+    // Cap of 2: the two oldest go (beta, gamma), the newest stay.
+    assert_eq!(store.apply_unloads(&s, 2).unwrap(), 2);
+    let listed = store.session_tool_ids(&s).unwrap();
+    assert!(
+        listed.contains(&ids[0]) && listed.contains(&ids[3]),
+        "{listed:?}"
+    );
+    assert_eq!(listed.len(), 2);
+}
