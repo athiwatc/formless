@@ -1,0 +1,313 @@
+//! Skills (SPEC §7.10): `SKILL.md` packages of procedural know-how
+//! (Agent Skills format: YAML frontmatter `name` + `description`, a
+//! Markdown body, optional extra files). Installed versioned under
+//! `<data>/skills/<name>/v<N>/`; a new install is never trusted until the
+//! user enables it.
+
+use anyhow::{anyhow, bail, Context, Result};
+use std::path::{Path, PathBuf};
+
+use crate::{Paths, Store};
+
+/// Bundled files beyond this total are refused.
+const MAX_BYTES: u64 = 10_000_000;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillMeta {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// Parse `SKILL.md`: `---` frontmatter with `name` and `description`
+/// (plain, quoted, or folded `>`/`|` values), then the body.
+pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
+    let text = text.trim_start_matches('\u{feff}');
+    let rest = text
+        .strip_prefix("---")
+        .context("SKILL.md must start with --- frontmatter")?;
+    let end = rest
+        .find("\n---")
+        .context("SKILL.md frontmatter is not closed with ---")?;
+    let (front, body) = (&rest[..end], &rest[end + 4..]);
+    let mut fields = std::collections::HashMap::new();
+    let lines: Vec<&str> = front.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        if line.starts_with(char::is_whitespace) || line.trim().is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let mut value = value.trim().to_string();
+        if value.is_empty() || value == ">" || value == "|" || value == ">-" || value == "|-" {
+            // Folded/literal block: the indented lines that follow.
+            let mut parts = Vec::new();
+            while i < lines.len()
+                && (lines[i].starts_with(char::is_whitespace) || lines[i].trim().is_empty())
+            {
+                parts.push(lines[i].trim());
+                i += 1;
+            }
+            value = parts.join(" ").trim().to_string();
+        }
+        let value = value.trim_matches(|c| c == '"' || c == '\'').to_string();
+        fields.insert(key.trim().to_string(), value);
+    }
+    let name = fields.remove("name").unwrap_or_default();
+    let description = fields.remove("description").unwrap_or_default();
+    validate_name(&name)?;
+    if description.is_empty() || description.chars().count() > 1024 {
+        bail!("SKILL.md needs a description of 1-1024 characters");
+    }
+    Ok(SkillMeta {
+        name,
+        description,
+        body: body.trim_start_matches(['\r', '\n']).to_string(),
+    })
+}
+
+/// Agent Skills names: 1-64 lowercase letters, digits and hyphens.
+pub fn validate_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-');
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "skill names use 1-64 lowercase letters, digits and '-' (got '{name}')"
+        ))
+    }
+}
+
+/// Files of a skill directory, relative, sorted (no `.git`).
+pub fn files(dir: &Path) -> Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                walk(root, &path, out)?;
+            } else {
+                out.push(
+                    path.strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Whether a skill bundles runnable scripts (they never run on the host;
+/// see SPEC §7.10).
+pub fn has_scripts(files: &[String]) -> bool {
+    const EXT: &[&str] = &[
+        ".py", ".sh", ".bash", ".js", ".mjs", ".ts", ".rb", ".pl", ".ps1", ".bat", ".cmd",
+    ];
+    files
+        .iter()
+        .any(|f| EXT.iter().any(|e| f.to_lowercase().ends_with(e)))
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<u64> {
+    let mut total = 0;
+    std::fs::create_dir_all(to)?;
+    for rel in files(from)? {
+        let (src, dst) = (from.join(&rel), to.join(&rel));
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        total += std::fs::copy(&src, &dst)?;
+        if total > MAX_BYTES {
+            bail!("skill is larger than {} MB", MAX_BYTES / 1_000_000);
+        }
+    }
+    Ok(total)
+}
+
+fn run(cmd: &mut std::process::Command, what: &str) -> Result<()> {
+    let out = cmd.output().with_context(|| format!("run {what}"))?;
+    if !out.status.success() {
+        bail!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Fetch a source into a temporary directory: a local folder, a git URL
+/// (optionally at `git_ref`), or a `.zip`. Returns the staging dir.
+fn stage(paths: &Paths, source: &str, git_ref: Option<&str>) -> Result<PathBuf> {
+    let staging = paths
+        .data_dir
+        .join("skills")
+        .join(".staging")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&staging)?;
+    let local = Path::new(source);
+    let is_git = source.starts_with("https://")
+        || source.starts_with("git@")
+        || source.trim_end_matches('/').ends_with(".git");
+    if is_git {
+        let mut git = std::process::Command::new("git");
+        git.args(["clone", "--depth", "1"]);
+        if let Some(r) = git_ref {
+            git.args(["--branch", r]);
+        }
+        git.arg(source).arg(&staging);
+        run(&mut git, "git clone")?;
+    } else if local.is_dir() {
+        copy_dir(local, &staging)?;
+    } else if source.to_lowercase().ends_with(".zip") && local.is_file() {
+        run(
+            std::process::Command::new("unzip")
+                .arg("-q")
+                .arg(local)
+                .arg("-d")
+                .arg(&staging),
+            "unzip",
+        )?;
+    } else {
+        bail!("skill source must be a folder, a .zip or a git URL: {source}");
+    }
+    Ok(staging)
+}
+
+/// A fetched, validated skill not yet installed (no database access, so
+/// slow fetches never hold the store).
+pub struct Staged {
+    staging: PathBuf,
+    root: PathBuf,
+    pub meta: SkillMeta,
+    pub files: Vec<String>,
+    source: String,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.staging);
+    }
+}
+
+/// Fetch and validate a skill source.
+pub fn prepare(
+    paths: &Paths,
+    source: &str,
+    subdir: Option<&str>,
+    git_ref: Option<&str>,
+) -> Result<Staged> {
+    let staging = stage(paths, source, git_ref)?;
+    let mut staged = Staged {
+        staging: staging.clone(),
+        root: staging.clone(),
+        meta: SkillMeta {
+            name: String::new(),
+            description: String::new(),
+            body: String::new(),
+        },
+        files: Vec::new(),
+        source: source.to_string(),
+    };
+    if let Some(sub) = subdir.filter(|s| !s.is_empty()) {
+        if sub.split(['/', '\\']).any(|p| p == "..") {
+            bail!("subdir may not contain '..'");
+        }
+        staged.root = staged.root.join(sub);
+    }
+    // A zip often wraps the skill in one folder.
+    if !staged.root.join("SKILL.md").is_file() {
+        let dirs: Vec<PathBuf> = std::fs::read_dir(&staged.root)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.join("SKILL.md").is_file())
+            .collect();
+        if let [only] = dirs.as_slice() {
+            staged.root = only.clone();
+        }
+    }
+    let text = std::fs::read_to_string(staged.root.join("SKILL.md"))
+        .context("no SKILL.md in the skill source")?;
+    staged.meta = parse_skill_md(&text)?;
+    staged.files = files(&staged.root)?;
+    Ok(staged)
+}
+
+/// Copy a staged skill into place as its next version, recorded
+/// **disabled**: the user reviews it (`GetSkill`) and enables it.
+pub fn commit(
+    paths: &Paths,
+    store: &Store,
+    staged: &Staged,
+    author: &str,
+) -> Result<formless_protocol::SkillInfo> {
+    let meta = &staged.meta;
+    let version = store.next_skill_version(&meta.name)?;
+    let dest = paths
+        .data_dir
+        .join("skills")
+        .join(&meta.name)
+        .join(format!("v{version}"));
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)?;
+    }
+    copy_dir(&staged.root, &dest)?;
+    store.add_skill_version(
+        &meta.name,
+        &meta.description,
+        version,
+        &dest.to_string_lossy(),
+        &staged.source,
+        author,
+        has_scripts(&staged.files),
+    )
+}
+
+/// Fetch, validate and install in one go (CLI and tests).
+pub fn install(
+    paths: &Paths,
+    store: &Store,
+    source: &str,
+    subdir: Option<&str>,
+    git_ref: Option<&str>,
+    author: &str,
+) -> Result<formless_protocol::SkillInfo> {
+    let staged = prepare(paths, source, subdir, git_ref)?;
+    commit(paths, store, &staged, author)
+}
+
+/// The installed directory of a skill's current version.
+pub fn current_dir(store: &Store, name: &str) -> Result<PathBuf> {
+    store
+        .skill_path(name)?
+        .map(PathBuf::from)
+        .with_context(|| format!("no skill named '{name}'"))
+}
+
+/// Read a file of a skill, refusing paths that leave its folder.
+pub fn read_file(store: &Store, name: &str, rel: &str) -> Result<String> {
+    let dir = current_dir(store, name)?.canonicalize()?;
+    let path = dir
+        .join(rel)
+        .canonicalize()
+        .with_context(|| format!("no file '{rel}' in skill '{name}'"))?;
+    if !path.starts_with(&dir) {
+        bail!("'{rel}' is outside the skill");
+    }
+    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}

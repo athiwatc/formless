@@ -110,6 +110,26 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// An installed skill (SPEC §7.10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub version: i64,
+    pub enabled: bool,
+    /// Where it was installed from (folder, git URL, zip).
+    pub source: String,
+    /// "user", "import" or "auto".
+    pub author: String,
+    /// Bundles scripts (which never run on the host).
+    pub has_scripts: bool,
+    pub retired: bool,
+    /// Times a Session loaded it.
+    pub loads: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// A configured MCP server and its state (SPEC §7.9).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpServerInfo {
@@ -295,6 +315,27 @@ pub enum Request {
     },
     /// Prompts offered by the configured MCP servers.
     ListMcpPrompts,
+    ListSkills,
+    /// Install a skill from a folder, a git URL (`git_ref`, `subdir`) or a
+    /// `.zip`. New installs start disabled: review, then enable.
+    AddSkill {
+        source: String,
+        #[serde(default)]
+        subdir: Option<String>,
+        #[serde(default)]
+        git_ref: Option<String>,
+    },
+    RemoveSkill {
+        name: String,
+    },
+    SetSkillEnabled {
+        name: String,
+        enabled: bool,
+    },
+    /// A skill with its SKILL.md body and file list, for review.
+    GetSkill {
+        name: String,
+    },
     /// One MCP prompt rendered to text (for the composer).
     GetMcpPrompt {
         server: String,
@@ -569,6 +610,8 @@ pub enum Event {
     SettingsChanged,
     /// MCP servers were added, removed or changed state.
     McpServersChanged,
+    /// Skills were installed, removed, enabled or disabled.
+    SkillsChanged,
     /// A stalled Invocation is active again (clears the stall flag).
     InvocationActivity {
         session_id: String,
@@ -617,6 +660,7 @@ impl Event {
             Event::SessionDeleted { id } => Some(id),
             Event::SettingsChanged
             | Event::McpServersChanged
+            | Event::SkillsChanged
             | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }
             | Event::ProposalUpdated { .. }

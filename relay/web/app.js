@@ -1309,6 +1309,20 @@
               if (ok) { await act({ type: "remove_mcp_server", name: m.name }, "Removed " + m.name); refreshSettings(); }
             } }, "Remove"))))))
         : h("p", { class: "muted" }, "None. Add one with formless mcp add NAME -- COMMAND, or --url URL.")));
+    const skills = S.skills || [];
+    grid.append(h("section", null, h("h3", null, "Skills"),
+      skills.length ? h("table", { class: "table" },
+        h("tbody", null, skills.map((sk) => h("tr", null,
+          h("td", null, h("strong", null, sk.name + " v" + sk.version), h("div", { class: "muted" }, sk.description),
+            sk.has_scripts ? h("div", { class: "muted" }, "bundles scripts (never run on the host)") : null),
+          h("td", { class: "num" }, sk.loads + " loads"),
+          h("td", null,
+            h("button", { class: "btn small", type: "button", onclick: () => reviewSkill(sk.name) }, "Review"),
+            h("button", { class: "btn small" + (sk.enabled ? "" : " primary"), type: "button", onclick: () => act({ type: "set_skill_enabled", name: sk.name, enabled: !sk.enabled }, (sk.enabled ? "Disabled " : "Enabled ") + sk.name).then(refreshSettings) }, sk.enabled ? "Disable" : "Enable"),
+            h("button", { class: "btn small danger", type: "button", onclick: async () => {
+              if (await ask({ title: "Remove skill " + sk.name + "?", text: "All its versions are deleted.", ok: "Remove", danger: true })) { await act({ type: "remove_skill", name: sk.name }, "Removed " + sk.name); refreshSettings(); }
+            } }, "Remove"))))))
+        : h("p", { class: "muted" }, "None. Install one with formless skills add FOLDER | GIT_URL | FILE.zip")));
     const thinking = h("input", { type: "checkbox", onchange: (e) => setThinking(e.target.checked) });
     thinking.checked = S.showThinking;
     grid.append(h("section", null, h("h3", null, "This browser"),
@@ -1348,8 +1362,14 @@
     if (list) S.proposals = list;
     renderView();
   }
+  async function reviewSkill(name) {
+    const r = await act({ type: "get_skill", name });
+    if (!r) return;
+    await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), ok: "Close" });
+  }
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
+    S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     try {
       S.settings = await request({ type: "get_settings" });
     } catch (e) {
@@ -1730,6 +1750,7 @@
       }
       case "settings_changed":
       case "mcp_servers_changed":
+      case "skills_changed":
         refreshSettings();
         break;
       case "subagent_started":

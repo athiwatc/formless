@@ -34,6 +34,11 @@ enum Cmd {
     Doctor,
     /// Apply artifact retention now (artifacts.max_total_mb / max_age_days)
     Gc,
+    /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
     /// External MCP servers (SPEC §7.9)
     Mcp {
         #[command(subcommand)]
@@ -161,6 +166,37 @@ enum ToolsAction {
 }
 
 #[derive(Subcommand)]
+enum SkillsAction {
+    /// Install from a folder, a git URL or a .zip (installed disabled)
+    Add {
+        source: String,
+        /// Folder inside the source that holds SKILL.md
+        #[arg(long)]
+        subdir: Option<String>,
+        /// git branch or tag
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// Enable right away instead of reviewing first
+        #[arg(long)]
+        enable: bool,
+    },
+    Remove {
+        name: String,
+    },
+    List,
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
+    /// Print a skill's SKILL.md and files, to review before enabling
+    Show {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum McpAction {
     /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio) or `add NAME --url URL` (http)
     Add {
@@ -225,6 +261,7 @@ fn main() -> Result<()> {
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Doctor) => doctor(paths),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
+        Some(Cmd::Skills { action }) => skills_cmd(paths, action),
         Some(Cmd::Gc) => {
             let cfg = Config::load(&paths)?;
             let store = formless_core::Store::open(&paths.db_file())?;
@@ -955,6 +992,94 @@ fn count_sigints() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         })
     });
     count
+}
+
+fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
+    let daemon = |req: Request| -> Result<serde_json::Value> {
+        formless_core::daemon::ensure_daemon(&paths)?;
+        formless_tui::client::request_once(&paths, req)
+    };
+    let set = |name: String, enabled: bool| {
+        daemon(Request::SetSkillEnabled {
+            name: name.clone(),
+            enabled,
+        })
+        .map(|_| println!("{} {name}", if enabled { "enabled" } else { "disabled" }))
+    };
+    match action {
+        SkillsAction::Add {
+            source,
+            subdir,
+            git_ref,
+            enable,
+        } => {
+            // A local folder is resolved here: the daemon may run elsewhere.
+            let source = match std::fs::canonicalize(&source) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => source,
+            };
+            let info = daemon(Request::AddSkill {
+                source,
+                subdir,
+                git_ref,
+            })?;
+            let name = info["name"].as_str().unwrap_or_default().to_string();
+            println!(
+                "installed {name} v{} — {}",
+                info["version"],
+                info["description"].as_str().unwrap_or_default()
+            );
+            if info["has_scripts"] == true {
+                println!("note: it bundles scripts; Formless never runs them on the host (port them to a Tool).");
+            }
+            if enable {
+                set(name, true)?;
+            } else {
+                println!("review it with `formless skills show {name}`, then `formless skills enable {name}`");
+            }
+        }
+        SkillsAction::Remove { name } => {
+            daemon(Request::RemoveSkill { name: name.clone() })?;
+            println!("removed {name}");
+        }
+        SkillsAction::List => {
+            let list = daemon(Request::ListSkills)?;
+            let skills = list.as_array().cloned().unwrap_or_default();
+            if skills.is_empty() {
+                println!("no skills installed (formless skills add …)");
+            }
+            for s in skills {
+                println!(
+                    "{:<24} v{:<3} {:<8} {:>4} loads  {}{}",
+                    s["name"].as_str().unwrap_or_default(),
+                    s["version"],
+                    if s["enabled"] == true {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    s["loads"],
+                    s["description"].as_str().unwrap_or_default(),
+                    if s["has_scripts"] == true {
+                        "  [scripts]"
+                    } else {
+                        ""
+                    },
+                );
+            }
+        }
+        SkillsAction::Enable { name } => set(name, true)?,
+        SkillsAction::Disable { name } => set(name, false)?,
+        SkillsAction::Show { name } => {
+            let r = daemon(Request::GetSkill { name })?;
+            println!("{}", r["body"].as_str().unwrap_or_default());
+            println!("\nfiles:");
+            for f in r["files"].as_array().into_iter().flatten() {
+                println!("  {}", f.as_str().unwrap_or_default());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {

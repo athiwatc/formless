@@ -436,6 +436,17 @@ Or manage them from the CLI: `formless mcp add files -- npx -y @modelcontextprot
 
 Its tools appear in the registry as `mcp__files__<tool>`. The agent finds them with `find_tools`, calls need approval like any sensitive Tool, and every call is measured. Servers start on first use and stop when idle (`mcp.idle_secs`); their stderr goes to `<data>/mcp/<name>.log`.
 
+### Skills
+
+Skills are `SKILL.md` folders of know-how (the Agent Skills format), installed from a folder, a git URL or a `.zip`:
+
+```bash
+formless skills add https://github.com/example/skills.git --subdir pdf
+formless skills show pdf      # review: new installs start disabled
+formless skills enable pdf
+formless skills list
+```
+
 ## 6. Invocations: async by design
 
 * Every Tool call is an **Invocation**: one Tool version, one input, recorded and measured.
