@@ -1238,7 +1238,11 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### 10.5 Input and keys
 
-- Enter: send / Steer while running (Ctrl+Enter: queue; configurable).
+- Enter: send / Steer while running. Queue: Ctrl+Enter where the
+  terminal supports the kitty keyboard protocol (enabled when available;
+  most terminals otherwise send the same byte for Enter and Ctrl+Enter),
+  and Ctrl+J or Alt+Enter everywhere, tmux and Terminal.app included. The
+  footer shows the binding that works in the current terminal.
   `Esc`: interrupt Run. `Ctrl+C`: clear the typed message; twice within 2 s: detach client. `Tab`/`Shift+Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
@@ -1499,7 +1503,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `[[hooks]]` | (none) | pre_tool / post_tool / run_end hooks (§9.8) |
 | `compaction.model` | (session) | Optional separate compaction model (§11) |
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
-| `tui.queue_key` | Ctrl+Enter | Queue-vs-steer binding (§10.5) |
+| `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 
 ## 14. Security

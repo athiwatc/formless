@@ -484,6 +484,9 @@ struct App {
     input: String,
     /// When Ctrl+C was last pressed: a second press soon after detaches.
     ctrl_c_at: Option<Instant>,
+    /// The terminal reports Ctrl+Enter apart from Enter (kitty keyboard
+    /// protocol); otherwise queueing uses Ctrl+J / Alt+Enter.
+    enhanced_keys: bool,
     /// Sessions with a Run in flight; run state is per session, not global.
     running_sessions: std::collections::HashSet<String>,
     notes: Vec<String>,
@@ -616,6 +619,7 @@ impl App {
             chat_line_count: 0,
             input: String::new(),
             ctrl_c_at: None,
+            enhanced_keys: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -2176,7 +2180,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /quit".into(),
+                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -2727,9 +2731,7 @@ impl App {
                 KeyCode::Up => self.scroll_chat_up(3),
                 KeyCode::Down => self.scroll_chat_down(3),
                 KeyCode::End => self.follow_chat_bottom(),
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.submit_chat(true)
-                }
+                _ if is_queue_key(&key) => self.submit_chat(true),
                 KeyCode::Enter => self.submit_chat(false),
                 KeyCode::Esc => {
                     if self.running() {
@@ -2952,10 +2954,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     let mut block = ui::panel(" Message ", app.color, color);
     if area.width > 64 {
         block = block.title(ui::hint(
-            if app.running() {
-                "Enter steer · Ctrl+Enter queue · Esc stop"
+            &if app.running() {
+                format!("Enter steer · {} queue · Esc stop", app.queue_label())
             } else {
-                "Enter send · Ctrl+Enter queue · /help"
+                format!("Enter send · {} queue · /help", app.queue_label())
             },
             app.color,
         ));
@@ -3066,10 +3068,32 @@ fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Keys that queue a message (SPEC §10.5): Ctrl+Enter where the terminal
+/// can tell it from Enter, and everywhere Ctrl+J (a raw line feed) or
+/// Alt+Enter.
+fn is_queue_key(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+        KeyCode::Char('j') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
 /// How soon a second Ctrl+C must follow the first to detach.
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl App {
+    /// The queue binding to advertise: one that works in this terminal.
+    fn queue_label(&self) -> &'static str {
+        if self.enhanced_keys {
+            "Ctrl+Enter"
+        } else {
+            "Ctrl+J"
+        }
+    }
+
     /// Ctrl+C: clear a typed message first; pressed again within
     /// [`CTRL_C_WINDOW`] it detaches (Runs keep going in the daemon). The
     /// setup wizard still quits at once.
@@ -4558,6 +4582,13 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
     out.execute(crossterm::event::EnableMouseCapture)?;
+    // Ctrl+Enter is only distinguishable with the kitty keyboard protocol.
+    app.enhanced_keys = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && out
+            .execute(crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ))
+            .is_ok();
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     let result = (|| -> Result<()> {
         while !app.should_quit {
@@ -4575,6 +4606,9 @@ pub fn run(paths: Paths) -> Result<()> {
         }
         Ok(())
     })();
+    if app.enhanced_keys {
+        let _ = stdout().execute(crossterm::event::PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
@@ -4664,6 +4698,7 @@ mod tests {
             chat_line_count: 100,
             input: String::new(),
             ctrl_c_at: None,
+            enhanced_keys: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -5328,5 +5363,19 @@ mod tests {
         assert!(!app.should_quit, "an expired first press only re-arms");
         app.key(ctrl_c);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn queue_keys_work_without_the_kitty_protocol() {
+        let k = |code, m| KeyEvent::new(code, m);
+        assert!(is_queue_key(&k(KeyCode::Enter, KeyModifiers::CONTROL)));
+        assert!(is_queue_key(&k(KeyCode::Enter, KeyModifiers::ALT)));
+        assert!(is_queue_key(&k(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+        assert!(!is_queue_key(&k(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!is_queue_key(&k(KeyCode::Char('j'), KeyModifiers::NONE)));
+        let mut app = test_app();
+        assert_eq!(app.queue_label(), "Ctrl+J", "advertise what works");
+        app.enhanced_keys = true;
+        assert_eq!(app.queue_label(), "Ctrl+Enter");
     }
 }
