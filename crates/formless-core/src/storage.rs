@@ -1611,12 +1611,29 @@ pub fn build_context(
     let (summary, up_to) = store.latest_checkpoint(session_id)?.unwrap_or_default();
     let all = store.list_messages(session_id)?;
     let live: Vec<&MessageInfo> = all.iter().filter(|m| m.seq > up_to).collect();
-    let mut ctx: Vec<Value> = vec![json!({"role": "system", "content": system_prompt})];
-    if !summary.is_empty() {
-        ctx.push(json!({"role": "system", "content": format!("Summary of earlier conversation:\n{summary}")}));
-    }
+    // Exactly one, leading system message: many chat templates and proxies
+    // reject a second or mid-conversation `system` (§11 summary included).
+    let system = if summary.is_empty() {
+        system_prompt.to_string()
+    } else {
+        format!("{system_prompt}\n\nSummary of earlier conversation:\n{summary}")
+    };
+    let mut ctx: Vec<Value> = vec![json!({"role": "system", "content": system})];
     for m in &live {
-        ctx.push(provider_message(m));
+        let msg = provider_message(m);
+        // A harness note right after a user message joins it, so strictly
+        // alternating templates never see two user turns in a row.
+        if m.role == "system-note" {
+            if let Some(last) = ctx.last_mut().filter(|l| l["role"] == "user") {
+                if let (Some(prev), Some(note)) =
+                    (last["content"].as_str(), msg["content"].as_str())
+                {
+                    last["content"] = json!(format!("{prev}\n\n{note}"));
+                    continue;
+                }
+            }
+        }
+        ctx.push(msg);
     }
     let tokens: usize = ctx.iter().map(|v| estimate_tokens(&v.to_string())).sum();
     let needs = (tokens as f64) > (context_tokens as f64 * trigger_fraction) && live.len() > 4;
@@ -1635,7 +1652,9 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(Value::Null);
     if m.role == "system-note" {
-        return json!({"role": "system", "content": m.content});
+        // Sent as a user turn: a mid-conversation `system` message is
+        // rejected by many OpenAI-compatible servers.
+        return json!({"role": "user", "content": format!("[harness note] {}", m.content)});
     }
     if m.role == "tool" {
         return json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
