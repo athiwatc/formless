@@ -136,6 +136,9 @@ struct State {
     streams: Mutex<HashMap<u64, Stream>>,
     next_stream: AtomicU64,
     stubbed: AtomicBool,
+    /// The Invocation's cancel flag: blocking host calls (process, network)
+    /// poll it so Esc stops them, not only the JS interpreter.
+    cancel: Arc<AtomicBool>,
 }
 
 const PRELUDE: &str = r#"
@@ -318,6 +321,35 @@ fn host_in_scope(domains: &[String], host: &str) -> bool {
 /// bare command (resolved through PATH by the OS) or a path that is that
 /// same PATH binary; a path grant matches only that file. A look-alike
 /// binary elsewhere (`/tmp/x/ls` under `process:ls`) never matches.
+/// Send a built request; a scope-denied redirect surfaces as "denied: …".
+fn send_request(
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<reqwest::blocking::Response, String> {
+    req.send().map_err(|e| {
+        use std::error::Error as _;
+        let mut msg = e.to_string();
+        let mut src = e.source();
+        while let Some(s) = src {
+            if s.to_string().starts_with("denied:") {
+                return s.to_string();
+            }
+            msg = format!("{msg}: {s}");
+            src = s.source();
+        }
+        msg
+    })
+}
+
+/// Kill a `process.run` child and everything it started.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: plain syscall; the child leads its own process group.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
 /// Variables a `process.run` child inherits without an `env:` grant: what
 /// ordinary programs need to locate binaries, temp dirs and the locale.
 const PROCESS_BASE_ENV: &[&str] = &[
@@ -813,12 +845,38 @@ impl State {
         Ok((parsed, fixed))
     }
 
-    fn send(
+    /// Run blocking work on its own thread, returning early with
+    /// "interrupted" once the Invocation is cancelled. The abandoned thread
+    /// finishes (or fails) on its own; its result is discarded.
+    fn cancellable<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self.cancel.load(Ordering::SeqCst) {
+                        return Err("interrupted".into());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("host call thread panicked".into());
+                }
+            }
+        }
+    }
+
+    fn build_request(
         &self,
         a: &Value,
         parsed: reqwest::Url,
         scope: Vec<String>,
-    ) -> Result<reqwest::blocking::Response, String> {
+    ) -> Result<reqwest::blocking::RequestBuilder, String> {
         // Redirects are followed, but every hop is scope-checked: a
         // scoped Tool can never be bounced to a host it was not granted.
         let unscoped = scope.is_empty();
@@ -850,19 +908,7 @@ impl State {
         if let Some(b) = a["body"].as_str() {
             req = req.body(decode(b, enc_of(&a["body_encoding"])?)?);
         }
-        req.send().map_err(|e| {
-            use std::error::Error as _;
-            let mut msg = e.to_string();
-            let mut src = e.source();
-            while let Some(s) = src {
-                if s.to_string().starts_with("denied:") {
-                    return s.to_string();
-                }
-                msg = format!("{msg}: {s}");
-                src = s.source();
-            }
-            msg
-        })
+        Ok(req)
     }
 
     fn response_meta(resp: &reqwest::blocking::Response) -> Value {
@@ -886,9 +932,13 @@ impl State {
         if self.mode == HostMode::Smoke {
             return Ok(self.stub(json!({"status": 200, "url": url, "headers": {}, "body": ""})));
         }
-        let resp = self.send(a, parsed, scope)?;
-        let mut meta = Self::response_meta(&resp);
-        let bytes = resp.bytes().map_err(|e| e.to_string())?;
+        let req = self.build_request(a, parsed, scope)?;
+        let (mut meta, bytes) = self.cancellable(move || {
+            let resp = send_request(req)?;
+            let meta = Self::response_meta(&resp);
+            let bytes = resp.bytes().map_err(|e| e.to_string())?;
+            Ok((meta, bytes))
+        })?;
         meta["body"] = encode(&bytes, enc);
         Ok(meta)
     }
@@ -900,7 +950,8 @@ impl State {
         if self.mode == HostMode::Smoke {
             return Ok(self.stub(json!({"id": 0, "status": 200, "url": url, "headers": {}})));
         }
-        let resp = self.send(a, parsed, scope)?;
+        let req = self.build_request(a, parsed, scope)?;
+        let resp = self.cancellable(move || send_request(req))?;
         let mut meta = Self::response_meta(&resp);
         let id = self.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
         self.streams.lock().unwrap().insert(
@@ -918,27 +969,43 @@ impl State {
     fn stream_read(&self, a: &Value) -> Result<Value, String> {
         let id = a["id"].as_u64().unwrap_or(0);
         let size = a["size"].as_u64().unwrap_or(65536).clamp(4, 1 << 20) as usize;
-        let mut streams = self.streams.lock().unwrap();
-        let Some(s) = streams.get_mut(&id) else {
+        // Taken out of the map while reading so a blocked read can run on a
+        // cancellable thread; a cancelled read drops the stream.
+        let Some(mut s) = self.streams.lock().unwrap().remove(&id) else {
             // Smoke stub (id 0) or an already-closed stream: empty body.
             return Ok(json!({"data": "", "eof": true}));
         };
-        let mut buf = std::mem::take(&mut s.carry);
-        let mut eof = false;
-        while buf.len() < size {
-            let mut chunk = vec![0u8; size - buf.len()];
-            let n = s.resp.read(&mut chunk).map_err(|e| e.to_string())?;
-            if n == 0 {
-                eof = true;
-                break;
+        let (mut s, read) = self.cancellable(move || {
+            let mut buf = std::mem::take(&mut s.carry);
+            let mut eof = false;
+            while buf.len() < size {
+                let mut chunk = vec![0u8; size - buf.len()];
+                let n = match s.resp.read(&mut chunk) {
+                    Ok(n) => n,
+                    Err(e) => return Ok((s, Err(e.to_string()))),
+                };
+                if n == 0 {
+                    eof = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
             }
-            buf.extend_from_slice(&chunk[..n]);
-        }
+            Ok((s, Ok((buf, eof))))
+        })?;
+        let (mut buf, eof) = match read {
+            Ok(r) => r,
+            Err(e) => {
+                self.streams.lock().unwrap().insert(id, s);
+                return Err(e);
+            }
+        };
         if s.enc == Enc::Text && !eof {
             let cut = utf8_cut(&buf).max(1);
             s.carry = buf.split_off(cut);
         }
-        Ok(json!({"data": encode(&buf, s.enc), "eof": eof && s.carry.is_empty()}))
+        let out = json!({"data": encode(&buf, s.enc), "eof": eof && s.carry.is_empty()});
+        self.streams.lock().unwrap().insert(id, s);
+        Ok(out)
     }
 
     fn process_run(&self, a: &Value) -> Result<Value, String> {
@@ -1011,28 +1078,66 @@ impl State {
                 }
             }
         }
+        // Own process group, so cancelling kills the whole tree (a shell
+        // and its children), not just the direct child.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command.spawn().map_err(|e| format!("{cmd}: {e}"))?;
-        // Feed stdin on its own thread so a chatty child cannot deadlock
-        // against a full stdout pipe.
+        // Feed stdin and drain stdout/stderr on their own threads so a
+        // chatty child cannot deadlock against a full pipe, and the wait
+        // below can poll for cancellation.
         let feeder = match (stdin, child.stdin.take()) {
             (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || {
                 let _ = pipe.write_all(&data);
             })),
             _ => None,
         };
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut out);
+                }
+                out
+            })
+        };
+        let stdout = drain(
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let stderr = drain(
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if self.cancel.load(Ordering::SeqCst) {
+                kill_tree(&mut child);
+                let _ = child.wait();
+                return Err("interrupted".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
         if let Some(f) = feeder {
             let _ = f.join();
         }
         #[cfg(unix)]
-        let signal = std::os::unix::process::ExitStatusExt::signal(&out.status);
+        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
         #[cfg(not(unix))]
         let signal: Option<i32> = None;
         Ok(json!({
-            "code": out.status.code().unwrap_or(-1),
+            "code": status.code().unwrap_or(-1),
             "signal": signal,
-            "stdout": encode(&out.stdout, enc),
-            "stderr": encode(&out.stderr, Enc::Text),
+            "stdout": encode(&stdout, enc),
+            "stderr": encode(&stderr, Enc::Text),
         }))
     }
 
@@ -1290,6 +1395,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         streams: Mutex::new(HashMap::new()),
         next_stream: AtomicU64::new(0),
         stubbed: AtomicBool::new(false),
+        cancel: req.cancel.clone(),
     });
     let cancelled = req.cancel.clone();
     let err = |e: &dyn std::fmt::Display| {
