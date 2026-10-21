@@ -407,3 +407,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
   .modal-actions .btn { flex: 1 1 auto; min-height: 40px; }
   .run-banner { font-size: 12px; }
 }
+
+/* Artifact viewer */
+.modal.viewer { max-width: min(1000px, 96vw); }
+.artifact-text { max-height: 65vh; overflow: auto; white-space: pre; }
+.modal-actions .spacer { flex: 1; }

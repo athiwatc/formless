@@ -874,12 +874,70 @@
   function toolResultChip(content) {
     const failed = /"ok"\s*:\s*false/.test(content) || /^\s*error/i.test(content);
     const lines = content.split("\n").length;
-    return h("details", { class: "chip result" + (failed ? " failed" : "") },
+    const refs = artifactRefs(content);
+    const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
       h("summary", null,
         h("span", { class: "tname" }, failed ? "↳ failed" : "↳ result"),
         h("span", { class: "targs" }, truncate(content, 160)),
         lines > 1 ? h("span", { class: "tstat" }, lines + " lines") : null),
       payload(content));
+    if (!refs.length) return chip;
+    return h("div", null, chip, ...refs.map((id) =>
+      h("button", { class: "btn ghost small", type: "button", onclick: () => openArtifact(id) }, "Open full output")));
+  }
+  // Artifact ids in a tool result (mirrors formless_protocol::artifact_refs).
+  function artifactRefs(text) {
+    const ids = new Set();
+    for (const re of [/stored as artifact ([0-9a-f-]{36})/g, /"emitted_artifact":"([0-9a-f-]{36})"/g]) {
+      for (const m of text.matchAll(re)) ids.add(m[1]);
+    }
+    return [...ids];
+  }
+  // Stored outputs open over the protocol (GetArtifact), never by path.
+  async function openArtifact(id) {
+    const first = await act({ type: "get_artifact", id, offset: 0 });
+    if (!first) return;
+    let text = first.text;
+    let end = first.end;
+    const pre = h("pre", { class: "diff artifact-text" }, text);
+    const more = h("button", { class: "btn small", type: "button" }, "Load more");
+    const status = h("span", { class: "muted" });
+    const sync = () => {
+      status.textContent = end + " of " + first.total_chars + " characters";
+      more.hidden = end >= first.total_chars;
+    };
+    more.onclick = async () => {
+      const r = await act({ type: "get_artifact", id, offset: end });
+      if (!r) return;
+      text += r.text;
+      end = r.end;
+      pre.textContent = text;
+      sync();
+    };
+    const download = h("button", { class: "btn small", type: "button", onclick: async () => {
+      while (end < first.total_chars) {
+        const r = await act({ type: "get_artifact", id, offset: end, length: 1000000 });
+        if (!r) return;
+        text += r.text;
+        end = r.end;
+      }
+      pre.textContent = text;
+      sync();
+      const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain" })), download: "artifact-" + id.slice(0, 8) + ".txt" });
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    } }, "Download");
+    const close = h("button", { class: "btn small primary", type: "button" }, "Close");
+    const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true" },
+      h("div", { class: "modal viewer" },
+        h("h2", null, "Output " + id.slice(0, 8) + " · " + first.bytes + " bytes"),
+        pre,
+        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), more, download, close)));
+    close.onclick = () => viewer.remove();
+    viewer.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); viewer.remove(); } });
+    document.body.append(viewer);
+    sync();
+    close.focus();
   }
 
   // Rendered message bodies by message id: the turn layout is rebuilt on
