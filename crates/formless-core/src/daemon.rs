@@ -420,40 +420,9 @@ impl Daemon {
             Request::AddMcpServer { name, server } => {
                 let server: crate::config::McpServerCfg =
                     serde_json::from_value(server).context("invalid MCP server config")?;
-                if name.is_empty()
-                    || name.contains("__")
-                    || !name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                {
-                    return Err(anyhow!(
-                        "MCP server names use letters, digits, '-' and '_' (no '__')"
-                    ));
-                }
-                let mut cfg = self.config()?;
-                cfg.mcp.servers.insert(name.clone(), server);
-                cfg.save(&self.paths)?;
-                let _ = self.with_store(|st| st.audit("user", "mcp.add", &name));
-                self.mcp.stop(&name).await;
-                let tools = self.sync_mcp_server(&cfg, &name).await;
-                self.mcp
-                    .set_error(&name, tools.as_ref().err().map(|e| format!("{e:#}")));
-                self.broadcast(Event::McpServersChanged);
-                Ok(json!({"added": name, "tools": tools.ok(), "error": self.mcp.last_error(&name)}))
+                self.add_mcp_server(&name, server, "user").await
             }
-            Request::RemoveMcpServer { name } => {
-                let mut cfg = self.config()?;
-                if cfg.mcp.servers.remove(&name).is_none() {
-                    return Err(anyhow!("no MCP server '{name}'"));
-                }
-                cfg.save(&self.paths)?;
-                self.mcp.stop(&name).await;
-                // Its tools stay in the registry, retired (metrics are kept).
-                let retired = self.with_store(|st| crate::mcp::sync_registry(st, &name, &[]))?;
-                let _ = self.with_store(|st| st.audit("user", "mcp.remove", &name));
-                self.broadcast(Event::McpServersChanged);
-                Ok(json!({"removed": name, "retired_tools": retired}))
-            }
+            Request::RemoveMcpServer { name } => self.remove_mcp_server(&name, "user").await,
             Request::RestartMcpServer { name } => {
                 let cfg = self.config()?;
                 self.mcp.stop(&name).await;
@@ -1452,6 +1421,31 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: find_tools failed: {e}"),
             },
+            toolreg::ADD_MCP_SERVER => self.agent_add_mcp_server(session_id, &args, cancel).await,
+            toolreg::REMOVE_MCP_SERVER => {
+                let name = args["name"].as_str().unwrap_or_default().to_string();
+                let reason = args["reason"].as_str().unwrap_or("(none given)");
+                let approved = self
+                    .ask_user_approval(
+                        session_id,
+                        "remove_mcp_server",
+                        vec![format!("remove MCP server '{name}'")],
+                        format!(
+                            "The agent wants to remove the MCP server '{name}'.\nReason: {reason}"
+                        ),
+                        cancel,
+                    )
+                    .await;
+                if !approved {
+                    let _ = self.with_store(|st| st.audit("agent", "mcp.remove.denied", &name));
+                    "error: the user did not approve removing this MCP server".to_string()
+                } else {
+                    match self.remove_mcp_server(&name, "agent").await {
+                        Ok(v) => v.to_string(),
+                        Err(e) => format!("error: {e}"),
+                    }
+                }
+            }
             toolreg::READ_ARTIFACT => match self.read_artifact_impl(session_id, &args) {
                 Ok(text) => text,
                 Err(e) => format!("error: read_artifact failed: {e}"),
@@ -2319,6 +2313,69 @@ impl Daemon {
         Ok(notes)
     }
 
+    /// The `add_mcp_server` built-in: the user approves the exact command
+    /// or URL (and env keys) first; headless, it fails closed.
+    async fn agent_add_mcp_server(
+        &self,
+        session_id: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> String {
+        let name = args["name"].as_str().unwrap_or_default().to_string();
+        let reason = args["reason"].as_str().unwrap_or("(none given)");
+        let strings = |k: &str| -> Vec<String> {
+            args[k]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        let http = args["transport"].as_str() == Some("http");
+        let server = crate::config::McpServerCfg {
+            transport: if http { "http" } else { "stdio" }.into(),
+            command: args["command"].as_str().unwrap_or_default().into(),
+            args: strings("args"),
+            url: args["url"].as_str().unwrap_or_default().into(),
+            env_keys: strings("env_keys"),
+            ..Default::default()
+        };
+        let target = if http {
+            format!("url: {}", server.url)
+        } else {
+            format!(
+                "command: {}",
+                std::iter::once(server.command.clone())
+                    .chain(server.args.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let mut items = vec![target.clone()];
+        if !server.env_keys.is_empty() {
+            items.push(format!("env: {}", server.env_keys.join(", ")));
+        }
+        let approved = self
+            .ask_user_approval(
+                session_id,
+                "add_mcp_server",
+                items,
+                format!(
+                    "The agent wants to add the MCP server '{name}'.\n{target}\nReason: {reason}"
+                ),
+                cancel,
+            )
+            .await;
+        if !approved {
+            let _ = self.with_store(|st| st.audit("agent", "mcp.add.denied", &name));
+            return "error: the user did not approve adding this MCP server".into();
+        }
+        match self.add_mcp_server(&name, server, "agent").await {
+            Ok(v) => v.to_string(),
+            Err(e) => format!("error: {e}"),
+        }
+    }
+
     /// A slice (or grep) of one of this Session's artifacts (SPEC §9.6).
     fn read_artifact_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let id = args["id"].as_str().context("id required")?;
@@ -2610,6 +2667,7 @@ impl Daemon {
             version: ver.version,
             capabilities: caps.to_specs(),
             memory_mb: ver.memory_mb,
+            detail: None,
         });
         let (approved, scope) = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
@@ -3228,6 +3286,86 @@ impl Daemon {
             }
             self.mcp.reap_idle(cfg.mcp.idle_secs).await;
         }
+    }
+
+    /// Add (or replace) an MCP server and list its tools in at once.
+    pub(crate) async fn add_mcp_server(
+        &self,
+        name: &str,
+        server: crate::config::McpServerCfg,
+        actor: &str,
+    ) -> Result<Value> {
+        if name.is_empty()
+            || name.contains("__")
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(anyhow!(
+                "MCP server names use letters, digits, '-' and '_' (no '__')"
+            ));
+        }
+        let mut cfg = self.config()?;
+        cfg.mcp.servers.insert(name.to_string(), server);
+        cfg.save(&self.paths)?;
+        let _ = self.with_store(|st| st.audit(actor, "mcp.add", name));
+        self.mcp.stop(name).await;
+        let tools = self.sync_mcp_server(&cfg, name).await;
+        self.mcp
+            .set_error(name, tools.as_ref().err().map(|e| format!("{e:#}")));
+        self.broadcast(Event::McpServersChanged);
+        Ok(json!({"added": name, "tools": tools.ok(), "error": self.mcp.last_error(name)}))
+    }
+
+    /// Remove an MCP server; its tools are retired (metrics kept).
+    pub(crate) async fn remove_mcp_server(&self, name: &str, actor: &str) -> Result<Value> {
+        let mut cfg = self.config()?;
+        if cfg.mcp.servers.remove(name).is_none() {
+            return Err(anyhow!("no MCP server '{name}'"));
+        }
+        cfg.save(&self.paths)?;
+        self.mcp.stop(name).await;
+        let retired = self.with_store(|st| crate::mcp::sync_registry(st, name, &[]))?;
+        let _ = self.with_store(|st| st.audit(actor, "mcp.remove", name));
+        self.broadcast(Event::McpServersChanged);
+        Ok(json!({"removed": name, "retired_tools": retired}))
+    }
+
+    /// Ask the user to approve something that is not a Tool call (SPEC
+    /// §10.3): same modal and fail-closed rule, with `detail` spelling out
+    /// exactly what would happen. Nothing is remembered.
+    async fn ask_user_approval(
+        &self,
+        session_id: &str,
+        what: &str,
+        items: Vec<String>,
+        detail: String,
+        cancel: &CancellationToken,
+    ) -> bool {
+        if self.subscriber_count() == 0 {
+            return false;
+        }
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel::<(bool, ApprovalScope)>();
+        self.approvals
+            .lock()
+            .unwrap()
+            .insert(approval_id.clone(), tx);
+        self.broadcast(Event::ApprovalRequested {
+            approval_id: approval_id.clone(),
+            session_id: session_id.to_string(),
+            tool_name: what.to_string(),
+            version: 0,
+            capabilities: items,
+            memory_mb: 0,
+            detail: Some(detail),
+        });
+        let approved = tokio::select! {
+            _ = cancel.cancelled() => false,
+            r = rx => r.map(|(ok, _)| ok).unwrap_or(false),
+        };
+        self.approvals.lock().unwrap().remove(&approval_id);
+        approved
     }
 
     /// Configured MCP servers with their live state.

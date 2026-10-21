@@ -21,7 +21,9 @@ pub const TEST_TOOL: &str = "test_tool";
 pub const UNLOAD_TOOLS: &str = "unload_tools";
 pub const READ_MODULE: &str = "read_module";
 pub const READ_ARTIFACT: &str = "read_artifact";
-pub const RESERVED: [&str; 13] = [
+pub const ADD_MCP_SERVER: &str = "add_mcp_server";
+pub const REMOVE_MCP_SERVER: &str = "remove_mcp_server";
+pub const RESERVED: [&str; 15] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -35,6 +37,8 @@ pub const RESERVED: [&str; 13] = [
     UNLOAD_TOOLS,
     READ_MODULE,
     READ_ARTIFACT,
+    ADD_MCP_SERVER,
+    REMOVE_MCP_SERVER,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -275,6 +279,44 @@ fn read_artifact_definition() -> Value {
                     "grep": {"type": "string", "description": "Return only lines containing this text (case-insensitive), up to 200"}
                 },
                 "required": ["id"]
+            }
+        }
+    })
+}
+
+fn add_mcp_server_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": ADD_MCP_SERVER,
+            "description": "Ask the user to connect an external MCP server, whose tools then become available (find them with find_tools). The user sees the exact command or URL, env keys and your reason, and must approve.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short server name: letters, digits, '-' or '_'"},
+                    "transport": {"type": "string", "enum": ["stdio", "http"]},
+                    "command": {"type": "string", "description": "stdio: program to run"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "url": {"type": "string", "description": "http: server URL"},
+                    "env_keys": {"type": "array", "items": {"type": "string"}, "description": "stdio: environment variables the server needs"},
+                    "reason": {"type": "string", "description": "Why this server is needed, shown to the user"}
+                },
+                "required": ["name", "transport", "reason"]
+            }
+        }
+    })
+}
+
+fn remove_mcp_server_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": REMOVE_MCP_SERVER,
+            "description": "Ask the user to disconnect an MCP server (its tools are retired). Requires approval.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "reason": {"type": "string"}},
+                "required": ["name", "reason"]
             }
         }
     })
@@ -580,6 +622,8 @@ pub fn tool_definitions(
         unload_tools_definition(),
         read_module_definition(),
         read_artifact_definition(),
+        add_mcp_server_definition(),
+        remove_mcp_server_definition(),
         test_tool_definition(),
         pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
         pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),

@@ -1107,3 +1107,26 @@ async fn read_tool_and_protocol_return_version_diffs() {
         .unwrap();
     assert_eq!(r["diff"], diff);
 }
+
+/// With nobody to approve, an agent cannot add or remove MCP servers.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_mcp_server_changes_fail_closed_headless() {
+    let paths = temp_paths("mcpheadless");
+    Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let out = daemon
+        .call_tool_direct(
+            &session,
+            "add_mcp_server",
+            json!({"name": "x", "transport": "stdio", "command": "evil", "reason": "r"}),
+        )
+        .await;
+    assert!(out.contains("did not approve"), "{out}");
+    assert!(Config::load(&paths).unwrap().mcp.servers.is_empty());
+    assert!(
+        toolreg::validate_name("add_mcp_server").is_err(),
+        "reserved"
+    );
+}

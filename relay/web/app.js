@@ -1041,13 +1041,15 @@
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
     body.replaceChildren(h("div", null,
-      h("p", null, "Tool ", h("strong", null, req.tool_name), req.version ? " v" + req.version : "",
-        promo ? " is ready to be promoted." : " wants sensitive capabilities:"),
+      req.detail
+        ? h("p", { class: "detail-text" }, req.detail)
+        : h("p", null, "Tool ", h("strong", null, req.tool_name), req.version ? " v" + req.version : "",
+          promo ? " is ready to be promoted." : " wants sensitive capabilities:"),
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
       h("ul", null,
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " unscoped — broad access") : null)),
-        h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
+        req.detail ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
@@ -1634,7 +1636,7 @@
         }
         break;
       case "approval_requested":
-        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb });
+        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null });
         if (here) setActivity("awaiting your approval");
         renderApproval();
         break;
