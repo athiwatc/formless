@@ -278,6 +278,16 @@ impl Daemon {
                 };
                 Ok(json!({"abandoned": abandoned}))
             }
+            Request::ListSubagents { session_id } => Ok(serde_json::to_value(
+                self.with_store(|st| st.list_subagents(&session_id))?,
+            )?),
+            Request::GetSubagent { id } => {
+                let (info, messages) = self.with_store(|st| {
+                    let info = st.get_subagent(&id)?.context("sub-agent not found")?;
+                    Ok((info, st.subagent_messages(&id)?))
+                })?;
+                Ok(json!({"subagent": info, "messages": messages}))
+            }
             Request::CancelInvocation { handle } => {
                 let entry = self
                     .pending_get(&handle)
@@ -1817,60 +1827,102 @@ impl Daemon {
                 messages.push(json!({"role": "system", "content": sys}));
             }
             messages.push(json!({"role": "user", "content": task}));
+            // Visible and stored (not just a local Vec): clients see each
+            // step, and the transcript outlives the call.
+            let sub = self.with_store(|st| {
+                st.create_subagent(session_id, run_id, task, agent_depth as u32)
+            })?;
+            let sub_id = sub.id.clone();
+            for m in &messages {
+                let _ = self.with_store(|st| st.append_subagent_message(&sub_id, m));
+            }
+            self.broadcast(Event::SubagentStarted {
+                session_id: session_id.to_string(),
+                subagent: sub,
+            });
+            let record = |m: &Value| {
+                let _ = self.with_store(|st| st.append_subagent_message(&sub_id, m));
+            };
+            let mut step = 0i64;
             // No step limit (SPEC principle 3): it ends on a final answer,
             // a fault, or cancellation.
-            loop {
-                if cancel.is_cancelled() {
-                    return Err(anyhow!("interrupted"));
-                }
-                // Rebuilt each step: find_tools/create_tool load new Tools.
-                let defs = sub_defs()?;
-                let result = provider
-                    .chat_stream(
-                        &messages,
-                        &defs,
-                        &model,
-                        cfg.provider.reasoning_effort.as_deref(),
-                        cancel,
-                        |_, _| {},
-                    )
-                    .await?;
-                if result.tool_calls.is_empty() {
-                    return Ok(result.content);
-                }
-                let calls_json: Vec<Value> = result
-                    .tool_calls
-                    .iter()
-                    .map(|c| {
-                        json!({"id": c.id, "type": "function",
-                           "function": {"name": c.name, "arguments": c.arguments}})
-                    })
-                    .collect();
-                let mut assistant =
-                    json!({"role": "assistant", "content": Value::Null, "tool_calls": calls_json});
-                if !result.reasoning.is_empty() {
-                    assistant["reasoning_content"] = json!(result.reasoning);
-                }
-                messages.push(assistant);
-                let denied = self
-                    .approve_calls(cfg, session_id, run_id, &result.tool_calls, cancel)
-                    .await?;
-                for tc in &result.tool_calls {
-                    let text = self
-                        .dispatch_call_inner(
-                            session_id,
-                            run_id,
-                            tc,
-                            cfg,
-                            cancel_flag,
+            let outcome: Result<String> = async {
+                loop {
+                    if cancel.is_cancelled() {
+                        return Err(anyhow!("interrupted"));
+                    }
+                    // Rebuilt each step: find_tools/create_tool load new Tools.
+                    let defs = sub_defs()?;
+                    let result = provider
+                        .chat_stream(
+                            &messages,
+                            &defs,
+                            &model,
+                            cfg.provider.reasoning_effort.as_deref(),
                             cancel,
-                            &denied,
-                            agent_depth,
+                            |_, _| {},
                         )
-                        .await;
-                    messages.push(json!({"role": "tool", "tool_call_id": tc.id, "content": text}));
+                        .await?;
+                    step += 1;
+                    let _ = self.with_store(|st| st.set_subagent_steps(&sub_id, step));
+                    self.broadcast(Event::SubagentStep {
+                        session_id: session_id.to_string(),
+                        subagent_id: sub_id.clone(),
+                        step,
+                        tool_calls: result.tool_calls.iter().map(|c| c.name.clone()).collect(),
+                    });
+                    if result.tool_calls.is_empty() {
+                        record(&json!({"role": "assistant", "content": result.content}));
+                        return Ok(result.content);
+                    }
+                    let calls_json: Vec<Value> = result
+                        .tool_calls
+                        .iter()
+                        .map(|c| {
+                            json!({"id": c.id, "type": "function",
+                               "function": {"name": c.name, "arguments": c.arguments}})
+                        })
+                        .collect();
+                    let mut assistant = json!({"role": "assistant", "content": Value::Null, "tool_calls": calls_json});
+                    if !result.reasoning.is_empty() {
+                        assistant["reasoning_content"] = json!(result.reasoning);
+                    }
+                    record(&assistant);
+                    messages.push(assistant);
+                    let denied = self
+                        .approve_calls(cfg, session_id, run_id, &result.tool_calls, cancel)
+                        .await?;
+                    for tc in &result.tool_calls {
+                        let text = self
+                            .dispatch_call_inner(
+                                session_id,
+                                run_id,
+                                tc,
+                                cfg,
+                                cancel_flag,
+                                cancel,
+                                &denied,
+                                agent_depth,
+                            )
+                            .await;
+                        let msg = json!({"role": "tool", "tool_call_id": tc.id, "content": text});
+                        record(&msg);
+                        messages.push(msg);
+                    }
                 }
             }
+            .await;
+            let (status, result) = match &outcome {
+                Ok(text) => ("completed", text.clone()),
+                Err(e) => ("failed", e.to_string()),
+            };
+            if let Ok(sub) = self.with_store(|st| st.finish_subagent(&sub_id, status, &result)) {
+                self.broadcast(Event::SubagentFinished {
+                    session_id: session_id.to_string(),
+                    subagent: sub,
+                });
+            }
+            outcome
         })
     }
 

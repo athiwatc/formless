@@ -123,6 +123,8 @@ enum Pending {
     ExportSession,
     /// Resume/abandon: the answer is a note (errors already are).
     RunControl,
+    ListSubagents,
+    GetSubagent,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -283,6 +285,23 @@ struct LiveToolCall {
     stalled_secs: Option<u64>,
 }
 
+/// One line of a sub-agent transcript (provider-shaped message).
+fn subagent_line(m: &serde_json::Value) -> String {
+    let role = m["role"].as_str().unwrap_or("?");
+    let text = match m["tool_calls"].as_array() {
+        Some(calls) => format!(
+            "calls {}",
+            calls
+                .iter()
+                .filter_map(|c| c["function"]["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => m["content"].as_str().unwrap_or_default().replace('\n', " "),
+    };
+    format!("  [{role}] {}", truncate_chars(&text, 120))
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     if flat.chars().count() <= max {
@@ -348,6 +367,8 @@ struct App {
     purge_arm: Option<String>,
     /// Session id armed for deletion by a first `d` press.
     delete_arm: Option<String>,
+    /// The current Session's sub-agents, as last listed by `/agents`.
+    subagents: Vec<SubagentInfo>,
     import_mode: Option<ImportKind>,
     renaming: bool,
     modules: Vec<ModuleInfo>,
@@ -430,6 +451,7 @@ impl App {
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,
+            subagents: Vec::new(),
             import_mode: None,
             renaming: false,
             modules: Vec::new(),
@@ -587,6 +609,40 @@ impl App {
                             if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
                                 self.tool_detail = Some(d);
                             }
+                        }
+                        Pending::ListSubagents => {
+                            self.subagents = serde_json::from_value(result).unwrap_or_default();
+                            if self.subagents.is_empty() {
+                                self.notes.push("no sub-agents in this session".into());
+                            }
+                            let lines: Vec<String> = self
+                                .subagents
+                                .iter()
+                                .enumerate()
+                                .map(|(i, a)| {
+                                    format!(
+                                        "#{} {} · {} step(s) · {}",
+                                        i + 1,
+                                        a.status,
+                                        a.steps,
+                                        truncate_chars(&a.task, 70)
+                                    )
+                                })
+                                .collect();
+                            self.notes.extend(lines);
+                            if !self.subagents.is_empty() {
+                                self.notes
+                                    .push("/agents <n> shows that sub-agent's transcript".into());
+                            }
+                        }
+                        Pending::GetSubagent => {
+                            let lines: Vec<String> = result["messages"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(subagent_line)
+                                .collect();
+                            self.notes.extend(lines);
                         }
                         Pending::RunControl => match result["abandoned"].as_bool() {
                             Some(true) => self.notes.push("abandoned the interrupted run".into()),
@@ -982,6 +1038,42 @@ impl App {
                     ));
                 }
             }
+            Event::SubagentStarted {
+                session_id,
+                subagent,
+            } => {
+                if self.is_current(&session_id) {
+                    self.notes.push(format!(
+                        "sub-agent started: {}",
+                        truncate_chars(&subagent.task, 80)
+                    ));
+                }
+            }
+            Event::SubagentStep {
+                session_id,
+                step,
+                tool_calls,
+                ..
+            } => {
+                if self.is_current(&session_id) {
+                    self.set_activity(if tool_calls.is_empty() {
+                        format!("sub-agent step {step}: answering")
+                    } else {
+                        format!("sub-agent step {step}: {}", tool_calls.join(", "))
+                    });
+                }
+            }
+            Event::SubagentFinished {
+                session_id,
+                subagent,
+            } => {
+                if self.is_current(&session_id) {
+                    self.notes.push(format!(
+                        "sub-agent {} after {} step(s) · /agents to inspect",
+                        subagent.status, subagent.steps
+                    ));
+                }
+            }
             Event::InvocationActivity { handle, .. } => {
                 for call in &mut self.live_tools {
                     if call.handle.as_deref() == Some(&handle) {
@@ -1212,6 +1304,26 @@ impl App {
                     if self.show_thinking { "on" } else { "off" }
                 ));
             }
+            "agents" => {
+                if let Some(session_id) = self.current.clone() {
+                    self.request(Pending::ListSubagents, Request::ListSubagents { session_id });
+                }
+            }
+            cmd if cmd.starts_with("agents ") => {
+                let picked = cmd[7..]
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| self.subagents.get(i))
+                    .map(|a| a.id.clone());
+                match picked {
+                    Some(id) => self.request(Pending::GetSubagent, Request::GetSubagent { id }),
+                    None => self
+                        .notes
+                        .push("usage: /agents to list, then /agents <n>".into()),
+                }
+            }
             "cancel" => {
                 let handle = self
                     .live_tools
@@ -1248,7 +1360,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -3322,6 +3434,7 @@ mod tests {
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,
+            subagents: Vec::new(),
             import_mode: None,
             renaming: false,
             modules: Vec::new(),
