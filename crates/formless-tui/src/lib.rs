@@ -340,6 +340,8 @@ struct App {
     approvals: std::collections::VecDeque<ApprovalReq>,
     promotions: std::collections::VecDeque<ApprovalReq>,
     purge_arm: Option<String>,
+    /// Session id armed for deletion by a first `d` press.
+    delete_arm: Option<String>,
     import_mode: Option<ImportKind>,
     renaming: bool,
     modules: Vec<ModuleInfo>,
@@ -421,6 +423,7 @@ impl App {
             approvals: std::collections::VecDeque::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
+            delete_arm: None,
             import_mode: None,
             renaming: false,
             modules: Vec::new(),
@@ -1472,6 +1475,11 @@ impl App {
                 KeyCode::Esc => self.view = View::Chat,
                 _ => {}
             },
+            View::Sessions
+                if key.code != KeyCode::Char('d') && self.delete_arm.take().is_some() =>
+            {
+                self.notes.push("delete cancelled".into());
+            }
             View::Sessions => match key.code {
                 KeyCode::Up => self.session_idx = self.session_idx.saturating_sub(1),
                 KeyCode::Down => {
@@ -1503,8 +1511,17 @@ impl App {
                 }
                 KeyCode::Char('d') => {
                     if let Some(s) = self.sessions.get(self.session_idx).cloned() {
-                        self.fire(Request::DeleteSession { id: s.id });
-                        self.request(Pending::ListSessions, Request::ListSessions);
+                        if self.delete_arm.as_deref() == Some(&s.id) {
+                            self.delete_arm = None;
+                            self.fire(Request::DeleteSession { id: s.id });
+                            self.request(Pending::ListSessions, Request::ListSessions);
+                        } else {
+                            self.notes.push(format!(
+                                "press d again to DELETE session {} and its transcript",
+                                s.name
+                            ));
+                            self.delete_arm = Some(s.id);
+                        }
                     }
                 }
                 KeyCode::Char('e') => {
@@ -2744,7 +2761,11 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
             " y ",
             bold_fg(color, Color::Green).add_modifier(Modifier::REVERSED),
         ),
-        Span::raw(if promotion { " approve    " } else { " always    " }),
+        Span::raw(if promotion {
+            " approve    "
+        } else {
+            " always    "
+        }),
     ];
     if !promotion {
         keys.push(Span::styled(
@@ -3177,6 +3198,7 @@ mod tests {
             approvals: std::collections::VecDeque::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
+            delete_arm: None,
             import_mode: None,
             renaming: false,
             modules: Vec::new(),
@@ -3525,6 +3547,33 @@ mod tests {
         assert!(app.streaming.is_empty() && app.thinking.is_empty());
         delta(&mut app, "step two");
         assert_eq!(app.streaming, "step two");
+    }
+
+    #[test]
+    fn deleting_a_session_needs_a_second_press() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = vec![SessionInfo {
+            id: "s1".into(),
+            name: "notes".into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }];
+        app.key(key(KeyCode::Char('d')));
+        assert_eq!(app.delete_arm.as_deref(), Some("s1"));
+        assert!(app.notes.last().unwrap().contains("press d again"));
+        // Any other key disarms; the next `d` arms again instead of deleting.
+        app.key(key(KeyCode::Down));
+        assert!(app.delete_arm.is_none());
+        app.key(key(KeyCode::Char('d')));
+        assert_eq!(app.delete_arm.as_deref(), Some("s1"));
+        // The second press fires the delete (no client here) and disarms.
+        app.key(key(KeyCode::Char('d')));
+        assert!(app.delete_arm.is_none());
+        assert!(!app.notes.last().unwrap().contains("cancelled"));
     }
 
     #[test]

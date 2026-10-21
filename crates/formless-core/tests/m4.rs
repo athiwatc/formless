@@ -672,3 +672,74 @@ async fn untitled_session_is_auto_named_after_first_run_but_user_names_stick() {
     let store = Store::open(&paths.db_file()).unwrap();
     assert_eq!(store.get_session(&mine.id).unwrap().unwrap().name, "Mine");
 }
+
+/// Deleting a Session interrupts its Run first, so nothing keeps writing to
+/// (or calling the provider for) a deleted Session.
+#[cfg(unix)]
+#[tokio::test]
+async fn deleting_a_session_interrupts_its_run_first() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4del");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|| async {
+                // A provider that never answers in time.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                sse_text("too late")
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "hello".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut deleted_sent = false;
+    let mut finished = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let line = tokio::time::timeout_at(deadline, c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) else {
+            continue;
+        };
+        match ev {
+            Event::RunStarted { .. } if !deleted_sent => {
+                deleted_sent = true;
+                c.send(Request::DeleteSession { id: sid.clone() }).await;
+            }
+            Event::RunFinished { status, .. } => finished = Some(status),
+            Event::SessionDeleted { id } if id == sid => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        finished.as_deref(),
+        Some("interrupted"),
+        "run stopped before delete"
+    );
+    let list = c.rpc(Request::ListSessions).await;
+    assert!(!list.to_string().contains(&sid));
+    server.abort();
+}

@@ -156,6 +156,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::DeleteSession { id } => {
+                self.stop_session_work(&id).await;
                 let existed = self.with_store(|st| st.delete_session(&id))?;
                 if existed {
                     self.broadcast(Event::SessionDeleted { id: id.clone() });
@@ -463,6 +464,30 @@ impl Daemon {
                 Ok(json!({"resolved": resolved}))
             }
         }
+    }
+
+    /// Stop everything still working on a Session before it is deleted:
+    /// drop its queued messages, interrupt its Run (and wait for it to
+    /// finish writing), and abandon its background invocations.
+    async fn stop_session_work(&self, session_id: &str) {
+        self.queued.lock().await.remove(session_id);
+        if let Some(ctl) = self.runs.lock().unwrap().get(session_id) {
+            ctl.cancel_flag.store(true, Ordering::SeqCst);
+            ctl.cancel.cancel();
+        }
+        for entry in self.pending.lock().unwrap().values() {
+            if entry.session_id == session_id {
+                entry.abandoned.store(true, Ordering::SeqCst);
+                entry.notify.notify_waiters();
+            }
+        }
+        for _ in 0..100 {
+            if !self.runs.lock().unwrap().contains_key(session_id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tracing::warn!("run for deleted session {session_id} did not stop within 5s");
     }
 
     async fn send_message(
