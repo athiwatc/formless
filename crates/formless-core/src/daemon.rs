@@ -295,6 +295,8 @@ impl Daemon {
             }
             Request::DeleteSession { id } => {
                 self.stop_session_work(&id).await;
+                // Stored outputs go with their Session (SPEC §15).
+                self.with_store(|st| crate::artifacts::remove_for_session(st, &id))?;
                 let existed = self.with_store(|st| st.delete_session(&id))?;
                 self.contexts.lock().unwrap().remove(&id);
                 if existed {
@@ -2903,6 +2905,22 @@ impl Daemon {
 
     /// A detached daemon writes its stdout/stderr to `daemon.log`; keep
     /// that file within `daemon.log_max_bytes` (SPEC §9.4).
+    /// Apply artifact retention at start and then hourly.
+    async fn artifact_gc_loop(self: Arc<Self>) {
+        loop {
+            if let Ok(cfg) = self.config() {
+                match self.with_store(|st| crate::artifacts::gc(st, &cfg.artifacts)) {
+                    Ok(c) if c.files > 0 => {
+                        tracing::info!("removed {} artifact(s), {} bytes", c.files, c.bytes)
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("artifact retention: {e}"),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    }
+
     async fn log_rotator(self: Arc<Self>) {
         if std::env::var_os(crate::logs::DAEMON_LOG_ENV).is_none() {
             return;
@@ -3013,8 +3031,13 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.log_rotator().await })
         };
+        let artifact_gc = {
+            let this = self.clone();
+            tokio::spawn(async move { this.artifact_gc_loop().await })
+        };
         let result = self.accept_loop().await;
         logs.abort();
+        artifact_gc.abort();
         relay.abort();
         optimiser.abort();
         watcher.abort();
