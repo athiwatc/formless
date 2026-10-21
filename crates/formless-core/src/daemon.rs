@@ -117,6 +117,14 @@ pub(crate) fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// What the MCP part of an approval decided.
+enum McpApproval {
+    Denied,
+    Allowed,
+    /// Continue with the per-tool approval, showing this detail.
+    AskTool(String),
+}
+
 /// Answers a waiting approval: (approved, scope).
 type ApprovalReply = oneshot::Sender<(bool, ApprovalScope)>;
 
@@ -1326,14 +1334,14 @@ impl Daemon {
             }
             if let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? {
                 // Unbindable input fails at execution with a clear error.
-                let Ok(caps) = serde_json::from_str::<Value>(&tc.arguments)
-                    .map_err(|e| e.to_string())
-                    .and_then(|input| bound_caps(&ver, &input))
-                else {
+                let Ok(input) = serde_json::from_str::<Value>(&tc.arguments) else {
+                    continue;
+                };
+                let Ok(caps) = bound_caps(&ver, &input) else {
                     continue;
                 };
                 if !self
-                    .ensure_approval(cfg, session_id, &info, &ver, &caps, cancel)
+                    .ensure_approval(cfg, session_id, &info, &ver, &caps, Some(&input), cancel)
                     .await
                 {
                     denied.insert(tc.id.clone(), true);
@@ -1425,7 +1433,7 @@ impl Daemon {
             toolreg::REMOVE_MCP_SERVER => {
                 let name = args["name"].as_str().unwrap_or_default().to_string();
                 let reason = args["reason"].as_str().unwrap_or("(none given)");
-                let approved = self
+                let (approved, _) = self
                     .ask_user_approval(
                         session_id,
                         "remove_mcp_server",
@@ -2355,7 +2363,7 @@ impl Daemon {
         if !server.env_keys.is_empty() {
             items.push(format!("env: {}", server.env_keys.join(", ")));
         }
-        let approved = self
+        let (approved, _) = self
             .ask_user_approval(
                 session_id,
                 "add_mcp_server",
@@ -2554,7 +2562,7 @@ impl Daemon {
             code: d.code.clone(),
         };
         if !self
-            .ensure_approval(cfg, session_id, &info, &ver, &caps, cancel)
+            .ensure_approval(cfg, session_id, &info, &ver, &caps, None, cancel)
             .await
         {
             return Ok(
@@ -2628,6 +2636,7 @@ impl Daemon {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_approval(
         self: &Arc<Self>,
         cfg: &Config,
@@ -2635,11 +2644,23 @@ impl Daemon {
         info: &ToolInfo,
         ver: &ToolVersionInfo,
         caps: &Capabilities,
+        input: Option<&Value>,
         cancel: &CancellationToken,
     ) -> bool {
         let needs = caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb;
         if !needs {
             return true;
+        }
+        let mut detail = None;
+        if let Some(server) = caps.mcp.first() {
+            match self
+                .mcp_preapproval(cfg, session_id, server, info, ver, input, cancel)
+                .await
+            {
+                McpApproval::Denied => return false,
+                McpApproval::Allowed => return true,
+                McpApproval::AskTool(d) => detail = Some(d),
+            }
         }
         let prior = self
             .with_store(|st| st.get_approval(&info.id))
@@ -2667,7 +2688,7 @@ impl Daemon {
             version: ver.version,
             capabilities: caps.to_specs(),
             memory_mb: ver.memory_mb,
-            detail: None,
+            detail,
         });
         let (approved, scope) = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
@@ -2898,7 +2919,7 @@ impl Daemon {
             };
             if !preapproved
                 && !self
-                    .ensure_approval(&cfg, &session_id, &info, &ver, &caps, &cancel)
+                    .ensure_approval(&cfg, &session_id, &info, &ver, &caps, Some(&input), &cancel)
                     .await
             {
                 self.record_inv(
@@ -2948,7 +2969,10 @@ impl Daemon {
                     .call(&self.paths, &cfg.mcp, &server, &tool, input.clone());
                 let outcome = tokio::select! {
                     _ = cancel.cancelled() => Err("interrupted".to_string()),
-                    r = call => r.map_err(|e| e.to_string()).and_then(|v| crate::mcp::call_result(&v)),
+                    r = call => r
+                        .map_err(|e| e.to_string())
+                        .and_then(|v| crate::mcp::call_result(&v))
+                        .map(|v| crate::mcp::untrusted(&server, v)),
                 };
                 let elapsed = dur(&started);
                 let ok = outcome.is_ok();
@@ -3341,9 +3365,9 @@ impl Daemon {
         items: Vec<String>,
         detail: String,
         cancel: &CancellationToken,
-    ) -> bool {
+    ) -> (bool, ApprovalScope) {
         if self.subscriber_count() == 0 {
-            return false;
+            return (false, ApprovalScope::Once);
         }
         let approval_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel::<(bool, ApprovalScope)>();
@@ -3360,12 +3384,82 @@ impl Daemon {
             memory_mb: 0,
             detail: Some(detail),
         });
-        let approved = tokio::select! {
-            _ = cancel.cancelled() => false,
-            r = rx => r.map(|(ok, _)| ok).unwrap_or(false),
+        let answer = tokio::select! {
+            _ = cancel.cancelled() => (false, ApprovalScope::Once),
+            r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.lock().unwrap().remove(&approval_id);
-        approved
+        answer
+    }
+
+    /// The MCP part of an approval (SPEC §7.9): the server is approved
+    /// once ("Always" remembers it); then read-only tools of a trusted
+    /// server run freely, and every other tool goes through the normal
+    /// per-tool approval with its annotations and input spelled out.
+    #[allow(clippy::too_many_arguments)]
+    async fn mcp_preapproval(
+        &self,
+        cfg: &Config,
+        session_id: &str,
+        server: &str,
+        info: &ToolInfo,
+        ver: &ToolVersionInfo,
+        input: Option<&Value>,
+        cancel: &CancellationToken,
+    ) -> McpApproval {
+        let scfg = cfg.mcp.servers.get(server).cloned().unwrap_or_default();
+        let target = if scfg.transport == "http" {
+            format!("url: {}", scfg.url)
+        } else {
+            format!(
+                "command: {}",
+                std::iter::once(scfg.command.clone())
+                    .chain(scfg.args.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        if !self
+            .with_store(|st| st.mcp_server_approved(server))
+            .unwrap_or(false)
+        {
+            let (ok, scope) = self
+                .ask_user_approval(
+                    session_id,
+                    &format!("mcp:{server}"),
+                    vec![target.clone()],
+                    format!("Allow Formless to use the MCP server '{server}'?\n{target}"),
+                    cancel,
+                )
+                .await;
+            if !ok {
+                let _ = self.with_store(|st| st.audit("user", "mcp.server.deny", server));
+                return McpApproval::Denied;
+            }
+            if scope == ApprovalScope::Always {
+                let _ = self.with_store(|st| st.approve_mcp_server(server));
+                let _ = self.with_store(|st| st.audit("user", "mcp.server.approve", server));
+            }
+        }
+        let ann = crate::mcp::annotations(&ver.code);
+        let read_only = ann["readOnlyHint"].as_bool() == Some(true);
+        if read_only && scfg.trusted {
+            return McpApproval::Allowed;
+        }
+        let mut detail = format!(
+            "MCP tool {} on server '{server}' ({target})",
+            crate::mcp::server_tool_name(&ver.code).unwrap_or(&info.name)
+        );
+        if ann["destructiveHint"].as_bool() == Some(true) {
+            detail.push_str("\n⚠ The server marks this tool as destructive.");
+        } else if read_only {
+            detail.push_str("\nThe server marks this tool as read-only.");
+        }
+        if let Some(input) = input {
+            let shown: String = input.to_string().chars().take(400).collect();
+            detail.push_str(&format!("\ninput: {shown}"));
+        }
+        McpApproval::AskTool(detail)
     }
 
     /// Configured MCP servers with their live state.

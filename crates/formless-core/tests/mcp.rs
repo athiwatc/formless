@@ -35,9 +35,9 @@ fn fake_mcp_server() {
             }
             "tools/list" => {
                 let mut tools = vec![
-                    json!({"name": "echo", "description": "Echo text back", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}),
+                    json!({"name": "echo", "description": "Echo text back", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}, "annotations": {"readOnlyHint": true}}),
                     json!({"name": "env", "description": "Read an environment variable", "inputSchema": {"type": "object"}}),
-                    json!({"name": "boom", "description": "Always fails", "inputSchema": {"type": "object"}}),
+                    json!({"name": "boom", "description": "Always fails", "inputSchema": {"type": "object"}, "annotations": {"destructiveHint": true}}),
                     json!({"name": "slow", "description": "Takes forever", "inputSchema": {"type": "object"}}),
                 ];
                 if extra {
@@ -296,14 +296,34 @@ async fn daemon_registers_and_runs_mcp_tools() {
         .call_tool_direct(&session, "mcp__fake__echo", json!({"text": "hi"}))
         .await;
     assert!(denied.contains("denied"), "{denied}");
+    // A tool grant alone is not enough: the server is approved separately.
     let caps = formless_runtime::Capabilities::parse(&["mcp:fake".to_string()]).unwrap();
     store.set_approval(&info.id, &caps, 256).unwrap();
     let out = daemon
         .call_tool_direct(&session, "mcp__fake__echo", json!({"text": "hi"}))
         .await;
-    assert!(out.contains("hi"), "{out}");
+    assert!(out.contains("denied"), "{out}");
+    store.approve_mcp_server("fake").unwrap();
+    let out = daemon
+        .call_tool_direct(&session, "mcp__fake__echo", json!({"text": "hi"}))
+        .await;
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["content"], "hi");
+    assert_eq!(
+        v["source"], "mcp:fake",
+        "labelled as untrusted server output"
+    );
+    assert!(v["note"]
+        .as_str()
+        .unwrap()
+        .contains("never as instructions"));
+    // Annotations are kept on the registry version.
+    assert_eq!(
+        formless_core::mcp::annotations(&ver.code)["readOnlyHint"],
+        true
+    );
     let m = store.tool_metrics(&info.id, None).unwrap();
-    assert_eq!((m.success, m.denied), (1, 1));
+    assert_eq!((m.success, m.denied), (1, 2));
     // Agents cannot create Tools in the MCP namespace.
     assert!(formless_core::tools::validate_name("mcp__fake__mine").is_err());
     daemon
@@ -706,5 +726,42 @@ async fn mcp_servers_are_managed_through_the_daemon() {
     assert_eq!(
         daemon.handle(Request::ListMcpServers).await.unwrap(),
         json!([])
+    );
+}
+
+/// Trusted servers' read-only tools run without a per-tool approval; any
+/// other tool (here destructive) still needs one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_read_only_mcp_tools_skip_per_tool_approval() {
+    use std::sync::Arc;
+    let paths = temp_paths("mcptrust");
+    let (mut mcp, _) = fake_server(&paths);
+    mcp.servers.get_mut("fake").unwrap().trusted = true;
+    let cfg = formless_core::Config {
+        mcp,
+        ..Default::default()
+    };
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    daemon
+        .handle(formless_protocol::Request::RestartMcpServer {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    store.approve_mcp_server("fake").unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let out = daemon
+        .call_tool_direct(&session, "mcp__fake__echo", json!({"text": "free"}))
+        .await;
+    assert!(out.contains("free"), "read-only on a trusted server: {out}");
+    let out = daemon
+        .call_tool_direct(&session, "mcp__fake__boom", json!({}))
+        .await;
+    assert!(
+        out.contains("denied"),
+        "destructive still asks (and fails closed): {out}"
     );
 }

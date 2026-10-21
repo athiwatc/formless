@@ -61,6 +61,9 @@ pub struct McpServerCfg {
     /// http: a pre-registered OAuth client id, for servers that offer no
     /// dynamic client registration.
     pub oauth_client_id: Option<String>,
+    /// Trusted servers' tools annotated `readOnlyHint` run without a
+    /// per-tool approval (the server itself is still approved once).
+    pub trusted: bool,
 }
 
 /// Retention for stored Tool outputs (SPEC §9.6). 0 disables a limit.
