@@ -2901,6 +2901,31 @@ impl Daemon {
         writer.abort();
     }
 
+    /// A detached daemon writes its stdout/stderr to `daemon.log`; keep
+    /// that file within `daemon.log_max_bytes` (SPEC §9.4).
+    async fn log_rotator(self: Arc<Self>) {
+        if std::env::var_os(crate::logs::DAEMON_LOG_ENV).is_none() {
+            return;
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let Ok(cfg) = self.config() else { continue };
+            match crate::logs::rotate_if_needed(
+                &self.paths,
+                cfg.daemon.log_max_bytes,
+                cfg.daemon.log_keep,
+            ) {
+                Ok(true) => {
+                    if let Err(e) = crate::logs::reopen_stdio(&self.paths) {
+                        tracing::warn!("reopen daemon log after rotation: {e}");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("rotate daemon log: {e}"),
+            }
+        }
+    }
+
     async fn idle_watcher(self: Arc<Self>) {
         let mut idle_since: Option<tokio::time::Instant> = None;
         loop {
@@ -2984,7 +3009,12 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { crate::relay::relay_loop(this).await })
         };
+        let logs = {
+            let this = self.clone();
+            tokio::spawn(async move { this.log_rotator().await })
+        };
         let result = self.accept_loop().await;
+        logs.abort();
         relay.abort();
         optimiser.abort();
         watcher.abort();
@@ -3133,6 +3163,8 @@ pub fn spawn_daemon(paths: &Paths) -> Result<()> {
 
 fn spawn_daemon_child(paths: &Paths) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("locate formless binary")?;
+    let cfg = Config::load(paths).unwrap_or_default();
+    let _ = crate::logs::rotate_if_needed(paths, cfg.daemon.log_max_bytes, cfg.daemon.log_keep);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -3143,6 +3175,7 @@ fn spawn_daemon_child(paths: &Paths) -> Result<std::process::Child> {
         .arg("serve")
         .env("FORMLESS_DATA_DIR", &paths.data_dir)
         .env("FORMLESS_CONFIG_DIR", &paths.config_dir)
+        .env(crate::logs::DAEMON_LOG_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(log_err);

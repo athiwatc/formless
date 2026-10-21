@@ -577,6 +577,12 @@ fn doctor(paths: Paths) -> Result<()> {
     );
     let cfg = Config::load(&paths)?;
     println!(
+        "logs:       {:.1} MB (rotates at {:.1} MB, keeps {})",
+        formless_core::logs::log_usage(&paths) as f64 / 1e6,
+        cfg.daemon.log_max_bytes as f64 / 1e6,
+        cfg.daemon.log_keep
+    );
+    println!(
         "base_url:   {}",
         if cfg.provider.base_url.is_empty() {
             "(unset)"
