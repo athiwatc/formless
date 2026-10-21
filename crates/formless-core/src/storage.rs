@@ -227,7 +227,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -242,7 +242,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 14] = [
+const MIGRATIONS: [(i64, MigrationStep); 15] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -273,6 +273,11 @@ const MIGRATIONS: [(i64, MigrationStep); 14] = [
     (13, |c| add_column(c, "sessions", "system_prompt TEXT")),
     (14, |c| {
         add_column(c, "session_tools", "unload INTEGER NOT NULL DEFAULT 0")
+    }),
+    (15, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mcp_server_grants (server TEXT PRIMARY KEY, approved_at TEXT NOT NULL);",
+        )?)
     }),
 ];
 
@@ -1941,6 +1946,23 @@ impl Store {
         self.conn.execute(
             "INSERT INTO approvals(tool_id,capabilities,memory_mb,approved_at) VALUES(?1,?2,?3,?4) ON CONFLICT(tool_id) DO UPDATE SET capabilities=excluded.capabilities, memory_mb=excluded.memory_mb, approved_at=excluded.approved_at",
             params![tool_id, serde_json::to_string(&caps.to_specs())?, memory_mb, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the user has approved using this MCP server at all.
+    pub fn mcp_server_approved(&self, server: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mcp_server_grants WHERE server=?1)",
+            params![server],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn approve_mcp_server(&self, server: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO mcp_server_grants(server, approved_at) VALUES(?1, ?2)",
+            params![server, now()],
         )?;
         Ok(())
     }
