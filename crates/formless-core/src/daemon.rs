@@ -147,6 +147,8 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+    /// Hook commands the user approved this daemon lifetime (SPEC §9.8).
+    hook_approvals: StdMutex<std::collections::HashSet<String>>,
     /// Files attached to each Session's next user message (SPEC §5.6).
     attachments: StdMutex<HashMap<String, Vec<Value>>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
@@ -199,6 +201,7 @@ impl Daemon {
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
+            hook_approvals: StdMutex::new(Default::default()),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
@@ -1138,6 +1141,27 @@ impl Daemon {
         });
         self.maybe_name_session(&session_id);
         self.maybe_auto_skill(&session_id, &run_id, final_status);
+        // run_end hooks (SPEC §9.8): automation, results only logged.
+        if let Ok(cfg) = self.config() {
+            let hooks: Vec<_> = cfg
+                .hooks
+                .iter()
+                .filter(|h| h.event == "run_end")
+                .cloned()
+                .collect();
+            if !hooks.is_empty() {
+                let payload = json!({"event": "run_end", "session_id": session_id, "run_id": run_id, "status": final_status});
+                let cancel = CancellationToken::new();
+                for h in &hooks {
+                    let (ok, out) = self
+                        .run_hook(h, &payload, &session_id, &run_id, &cfg, &cancel)
+                        .await;
+                    if !ok {
+                        tracing::warn!("run_end hook failed: {out}");
+                    }
+                }
+            }
+        }
         // Queued messages start fresh Runs, in order (SPEC §5.3).
         let next = self
             .with_store(|st| st.pop_queued_message(&session_id))
@@ -1806,6 +1830,16 @@ impl Daemon {
                 );
             }
         };
+        // pre_tool hooks (SPEC §9.8) may deny the call; the reason goes
+        // back to the model.
+        if let Some(reason) = self
+            .run_tool_hooks(
+                "pre_tool", session_id, run_id, &tc.name, &args, None, cfg, cancel,
+            )
+            .await
+        {
+            return format!("error: denied by a pre_tool hook: {reason}");
+        }
         // Bootstrap/meta tools don't pass through execute_tool_value, so
         // broadcast their lifecycle here (registry Tools broadcast there).
         let bootstrap = toolreg::is_builtin(&tc.name);
@@ -2022,7 +2056,7 @@ impl Daemon {
                     session_id,
                     run_id,
                     name,
-                    args,
+                    args.clone(),
                     cfg,
                     cancel_flag,
                     cancel,
@@ -2050,7 +2084,130 @@ impl Daemon {
                 elapsed_ms,
             });
         }
+        if cfg.hooks.iter().any(|h| h.event == "post_tool") {
+            let result: String = text.chars().take(4000).collect();
+            self.run_tool_hooks(
+                "post_tool",
+                session_id,
+                run_id,
+                &tc.name,
+                &args,
+                Some(&result),
+                cfg,
+                cancel,
+            )
+            .await;
+        }
         text
+    }
+
+    /// Run the hooks for a Tool call event. Returns a deny reason when a
+    /// pre_tool hook refused the call.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_tool_hooks(
+        self: &Arc<Self>,
+        event: &str,
+        session_id: &str,
+        run_id: &str,
+        tool: &str,
+        args: &Value,
+        result: Option<&str>,
+        cfg: &Config,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
+        let hooks: Vec<&crate::config::HookCfg> =
+            cfg.hooks.iter().filter(|h| h.event == event).collect();
+        if hooks.is_empty() {
+            return None;
+        }
+        let caps = self
+            .with_store(|st| st.get_tool_by_name(tool))
+            .ok()
+            .flatten()
+            .map(|(_, v)| v.capabilities)
+            .unwrap_or_default();
+        let mut payload = json!({
+            "event": event, "tool": tool, "arguments": args,
+            "capabilities": caps, "session_id": session_id, "run_id": run_id,
+        });
+        if let Some(r) = result {
+            payload["result"] = json!(r);
+            payload["ok"] = json!(!r.starts_with("error:"));
+        }
+        for h in hooks {
+            if !crate::hooks::matches(h, tool, &caps) {
+                continue;
+            }
+            let (ok, out) = self
+                .run_hook(h, &payload, session_id, run_id, cfg, cancel)
+                .await;
+            if event == "pre_tool" && !ok {
+                let _ = self.with_store(|st| st.audit("hook", "tool.denied_by_hook", tool));
+                return Some(if out.is_empty() {
+                    "no reason given".into()
+                } else {
+                    out
+                });
+            }
+        }
+        None
+    }
+
+    /// Run one hook: (allowed/succeeded, its output or reason).
+    async fn run_hook(
+        self: &Arc<Self>,
+        h: &crate::config::HookCfg,
+        payload: &Value,
+        session_id: &str,
+        run_id: &str,
+        cfg: &Config,
+        cancel: &CancellationToken,
+    ) -> (bool, String) {
+        let timeout = std::time::Duration::from_secs(h.timeout_secs.unwrap_or(30).max(1));
+        if let Some(name) = &h.run_tool {
+            let fut = self.clone().execute_tool_value(
+                session_id.to_string(),
+                run_id.to_string(),
+                name.clone(),
+                payload.clone(),
+                1,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                cancel.clone(),
+                cfg.clone(),
+                false,
+            );
+            return match tokio::time::timeout(timeout, fut).await {
+                Ok(Ok((v, _))) => crate::hooks::tool_verdict(&v),
+                Ok(Err(e)) => (false, format!("hook tool {name} failed: {e}")),
+                Err(_) => (false, format!("hook tool {name} timed out")),
+            };
+        }
+        let Some((cmd, args)) = h.command.split_first() else {
+            return (true, String::new());
+        };
+        let key = h.command.join(" ");
+        if !h.trusted && !self.hook_approvals.lock().unwrap().contains(&key) {
+            let (ok, _) = self
+                .ask_user_approval(
+                    session_id,
+                    "hook command",
+                    vec![format!("process:{cmd}")],
+                    format!(
+                        "Run hook command for {}: {key}",
+                        payload["event"].as_str().unwrap_or("hook")
+                    ),
+                    cancel,
+                )
+                .await;
+            if !ok {
+                // Fail closed: an unapproved policy hook blocks its call.
+                return (false, format!("hook command not approved: {key}"));
+            }
+            self.hook_approvals.lock().unwrap().insert(key.clone());
+        }
+        crate::hooks::run_command(cmd, args, payload, timeout).await
     }
 
     /// After an empty `find_tools` in this Run, does the new Tool's

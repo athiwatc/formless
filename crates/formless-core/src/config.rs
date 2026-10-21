@@ -20,6 +20,30 @@ pub struct Config {
     pub artifacts: ArtifactsCfg,
     pub mcp: McpCfg,
     pub skills: SkillsCfg,
+    /// `[[hooks]]` (SPEC §9.8): user policy and automation around Tool
+    /// calls and Runs.
+    pub hooks: Vec<HookCfg>,
+}
+
+/// One hook: on `event`, for matching calls, run a registry Tool or a
+/// command. A pre_tool hook may deny the call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HookCfg {
+    /// "pre_tool", "post_tool" or "run_end".
+    pub event: String,
+    /// Tool name to match: exact, or with `*` wildcards ("mcp__*").
+    pub tool: Option<String>,
+    /// Match only Tools declaring a Capability starting with this ("net").
+    pub capability: Option<String>,
+    /// Registry Tool to run with the event as input.
+    pub run_tool: Option<String>,
+    /// Command (no shell) run with the event as JSON on stdin.
+    pub command: Vec<String>,
+    /// Run `command` without asking: you wrote it. Unset, it is approved
+    /// once per daemon lifetime by the user.
+    pub trusted: bool,
+    pub timeout_secs: Option<u64>,
 }
 
 /// Automatic skills (SPEC §7.10): distilled from successful Runs,

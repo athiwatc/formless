@@ -1016,6 +1016,42 @@ refresh a cache, nightly cleanup.
   - TUI: `/jobs`, `/jobs enable|disable|rm ID`
   - web: the Settings "Jobs" section (approve, enable, delete).
 
+### 9.8 Hooks
+
+Hooks let users enforce policy and automate workflows. Each is a
+`[[hooks]]` entry in `config.toml`, and everything runs daemon-side.
+
+```toml
+[[hooks]]
+event = "pre_tool"              # pre_tool | post_tool | run_end
+tool = "mcp__*"                 # optional: name, with * wildcards
+capability = "net"              # optional: a declared Capability prefix
+run_tool = "network_policy"     # a registry Tool, or…
+# command = ["/usr/local/bin/check"]   # …a command (no shell)
+# trusted = true                # run the command without asking
+# timeout_secs = 30
+```
+
+- **Input:** a hook gets the event as JSON: event, tool, arguments, the
+  Tool's Capabilities, Session and Run. post_tool adds the result
+  (clipped to 4000 characters) and `ok`; run_end has the Run's `status`.
+  A Tool hook gets it as input, and a command gets it on stdin.
+- **pre_tool:**
+  - Runs before every matching call, built-ins included.
+  - A Tool hook returning `{deny: true, reason}`, or a command exiting
+    non-zero (its output is the reason), denies the call. The model sees
+    `error: denied by a pre_tool hook: <reason>`.
+  - Hooks run in order, and the first denial wins.
+- **post_tool and run_end:** automation only. Their results are logged
+  and never change the call.
+- **Trust:**
+  - Hook Tools run through the normal approval rules.
+  - A command runs without asking only when `trusted = true`. Otherwise
+    the user approves it once per daemon lifetime, and an unapproved
+    pre_tool command fails closed by denying its call.
+  - Hooks run outside model turns, so they never trigger themselves, and
+    every denial is audit-logged.
+
 ## 10. TUI (v1 user interface)
 
 ### 10.1 First-run onboarding wizard
