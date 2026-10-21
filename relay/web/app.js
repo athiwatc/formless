@@ -1694,6 +1694,23 @@
           setActivity(isRunning() ? "waiting for model" : null);
         }
         break;
+      case "user_question": {
+        if (here) setActivity("awaiting your answer");
+        S.questionId = ev.question_id;
+        const opts = (ev.options || []).map((o, i) => (i + 1) + ") " + o).join("\n");
+        ask({ title: "The agent asks", text: ev.question + (opts ? "\n\n" + opts : ""), input: true, placeholder: opts ? "Your answer, or an option number" : "Your answer", ok: "Answer" }).then((text) => {
+          if (S.questionId !== ev.question_id || text == null || text === "") return;
+          S.questionId = null;
+          const n = parseInt(text, 10);
+          const answer = String(n) === text.trim() && ev.options && ev.options[n - 1] ? ev.options[n - 1] : text;
+          act({ type: "answer_question", question_id: ev.question_id, answer });
+        });
+        break;
+      }
+      case "user_question_closed":
+        // Answered elsewhere (or the Run stopped): close our prompt.
+        if (S.questionId === ev.question_id) { S.questionId = null; closeAsk(null); }
+        break;
       case "approval_requested":
         S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null });
         if (here) setActivity("awaiting your approval");

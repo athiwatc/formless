@@ -101,6 +101,10 @@ enum Cmd {
         /// Auto-approve sensitive tools for this Run only
         #[arg(long)]
         yes: bool,
+        /// Answer for the agent's ask_user questions (default: ask on a
+        /// terminal, otherwise tell the agent nobody can answer)
+        #[arg(long)]
+        answer: Option<String>,
         /// Emit one JSON event per line
         #[arg(long)]
         json: bool,
@@ -343,9 +347,10 @@ fn main() -> Result<()> {
             task,
             session,
             yes,
+            answer,
             json,
         }) => {
-            let code = run_headless(paths, task, session, yes, json)?;
+            let code = run_headless(paths, task, session, yes, answer, json)?;
             std::process::exit(code);
         }
     }
@@ -878,6 +883,7 @@ fn run_headless(
     task: String,
     session: Option<String>,
     yes: bool,
+    answer: Option<String>,
     json_out: bool,
 ) -> Result<i32> {
     let cfg = Config::load(&paths)?;
@@ -970,6 +976,39 @@ fn run_headless(
                         if !json_out {
                             eprintln!("[tool] {tool_name}");
                         }
+                    }
+                    Event::UserQuestion {
+                        question_id,
+                        question,
+                        options,
+                        ..
+                    } => {
+                        use std::io::IsTerminal;
+                        let reply = match &answer {
+                            Some(a) => a.clone(),
+                            None if std::io::stdin().is_terminal() && !json_out => {
+                                eprintln!("[question] {question}");
+                                for (i, o) in options.iter().enumerate() {
+                                    eprintln!("  {}) {o}", i + 1);
+                                }
+                                eprint!("> ");
+                                let mut line = String::new();
+                                let _ = std::io::stdin().read_line(&mut line);
+                                let line = line.trim().to_string();
+                                line.parse::<usize>()
+                                    .ok()
+                                    .and_then(|n| options.get(n.wrapping_sub(1)).cloned())
+                                    .unwrap_or(line)
+                            }
+                            None => "[no answer: this is a non-interactive run; proceed on your best assumption and state it]".to_string(),
+                        };
+                        if !json_out {
+                            eprintln!("[answer] {reply}");
+                        }
+                        client.send(Request::AnswerQuestion {
+                            question_id,
+                            answer: reply,
+                        });
                     }
                     Event::ApprovalRequested {
                         approval_id,

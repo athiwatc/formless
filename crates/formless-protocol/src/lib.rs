@@ -422,6 +422,11 @@ pub enum Request {
     },
     /// Built-in call stats (SPEC §8.8).
     ListBuiltinStats,
+    /// Answer an `ask_user` question (first answer wins).
+    AnswerQuestion {
+        question_id: String,
+        answer: String,
+    },
     /// User-memory notes (SPEC §7.11).
     ListMemories,
     /// Add a note (no `id`, author `user`) or edit one: text, scope,
@@ -660,6 +665,19 @@ pub enum Event {
         #[serde(default)]
         elapsed_ms: i64,
     },
+    /// The agent asks the user something mid-Run (`ask_user`); answer with
+    /// `AnswerQuestion`. Global like approvals.
+    UserQuestion {
+        question_id: String,
+        session_id: String,
+        question: String,
+        #[serde(default)]
+        options: Vec<String>,
+    },
+    /// A question was answered (or abandoned): clients close their prompt.
+    UserQuestionClosed {
+        question_id: String,
+    },
     ApprovalRequested {
         approval_id: String,
         session_id: String,
@@ -764,6 +782,7 @@ impl Event {
             | Event::ToolCallStarted { session_id, .. }
             | Event::ToolCallFinished { session_id, .. }
             | Event::ApprovalRequested { session_id, .. }
+            | Event::UserQuestion { session_id, .. }
             | Event::InvocationPending { session_id, .. }
             | Event::InvocationCompleted { session_id, .. }
             | Event::InvocationStalled { session_id, .. }
@@ -778,6 +797,7 @@ impl Event {
             | Event::McpServersChanged
             | Event::SkillsChanged
             | Event::MemoryUpdated
+            | Event::UserQuestionClosed { .. }
             | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }
             | Event::ProposalUpdated { .. }
