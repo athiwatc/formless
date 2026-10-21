@@ -319,7 +319,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -334,7 +334,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 24] = [
+const MIGRATIONS: [(i64, MigrationStep); 25] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -390,6 +390,11 @@ const MIGRATIONS: [(i64, MigrationStep); 24] = [
     (22, |c| Ok(c.execute_batch(SCHEMA_V22)?)),
     (23, |c| Ok(c.execute_batch(SCHEMA_V23)?)),
     (24, |c| Ok(c.execute_batch(SCHEMA_V24)?)),
+    (25, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS optimiser_queue (tool_id TEXT PRIMARY KEY, queued_at TEXT NOT NULL);",
+        )?)
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1032,6 +1037,45 @@ impl Store {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM jobs WHERE enabled=1 AND approved=1 AND next_run IS NOT NULL)",
             [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Queue a Tool for the optimiser (persisted; no duplicates).
+    pub fn enqueue_optimise(&self, tool_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO optimiser_queue(tool_id, queued_at) VALUES(?1, ?2)",
+            params![tool_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Queued Tools, oldest first.
+    pub fn optimise_queue(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tool_id FROM optimiser_queue ORDER BY queued_at, rowid")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn dequeue_optimise(&self, tool_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM optimiser_queue WHERE tool_id=?1",
+            params![tool_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a Tool is in use: an Invocation still running, or used by
+    /// one of `active_runs` (SPEC §8.3: the optimiser waits only for those).
+    pub fn tool_busy(&self, tool_id: &str, active_runs: &[String]) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM invocations WHERE tool_id=?1
+               AND (status='running' OR run_id IN (SELECT value FROM json_each(?2))))",
+            params![tool_id, serde_json::to_string(active_runs)?],
             |r| r.get(0),
         )?)
     }

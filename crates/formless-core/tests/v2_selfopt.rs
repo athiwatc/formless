@@ -255,3 +255,66 @@ fn optimiser_fix_plan_follows_failure_tags() {
     assert!(s.contains("Fix the description and input_schema first"));
     assert!(s.contains("do not widen Capabilities"));
 }
+
+#[test]
+fn optimiser_queue_persists_and_waits_only_for_busy_tools() {
+    let store = temp_store("optq");
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let mk = |n: &str| {
+        store
+            .create_tool_version(
+                n,
+                "d",
+                "{}",
+                "{}",
+                "function run(i){return i;}",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+            .id
+    };
+    let (a, b) = (mk("tool_a"), mk("tool_b"));
+    store.enqueue_optimise(&a).unwrap();
+    store.enqueue_optimise(&b).unwrap();
+    store.enqueue_optimise(&a).unwrap();
+    assert_eq!(
+        store.optimise_queue().unwrap(),
+        vec![a.clone(), b.clone()],
+        "no duplicates, oldest first"
+    );
+    let s = store.create_session(None).unwrap().id;
+    let run = store.create_run(&s).unwrap();
+    // tool_a was used by the active Run; tool_b is idle.
+    store
+        .record_invocation(
+            &a,
+            1,
+            Some(&s),
+            Some(&run),
+            None,
+            "success",
+            "",
+            "{}",
+            "",
+            "",
+            1,
+            100,
+        )
+        .unwrap();
+    assert!(store.tool_busy(&a, std::slice::from_ref(&run)).unwrap());
+    assert!(!store.tool_busy(&b, std::slice::from_ref(&run)).unwrap());
+    assert!(
+        !store.tool_busy(&a, &[]).unwrap(),
+        "once that Run ends, tool_a is free"
+    );
+    // A still-running Invocation keeps a Tool busy regardless of Runs.
+    store
+        .start_invocation(&b, 1, Some(&s), None, None, "{}")
+        .unwrap();
+    assert!(store.tool_busy(&b, &[]).unwrap());
+    store.dequeue_optimise(&a).unwrap();
+    assert_eq!(store.optimise_queue().unwrap(), vec![b]);
+}
