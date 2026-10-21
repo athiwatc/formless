@@ -3160,6 +3160,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// Audit entries for the log view, newest first: `filter` matches the
+    /// actor, action or detail (case-insensitive); `before` pages back.
+    pub fn list_audit(
+        &self,
+        filter: Option<&str>,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<formless_protocol::AuditEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT actor, action, detail, created_at FROM audit
+             WHERE (?1 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?1)) > 0)
+               AND (?2 IS NULL OR created_at < ?2)
+             ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![filter, before, limit.clamp(1, 500) as i64], |r| {
+                Ok(formless_protocol::AuditEntry {
+                    actor: r.get(0)?,
+                    action: r.get(1)?,
+                    detail: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Every active Tool with its current version.
     pub fn current_tools(&self) -> Result<Vec<(ToolInfo, ToolVersionInfo)>> {
         let mut out = Vec::new();
