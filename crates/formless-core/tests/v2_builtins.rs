@@ -459,11 +459,12 @@ async fn large_registries_load_tools_lazily_through_find_tools() {
     let find_desc = defs
         .iter()
         .find(|d| d["function"]["name"] == "find_tools")
-        .unwrap();
-    assert!(find_desc["function"]["description"]
-        .as_str()
         .unwrap()
-        .contains("46 Tools"));
+        .clone();
+    // Registry size never appears in a definition (prompt-cache prefix).
+    let desc = find_desc["function"]["description"].as_str().unwrap();
+    assert!(desc.contains("more Tools than are listed"), "{desc}");
+    assert!(!desc.chars().any(|c| c.is_ascii_digit()), "{desc}");
 
     // The listing is name-sorted and frozen: usage elsewhere doesn't move it.
     let builtins = listed.iter().filter(|n| toolreg::is_builtin(n)).count();
@@ -520,6 +521,19 @@ async fn large_registries_load_tools_lazily_through_find_tools() {
         names(&toolreg::tool_definitions(&store, None, 100).unwrap()).len(),
         46 + builtins
     );
+    seed(
+        &store,
+        "zz_one_more",
+        "another",
+        "function run(){ return 1; }",
+        &[],
+    );
+    let again = toolreg::tool_definitions(&store, Some(&session), 40).unwrap();
+    let again_desc = again
+        .iter()
+        .find(|d| d["function"]["name"] == "find_tools")
+        .unwrap();
+    assert_eq!(again_desc, &find_desc, "a new Tool does not change it");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -209,17 +209,15 @@ fn pending_definition(name: &str, description: &str) -> Value {
     })
 }
 
-fn find_tools_definition(total: usize, listed: usize) -> Value {
-    let scope = if listed < total {
-        format!(" The registry holds {total} Tools; only {listed} are listed as functions right now, so search before assuming a Tool does not exist.")
-    } else {
-        String::new()
-    };
+/// Fixed wording: tool definitions are part of every request's cached
+/// prefix, so nothing here may depend on the registry's size (a Tool
+/// created in one Session would otherwise bust every Session's cache).
+fn find_tools_definition() -> Value {
     json!({
         "type": "function",
         "function": {
             "name": FIND_TOOLS,
-            "description": format!("Search the Tool registry by keywords (matched against names and descriptions) and load the matches into this session, so they become callable functions from your next step.{scope} Search before creating a Tool."),
+            "description": "Search the Tool registry by keywords (matched against names and descriptions) and load the matches into this session, so they become callable functions from your next step. The registry may hold more Tools than are listed as functions, so search before assuming a Tool does not exist, and before creating one.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -367,7 +365,7 @@ pub fn tool_definitions(
         create_tool_definition(),
         create_module_definition(),
         retire_tool_definition(),
-        find_tools_definition(total, shown.len()),
+        find_tools_definition(),
         read_tool_definition(),
         test_tool_definition(),
         pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
