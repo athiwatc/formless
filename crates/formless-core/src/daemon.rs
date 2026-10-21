@@ -2164,7 +2164,8 @@ impl Daemon {
     fn find_tools_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let query = args["query"].as_str().unwrap_or_default();
         let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
-        let hits = self.with_store(|st| toolreg::search_tools(st, query, limit))?;
+        let method = self.config()?.tools.search;
+        let hits = self.with_store(|st| toolreg::search_tools_with(st, query, limit, &method))?;
         let ids: Vec<String> = hits.iter().map(|t| t.id.clone()).collect();
         self.with_store(|st| st.load_session_tools(session_id, &ids, "found"))?;
         let upgraded = self.refresh_pins(session_id, &ids)?;

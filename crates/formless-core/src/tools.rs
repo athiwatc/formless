@@ -285,6 +285,146 @@ fn word_match(a: &str, b: &str) -> bool {
     a == b || (a.len() >= 3 && b.len() >= 3 && (a.starts_with(b) || b.starts_with(a)))
 }
 
+/// Search active Tools with the configured ranking (`tools.search`).
+pub fn search_tools_with(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    method: &str,
+) -> Result<Vec<ToolInfo>> {
+    if method.eq_ignore_ascii_case("keyword") {
+        search_tools(store, query, limit)
+    } else {
+        search_tools_bm25(store, query, limit)
+    }
+}
+
+/// Word groups treated as related when searching ("download web page"
+/// should find `http_get_text`). Small and generic on purpose.
+const SYNONYMS: &[&[&str]] = &[
+    &[
+        "fetch", "download", "get", "http", "url", "web", "page", "request", "curl", "site",
+    ],
+    &["count", "stat", "statistic", "number", "tally", "metric"],
+    &["word", "text", "string", "character"],
+    &["file", "fs", "path", "disk", "folder"],
+    &["read", "load", "open", "cat"],
+    &["write", "save", "store", "persist"],
+    &["list", "ls", "dir", "directory", "enumerate"],
+    &["search", "find", "grep", "match", "lookup", "query"],
+    &["delete", "remove", "rm", "erase"],
+    &["run", "exec", "execute", "command", "shell", "process"],
+    &["date", "time", "clock", "timestamp"],
+    &["summar", "summary", "digest", "tldr"],
+    &["convert", "transform", "format", "translate"],
+];
+
+/// Lowercase, split, and strip common English suffixes so "files",
+/// "filed" and "filing" meet "file".
+fn stems(s: &str) -> Vec<String> {
+    tokens(s)
+        .into_iter()
+        .map(|t| {
+            for suffix in ["ing", "ies", "es", "ed", "s"] {
+                if t.len() > suffix.len() + 2 {
+                    if let Some(stem) = t.strip_suffix(suffix) {
+                        return if suffix == "ies" {
+                            format!("{stem}y")
+                        } else {
+                            stem.to_string()
+                        };
+                    }
+                }
+            }
+            t
+        })
+        .collect()
+}
+
+/// BM25 search (SPEC §7.1) over each Tool's name (weighted), description
+/// and input-schema property names/descriptions, with stemming, prefix
+/// matches and the [`SYNONYMS`] groups at reduced weight. Ties go to the
+/// more used, more reliable Tool.
+pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
+    let tools = store.list_tools(false)?;
+    let docs: Vec<Vec<String>> = tools
+        .iter()
+        .map(|t| {
+            let name = stems(&t.name);
+            let mut doc: Vec<String> = name.iter().chain(&name).chain(&name).cloned().collect();
+            doc.extend(stems(&t.description));
+            if let Ok(Some((_, v))) = store.get_tool_current(&t.id) {
+                if let Ok(schema) = serde_json::from_str::<Value>(&v.input_schema) {
+                    for (prop, def) in schema["properties"].as_object().into_iter().flatten() {
+                        doc.extend(stems(prop));
+                        doc.extend(stems(def["description"].as_str().unwrap_or_default()));
+                    }
+                }
+            }
+            doc
+        })
+        .collect();
+    // Query terms with weights: the words themselves, then their synonyms.
+    let mut terms: Vec<(String, f64)> = Vec::new();
+    for w in stems(query) {
+        for group in SYNONYMS
+            .iter()
+            .filter(|g| g.iter().any(|s| word_match(s, &w)))
+        {
+            for s in group.iter() {
+                if !terms.iter().any(|(t, _)| t == s) {
+                    terms.push((s.to_string(), 0.4));
+                }
+            }
+        }
+        match terms.iter_mut().find(|(t, _)| *t == w) {
+            Some(t) => t.1 = 1.0,
+            None => terms.push((w, 1.0)),
+        }
+    }
+    let n = docs.len() as f64;
+    let avg_len = docs.iter().map(Vec::len).sum::<usize>() as f64 / n.max(1.0);
+    let (k1, b) = (1.2, 0.75);
+    // A document term counts fully when equal, half when it is a prefix match.
+    let tf = |doc: &[String], term: &str| -> f64 {
+        doc.iter()
+            .map(|d| {
+                if d == term {
+                    1.0
+                } else if word_match(d, term) {
+                    0.5
+                } else {
+                    0.0
+                }
+            })
+            .sum()
+    };
+    let mut scored: Vec<(f64, ToolInfo)> = tools
+        .into_iter()
+        .zip(&docs)
+        .filter_map(|(t, doc)| {
+            let mut score = 0.0;
+            for (term, weight) in &terms {
+                let f = tf(doc, term);
+                if f == 0.0 {
+                    continue;
+                }
+                let df = docs.iter().filter(|d| tf(d, term) > 0.0).count() as f64;
+                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let len_norm = 1.0 - b + b * doc.len() as f64 / avg_len.max(1.0);
+                score += weight * idf * f * (k1 + 1.0) / (f + k1 * len_norm);
+            }
+            if !terms.is_empty() && score == 0.0 {
+                return None;
+            }
+            let usage = (t.invocations as f64 + 1.0).ln() * t.success_rate.unwrap_or(0.5);
+            Some((score * 10.0 + usage, t))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Ok(scored.into_iter().take(limit).map(|(_, t)| t).collect())
+}
+
 /// Keyword search over active Tools (SPEC §7.1). Name hits outrank
 /// description hits; ties go to the more used, more reliable Tool.
 pub fn search_tools(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {

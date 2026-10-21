@@ -802,3 +802,89 @@ fn listed_tool_definitions_are_pinned_per_session() {
     let refreshed = toolreg::tool_definitions(&store, Some(&session), 40).unwrap();
     assert!(params(&refreshed).get("who").is_some());
 }
+
+/// Find-before-create eval: paraphrased requests must find the Tool that
+/// already does the job (the keyword matcher misses most of these).
+#[test]
+fn bm25_search_finds_tools_by_meaning_not_exact_words() {
+    let store = Store::open_in_memory().unwrap();
+    let tools = [
+        (
+            "http_get_text",
+            "Fetch a URL and return the response body as text",
+            r#"{"type":"object","properties":{"url":{"type":"string"}}}"#,
+        ),
+        (
+            "text_stats",
+            "Character, word and line statistics for a string",
+            r#"{"type":"object","properties":{"text":{"type":"string"}}}"#,
+        ),
+        (
+            "list_dir",
+            "Names of the entries in a directory",
+            r#"{"type":"object","properties":{"path":{"type":"string"}}}"#,
+        ),
+        (
+            "delete_path",
+            "Remove a file",
+            r#"{"type":"object","properties":{"path":{"type":"string"}}}"#,
+        ),
+        (
+            "now_iso",
+            "Current timestamp in ISO 8601",
+            r#"{"type":"object","properties":{}}"#,
+        ),
+        (
+            "json_pretty",
+            "Reformat JSON with indentation",
+            r#"{"type":"object","properties":{"json":{"type":"string"}}}"#,
+        ),
+        (
+            "sha256_hex",
+            "Hash input bytes",
+            r#"{"type":"object","properties":{"data":{"type":"string","description":"bytes to hash"}}}"#,
+        ),
+        (
+            "csv_to_rows",
+            "Parse CSV into rows",
+            r#"{"type":"object","properties":{"csv":{"type":"string"}}}"#,
+        ),
+    ];
+    for (name, desc, schema) in tools {
+        store
+            .create_tool_version(
+                name,
+                desc,
+                schema,
+                "{}",
+                "function run(){ return 1; }",
+                &Capabilities::default(),
+                256,
+                "agent",
+            )
+            .unwrap();
+    }
+    let cases = [
+        ("download web page", "http_get_text"),
+        ("count words", "text_stats"),
+        ("list files in a folder", "list_dir"),
+        ("erase a file", "delete_path"),
+        ("what time is it", "now_iso"),
+        ("checksum of some data", "sha256_hex"),
+    ];
+    let top = |q: &str, method: &str| {
+        toolreg::search_tools_with(&store, q, 3, method)
+            .unwrap()
+            .first()
+            .map(|t| t.name.clone())
+    };
+    let mut keyword_hits = 0;
+    for (query, want) in cases {
+        assert_eq!(top(query, "bm25").as_deref(), Some(want), "query {query:?}");
+        keyword_hits += usize::from(top(query, "keyword").as_deref() == Some(want));
+    }
+    assert!(
+        keyword_hits < cases.len(),
+        "the eval should be harder than exact words"
+    );
+}

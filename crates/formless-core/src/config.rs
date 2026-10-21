@@ -307,10 +307,18 @@ pub struct ToolsCfg {
     /// Registry size up to which every Tool is listed to the model; past
     /// it, Sessions see loaded + most-used Tools and use find_tools.
     pub inline_limit: usize,
+    /// find_tools ranking: "bm25" (default: names, descriptions and input
+    /// fields, with stemming and synonyms) or "keyword" (word matches).
+    #[serde(default = "default_tool_search")]
+    pub search: String,
     /// How deep `agents.run` sub-agents may nest (1 = the main agent's
     /// Tools may spawn sub-agents; theirs may not).
     pub max_agent_depth: usize,
 }
+fn default_tool_search() -> String {
+    "bm25".into()
+}
+
 impl Default for ToolsCfg {
     fn default() -> Self {
         Self {
@@ -319,6 +327,7 @@ impl Default for ToolsCfg {
             max_memory_mb: 4096,
             artifact_preview_chars: 2000,
             inline_limit: 40,
+            search: default_tool_search(),
             max_agent_depth: 1,
         }
     }
