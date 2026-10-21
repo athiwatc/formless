@@ -1118,7 +1118,8 @@
     return h("dl", { class: "kv" },
       h("dt", null, "Success"), h("dd", null, bar(m.success_rate), " ", rateCell(m.success_rate), h("span", { class: "muted" }, "  retry " + pct(m.retry_rate))),
       h("dt", null, "Invocations"), h("dd", null, m.total + " total · " + m.success + " ok · " + m.failure + " failed · " + m.denied + " denied · " + m.cancelled + " cancelled · " + m.validation_failures + " invalid"),
-      h("dt", null, "Latency"), h("dd", null, "p50 " + (m.p50_ms == null ? "-" : Math.round(m.p50_ms) + "ms") + " · p95 " + (m.p95_ms == null ? "-" : Math.round(m.p95_ms) + "ms")));
+      h("dt", null, "Latency"), h("dd", null, "p50 " + (m.p50_ms == null ? "-" : Math.round(m.p50_ms) + "ms") + " · p95 " + (m.p95_ms == null ? "-" : Math.round(m.p95_ms) + "ms")),
+      h("dt", null, "Cost per success"), h("dd", null, m.ms_per_success == null ? "-" : (m.ms_per_success / 1000).toFixed(1) + "s · " + Math.round(m.tokens_per_success || 0) + " tokens"));
   }
 
   function renderToolDetail(box, d) {
