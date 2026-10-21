@@ -484,7 +484,7 @@ pattern (§4.4).
   §7.11; memory-kind proposals from older builds, when applied, become
   memory notes with author `optimiser` and are deleted again on
   rollback), measures
-  it against the current prompt on a fixed eval suite (baseline vs
+  it against the current prompt on the scenario eval suite (§8.6; baseline vs
   candidate scores are stored), and only a measured proposal that beats
   the baseline by the promotion margin can be applied — always by the
   user's decision (`formless prompts`, TUI `/proposals`). Applied
@@ -771,6 +771,30 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   subsequent Invocations use the promoted version. Every version is retained
   with **one-action rollback** in the Tool browser. Promotions, rollbacks,
   Candidate discards, and `needs attention` flags are audit-logged (§14).
+
+### 8.6 Prompt-proposal evals
+
+A guidance proposal is measured on **what the agent does**, not on what
+it says.
+
+- Each scenario is a scripted conversation (a task, sometimes with an
+  earlier `find_tools` result) sent with the real built-in Tool
+  definitions, plus any registry Tools the scenario has loaded.
+- The agent's next tool calls are checked:
+  - `find_tools` before `create_tool`
+  - least-privilege Capabilities (only scoped `fs:read:` for a read)
+  - streaming (`*Chunks`) for large files
+  - throwing on failure, never `return {error}`
+  - no hardcoded task paths, and a real input schema
+  - reusing a loaded Tool
+  - `env:` for API keys
+- Each scenario runs `optimiser.eval_repeats` (3) times per arm, to
+  absorb sampling variance. The log reports both pass rates with 95%
+  Wilson intervals.
+- **Apply gate:** the candidate must beat the baseline by
+  `promotion_margin_points` **and** be significant (one-sided
+  two-proportion z-test, p < 0.05). The one exception is when both arms
+  are perfect.
 
 ## 9. Daemon Core
 

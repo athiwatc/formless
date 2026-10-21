@@ -1,7 +1,10 @@
 //! v2 prompt/memory self-optimisation (SPEC §7.7/§17): versioned,
 //! measured proposals and their lifecycle gates.
 
-use formless_core::optimiser::{prompt_eval_cases, proposal_beats_baseline, score_eval_responses};
+use formless_core::optimiser::{
+    proposal_beats_baseline, scenario_cases, significant_improvement, wilson_interval,
+};
+use formless_core::provider::ToolCall;
 use formless_core::{Paths, Store};
 
 fn temp_store(tag: &str) -> Store {
@@ -83,24 +86,88 @@ fn proposal_lifecycle_is_measured_and_versioned() {
         .is_none());
 }
 
-#[test]
-fn eval_scoring_matches_expected_phrases() {
-    let cases = prompt_eval_cases();
-    assert!(!cases.is_empty());
-    let perfect: Vec<String> = cases
-        .iter()
-        .map(|c| format!("I would {}", c.expect_any[0]))
-        .collect();
-    assert_eq!(score_eval_responses(&cases, &perfect), 1.0);
-    let empty: Vec<String> = cases.iter().map(|_| "dunno".to_string()).collect();
-    assert_eq!(score_eval_responses(&cases, &empty), 0.0);
-    let mut half = perfect.clone();
-    for r in half.iter_mut().skip(3) {
-        *r = "dunno".into();
+fn call(name: &str, args: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: "c".into(),
+        name: name.into(),
+        arguments: args.to_string(),
     }
-    assert_eq!(
-        score_eval_responses(&cases, &half),
-        3.0 / cases.len() as f64
+}
+
+fn create(js: &str, caps: &[&str]) -> ToolCall {
+    call(
+        "create_tool",
+        serde_json::json!({"name": "count_lines", "description": "d",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+            "output_schema": {}, "implementation_js": js, "capabilities": caps}),
+    )
+}
+
+#[test]
+fn scenarios_judge_actions_not_words() {
+    let cases = scenario_cases();
+    let case = |n: &str| cases.iter().find(|c| c.name == n).unwrap().check;
+    let find = call("find_tools", serde_json::json!({"query": "csv"}));
+    assert!(case("find_before_create")(std::slice::from_ref(&find)));
+    assert!(!case("find_before_create")(&[create("x", &[])]));
+    assert!(case("least_privilege")(&[create(
+        "x",
+        &["fs:read:$input.path"]
+    )]));
+    assert!(!case("least_privilege")(&[create("x", &["fs:read:/"])]));
+    assert!(!case("least_privilege")(&[create(
+        "x",
+        &["fs:read:$input.path", "net"]
+    )]));
+    assert!(case("stream_large_data")(&[create(
+        "for await (const c of fs.readChunks(i.path)) n++;",
+        &[]
+    )]));
+    assert!(!case("stream_large_data")(&[create(
+        "fs.read(i.path).split('\\n')",
+        &[]
+    )]));
+    assert!(case("throw_on_failure")(&[create(
+        "if (!r.ok) throw new Error('bad');",
+        &[]
+    )]));
+    assert!(!case("throw_on_failure")(&[create(
+        "if (!r.ok) return { error: 'bad' }; throw x",
+        &[]
+    )]));
+    assert!(case("generic_tools")(&[create("fs.read(i.path)", &[])]));
+    assert!(!case("generic_tools")(&[create(
+        "fs.read('/home/a/proj/notes.txt')",
+        &[]
+    )]));
+    assert!(case("reuse_tools")(&[call(
+        "csv_column_sum",
+        serde_json::json!({})
+    )]));
+    assert!(!case("reuse_tools")(&[create("x", &[])]));
+    assert!(case("no_secrets_in_code")(&[create(
+        "x",
+        &["net", "env:WEBHOOK_KEY"]
+    )]));
+    // Saying the right words without acting fails everything.
+    assert!(cases.iter().all(|c| !(c.check)(&[])));
+}
+
+#[test]
+fn eval_statistics() {
+    let (lo, hi) = wilson_interval(15, 21);
+    assert!(
+        lo > 0.49 && lo < 0.52 && hi > 0.85 && hi < 0.88,
+        "{lo} {hi}"
+    );
+    assert_eq!(wilson_interval(0, 0), (0.0, 1.0));
+    // 21 runs each: 50% -> 90% is significant, 50% -> 62% is not.
+    assert!(significant_improvement(0.5, 0.9, 21));
+    assert!(!significant_improvement(0.5, 0.62, 21));
+    assert!(!significant_improvement(0.8, 0.7, 21));
+    assert!(
+        significant_improvement(0.5, 0.62, 400),
+        "more trials, smaller effects"
     );
 }
 
