@@ -298,6 +298,10 @@ impl EditorState {
 #[derive(Clone)]
 struct LiveToolCall {
     name: String,
+    /// Tree depth: nested `tools.call`, or a sub-agent under its Tool.
+    depth: usize,
+    /// The sub-agent this node stands for.
+    subagent: Option<String>,
     version: i64,
     arguments: String,
     status: String,
@@ -307,6 +311,37 @@ struct LiveToolCall {
     handle: Option<String>,
     /// Seconds without activity, while the daemon flags it stalled.
     stalled_secs: Option<u64>,
+}
+
+/// The live calls to draw, with how many descendants each folds away. A
+/// node shows while it or an ancestor is running; under a node that
+/// finished successfully its descendants fold into a count.
+fn live_tree(calls: &[LiveToolCall]) -> Vec<(&LiveToolCall, usize)> {
+    let mut out: Vec<(&LiveToolCall, usize)> = Vec::new();
+    // Stack of (depth, running, open) for the current ancestors.
+    let mut stack: Vec<(usize, bool, bool)> = Vec::new();
+    for c in calls {
+        while stack.last().is_some_and(|(d, _, _)| *d >= c.depth) {
+            stack.pop();
+        }
+        let parent_open = stack.last().is_none_or(|(_, _, open)| *open);
+        let ancestor_running = stack.iter().any(|(_, running, _)| *running);
+        let running = c.status == "running";
+        let visible = parent_open && (running || ancestor_running);
+        // Children show under running or failed nodes; ok ones fold.
+        let open = visible && c.status != "ok";
+        if visible {
+            out.push((c, 0));
+        } else if let Some(idx) = out
+            .iter()
+            .rposition(|(n, _)| n.depth < c.depth && n.status == "ok")
+            .filter(|_| ancestor_running && !parent_open)
+        {
+            out[idx].1 += 1;
+        }
+        stack.push((c.depth, running, open));
+    }
+    out
 }
 
 /// Share of a model's prompt tokens served from the provider's cache.
@@ -1315,6 +1350,7 @@ impl App {
                 tool_name,
                 version,
                 arguments,
+                depth,
                 ..
             } => {
                 if !self.is_current(&session_id) {
@@ -1323,6 +1359,8 @@ impl App {
                 self.set_activity(format!("running {tool_name}"));
                 self.live_tools.push(LiveToolCall {
                     name: tool_name.clone(),
+                    depth,
+                    subagent: None,
                     version,
                     arguments,
                     status: "running".into(),
@@ -1499,15 +1537,46 @@ impl App {
                         "sub-agent started: {}",
                         truncate_chars(&subagent.task, 80)
                     ));
+                    // Under the Tool that called agents.run (the latest
+                    // running node).
+                    let depth = self
+                        .live_tools
+                        .iter()
+                        .rev()
+                        .find(|c| c.status == "running")
+                        .map_or(0, |c| c.depth + 1);
+                    self.live_tools.push(LiveToolCall {
+                        name: format!("sub-agent: {}", truncate_chars(&subagent.task, 60)),
+                        depth,
+                        subagent: Some(subagent.id.clone()),
+                        version: 0,
+                        arguments: String::new(),
+                        status: "running".into(),
+                        started: Instant::now(),
+                        elapsed_ms: None,
+                        handle: None,
+                        stalled_secs: None,
+                    });
                 }
             }
             Event::SubagentStep {
                 session_id,
+                subagent_id,
                 step,
                 tool_calls,
-                ..
             } => {
                 if self.is_current(&session_id) {
+                    if let Some(node) = self
+                        .live_tools
+                        .iter_mut()
+                        .find(|c| c.subagent.as_deref() == Some(&subagent_id))
+                    {
+                        node.arguments = if tool_calls.is_empty() {
+                            format!("step {step}: answering")
+                        } else {
+                            format!("step {step}: {}", tool_calls.join(", "))
+                        };
+                    }
                     self.set_activity(if tool_calls.is_empty() {
                         format!("sub-agent step {step}: answering")
                     } else {
@@ -1524,6 +1593,18 @@ impl App {
                         "sub-agent {} after {} step(s) · /agents to inspect",
                         subagent.status, subagent.steps
                     ));
+                    if let Some(node) = self
+                        .live_tools
+                        .iter_mut()
+                        .find(|c| c.subagent.as_deref() == Some(&subagent.id))
+                    {
+                        node.status = if subagent.status == "completed" {
+                            "ok".into()
+                        } else {
+                            "failed".into()
+                        };
+                        node.elapsed_ms = Some(node.started.elapsed().as_millis() as i64);
+                    }
                 }
             }
             Event::InvocationActivity { handle, .. } => {
@@ -3002,29 +3083,41 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    // Currently-running Tool calls (persisted lines above keep the history).
-    let running: Vec<&LiveToolCall> = app
-        .live_tools
-        .iter()
-        .filter(|c| c.status == "running")
-        .collect();
-    if !running.is_empty() {
+    // Live call tree (persisted lines above keep the history): running
+    // calls with their nested calls and sub-agents; a finished, successful
+    // subtree folds to one line.
+    let shown = live_tree(&app.live_tools);
+    if !shown.is_empty() {
         open_group(&mut lines, &mut group, "assistant", None);
-        for call in running {
+        for (call, folded) in shown {
             let version = if call.version > 0 {
                 format!(" v{}", call.version)
             } else {
                 String::new()
             };
+            let indent = "  ".repeat(call.depth);
+            let branch = if call.depth > 0 { "└ " } else { "" };
+            let (mark, style) = match call.status.as_str() {
+                "running" => (app.spinner().to_string(), bold_fg(app.color, Color::Yellow)),
+                "ok" => ("✓".to_string(), fg(app.color, Color::Green)),
+                _ => ("✗".to_string(), fg(app.color, Color::Red)),
+            };
+            let elapsed = match call.elapsed_ms {
+                Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
+                None => format_elapsed(call.started.elapsed()),
+            };
             let mut spans = vec![Span::styled(
                 format!(
-                    "  {} {}{} · {}  ",
-                    app.spinner(),
+                    "  {indent}{branch}{mark} {}{} · {elapsed}{}  ",
                     call.name,
                     version,
-                    format_elapsed(call.started.elapsed()),
+                    if folded > 0 {
+                        format!(" · +{folded} nested")
+                    } else {
+                        String::new()
+                    }
                 ),
-                bold_fg(app.color, Color::Yellow),
+                style,
             )];
             if let Some(secs) = call.stalled_secs {
                 spans.push(Span::styled(
@@ -4480,6 +4573,7 @@ mod tests {
             tool_name: "t".into(),
             version: 1,
             arguments: "{}".into(),
+            depth: 0,
         });
         assert!(app.streaming.is_empty() && app.live_tools.is_empty());
         assert!(app.activity.is_none());
@@ -4534,6 +4628,7 @@ mod tests {
             tool_name: "create_tool".into(),
             version: 1,
             arguments: "{\"name\":\"writer\"}".into(),
+            depth: 0,
         });
         assert!(app.activity_text().unwrap().contains("running create_tool"));
         assert_eq!(app.live_tools.len(), 1);
@@ -5013,5 +5108,44 @@ mod tests {
             "{last}"
         );
         assert!(!app.notes.iter().any(|n| n.contains("M2")));
+    }
+
+    #[test]
+    fn live_calls_render_as_a_tree_and_fold_finished_subtrees() {
+        let node = |name: &str, depth: usize, status: &str| LiveToolCall {
+            name: name.into(),
+            depth,
+            subagent: None,
+            version: 1,
+            arguments: String::new(),
+            status: status.into(),
+            started: Instant::now(),
+            elapsed_ms: Some(5),
+            handle: None,
+            stalled_secs: None,
+        };
+        let calls = vec![
+            node("done_top", 0, "ok"),
+            node("outer", 0, "running"),
+            node("fetch", 1, "ok"),
+            node("parse", 2, "ok"),
+            node("parse2", 2, "ok"),
+            node("store", 1, "failed"),
+            node("retry", 2, "running"),
+        ];
+        let shown: Vec<(String, usize)> = live_tree(&calls)
+            .into_iter()
+            .map(|(c, folded)| (c.name.clone(), folded))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("outer".to_string(), 0),
+                ("fetch".to_string(), 2),
+                ("store".to_string(), 0),
+                ("retry".to_string(), 0),
+            ],
+            "finished top-level calls hide; ok subtrees fold; failed ones stay open"
+        );
     }
 }
