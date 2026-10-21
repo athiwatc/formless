@@ -1407,7 +1407,12 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **Real-time thinking:** when the endpoint streams reasoning deltas
   (`reasoning_content`, or `reasoning` on some endpoints) the daemon
   forwards them as `ReasoningDelta` events and the TUI shows them live in
-  a dimmed, separate "Thinking" block (`/thinking` toggles it). Reasoning
+  a dimmed, separate "Thinking" block (`/thinking` toggles it). The
+  block has a fixed height: a header ("Thinking · N lines") plus the
+  latest 4 rendered rows, wrapped by display width and padded while
+  shorter. The assistant header and activity line below it therefore stay
+  put while reasoning streams, and stay put when the answer starts
+  streaming below it. Reasoning
   is never fabricated when the endpoint emits none, never shown as the
   assistant's answer, and never persisted as message content; on
   tool-call turns it is kept only as provider metadata so thinking-mode
