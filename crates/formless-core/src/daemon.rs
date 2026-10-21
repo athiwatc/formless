@@ -1702,6 +1702,14 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: load_skill failed: {e}"),
             },
+            toolreg::REMEMBER => match self.remember_impl(session_id, &args) {
+                Ok(text) => text,
+                Err(e) => format!("error: remember failed: {e}"),
+            },
+            toolreg::FORGET => match self.forget_impl(&args) {
+                Ok(text) => text,
+                Err(e) => format!("error: forget failed: {e}"),
+            },
             toolreg::READ_SKILL_FILE => match self.read_skill_file_impl(&args) {
                 Ok(text) => self.model_text(session_id, &json!(text), cfg),
                 Err(e) => format!("error: read_skill_file failed: {e}"),
@@ -2246,10 +2254,11 @@ impl Daemon {
         }
         let p = self.effective_system_prompt();
         self.with_store(|st| st.set_session_system_prompt(session_id, &p))?;
+        let _ = self.with_store(|st| st.touch_memories());
         Ok(p)
     }
 
-    pub(crate) fn effective_system_prompt(&self) -> String {
+    pub fn effective_system_prompt(&self) -> String {
         let mut prompt = self
             .with_store(|st| st.effective_system_prompt(SYSTEM_PROMPT))
             .unwrap_or_else(|_| SYSTEM_PROMPT.to_string());
@@ -2267,6 +2276,9 @@ impl Daemon {
             prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
             prompt.push_str(&skills.join("\n"));
         }
+        // User memory (SPEC §7.11), also part of the snapshot.
+        let memories = self.with_store(|st| st.list_memories()).unwrap_or_default();
+        prompt.push_str(&crate::memory::prompt_block(&memories));
         prompt
     }
 
@@ -2652,6 +2664,33 @@ impl Daemon {
         self.with_store(|st| st.get_skill(name))?
             .filter(|s| s.enabled && !s.retired)
             .with_context(|| format!("no enabled skill named '{name}'"))
+    }
+
+    /// `remember` (SPEC §7.11): save (or refresh) a user-memory note.
+    fn remember_impl(&self, session_id: &str, args: &Value) -> Result<String> {
+        let text = args["text"].as_str().context("text required")?;
+        let scope = args["scope"].as_str().unwrap_or("global");
+        let (m, created) =
+            self.with_store(|st| st.add_memory(text, scope, "agent", Some(session_id)))?;
+        let _ = self.with_store(|st| st.audit("agent", "memory.remember", &m.id));
+        self.broadcast(Event::MemoryUpdated);
+        Ok(json!({
+            "id": m.id,
+            "saved": if created { "new" } else { "already remembered" },
+            "note": "Applies from the next Session (or this one after compaction).",
+        })
+        .to_string())
+    }
+
+    /// `forget` (SPEC §7.11): delete a note by id.
+    fn forget_impl(&self, args: &Value) -> Result<String> {
+        let id = args["id"].as_str().context("id required")?;
+        if !self.with_store(|st| st.delete_memory(id))? {
+            return Err(anyhow!("no memory '{id}'"));
+        }
+        let _ = self.with_store(|st| st.audit("agent", "memory.forget", id));
+        self.broadcast(Event::MemoryUpdated);
+        Ok(json!({"forgotten": id}).to_string())
     }
 
     fn load_skill_impl(&self, session_id: &str, run_id: &str, args: &Value) -> Result<String> {
@@ -3661,7 +3700,9 @@ impl Daemon {
         let current = self.effective_system_prompt();
         if self.session_prompt(session_id)? != current {
             self.with_store(|st| st.set_session_system_prompt(session_id, &current))?;
-            let note = "The harness guidance in the system prompt was updated (applied or rolled-back proposals).";
+            let _ = self.with_store(|st| st.touch_memories());
+            let note =
+                "The system prompt was updated (learned guidance, skills or user memory changed).";
             let msg = self.with_store(|st| st.append_message(session_id, "system-note", note))?;
             self.broadcast(Event::MessageAppended {
                 session_id: session_id.to_string(),

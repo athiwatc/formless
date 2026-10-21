@@ -228,6 +228,16 @@ CREATE TABLE IF NOT EXISTS skill_loads (
 CREATE INDEX IF NOT EXISTS idx_skill_loads ON skill_loads(skill_id, created_at);
 ";
 
+/// User memory (SPEC §7.11).
+const SCHEMA_V17: &str = "
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY, text TEXT NOT NULL, dedup_key TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'global', author TEXT NOT NULL DEFAULT 'agent',
+  session_id TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup ON memories(scope, dedup_key);
+";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -251,7 +261,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -266,7 +276,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 16] = [
+const MIGRATIONS: [(i64, MigrationStep); 17] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -304,6 +314,7 @@ const MIGRATIONS: [(i64, MigrationStep); 16] = [
         )?)
     }),
     (16, |c| Ok(c.execute_batch(SCHEMA_V16)?)),
+    (17, |c| Ok(c.execute_batch(SCHEMA_V17)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -2188,6 +2199,126 @@ impl Store {
         self.conn
             .execute("DELETE FROM skills WHERE name=?1", params![name])?;
         Ok(paths)
+    }
+
+    fn row_memory(r: &rusqlite::Row) -> rusqlite::Result<formless_protocol::MemoryInfo> {
+        Ok(formless_protocol::MemoryInfo {
+            id: r.get("id")?,
+            text: r.get("text")?,
+            scope: r.get("scope")?,
+            author: r.get("author")?,
+            session_id: r.get("session_id")?,
+            enabled: r.get::<_, i64>("enabled")? != 0,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+            last_used: r.get("last_used")?,
+        })
+    }
+
+    /// Save a memory note; a duplicate (same scope, same text ignoring
+    /// case and spacing) refreshes the existing note instead. Returns the
+    /// note and whether it is new.
+    pub fn add_memory(
+        &self,
+        text: &str,
+        scope: &str,
+        author: &str,
+        session_id: Option<&str>,
+    ) -> Result<(formless_protocol::MemoryInfo, bool)> {
+        crate::memory::validate(text, scope)?;
+        let key = crate::memory::dedup_key(text);
+        let t = now();
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2",
+                params![scope, key],
+                |r| r.get(0),
+            )
+            .ok();
+        let (id, created) = match existing {
+            Some(id) => {
+                self.conn.execute(
+                    "UPDATE memories SET enabled=1, updated_at=?2 WHERE id=?1",
+                    params![id, t],
+                )?;
+                (id, false)
+            }
+            None => {
+                let id = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+                self.conn.execute(
+                    "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+                    params![id, crate::memory::clean(text), key, scope, author, session_id, t],
+                )?;
+                (id, true)
+            }
+        };
+        Ok((self.get_memory(&id)?.context("memory vanished")?, created))
+    }
+
+    pub fn get_memory(&self, id: &str) -> Result<Option<formless_protocol::MemoryInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM memories WHERE id=?1",
+                params![id],
+                Self::row_memory,
+            )
+            .ok())
+    }
+
+    pub fn list_memories(&self) -> Result<Vec<formless_protocol::MemoryInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM memories ORDER BY scope, created_at, rowid")?;
+        let rows = stmt
+            .query_map([], Self::row_memory)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Edit a note's text, scope or enabled flag.
+    pub fn update_memory(
+        &self,
+        id: &str,
+        text: Option<&str>,
+        scope: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<formless_protocol::MemoryInfo>> {
+        let Some(cur) = self.get_memory(id)? else {
+            return Ok(None);
+        };
+        let text = text.unwrap_or(&cur.text);
+        let scope = scope.unwrap_or(&cur.scope);
+        crate::memory::validate(text, scope)?;
+        self.conn.execute(
+            "UPDATE memories SET text=?2, dedup_key=?3, scope=?4, enabled=?5, updated_at=?6 WHERE id=?1",
+            params![
+                id,
+                crate::memory::clean(text),
+                crate::memory::dedup_key(text),
+                scope,
+                enabled.unwrap_or(cur.enabled),
+                now()
+            ],
+        )?;
+        self.get_memory(id)
+    }
+
+    pub fn delete_memory(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM memories WHERE id=?1", params![id])?
+            > 0)
+    }
+
+    /// Mark the enabled notes as used (a Session's prompt included them).
+    pub fn touch_memories(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE memories SET last_used=?1 WHERE enabled=1",
+            params![now()],
+        )?;
+        Ok(())
     }
 
     /// Whether the user has approved using this MCP server at all.

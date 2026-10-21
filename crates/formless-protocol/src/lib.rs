@@ -110,6 +110,24 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// A user-memory note (SPEC §7.11).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryInfo {
+    pub id: String,
+    pub text: String,
+    /// "global" or "project:<path>".
+    pub scope: String,
+    /// "agent", "user" or "optimiser".
+    pub author: String,
+    /// The Session that wrote it (agent notes).
+    pub session_id: Option<String>,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    /// When a Session's prompt last included it.
+    pub last_used: Option<String>,
+}
+
 /// An installed skill (SPEC §7.10).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillInfo {
@@ -628,6 +646,8 @@ pub enum Event {
     McpServersChanged,
     /// Skills were installed, removed, enabled or disabled.
     SkillsChanged,
+    /// User memory changed (SPEC §7.11).
+    MemoryUpdated,
     /// A stalled Invocation is active again (clears the stall flag).
     InvocationActivity {
         session_id: String,
@@ -677,6 +697,7 @@ impl Event {
             Event::SettingsChanged
             | Event::McpServersChanged
             | Event::SkillsChanged
+            | Event::MemoryUpdated
             | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }
             | Event::ProposalUpdated { .. }

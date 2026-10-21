@@ -1142,7 +1142,7 @@ impl App {
                 self.notes.push(format!("compacted: {summary_preview}"));
             }
             Event::Note { text, .. } => self.notes.push(text),
-            Event::McpServersChanged | Event::SkillsChanged => {}
+            Event::McpServersChanged | Event::SkillsChanged | Event::MemoryUpdated => {}
             Event::SettingsChanged => {
                 if let Ok(cfg) = Config::load(&self.paths) {
                     self.model_label = cfg.provider.model;
