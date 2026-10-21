@@ -260,3 +260,66 @@ async fn model_failover_routes_to_fallback() {
     assert_eq!(out.content, "hello from good");
     assert_eq!(out.model_used, "good");
 }
+
+/// A multibyte character split across network chunks must survive intact
+/// (not become two U+FFFD), in both content and tool-call arguments.
+#[tokio::test]
+async fn sse_keeps_multibyte_chars_split_across_chunks() {
+    let line = |v: Value| format!("data: {v}\n\n");
+    let body = [
+        line(json!({"choices": [{"delta": {"content": "hi 😀 ok"}}]})),
+        line(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "type": "function",
+            "function": {"name": "writer", "arguments": "{\"x\":\"日本\"}"}}]}}]})),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat()
+    .into_bytes();
+    // Cut inside the emoji (2 of its 4 bytes) and inside "日".
+    let emoji = body.windows(4).position(|w| w == "😀".as_bytes()).unwrap() + 2;
+    let kanji = body.windows(3).position(|w| w == "日".as_bytes()).unwrap() + 1;
+    let chunks = vec![
+        body[..emoji].to_vec(),
+        body[emoji..kanji].to_vec(),
+        body[kanji..].to_vec(),
+    ];
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let chunks = chunks.clone();
+            async move {
+                let stream =
+                    futures_util::stream::unfold(chunks.into_iter(), |mut it| async move {
+                        let next = it.next()?;
+                        // Separate writes so the client sees separate chunks.
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        Some((Ok::<_, std::io::Error>(next), it))
+                    });
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    let p = Provider::new(c, "k".into()).unwrap();
+    let mut streamed = String::new();
+    let out = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "go"})],
+            &[writer_tool()],
+            "good",
+            None,
+            &CancellationToken::new(),
+            |_, d| streamed.push_str(d),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streamed, "hi 😀 ok");
+    assert_eq!(out.content, "hi 😀 ok");
+    assert_eq!(out.tool_calls[0].arguments, "{\"x\":\"日本\"}");
+}
