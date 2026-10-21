@@ -990,6 +990,14 @@ such as `read_file`, `read_text_file` and `file_read`.
   the TUI, web and headless clients subscribe to the Session they show.
 - A client whose protocol version mismatches the daemon's **refuses to
   attach** with a clear message (no silent incompatibility).
+- **Ordering and responsiveness:** on each connection, ordinary requests
+  run one at a time and in order on a per-connection worker, so a
+  client's fire-and-forget sequences keep their order. Control requests
+  skip that queue and run at once, with replies matched by request id:
+  `Ping`, `Status`, `InterruptRun`, `CancelInvocation`,
+  `ApprovalDecision`, `PromotionDecision` and `AnswerQuestion`. A slow
+  smoke test, export or search therefore never delays Esc or an approval
+  from the same client.
 
 ### 9.4 Instances, profiles, storage, data dirs
 
