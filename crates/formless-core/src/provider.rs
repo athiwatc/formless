@@ -431,12 +431,14 @@ impl Provider {
                     &credential,
                 )
                 .json(&b);
+                let mut server_wait = None;
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
                             return Ok((resp, dropped, model.clone()));
                         }
+                        server_wait = retry_after(resp.headers());
                         let text = resp.text().await.unwrap_or_default();
                         if status.as_u16() == 400 && with_effort && is_unknown_param(&text) {
                             with_effort = false;
@@ -454,7 +456,7 @@ impl Provider {
                     Err(e) => last_err = e.to_string(),
                 }
                 if attempt < self.cfg.max_retries {
-                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
+                    tokio::time::sleep(self.backoff(attempt, server_wait)).await;
                 }
             }
             // Retryable failures exhausted for this model: fail over.
@@ -463,6 +465,22 @@ impl Provider {
             }
         }
         Err(anyhow!("provider request failed after retries: {last_err}"))
+    }
+
+    /// Wait before retry `attempt` (0-based): the server's own hint when it
+    /// sent one (`Retry-After`, rate-limit reset headers), otherwise full
+    /// jitter up to an exponential cap, so concurrent Sessions do not
+    /// retry in lockstep.
+    fn backoff(&self, attempt: usize, server_wait: Option<Duration>) -> Duration {
+        let cap = Duration::from_secs(self.cfg.max_backoff_secs.max(1));
+        if let Some(wait) = server_wait {
+            // Honour the server even past our own cap, within reason.
+            return wait.min(cap.max(Duration::from_secs(300)));
+        }
+        let ceiling = Duration::from_millis(500)
+            .saturating_mul(2u32.saturating_pow(attempt as u32))
+            .min(cap);
+        ceiling.mul_f64(rand::random::<f64>())
     }
 
     /// Streaming chat with optional tools. Calls `on_delta(kind, text)`
@@ -551,7 +569,7 @@ impl Provider {
                                 reasoning.clear();
                                 tool_calls.clear();
                                 truncated = false;
-                                tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
+                                tokio::time::sleep(self.backoff(attempt, None)).await;
                                 attempt += 1;
                                 continue 'request;
                             }
@@ -584,7 +602,7 @@ impl Provider {
                                         let nothing_streamed =
                                             content.is_empty() && reasoning.is_empty() && tool_calls.is_empty();
                                         if retryable && nothing_streamed && attempt < self.cfg.max_retries {
-                                            tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
+                                            tokio::time::sleep(self.backoff(attempt, None)).await;
                                             attempt += 1;
                                             continue 'request;
                                         }
@@ -803,6 +821,56 @@ fn is_model_error(status: u16, text: &str) -> bool {
             || t.contains("invalid model"))
 }
 
+/// How long the server asked us to wait: `Retry-After` (seconds or an
+/// HTTP date), else the longest `x-ratelimit-reset-*` (`"1s"`, `"6m0s"`,
+/// `"20ms"`).
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(v) = header("retry-after") {
+        if let Ok(secs) = v.trim().parse::<f64>() {
+            return Some(Duration::from_secs_f64(secs.max(0.0)));
+        }
+        if let Ok(at) = chrono::DateTime::parse_from_rfc2822(v.trim()) {
+            let wait = at.signed_duration_since(chrono::Utc::now());
+            return Some(wait.to_std().unwrap_or_default());
+        }
+    }
+    ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"]
+        .iter()
+        .filter_map(|h| header(h).and_then(parse_reset_duration))
+        .max()
+}
+
+/// `"1m30s"`, `"6m0s"`, `"20ms"`, `"0.5s"`, or bare seconds.
+fn parse_reset_duration(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    if let Ok(secs) = text.parse::<f64>() {
+        return Some(Duration::from_secs_f64(secs.max(0.0)));
+    }
+    let mut total = 0.0;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let num_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let value: f64 = rest[..num_len].parse().ok()?;
+        rest = &rest[num_len..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        total += value
+            * match &rest[..unit_len] {
+                "h" => 3600.0,
+                "m" => 60.0,
+                "s" => 1.0,
+                "ms" => 0.001,
+                _ => return None,
+            };
+        rest = &rest[unit_len..];
+    }
+    Some(Duration::from_secs_f64(total))
+}
+
 /// Whether a 400 body rejects the reasoning-effort parameter itself (and
 /// not something else that happens to be "unknown" or "unsupported").
 fn is_unknown_param(text: &str) -> bool {
@@ -989,6 +1057,54 @@ pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_hints_are_parsed_from_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(retry_after(&h), None);
+        h.insert("x-ratelimit-reset-requests", HeaderValue::from_static("1s"));
+        h.insert(
+            "x-ratelimit-reset-tokens",
+            HeaderValue::from_static("1m30s"),
+        );
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(90)));
+        h.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_reset_duration("20ms"),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(parse_reset_duration("6m0s"), Some(Duration::from_secs(360)));
+        assert_eq!(parse_reset_duration("soon"), None);
+        let mut h = HeaderMap::new();
+        let at = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
+        h.insert("retry-after", HeaderValue::from_str(&at).unwrap());
+        let wait = retry_after(&h).unwrap();
+        assert!(wait > Duration::from_secs(25) && wait <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_has_jitter_a_cap_and_honours_the_server() {
+        let mut cfg = ProviderCfg::default();
+        cfg.max_backoff_secs = 4;
+        let p = Provider::new(cfg, "k".into()).unwrap();
+        let waits: Vec<Duration> = (0..50).map(|_| p.backoff(10, None)).collect();
+        assert!(waits.iter().all(|w| *w <= Duration::from_secs(4)));
+        assert!(
+            waits.iter().any(|w| *w != waits[0]),
+            "full jitter varies the wait"
+        );
+        assert_eq!(
+            p.backoff(0, Some(Duration::from_secs(20))),
+            Duration::from_secs(20),
+            "a server hint beats our own cap"
+        );
+        assert_eq!(
+            p.backoff(0, Some(Duration::from_secs(3600))),
+            Duration::from_secs(300)
+        );
+    }
 
     #[test]
     fn unknown_param_needs_the_reasoning_param_named() {
