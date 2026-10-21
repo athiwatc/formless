@@ -110,6 +110,19 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// A built-in's measured use (SPEC §8.8).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BuiltinStatInfo {
+    pub name: String,
+    pub calls: i64,
+    pub failures: i64,
+    /// Counts per outcome kind: syntax, smoke, empty, near-duplicate, …
+    pub kinds: std::collections::BTreeMap<String, i64>,
+    pub avg_ms: f64,
+    #[serde(skip)]
+    pub total_ms: f64,
+}
+
 /// One Run's metrics (SPEC §8.7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunMetricsInfo {
@@ -401,6 +414,8 @@ pub enum Request {
         #[serde(default)]
         limit: Option<usize>,
     },
+    /// Built-in call stats (SPEC §8.8).
+    ListBuiltinStats,
     /// User-memory notes (SPEC §7.11).
     ListMemories,
     /// Add a note (no `id`, author `user`) or edit one: text, scope,

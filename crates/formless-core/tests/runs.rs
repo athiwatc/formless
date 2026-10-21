@@ -71,3 +71,91 @@ fn run_metrics_record_steps_tokens_and_followups() {
     assert!((sum.interrupted - 1.0 / 3.0).abs() < 1e-9);
     assert!((sum.avg_tokens - 40.0).abs() < 1e-9);
 }
+
+#[test]
+fn builtin_outcomes_and_stats() {
+    use formless_core::daemon::builtin_outcome;
+    assert_eq!(
+        builtin_outcome(
+            "create_tool",
+            "error: create_tool failed: syntax check failed: x"
+        ),
+        (false, "syntax")
+    );
+    assert_eq!(
+        builtin_outcome(
+            "create_tool",
+            "error: create_tool failed: smoke test failed: y"
+        ),
+        (false, "smoke")
+    );
+    assert_eq!(
+        builtin_outcome("find_tools", r#"{"tools":[],"note":"No matching Tool"}"#),
+        (true, "empty")
+    );
+    assert_eq!(
+        builtin_outcome("find_tools", r#"{"tools":[{"name":"a"}]}"#),
+        (true, "")
+    );
+    assert_eq!(
+        builtin_outcome("test_tool", r#"{"ok":false,"stage":"run"}"#),
+        (false, "test-failed")
+    );
+
+    let store = Store::open_in_memory().unwrap();
+    store
+        .record_builtin_call("find_tools", "s", "r1", true, "empty", 4)
+        .unwrap();
+    store
+        .record_builtin_call("find_tools", "s", "r1", true, "", 6)
+        .unwrap();
+    store
+        .record_builtin_call("create_tool", "s", "r1", false, "syntax", 10)
+        .unwrap();
+    store
+        .record_builtin_call("create_tool", "s", "r1", true, "near-duplicate", 30)
+        .unwrap();
+    assert!(store.run_had_empty_find("r1").unwrap());
+    assert!(!store.run_had_empty_find("r2").unwrap());
+    let stats = store.builtin_stats().unwrap();
+    let create = stats.iter().find(|s| s.name == "create_tool").unwrap();
+    assert_eq!((create.calls, create.failures), (2, 1));
+    assert_eq!(create.kinds.get("near-duplicate"), Some(&1));
+    assert!((create.avg_ms - 20.0).abs() < 1e-9);
+    let find = stats.iter().find(|s| s.name == "find_tools").unwrap();
+    assert_eq!(
+        (find.calls, find.failures, find.kinds.get("empty")),
+        (2, 0, Some(&1))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn built_in_calls_are_recorded_without_payloads() {
+    use std::sync::Arc;
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-bic-{short}"));
+    let paths = formless_core::Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-bic-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    daemon
+        .call_tool_direct(
+            &s,
+            "find_tools",
+            serde_json::json!({"query": "zebra telescope"}),
+        )
+        .await;
+    let stats = daemon
+        .handle(formless_protocol::Request::ListBuiltinStats)
+        .await
+        .unwrap();
+    assert_eq!(stats[0]["name"], "find_tools");
+    assert_eq!(stats[0]["kinds"]["empty"], 1);
+}
