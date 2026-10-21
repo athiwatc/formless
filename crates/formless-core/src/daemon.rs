@@ -480,6 +480,36 @@ impl Daemon {
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
             }
+            Request::ExportSkill { name } => {
+                self.with_reader(|st| crate::skills::export(st, &name))
+            }
+            Request::ExportSkills => {
+                let skills = self.with_reader(|st| {
+                    st.list_skills()?
+                        .iter()
+                        .map(|s| crate::skills::export(st, &s.name))
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                Ok(json!({"format": "formless.skills/1", "skills": skills}))
+            }
+            Request::ImportSkill { bundle } => {
+                let bundles = if bundle["format"].as_str() == Some("formless.skills/1") {
+                    bundle["skills"].as_array().cloned().unwrap_or_default()
+                } else {
+                    vec![bundle]
+                };
+                let mut imported = Vec::new();
+                for b in bundles {
+                    let staged = crate::skills::prepare_bundle(&self.paths, &b)?;
+                    let info = self.with_store(|st| {
+                        crate::skills::commit(&self.paths, st, &staged, "import")
+                    })?;
+                    let _ = self.with_store(|st| st.audit("user", "skill.import", &info.name));
+                    imported.push(info);
+                }
+                self.broadcast(Event::SkillsChanged);
+                Ok(serde_json::to_value(imported)?)
+            }
             Request::ListMcpPrompts => {
                 let cfg = self.config()?;
                 let mut out = Vec::new();

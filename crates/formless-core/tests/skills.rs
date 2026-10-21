@@ -252,3 +252,41 @@ async fn the_agent_loads_enabled_skills() {
     .unwrap();
     assert_eq!(found["skills"][0]["name"], "report-writer");
 }
+
+#[test]
+fn skills_export_and_import_bundles() {
+    use formless_core::skills::{commit, export, prepare_bundle};
+    let paths = temp_paths("skbundle");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let src = paths.data_dir.join("src/report");
+    write_skill(&src, "report-writer", "Step 1: read the sheet.");
+    install(&paths, &store, src.to_str().unwrap(), None, None, "user").unwrap();
+    store.set_skill_enabled("report-writer", true).unwrap();
+
+    let bundle = export(&store, "report-writer").unwrap();
+    assert_eq!(bundle["format"], "formless.skill/1");
+    assert!(bundle.get("loads").is_none(), "no metrics in a bundle");
+
+    // Into a fresh install: author import, disabled, same files.
+    let other = temp_paths("skbundle2");
+    let store2 = Store::open(&other.db_file()).unwrap();
+    let staged = prepare_bundle(&other, &bundle).unwrap();
+    let info = commit(&other, &store2, &staged, "import").unwrap();
+    assert_eq!(
+        (info.version, info.enabled, info.has_scripts),
+        (1, false, true)
+    );
+    assert_eq!(
+        (info.author.as_str(), info.source.as_str()),
+        ("import", "import")
+    );
+    assert_eq!(
+        read_file(&store2, "report-writer", "scripts/fix.py").unwrap(),
+        "print('hi')"
+    );
+
+    // Paths that leave the folder are refused.
+    let mut evil = bundle.clone();
+    evil["files"][0]["path"] = "../escape.md".into();
+    assert!(prepare_bundle(&other, &evil).is_err());
+}

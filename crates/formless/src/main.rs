@@ -194,6 +194,18 @@ enum SkillsAction {
     Show {
         name: String,
     },
+    /// Write a skill (or --all) as a bundle file (no metrics)
+    Export {
+        name: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Install a bundle; imported skills start disabled for review
+    Import {
+        file: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1084,6 +1096,46 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
             println!("\nfiles:");
             for f in r["files"].as_array().into_iter().flatten() {
                 println!("  {}", f.as_str().unwrap_or_default());
+            }
+        }
+        SkillsAction::Export { name, all, output } => {
+            let bundle = if all {
+                daemon(Request::ExportSkills)?
+            } else {
+                let name = name.ok_or_else(|| anyhow::anyhow!("give a skill name or --all"))?;
+                daemon(Request::ExportSkill { name })?
+            };
+            let text = serde_json::to_string_pretty(&bundle)?;
+            match output {
+                Some(f) => {
+                    std::fs::write(&f, text)?;
+                    println!("wrote {f}");
+                }
+                None => println!("{text}"),
+            }
+        }
+        SkillsAction::Import { file } => {
+            let bundle: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+            let imported = daemon(Request::ImportSkill { bundle })?;
+            for info in imported.as_array().into_iter().flatten() {
+                let name = info["name"].as_str().unwrap_or_default();
+                println!(
+                    "imported {name} v{} (disabled) — {}",
+                    info["version"],
+                    info["description"].as_str().unwrap_or_default()
+                );
+                // Show the contents before the user enables it.
+                let r = daemon(Request::GetSkill {
+                    name: name.to_string(),
+                })?;
+                println!("{}", r["body"].as_str().unwrap_or_default());
+                for f in r["files"].as_array().into_iter().flatten() {
+                    println!("  {}", f.as_str().unwrap_or_default());
+                }
+                if info["has_scripts"] == true {
+                    println!("note: it bundles scripts; Formless never runs them on the host.");
+                }
+                println!("enable it with `formless skills enable {name}`\n");
             }
         }
     }
