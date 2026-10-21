@@ -533,7 +533,12 @@ None ship by default (principle 1).
   own name is kept on the version), with the `mcp:<server>` Capability. A
   changed tool list (`notifications/tools/list_changed`) re-syncs it:
   new tools are added, changed ones get a new version, vanished ones are
-  retired. They are found, listed, pinned and **measured** like Tools, but
+  retired. The registry changes at once, but a Session's listing only at
+  its safe points (§7.1): new tools are reached with `find_tools`, and a
+  tool the server dropped stays in the listing (as pinned) until the
+  Session's next compaction, so its cached prefix survives; calling it
+  reports that it is retired. They are found, listed, pinned and
+  **measured** like Tools, but
   run on the server, and the optimiser never rewrites them. The `mcp__`
   prefix is reserved.
 - **HTTP transport** (`transport = "http"`, `url`, static `headers`):
