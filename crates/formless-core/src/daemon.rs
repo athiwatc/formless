@@ -558,6 +558,20 @@ impl Daemon {
                 let _ = self.config();
                 Ok(json!({"key": key, "value": value, "restart_required": false}))
             }
+            Request::RevokeApproval {
+                tool_id,
+                capability,
+            } => {
+                if !self.with_store(|st| st.revoke_approval(&tool_id, capability.as_deref()))? {
+                    return Err(anyhow!("nothing to revoke"));
+                }
+                let what = format!("{tool_id} {}", capability.as_deref().unwrap_or("(all)"));
+                let _ = self.with_store(|st| st.audit("user", "tool.revoke", &what));
+                if let Ok(Some((tool, _))) = self.with_store(|st| st.get_tool_current(&tool_id)) {
+                    self.broadcast(Event::ToolUpdated { tool });
+                }
+                Ok(json!({"revoked": true}))
+            }
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
             )?),
@@ -3981,6 +3995,7 @@ impl Daemon {
             .lock()
             .unwrap()
             .insert(approval_id.clone(), tx);
+        let preview: String = ver.code.lines().take(15).collect::<Vec<_>>().join("\n");
         self.broadcast(Event::ApprovalRequested {
             approval_id: approval_id.clone(),
             session_id: session_id.to_string(),
@@ -3989,6 +4004,11 @@ impl Daemon {
             capabilities: caps.to_specs(),
             memory_mb: ver.memory_mb,
             detail,
+            already_allowed: prior
+                .as_ref()
+                .map(|(p, _)| p.to_specs())
+                .unwrap_or_default(),
+            code_preview: (!preview.is_empty()).then_some(preview),
         });
         let (approved, scope) = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
@@ -4727,6 +4747,8 @@ impl Daemon {
             capabilities: items,
             memory_mb: 0,
             detail: Some(detail),
+            already_allowed: Vec::new(),
+            code_preview: None,
         });
         let answer = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),

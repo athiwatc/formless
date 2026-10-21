@@ -317,6 +317,16 @@ pub struct ToolDetail {
     /// Metrics of each version, as (version, metrics).
     #[serde(default)]
     pub version_metrics: Vec<(i64, ToolMetricsInfo)>,
+    /// The accumulated approval grant, if any (SPEC §10.3).
+    #[serde(default)]
+    pub approval: Option<ApprovalGrant>,
+}
+
+/// What the user has allowed a Tool, accumulated across approvals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalGrant {
+    pub capabilities: Vec<String>,
+    pub memory_mb: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,6 +492,13 @@ pub enum Request {
     SetSetting {
         key: String,
         value: serde_json::Value,
+    },
+    /// Revoke one granted Capability spec of a Tool, or (without
+    /// `capability`) its whole grant; the next call asks again.
+    RevokeApproval {
+        tool_id: String,
+        #[serde(default)]
+        capability: Option<String>,
     },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
@@ -770,6 +787,12 @@ pub enum Event {
         /// alone (e.g. the command an agent wants to add as an MCP server).
         #[serde(default)]
         detail: Option<String>,
+        /// Capabilities this Tool already holds (so clients show what is new).
+        #[serde(default)]
+        already_allowed: Vec<String>,
+        /// The first lines of the Tool's code, to see what is being trusted.
+        #[serde(default)]
+        code_preview: Option<String>,
     },
     ToolUpdated {
         tool: ToolInfo,
@@ -925,6 +948,8 @@ mod tests {
             capabilities: vec![],
             memory_mb: 0,
             detail: None,
+            already_allowed: vec![],
+            code_preview: None,
         };
         assert_eq!(ev.session_id(), Some("s1"));
         let note = Event::Note {

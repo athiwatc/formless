@@ -1982,12 +1982,19 @@ impl Store {
             .iter()
             .map(|v| Ok((v.version, self.tool_metrics(id, Some(v.version))?)))
             .collect::<Result<Vec<_>>>()?;
+        let approval =
+            self.get_approval(id)?
+                .map(|(caps, memory_mb)| formless_protocol::ApprovalGrant {
+                    capabilities: caps.to_specs(),
+                    memory_mb,
+                });
         Ok(Some(formless_protocol::ToolDetail {
             tool,
             versions,
             metrics,
             optimiser_attempts,
             version_metrics,
+            approval,
         }))
     }
 
@@ -2459,6 +2466,33 @@ impl Store {
             ms_per_success: per_success(all_ms),
             tokens_per_success: per_success(all_tokens),
         })
+    }
+
+    /// Remove one Capability spec from a Tool's grant (or the whole grant
+    /// with `None`). Returns whether anything was revoked.
+    pub fn revoke_approval(&self, tool_id: &str, spec: Option<&str>) -> Result<bool> {
+        let Some(spec) = spec else {
+            return Ok(self
+                .conn
+                .execute("DELETE FROM approvals WHERE tool_id=?1", params![tool_id])?
+                > 0);
+        };
+        let Some((caps, mem)) = self.get_approval(tool_id)? else {
+            return Ok(false);
+        };
+        let specs = caps.to_specs();
+        if !specs.iter().any(|s| s == spec) {
+            return Ok(false);
+        }
+        let rest: Vec<String> = specs.into_iter().filter(|s| s != spec).collect();
+        if rest.is_empty() {
+            self.conn
+                .execute("DELETE FROM approvals WHERE tool_id=?1", params![tool_id])?;
+        } else {
+            let caps = Capabilities::parse(&rest).map_err(|e| anyhow::anyhow!(e))?;
+            self.set_approval(tool_id, &caps, mem)?;
+        }
+        Ok(true)
     }
 
     pub fn get_approval(&self, tool_id: &str) -> Result<Option<(Capabilities, u32)>> {

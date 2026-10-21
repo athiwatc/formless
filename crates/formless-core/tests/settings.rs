@@ -82,3 +82,82 @@ async fn the_daemon_writes_the_file_without_env_overrides() {
         true
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_grants_show_in_tool_detail_and_revoke_per_item() {
+    use formless_runtime::Capabilities;
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-grant-{short}"));
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-grant-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    Config::default().save(&paths).unwrap();
+    let store = formless_core::Store::open(&paths.db_file()).unwrap();
+    let caps = Capabilities::parse(&["net:a.example".into(), "net:b.example".into()]).unwrap();
+    let (tool, _) = store
+        .create_tool_version(
+            "fetcher",
+            "d",
+            "{}",
+            "{}",
+            "function run(i){return i;}",
+            &caps,
+            64,
+            "agent",
+        )
+        .unwrap();
+    store.set_approval(&tool.id, &caps, 64).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let detail = daemon
+        .handle(Request::GetTool {
+            id: tool.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["approval"]["capabilities"],
+        serde_json::json!(["net:a.example", "net:b.example"])
+    );
+    daemon
+        .handle(Request::RevokeApproval {
+            tool_id: tool.id.clone(),
+            capability: Some("net:a.example".into()),
+        })
+        .await
+        .unwrap();
+    let detail = daemon
+        .handle(Request::GetTool {
+            id: tool.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["approval"]["capabilities"],
+        serde_json::json!(["net:b.example"])
+    );
+    assert!(daemon
+        .handle(Request::RevokeApproval {
+            tool_id: tool.id.clone(),
+            capability: Some("net:zzz".into())
+        })
+        .await
+        .is_err());
+    daemon
+        .handle(Request::RevokeApproval {
+            tool_id: tool.id.clone(),
+            capability: None,
+        })
+        .await
+        .unwrap();
+    let detail = daemon
+        .handle(Request::GetTool {
+            id: tool.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(detail["approval"].is_null());
+}

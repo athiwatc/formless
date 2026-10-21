@@ -1161,6 +1161,16 @@ run_tool = "network_policy"     # a registry Tool, or…
   default for clients that omit it) stores the grant as above; **once**
   (`o`) allows only the waiting call and stores nothing, so the next call
   asks again. Headless `--yes` answers every prompt with *once*.
+- The prompt (`ApprovalRequested`) carries `already_allowed`, the Tool's
+  current grant. Clients mark those Capabilities "already allowed" and the
+  rest "new". It also carries `code_preview`, the first 15 lines of the
+  Tool's code, so the user sees what they are trusting.
+- **Grants and revoking:** a Tool's detail (`GetTool`) includes its
+  accumulated grant (`approval`: Capabilities and memory).
+  `RevokeApproval {tool_id, capability?}` removes one Capability spec or
+  the whole grant; the next call that needs it asks again. Revokes are
+  audit-logged. Clients: TUI `/revoke NAME [CAPABILITY]` and the Tool
+  detail's "Approved" list; web Tool detail × per item and "Revoke all".
 
 ### 10.4 Sessions, Tools, and Settings views
 

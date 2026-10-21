@@ -1051,8 +1051,11 @@
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
       h("ul", null,
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
-          h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " unscoped — broad access") : null)),
+          (req.already || []).includes(c)
+            ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
+            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " unscoped — broad access") : (req.already || []).length ? h("span", null, " new") : null)),
         req.detail ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
+      req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
@@ -1136,7 +1139,13 @@
           ? h("span", { class: "version current", title: "current" }, "v" + v.version + " " + v.author)
           : h("button", { class: "version", type: "button", title: "Roll back to v" + v.version, onclick: () => rollbackTool(t, v.version) }, "v" + v.version + " " + v.author)))),
       h("dt", null, "Capabilities"), h("dd", null, capTags(t.capabilities)),
-      h("dt", null, "Memory"), h("dd", null, t.memory_mb + " MB")));
+      h("dt", null, "Memory"), h("dd", null, t.memory_mb + " MB"),
+      h("dt", null, "Approved"), h("dd", null, d.approval
+        ? h("div", null,
+            d.approval.capabilities.map((c) => h("span", { class: "tag" }, c,
+              h("button", { class: "btn ghost small", type: "button", title: "Revoke " + c, onclick: () => revokeApproval(t, c) }, "×"))),
+            h("button", { class: "btn small", type: "button", onclick: () => revokeApproval(t, null) }, "Revoke all"))
+        : h("span", { class: "muted" }, "nothing yet (asks on first sensitive call)"))));
     box.append(metricsBlock(d.metrics));
     const idx = d.versions.findIndex((v) => v.version === t.current_version);
     if (idx > 0) {
@@ -1461,6 +1470,10 @@
     renderView();
     renderStatus();
   }
+  async function revokeApproval(t, capability) {
+    if (!(await ask({ title: "Revoke " + (capability || "every approval") + " for " + t.name + "?", text: "The next call that needs it asks again.", ok: "Revoke", danger: true }))) return;
+    if (await act({ type: "revoke_approval", tool_id: t.id, capability }, "Revoked")) selectTool(t.id, true);
+  }
   async function selectTool(id, quiet) {
     S.selectedTool = id;
     if (!quiet && S.editingCode && S.editingCode.toolId !== id) S.editingCode = null;
@@ -1769,7 +1782,8 @@
         if (S.questionId === ev.question_id) { S.questionId = null; closeAsk(null); }
         break;
       case "approval_requested":
-        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null });
+        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
+          already: ev.already_allowed || [], code: ev.code_preview || null });
         if (here) setActivity("awaiting your approval");
         renderApproval();
         break;
