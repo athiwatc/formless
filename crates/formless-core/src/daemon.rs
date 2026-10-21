@@ -2716,6 +2716,25 @@ impl Daemon {
     fn remember_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let text = args["text"].as_str().context("text required")?;
         let scope = args["scope"].as_str().unwrap_or("global");
+        // Never store Tool output verbatim (SPEC §7.11): it may carry data
+        // the user never meant to keep, and it reaches every Session.
+        let cleaned = crate::memory::clean(text);
+        if cleaned.chars().count() >= 40 {
+            let copied = self.with_store(|st| {
+                Ok(st
+                    .list_messages(session_id)?
+                    .iter()
+                    .rev()
+                    .filter(|m| m.role == "tool")
+                    .take(50)
+                    .any(|m| crate::memory::clean(&m.content).contains(&cleaned)))
+            })?;
+            if copied {
+                return Err(anyhow!(
+                    "refused: that text is copied from a Tool result; remember the user's preference in your own words instead"
+                ));
+            }
+        }
         let (m, created) =
             self.with_store(|st| st.add_memory(text, scope, "agent", Some(session_id)))?;
         let _ = self.with_store(|st| st.audit("agent", "memory.remember", &m.id));

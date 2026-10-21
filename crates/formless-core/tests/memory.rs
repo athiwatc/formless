@@ -142,3 +142,68 @@ async fn users_list_add_edit_and_delete_memories() {
         serde_json::json!([])
     );
 }
+
+#[test]
+fn secrets_are_refused() {
+    use formless_core::memory::find_secret;
+    for secret in [
+        "My OpenAI key is sk-proj-abcdefghijklmnop1234567890",
+        "use ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 for GitHub",
+        "AWS: AKIAIOSFODNN7EXAMPLE",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+        "password is hunter2!",
+        "db password: correct-horse",
+        "api_key=abcd1234",
+        "token aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG",
+        "-----BEGIN RSA PRIVATE KEY----- MIIE",
+        "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcDEF123",
+    ] {
+        assert!(find_secret(secret).is_some(), "missed: {secret}");
+    }
+    for fine in [
+        "Uses pnpm, not npm",
+        "Answer in Thai",
+        "Projects live in ~/code and tests run with make check",
+        "Prefers the password manager over typing passwords",
+        "Commit 3f2a9c1b4d5e6f708192a3b4c5d6e7f8091a2b3c is the baseline",
+        "Reset tokens expire after an hour in their app",
+    ] {
+        assert_eq!(find_secret(fine), None, "false positive: {fine}");
+    }
+    let store = Store::open_in_memory().unwrap();
+    let err = store
+        .add_memory("my password is hunter22", "global", "user", None)
+        .unwrap_err();
+    assert!(err.to_string().contains("secret"), "{err}");
+    let (m, _) = store
+        .add_memory("Uses pnpm", "global", "user", None)
+        .unwrap();
+    assert!(store
+        .update_memory(&m.id, Some("token: abcdef123456"), None, None)
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_output_is_never_remembered_verbatim() {
+    let paths = temp_paths("memtool");
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap().id;
+    store
+        .append_message(
+            &s,
+            "tool",
+            "Customer record: Jane Example lives at 12 Sample Road and owes 300 dollars",
+        )
+        .unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let out = daemon
+        .call_tool_direct(
+            &s,
+            "remember",
+            serde_json::json!({"text": "Jane Example lives at 12 Sample Road and owes 300 dollars"}),
+        )
+        .await;
+    assert!(out.contains("copied from a Tool result"), "{out}");
+    assert!(store.list_memories().unwrap().is_empty());
+}
