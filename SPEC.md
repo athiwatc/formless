@@ -512,6 +512,33 @@ pattern (§4.4).
   approval applies (§10.3), metrics start at zero, author recorded as
   `import`. A name collision imports as a new Tool, never a silent overwrite.
 
+### 7.9 External MCP servers
+
+Formless can use the tools of external MCP servers alongside its own.
+None ship by default (principle 1).
+
+- **Config:** `[mcp.servers.<name>]` in `config.toml`: `command`, `args`,
+  `cwd`, `env` (literal values), `env_keys` (daemon variables passed
+  through; never `FORMLESS_*`), `disabled`; `mcp.idle_secs` (300).
+- **stdio transport:** the daemon spawns the server in its own process
+  group with a minimal environment (as `process.run`, §7.4), speaks
+  newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`),
+  answers the server's `ping`, and writes its stderr to
+  `<data>/mcp/<name>.log`. Servers start on first use, stop after
+  `idle_secs` without calls, and a crashed server is simply started again
+  on the next call (the failed call is a failed Invocation, never a hung
+  Run). Cancelling an Invocation sends `notifications/cancelled`.
+- **Registry:** at daemon start each enabled server's tools are listed into
+  the registry as `mcp__<server>__<tool>` (provider-safe name; the server's
+  own name is kept on the version), with the `mcp:<server>` Capability. A
+  changed tool list (`notifications/tools/list_changed`) re-syncs it:
+  new tools are added, changed ones get a new version, vanished ones are
+  retired. They are found, listed, pinned and **measured** like Tools, but
+  run on the server, and the optimiser never rewrites them. The `mcp__`
+  prefix is reserved.
+- `mcp:<server>` is sensitive: calls need approval (§10.3) and headless
+  calls fail closed.
+
 ## 8. Metrics and Self-Optimisation
 
 ### 8.1 What is measured (per Tool, pooled across all Sessions)

@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod diff;
 pub mod logs;
+pub mod mcp;
 pub mod namer;
 pub mod optimiser;
 pub mod paths;

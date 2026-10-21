@@ -283,7 +283,8 @@ impl Daemon {
         let Ok(Some((info, ver))) = self.with_store(|st| st.get_tool_current(tool_id)) else {
             return;
         };
-        if !self.guardrails_ok(&info, cfg) {
+        // MCP tools run on their server: there is no code to rewrite.
+        if info.name.starts_with(crate::mcp::PREFIX) || !self.guardrails_ok(&info, cfg) {
             return;
         }
         self.activity(&info.name, "generating candidate…".into());

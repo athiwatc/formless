@@ -412,6 +412,19 @@ function run(input) {
 
 ---
 
+### MCP servers
+
+Formless can also call the tools of external [MCP](https://modelcontextprotocol.io) servers. Add a stdio server to `config.toml`:
+
+```toml
+[mcp.servers.files]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/notes"]
+env_keys = ["GITHUB_TOKEN"]   # daemon variables to pass through; nothing else is
+```
+
+Its tools appear in the registry as `mcp__files__<tool>`. The agent finds them with `find_tools`, calls need approval like any sensitive Tool, and every call is measured. Servers start on first use and stop when idle (`mcp.idle_secs`); their stderr goes to `<data>/mcp/<name>.log`.
+
 ## 6. Invocations: async by design
 
 * Every Tool call is an **Invocation**: one Tool version, one input, recorded and measured.

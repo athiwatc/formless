@@ -18,6 +18,46 @@ pub struct Config {
     pub tui: TuiCfg,
     pub naming: NamingCfg,
     pub artifacts: ArtifactsCfg,
+    pub mcp: McpCfg,
+}
+
+/// External MCP servers ((SPEC §7.9)). None ship by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpCfg {
+    /// Stop a server's process after this long without calls (it restarts
+    /// on the next one).
+    pub idle_secs: u64,
+    pub servers: BTreeMap<String, McpServerCfg>,
+}
+impl Default for McpCfg {
+    fn default() -> Self {
+        Self {
+            idle_secs: 300,
+            servers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct McpServerCfg {
+    /// "stdio" (default) or "http".
+    pub transport: String,
+    /// stdio: the program and its arguments.
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    /// stdio: literal environment values for the server.
+    pub env: BTreeMap<String, String>,
+    /// stdio: names of daemon environment variables passed through (never
+    /// `FORMLESS_*`); nothing else of the daemon's environment is.
+    pub env_keys: Vec<String>,
+    /// http: the endpoint, plus static headers.
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    /// Disabled servers keep their config but are never started.
+    pub disabled: bool,
 }
 
 /// Retention for stored Tool outputs (SPEC §9.6). 0 disables a limit.
