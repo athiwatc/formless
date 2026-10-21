@@ -103,6 +103,8 @@ enum Io {
         url: String,
         headers: Vec<(String, String)>,
         session: StdMutex<Option<String>>,
+        /// For OAuth tokens (`formless mcp login`): (paths, server name).
+        auth: (Paths, String),
     },
     /// Legacy HTTP+SSE: answers arrive on a long-lived GET event stream;
     /// messages are POSTed to the endpoint it announced.
@@ -189,7 +191,7 @@ impl Connection {
         let conn = match cfg.transport.as_str() {
             "" | "stdio" => Self::spawn_stdio(paths, name, cfg)?,
             "http" => {
-                let conn = Self::http(cfg)?;
+                let conn = Self::http(paths, name, cfg)?;
                 match conn.initialize().await {
                     Ok(()) => return Ok(conn),
                     // An older server: fall back to HTTP+SSE.
@@ -299,7 +301,7 @@ impl Connection {
         Ok(conn)
     }
 
-    fn http(cfg: &McpServerCfg) -> Result<Arc<Self>> {
+    fn http(paths: &Paths, name: &str, cfg: &McpServerCfg) -> Result<Arc<Self>> {
         if cfg.url.is_empty() {
             return Err(anyhow!("an http MCP server needs a url"));
         }
@@ -309,6 +311,7 @@ impl Connection {
                 url: cfg.url.clone(),
                 headers: cfg.headers.clone().into_iter().collect(),
                 session: StdMutex::new(None),
+                auth: (paths.clone(), name.to_string()),
             },
             Default::default(),
             Arc::new(AtomicBool::new(true)),
@@ -424,10 +427,22 @@ impl Connection {
             url,
             headers,
             session,
+            auth: (paths, server),
         } = &self.io
         else {
             return Err(anyhow!("not an HTTP connection"));
         };
+        // A stored OAuth login supplies the bearer token, unless the config
+        // sets Authorization itself.
+        let fixed_auth = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+        let mut bearer = if fixed_auth {
+            None
+        } else {
+            crate::mcp_auth::bearer(paths, server).await?
+        };
+        let mut refreshed = false;
         let mut attempt = 0u32;
         let resp = loop {
             let mut req = with_headers(client.post(url), headers)
@@ -437,8 +452,21 @@ impl Connection {
             if let Some(id) = session.lock().unwrap().clone() {
                 req = req.header("mcp-session-id", id);
             }
+            if let Some(token) = &bearer {
+                req = req.bearer_auth(token);
+            }
             let resp = req.send().await?;
             let status = resp.status().as_u16();
+            if status == 401 && !fixed_auth {
+                if bearer.is_some() && !refreshed {
+                    refreshed = true;
+                    bearer = Some(crate::mcp_auth::refresh(paths, server).await?);
+                    continue;
+                }
+                return Err(anyhow!(
+                    "MCP server '{server}' needs authorization: run `formless mcp login {server}`"
+                ));
+            }
             if (status == 429 || resp.status().is_server_error()) && attempt < 3 {
                 let wait = 250u64 << attempt;
                 tokio::time::sleep(std::time::Duration::from_millis(

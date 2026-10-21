@@ -34,6 +34,11 @@ enum Cmd {
     Doctor,
     /// Apply artifact retention now (artifacts.max_total_mb / max_age_days)
     Gc,
+    /// External MCP servers (SPEC §7.9)
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Provider credential login/status/logout (API key or OAuth)
     Auth {
         #[command(subcommand)]
@@ -156,6 +161,14 @@ enum ToolsAction {
 }
 
 #[derive(Subcommand)]
+enum McpAction {
+    /// Authorize Formless with a remote (http) MCP server via OAuth
+    Login { server: String },
+    /// Delete a server's stored OAuth tokens
+    Logout { server: String },
+}
+
+#[derive(Subcommand)]
 enum NamingAction {
     /// Show the configured model and whether it is installed
     Status,
@@ -189,6 +202,7 @@ fn main() -> Result<()> {
         None | Some(Cmd::Tui) => formless_tui::run(paths),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Doctor) => doctor(paths),
+        Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Gc) => {
             let cfg = Config::load(&paths)?;
             let store = formless_core::Store::open(&paths.db_file())?;
@@ -919,6 +933,29 @@ fn count_sigints() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         })
     });
     count
+}
+
+fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
+    let cfg = Config::load(&paths)?;
+    match action {
+        McpAction::Login { server } => {
+            let scfg = cfg
+                .mcp
+                .servers
+                .get(&server)
+                .with_context(|| format!("no MCP server '{server}' in config.toml"))?;
+            formless_core::mcp_auth::login(&paths, &server, scfg, |url| {
+                println!("Open this URL in a browser on this machine to authorize Formless:\n\n  {url}\n");
+                let _ = open_browser(url);
+            })?;
+            println!("Logged in to '{server}'.");
+        }
+        McpAction::Logout { server } => {
+            formless_core::mcp_auth::logout(&paths, &server);
+            println!("Deleted stored OAuth tokens for '{server}'.");
+        }
+    }
+    Ok(())
 }
 
 fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
