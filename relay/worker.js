@@ -6,6 +6,12 @@
 // headers below (the page URL carries the key, so no inline script runs).
 // The room id is a truncated SHA-256 of the pairing key, so knowing a
 // room does not reveal the key. Deployed at formless.athiwat.xyz.
+//
+// A daemon that connects with ?mux=1 gets one logical connection per
+// browser: each client socket has an id (cid), the daemon is told
+// {"relay":"client_open"|"client_close","cid"}, browser frames reach it as
+// {"cid","f":<frame>}, and its {"cid","f"} replies go to that browser only.
+// Older daemons (no mux) still get raw frames fanned out to every client.
 
 export class RelayRoom {
   constructor(state, env) {
@@ -15,6 +21,19 @@ export class RelayRoom {
 
   sockets(role) {
     return this.state.getWebSockets(role).filter((ws) => ws.readyState === 1);
+  }
+
+  attachment(ws) {
+    try { return ws.deserializeAttachment() || {}; } catch (_) { return {}; }
+  }
+
+  /** The connected daemon socket if it speaks the multiplexed protocol. */
+  muxDaemon() {
+    return this.sockets("daemon").find((ws) => this.attachment(ws).mux) || null;
+  }
+
+  notifyDaemon(daemon, kind, cid) {
+    try { daemon.send(JSON.stringify({ relay: kind, cid: cid })); } catch (_) {}
   }
 
   notifyClients(kind) {
@@ -36,10 +55,20 @@ export class RelayRoom {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    this.state.acceptWebSocket(server, [role]);
-    server.serializeAttachment({ role: role });
-    if (role === "daemon") this.notifyClients("daemon_online");
-    if (role === "client") {
+    if (role === "daemon") {
+      const mux = url.searchParams.get("mux") === "1";
+      this.state.acceptWebSocket(server, [role]);
+      server.serializeAttachment({ role: role, mux: mux });
+      if (mux) {
+        for (const ws of this.sockets("client")) this.notifyDaemon(server, "client_open", this.attachment(ws).cid);
+      }
+      this.notifyClients("daemon_online");
+    } else {
+      const cid = crypto.randomUUID();
+      this.state.acceptWebSocket(server, [role, cid]);
+      server.serializeAttachment({ role: role, cid: cid });
+      const daemon = this.muxDaemon();
+      if (daemon) this.notifyDaemon(daemon, "client_open", cid);
       const online = this.sockets("daemon").length > 0;
       try { server.send(JSON.stringify({ relay: online ? "daemon_online" : "daemon_offline" })); } catch (_) {}
     }
@@ -48,18 +77,37 @@ export class RelayRoom {
 
   async webSocketMessage(ws, message) {
     if (typeof message !== "string") return;
-    let role = "client";
-    try { role = (ws.deserializeAttachment() || {}).role || "client"; } catch (_) {}
-    const targets = this.sockets(role === "daemon" ? "client" : "daemon");
-    for (const target of targets) {
-      try { target.send(message); } catch (_) {}
+    const att = this.attachment(ws);
+    if (att.role === "daemon") {
+      let routed = null;
+      if (att.mux) {
+        try { routed = JSON.parse(message); } catch (_) {}
+      }
+      if (routed && typeof routed.cid === "string" && typeof routed.f === "string") {
+        for (const target of this.state.getWebSockets(routed.cid)) {
+          try { target.send(routed.f); } catch (_) {}
+        }
+        return;
+      }
+      for (const target of this.sockets("client")) {
+        try { target.send(message); } catch (_) {}
+      }
+      return;
+    }
+    for (const daemon of this.sockets("daemon")) {
+      const frame = this.attachment(daemon).mux ? JSON.stringify({ cid: att.cid, f: message }) : message;
+      try { daemon.send(frame); } catch (_) {}
     }
   }
 
   async webSocketClose(ws) {
-    let role = "client";
-    try { role = (ws.deserializeAttachment() || {}).role || "client"; } catch (_) {}
-    if (role === "daemon") this.notifyClients("daemon_offline");
+    const att = this.attachment(ws);
+    if (att.role === "daemon") {
+      this.notifyClients("daemon_offline");
+      return;
+    }
+    const daemon = this.muxDaemon();
+    if (daemon && att.cid) this.notifyDaemon(daemon, "client_close", att.cid);
   }
 
   async webSocketError(ws) {

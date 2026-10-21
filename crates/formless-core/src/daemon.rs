@@ -92,6 +92,13 @@ impl Daemon {
         })
     }
 
+    /// Connected clients that receive events (and can answer approvals).
+    pub fn subscriber_count(&self) -> usize {
+        let mut subs = self.subs.lock().unwrap();
+        subs.retain(|tx| !tx.is_closed());
+        subs.len()
+    }
+
     pub(crate) fn broadcast(&self, ev: Event) {
         send_all(&self.subs, ev);
     }
@@ -1922,8 +1929,7 @@ impl Daemon {
             }
         }
         // Fail closed when nobody can answer (SPEC §12 headless rule).
-        self.subs.lock().unwrap().retain(|tx| !tx.is_closed());
-        if self.subs.lock().unwrap().is_empty() {
+        if self.subscriber_count() == 0 {
             return false;
         }
         let approval_id = uuid::Uuid::new_v4().to_string();
@@ -2455,8 +2461,6 @@ impl Daemon {
             if grace == u64::MAX {
                 continue; // idle-close disabled (used by explicit foreground serve in tests)
             }
-            // Prune subscribers whose client disconnected (receiver dropped).
-            self.subs.lock().unwrap().retain(|tx| !tx.is_closed());
             let pending_running = self
                 .pending
                 .lock()
@@ -2488,7 +2492,7 @@ impl Daemon {
             }
             let busy = pending_running
                 || !self.runs.lock().unwrap().is_empty()
-                || !self.subs.lock().unwrap().is_empty();
+                || self.subscriber_count() > 0;
             if busy {
                 idle_since = None;
             } else {

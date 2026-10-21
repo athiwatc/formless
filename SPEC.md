@@ -772,7 +772,12 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   `relay/`) forwards only opaque AES-256-GCM ciphertext: the pairing
   secret (32 random bytes, keychain + `0600` file, never in config) is
   the key, and the room id is a truncated SHA-256 of it, so the Relay
-  can neither read traffic nor derive the key. The browser URL carries
+  can neither read traffic nor derive the key. The daemon connects with
+  `?mux=1`: the Relay gives every browser a client id, announces
+  `client_open`/`client_close`, and routes `{cid, f}` frames, so each
+  browser has its own daemon connection. The relay link itself is not a
+  subscriber: with no browser attached, approvals fail closed and the
+  daemon can idle-close. The browser URL carries
   the secret in the `#k=` fragment, which is never sent to a server.
   `--rotate` invalidates old links. The hosted Web frontend is a full
   client with TUI feature parity — Sessions (new, fork, rename, delete,

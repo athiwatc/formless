@@ -1,7 +1,7 @@
 // Local stand-in for the Cloudflare Worker, for developing the Web frontend
 // without deploying: serves web/ with the production security headers and
-// implements the same relay room semantics (one daemon per room, frames
-// forwarded verbatim, daemon_online/offline notices). No dependencies.
+// implements the same relay room semantics (one daemon per room, per-client
+// routing for ?mux=1 daemons, daemon_online/offline notices). No dependencies.
 //
 //   node relay/dev.mjs [--port 8787] [--mock-provider]
 //
@@ -13,7 +13,7 @@
 // profile at it: provider.base_url = "http://127.0.0.1:8787/mock/v1",
 // relay.url = "ws://127.0.0.1:8787".
 import { createServer } from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,24 +75,38 @@ function close(conn) {
 }
 
 // ----------------------------------------------------------------- rooms
-const rooms = new Map(); // room -> { daemon, clients:Set }
-function joinRoom(room, role, conn, reject) {
-  const r = rooms.get(room) || { daemon: null, clients: new Set() };
+const rooms = new Map(); // room -> { daemon, mux, clients:Map<cid, conn> }
+function joinRoom(room, role, conn, reject, mux) {
+  const r = rooms.get(room) || { daemon: null, mux: false, clients: new Map() };
   rooms.set(room, r);
+  const notifyDaemon = (kind, cid) => { if (r.daemon && r.mux) sendText(r.daemon, JSON.stringify({ relay: kind, cid })); };
   if (role === "daemon") {
     if (r.daemon) return reject();
     r.daemon = conn;
-    for (const c of r.clients) sendText(c, JSON.stringify({ relay: "daemon_online" }));
-    conn.onText = (t) => { for (const c of r.clients) sendText(c, t); };
+    r.mux = mux;
+    for (const cid of r.clients.keys()) notifyDaemon("client_open", cid);
+    for (const c of r.clients.values()) sendText(c, JSON.stringify({ relay: "daemon_online" }));
+    conn.onText = (t) => {
+      let routed = null;
+      if (r.mux) { try { routed = JSON.parse(t); } catch (_) {} }
+      if (routed && typeof routed.cid === "string" && typeof routed.f === "string") {
+        const c = r.clients.get(routed.cid);
+        if (c) sendText(c, routed.f);
+        return;
+      }
+      for (const c of r.clients.values()) sendText(c, t);
+    };
     conn.onClose = () => {
       r.daemon = null;
-      for (const c of r.clients) sendText(c, JSON.stringify({ relay: "daemon_offline" }));
+      for (const c of r.clients.values()) sendText(c, JSON.stringify({ relay: "daemon_offline" }));
     };
   } else {
-    r.clients.add(conn);
+    const cid = randomUUID();
+    r.clients.set(cid, conn);
+    notifyDaemon("client_open", cid);
     sendText(conn, JSON.stringify({ relay: r.daemon ? "daemon_online" : "daemon_offline" }));
-    conn.onText = (t) => { if (r.daemon) sendText(r.daemon, t); };
-    conn.onClose = () => r.clients.delete(conn);
+    conn.onText = (t) => { if (r.daemon) sendText(r.daemon, r.mux ? JSON.stringify({ cid, f: t }) : t); };
+    conn.onClose = () => { r.clients.delete(cid); notifyDaemon("client_close", cid); };
   }
   console.log("relay: " + role + " joined " + room.slice(0, 8) + "… (" + r.clients.size + " client(s), daemon " + (r.daemon ? "online" : "offline") + ")");
 }
@@ -193,13 +207,14 @@ const server = createServer(async (req, res) => {
 server.on("upgrade", (req, socket) => {
   const m = new URL(req.url, "http://localhost").pathname.match(/^\/relay\/([a-f0-9]{32})$/);
   if (!m) return socket.destroy();
-  const role = new URL(req.url, "http://localhost").searchParams.get("role") === "daemon" ? "daemon" : "client";
+  const params = new URL(req.url, "http://localhost").searchParams;
+  const role = params.get("role") === "daemon" ? "daemon" : "client";
   const r = rooms.get(m[1]);
   if (role === "daemon" && r && r.daemon) {
     socket.end("HTTP/1.1 409 Conflict\r\n\r\n");
     return;
   }
-  joinRoom(m[1], role, wsAccept(req, socket), () => socket.destroy());
+  joinRoom(m[1], role, wsAccept(req, socket), () => socket.destroy(), params.get("mux") === "1");
 });
 server.listen(port, "127.0.0.1", () => {
   console.log("formless dev relay on http://127.0.0.1:" + port + (mock ? " (mock provider at /mock/v1)" : ""));
