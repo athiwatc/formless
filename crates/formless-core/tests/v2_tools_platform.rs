@@ -143,3 +143,50 @@ fn module_fingerprint_changes_with_every_module_write() {
         "module.exports = 2;"
     );
 }
+
+#[test]
+fn version_diffs_show_only_what_changed() {
+    use formless_core::diff::{line_diff, version_diff};
+    let d = line_diff("a\nb\nc\n", "a\nB\nc\nd\n");
+    assert_eq!(
+        d,
+        vec![
+            (' ', "a".into()),
+            ('-', "b".into()),
+            ('+', "B".into()),
+            (' ', "c".into()),
+            ('+', "d".into())
+        ]
+    );
+    let v = |version: i64, code: &str, caps: &[&str]| formless_protocol::ToolVersionInfo {
+        version,
+        author: "agent".into(),
+        created_at: String::new(),
+        capabilities: caps.iter().map(|s| s.to_string()).collect(),
+        memory_mb: 256,
+        input_schema: r#"{"type":"object"}"#.into(),
+        output_schema: "{}".into(),
+        code: code.into(),
+    };
+    let text = version_diff(
+        &v(1, "function run(i) {\n  return 1;\n}", &["net"]),
+        &v(2, "function run(i) {\n  return 2;\n}", &["net:example.com"]),
+    );
+    assert!(text.contains("@@ code (v1 → v2)"), "{text}");
+    assert!(
+        text.contains("-   return 1;") && text.contains("+   return 2;"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@@ capabilities") && text.contains("+ net:example.com"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("input_schema"),
+        "unchanged sections are left out: {text}"
+    );
+    assert_eq!(
+        version_diff(&v(1, "x", &[]), &v(2, "x", &[])),
+        "(no changes)"
+    );
+}

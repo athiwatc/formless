@@ -307,9 +307,10 @@ pattern (§4.4).
     other Sessions' artifacts are refused.
   - `unload_tools(names)` — drop Tools from the Session's listing at its
     next compaction.
-  - `read_tool(name, version?)` — the full definition (code, schemas,
-    Capabilities, `memory_mb`), version list, metrics and the last few
-    failures, so a new version is built from the real code.
+  - `read_tool(name, version?, diff_from?)` — the full definition (code,
+    schemas, Capabilities, `memory_mb`), version list, metrics and the last
+    few failures, so a new version is built from the real code; with
+    `diff_from`, also what changed since that version.
   - `test_tool(input, name? | draft)` — dry-runs a saved Tool or an
     unsaved draft (the `create_tool` fields) live on a real input, with
     approval as for a normal call. Neither saved nor recorded as an

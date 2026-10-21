@@ -1132,6 +1132,17 @@
       h("dt", null, "Capabilities"), h("dd", null, capTags(t.capabilities)),
       h("dt", null, "Memory"), h("dd", null, t.memory_mb + " MB")));
     box.append(metricsBlock(d.metrics));
+    const idx = d.versions.findIndex((v) => v.version === t.current_version);
+    if (idx > 0) {
+      // What the current version changed (optimiser promotion or agent edit).
+      const from = d.versions[idx - 1].version;
+      const pre = h("pre", { class: "diff" }, "loading…");
+      box.append(h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + t.current_version), pre));
+      request({ type: "diff_tool_versions", id: t.id, from, to: t.current_version }).then((r) => {
+        pre.replaceChildren(...String(r.diff).split("\n").map((l) =>
+          h("div", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : l[0] === "@" ? "muted" : null }, l)));
+      }).catch((e) => { pre.textContent = String(e.message || e); });
+    }
     const editing = S.editingCode && S.editingCode.toolId === t.id;
     box.append(h("div", { class: "detail-actions" },
       editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "" }; renderTools(); } }, "Edit code"),

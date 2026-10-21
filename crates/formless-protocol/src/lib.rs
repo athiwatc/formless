@@ -261,6 +261,12 @@ pub enum Request {
     ListSubagents {
         session_id: String,
     },
+    /// What changed between two versions of a Tool, as diff text.
+    DiffToolVersions {
+        id: String,
+        from: i64,
+        to: i64,
+    },
     /// A sub-agent and its transcript (provider-shaped messages).
     GetSubagent {
         id: String,
