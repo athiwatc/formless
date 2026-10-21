@@ -116,6 +116,26 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// A scheduled job (SPEC §9.7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobInfo {
+    pub id: String,
+    pub prompt: String,
+    /// Run in this Session; None starts a new Session each time.
+    pub session_id: Option<String>,
+    /// Recurring schedule (5-field cron, local time); None is one-shot.
+    pub cron: Option<String>,
+    pub next_run: Option<String>,
+    pub last_run: Option<String>,
+    pub last_status: String,
+    pub enabled: bool,
+    /// Recurring jobs the agent created wait for the user's approval.
+    pub approved: bool,
+    /// "user" or "agent".
+    pub author: String,
+    pub created_at: String,
+}
+
 /// A built-in's measured use (SPEC §8.8).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct BuiltinStatInfo {
@@ -422,6 +442,26 @@ pub enum Request {
     },
     /// Built-in call stats (SPEC §8.8).
     ListBuiltinStats,
+    /// Scheduled jobs (SPEC §9.7).
+    ListJobs,
+    /// Add a job as the user (approved): `cron` for recurring, else `at`.
+    AddJob {
+        prompt: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        cron: Option<String>,
+        #[serde(default)]
+        at: Option<String>,
+    },
+    /// Enabling also approves an agent-created recurring job.
+    SetJobEnabled {
+        id: String,
+        enabled: bool,
+    },
+    DeleteJob {
+        id: String,
+    },
     /// Answer an `ask_user` question (first answer wins).
     AnswerQuestion {
         question_id: String,
@@ -746,6 +786,8 @@ pub enum Event {
     SkillsChanged,
     /// User memory changed (SPEC §7.11).
     MemoryUpdated,
+    /// Scheduled jobs changed (SPEC §9.7).
+    JobsChanged,
     /// A stalled Invocation is active again (clears the stall flag).
     InvocationActivity {
         session_id: String,
@@ -797,6 +839,7 @@ impl Event {
             | Event::McpServersChanged
             | Event::SkillsChanged
             | Event::MemoryUpdated
+            | Event::JobsChanged
             | Event::UserQuestionClosed { .. }
             | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }

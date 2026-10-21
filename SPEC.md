@@ -312,6 +312,7 @@ pattern (§4.4).
   `create_tool`, `create_module`, `retire_tool`,
   `find_tools`, `read_tool`, `read_module`, `read_artifact`, `test_tool`,
   `unload_tools`, `remember`, `forget` (§7.11), `ask_user` (§5.5),
+  `schedule_run` (§9.7),
   and the Pending Invocation handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
   former built-in; sub-agents are now the `agent` Capability, §7.6), so no
   registry Tool can impersonate one.
@@ -952,6 +953,36 @@ and the TUI Metrics view shows them in a "Built-ins" table.
   `artifacts.max_age_days` (30) are removed, then the oldest beyond
   `artifacts.max_total_mb` (1024), at daemon start and hourly or on
   `formless gc`; deleting a Session deletes its artifact files.
+
+### 9.7 Scheduled jobs
+
+A job is a prompt that runs later or periodically: re-check a build,
+refresh a cache, nightly cleanup.
+
+- **Creating:**
+  - The agent uses `schedule_run({prompt, cron? | at?, session_id?})`.
+    `cron` is a 5-field expression in local time (`*`, lists, ranges,
+    `/step`, `@hourly`/`@daily`/`@weekly`/`@monthly`; when both day fields
+    are restricted, either may match). `at` is RFC 3339,
+    `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
+  - The user uses `AddJob` or `formless jobs add PROMPT --cron … | --at …`.
+- **Trust:** one-shot jobs from the agent are scheduled at once.
+  Recurring ones need the user's approval: asked immediately, or, with
+  nobody connected, saved as "awaiting approval" until the user enables
+  them. Enabling a job approves it.
+- **Running:** the daemon checks every 20 s. A due job sends its prompt to
+  its Session (queued if that Session is busy), or to a new Session named
+  `Job: …`. A one-shot job then ends; a recurring one moves to its next
+  match after now. A job missed while the daemon was down runs once on
+  the next start, so there are no catch-up storms. Everything is
+  audit-logged and broadcasts `JobsChanged`.
+- **Idle rule:** the daemon still idle-closes (§9.1) unless the user sets
+  `daemon.keep_alive_for_jobs = true`, which keeps it up while enabled
+  jobs wait. Otherwise due jobs run at the next start.
+- **Clients:**
+  - CLI: `formless jobs list|add|enable|disable|rm`
+  - TUI: `/jobs`, `/jobs enable|disable|rm ID`
+  - web: the Settings "Jobs" section (approve, enable, delete).
 
 ## 10. TUI (v1 user interface)
 

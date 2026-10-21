@@ -127,6 +127,9 @@ pub struct DaemonCfg {
     /// How long a client waits for an auto-started daemon to accept
     /// connections (a first start may migrate and back up a large DB).
     pub start_timeout_secs: u64,
+    /// Stay up past the idle grace while scheduled jobs wait (SPEC §9.7);
+    /// off: due jobs run on the next start.
+    pub keep_alive_for_jobs: bool,
 }
 impl Default for DaemonCfg {
     fn default() -> Self {
@@ -136,6 +139,7 @@ impl Default for DaemonCfg {
             log_max_bytes: 10_000_000,
             log_keep: 5,
             start_timeout_secs: 60,
+            keep_alive_for_jobs: false,
         }
     }
 }

@@ -30,7 +30,8 @@ pub const READ_SKILL_FILE: &str = "read_skill_file";
 pub const REMEMBER: &str = "remember";
 pub const FORGET: &str = "forget";
 pub const ASK_USER: &str = "ask_user";
-pub const RESERVED: [&str; 22] = [
+pub const SCHEDULE_RUN: &str = "schedule_run";
+pub const RESERVED: [&str; 23] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -53,6 +54,7 @@ pub const RESERVED: [&str; 22] = [
     REMEMBER,
     FORGET,
     ASK_USER,
+    SCHEDULE_RUN,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -382,6 +384,26 @@ fn ask_user_definition() -> Value {
                     "options": {"type": "array", "items": {"type": "string"}, "description": "Suggested answers; the user may still type their own"}
                 },
                 "required": ["question"]
+            }
+        }
+    })
+}
+
+fn schedule_run_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": SCHEDULE_RUN,
+            "description": "Schedule a prompt to run later (at) or periodically (cron, 5 fields, local time), e.g. to re-check a build or run nightly cleanup. Recurring jobs need the user's approval. Without session_id each run gets a new Session; \"current\" runs in this one.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The task, self-contained"},
+                    "cron": {"type": "string", "description": "e.g. \"0 3 * * *\" (03:00 daily) or @hourly"},
+                    "at": {"type": "string", "description": "One-shot: RFC 3339, \"YYYY-MM-DD HH:MM\" or \"in 30m\""},
+                    "session_id": {"type": "string"}
+                },
+                "required": ["prompt"]
             }
         }
     })
@@ -756,6 +778,7 @@ pub fn tool_definitions(
         remember_definition(),
         forget_definition(),
         ask_user_definition(),
+        schedule_run_definition(),
         list_mcp_resources_definition(),
         read_mcp_resource_definition(),
         test_tool_definition(),
