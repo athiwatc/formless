@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, ProviderCfg};
 use crate::namer::{self, ModelSpec};
 use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
-use crate::storage::{build_context, Store, DEFAULT_SESSION_NAME};
+use crate::storage::{ContextCache, Store, DEFAULT_SESSION_NAME};
 use crate::tools as toolreg;
 use crate::Paths;
 
@@ -80,6 +80,8 @@ pub struct Daemon {
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
     subs: Subs,
+    /// Per-Session provider context, extended step by step (SPEC §11).
+    contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
     /// copy of the model in memory.
     naming: Arc<tokio::sync::Semaphore>,
@@ -110,6 +112,7 @@ impl Daemon {
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
+            contexts: StdMutex::new(HashMap::new()),
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
@@ -179,6 +182,7 @@ impl Daemon {
             Request::DeleteSession { id } => {
                 self.stop_session_work(&id).await;
                 let existed = self.with_store(|st| st.delete_session(&id))?;
+                self.contexts.lock().unwrap().remove(&id);
                 if existed {
                     self.broadcast(Event::SessionDeleted { id: id.clone() });
                 }
@@ -845,14 +849,7 @@ impl Daemon {
             .clone()
             .unwrap_or_else(|| cfg.provider.model.clone());
         let (context_chars, tool_count) = self.with_store(|st| {
-            let chars = st
-                .list_messages(session_id)
-                .map(|msgs| {
-                    msgs.iter()
-                        .map(|m| m.content.chars().count())
-                        .sum::<usize>()
-                })
-                .unwrap_or(0);
+            let chars = st.session_content_chars(session_id).unwrap_or(0);
             let tools = toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
                 .map(|d| d.len())
                 .unwrap_or(0);
@@ -889,17 +886,9 @@ impl Daemon {
             }
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let prompt = self.effective_system_prompt();
-            let ctx = self.with_store(|st| {
-                build_context(
-                    st,
-                    session_id,
-                    &prompt,
-                    context_tokens,
-                    cfg.compaction.fraction(),
-                )
-                .map(|(c, _, _)| c)
-            })?;
+            let ctx = self
+                .session_context(session_id, context_tokens, cfg.compaction.fraction())?
+                .0;
             let defs = self.with_store(|st| {
                 toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
             })?;
@@ -2631,6 +2620,32 @@ impl Daemon {
         })
     }
 
+    /// The Session's provider context, read incrementally from its cache.
+    fn session_context(
+        &self,
+        session_id: &str,
+        context_tokens: u32,
+        trigger_fraction: f64,
+    ) -> Result<crate::storage::BuiltContext> {
+        let prompt = self.effective_system_prompt();
+        let mut cache = self
+            .contexts
+            .lock()
+            .unwrap()
+            .remove(session_id)
+            .unwrap_or_default();
+        let built = self.with_store(|st| {
+            cache.build(st, session_id, &prompt, context_tokens, trigger_fraction)
+        });
+        if built.is_ok() {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), cache);
+        }
+        built
+    }
+
     async fn maybe_compact(
         &self,
         provider: &Provider,
@@ -2639,16 +2654,8 @@ impl Daemon {
         model: &str,
         context_tokens: u32,
     ) -> Result<()> {
-        let prompt = self.effective_system_prompt();
-        let (_ctx, needs, compact_up_to) = self.with_store(|st| {
-            build_context(
-                st,
-                session_id,
-                &prompt,
-                context_tokens,
-                cfg.compaction.fraction(),
-            )
-        })?;
+        let (_ctx, needs, compact_up_to) =
+            self.session_context(session_id, context_tokens, cfg.compaction.fraction())?;
         if !needs {
             return Ok(());
         }
