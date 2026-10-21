@@ -267,3 +267,44 @@ async fn relay_gives_each_browser_its_own_connection() {
     shutdown.cancel();
     link.await.unwrap().unwrap();
 }
+
+/// With no browser in the room the daemon sends the relay nothing, even
+/// while events are being broadcast, and is not kept alive as a subscriber.
+#[tokio::test]
+async fn relay_link_is_silent_without_browsers() {
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(temp_paths("relayquiet")).unwrap());
+    let secret = generate_relay_secret();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let link = tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+    // Daemon activity that would be broadcast to any attached client.
+    daemon
+        .handle(formless_protocol::Request::CreateSession { name: None })
+        .await
+        .unwrap();
+    let quiet = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "no frames without a browser: {quiet:?}");
+    assert_eq!(daemon.subscriber_count(), 0);
+    shutdown.cancel();
+    link.await.unwrap().unwrap();
+}
