@@ -432,6 +432,8 @@ url = "https://example.com/mcp"
 headers = { Authorization = "Bearer …" }
 ```
 
+Servers that use OAuth need a one-time login (it opens your browser): `formless mcp login docs`.
+
 Its tools appear in the registry as `mcp__files__<tool>`. The agent finds them with `find_tools`, calls need approval like any sensitive Tool, and every call is measured. Servers start on first use and stop when idle (`mcp.idle_secs`); their stderr goes to `<data>/mcp/<name>.log`.
 
 ## 6. Invocations: async by design

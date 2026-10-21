@@ -133,6 +133,55 @@ pub fn load_oauth_tokens(paths: &Paths) -> Option<OAuthTokens> {
     None
 }
 
+/// A JSON credential stored like the provider tokens (keychain + `0600`
+/// file), under its own name (e.g. one per MCP server).
+pub fn save_named_secret(paths: &Paths, name: &str, value: &Value) -> Result<()> {
+    let encoded = value.to_string();
+    let file = paths.config_dir.join(format!("{name}.json"));
+    let file_result = (|| -> Result<()> {
+        std::fs::create_dir_all(&paths.config_dir)?;
+        let tmp = file.with_extension("json.tmp");
+        std::fs::write(&tmp, &encoded).with_context(|| format!("write {}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
+        Ok(())
+    })();
+    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &format!("{name}-{}", paths.profile))
+        .map(|entry| entry.set_password(&encoded).is_ok())
+        .unwrap_or(false);
+    if file_result.is_ok() || keyring_ok {
+        Ok(())
+    } else {
+        file_result
+    }
+}
+
+pub fn load_named_secret(paths: &Paths, name: &str) -> Option<Value> {
+    let file = paths.config_dir.join(format!("{name}.json"));
+    if let Some(v) = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+    {
+        return Some(v);
+    }
+    keyring::Entry::new(KEYRING_SERVICE, &format!("{name}-{}", paths.profile))
+        .ok()?
+        .get_password()
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+}
+
+pub fn delete_named_secret(paths: &Paths, name: &str) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &format!("{name}-{}", paths.profile)) {
+        let _ = entry.delete_credential();
+    }
+    let _ = std::fs::remove_file(paths.config_dir.join(format!("{name}.json")));
+}
+
 pub fn delete_oauth_tokens(paths: &Paths) {
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths)) {
         let _ = entry.delete_credential();
@@ -699,28 +748,45 @@ where
 pub fn login_with_timeout<F>(
     paths: &Paths,
     cfg: &ProviderCfg,
-    mut on_url: F,
+    on_url: F,
     timeout: Duration,
 ) -> Result<OAuthTokens>
 where
     F: FnMut(&str),
 {
     validate_oauth_config(cfg)?;
-    let listener = TcpListener::bind(("127.0.0.1", cfg.auth.redirect_port)).with_context(|| {
-        format!(
-            "bind OAuth callback on 127.0.0.1:{}",
-            cfg.auth.redirect_port
-        )
-    })?;
+    let auth = cfg.auth.clone();
+    let tokens = run_code_flow(cfg.auth.redirect_port, |_| Ok(auth), on_url, timeout)?;
+    save_oauth_tokens(paths, &tokens).context("persist OAuth tokens")?;
+    Ok(tokens)
+}
+
+/// The authorization-code + PKCE flow on a loopback callback. `prepare`
+/// gets the redirect URI before anything is sent and returns the client
+/// settings to use (dynamic client registration needs the real URI).
+/// Returns the tokens; storing them is the caller's job.
+pub fn run_code_flow<P, F>(
+    port: u16,
+    prepare: P,
+    mut on_url: F,
+    timeout: Duration,
+) -> Result<OAuthTokens>
+where
+    P: FnOnce(&str) -> Result<AuthCfg>,
+    F: FnMut(&str),
+{
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("bind OAuth callback on 127.0.0.1:{port}"))?;
     let actual_port = listener
         .local_addr()
         .context("read OAuth callback address")?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{actual_port}/callback");
+    let auth = prepare(&redirect_uri)?;
     let verifier = generate_pkce_verifier();
     let challenge = pkce_challenge(&verifier);
     let state = generate_state();
-    let url = build_authorize_url(&cfg.auth, &redirect_uri, &state, &challenge)?;
+    let url = build_authorize_url(&auth, &redirect_uri, &state, &challenge)?;
     on_url(&url);
 
     listener
@@ -744,8 +810,6 @@ where
         }
     };
 
-    let tokens = exchange_code_blocking(&cfg.auth, &code, &redirect_uri, &verifier)
-        .context("exchange OAuth authorization code")?;
-    save_oauth_tokens(paths, &tokens).context("persist OAuth tokens")?;
-    Ok(tokens)
+    exchange_code_blocking(&auth, &code, &redirect_uri, &verifier)
+        .context("exchange OAuth authorization code")
 }

@@ -93,7 +93,16 @@ fn fake_mcp_server() {
 pub fn temp_paths(tag: &str) -> Paths {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-{tag}-{short}"));
-    Paths::from_dirs(base.join("d"), base.join("c")).unwrap()
+    // A unique profile: keychain entries derive from it, so tests never
+    // touch the developer's real "default" ones.
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-{tag}-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    paths
 }
 
 /// Config for the fake server (this test binary, re-run as a server).
@@ -457,4 +466,176 @@ async fn legacy_sse_servers_work() {
         .await
         .unwrap();
     assert_eq!(call_result(&r).unwrap(), json!("legacy"));
+}
+
+/// MCP OAuth: discovery from the 401, dynamic registration, PKCE with the
+/// resource indicator, an authorized call, and refresh on expiry.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_protected_servers_log_in_and_refresh() {
+    use axum::{
+        extract::{Query, State},
+        http::{HeaderMap, StatusCode},
+        response::{IntoResponse, Redirect},
+        routing::{get, post},
+        Form, Json, Router,
+    };
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct As {
+        challenge: String,
+        resource: String,
+        issued: Vec<String>,
+    }
+    type St = Arc<Mutex<As>>;
+    let state: St = Default::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let b2 = base.clone();
+    let b3 = base.clone();
+    let app = Router::new()
+        .route(
+            "/mcp",
+            post(move |State(st): State<St>, headers: HeaderMap, Json(msg): Json<Value>| {
+                let base = b2.clone();
+                async move {
+                    let token = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .map(str::to_string);
+                    let ok = token.is_some_and(|t| st.lock().unwrap().issued.last() == Some(&t));
+                    if !ok {
+                        let hdr = format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
+                        return (StatusCode::UNAUTHORIZED, [("www-authenticate", hdr)]).into_response();
+                    }
+                    if msg.get("id").is_none() {
+                        return StatusCode::ACCEPTED.into_response();
+                    }
+                    Json(answer(&msg["id"], msg["method"].as_str().unwrap(), &msg["params"])).into_response()
+                }
+            }),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(move || {
+                let base = b3.clone();
+                async move { Json(json!({"resource": format!("{base}/mcp"), "authorization_servers": [base]})) }
+            }),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get({
+                let base = base.clone();
+                move || {
+                    let base = base.clone();
+                    async move {
+                        Json(json!({
+                            "issuer": base, "authorization_endpoint": format!("{base}/authorize"),
+                            "token_endpoint": format!("{base}/token"), "registration_endpoint": format!("{base}/register"),
+                        }))
+                    }
+                }
+            }),
+        )
+        .route("/register", post(|| async { Json(json!({"client_id": "dyn-client"})) }))
+        .route(
+            "/authorize",
+            get(|State(st): State<St>, Query(q): Query<HashMap<String, String>>| async move {
+                assert_eq!(q["client_id"], "dyn-client");
+                assert_eq!(q["code_challenge_method"], "S256");
+                let mut s = st.lock().unwrap();
+                s.challenge = q["code_challenge"].clone();
+                s.resource = q["resource"].clone();
+                Redirect::to(&format!("{}?code=c0de&state={}", q["redirect_uri"], q["state"]))
+            }),
+        )
+        .route(
+            "/token",
+            post(|State(st): State<St>, Form(f): Form<HashMap<String, String>>| async move {
+                let mut s = st.lock().unwrap();
+                assert!(f["resource"].ends_with("/mcp"), "resource indicator on token requests");
+                if f["grant_type"] == "authorization_code" {
+                    let digest = Sha256::digest(f["code_verifier"].as_bytes());
+                    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+                    assert_eq!(challenge, s.challenge, "PKCE verifier matches");
+                    assert_eq!(s.resource, f["resource"]);
+                } else {
+                    assert_eq!(f["refresh_token"], "rt-1");
+                }
+                let token = format!("at-{}", s.issued.len() + 1);
+                s.issued.push(token.clone());
+                // The first token is already expired, to exercise refresh.
+                let expires_in = if s.issued.len() == 1 { 1 } else { 3600 };
+                Json(json!({"access_token": token, "refresh_token": "rt-1", "token_type": "Bearer", "expires_in": expires_in}))
+            }),
+        )
+        .with_state(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let paths = temp_paths("mcpoauth");
+    let scfg = McpServerCfg {
+        transport: "http".into(),
+        url: format!("{base}/mcp"),
+        ..Default::default()
+    };
+    let cfg = McpCfg {
+        servers: [("secure".to_string(), scfg.clone())].into(),
+        ..Default::default()
+    };
+    // Not logged in: a clear instruction instead of a hang.
+    let err = Manager::default()
+        .connection(&paths, &cfg, "secure")
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        format!("{err:#}").contains("formless mcp login secure"),
+        "{err:#}"
+    );
+
+    // Log in (blocking, outside Tokio); "the browser" follows the redirect.
+    let (p2, s2) = (paths.clone(), scfg.clone());
+    let login = std::thread::spawn(move || {
+        formless_core::mcp_auth::login(&p2, "secure", &s2, |url| {
+            let url = url.to_string();
+            std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap();
+                let to = client.get(&url).send().unwrap().headers()["location"]
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                client.get(&to).send().unwrap();
+            });
+        })
+    });
+    tokio::task::spawn_blocking(move || login.join().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(formless_core::mcp_auth::has_login(&paths, "secure"));
+
+    // at-1 expires at once, so the first call refreshes to at-2.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let mcp = Manager::default();
+    let r = mcp
+        .call(
+            &paths,
+            &cfg,
+            "secure",
+            "echo",
+            json!({"text": "authorized"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(call_result(&r).unwrap(), json!("authorized"));
+    assert_eq!(state.lock().unwrap().issued, ["at-1", "at-2"]);
+    formless_core::mcp_auth::logout(&paths, "secure");
+    assert!(!formless_core::mcp_auth::has_login(&paths, "secure"));
 }

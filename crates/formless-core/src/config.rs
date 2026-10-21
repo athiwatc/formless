@@ -58,6 +58,9 @@ pub struct McpServerCfg {
     pub headers: BTreeMap<String, String>,
     /// Disabled servers keep their config but are never started.
     pub disabled: bool,
+    /// http: a pre-registered OAuth client id, for servers that offer no
+    /// dynamic client registration.
+    pub oauth_client_id: Option<String>,
 }
 
 /// Retention for stored Tool outputs (SPEC §9.6). 0 disables a limit.

@@ -542,6 +542,15 @@ None ship by default (principle 1).
   jittered backoff), falling back to the legacy HTTP+SSE transport (GET
   event stream announcing an `endpoint`) when the initialize POST is
   refused with 404/405.
+- **OAuth 2.1** for HTTP servers (`formless mcp login|logout <server>`):
+  protected-resource metadata (from the 401's `WWW-Authenticate`, else the
+  well-known URL) → authorization-server metadata → dynamic client
+  registration when offered (else `oauth_client_id`) → authorization code
+  with PKCE on a loopback callback and the `resource` indicator. Tokens are
+  stored per server like the provider's (keychain + `0600` file), sent as
+  `Bearer`, refreshed when expired or on a 401 (rotation kept), and never
+  shown to the model or Tools; a server needing a login fails with the
+  command to run.
 - `mcp:<server>` is sensitive: calls need approval (§10.3) and headless
   calls fail closed.
 
