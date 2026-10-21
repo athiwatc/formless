@@ -2727,9 +2727,9 @@ impl Daemon {
                 return Err(anyhow!("sub-agent task is empty"));
             }
             let provider = self.provider(cfg).await?;
-            let requested = model
-                .map(str::to_string)
-                .unwrap_or_else(|| cfg.provider.model.clone());
+            // The Session's model/effort, not the daemon default (SPEC §7.6).
+            let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
+            let requested = model.map(str::to_string).unwrap_or(session_model);
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -2786,7 +2786,7 @@ impl Daemon {
                             &messages,
                             &defs,
                             &model,
-                            cfg.provider.reasoning_effort.as_deref(),
+                            session_effort.as_deref(),
                             cancel,
                             |_, _| {},
                         )
@@ -3044,6 +3044,24 @@ impl Daemon {
         self.with_store(|st| st.get_skill(name))?
             .filter(|s| s.enabled && !s.retired)
             .with_context(|| format!("no enabled skill named '{name}'"))
+    }
+
+    /// The model and reasoning effort a Session runs with: its overrides,
+    /// else the configured defaults. Sub-agents and `llm.complete` use them
+    /// too, so a Session switched to a local model stays local.
+    pub fn session_model_effort(&self, session_id: &str, cfg: &Config) -> (String, Option<String>) {
+        let s = self
+            .with_reader(|st| st.get_session(session_id))
+            .ok()
+            .flatten();
+        let model = s
+            .as_ref()
+            .and_then(|s| s.model.clone())
+            .unwrap_or_else(|| cfg.provider.model.clone());
+        let effort = s
+            .and_then(|s| s.reasoning_effort)
+            .or_else(|| cfg.provider.reasoning_effort.clone());
+        (model, effort)
     }
 
     /// `read_metrics` (SPEC §8.9): registry-wide health for the agent.
@@ -5314,9 +5332,10 @@ impl HostOps for NestedOps {
             .handle
             .block_on(self.daemon.provider(&self.cfg))
             .map_err(|e| e.to_string())?;
-        let requested = model
-            .map(str::to_string)
-            .unwrap_or_else(|| self.cfg.provider.model.clone());
+        let (session_model, effort) = self
+            .daemon
+            .session_model_effort(&self.session_id, &self.cfg);
+        let requested = model.map(str::to_string).unwrap_or(session_model);
         let model = self
             .daemon
             .resolve_model(
@@ -5334,7 +5353,6 @@ impl HostOps for NestedOps {
             messages.push(json!({"role": "system", "content": sys}));
         }
         messages.push(json!({"role": "user", "content": prompt}));
-        let effort = self.cfg.provider.reasoning_effort.clone();
         let (text, usage) = self.block_cancellable(provider.complete_with_usage(
             &messages,
             &model,

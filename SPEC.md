@@ -487,7 +487,8 @@ pattern (§4.4).
   - v2: `clipboard.read/write` (gated by `clipboard:*`), `notify(title,
     body)` (gated by `notify`), `llm.complete(prompt, {system, model})`
     (gated by `llm`; one non-streaming completion via the daemon's
-    configured provider), `agents.run(task, {system, model})` (gated by
+    configured provider, with the Session's model and reasoning effort
+    unless `model` is given), `agents.run(task, {system, model})` (gated by
     `agent`; §7.6 sub-agents), and `requireModule(name)` for shared JS
     modules (§7.6). In smoke tests these are stubbed; in optimiser
     replay the side-effecting ones are denied.
