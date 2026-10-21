@@ -1531,7 +1531,8 @@ fn clipboard_read() -> Result<String, String> {
     }
 }
 
-fn clipboard_write(text: &str) -> Result<(), String> {
+/// Put text on the OS clipboard (pbcopy, wl-copy/xclip/xsel, PowerShell).
+pub fn clipboard_write(text: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         run_capture("pbcopy", &[], Some(text)).map(|_| ())

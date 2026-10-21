@@ -240,7 +240,7 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 
 - **Enter during a Run = Steer** (the default): the message is injected at
   the next step boundary without killing in-flight work. **Ctrl+Enter =
-  queue** for after the Run ends (binding configurable); queued messages
+  queue** for after the Run ends (Ctrl+J or Alt+Enter in any terminal, §10.5); queued messages
   are stored in the database, so a daemon restart does not lose them, and
   `GetSession` lists them. When idle, Enter
   simply starts a new Run.
@@ -1346,6 +1346,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   most terminals otherwise send the same byte for Enter and Ctrl+Enter),
   and Ctrl+J or Alt+Enter everywhere, tmux and Terminal.app included. The
   footer shows the binding that works in the current terminal.
+- Copying: `/copy` copies the last answer and `/copy code [n]` its n-th
+  code block (default: the last one). The text goes to the clipboard
+  through OSC 52, which works over SSH and inside tmux with
+  `allow-passthrough`, and also through the OS clipboard when the terminal
+  is local. Mouse capture (for wheel scrolling) stops the terminal's own
+  text selection, so `/mouse` toggles it; holding Shift (Option in
+  iTerm2, Fn in Terminal.app) while dragging also bypasses it.
   `Esc`: interrupt Run. `Ctrl+C`: clear the typed message; twice within 2 s: detach client. `Tab`/`Shift+Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
