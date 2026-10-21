@@ -89,7 +89,7 @@ pub fn set_limits(max_sleep_ms: u64, max_random_bytes: u64) {
     MAX_RANDOM_BYTES.store(max_random_bytes, Ordering::Relaxed);
 }
 
-/// Set how many `tools.callAsync` Invocations one sandbox may have in
+/// Set how many `tools.call` Invocations one sandbox may have in
 /// flight at once; the rest queue (SPEC §7.12, `scripts.max_parallel`).
 pub fn set_max_parallel_calls(n: u64) {
     MAX_PARALLEL_CALLS.store(n.max(1), Ordering::Relaxed);
@@ -170,18 +170,18 @@ struct State {
     cancel: Arc<AtomicBool>,
     /// Smoke/Replay key-value store: in memory, gone after the run.
     kv_overlay: Mutex<std::collections::BTreeMap<(String, String), Value>>,
-    /// `tools.callAsync` bookkeeping: each call runs on its own thread.
+    /// `tools.call` bookkeeping: each call runs on its own thread.
     calls: Mutex<AsyncCalls>,
     settled_tx: std::sync::mpsc::Sender<Settled>,
     settled_rx: Mutex<std::sync::mpsc::Receiver<Settled>>,
 }
 
-/// A finished `tools.callAsync`: its id and result.
+/// A finished `tools.call`: its id and result.
 type Settled = (u64, Result<Value, String>);
 
-/// Async nested calls: those running, and those waiting for a slot under
-/// the parallelism cap. Calls still running when the sandbox ends are
-/// left to finish on their own; their results are discarded.
+/// Nested calls: those running, and those waiting for a slot under the
+/// parallelism cap. A sandbox stopped with calls still running leaves
+/// them to finish on their own; their results are discarded.
 #[derive(Default)]
 struct AsyncCalls {
     next_id: u64,
@@ -262,13 +262,12 @@ globalThis.process = {
       stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null });
   },
 };
-// tools.call blocks until the nested Tool returns; tools.callAsync returns
-// a Promise, so Promise.all runs nested Tools in parallel (SPEC §7.12).
+// tools.call returns a Promise settled from the event loop, so
+// Promise.all runs nested Tools in parallel (SPEC §7.6, §7.12).
 const __pendingCalls = new Map();
 globalThis.tools = {
-  call: (name, input) => __call("tools_call", { name: String(name), input: input || {} }),
-  callAsync: (name, input) => new Promise((resolve, reject) => {
-    const id = __call("tools_call_start", { name: String(name), input: input || {} });
+  call: (name, input) => new Promise((resolve, reject) => {
+    const id = __call("tools_call", { name: String(name), input: input || {} });
     __pendingCalls.set(id, { resolve, reject });
   }),
 };
@@ -645,13 +644,6 @@ impl State {
                 Ok(Value::Null)
             }
             "tools_call" => {
-                if self.mode == HostMode::Smoke {
-                    return Err(self.stub(denied("tools.call in smoke test")));
-                }
-                self.ops
-                    .call_tool(a["name"].as_str().unwrap_or_default(), a["input"].clone())
-            }
-            "tools_call_start" => {
                 if self.mode == HostMode::Smoke {
                     return Err(self.stub(denied("tools.call in smoke test")));
                 }
@@ -1084,7 +1076,7 @@ impl State {
         }
     }
 
-    /// Start queued async calls while there are free slots.
+    /// Start queued nested calls while there are free slots.
     fn start_queued(&self, calls: &mut AsyncCalls) {
         let cap = MAX_PARALLEL_CALLS.load(Ordering::Relaxed) as usize;
         while calls.running < cap {
@@ -1099,13 +1091,13 @@ impl State {
         }
     }
 
-    /// Async calls not yet settled (running or queued).
+    /// Nested calls not yet settled (running or queued).
     fn outstanding_calls(&self) -> usize {
         let calls = self.calls.lock().unwrap();
         calls.running + calls.queued.len()
     }
 
-    /// Wait up to `wait` (forever when None) for async calls to finish,
+    /// Wait up to `wait` (forever when None) for nested calls to finish,
     /// returning those that did; "interrupted" once cancelled.
     fn wait_settled(&self, wait: Option<std::time::Duration>) -> Result<Vec<Settled>, String> {
         let until = wait.map(|w| std::time::Instant::now() + w);
@@ -1747,9 +1739,9 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         ctx.eval::<(), _>(RUNNER).map_err(|e| err(&e))
     })?;
     // Event loop: drain the job queue (an async run() settles through it),
-    // then fire due timers, waiting until the next one or an async call's
-    // result. It ends when the result is set (leftover timers are dropped,
-    // running async calls abandoned) or nothing is left to run.
+    // then fire due timers, waiting until the next one or a nested call's
+    // result. It ends when the result is set (leftover timers are dropped)
+    // or nothing is left to run.
     let result_json: Option<String> = loop {
         while runtime.is_job_pending() {
             if runtime.execute_pending_job().is_err() {
@@ -1796,6 +1788,15 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     };
     let result_json =
         result_json.ok_or_else(|| err(&"run() returned a Promise that never settled"))?;
+    // A call still running when run() is done was never awaited: its
+    // result cannot have reached the output, so the output is suspect.
+    let unsettled = state.outstanding_calls();
+    if unsettled > 0 {
+        return Err(err(&format!(
+            "run() finished while {unsettled} tools.call result(s) were still pending: \
+             tools.call returns a Promise, await every call"
+        )));
+    }
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
     let logs = state.logs.lock().map(|g| g.clone()).unwrap_or_default();
     if !parsed["ok"].as_bool().unwrap_or(false) {
@@ -1872,10 +1873,10 @@ mod tests {
     }
 
     #[test]
-    fn call_async_runs_nested_tools_in_parallel() {
+    fn nested_calls_run_in_parallel() {
         let req = live(
             "async function run() {
-               const xs = await Promise.all([1, 2, 3, 4].map(n => tools.callAsync('t', {n})));
+               const xs = await Promise.all([1, 2, 3, 4].map(n => tools.call('t', {n})));
                return xs.map(x => x.n);
              }",
         );
@@ -1887,10 +1888,10 @@ mod tests {
     }
 
     #[test]
-    fn call_async_rejects_with_the_nested_error() {
+    fn a_failed_nested_call_rejects_with_its_error() {
         let req = live(
             "async function run() {
-               try { await tools.callAsync('bad', {}); return 'no'; }
+               try { await tools.call('bad', {}); return 'no'; }
                catch (e) { return e.message; }
              }",
         );
@@ -1899,11 +1900,22 @@ mod tests {
     }
 
     #[test]
-    fn call_async_is_stubbed_in_smoke_tests() {
-        let mut req = live("async function run() { return await tools.callAsync('t', {}); }");
+    fn nested_calls_are_stubbed_in_smoke_tests() {
+        let mut req = live("async function run() { return await tools.call('t', {}); }");
         req.mode = HostMode::Smoke;
         let e = execute(&req, Arc::new(SlowOps)).unwrap_err();
         assert!(e.after_stub, "{}", e.message);
+    }
+
+    #[test]
+    fn a_tool_that_does_not_await_its_calls_fails() {
+        let req = live("function run() { const r = tools.call('t', {n: 1}); return {n: r.n}; }");
+        let e = execute(&req, Arc::new(SlowOps)).unwrap_err();
+        assert!(e.message.contains("await every call"), "{}", e.message);
+        // Returning the Promise itself is awaited by the runner.
+        let req = live("function run() { return tools.call('t', {n: 1}); }");
+        let out = execute(&req, Arc::new(SlowOps)).unwrap();
+        assert_eq!(out.output["n"], 1);
     }
 
     #[test]

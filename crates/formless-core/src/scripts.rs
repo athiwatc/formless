@@ -34,10 +34,10 @@ pub fn script_code(source: &str, uses: &[String]) -> String {
          function __scriptTools() {{\n\
          \x20 const t = globalThis.tools, allowed = new Set(__uses);\n\
          \x20 const call = (name, input) => allowed.has(String(name))\n\
-         \x20   ? t.callAsync(name, input)\n\
+         \x20   ? t.call(name, input)\n\
          \x20   : Promise.reject(new Error(\"'\" + name + \"' is not in this script's uses list\"));\n\
          \x20 const out = {{ call }};\n\
-         \x20 for (const n of __uses) out[n] = (input) => t.callAsync(n, input);\n\
+         \x20 for (const n of __uses) out[n] = (input) => t.call(n, input);\n\
          \x20 return out;\n\
          }}\n\
          async function run(input) {{\n\

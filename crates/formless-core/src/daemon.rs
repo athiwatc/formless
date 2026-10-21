@@ -5627,7 +5627,8 @@ struct ScriptScope {
 }
 
 /// HostOps for nested `tools.call` + `emit` (SPEC §7.6). Runs on the
-/// blocking QuickJS thread; nested calls block_on the daemon executor.
+/// blocking QuickJS thread (nested calls on threads of their own) and
+/// block_on the daemon executor.
 struct NestedOps {
     daemon: Arc<Daemon>,
     /// The Tool's own store namespace ("tool:<id>"; "test:<name>" drafts).

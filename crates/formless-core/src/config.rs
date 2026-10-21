@@ -566,7 +566,7 @@ impl Default for ToolsCfg {
 #[serde(default)]
 pub struct ScriptsCfg {
     /// Most nested Invocations one sandbox runs at once through
-    /// `tools.callAsync`; the rest queue.
+    /// `tools.call`; the rest queue.
     pub max_parallel: usize,
     /// Largest script source, in KB.
     pub max_source_kb: usize,

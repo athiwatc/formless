@@ -116,14 +116,14 @@ async fn scripts_have_no_ambient_authority_and_only_reach_their_uses() {
         json!({
             "code": "const r = [];\n\
                      try { await tools.call('other', {}); r.push('local'); } catch (e) { r.push(e.message); }\n\
-                     try { await globalThis.tools.callAsync('other', {}); r.push('global'); } catch (e) { r.push(e.message); }\n\
-                     try { globalThis.tools.call('other', {}); r.push('sync'); } catch (e) { r.push(e.message); }\n\
+                     try { await globalThis.tools.call('other', {}); r.push('global'); } catch (e) { r.push(e.message); }\n\
                      return r;",
             "uses": ["slow_double"]
         }),
     )
     .await;
     let r: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(r["result"].as_array().map(Vec::len), Some(2), "{out}");
     for msg in r["result"].as_array().unwrap() {
         assert!(
             msg.as_str()
@@ -147,6 +147,18 @@ async fn scripts_have_no_ambient_authority_and_only_reach_their_uses() {
     )
     .await;
     assert!(out.contains("no tool named 'missing'"), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_that_forgets_await_fails() {
+    let (_paths, _store, session, daemon) = setup("noawait", Config::default());
+    let out = script(
+        &daemon,
+        &session,
+        json!({"code": "const x = tools.slow_double({n: 2});\nreturn x * 2;", "uses": ["slow_double"]}),
+    )
+    .await;
+    assert!(out.contains("await every call"), "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
