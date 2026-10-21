@@ -1262,6 +1262,37 @@ impl Store {
         Ok(Some((info, code)))
     }
 
+    /// Every version of a module as (version, code, author, created_at).
+    pub fn module_versions(&self, module_id: &str) -> Result<Vec<(i64, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT version, code, author, created_at FROM module_versions WHERE module_id=?1 ORDER BY version",
+        )?;
+        let rows = stmt
+            .query_map(params![module_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Active Tools whose current code requires the module (by name).
+    pub fn module_dependents(&self, name: &str) -> Result<Vec<String>> {
+        let lower = name.to_lowercase();
+        let mut out = Vec::new();
+        for t in self.list_tools(false)? {
+            if let Some((_, v)) = self.get_tool_current(&t.id)? {
+                let code = v.code.to_lowercase();
+                if ["\"", "'", "`"].iter().any(|q| {
+                    code.contains(&format!("requiremodule({q}{lower}{q}"))
+                        || code.contains(&format!("modules.load({q}{lower}{q}"))
+                }) {
+                    out.push(t.name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn list_modules(&self) -> Result<Vec<ModuleInfo>> {
         let ids: Vec<String> = {
             let mut stmt = self

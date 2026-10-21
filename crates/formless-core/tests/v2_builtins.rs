@@ -984,3 +984,50 @@ fn filler_is_repicked_after_compaction() {
     assert!(!after.contains(&"old_tool".to_string()), "{after:?}");
     let _ = old;
 }
+
+/// The agent can find and read shared modules (and see who uses them)
+/// before versioning one, instead of rewriting it from memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_can_find_and_read_modules() {
+    let paths = temp_paths("readmod");
+    Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    store
+        .create_module_version(
+            "strings",
+            "string helpers: shout and trim",
+            "module.exports = { v: 1 };",
+            "agent",
+        )
+        .unwrap();
+    store
+        .create_module_version(
+            "strings",
+            "string helpers: shout and trim",
+            "module.exports = { v: 2 };",
+            "agent",
+        )
+        .unwrap();
+    seed(
+        &store,
+        "loud",
+        "uses strings",
+        "function run(i){ return requireModule('strings').v; }",
+        &[],
+    );
+    let session = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let call = |name: &'static str, args: Value| {
+        let (d, s) = (daemon.clone(), session.clone());
+        async move { serde_json::from_str::<Value>(&d.call_tool_direct(&s, name, args).await).unwrap() }
+    };
+    let m = call("read_module", json!({"name": "strings"})).await;
+    assert_eq!(m["version"], 2);
+    assert_eq!(m["implementation_js"], "module.exports = { v: 2 };");
+    assert_eq!(m["versions"].as_array().unwrap().len(), 2);
+    assert_eq!(m["required_by"], json!(["loud"]));
+    let old = call("read_module", json!({"name": "strings", "version": 1})).await;
+    assert_eq!(old["implementation_js"], "module.exports = { v: 1 };");
+    let found = call("find_tools", json!({"query": "string helpers"})).await;
+    assert_eq!(found["modules"][0]["name"], "strings");
+}
