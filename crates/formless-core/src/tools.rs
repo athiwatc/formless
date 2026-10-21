@@ -416,11 +416,11 @@ fn read_metrics_definition() -> Value {
         "type": "function",
         "function": {
             "name": READ_METRICS,
-            "description": "Registry-wide health, to clean up and explain: kind \"tools\" (filter: needs_attention | failing | unused | a name substring), \"audit\" (recent actions; filter: an action prefix such as tool., proposal., job.), \"models\" (measured model reliability and latency), \"runs\" (Run outcomes), \"builtins\" (built-in call stats).",
+            "description": "Registry-wide health, to clean up and explain: kind \"tools\" (filter: needs_attention | failing | unused | a name substring), \"audit\" (recent actions; filter: an action prefix such as tool., proposal., job.), \"models\" (measured model reliability and latency), \"runs\" (Run outcomes), \"builtins\" (built-in call stats), \"duplicates\" (near-duplicate Tool pairs to merge).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["tools", "audit", "models", "runs", "builtins"]},
+                    "kind": {"type": "string", "enum": ["tools", "audit", "models", "runs", "builtins", "duplicates"]},
                     "filter": {"type": "string"},
                     "limit": {"type": "integer", "description": "Default 50, max 200"}
                 },

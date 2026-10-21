@@ -3081,6 +3081,17 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every active Tool with its current version.
+    pub fn current_tools(&self) -> Result<Vec<(ToolInfo, ToolVersionInfo)>> {
+        let mut out = Vec::new();
+        for t in self.list_tools(false)? {
+            if let Some(pair) = self.get_tool_current(&t.id)? {
+                out.push(pair);
+            }
+        }
+        Ok(out)
+    }
+
     /// When each Tool was last invoked (tool id -> RFC 3339).
     pub fn tool_last_used(&self) -> Result<std::collections::HashMap<String, String>> {
         let mut stmt = self
