@@ -218,6 +218,11 @@ pub enum Request {
     AbandonRun {
         session_id: String,
     },
+    /// Stop one running Tool Invocation without interrupting its Run (it is
+    /// recorded as user-cancelled, and the agent gets the error result).
+    CancelInvocation {
+        handle: String,
+    },
     /// Abort the active Run's in-flight provider request and send it again
     /// (for a stalled stream; nothing in the transcript is lost).
     RetryProviderRequest {
@@ -434,6 +439,19 @@ pub enum Event {
         tool_name: String,
         ok: bool,
     },
+    /// A running Invocation has shown no activity for `silent_secs`
+    /// (SPEC §6.1: advisory, never auto-killed).
+    InvocationStalled {
+        session_id: String,
+        handle: String,
+        tool_name: String,
+        silent_secs: u64,
+    },
+    /// A stalled Invocation is active again (clears the stall flag).
+    InvocationActivity {
+        session_id: String,
+        handle: String,
+    },
     OptimiserActivity {
         tool_name: String,
         text: String,
@@ -466,7 +484,9 @@ impl Event {
             | Event::ToolCallFinished { session_id, .. }
             | Event::ApprovalRequested { session_id, .. }
             | Event::InvocationPending { session_id, .. }
-            | Event::InvocationCompleted { session_id, .. } => Some(session_id),
+            | Event::InvocationCompleted { session_id, .. }
+            | Event::InvocationStalled { session_id, .. }
+            | Event::InvocationActivity { session_id, .. } => Some(session_id),
             Event::Note { session_id, .. } => session_id.as_deref(),
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),

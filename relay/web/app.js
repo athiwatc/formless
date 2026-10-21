@@ -909,6 +909,14 @@
       h("p", { class: "muted" }, "Enter sends · Ctrl/⌘+Enter queues · /help lists commands"));
   }
 
+  function runningTool(name) {
+    return [...S.liveTools].reverse().find((x) => x.name === name && x.status === "running");
+  }
+  function cancelTool(handle) {
+    if (handle) act({ type: "cancel_invocation", handle }, "Cancelling the tool");
+    else note("no pending or stalled tool to cancel (Esc stops the whole run)", true);
+  }
+
   function renderLive() {
     const live = $("live");
     if (!live) return;
@@ -928,6 +936,8 @@
           h("span", { class: "spinner", style: "color:var(--warn)" }),
           h("span", { class: "tname" }, t.name + (t.version > 0 ? " v" + t.version : "")),
           h("span", { class: "targs" }, summarizeArgs(t.arguments || "")),
+          t.stalledSecs != null ? h("span", { class: "tag broad" }, "stalled " + t.stalledSecs + "s") : null,
+          t.handle ? h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(t.handle); } }, "Cancel") : null,
           h("span", { class: "tstat" }, elapsed(t.started))),
         payload(t.arguments || "")));
     }
@@ -1414,7 +1424,7 @@
     if (S.view === "settings") renderSettings();
   }
 
-  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /resend /resume /abandon /help";
+  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /cancel /resend /resume /abandon /help";
   async function slash(cmd) {
     const [name, ...rest] = cmd.split(/\s+/);
     const arg = rest.join(" ");
@@ -1431,6 +1441,10 @@
       case "propose": act({ type: "generate_proposal" }); return note("generating a measured proposal…");
       case "thinking": setThinking(!S.showThinking); return note("thinking display " + (S.showThinking ? "on" : "off"));
       case "stop": return stop();
+      case "cancel": {
+        const t = [...S.liveTools].reverse().find((x) => x.status === "running" && x.handle);
+        return cancelTool(t && t.handle);
+      }
       case "resend":
         if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
         return;
@@ -1616,8 +1630,25 @@
       case "compaction_notice":
         if (here) note("compacted earlier context: " + truncate(ev.summary_preview, 80));
         break;
-      case "invocation_pending":
+      case "invocation_pending": {
+        const t = here && runningTool(ev.tool_name);
+        if (t) t.handle = ev.handle;
         note(ev.tool_name + " continues in the background (" + ev.handle + ")");
+        break;
+      }
+      case "invocation_stalled": {
+        const t = here && runningTool(ev.tool_name);
+        if (t) {
+          t.handle = ev.handle;
+          t.stalledSecs = ev.silent_secs;
+          note(ev.tool_name + ": no activity for " + ev.silent_secs + "s; /cancel stops just this tool", true);
+          renderLive();
+        }
+        break;
+      }
+      case "invocation_activity":
+        for (const t of S.liveTools) if (t.handle === ev.handle) t.stalledSecs = null;
+        if (here) renderLive();
         break;
       case "invocation_completed":
         note(ev.tool_name + " background invocation " + (ev.ok ? "finished" : "failed"), !ev.ok);

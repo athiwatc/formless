@@ -1261,3 +1261,84 @@ async fn pending_handle_survives_restart_as_interrupted() {
     assert!(store.pending_handle("h-old").unwrap().is_none());
     server.abort();
 }
+
+/// A silent Invocation is flagged with a structured event naming its
+/// handle; CancelInvocation stops just that Tool and the Run carries on.
+#[cfg(unix)]
+#[tokio::test]
+async fn stalled_invocation_is_flagged_and_can_be_cancelled_alone() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4invstall");
+    seed_sleeper(&paths);
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                match msgs.iter().find(|m| m["role"] == "tool") {
+                    None => sse_tool("c1", "sleeper", json!({"ms": 60000})),
+                    Some(t) => sse_text(&format!(
+                        "tool said: {}",
+                        t["content"].as_str().unwrap_or_default()
+                    )),
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let mut cfg = formless_core::Config::load(&paths).unwrap();
+    cfg.daemon.stall_warning_secs = 1;
+    cfg.save(&paths).unwrap();
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut stalled_at = None;
+    let mut answer = String::new();
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(20), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) else {
+            continue;
+        };
+        match ev {
+            Event::InvocationStalled {
+                handle, tool_name, ..
+            } => {
+                assert_eq!(tool_name, "sleeper");
+                stalled_at = Some(std::time::Instant::now());
+                c.send(Request::CancelInvocation { handle }).await;
+            }
+            Event::MessageDelta { delta, .. } => answer.push_str(&delta),
+            Event::RunFinished { status, .. } => {
+                assert_eq!(status, "completed", "the Run itself carries on");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let took = stalled_at.expect("stall flagged").elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    assert!(answer.contains("interrupted"), "{answer}");
+    server.abort();
+}
