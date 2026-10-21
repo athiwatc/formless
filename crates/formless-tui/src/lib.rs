@@ -159,6 +159,9 @@ struct ApprovalReq {
     memory_mb: u32,
     /// What exactly is being approved, for non-Tool approvals.
     detail: Option<String>,
+    /// Capabilities already granted (the rest are new).
+    already_allowed: Vec<String>,
+    code_preview: Option<String>,
 }
 
 enum WizardJob {
@@ -1322,6 +1325,8 @@ impl App {
                 capabilities,
                 memory_mb,
                 detail,
+                already_allowed,
+                code_preview,
             } => {
                 // Approvals stay global: a backgrounded Run still needs one.
                 if self.is_current(&session_id) {
@@ -1334,6 +1339,8 @@ impl App {
                     capabilities,
                     memory_mb,
                     detail,
+                    already_allowed,
+                    code_preview,
                 });
             }
             Event::ToolUpdated { tool } => {
@@ -1383,6 +1390,8 @@ impl App {
                     capabilities,
                     memory_mb,
                     detail: None,
+                    already_allowed: Vec::new(),
+                    code_preview: None,
                 });
             }
             Event::InvocationPending {
@@ -1715,6 +1724,26 @@ impl App {
                     before: None,
                 },
             ),
+            cmd if cmd.starts_with("revoke ") => {
+                let mut words = cmd.split_whitespace().skip(1);
+                let name = words.next().unwrap_or_default();
+                let capability = words.next().map(str::to_string);
+                match self.tools.iter().find(|t| t.name == name) {
+                    Some(t) => {
+                        self.fire(Request::RevokeApproval {
+                            tool_id: t.id.clone(),
+                            capability: capability.clone(),
+                        });
+                        self.notes.push(format!(
+                            "revoked {} for {name}; the next call asks again",
+                            capability.as_deref().unwrap_or("every approval")
+                        ));
+                    }
+                    None => self
+                        .notes
+                        .push(format!("no tool '{name}' (open /tools first)")),
+                }
+            }
             cmd if cmd.starts_with("attach ") => {
                 let path = cmd["attach ".len()..].trim().trim_matches(['"', '\'']);
                 let path = match path.strip_prefix("~/") {
@@ -1894,7 +1923,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -3514,6 +3543,20 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             ),
                         ]),
                     ];
+            if let Some(g) = &d.approval {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Approved (revoke with /revoke NAME [CAPABILITY])",
+                    bold_fg(app.color, Color::Cyan),
+                ));
+                for c in &g.capabilities {
+                    lines.push(Line::raw(format!("  • {c}")));
+                }
+                lines.push(Line::styled(
+                    format!("  • memory {} MB", g.memory_mb),
+                    ui::dim(app.color),
+                ));
+            }
             if !d.optimiser_attempts.is_empty() {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled("Optimiser", bold_fg(app.color, Color::Cyan)));
@@ -3699,6 +3742,13 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
         lines.push(Line::styled("  • (no capabilities)", ui::dim(color)));
     }
     for cap in &req.capabilities {
+        if req.already_allowed.contains(cap) {
+            lines.push(Line::styled(
+                format!("  • {cap}  (already allowed)"),
+                ui::dim(color),
+            ));
+            continue;
+        }
         // Bare `net` / `process` are unscoped and flagged broad (§7.2).
         if cap == "net" || cap == "process" {
             lines.push(Line::from(vec![
@@ -3711,6 +3761,16 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
     }
     if req.detail.is_none() {
         lines.push(Line::raw(format!("  • memory {} MB", req.memory_mb)));
+    }
+    if let Some(code) = &req.code_preview {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Code (first lines):", ui::dim(color)));
+        for l in code.lines().take(15) {
+            lines.push(Line::styled(
+                format!("  {}", truncate_chars(l, 100)),
+                ui::dim(color),
+            ));
+        }
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
@@ -4312,6 +4372,8 @@ mod tests {
             capabilities: vec![],
             detail: None,
             memory_mb: 256,
+            already_allowed: vec![],
+            code_preview: None,
         });
         assert!(app
             .activity_text()
@@ -4663,6 +4725,8 @@ mod tests {
             capabilities: vec!["net".into(), "fs:read:/tmp".into(), "env:HOME".into()],
             memory_mb: 256,
             detail: None,
+            already_allowed: Vec::new(),
+            code_preview: None,
         });
         let screen = render(&mut app, 100, 24);
         assert!(
@@ -4724,6 +4788,8 @@ mod tests {
             capabilities: vec![],
             memory_mb: 1,
             detail: None,
+            already_allowed: Vec::new(),
+            code_preview: None,
         });
         app.editor = Some(EditorState {
             tool_id: "t".into(),
