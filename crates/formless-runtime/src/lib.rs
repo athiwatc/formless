@@ -311,6 +311,33 @@ fn host_in_scope(domains: &[String], host: &str) -> bool {
 /// bare command (resolved through PATH by the OS) or a path that is that
 /// same PATH binary; a path grant matches only that file. A look-alike
 /// binary elsewhere (`/tmp/x/ls` under `process:ls`) never matches.
+/// Variables a `process.run` child inherits without an `env:` grant: what
+/// ordinary programs need to locate binaries, temp dirs and the locale.
+const PROCESS_BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Windows needs these for most programs to start at all.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
 fn process_allowed(allowed: &[String], cmd: &str) -> bool {
     let is_path = |s: &str| s.contains('/') || s.contains('\\');
     let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
@@ -953,6 +980,19 @@ impl State {
             .stderr(std::process::Stdio::piped());
         if let Some(cwd) = a["cwd"].as_str() {
             command.current_dir(cwd);
+        }
+        // Children see only a minimal base environment plus the keys the
+        // Tool's env Capability grants, never the daemon's secrets.
+        command.env_clear();
+        let inherited = PROCESS_BASE_ENV
+            .iter()
+            .copied()
+            .chain(self.caps.env.iter().map(String::as_str))
+            .filter(|k| !k.to_ascii_uppercase().starts_with("FORMLESS_"));
+        for key in inherited {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
         }
         if let Some(env) = a["env"].as_object() {
             for (k, v) in env {

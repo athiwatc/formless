@@ -483,3 +483,33 @@ async fn three_failed_candidates_flag_needs_attention_and_stop() {
     assert_eq!(info.current_version, 1);
     assert_eq!(store.list_attempts(&tool_id, 50).unwrap().len(), 3);
 }
+
+#[cfg(unix)]
+#[test]
+fn process_children_do_not_inherit_daemon_secrets() {
+    std::env::set_var("FORMLESS_TEST_SECRET", "leak-1");
+    std::env::set_var("FL_M3_OTHER_SECRET", "leak-2");
+    std::env::set_var("FL_M3_GRANTED", "visible");
+    let out = run_mode(
+        "function run(i){ return process.run('printenv', []).stdout; }",
+        json!({}),
+        &["process:printenv", "env:FL_M3_GRANTED"],
+        HostMode::Live,
+    )
+    .unwrap();
+    let env = out.as_str().unwrap();
+    assert!(!env.contains("leak-1"), "FORMLESS_* leaked: {env}");
+    assert!(!env.contains("leak-2"), "undeclared variable leaked: {env}");
+    assert!(env.contains("FL_M3_GRANTED=visible"), "{env}");
+    assert!(env.contains("PATH="), "base environment missing: {env}");
+
+    // FORMLESS_* stays hidden even when declared.
+    let out = run_mode(
+        "function run(i){ return process.run('printenv', []).stdout; }",
+        json!({}),
+        &["process:printenv", "env:FORMLESS_TEST_SECRET"],
+        HostMode::Live,
+    )
+    .unwrap();
+    assert!(!out.as_str().unwrap().contains("leak-1"));
+}

@@ -863,6 +863,10 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   string interpolation); only commands in the Tool's declared scope run. A
   bare grant (`process:ls`) matches the bare name or a path to the same
   file PATH resolves it to; a look-alike binary elsewhere never matches.
+  Children start from an empty environment: only a minimal base (`PATH`,
+  `HOME`, `USER`, locale, `TERM`, `TZ`, temp dirs, and the Windows
+  system variables) plus the keys the Tool's `env:` Capability grants are
+  passed on, and `FORMLESS_*` variables never are.
 - **Network:** `fetch` honours the `net` scope (domain allowlist when
   scoped), http(s) only; redirects are followed but every hop is checked,
   so they may not escape a domain scope.
