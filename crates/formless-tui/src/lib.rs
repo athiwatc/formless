@@ -126,6 +126,8 @@ enum Pending {
     ListSubagents,
     GetSubagent,
     ListMcpServers,
+    ListMcpPrompts,
+    GetMcpPrompt,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -764,6 +766,32 @@ impl App {
                                         .unwrap_or_default()
                                 ));
                             }
+                        }
+                        Pending::ListMcpPrompts => {
+                            let list = result.as_array().cloned().unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push("no MCP prompts available".into());
+                            }
+                            for p in list {
+                                let args: Vec<String> = p["arguments"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|a| a["name"].as_str().map(|n| format!("{n}=…")))
+                                    .collect();
+                                self.notes.push(format!(
+                                    "/prompt {}:{} {} — {}",
+                                    p["server"].as_str().unwrap_or_default(),
+                                    p["name"].as_str().unwrap_or_default(),
+                                    args.join(" "),
+                                    p["description"].as_str().unwrap_or_default()
+                                ));
+                            }
+                        }
+                        Pending::GetMcpPrompt => {
+                            self.input = result["text"].as_str().unwrap_or_default().to_string();
+                            self.notes
+                                .push("prompt loaded into the input; edit it, then Enter".into());
                         }
                         Pending::GetSubagent => {
                             let lines: Vec<String> = result["messages"]
@@ -1507,6 +1535,30 @@ impl App {
                 ));
             }
             "mcp" => self.request(Pending::ListMcpServers, Request::ListMcpServers),
+            "prompts" => self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts),
+            cmd if cmd.starts_with("prompt ") => {
+                let mut words = cmd["prompt ".len()..].split_whitespace();
+                let target = words.next().unwrap_or_default();
+                match target.split_once(':') {
+                    Some((server, name)) => {
+                        let arguments = words
+                            .filter_map(|w| w.split_once('='))
+                            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                            .collect();
+                        self.request(
+                            Pending::GetMcpPrompt,
+                            Request::GetMcpPrompt {
+                                server: server.into(),
+                                name: name.into(),
+                                arguments,
+                            },
+                        );
+                    }
+                    None => self
+                        .notes
+                        .push("usage: /prompt SERVER:NAME [key=value …] (see /prompts)".into()),
+                }
+            }
             cmd if cmd.starts_with("mcp restart ") => {
                 let name = cmd["mcp restart ".len()..].trim().to_string();
                 self.fire(Request::RestartMcpServer { name: name.clone() });
@@ -1568,7 +1620,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

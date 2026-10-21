@@ -293,6 +293,15 @@ pub enum Request {
     RestartMcpServer {
         name: String,
     },
+    /// Prompts offered by the configured MCP servers.
+    ListMcpPrompts,
+    /// One MCP prompt rendered to text (for the composer).
+    GetMcpPrompt {
+        server: String,
+        name: String,
+        #[serde(default)]
+        arguments: serde_json::Map<String, serde_json::Value>,
+    },
     /// What changed between two versions of a Tool, as diff text.
     DiffToolVersions {
         id: String,

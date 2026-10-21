@@ -75,6 +75,25 @@ fn fake_mcp_server() {
                     _ => json!({"isError": true, "content": [{"type": "text", "text": "unknown"}]}),
                 }
             }
+            "resources/list" => json!({"resources": [
+                {"uri": "file:///notes/a.md", "name": "a.md", "description": "Short note", "mimeType": "text/markdown"},
+                {"uri": "file:///notes/big.log", "name": "big.log", "description": "Long log"}
+            ]}),
+            "resources/read" => {
+                let uri = msg["params"]["uri"].as_str().unwrap_or_default();
+                let text = if uri.ends_with("big.log") {
+                    "log line\n".repeat(5000)
+                } else {
+                    "# Note A".into()
+                };
+                json!({"contents": [{"uri": uri, "text": text}]})
+            }
+            "prompts/list" => json!({"prompts": [
+                {"name": "review", "description": "Review a file", "arguments": [{"name": "path", "required": true}]}
+            ]}),
+            "prompts/get" => json!({"messages": [
+                {"role": "user", "content": {"type": "text", "text": format!("Please review {}", msg["params"]["arguments"]["path"].as_str().unwrap_or("?"))}}
+            ]}),
             "notifications/cancelled" => {
                 let _ = std::fs::OpenOptions::new()
                     .create(true)
@@ -764,4 +783,81 @@ async fn trusted_read_only_mcp_tools_skip_per_tool_approval() {
         out.contains("denied"),
         "destructive still asks (and fails closed): {out}"
     );
+}
+
+/// Resources (agent built-ins) and prompts (protocol, for slash commands).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_resources_and_prompts() {
+    use formless_protocol::Request;
+    use std::sync::Arc;
+    let paths = temp_paths("mcpres");
+    let (mcp, _) = fake_server(&paths);
+    formless_core::Config {
+        mcp,
+        ..Default::default()
+    }
+    .save(&paths)
+    .unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let store = Store::open(&paths.db_file()).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    // Not approved yet: headless, the server stays closed.
+    let out = daemon
+        .call_tool_direct(
+            &session,
+            "read_mcp_resource",
+            json!({"server": "fake", "uri": "file:///notes/a.md"}),
+        )
+        .await;
+    assert!(out.contains("did not approve"), "{out}");
+    store.approve_mcp_server("fake").unwrap();
+    let list: Value = serde_json::from_str(
+        &daemon
+            .call_tool_direct(&session, "list_mcp_resources", json!({"query": "short"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(list["resources"][0]["uri"], "file:///notes/a.md");
+    assert_eq!(
+        list["resources"].as_array().unwrap().len(),
+        1,
+        "query narrows"
+    );
+    let small = daemon
+        .call_tool_direct(
+            &session,
+            "read_mcp_resource",
+            json!({"server": "fake", "uri": "file:///notes/a.md"}),
+        )
+        .await;
+    assert!(
+        small.contains("# Note A") && small.contains("mcp:fake"),
+        "{small}"
+    );
+    let big = daemon
+        .call_tool_direct(
+            &session,
+            "read_mcp_resource",
+            json!({"server": "fake", "uri": "file:///notes/big.log"}),
+        )
+        .await;
+    assert!(
+        big.contains("stored as artifact"),
+        "large contents go to an artifact: {}",
+        &big[..200.min(big.len())]
+    );
+    let prompts = daemon.handle(Request::ListMcpPrompts).await.unwrap();
+    assert_eq!(prompts[0]["name"], "review");
+    let text = daemon
+        .handle(Request::GetMcpPrompt {
+            server: "fake".into(),
+            name: "review".into(),
+            arguments: [("path".to_string(), json!("src/main.rs"))]
+                .into_iter()
+                .collect(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(text["text"], "Please review src/main.rs");
 }
