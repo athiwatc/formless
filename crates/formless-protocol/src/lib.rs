@@ -442,6 +442,15 @@ pub enum Request {
     },
     /// Built-in call stats (SPEC §8.8).
     ListBuiltinStats,
+    /// Attach a file to the Session's next user message (SPEC §5.6): stored
+    /// as an artifact; returns `{id, name, mime, bytes}`.
+    AttachFile {
+        session_id: String,
+        name: String,
+        data_b64: String,
+        #[serde(default)]
+        mime: Option<String>,
+    },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
     /// Add a job as the user (approved): `cron` for recurring, else `at`.

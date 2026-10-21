@@ -3251,5 +3251,31 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         }
         return msg;
     }
+    // Attachments (SPEC §5.6): a reference line the model can follow with
+    // read_artifact; images also carry a marker the provider resolves
+    // into an image part for vision models.
+    if m.role == "user" {
+        if let Some(atts) = meta["attachments"].as_array().filter(|a| !a.is_empty()) {
+            let mut content = m.content.clone();
+            let mut images = Vec::new();
+            for a in atts {
+                content.push_str(&format!(
+                    "\n[attached: {} ({}, {} bytes), artifact {}; read it with read_artifact]",
+                    a["name"].as_str().unwrap_or("file"),
+                    a["mime"].as_str().unwrap_or("application/octet-stream"),
+                    a["bytes"],
+                    a["id"].as_str().unwrap_or_default()
+                ));
+                if a["mime"].as_str().is_some_and(|t| t.starts_with("image/")) {
+                    images.push(json!({"path": a["path"], "mime": a["mime"]}));
+                }
+            }
+            let mut msg = json!({"role": "user", "content": content});
+            if !images.is_empty() {
+                msg["_attachments"] = json!(images);
+            }
+            return msg;
+        }
+    }
     json!({"role": m.role, "content": m.content})
 }
