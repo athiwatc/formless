@@ -368,3 +368,6 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .diff { margin: 0; padding: 8px; overflow-x: auto; font: 12px/1.4 var(--mono); background: var(--code-bg); }
 .diff .add { color: var(--accent); }
 .diff .del { color: var(--err); }
+
+/* Non-Tool approvals spell out exactly what would happen. */
+.detail-text { white-space: pre-wrap; font-family: var(--mono); font-size: 13px; }

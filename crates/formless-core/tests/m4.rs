@@ -1924,3 +1924,122 @@ async fn pending_results_are_delivered_in_one_ordered_note() {
     );
     server.abort();
 }
+
+/// The agent can add an MCP server only after the user approves the exact
+/// URL and reason; then its tools are in the registry.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_adds_an_mcp_server_after_approval() {
+    use axum::{
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4addmcp");
+    // A minimal Streamable HTTP MCP server with one tool.
+    let mcp_app = Router::new().route(
+        "/mcp",
+        post(|Json(msg): Json<Value>| async move {
+            if msg.get("id").is_none() {
+                return axum::http::StatusCode::ACCEPTED.into_response();
+            }
+            let result = match msg["method"].as_str().unwrap_or_default() {
+                "initialize" => json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+                "tools/list" => json!({"tools": [{"name": "lookup", "description": "Look things up", "inputSchema": {"type": "object"}}]}),
+                _ => json!({}),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": msg["id"], "result": result})).into_response()
+        }),
+    );
+    let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mcp_url = format!("http://{}/mcp", mcp_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mcp_listener, mcp_app).await.unwrap() });
+    let url2 = mcp_url.clone();
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let url = url2.clone();
+                async move {
+                    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                    match msgs.iter().find(|m| m["role"] == "tool") {
+                        None => sse_tool(
+                            "c1",
+                            "add_mcp_server",
+                            json!({"name": "web", "transport": "http", "url": url, "reason": "to look things up"}),
+                        ),
+                        Some(t) => sse_text(t["content"].as_str().unwrap_or_default()),
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let sid = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: sid,
+        content: "add a lookup server".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut answer = String::new();
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(20), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) else {
+            continue;
+        };
+        match ev {
+            Event::ApprovalRequested {
+                approval_id,
+                tool_name,
+                detail,
+                ..
+            } => {
+                assert_eq!(tool_name, "add_mcp_server");
+                let detail = detail.expect("the modal says exactly what is added");
+                assert!(
+                    detail.contains(&mcp_url) && detail.contains("to look things up"),
+                    "{detail}"
+                );
+                c.send(Request::ApprovalDecision {
+                    approval_id,
+                    approved: true,
+                    scope: formless_protocol::ApprovalScope::Once,
+                })
+                .await;
+            }
+            Event::MessageDelta { delta, .. } => answer.push_str(&delta),
+            Event::RunFinished { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(answer.contains("\"added\":\"web\""), "{answer}");
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert!(store
+        .get_tool_by_name("mcp__web__lookup")
+        .unwrap()
+        .is_some());
+    assert!(formless_core::Config::load(&paths)
+        .unwrap()
+        .mcp
+        .servers
+        .contains_key("web"));
+    server.abort();
+}

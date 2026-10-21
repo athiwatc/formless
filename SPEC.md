@@ -559,6 +559,13 @@ None ship by default (principle 1).
   [--header K=V]`, `remove`, `list` (state, tool count, last error),
   `test`, `login`, `logout`; TUI `/mcp` (and `/mcp restart NAME`); the web
   Settings view lists servers with Restart/Remove.
+- **The agent** may extend itself with the built-ins `add_mcp_server
+  {name, transport, command?, args?, url?, env_keys?, reason}` and
+  `remove_mcp_server {name, reason}`. Each raises an approval modal that
+  shows the exact command line or URL, the env keys and the reason
+  (`ApprovalRequested.detail`); headless they fail closed. Decisions are
+  audit-logged with actor `agent`. There is no registry browsing: the
+  agent can only propose servers it already knows.
 - `mcp:<server>` is sensitive: calls need approval (§10.3) and headless
   calls fail closed.
 

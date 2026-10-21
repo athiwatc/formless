@@ -149,6 +149,8 @@ struct ApprovalReq {
     version: i64,
     capabilities: Vec<String>,
     memory_mb: u32,
+    /// What exactly is being approved, for non-Tool approvals.
+    detail: Option<String>,
 }
 
 enum WizardJob {
@@ -1148,7 +1150,7 @@ impl App {
                 version,
                 capabilities,
                 memory_mb,
-                ..
+                detail,
             } => {
                 // Approvals stay global: a backgrounded Run still needs one.
                 if self.is_current(&session_id) {
@@ -1160,6 +1162,7 @@ impl App {
                     version,
                     capabilities,
                     memory_mb,
+                    detail,
                 });
             }
             Event::ToolUpdated { tool } => {
@@ -1208,6 +1211,7 @@ impl App {
                     version: 0,
                     capabilities,
                     memory_mb,
+                    detail: None,
                 });
             }
             Event::InvocationPending {
@@ -3276,22 +3280,33 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize, color: bool) {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::raw("Tool "),
-            Span::styled(req.tool_name.clone(), bold_fg(color, Color::Yellow)),
-            Span::raw(format!(
-                " v{} {}",
-                req.version,
-                if promotion {
-                    "is ready to be promoted with:"
-                } else {
-                    "wants sensitive capabilities:"
-                }
-            )),
-        ]),
-        Line::raw(""),
-    ];
+    let mut lines = match &req.detail {
+        // A non-Tool approval (e.g. the agent adding an MCP server).
+        Some(detail) => {
+            let mut l: Vec<Line> = detail
+                .lines()
+                .map(|d| Line::styled(d.to_string(), bold_fg(color, Color::Yellow)))
+                .collect();
+            l.push(Line::raw(""));
+            l
+        }
+        None => vec![
+            Line::from(vec![
+                Span::raw("Tool "),
+                Span::styled(req.tool_name.clone(), bold_fg(color, Color::Yellow)),
+                Span::raw(format!(
+                    " v{} {}",
+                    req.version,
+                    if promotion {
+                        "is ready to be promoted with:"
+                    } else {
+                        "wants sensitive capabilities:"
+                    }
+                )),
+            ]),
+            Line::raw(""),
+        ],
+    };
     if req.capabilities.is_empty() {
         lines.push(Line::styled("  • (no capabilities)", ui::dim(color)));
     }
@@ -3306,7 +3321,9 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
             lines.push(Line::raw(format!("  • {cap}")));
         }
     }
-    lines.push(Line::raw(format!("  • memory {} MB", req.memory_mb)));
+    if req.detail.is_none() {
+        lines.push(Line::raw(format!("  • memory {} MB", req.memory_mb)));
+    }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         if promotion {
@@ -3882,6 +3899,7 @@ mod tests {
             tool_name: "create_tool".into(),
             version: 1,
             capabilities: vec![],
+            detail: None,
             memory_mb: 256,
         });
         assert!(app
@@ -4233,6 +4251,7 @@ mod tests {
             version: 1,
             capabilities: vec!["net".into(), "fs:read:/tmp".into(), "env:HOME".into()],
             memory_mb: 256,
+            detail: None,
         });
         let screen = render(&mut app, 100, 24);
         assert!(
@@ -4293,6 +4312,7 @@ mod tests {
             version: 1,
             capabilities: vec![],
             memory_mb: 1,
+            detail: None,
         });
         app.editor = Some(EditorState {
             tool_id: "t".into(),

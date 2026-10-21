@@ -503,6 +503,10 @@ pub enum Event {
         version: i64,
         capabilities: Vec<String>,
         memory_mb: u32,
+        /// What exactly is being approved, when not a Tool's Capabilities
+        /// alone (e.g. the command an agent wants to add as an MCP server).
+        #[serde(default)]
+        detail: Option<String>,
     },
     ToolUpdated {
         tool: ToolInfo,
@@ -646,6 +650,7 @@ mod tests {
             version: 1,
             capabilities: vec![],
             memory_mb: 0,
+            detail: None,
         };
         assert_eq!(ev.session_id(), Some("s1"));
         let note = Event::Note {
