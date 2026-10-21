@@ -600,7 +600,10 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - **SQLite** holds Sessions, Runs, Tool metadata/versions index,
   Invocations, metrics tallies, compaction checkpoints, approvals, audit
   events. Schema is versioned; the daemon auto-migrates on start and takes a
-  **backup before migrating**. On corruption it refuses to guess: it stops,
+  **backup before migrating** (a consistent `VACUUM INTO` copy named
+  `formless.db.v<old>-<UTC time>.bak`, whenever an existing database is
+  older than the build). Each step runs in a transaction with its version
+  bump, and a database newer than the build is refused, never downgraded. On corruption it refuses to guess: it stops,
   reports, and points at the backup (see Edge Cases, §16).
 
 ### 9.5 Crash recovery

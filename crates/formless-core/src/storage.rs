@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use formless_protocol::{
     MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, ToolInfo, ToolMetricsInfo,
     ToolVersionInfo,
@@ -6,7 +6,7 @@ use formless_protocol::{
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Store {
     conn: Connection,
@@ -180,53 +180,85 @@ impl ModelStat {
     }
 }
 
+/// Schema version this build writes (`PRAGMA user_version`).
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// Add a column, tolerating only "it already exists" (a step that was
+/// partly applied by an older build); every other error is real.
+fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
+    match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column_def}"), []) {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("add column {table}.{column_def}")),
+    }
+}
+
+type MigrationStep = fn(&Connection) -> Result<()>;
+
+/// Migration steps by the version they produce.
+const MIGRATIONS: [(i64, MigrationStep); 7] = [
+    (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
+    (2, |c| {
+        add_column(c, "messages", "meta TEXT")?;
+        Ok(c.execute_batch(SCHEMA_V2)?)
+    }),
+    (3, |c| {
+        add_column(c, "tools", "cooldown_until TEXT")?;
+        add_column(
+            c,
+            "tools",
+            "consecutive_failures INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column(c, "invocations", "retried INTEGER NOT NULL DEFAULT 0")?;
+        Ok(c.execute_batch(SCHEMA_V3)?)
+    }),
+    (4, |c| Ok(c.execute_batch(SCHEMA_V4)?)),
+    (5, |c| Ok(c.execute_batch(SCHEMA_V5)?)),
+    (6, |c| Ok(c.execute_batch(SCHEMA_V6)?)),
+    (7, |c| Ok(c.execute_batch(SCHEMA_V7)?)),
+];
+
+/// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
+/// database is backed up first; each step runs in its own transaction
+/// together with its version bump, so a failure leaves the database at
+/// the last completed version.
 fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version < 1 {
-        conn.execute_batch(SCHEMA_V1)?;
-        conn.execute_batch("PRAGMA user_version=1;")?;
+    if version > SCHEMA_VERSION {
+        return Err(anyhow!(
+            "database schema v{version} is newer than this build (v{SCHEMA_VERSION}); upgrade formless"
+        ));
     }
-    if version < 2 {
-        if version == 1 {
-            if let Some(f) = file {
-                let _ = std::fs::copy(f, f.with_extension("db.bak"));
-            }
+    if version > 0 && version < SCHEMA_VERSION {
+        if let Some(f) = file {
+            backup_before_migration(conn, f, version)?;
         }
-        // messages.meta (ignore if a previous partial migration added it)
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT", []);
-        conn.execute_batch(SCHEMA_V2)?;
-        conn.execute_batch("PRAGMA user_version=2;")?;
     }
-    if version < 3 {
-        let _ = conn.execute("ALTER TABLE tools ADD COLUMN cooldown_until TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE tools ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE invocations ADD COLUMN retried INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        conn.execute_batch(SCHEMA_V3)?;
-        conn.execute_batch("PRAGMA user_version=3;")?;
-    }
-    if version < 4 {
-        conn.execute_batch(SCHEMA_V4)?;
-        conn.execute_batch("PRAGMA user_version=4;")?;
-    }
-    if version < 5 {
-        conn.execute_batch(SCHEMA_V5)?;
-        conn.execute_batch("PRAGMA user_version=5;")?;
-    }
-    if version < 6 {
-        conn.execute_batch(SCHEMA_V6)?;
-        conn.execute_batch("PRAGMA user_version=6;")?;
-    }
-    if version < 7 {
-        conn.execute_batch(SCHEMA_V7)?;
-        conn.execute_batch("PRAGMA user_version=7;")?;
+    for (target, step) in MIGRATIONS {
+        if version < target {
+            let tx = conn.unchecked_transaction()?;
+            step(&tx).with_context(|| format!("migrate database to v{target}"))?;
+            tx.execute_batch(&format!("PRAGMA user_version={target};"))?;
+            tx.commit()?;
+        }
     }
     Ok(())
+}
+
+/// Consistent copy (WAL included) next to the database, named after the
+/// version it holds and the time it was taken.
+fn backup_before_migration(conn: &Connection, file: &Path, version: i64) -> Result<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let name = format!(
+        "{}.v{version}-{stamp}.bak",
+        file.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("formless.db")
+    );
+    let dest = file.with_file_name(name);
+    conn.execute("VACUUM INTO ?1", params![dest.to_string_lossy()])
+        .with_context(|| format!("back up database to {}", dest.display()))?;
+    Ok(dest)
 }
 
 impl Store {
