@@ -322,7 +322,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -337,7 +337,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 25] = [
+const MIGRATIONS: [(i64, MigrationStep); 26] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -397,6 +397,10 @@ const MIGRATIONS: [(i64, MigrationStep); 25] = [
         Ok(c.execute_batch(
             "CREATE TABLE IF NOT EXISTS optimiser_queue (tool_id TEXT PRIMARY KEY, queued_at TEXT NOT NULL);",
         )?)
+    }),
+    // Why a Run stopped (paused provider error, crash, interrupt).
+    (26, |c| {
+        add_column(c, "runs", "error TEXT NOT NULL DEFAULT ''")
     }),
 ];
 
@@ -1107,6 +1111,32 @@ impl Store {
         Ok((rows, steps))
     }
 
+    /// Record why a Run stopped.
+    pub fn set_run_error(&self, run_id: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET error=?2 WHERE id=?1",
+            params![run_id, error],
+        )?;
+        Ok(())
+    }
+
+    /// The Session's last Run when it stopped unfinished (interrupted or
+    /// paused): (id, status, reason).
+    pub fn unfinished_last_run(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, status, error FROM runs WHERE session_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+            .filter(|(_, s, _): &(String, String, String)| s == "interrupted" || s == "paused"))
+    }
+
     /// One model call made in a Run (a step).
     pub fn bump_run_steps(&self, run_id: &str) -> Result<()> {
         self.conn
@@ -1421,7 +1451,7 @@ impl Store {
             params![now()],
         );
         Ok(self.conn.execute(
-            "UPDATE runs SET status='interrupted', updated_at=?1 WHERE status='running'",
+            "UPDATE runs SET status='interrupted', error='the daemon stopped while this Run was going', updated_at=?1 WHERE status='running'",
             params![now()],
         )?)
     }

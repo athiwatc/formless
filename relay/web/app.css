@@ -378,3 +378,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .running-item { display: flex; align-items: center; gap: 4px; padding: 2px 0; }
 .running-item .linklike { flex: 1; text-align: left; background: none; border: 0; color: inherit; cursor: pointer; padding: 0; font: inherit; }
 .running-item.stalled .linklike { color: var(--warn, #e0b050); }
+
+/* Interrupted / paused Run banner */
+.run-banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 10px; margin-bottom: 6px;
+  border: 1px solid var(--warn, #e0b050); border-radius: 6px; font-size: 13px; }
+.run-banner span { flex: 1; min-width: 200px; }

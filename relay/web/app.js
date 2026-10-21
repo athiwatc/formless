@@ -998,6 +998,22 @@
   });
   $("jump").onclick = () => scrollToBottom(true);
 
+  // An interrupted/paused last Run (SPEC §5.4): why, and what to do.
+  function renderRunBanner() {
+    const box = $("run-banner");
+    const u = S.unfinished;
+    box.classList.toggle("hidden", !u || isRunning());
+    if (!u) return box.replaceChildren();
+    box.replaceChildren(
+      h("span", null, "⏸ The last Run was " + u.status + (u.error ? ": " + truncate(u.error, 200) : "")),
+      h("button", { class: "btn small primary", type: "button", onclick: async () => {
+        if (await act({ type: "resume_run", session_id: S.current })) { S.unfinished = null; renderRunBanner(); }
+      } }, "Resume"),
+      h("button", { class: "btn small", type: "button", onclick: async () => {
+        if (await act({ type: "abandon_run", session_id: S.current }, "Abandoned")) { S.unfinished = null; renderRunBanner(); }
+      } }, "Abandon"));
+  }
+
   function renderComposer() {
     const running = isRunning();
     $("composer").classList.toggle("running", running);
@@ -1534,6 +1550,8 @@
     const r = await act({ type: "get_session", id });
     if (r && S.current === id) {
       S.messages = r.messages || [];
+      S.unfinished = r.unfinished_run || null;
+      renderRunBanner();
       if (r.queued && r.queued.length) note(r.queued.length + " queued message(s) start after the current run");
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
@@ -1757,6 +1775,7 @@
     switch (ev.type) {
       case "run_started":
         S.running.add(ev.session_id);
+        if (here) { S.unfinished = null; renderRunBanner(); }
         if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = []; setActivity("waiting for model"); }
         break;
       case "message_appended":
@@ -1781,6 +1800,7 @@
       case "run_finished":
       case "run_paused":
         S.running.delete(ev.session_id);
+        if (here) { S.unfinished = { status: "paused", error: ev.error }; renderRunBanner(); }
         if (here) {
           S.streaming = "";
           S.thinking = "";
