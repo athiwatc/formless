@@ -241,7 +241,36 @@ globalThis.requireModule = (name) => {
 globalThis.modules = { load: globalThis.requireModule, list: () => __call("module_list", {}) };
 globalThis.emit = (chunk) => __call("emit", { chunk: String(chunk) });
 globalThis.sleep = (ms) => __call("sleep", { ms: ms | 0 });
-globalThis.setTimeout = (fn, ms) => { sleep(ms || 0); if (fn) fn(); return 0; };
+// Real timers: callbacks run from the host's event loop after the current
+// job, in due order (ties by creation), never synchronously.
+const __timers = new Map();
+let __timerSeq = 0;
+function __addTimer(fn, ms, args, repeat) {
+  const id = ++__timerSeq;
+  const delay = Math.max(0, Number(ms) || 0);
+  __timers.set(id, { fn, args, at: Date.now() + delay, every: repeat ? Math.max(1, delay) : 0 });
+  return id;
+}
+globalThis.setTimeout = (fn, ms, ...args) => __addTimer(fn, ms, args, false);
+globalThis.setInterval = (fn, ms, ...args) => __addTimer(fn, ms, args, true);
+globalThis.clearTimeout = globalThis.clearInterval = (id) => { __timers.delete(id); };
+// Runs every timer that is due; returns ms until the next one, or -1.
+globalThis.__runTimers = () => {
+  const due = [...__timers].filter(([, t]) => t.at <= Date.now()).sort((a, b) => a[1].at - b[1].at || a[0] - b[0]);
+  for (const [id, t] of due) {
+    if (!__timers.has(id)) continue; // cleared by an earlier callback
+    if (t.every) t.at = Date.now() + t.every; else __timers.delete(id);
+    if (typeof t.fn === "function") {
+      try { t.fn(...t.args); } catch (e) { console.error("timer callback threw: " + ((e && e.message) || e)); }
+    }
+  }
+  let next = -1;
+  for (const t of __timers.values()) {
+    const wait = Math.max(0, t.at - Date.now());
+    if (next < 0 || wait < next) next = wait;
+  }
+  return next;
+};
 globalThis.cryptoRandom = () => __call("crypto_random", {});
 globalThis.randomBytes = (n) => __call("random_bytes", { n: n | 0 });
 "#;
@@ -453,8 +482,11 @@ impl State {
             }
             "sleep" => {
                 let ms = a["ms"].as_u64().unwrap_or(0).min(60_000);
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                Ok(Value::Null)
+                if self.sleep_cancellable(std::time::Duration::from_millis(ms)) {
+                    Ok(Value::Null)
+                } else {
+                    Err("interrupted".into())
+                }
             }
             "crypto_random" => Ok(json!(uuid::Uuid::new_v4().to_string())),
             "random_bytes" => {
@@ -843,6 +875,21 @@ impl State {
             return Err(denied("net denied in replay"));
         }
         Ok((parsed, fixed))
+    }
+
+    /// Sleep in short slices; false if the Invocation was cancelled.
+    fn sleep_cancellable(&self, total: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + total;
+        loop {
+            if self.cancel.load(Ordering::SeqCst) {
+                return false;
+            }
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            std::thread::sleep(left.min(std::time::Duration::from_millis(25)));
+        }
     }
 
     /// Run blocking work on its own thread, returning early with
@@ -1438,18 +1485,38 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         ctx.eval::<(), _>(req.code.as_str()).map_err(|e| err(&e))?;
         ctx.eval::<(), _>(RUNNER).map_err(|e| err(&e))
     })?;
-    // An async run() settles through the job queue; host calls are
-    // synchronous, so draining it always makes progress.
-    while runtime.is_job_pending() {
-        if runtime.execute_pending_job().is_err() {
-            break;
+    // Event loop: drain the job queue (an async run() settles through it),
+    // then fire due timers, sleeping until the next one. It ends when the
+    // result is set (leftover timers are dropped) or nothing is left to run.
+    let result_json: Option<String> = loop {
+        while runtime.is_job_pending() {
+            if runtime.execute_pending_job().is_err() {
+                break;
+            }
         }
-    }
-    let result_json: Option<String> = ctx.with(|ctx| {
-        ctx.globals()
-            .get::<_, Option<String>>("__result_json")
-            .map_err(|e| err(&e))
-    })?;
+        let (result, next_timer) = ctx.with(|ctx| -> Result<(Option<String>, i64), ExecError> {
+            let result = ctx
+                .globals()
+                .get::<_, Option<String>>("__result_json")
+                .map_err(|e| err(&e))?;
+            if result.is_some() {
+                return Ok((result, -1));
+            }
+            let next = ctx.eval::<i64, _>("__runTimers()").map_err(|e| err(&e))?;
+            Ok((None, next))
+        })?;
+        if result.is_some() {
+            break result;
+        }
+        if next_timer < 0 && !runtime.is_job_pending() {
+            break None;
+        }
+        if next_timer > 0
+            && !state.sleep_cancellable(std::time::Duration::from_millis(next_timer as u64))
+        {
+            return Err(err(&"interrupted"));
+        }
+    };
     let result_json =
         result_json.ok_or_else(|| err(&"run() returned a Promise that never settled"))?;
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
