@@ -333,7 +333,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 29;
+pub const SCHEMA_VERSION: i64 = 30;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -348,7 +348,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 29] = [
+const MIGRATIONS: [(i64, MigrationStep); 30] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -419,6 +419,17 @@ const MIGRATIONS: [(i64, MigrationStep); 29] = [
     // Which role/model a sub-agent ran on (SPEC §4.5).
     (29, |c| {
         add_column(c, "subagents", "model TEXT NOT NULL DEFAULT ''")
+    }),
+    // Per-task routing stats for roles (SPEC §4.6).
+    (30, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_stats (
+               id TEXT PRIMARY KEY, role TEXT NOT NULL, model TEXT NOT NULL,
+               session_id TEXT, run_id TEXT, task_hash TEXT NOT NULL,
+               ms INTEGER NOT NULL, tokens INTEGER NOT NULL, turns INTEGER NOT NULL,
+               outcome TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS idx_task_stats ON task_stats(role, model);",
+        )?)
     }),
 ];
 
@@ -1276,6 +1287,57 @@ impl Store {
             )
             .ok()
             .filter(|(_, s, _): &(String, String, String)| s == "interrupted" || s == "paused"))
+    }
+
+    /// Record one finished sub-agent task for routing (SPEC §4.6).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_task(
+        &self,
+        role: &str,
+        model: &str,
+        session_id: &str,
+        run_id: &str,
+        task_hash: &str,
+        ms: i64,
+        tokens: i64,
+        turns: i64,
+        outcome: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO task_stats(id,role,model,session_id,run_id,task_hash,ms,tokens,turns,outcome,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![uuid::Uuid::new_v4().to_string(), role, model, session_id, run_id, task_hash, ms, tokens, turns, outcome, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The same task started again in the same Run: the earlier result was
+    /// not good enough, so it no longer counts as good.
+    pub fn mark_task_respawned(&self, role: &str, run_id: &str, task_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE task_stats SET outcome='respawned' WHERE role=?1 AND run_id=?2 AND task_hash=?3 AND outcome='completed'",
+            params![role, run_id, task_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Per-model task stats of a role.
+    pub fn task_stats(&self, role: &str) -> Result<Vec<crate::routing::TaskStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, COUNT(*), SUM(outcome='completed'), AVG(ms), AVG(tokens) FROM task_stats WHERE role=?1 GROUP BY model",
+        )?;
+        let rows = stmt
+            .query_map(params![role], |r| {
+                Ok(crate::routing::TaskStat {
+                    model: r.get(0)?,
+                    samples: r.get(1)?,
+                    good: r.get(2)?,
+                    avg_ms: r.get(3)?,
+                    avg_tokens: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// One model call made in a Run (a step).

@@ -45,6 +45,12 @@ pub struct RoleCfg {
     pub reasoning_effort: Option<String>,
     /// Extra system prompt for sub-agents in this role.
     pub system: Option<String>,
+    /// With `model = "auto"`: the models to choose from, per task, by
+    /// measured quality then cost (SPEC §4.6). Empty: the global pool.
+    pub candidates: Vec<String>,
+    /// Most model turns a sub-agent in this role may take; unset uses
+    /// `tools.subagent_max_turns`.
+    pub max_turns: Option<u32>,
 }
 
 /// The name of the built-in provider (`[provider]`).
@@ -573,6 +579,32 @@ pub struct ToolsCfg {
     /// Most results one `find_tools` call may return.
     #[serde(default = "default_find_tools_max")]
     pub find_tools_max: usize,
+    /// Most model turns a sub-agent may take before it stops (a quality
+    /// signal for routing, SPEC §4.6).
+    #[serde(default = "default_subagent_max_turns")]
+    pub subagent_max_turns: u32,
+    /// Per-task routing for `auto` roles (SPEC §4.6): samples a model
+    /// needs before its score counts …
+    #[serde(default = "default_task_min_samples")]
+    pub task_min_samples: i64,
+    /// … the share of good tasks it must reach …
+    #[serde(default = "default_task_quality_bar")]
+    pub task_quality_bar: f64,
+    /// … and how often an under-sampled candidate is tried instead.
+    #[serde(default = "default_task_explore_rate")]
+    pub task_explore_rate: f64,
+}
+fn default_subagent_max_turns() -> u32 {
+    40
+}
+fn default_task_min_samples() -> i64 {
+    5
+}
+fn default_task_quality_bar() -> f64 {
+    0.8
+}
+fn default_task_explore_rate() -> f64 {
+    0.1
 }
 fn default_max_tool_depth() -> usize {
     8
@@ -617,6 +649,10 @@ impl Default for ToolsCfg {
             max_sleep_secs: default_max_sleep_secs(),
             max_random_bytes: default_max_random_bytes(),
             find_tools_max: default_find_tools_max(),
+            subagent_max_turns: default_subagent_max_turns(),
+            task_min_samples: default_task_min_samples(),
+            task_quality_bar: default_task_quality_bar(),
+            task_explore_rate: default_task_explore_rate(),
         }
     }
 }
