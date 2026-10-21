@@ -1660,6 +1660,19 @@ impl Store {
             .ok())
     }
 
+    /// Pinned definitions of a Session's Tools that are no longer active
+    /// (retired, e.g. an MCP server dropped them), as (tool id, definition).
+    pub fn pinned_inactive(&self, session_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT st.tool_id, st.pinned_def FROM session_tools st JOIN tools t ON t.id = st.tool_id
+             WHERE st.session_id=?1 AND st.pinned_def IS NOT NULL AND st.source!='unloaded' AND t.retired=1",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn pin_definition(
         &self,
         session_id: &str,

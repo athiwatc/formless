@@ -861,3 +861,61 @@ async fn mcp_resources_and_prompts() {
         .unwrap();
     assert_eq!(text["text"], "Please review src/main.rs");
 }
+
+/// When a server drops a tool, the registry retires it at once, but a
+/// Session that listed it keeps the same listing until its next refresh
+/// point (compaction), so its cached prefix survives.
+#[test]
+fn dropped_mcp_tools_leave_session_listings_alone_until_compaction() {
+    use formless_core::mcp::McpTool;
+    use formless_core::tools::tool_definitions;
+    let store = Store::open_in_memory().unwrap();
+    let tool = |name: &str| McpTool {
+        name: name.into(),
+        description: format!("{name} tool"),
+        input_schema: json!({"type": "object"}),
+        annotations: Value::Null,
+    };
+    sync_registry(&store, "srv", &[tool("alpha"), tool("beta"), tool("gamma")]).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let before = tool_definitions(&store, Some(&session), 40).unwrap();
+    // The server drops beta and adds delta.
+    sync_registry(
+        &store,
+        "srv",
+        &[tool("alpha"), tool("gamma"), tool("delta")],
+    )
+    .unwrap();
+    assert!(
+        store
+            .get_tool_by_name("mcp__srv__beta")
+            .unwrap()
+            .unwrap()
+            .0
+            .retired
+    );
+    assert_eq!(
+        tool_definitions(&store, Some(&session), 40).unwrap(),
+        before,
+        "byte-identical listing mid-session"
+    );
+    // A new Session sees the current set.
+    let fresh = store.create_session(None).unwrap().id;
+    let names = |defs: Vec<Value>| -> Vec<String> {
+        defs.iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .filter(|n| n.starts_with("mcp__"))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        names(tool_definitions(&store, Some(&fresh), 40).unwrap()),
+        ["mcp__srv__alpha", "mcp__srv__delta", "mcp__srv__gamma"]
+    );
+    // At compaction the Session refreshes: beta goes (delta is reached via find_tools).
+    store.unpin_definitions(&session, None).unwrap();
+    assert_eq!(
+        names(tool_definitions(&store, Some(&session), 40).unwrap()),
+        ["mcp__srv__alpha", "mcp__srv__gamma"]
+    );
+}

@@ -692,5 +692,25 @@ pub fn tool_definitions(
             defs.push(def);
         }
     }
+    // A Tool retired since the Session listed it (an MCP server dropped
+    // it, or a user retired it) stays listed, as pinned, until the next
+    // refresh point (compaction): removing it would rewrite the cached
+    // prefix. Calling it reports that it is retired.
+    if let Some(s) = session_id {
+        let builtins = defs.iter().take_while(|d| is_builtin(fn_name(d))).count();
+        let mut registry: Vec<Value> = defs.split_off(builtins);
+        for (_, def) in store.pinned_inactive(s)? {
+            if let Ok(def) = serde_json::from_str::<Value>(&def) {
+                registry.push(def);
+            }
+        }
+        // Same name order as the listing itself.
+        registry.sort_by_key(|d| fn_name(d).to_lowercase());
+        defs.extend(registry);
+    }
     Ok(defs)
+}
+
+fn fn_name(def: &Value) -> &str {
+    def["function"]["name"].as_str().unwrap_or_default()
 }
