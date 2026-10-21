@@ -734,6 +734,10 @@ fn run_headless(
             found.unwrap()
         }
     };
+    client.send(Request::Subscribe {
+        sessions: Some(vec![session_id.clone()]),
+        deltas: true,
+    });
     client.send(Request::SendMessage {
         session_id: session_id.clone(),
         content: task,

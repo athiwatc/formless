@@ -842,6 +842,11 @@ impl App {
     /// Make `id` the session on screen, dropping the previous one's live
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
+        // Live traffic only for the Session on screen (lists stay global).
+        self.fire(Request::Subscribe {
+            sessions: Some(vec![id.clone()]),
+            deltas: true,
+        });
         self.current = Some(id);
         self.streaming.clear();
         self.thinking.clear();

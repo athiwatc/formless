@@ -599,6 +599,11 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   Sessions, settings, export/import) and daemon→client streamed events
   (model content and reasoning deltas, tool-call lifecycle, pending/stall
   notices, approval requests, compaction notices, optimiser activity).
+- Each connection may `Subscribe {sessions, deltas}`: only the listed
+  Sessions' transcript and live events (and token deltas only if
+  `deltas`) reach it. Tool/module/proposal events, approvals, the Session
+  list and Run start/end stay global. A new connection receives everything;
+  the TUI, web and headless clients subscribe to the Session they show.
 - A client whose protocol version mismatches the daemon's **refuses to
   attach** with a clear message (no silent incompatibility).
 
