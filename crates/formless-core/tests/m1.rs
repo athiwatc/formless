@@ -586,3 +586,38 @@ fn reader_connections_see_writes_and_cannot_write() {
         "query_only connections refuse writes"
     );
 }
+
+#[test]
+fn concurrent_appends_get_distinct_ordered_seqs() {
+    let paths = temp_paths("seqs");
+    let session = Store::open(&paths.db_file())
+        .unwrap()
+        .create_session(None)
+        .unwrap()
+        .id;
+    // Two connections (as a second writer would have) appending at once.
+    let writers: Vec<_> = (0..2)
+        .map(|w| {
+            let (db, session) = (paths.db_file(), session.clone());
+            std::thread::spawn(move || {
+                let store = Store::open(&db).unwrap();
+                for i in 0..50 {
+                    store
+                        .append_message(&session, "user", &format!("{w}-{i}"))
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    let seqs: Vec<i64> = Store::open(&paths.db_file())
+        .unwrap()
+        .list_messages(&session)
+        .unwrap()
+        .iter()
+        .map(|m| m.seq)
+        .collect();
+    assert_eq!(seqs, (1..=100).collect::<Vec<i64>>());
+}
