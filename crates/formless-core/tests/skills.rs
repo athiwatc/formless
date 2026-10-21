@@ -198,3 +198,51 @@ async fn skills_are_managed_through_the_daemon() {
         serde_json::json!([])
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_loads_enabled_skills() {
+    use std::sync::Arc;
+    let paths = temp_paths("loadskill");
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let src = paths.data_dir.join("src/report");
+    write_skill(&src, "report-writer", "Step 1: read the sheet.");
+    install(&paths, &store, src.to_str().unwrap(), None, None, "user").unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let call = |name: &'static str, args: serde_json::Value| {
+        let (d, s) = (daemon.clone(), session.clone());
+        async move { d.call_tool_direct(&s, name, args).await }
+    };
+    let off = call("load_skill", serde_json::json!({"name": "report-writer"})).await;
+    assert!(
+        off.contains("no enabled skill"),
+        "disabled skills stay closed: {off}"
+    );
+    store.set_skill_enabled("report-writer", true).unwrap();
+    let loaded: serde_json::Value = serde_json::from_str(
+        &call("load_skill", serde_json::json!({"name": "report-writer"})).await,
+    )
+    .unwrap();
+    assert_eq!(loaded["instructions"], "Step 1: read the sheet.\n");
+    assert_eq!(
+        loaded["files"],
+        serde_json::json!(["reference.md", "scripts/fix.py"])
+    );
+    assert_eq!(store.get_skill("report-writer").unwrap().unwrap().loads, 1);
+    let file = call(
+        "read_skill_file",
+        serde_json::json!({"name": "report-writer", "path": "reference.md"}),
+    )
+    .await;
+    assert_eq!(file, "extra notes");
+    let found: serde_json::Value = serde_json::from_str(
+        &call(
+            "find_tools",
+            serde_json::json!({"query": "spreadsheets reports"}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(found["skills"][0]["name"], "report-writer");
+}

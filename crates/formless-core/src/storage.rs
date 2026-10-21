@@ -2074,6 +2074,15 @@ impl Store {
         )? > 0)
     }
 
+    /// Record that a Session loaded a skill (usage metrics).
+    pub fn record_skill_load(&self, name: &str, session_id: &str, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO skill_loads(skill_id, session_id, run_id, created_at) SELECT id, ?2, ?3, ?4 FROM skills WHERE name=?1",
+            params![name, session_id, run_id, now()],
+        )?;
+        Ok(())
+    }
+
     /// Delete a skill's rows; returns its version folders to remove.
     pub fn remove_skill(&self, name: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(

@@ -606,6 +606,14 @@ Tools fill capability gaps; skills say how to use them well.
   version, starts **disabled**: the user reviews the body and files
   (`GetSkill`, `formless skills show`) and enables it. Skills that bundle
   scripts are flagged.
+- **Progressive disclosure:** only enabled skills' `name: description`
+  lines go into the system prompt, as a sorted "Skills" block that is part
+  of the per-Session prompt snapshot (§11), so installing or enabling a
+  skill reaches new Sessions (or a Session after compaction) without
+  breaking running Sessions' caches. The body is loaded on demand with the
+  built-in `load_skill(name)` (recorded as a load, for metrics), extra
+  files with `read_skill_file(name, path)` (confined to the skill's
+  folder); `find_tools` also lists matching skills.
 - **Management** goes through the daemon: `ListSkills`, `AddSkill`,
   `RemoveSkill`, `SetSkillEnabled`, `GetSkill`, the `SkillsChanged` event;
   CLI `formless skills add|remove|list|enable|disable|show`; TUI `/skills`

@@ -1521,6 +1521,14 @@ impl Daemon {
                 Err(e) => format!("error: find_tools failed: {e}"),
             },
             toolreg::ADD_MCP_SERVER => self.agent_add_mcp_server(session_id, &args, cancel).await,
+            toolreg::LOAD_SKILL => match self.load_skill_impl(session_id, run_id, &args) {
+                Ok(text) => text,
+                Err(e) => format!("error: load_skill failed: {e}"),
+            },
+            toolreg::READ_SKILL_FILE => match self.read_skill_file_impl(&args) {
+                Ok(text) => self.model_text(session_id, &json!(text), cfg),
+                Err(e) => format!("error: read_skill_file failed: {e}"),
+            },
             toolreg::LIST_MCP_RESOURCES => {
                 match self.list_mcp_resources(session_id, &args, cancel).await {
                     Ok(v) => v.to_string(),
@@ -2065,8 +2073,24 @@ impl Daemon {
     }
 
     pub(crate) fn effective_system_prompt(&self) -> String {
-        self.with_store(|st| st.effective_system_prompt(SYSTEM_PROMPT))
-            .unwrap_or_else(|_| SYSTEM_PROMPT.to_string())
+        let mut prompt = self
+            .with_store(|st| st.effective_system_prompt(SYSTEM_PROMPT))
+            .unwrap_or_else(|_| SYSTEM_PROMPT.to_string());
+        // The skills index (SPEC §7.10): names and one-line descriptions,
+        // sorted. It is part of the per-Session prompt snapshot, so a new
+        // skill reaches new Sessions (or this one after compaction).
+        let skills: Vec<String> = self
+            .with_store(|st| st.list_skills())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.enabled && !s.retired)
+            .map(|s| format!("- {}: {}", s.name, s.description))
+            .collect();
+        if !skills.is_empty() {
+            prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
+            prompt.push_str(&skills.join("\n"));
+        }
+        prompt
     }
 
     /// Current module code for Invocations: one shared snapshot, re-read
@@ -2404,9 +2428,21 @@ impl Daemon {
             .take(limit)
             .map(|m| json!({"name": m.name, "description": m.description, "version": m.current_version}))
             .collect();
+        let skills: Vec<Value> = self
+            .with_store(|st| st.list_skills())?
+            .into_iter()
+            .filter(|s| s.enabled && !s.retired)
+            .filter(|s| {
+                let hay = format!("{} {}", s.name, s.description).to_lowercase();
+                words.iter().any(|w| hay.contains(w.as_str()))
+            })
+            .take(limit)
+            .map(|s| json!({"name": s.name, "description": s.description, "load_with": "load_skill"}))
+            .collect();
         Ok(json!({
             "tools": tools,
             "modules": modules,
+            "skills": skills,
             "upgraded": upgraded,
             "note": if tools.is_empty() {
                 "No matching Tool; create one."
@@ -2433,6 +2469,39 @@ impl Daemon {
             }
         }
         Ok(notes)
+    }
+
+    fn enabled_skill(&self, name: &str) -> Result<SkillInfo> {
+        self.with_store(|st| st.get_skill(name))?
+            .filter(|s| s.enabled && !s.retired)
+            .with_context(|| format!("no enabled skill named '{name}'"))
+    }
+
+    fn load_skill_impl(&self, session_id: &str, run_id: &str, args: &Value) -> Result<String> {
+        let name = args["name"].as_str().context("name required")?;
+        let skill = self.enabled_skill(name)?;
+        let dir = self.with_store(|st| crate::skills::current_dir(st, name))?;
+        let body =
+            crate::skills::parse_skill_md(&std::fs::read_to_string(dir.join("SKILL.md"))?)?.body;
+        let files: Vec<String> = crate::skills::files(&dir)?
+            .into_iter()
+            .filter(|f| f != "SKILL.md")
+            .collect();
+        let _ = self.with_store(|st| st.record_skill_load(name, session_id, run_id));
+        Ok(json!({
+            "name": skill.name,
+            "version": skill.version,
+            "instructions": body,
+            "files": files,
+        })
+        .to_string())
+    }
+
+    fn read_skill_file_impl(&self, args: &Value) -> Result<String> {
+        let name = args["name"].as_str().context("name required")?;
+        let path = args["path"].as_str().context("path required")?;
+        self.enabled_skill(name)?;
+        self.with_store(|st| crate::skills::read_file(st, name, path))
     }
 
     /// Server-level MCP approval for reading resources (tools have the
