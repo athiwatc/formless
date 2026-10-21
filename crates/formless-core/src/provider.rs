@@ -776,13 +776,41 @@ fn is_model_error(status: u16, text: &str) -> bool {
             || t.contains("invalid model"))
 }
 
+/// Whether a 400 body rejects the reasoning-effort parameter itself (and
+/// not something else that happens to be "unknown" or "unsupported").
 fn is_unknown_param(text: &str) -> bool {
+    let is_effort_param = |p: &str| {
+        let p = p.to_lowercase();
+        p == "reasoning_effort" || p == "reasoning" || p.starts_with("reasoning.")
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        if let Some(param) = v["error"]["param"].as_str() {
+            return is_effort_param(param);
+        }
+    }
     let t = text.to_lowercase();
-    t.contains("reasoning_effort")
-        || t.contains("reasoning")
-        || t.contains("unknown")
-        || t.contains("unrecognized")
-        || t.contains("unsupported")
+    let names_param = [
+        "reasoning_effort",
+        "reasoning.effort",
+        "'reasoning'",
+        "\"reasoning\"",
+    ]
+    .iter()
+    .any(|p| t.contains(p));
+    let rejects = [
+        "unknown",
+        "unrecognized",
+        "unsupported",
+        "not supported",
+        "not permitted",
+        "not allowed",
+        "extra inputs",
+        "extra_forbidden",
+        "invalid",
+    ]
+    .iter()
+    .any(|p| t.contains(p));
+    names_param && rejects
 }
 
 #[derive(Debug, Clone)]
@@ -929,4 +957,39 @@ pub fn list_models_blocking(cfg: &ProviderCfg, api_key: &str) -> Result<Vec<Stri
 pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<ProbeResult> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(probe(cfg, api_key, model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_param_needs_the_reasoning_param_named() {
+        // Rejections of the parameter itself.
+        assert!(is_unknown_param(
+            r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#
+        ));
+        assert!(is_unknown_param(
+            r#"{"error":{"message":"bad","param":"reasoning_effort"}}"#
+        ));
+        assert!(is_unknown_param(
+            r#"{"error":{"message":"bad","param":"reasoning.effort"}}"#
+        ));
+        assert!(is_unknown_param(
+            "Extra inputs are not permitted: 'reasoning'"
+        ));
+        // Unrelated 400s keep reasoning_effort.
+        assert!(!is_unknown_param(
+            r#"{"error":{"message":"unsupported image format"}}"#
+        ));
+        assert!(!is_unknown_param(
+            r#"{"error":{"message":"unknown tool name: foo"}}"#
+        ));
+        assert!(!is_unknown_param(
+            r#"{"error":{"message":"this reasoning model needs more tokens"}}"#
+        ));
+        assert!(!is_unknown_param(
+            r#"{"error":{"message":"unknown parameter","param":"tools"}}"#
+        ));
+    }
 }
