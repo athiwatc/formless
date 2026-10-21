@@ -28,6 +28,12 @@ pub struct Capabilities {
     /// on the registry rows that stand for MCP tools.
     #[serde(default)]
     pub mcp: Vec<String>,
+    /// `store`: the Tool's own key-value namespace (SPEC §7.4).
+    #[serde(default)]
+    pub store: bool,
+    /// `store:<ns>`: shared key-value namespaces.
+    #[serde(default)]
+    pub store_shared: Vec<String>,
 }
 
 impl Capabilities {
@@ -83,6 +89,19 @@ impl Capabilities {
                 c.clipboard_write = true;
             } else if s == "notify" {
                 c.notify = true;
+            } else if s == "store" {
+                c.store = true;
+            } else if let Some(ns) = s.strip_prefix("store:") {
+                if ns.is_empty()
+                    || !ns
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || "-_.".contains(ch))
+                {
+                    return Err(format!(
+                        "store namespace must be letters, digits, '-', '_' or '.': {s}"
+                    ));
+                }
+                c.store_shared.push(ns.to_string());
             } else if s == "llm" {
                 c.llm = Some(Vec::new());
             } else if let Some(m) = s.strip_prefix("llm:") {
@@ -137,6 +156,10 @@ impl Capabilities {
         if self.notify {
             out.push("notify".into());
         }
+        if self.store {
+            out.push("store".into());
+        }
+        out.extend(self.store_shared.iter().map(|n| format!("store:{n}")));
         match &self.llm {
             Some(v) if v.is_empty() => out.push("llm".into()),
             Some(v) => out.extend(v.iter().map(|m| format!("llm:{m}"))),
@@ -249,6 +272,8 @@ impl Capabilities {
             llm: merge_scoped(&self.llm, &other.llm),
             agent: merge_scoped(&self.agent, &other.agent),
             mcp: merge(&self.mcp, &other.mcp),
+            store: self.store || other.store,
+            store_shared: merge(&self.store_shared, &other.store_shared),
         }
     }
 
@@ -280,6 +305,11 @@ impl Capabilities {
             && scoped_covers(&self.llm, &other.llm, |a, b| a == b)
             && scoped_covers(&self.agent, &other.agent, |a, b| a == b)
             && other.mcp.iter().all(|s| self.mcp.contains(s))
+            && (!other.store || self.store)
+            && other
+                .store_shared
+                .iter()
+                .all(|n| self.store_shared.contains(n))
     }
 }
 

@@ -56,6 +56,17 @@ pub trait HostOps: Send + Sync {
     ) -> Result<String, String> {
         Err("agents.run is not available in this context".into())
     }
+    /// Key-value store (SPEC §7.4): `op` is get, set, delete or list.
+    /// `namespace` is "" for the Tool's own, else a shared namespace.
+    fn kv(
+        &self,
+        _op: &str,
+        _namespace: &str,
+        _key: &str,
+        _value: Option<&Value>,
+    ) -> Result<Value, String> {
+        Err("store is not available in this context".into())
+    }
     /// One non-streaming LLM completion via the daemon's provider.
     fn llm_complete(
         &self,
@@ -140,6 +151,8 @@ struct State {
     /// The Invocation's cancel flag: blocking host calls (process, network)
     /// poll it so Esc stops them, not only the JS interpreter.
     cancel: Arc<AtomicBool>,
+    /// Smoke/Replay key-value store: in memory, gone after the run.
+    kv_overlay: Mutex<std::collections::BTreeMap<(String, String), Value>>,
 }
 
 const PRELUDE: &str = r#"
@@ -222,6 +235,12 @@ globalThis.clipboard = {
 };
 globalThis.notify = (title, body) => __call("notify", { title: String(title || ""), body: String(body || "") });
 globalThis.notifications = { send: globalThis.notify };
+globalThis.store = {
+  get: (k, o) => __call("kv", { op: "get", key: String(k), ns: (o && o.ns) || "" }),
+  set: (k, v, o) => __call("kv", { op: "set", key: String(k), value: v === undefined ? null : v, ns: (o && o.ns) || "" }),
+  delete: (k, o) => __call("kv", { op: "delete", key: String(k), ns: (o && o.ns) || "" }),
+  list: (prefix, o) => __call("kv", { op: "list", key: String(prefix || ""), ns: (o && o.ns) || "" }),
+};
 globalThis.llm = {
   complete: (prompt, opts) => __call("llm_complete", { prompt: String(prompt), system: (opts && opts.system) || null, model: (opts && opts.model) || null }),
 };
@@ -613,6 +632,39 @@ impl State {
                             a["body"].as_str().unwrap_or_default(),
                         )?;
                         Ok(Value::Null)
+                    }
+                }
+            }
+            "kv" => {
+                let ns = a["ns"].as_str().unwrap_or_default();
+                if ns.is_empty() && !self.caps.store {
+                    return Err(denied("store not declared"));
+                }
+                if !ns.is_empty() && !self.caps.store_shared.iter().any(|n| n == ns) {
+                    return Err(denied(format!("store:{ns} not declared")));
+                }
+                let op = a["op"].as_str().unwrap_or_default();
+                let key = a["key"].as_str().unwrap_or_default();
+                let value = a.get("value").filter(|v| !v.is_null());
+                match self.mode {
+                    HostMode::Live => self.ops.kv(op, ns, key, value),
+                    HostMode::Smoke | HostMode::Replay => {
+                        let mut kv = self.kv_overlay.lock().unwrap();
+                        let k = (ns.to_string(), key.to_string());
+                        Ok(match op {
+                            "get" => kv.get(&k).cloned().unwrap_or(Value::Null),
+                            "set" => {
+                                kv.insert(k, value.cloned().unwrap_or(Value::Null));
+                                Value::Null
+                            }
+                            "delete" => json!(kv.remove(&k).is_some()),
+                            "list" => json!(kv
+                                .keys()
+                                .filter(|(n, key2)| n == ns && key2.starts_with(key))
+                                .map(|(_, key2)| key2.clone())
+                                .collect::<Vec<_>>()),
+                            other => return Err(format!("unknown store op {other}")),
+                        })
                     }
                 }
             }
@@ -1482,7 +1534,9 @@ pub fn check_syntax(code: &str) -> Result<(), String> {
 const RUNNER: &str = r#"
   (function () {
     const done = (v) => { globalThis.__result_json = JSON.stringify({ ok: true, value: v === undefined ? null : v }); };
-    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: String((e && e.message) || e) + "\n" + String((e && e.stack) || "") }); };
+    // QuickJS throws null when it cannot even allocate the out-of-memory
+    // error, so a null exception is reported as out of memory.
+    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || "") }); };
     try {
       const out = run(JSON.parse(globalThis.__input_json));
       if (out && typeof out.then === "function") out.then(done, fail); else done(out);
@@ -1503,6 +1557,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         next_stream: AtomicU64::new(0),
         stubbed: AtomicBool::new(false),
         cancel: req.cancel.clone(),
+        kv_overlay: Mutex::new(Default::default()),
     });
     let cancelled = req.cancel.clone();
     let err = |e: &dyn std::fmt::Display| {

@@ -399,6 +399,7 @@ pattern (§4.4).
 | `notify` | — | v2; desktop notifications |
 | `llm` | optionally per-model | v2; LLM completions from inside Tools (§7.5) |
 | `agent` | optionally per-model | v2; sub-agents from inside Tools (§7.6) |
+| `store` / `store:<ns>` | own / named shared namespace | Key-value state between Invocations; not sensitive (no approval) |
 
 - **Input-bound scopes (v2.1).** `fs:read`, `fs:write` and `net` may be
   scoped to an input field instead of a fixed value: `fs:read:$input.path`,
@@ -453,6 +454,17 @@ pattern (§4.4).
     `agent`; §7.6 sub-agents), and `requireModule(name)` for shared JS
     modules (§7.6). In smoke tests these are stubbed; in optimiser
     replay the side-effecting ones are denied.
+  - `store.get(key, {ns})`, `store.set(key, json, {ns})`,
+    `store.delete(key, {ns})` and `store.list(prefix, {ns})` keep small
+    state between Invocations: caches, cursors, tokens and rate-limit
+    state.
+    - `store` gates the Tool's own namespace, and `store:<ns>` gates a
+      shared namespace other Tools can name too.
+    - Limits: 64 KB per value, 5 MB per namespace, keys of 1–256
+      characters, and `list` returns at most 1000 keys.
+    - Values live in the `tool_kv` table (schema v23). They are never
+      exported in bundles, and purging a Tool deletes its own namespace.
+    - Smoke tests and replay use an in-memory store that is thrown away.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.

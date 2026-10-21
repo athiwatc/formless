@@ -238,6 +238,17 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup ON memories(scope, dedup_key);
 ";
 
+/// Tool key-value store (SPEC §7.4 `store`).
+const SCHEMA_V23: &str = "
+CREATE TABLE IF NOT EXISTS tool_kv (
+  namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+  updated_at TEXT NOT NULL, PRIMARY KEY (namespace, key));
+";
+
+/// Largest stored value (JSON bytes) and namespace total.
+pub const KV_MAX_VALUE: usize = 64 * 1024;
+pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
+
 /// Scheduled jobs (SPEC §9.7).
 const SCHEMA_V22: &str = "
 CREATE TABLE IF NOT EXISTS jobs (
@@ -289,7 +300,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -304,7 +315,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 22] = [
+const MIGRATIONS: [(i64, MigrationStep); 23] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -358,6 +369,7 @@ const MIGRATIONS: [(i64, MigrationStep); 22] = [
         add_column(c, "invocations", "tokens INTEGER NOT NULL DEFAULT 0")
     }),
     (22, |c| Ok(c.execute_batch(SCHEMA_V22)?)),
+    (23, |c| Ok(c.execute_batch(SCHEMA_V23)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -2116,7 +2128,70 @@ impl Store {
         self.tool_info(id)
     }
 
+    pub fn kv_get(&self, namespace: &str, key: &str) -> Result<Option<Value>> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM tool_kv WHERE namespace=?1 AND key=?2",
+                params![namespace, key],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(text.and_then(|t| serde_json::from_str(&t).ok()))
+    }
+
+    /// Store a JSON value, within the size caps.
+    pub fn kv_set(&self, namespace: &str, key: &str, value: &Value) -> Result<()> {
+        if key.is_empty() || key.len() > 256 {
+            anyhow::bail!("store keys must be 1-256 characters");
+        }
+        let text = value.to_string();
+        if text.len() > KV_MAX_VALUE {
+            anyhow::bail!("store value is larger than {} KB", KV_MAX_VALUE / 1024);
+        }
+        let used: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(length(value)+length(key)),0) FROM tool_kv WHERE namespace=?1 AND key!=?2",
+            params![namespace, key],
+            |r| r.get(0),
+        )?;
+        if used + (text.len() + key.len()) as i64 > KV_MAX_NAMESPACE {
+            anyhow::bail!(
+                "store namespace is full ({} MB); delete keys first",
+                KV_MAX_NAMESPACE / 1024 / 1024
+            );
+        }
+        self.conn.execute(
+            "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![namespace, key, text, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn kv_delete(&self, namespace: &str, key: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM tool_kv WHERE namespace=?1 AND key=?2",
+            params![namespace, key],
+        )? > 0)
+    }
+
+    /// Keys under `prefix`, sorted (at most 1000).
+    pub fn kv_list(&self, namespace: &str, prefix: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key FROM tool_kv WHERE namespace=?1 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000",
+        )?;
+        let rows = stmt
+            .query_map(params![namespace, prefix], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn purge_tool(&self, id: &str) -> Result<bool> {
+        // The Tool's own store goes with it.
+        self.conn.execute(
+            "DELETE FROM tool_kv WHERE namespace=?1",
+            params![format!("tool:{id}")],
+        )?;
         Ok(self
             .conn
             .execute("DELETE FROM tools WHERE id=?1", params![id])?
