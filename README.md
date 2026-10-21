@@ -458,7 +458,7 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines(path, cb)` | `fs:read` | Streaming reads — never load large data whole |
 | `env.get(key)` | `env` | Read one declared key |
 | `process.run(cmd, args, {cwd, env, stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` | `process` | Execute a declared binary, no shell |
-| `tools.call(name, input)` | — | Composition (nested Invocations are recorded and measured) |
+| `tools.call(name, input)` → Promise | — | Composition; await every call, and `Promise.all` runs several in parallel (nested Invocations are recorded and measured) |
 | `clipboard.read()` / `clipboard.write(text)` | `clipboard:read` / `clipboard:write` | v2; OS clipboard |
 | `notify(title, body)` | `notify` | v2; desktop notification |
 | `llm.complete(prompt, {system, model})` | `llm` | v2; one non-streaming completion via the configured provider |

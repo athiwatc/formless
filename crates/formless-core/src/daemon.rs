@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use formless_protocol::*;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
@@ -246,6 +246,7 @@ impl Daemon {
             cfg.tools.max_sleep_secs.saturating_mul(1000),
             cfg.tools.max_random_bytes as u64,
         );
+        formless_runtime::set_max_parallel_calls(cfg.scripts.max_parallel as u64);
         let changed = slot.is_some();
         *slot = Some((stamp, cfg.clone()));
         drop(slot);
@@ -2174,6 +2175,13 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: test_tool failed: {e}"),
             },
+            toolreg::RUN_SCRIPT => match self
+                .run_script_impl(session_id, run_id, &args, cfg, cancel, agent_depth)
+                .await
+            {
+                Ok(text) => text,
+                Err(e) => format!("error: run_script failed: {e}"),
+            },
             toolreg::CREATE_MODULE => {
                 match self.create_module_impl(&args, cfg, cancel_flag).await {
                     Ok(text) => text,
@@ -3960,6 +3968,194 @@ impl Daemon {
 
     /// Dry-run a saved Tool or an unsaved draft: live, approval-gated, but
     /// neither saved nor recorded as an Invocation (SPEC §7.1).
+    /// `run_script` (SPEC §7.12): a Capability-free script that calls the
+    /// registry Tools in its `uses` list, approved before it runs. Its
+    /// nested Invocations link to it through `parent_id` "script:<id>".
+    async fn run_script_impl(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+        args: &Value,
+        cfg: &Config,
+        cancel: &CancellationToken,
+        agent_depth: usize,
+    ) -> Result<String> {
+        let source = args["code"].as_str().context("code is required")?;
+        if source.len() > cfg.scripts.max_source_kb * 1024 {
+            bail!(
+                "script is {} KB, over scripts.max_source_kb ({}); make it a Tool instead",
+                source.len() / 1024,
+                cfg.scripts.max_source_kb
+            );
+        }
+        let mut uses: Vec<String> = Vec::new();
+        for n in args["uses"]
+            .as_array()
+            .context("uses must be an array of Tool names")?
+        {
+            let n = n.as_str().context("uses must be an array of Tool names")?;
+            if !uses.iter().any(|u| u == n) {
+                uses.push(n.to_string());
+            }
+        }
+        let input = args.get("input").cloned().unwrap_or(json!({}));
+        if !input.is_object() {
+            bail!("input must be an object");
+        }
+        let code = crate::scripts::script_code(source, &uses);
+        formless_runtime::check_syntax(&code).map_err(|e| {
+            anyhow!(
+                "syntax check failed: {e} (line numbers include {} wrapper lines)",
+                crate::scripts::LINE_OFFSET
+            )
+        })?;
+        // Approval pre-pass over the uses list, before anything runs.
+        let mut preapproved = std::collections::HashSet::new();
+        for name in &uses {
+            if toolreg::is_builtin(name) {
+                bail!("'{name}' is a built-in; scripts can only call registry Tools");
+            }
+            let (info, ver) = self
+                .with_store(|st| st.get_tool_by_name(name))?
+                .with_context(|| format!("no tool named '{name}' (find_tools first)"))?;
+            if info.retired {
+                bail!("tool '{name}' is retired");
+            }
+            let caps = Capabilities::parse(&ver.capabilities).map_err(|e| anyhow!(e))?;
+            if !self
+                .ensure_approval(cfg, session_id, &info, &ver, &caps.unbound(), None, cancel)
+                .await
+            {
+                bail!("user denied approval for tool '{name}'");
+            }
+            if !caps.has_bindings() {
+                preapproved.insert(name.clone());
+            }
+        }
+        let script_id = uuid::Uuid::new_v4().to_string();
+        let ops = Arc::new(NestedOps {
+            daemon: self.clone(),
+            kv_scope: String::new(),
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            parent_inv: Some(format!("script:{script_id}")),
+            activity: None,
+            depth: 1,
+            agent_depth,
+            agent_ok: false,
+            script: Some(ScriptScope {
+                uses: uses.iter().cloned().collect(),
+                preapproved,
+            }),
+            // Nested Invocations follow the Run, not the script: a script
+            // that ends or times out abandons them rather than cancelling.
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel: cancel.clone(),
+            cfg: cfg.clone(),
+            handle: tokio::runtime::Handle::current(),
+            emitted: StdMutex::new(None),
+            artifact_dir: self.paths.data_dir.join("artifacts"),
+        });
+        // The script's own stop flag: the Run's cancellation or the timeout.
+        let stop = Arc::new(AtomicBool::new(cancel.is_cancelled()));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let done = CancellationToken::new();
+        {
+            let (stop, timed_out, done, tok) = (
+                stop.clone(),
+                timed_out.clone(),
+                done.clone(),
+                cancel.clone(),
+            );
+            let limit = std::time::Duration::from_secs(cfg.scripts.timeout_secs.max(1));
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tok.cancelled() => stop.store(true, Ordering::SeqCst),
+                    _ = tokio::time::sleep(limit) => {
+                        timed_out.store(true, Ordering::SeqCst);
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    _ = done.cancelled() => {}
+                }
+            });
+        }
+        let req = ExecRequest {
+            code: code.clone(),
+            input: input.clone(),
+            caps: Capabilities::default(),
+            memory_mb: cfg.scripts.memory_mb,
+            mode: HostMode::Live,
+            overlay: None,
+            activity: None,
+            modules: self.module_code(),
+            cancel: stop,
+        };
+        let ops_dyn: Arc<dyn HostOps> = ops;
+        let started = std::time::Instant::now();
+        let outcome = tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn))
+            .await
+            .map_err(|e| anyhow!("script panicked: {e}"));
+        done.cancel();
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        let hash = crate::scripts::fingerprint(source);
+        let record = |status: &str, error: &str, saved: &str| {
+            let _ = self.with_store(|st| {
+                st.record_script(
+                    &script_id, session_id, run_id, &hash, source, &uses, status, error,
+                    elapsed_ms, saved,
+                )
+            });
+        };
+        let out = match outcome? {
+            Ok(out) => out,
+            Err(e) => {
+                let (status, message) = if timed_out.load(Ordering::SeqCst) {
+                    (
+                        "failure",
+                        format!(
+                            "stopped after scripts.timeout_secs ({}s); Tools it started were left to finish",
+                            cfg.scripts.timeout_secs
+                        ),
+                    )
+                } else if e.kind == ExecErrorKind::Cancelled {
+                    ("cancelled", "interrupted".to_string())
+                } else {
+                    ("failure", e.message.clone())
+                };
+                record(status, &message, "");
+                bail!("{message}");
+            }
+        };
+        let mut res = json!({"result": out.output});
+        let mut saved = String::new();
+        if let Some(save) = args.get("save_as").filter(|v| v.is_object()) {
+            let mut tool = save.clone();
+            tool["implementation_js"] = json!(code);
+            tool["capabilities"] = json!([]);
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            match self.create_tool_impl(&tool, cfg, &cancel_flag).await {
+                Ok((text, tool_id)) => {
+                    let _ = self.with_store(|st| {
+                        st.load_session_tools(session_id, std::slice::from_ref(&tool_id), "created")
+                    });
+                    saved = save["name"].as_str().unwrap_or_default().to_string();
+                    res["saved"] = serde_json::from_str(&text).unwrap_or(json!(text));
+                }
+                Err(e) => res["save_error"] = json!(format!("{e:#}")),
+            }
+        }
+        record("success", "", &saved);
+        if saved.is_empty() {
+            let sessions = self.with_store(|st| st.script_sessions(&hash)).unwrap_or(0);
+            if sessions >= cfg.scripts.recurrence_threshold {
+                res["hint"] = json!(format!(
+                    "this script has now run in {sessions} sessions: save it as a Tool with save_as"
+                ));
+            }
+        }
+        Ok(self.model_text(session_id, &res, cfg))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn test_tool_impl(
         self: &Arc<Self>,
@@ -4049,6 +4245,8 @@ impl Daemon {
             activity: None,
             depth: 1,
             agent_depth,
+            agent_ok: true,
+            script: None,
             cancel_flag: cancel_flag.clone(),
             cancel: cancel.clone(),
             cfg: cfg.clone(),
@@ -4489,6 +4687,8 @@ impl Daemon {
                 activity: activity.clone(),
                 depth: depth + 1,
                 agent_depth,
+                agent_ok: depth == 0 || parent.as_deref().is_some_and(|p| p.starts_with("script:")),
+                script: None,
                 cancel_flag: cancel_flag.clone(),
                 cancel: cancel.clone(),
                 cfg: cfg.clone(),
@@ -5478,8 +5678,17 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
     ))
 }
 
+/// What a `run_script` sandbox may call.
+struct ScriptScope {
+    uses: std::collections::HashSet<String>,
+    /// Approved before the script ran; others (input-bound scopes) are
+    /// approved per call, for the paths or hosts it binds.
+    preapproved: std::collections::HashSet<String>,
+}
+
 /// HostOps for nested `tools.call` + `emit` (SPEC §7.6). Runs on the
-/// blocking QuickJS thread; nested calls block_on the daemon executor.
+/// blocking QuickJS thread (nested calls on threads of their own) and
+/// block_on the daemon executor.
 struct NestedOps {
     daemon: Arc<Daemon>,
     /// The Tool's own store namespace ("tool:<id>"; "test:<name>" drafts).
@@ -5491,6 +5700,12 @@ struct NestedOps {
     depth: usize,
     /// Sub-agent nesting of the Run this Tool serves (0 = the main agent).
     agent_depth: usize,
+    /// May this sandbox start sub-agents: a top-level Tool, or one a
+    /// script called (nested Tools may not).
+    agent_ok: bool,
+    /// A script's `uses` list: the only Tools its nested calls may reach,
+    /// and those its approval pre-pass already covered (SPEC §7.12).
+    script: Option<ScriptScope>,
     cancel_flag: Arc<AtomicBool>,
     cancel: CancellationToken,
     cfg: Config,
@@ -5548,7 +5763,7 @@ impl HostOps for NestedOps {
         system: Option<&str>,
         model: Option<&str>,
     ) -> std::result::Result<String, String> {
-        if self.depth > 1 {
+        if !self.agent_ok {
             return Err("sub-agents cannot be spawned from nested tools".into());
         }
         // A sub-agent's own Tool calls restart at tool depth 0, so tool
@@ -5640,6 +5855,13 @@ impl HostOps for NestedOps {
     }
 
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
+        let mut preapproved = false;
+        if let Some(scope) = &self.script {
+            if !scope.uses.contains(name) {
+                return Err(format!("'{name}' is not in this script's uses list"));
+            }
+            preapproved = scope.preapproved.contains(name);
+        }
         let daemon = self.daemon.clone();
         let (sid, rid, name) = (
             self.session_id.clone(),
@@ -5668,7 +5890,7 @@ impl HostOps for NestedOps {
                     activity,
                     tok,
                     cfg,
-                    false,
+                    preapproved,
                     agent_depth,
                 )
                 .await

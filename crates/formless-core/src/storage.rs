@@ -247,6 +247,17 @@ CREATE TABLE IF NOT EXISTS tool_kv (
 
 /// Full-text index over message content (SPEC §5.1 search), kept in step
 /// with `messages` by triggers and backfilled once.
+/// Orchestration scripts (SPEC §7.12). Nested Invocations link to theirs
+/// through `parent_id` = "script:<id>".
+const SCHEMA_V28: &str = "
+CREATE TABLE IF NOT EXISTS scripts (
+  id TEXT PRIMARY KEY, session_id TEXT, run_id TEXT, hash TEXT NOT NULL,
+  source TEXT NOT NULL, uses TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL,
+  error TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0,
+  saved_tool TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_scripts_hash ON scripts(hash, session_id);
+";
+
 const SCHEMA_V24: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   content, content='messages', content_rowid='rowid',
@@ -322,7 +333,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -337,7 +348,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 27] = [
+const MIGRATIONS: [(i64, MigrationStep); 28] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -404,6 +415,7 @@ const MIGRATIONS: [(i64, MigrationStep); 27] = [
     }),
     // Session delete with an undo window (SPEC §5.1).
     (27, |c| add_column(c, "sessions", "deleted_at TEXT")),
+    (28, |c| Ok(c.execute_batch(SCHEMA_V28)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -974,11 +986,91 @@ impl Store {
         if tokens <= 0 || calls == 0 {
             return Ok(());
         }
+        let share = tokens / calls as i64;
         self.conn.execute(
             "UPDATE invocations SET tokens=tokens+?3 WHERE run_id=?1 AND parent_id IS NULL AND created_at>=?2",
-            params![run_id, since, tokens / calls as i64],
+            params![run_id, since, share],
+        )?;
+        // A run_script call's share is split over the Tools it called.
+        self.conn.execute(
+            "UPDATE invocations SET tokens=tokens+?3/(SELECT count(*) FROM invocations s WHERE s.parent_id=invocations.parent_id) \
+             WHERE run_id=?1 AND parent_id LIKE 'script:%' AND created_at>=?2",
+            params![run_id, since, share],
         )?;
         Ok(())
+    }
+
+    /// Record one finished `run_script` (SPEC §7.12).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_script(
+        &self,
+        id: &str,
+        session_id: &str,
+        run_id: &str,
+        hash: &str,
+        source: &str,
+        uses: &[String],
+        status: &str,
+        error: &str,
+        duration_ms: i64,
+        saved_tool: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO scripts(id,session_id,run_id,hash,source,uses,status,error,duration_ms,saved_tool,created_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                id,
+                session_id,
+                run_id,
+                hash,
+                source,
+                serde_json::to_string(uses)?,
+                status,
+                error,
+                duration_ms,
+                saved_tool,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Distinct Sessions that ran a script with this hash successfully.
+    pub fn script_sessions(&self, hash: &str) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT count(DISTINCT session_id) FROM scripts WHERE hash=?1 AND status='success'",
+            params![hash],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    /// Scripts run successfully in at least `threshold` Sessions and never
+    /// saved as a Tool, most widespread first: (sessions, uses, latest source).
+    pub fn recurring_scripts(
+        &self,
+        threshold: usize,
+        limit: usize,
+    ) -> Result<Vec<(usize, Vec<String>, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT count(DISTINCT session_id) AS n, \
+                    (SELECT uses FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1), \
+                    (SELECT source FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1) \
+             FROM scripts s WHERE status='success' GROUP BY hash \
+             HAVING n>=?1 AND max(saved_tool)='' ORDER BY n DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![threshold as i64, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as usize,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (n, uses, source) = row?;
+            out.push((n, serde_json::from_str(&uses).unwrap_or_default(), source));
+        }
+        Ok(out)
     }
 
     /// Tokens a Tool spent itself (`llm.complete` inside it).

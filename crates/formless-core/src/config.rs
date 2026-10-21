@@ -14,6 +14,7 @@ pub struct Config {
     pub optimiser: OptimiserCfg,
     pub metrics: MetricsCfg,
     pub tools: ToolsCfg,
+    pub scripts: ScriptsCfg,
     pub compaction: CompactionCfg,
     pub tui: TuiCfg,
     pub naming: NamingCfg,
@@ -122,6 +123,7 @@ pub const SETTABLE: &[&str] = &[
     "daemon.delete_undo_secs",
     "tui.",
     "tools.",
+    "scripts.",
     "metrics.",
     "optimiser.",
     "compaction.",
@@ -559,6 +561,36 @@ impl Default for ToolsCfg {
             max_sleep_secs: default_max_sleep_secs(),
             max_random_bytes: default_max_random_bytes(),
             find_tools_max: default_find_tools_max(),
+        }
+    }
+}
+
+/// Orchestration scripts (`run_script`, SPEC §7.12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScriptsCfg {
+    /// Most nested Invocations one sandbox runs at once through
+    /// `tools.call`; the rest queue.
+    pub max_parallel: usize,
+    /// Largest script source, in KB.
+    pub max_source_kb: usize,
+    /// Script heap cap, in MB.
+    pub memory_mb: u32,
+    /// A script still running after this long is stopped; its nested
+    /// Invocations are abandoned, not cancelled.
+    pub timeout_secs: u64,
+    /// Distinct Sessions running the same script before it is flagged
+    /// "save as a Tool".
+    pub recurrence_threshold: usize,
+}
+impl Default for ScriptsCfg {
+    fn default() -> Self {
+        Self {
+            max_parallel: 8,
+            max_source_kb: 64,
+            memory_mb: 256,
+            timeout_secs: 600,
+            recurrence_threshold: 3,
         }
     }
 }
