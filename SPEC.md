@@ -204,6 +204,16 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 - v2: Sessions can be forked (full copy, or a prefix up to a message),
   searched across all Sessions, and a past user message can be edited —
   everything after it is dropped and the Run retries from there.
+  **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
+  It is hidden at once from lists, search and `GetSession`
+  (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it
+  back. When the window ends it is deleted for good, with its artifacts,
+  and a window that ended while the daemon was down is finished at the
+  next start. Every destructive action asks first:
+  - Session delete: TUI `d` twice, then `/undo`; web dialog, then a toast
+    with Undo.
+  - Tool purge: TUI `p` twice; web needs the Tool name typed.
+  - `formless reset`: needs `reset` typed.
   Search uses an FTS5 index over message content (schema v24, with
   `unicode61` tokens and diacritics folded). Triggers keep the index
   current through inserts, edits and deletes. Every query word must match
@@ -863,7 +873,7 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
   discarded. Syntax errors give line numbers that include the wrapper
   lines, and the error says how many those are.
 - **Recording.**
-  - Each run is a row in the `scripts` table (schema v27): source, `uses`,
+  - Each run is a row in the `scripts` table (schema v28): source, `uses`,
     a fingerprint, status, error, duration, and the saved Tool's name.
   - Nested Invocations record `parent_id` = `script:<id>`. The live tree
     (§10.6) shows them under the `run_script` call.
@@ -1184,6 +1194,17 @@ such as `read_file`, `read_text_file` and `file_read`.
   `artifacts.max_age_days` (30) are removed, then the oldest beyond
   `artifacts.max_total_mb` (1024), at daemon start and hourly or on
   `formless gc`; deleting a Session deletes its artifact files.
+- **Opening a stored output:** the transcript note reads `[full output (N
+  bytes) stored as artifact ID; read it with read_artifact]`, with no
+  filesystem path, because transcripts also reach remote web clients.
+  `GetArtifact {id, offset?, length?}` returns a text slice (200 000
+  characters by default) with `total_chars` and `end`, never the path.
+  - TUI: a tool result that references an artifact shows `/open <id>`,
+    and `/open` (the newest) or `/open <id-prefix>` shows a full-screen
+    pager (↑↓, PgUp/PgDn, g/G, Esc).
+  - Web: the result gets an "Open full output" button that opens a viewer
+    with "Load more" and Download, which fetches the rest and saves it as
+    a file.
 
 ### 9.7 Scheduled jobs
 
@@ -1336,6 +1357,17 @@ run_tool = "network_policy"     # a registry Tool, or…
   used only when the terminal is at least 110 columns wide; narrower
   terminals fall back to the single-column chat automatically.
 
+- **Web shortcuts.** The web client mirrors the TUI where a browser
+  allows. Tab stays focus navigation, so views switch with `1`–`5` and
+  `[` / `]`.
+  - `j`/`k` (or ↓/↑) move through Sessions (Chat) or Tools (Tools).
+  - `/` focuses the message box and `n` starts a new Session.
+  - On the selected Tool: `x` retire/restore, `b` roll back one version,
+    `e` export, `o` optimise, `p` purge (typed confirmation).
+  - `?` shows a help overlay built from the same table.
+  Shortcuts never fire while typing or while a dialog is open. Approvals
+  keep `y`/`o`/`n`.
+
 ### 10.6 Live feedback (v2)
 
 - **Live call tree:** `ToolCallStarted.depth` gives a call's `tools.call`
@@ -1440,6 +1472,13 @@ run_tool = "network_policy"     # a registry Tool, or…
     and the WebSocket must also come from that `Origin`, and the
     WebSocket needs the cookie.
   - Responses carry the same CSP as the hosted relay.
+  - **Reconnecting:** when a connected page loses the daemon, it keeps
+    retrying with backoff. The connection pill counts down ("daemon
+    offline · retry in Ns") and a tap retries at once. After 3 failed
+    tries it notes that a restarted daemon needs a new `formless web`
+    link, because session cookies don't survive a restart. Pasting a new
+    link into an open tab signs in with it. Relay mode uses the same
+    visible countdown.
 - `formless tools list|export|import …` — registry inspection/transfer
   (same trust rules as §7.8).
 - `formless doctor` — diagnostics: config validity, data dir, keychain
@@ -1510,6 +1549,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
 | `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
+| `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
 | `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |

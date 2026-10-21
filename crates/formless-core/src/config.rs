@@ -120,6 +120,7 @@ pub const SETTABLE: &[&str] = &[
     "daemon.idle_grace_secs",
     "daemon.stall_warning_secs",
     "daemon.keep_alive_for_jobs",
+    "daemon.delete_undo_secs",
     "tui.",
     "tools.",
     "scripts.",
@@ -207,6 +208,8 @@ pub struct DaemonCfg {
     /// Stay up past the idle grace while scheduled jobs wait (SPEC §9.7);
     /// off: due jobs run on the next start.
     pub keep_alive_for_jobs: bool,
+    /// How long a deleted Session can be restored before it is gone.
+    pub delete_undo_secs: u64,
 }
 impl Default for DaemonCfg {
     fn default() -> Self {
@@ -217,6 +220,7 @@ impl Default for DaemonCfg {
             log_keep: 5,
             start_timeout_secs: 60,
             keep_alive_for_jobs: false,
+            delete_undo_secs: 30,
         }
     }
 }

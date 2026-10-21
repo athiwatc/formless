@@ -276,10 +276,12 @@
     renderNotes();
     renderStatus();
   }
-  function toast(text, err) {
-    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text);
+  /** A toast; `action` ({label, run, ms}) adds a button and keeps it up for `ms`. */
+  function toast(text, err, action) {
+    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text,
+      action ? h("button", { class: "btn small", type: "button", onclick: () => { t.remove(); action.run(); } }, action.label) : null);
     $("toasts").append(t);
-    setTimeout(() => t.remove(), err ? 6000 : 3500);
+    setTimeout(() => t.remove(), action ? action.ms : err ? 6000 : 3500);
   }
 
   // -------------------------------------------------------- ask dialogs
@@ -343,9 +345,18 @@
     $("sidebar").classList.toggle("hidden", S.view !== "chat");
     $("menu-btn").classList.toggle("hidden", S.view !== "chat");
     const conn = $("conn");
-    if (!S.ws || S.ws.readyState !== 1) {
+    conn.title = "";
+    conn.onclick = null;
+    if (S.reconnect) {
+      // Visible backoff with a manual retry (SPEC §12).
+      const secs = Math.max(0, Math.ceil((S.reconnect.at - Date.now()) / 1000));
+      conn.className = "pill off clickable";
+      conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
+      conn.title = "Retry now";
+      conn.onclick = retryNow;
+    } else if (!S.ws || S.ws.readyState !== 1) {
       conn.className = "pill off";
-      conn.textContent = "relay disconnected";
+      conn.textContent = S.ws && S.ws.readyState === 0 ? "connecting…" : "relay disconnected";
     } else if (!S.daemonOnline) {
       conn.className = "pill off";
       conn.textContent = "daemon offline";
@@ -863,12 +874,70 @@
   function toolResultChip(content) {
     const failed = /"ok"\s*:\s*false/.test(content) || /^\s*error/i.test(content);
     const lines = content.split("\n").length;
-    return h("details", { class: "chip result" + (failed ? " failed" : "") },
+    const refs = artifactRefs(content);
+    const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
       h("summary", null,
         h("span", { class: "tname" }, failed ? "↳ failed" : "↳ result"),
         h("span", { class: "targs" }, truncate(content, 160)),
         lines > 1 ? h("span", { class: "tstat" }, lines + " lines") : null),
       payload(content));
+    if (!refs.length) return chip;
+    return h("div", null, chip, ...refs.map((id) =>
+      h("button", { class: "btn ghost small", type: "button", onclick: () => openArtifact(id) }, "Open full output")));
+  }
+  // Artifact ids in a tool result (mirrors formless_protocol::artifact_refs).
+  function artifactRefs(text) {
+    const ids = new Set();
+    for (const re of [/stored as artifact ([0-9a-f-]{36})/g, /"emitted_artifact":"([0-9a-f-]{36})"/g]) {
+      for (const m of text.matchAll(re)) ids.add(m[1]);
+    }
+    return [...ids];
+  }
+  // Stored outputs open over the protocol (GetArtifact), never by path.
+  async function openArtifact(id) {
+    const first = await act({ type: "get_artifact", id, offset: 0 });
+    if (!first) return;
+    let text = first.text;
+    let end = first.end;
+    const pre = h("pre", { class: "diff artifact-text" }, text);
+    const more = h("button", { class: "btn small", type: "button" }, "Load more");
+    const status = h("span", { class: "muted" });
+    const sync = () => {
+      status.textContent = end + " of " + first.total_chars + " characters";
+      more.hidden = end >= first.total_chars;
+    };
+    more.onclick = async () => {
+      const r = await act({ type: "get_artifact", id, offset: end });
+      if (!r) return;
+      text += r.text;
+      end = r.end;
+      pre.textContent = text;
+      sync();
+    };
+    const download = h("button", { class: "btn small", type: "button", onclick: async () => {
+      while (end < first.total_chars) {
+        const r = await act({ type: "get_artifact", id, offset: end, length: 1000000 });
+        if (!r) return;
+        text += r.text;
+        end = r.end;
+      }
+      pre.textContent = text;
+      sync();
+      const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain" })), download: "artifact-" + id.slice(0, 8) + ".txt" });
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    } }, "Download");
+    const close = h("button", { class: "btn small primary", type: "button" }, "Close");
+    const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true" },
+      h("div", { class: "modal viewer" },
+        h("h2", null, "Output " + id.slice(0, 8) + " · " + first.bytes + " bytes"),
+        pre,
+        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), more, download, close)));
+    close.onclick = () => viewer.remove();
+    viewer.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); viewer.remove(); } });
+    document.body.append(viewer);
+    sync();
+    close.focus();
   }
 
   // Rendered message bodies by message id: the turn layout is rebuilt on
@@ -1588,8 +1657,14 @@
     if (s && s.id) openSession(s.id);
   }
   async function deleteSession(s) {
-    const ok = await ask({ title: "Delete “" + s.name + "”?", text: "This permanently deletes the session and its transcript.", ok: "Delete", danger: true });
-    if (ok) await act({ type: "delete_session", id: s.id }, "Session deleted");
+    const ok = await ask({ title: "Delete “" + s.name + "”?", text: "The session and its transcript are deleted (you can undo for a short while).", ok: "Delete", danger: true });
+    if (!ok) return;
+    const r = await act({ type: "delete_session", id: s.id });
+    if (r && r.deleted) {
+      toast("Deleted “" + s.name + "”", false, { label: "Undo", ms: (r.undo_secs || 30) * 1000, run: async () => {
+        if (await act({ type: "restore_session", id: s.id }, "Restored “" + s.name + "”")) refreshSessions();
+      } });
+    }
   }
 
   function beginEdit(msg) {
@@ -2046,8 +2121,7 @@
       if (!$("app").classList.contains("hidden")) renderAll();
       if (S.userClosed) return;
       // Reconnect with backoff; the relay and daemon are both stateless here.
-      setTimeout(() => { if (!S.userClosed && S.ws === ws) connect(S.secret); }, S.backoff);
-      S.backoff = Math.min(S.backoff * 2, 15000);
+      scheduleReconnect(() => { if (!S.userClosed && S.ws === ws) connect(S.secret); });
     };
   }
 
@@ -2078,6 +2152,8 @@
     S.ws = ws;
     ws.onopen = () => {
       S.backoff = 1000;
+      S.localConnected = true;
+      S.localFails = 0;
       S.channel = { local: true };
       S.daemonOnline = true;
       $("pair").classList.add("hidden");
@@ -2100,16 +2176,38 @@
       for (const p of S.pending.values()) p.reject(new Error("local daemon connection closed"));
       S.pending.clear();
       if (S.userClosed) return;
-      if (!wasOpen) {
+      if (!wasOpen && !S.localConnected) {
         $("pair-error").textContent = "Not signed in to the local daemon: run formless web for a new link.";
         showPair();
         return;
       }
+      // Was connected: keep retrying (the daemon may be restarting).
+      if (!wasOpen && ++S.localFails === 3) {
+        note("Still offline. If the daemon restarted, run formless web for a new link.", true);
+      }
       renderAll();
-      setTimeout(() => { if (!S.userClosed && S.ws === ws) connectLocal(null); }, S.backoff);
-      S.backoff = Math.min(S.backoff * 2, 15000);
+      scheduleReconnect(() => { if (!S.userClosed && S.ws === ws) connectLocal(null); });
     };
   }
+
+  // Reconnect after S.backoff, visibly: the pill counts down and a tap
+  // retries at once.
+  function scheduleReconnect(fn) {
+    clearTimeout(S.reconnect && S.reconnect.timer);
+    const delay = S.backoff;
+    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(() => { S.reconnect = null; fn(); }, delay) };
+    S.backoff = Math.min(S.backoff * 2, 15000);
+    renderChrome();
+  }
+  function retryNow() {
+    if (!S.reconnect) return;
+    const fn = S.reconnect.fn;
+    clearTimeout(S.reconnect.timer);
+    S.reconnect = null;
+    renderChrome();
+    fn();
+  }
+  setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
 
   function showPair() {
     $("app").classList.add("hidden");
@@ -2186,12 +2284,57 @@
     const sb = $("sidebar");
     if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== $("menu-btn")) closeSidebar();
   });
+  // Keyboard shortcuts (SPEC §10.5): one table drives both the handler
+  // and the `?` overlay. Keys mirror the TUI where a browser allows: Tab
+  // stays focus navigation, so views move with 1–5 and [ ].
+  const VIEWS = ["chat", "tools", "metrics", "proposals", "settings"];
+  const selectedTool = () => S.tools.find((t) => t.id === S.selectedTool);
+  function moveSelection(delta) {
+    if (S.view === "tools") {
+      const list = S.tools;
+      if (!list.length) return;
+      const i = list.findIndex((t) => t.id === S.selectedTool);
+      selectTool(list[Math.max(0, Math.min(list.length - 1, (i < 0 ? 0 : i + delta)))].id);
+    } else {
+      const list = S.sessions;
+      if (!list.length) return;
+      const i = list.findIndex((s) => s.id === S.current);
+      openSession(list[Math.max(0, Math.min(list.length - 1, (i < 0 ? 0 : i + delta)))].id);
+    }
+  }
+  const SHORTCUTS = [
+    { keys: ["/"], help: "focus the message box", run: () => { if (S.view !== "chat") setView("chat"); $("input").focus(); } },
+    { keys: ["?"], help: "this help", run: () => showShortcuts() },
+    { keys: ["1", "2", "3", "4", "5"], help: "Chat · Tools · Metrics · Proposals · Settings", run: (k) => setView(VIEWS[Number(k) - 1]) },
+    { keys: ["[", "]"], help: "previous / next view (TUI Shift+Tab / Tab)", run: (k) => setView(VIEWS[(VIEWS.indexOf(S.view) + (k === "]" ? 1 : VIEWS.length - 1)) % VIEWS.length]) },
+    { keys: ["j", "ArrowDown"], help: "next Session (Chat) or Tool (Tools)", run: () => moveSelection(1) },
+    { keys: ["k", "ArrowUp"], help: "previous Session or Tool", run: () => moveSelection(-1) },
+    { keys: ["n"], help: "new Session", run: () => newSession() },
+    { keys: ["x"], view: "tools", help: "retire / restore the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name); } },
+    { keys: ["b"], view: "tools", help: "roll the selected Tool back one version", run: () => { const t = selectedTool(); if (t && t.current_version > 1) rollbackTool(t, t.current_version - 1); } },
+    { keys: ["e"], view: "tools", help: "export the selected Tool", run: () => { const t = selectedTool(); if (t) exportTool(t); } },
+    { keys: ["o"], view: "tools", help: "optimise the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name); } },
+    { keys: ["p"], view: "tools", help: "purge the selected Tool (typed confirmation)", run: () => { const t = selectedTool(); if (t) purgeTool(t); } },
+  ];
+  function showShortcuts() {
+    const keyName = (k) => (k === "ArrowDown" ? "↓" : k === "ArrowUp" ? "↑" : k);
+    const lines = SHORTCUTS.map((s) => s.keys.map(keyName).join(" ") + "  —  " + (s.view ? "(" + s.view + ") " : "") + s.help);
+    lines.push("", "Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · Esc close or stop", "Approvals: y always · o once · n deny");
+    ask({ title: "Keyboard shortcuts", text: lines.join("\n"), ok: "Close" });
+  }
+  const typingIn = (el) => el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
+
   document.addEventListener("keydown", (e) => {
     const modalOpen = !$("modal-backdrop").classList.contains("hidden");
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
       if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
+    }
+    const dialogOpen = modalOpen || !$("ask-backdrop").classList.contains("hidden");
+    if (!dialogOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !typingIn(document.activeElement) && S.channel) {
+      const sc = SHORTCUTS.find((s) => s.keys.includes(e.key) && (!s.view || s.view === S.view));
+      if (sc) { e.preventDefault(); sc.run(e.key); return; }
     }
     if (e.key === "Escape") {
       if (!$("ask-backdrop").classList.contains("hidden")) closeAsk(null);
@@ -2206,6 +2349,19 @@
   }, 1000);
   // Relative times drift; refresh the sidebar each minute.
   setInterval(renderSessions, 60000);
+
+  // A new `formless web` link pasted into an open tab only changes the
+  // fragment: sign in with it instead of ignoring it.
+  window.addEventListener("hashchange", () => {
+    if (!document.querySelector('meta[name="formless-local"]') || !location.hash.startsWith("#local=")) return;
+    const token = decodeURIComponent(location.hash.slice(7));
+    clearTimeout(S.reconnect && S.reconnect.timer);
+    S.reconnect = null;
+    const old = S.ws;
+    S.ws = null;
+    if (old) old.close();
+    connectLocal(token);
+  });
 
   (function init() {
     if (document.querySelector('meta[name="formless-local"]')) {

@@ -136,6 +136,7 @@ enum Pending {
     ListAudit,
     SessionUsage,
     ListInvocations,
+    GetArtifact,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -296,6 +297,13 @@ impl EditorState {
 }
 
 #[derive(Clone)]
+/// A full-screen text viewer (artifact outputs, SPEC §9.6).
+struct Pager {
+    title: String,
+    lines: Vec<String>,
+    top: usize,
+}
+
 struct LiveToolCall {
     name: String,
     /// Tree depth: nested `tools.call`, or a sub-agent under its Tool.
@@ -495,6 +503,10 @@ struct App {
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
     purge_arm: Option<String>,
+    /// The last deleted Session, restorable with /undo while its window lasts.
+    last_deleted: Option<(String, String)>,
+    /// Open artifact viewer (/open).
+    pager: Option<Pager>,
     /// Session id armed for deletion by a first `d` press.
     delete_arm: Option<String>,
     /// The current Session's sub-agents, as last listed by `/agents`.
@@ -615,6 +627,8 @@ impl App {
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
+            last_deleted: None,
+            pager: None,
             delete_arm: None,
             subagents: Vec::new(),
             import_mode: None,
@@ -866,6 +880,25 @@ impl App {
                                     truncate_chars(&i.handle, 8)
                                 ));
                             }
+                        }
+                        Pending::GetArtifact => {
+                            let text = result["text"].as_str().unwrap_or_default();
+                            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+                            if result["end"].as_u64() < result["total_chars"].as_u64() {
+                                lines.push(format!(
+                                    "… showing {} of {} characters",
+                                    result["end"], result["total_chars"]
+                                ));
+                            }
+                            self.pager = Some(Pager {
+                                title: format!(
+                                    "artifact {} · {} bytes",
+                                    truncate_chars(result["id"].as_str().unwrap_or_default(), 8),
+                                    result["bytes"]
+                                ),
+                                lines,
+                                top: 0,
+                            });
                         }
                         Pending::SessionUsage => {
                             let get = |k: &str| {
@@ -1882,6 +1915,16 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            "open" => self.open_artifact(""),
+            cmd if cmd.starts_with("open ") => self.open_artifact(cmd[5..].trim()),
+            "undo" => match self.last_deleted.take() {
+                Some((id, name)) => {
+                    self.fire(Request::RestoreSession { id });
+                    self.request(Pending::ListSessions, Request::ListSessions);
+                    self.notes.push(format!("restoring session {name}"));
+                }
+                None => self.notes.push("nothing to undo".into()),
+            },
             "invocations" | "pending" => {
                 self.request(Pending::ListInvocations, Request::ListInvocations)
             }
@@ -2130,7 +2173,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -2363,6 +2406,21 @@ impl App {
             self.should_quit = true;
             return;
         }
+        if let Some(p) = &mut self.pager {
+            let page = 20;
+            let last = p.lines.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.pager = None,
+                KeyCode::Down | KeyCode::Char('j') => p.top = (p.top + 1).min(last),
+                KeyCode::Up | KeyCode::Char('k') => p.top = p.top.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => p.top = (p.top + page).min(last),
+                KeyCode::PageUp => p.top = p.top.saturating_sub(page),
+                KeyCode::Home | KeyCode::Char('g') => p.top = 0,
+                KeyCode::End | KeyCode::Char('G') => p.top = last,
+                _ => {}
+            }
+            return;
+        }
         if self.wizard.is_some() {
             self.wizard_key(key);
             return;
@@ -2512,6 +2570,11 @@ impl App {
                     if let Some(s) = self.sessions.get(self.session_idx).cloned() {
                         if self.delete_arm.as_deref() == Some(&s.id) {
                             self.delete_arm = None;
+                            self.notes.push(format!(
+                                "deleted session {} · /undo to restore it (30s)",
+                                s.name
+                            ));
+                            self.last_deleted = Some((s.id.clone(), s.name.clone()));
                             self.fire(Request::DeleteSession { id: s.id });
                             self.request(Pending::ListSessions, Request::ListSessions);
                         } else {
@@ -2724,6 +2787,28 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_approval(f, req, promotion, more, app.color);
     } else if let Some(pick) = &app.rollback_pick {
         draw_rollback_picker(f, app, pick);
+    }
+    if let Some(p) = &app.pager {
+        let area = f.area();
+        let height = area.height.saturating_sub(2) as usize;
+        let body: Vec<Line> = p
+            .lines
+            .iter()
+            .skip(p.top)
+            .take(height)
+            .map(|l| Line::raw(l.clone()))
+            .collect();
+        let title = format!(
+            " {} · line {}/{} · ↑↓ PgUp PgDn g G · Esc close ",
+            p.title,
+            (p.top + 1).min(p.lines.len().max(1)),
+            p.lines.len()
+        );
+        f.render_widget(ratatui::widgets::Clear, area);
+        f.render_widget(
+            Paragraph::new(body).block(ui::panel(title, app.color, Color::Cyan)),
+            area,
+        );
     }
 }
 
@@ -2978,6 +3063,39 @@ fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
     Line::from(spans)
 }
 
+impl App {
+    /// `/open [id-prefix]`: view a stored output in the pager. Without an
+    /// id, the newest one referenced in this Session.
+    fn open_artifact(&mut self, prefix: &str) {
+        let refs: Vec<String> = self
+            .messages
+            .iter()
+            .rev()
+            .flat_map(|m| formless_protocol::artifact_refs(&m.content))
+            .collect();
+        let id = if prefix.is_empty() {
+            refs.first().cloned()
+        } else if prefix.len() == 36 {
+            Some(prefix.to_string())
+        } else {
+            refs.into_iter().find(|r| r.starts_with(prefix))
+        };
+        match id {
+            Some(id) => self.request(
+                Pending::GetArtifact,
+                Request::GetArtifact {
+                    id,
+                    offset: None,
+                    length: None,
+                },
+            ),
+            None => self
+                .notes
+                .push("no stored output to open in this session".into()),
+        }
+    }
+}
+
 fn tool_result_line(content: &str, color: bool) -> Line<'static> {
     let n = content.lines().count();
     let failed = content.contains("\"ok\":false")
@@ -2995,6 +3113,12 @@ fn tool_result_line(content: &str, color: bool) -> Line<'static> {
     ];
     if n > 1 {
         spans.push(Span::styled(format!("  ({n} lines)"), ui::dim(color)));
+    }
+    if let Some(id) = formless_protocol::artifact_refs(content).first() {
+        spans.push(Span::styled(
+            format!("  /open {}", &id[..8]),
+            fg(color, Color::Cyan),
+        ));
     }
     Line::from(spans)
 }
@@ -4523,6 +4647,8 @@ mod tests {
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
+            last_deleted: None,
+            pager: None,
             delete_arm: None,
             subagents: Vec::new(),
             import_mode: None,

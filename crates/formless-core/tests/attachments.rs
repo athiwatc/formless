@@ -135,3 +135,72 @@ async fn attachments_ride_on_the_next_message() {
     let forced = provider(Some(false)).prepare_attachments(std::slice::from_ref(&pm), "gpt-4o");
     assert!(forced[0]["content"].is_string());
 }
+
+#[test]
+fn artifact_refs_are_found_in_tool_results() {
+    use formless_protocol::artifact_refs;
+    let id = "0b9c4a6e-1f2d-4c3b-9a8e-7d6c5b4a3f21";
+    let note = format!(
+        "preview…\n[full output (90000 bytes) stored as artifact {id}; read it with read_artifact]"
+    );
+    assert_eq!(artifact_refs(&note), vec![id.to_string()]);
+    let emitted = format!("{{\"result\":1,\"emitted_artifact\":\"{id}\",\"emitted_bytes\":5}}");
+    assert_eq!(artifact_refs(&emitted), vec![id.to_string()]);
+    assert!(artifact_refs("stored as artifact nope").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_artifact_reads_slices_and_never_the_path() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-art-{short}"));
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-art-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let att = daemon
+        .handle(Request::AttachFile {
+            session_id: sid.clone(),
+            name: "notes.txt".into(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode("abcdefghij"),
+            mime: None,
+        })
+        .await
+        .unwrap();
+    let id = att["id"].as_str().unwrap().to_string();
+    let r = daemon
+        .handle(Request::GetArtifact {
+            id: id.clone(),
+            offset: Some(2),
+            length: Some(4),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            r["text"].as_str(),
+            r["end"].as_u64(),
+            r["total_chars"].as_u64()
+        ),
+        (Some("cdef"), Some(6), Some(10))
+    );
+    let all = r.to_string();
+    assert!(
+        !all.contains(&paths.data_dir.display().to_string()),
+        "no path: {all}"
+    );
+    assert!(daemon
+        .handle(Request::GetArtifact {
+            id: "missing".into(),
+            offset: None,
+            length: None
+        })
+        .await
+        .is_err());
+}
