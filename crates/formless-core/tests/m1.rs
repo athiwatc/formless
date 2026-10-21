@@ -530,3 +530,44 @@ fn queued_messages_survive_reopening_the_store() {
     store.clear_queued_messages(&id).unwrap();
     assert_eq!(store.pop_queued_message(&id).unwrap(), None);
 }
+
+#[test]
+fn context_cache_matches_a_full_build_through_every_change() {
+    use formless_core::storage::ContextCache;
+    let paths = temp_paths("ctxcache");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap();
+    let mut cache = ContextCache::default();
+    let check = |cache: &mut ContextCache, prompt: &str, label: &str| {
+        let cached = cache.build(&store, &s.id, prompt, 200, 0.8).unwrap();
+        let full = build_context(&store, &s.id, prompt, 200, 0.8).unwrap();
+        assert_eq!(cached, full, "after {label}");
+    };
+    check(&mut cache, "sys", "nothing");
+    let first = store.append_message(&s.id, "user", "hello").unwrap();
+    check(&mut cache, "sys", "a user message");
+    store
+        .append_message(&s.id, "system-note", "merged")
+        .unwrap();
+    check(&mut cache, "sys", "a note joining the user turn");
+    for i in 0..6 {
+        store
+            .append_message(&s.id, "assistant", &format!("reply {i} {}", "x".repeat(80)))
+            .unwrap();
+        store
+            .append_message(&s.id, "user", &format!("more {i}"))
+            .unwrap();
+        check(&mut cache, "sys", "growth past the compaction trigger");
+    }
+    let (_, needs, up_to) = cache.build(&store, &s.id, "sys", 200, 0.8).unwrap();
+    assert!(needs);
+    store.save_checkpoint(&s.id, "the summary", up_to).unwrap();
+    check(&mut cache, "sys", "a checkpoint");
+    check(&mut cache, "new prompt", "a system prompt change");
+    store.edit_message(&s.id, &first.id, "edited").unwrap();
+    check(&mut cache, "new prompt", "an edit that truncates");
+    store
+        .append_message(&s.id, "assistant", "after edit")
+        .unwrap();
+    check(&mut cache, "new prompt", "appending after the edit");
+}

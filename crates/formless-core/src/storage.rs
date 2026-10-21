@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 pub struct Store {
     conn: Connection,
+    /// Bumped whenever stored messages change other than by appending
+    /// (edit/truncate, delete), so [`ContextCache`]s know to rebuild.
+    rewrites: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -302,14 +305,20 @@ impl Store {
         let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         migrate(&conn, Some(file))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            rewrites: Default::default(),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         migrate(&conn, None)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            rewrites: Default::default(),
+        })
     }
 
     fn row_session(r: &rusqlite::Row) -> rusqlite::Result<SessionInfo> {
@@ -402,7 +411,13 @@ impl Store {
         self.get_session(id)
     }
 
+    fn note_rewrite(&self) {
+        self.rewrites
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn delete_session(&self, id: &str) -> Result<bool> {
+        self.note_rewrite();
         Ok(self
             .conn
             .execute("DELETE FROM sessions WHERE id=?1", params![id])?
@@ -459,6 +474,28 @@ impl Store {
             .query_map(params![session_id], Self::row_msg)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Messages with `seq > after`, in order (incremental context builds).
+    pub fn list_messages_after(&self, session_id: &str, after: i64) -> Result<Vec<MessageInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM messages WHERE session_id=?1 AND seq>?2 ORDER BY seq")?;
+        let rows = stmt
+            .query_map(params![session_id, after], Self::row_msg)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Total characters of a Session's message contents, without loading
+    /// them (routing's task-size signal).
+    pub fn session_content_chars(&self, session_id: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(content)),0) FROM messages WHERE session_id=?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<(String, i64)>> {
@@ -591,6 +628,7 @@ impl Store {
         if msg.role != "user" {
             return Ok(None);
         }
+        self.note_rewrite();
         self.conn.execute(
             "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
             params![session_id, message_id, content],
@@ -1910,41 +1948,91 @@ pub fn build_context(
     context_tokens: u32,
     trigger_fraction: f64,
 ) -> Result<BuiltContext> {
-    let (summary, up_to) = store.latest_checkpoint(session_id)?.unwrap_or_default();
-    let all = store.list_messages(session_id)?;
-    let live: Vec<&MessageInfo> = all.iter().filter(|m| m.seq > up_to).collect();
-    // Exactly one, leading system message: many chat templates and proxies
-    // reject a second or mid-conversation `system` (§11 summary included).
-    let system = if summary.is_empty() {
-        system_prompt.to_string()
-    } else {
-        format!("{system_prompt}\n\nSummary of earlier conversation:\n{summary}")
-    };
-    let mut ctx: Vec<Value> = vec![json!({"role": "system", "content": system})];
-    for m in &live {
-        let msg = provider_message(m);
-        // A harness note right after a user message joins it, so strictly
-        // alternating templates never see two user turns in a row.
-        if m.role == "system-note" {
-            if let Some(last) = ctx.last_mut().filter(|l| l["role"] == "user") {
-                if let (Some(prev), Some(note)) =
-                    (last["content"].as_str(), msg["content"].as_str())
-                {
-                    last["content"] = json!(format!("{prev}\n\n{note}"));
-                    continue;
+    ContextCache::default().build(
+        store,
+        session_id,
+        system_prompt,
+        context_tokens,
+        trigger_fraction,
+    )
+}
+
+/// [`build_context`] for one Session, kept between agent steps: each build
+/// reads only messages newer than the last one seen and keeps a running
+/// token estimate. It starts over when the system prompt or checkpoint
+/// changes, or when stored messages were rewritten (edit, delete).
+#[derive(Default)]
+pub struct ContextCache {
+    /// (store rewrite count, checkpoint up_to, system prompt) it was built for.
+    key: Option<(u64, i64, String)>,
+    ctx: Vec<Value>,
+    /// Token estimate per `ctx` element.
+    tokens: Vec<usize>,
+    /// Seqs of the post-checkpoint messages, in order.
+    live_seqs: Vec<i64>,
+}
+
+impl ContextCache {
+    pub fn build(
+        &mut self,
+        store: &Store,
+        session_id: &str,
+        system_prompt: &str,
+        context_tokens: u32,
+        trigger_fraction: f64,
+    ) -> Result<BuiltContext> {
+        let (summary, up_to) = store.latest_checkpoint(session_id)?.unwrap_or_default();
+        let key = (
+            store.rewrites.load(std::sync::atomic::Ordering::SeqCst),
+            up_to,
+            system_prompt.to_string(),
+        );
+        if self.key.as_ref() != Some(&key) {
+            // Exactly one, leading system message: many chat templates and
+            // proxies reject a second or mid-conversation `system` (§11
+            // summary included).
+            let system = if summary.is_empty() {
+                system_prompt.to_string()
+            } else {
+                format!("{system_prompt}\n\nSummary of earlier conversation:\n{summary}")
+            };
+            *self = Self {
+                key: Some(key),
+                ..Self::default()
+            };
+            self.push(json!({"role": "system", "content": system}));
+        }
+        let after = self.live_seqs.last().copied().unwrap_or(up_to);
+        for m in store.list_messages_after(session_id, after)? {
+            self.live_seqs.push(m.seq);
+            let msg = provider_message(&m);
+            // A harness note right after a user message joins it, so strictly
+            // alternating templates never see two user turns in a row.
+            if m.role == "system-note" {
+                if let Some(last) = self.ctx.last_mut().filter(|l| l["role"] == "user") {
+                    if let (Some(prev), Some(note)) =
+                        (last["content"].as_str(), msg["content"].as_str())
+                    {
+                        last["content"] = json!(format!("{prev}\n\n{note}"));
+                        let n = estimate_tokens(&last.to_string());
+                        *self.tokens.last_mut().expect("tokens track ctx") = n;
+                        continue;
+                    }
                 }
             }
+            self.push(msg);
         }
-        ctx.push(msg);
+        let tokens: usize = self.tokens.iter().sum();
+        let live = &self.live_seqs;
+        let needs = (tokens as f64) > (context_tokens as f64 * trigger_fraction) && live.len() > 4;
+        let compact_up_to = if needs { live[live.len() / 2] } else { up_to };
+        Ok((self.ctx.clone(), needs, compact_up_to))
     }
-    let tokens: usize = ctx.iter().map(|v| estimate_tokens(&v.to_string())).sum();
-    let needs = (tokens as f64) > (context_tokens as f64 * trigger_fraction) && live.len() > 4;
-    let compact_up_to = if needs {
-        live[live.len() / 2].seq
-    } else {
-        up_to
-    };
-    Ok((ctx, needs, compact_up_to))
+
+    fn push(&mut self, msg: Value) {
+        self.tokens.push(estimate_tokens(&msg.to_string()));
+        self.ctx.push(msg);
+    }
 }
 
 pub fn provider_message(m: &MessageInfo) -> Value {
