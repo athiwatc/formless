@@ -668,6 +668,15 @@ suite cannot measure preferences.
   it keeps the cache stable. A new note applies from the next Session, or
   from this one after compaction, which adds a note to the chat that the
   prompt changed. Disabled notes are left out.
+- **Visible and editable.** Every agent write shows live in the chat
+  (`remembered: …`, `forgot: …`). Management uses `ListMemories`,
+  `UpsertMemory` (add with no `id`, author `user`; or edit the text,
+  scope or enabled flag) and `DeleteMemory`. Clients are:
+  - CLI: `formless memory list [--json]|add|rm|edit`
+  - TUI: `/memory`, `/memory rm|on|off ID`, `/memory edit ID TEXT`
+  - web: the Settings "Memory" section.
+  Memory is never part of Tool or skill bundles, and `formless reset`
+  wipes it with the rest of the data.
 - Every change is audit-logged and broadcasts `MemoryUpdated`.
 
 ## 8. Metrics and Self-Optimisation

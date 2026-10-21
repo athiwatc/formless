@@ -1324,6 +1324,28 @@
               if (await ask({ title: "Remove skill " + sk.name + "?", text: "All its versions are deleted.", ok: "Remove", danger: true })) { await act({ type: "remove_skill", name: sk.name }, "Removed " + sk.name); refreshSettings(); }
             } }, "Remove"))))))
         : h("p", { class: "muted" }, "None. Install one with formless skills add FOLDER | GIT_URL | FILE.zip")));
+    const memories = S.memories || [];
+    grid.append(h("section", null, h("h3", null, "Memory"),
+      h("p", { class: "muted" }, "Notes the agent keeps about your preferences; they go into new sessions' prompts."),
+      memories.length ? h("table", { class: "table" },
+        h("tbody", null, memories.map((m) => h("tr", null,
+          h("td", null, h("div", { class: m.enabled ? "" : "muted" }, m.text),
+            h("div", { class: "muted" }, m.scope + " · " + (m.session_id ? "from session " + m.session_id.slice(0, 8) : m.author) + (m.enabled ? "" : " · off"))),
+          h("td", null,
+            h("button", { class: "btn small", type: "button", onclick: async () => {
+              const text = await ask({ title: "Edit memory", input: true, value: m.text, ok: "Save" });
+              if (text && text !== m.text) { await act({ type: "upsert_memory", id: m.id, text }, "Saved"); refreshSettings(); }
+            } }, "Edit"),
+            h("button", { class: "btn small", type: "button", onclick: () => act({ type: "upsert_memory", id: m.id, enabled: !m.enabled }, m.enabled ? "Disabled" : "Enabled").then(refreshSettings) }, m.enabled ? "Disable" : "Enable"),
+            h("button", { class: "btn small danger", type: "button", onclick: async () => {
+              if (await ask({ title: "Delete this memory?", text: m.text, ok: "Delete", danger: true })) { await act({ type: "delete_memory", id: m.id }, "Deleted"); refreshSettings(); }
+            } }, "Delete"))))))
+        : h("p", { class: "muted" }, "None yet."),
+      h("div", { class: "detail-actions" },
+        h("button", { class: "btn small", type: "button", onclick: async () => {
+          const text = await ask({ title: "Add a memory", input: true, placeholder: "e.g. Use pnpm, not npm", ok: "Add" });
+          if (text) { await act({ type: "upsert_memory", text }, "Added"); refreshSettings(); }
+        } }, "Add"))));
     const thinking = h("input", { type: "checkbox", onchange: (e) => setThinking(e.target.checked) });
     thinking.checked = S.showThinking;
     grid.append(h("section", null, h("h3", null, "This browser"),
@@ -1371,6 +1393,7 @@
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
+    S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     try {
       S.settings = await request({ type: "get_settings" });
     } catch (e) {
@@ -1752,6 +1775,7 @@
       case "settings_changed":
       case "mcp_servers_changed":
       case "skills_changed":
+      case "memory_updated":
         refreshSettings();
         break;
       case "subagent_started":

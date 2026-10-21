@@ -39,6 +39,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// User memory: notes the agent keeps about your preferences (SPEC §7.11)
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// External MCP servers (SPEC §7.9)
     Mcp {
         #[command(subcommand)]
@@ -209,6 +214,37 @@ enum SkillsAction {
 }
 
 #[derive(Subcommand)]
+enum MemoryAction {
+    /// List notes with id, scope and source
+    List {
+        /// Print JSON (for export)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a note
+    Add {
+        text: String,
+        /// "global" or "project:/abs/path"
+        #[arg(long, default_value = "global")]
+        scope: String,
+    },
+    /// Delete a note
+    Rm { id: String },
+    /// Change a note's text or scope, or disable/enable it
+    Edit {
+        id: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        #[arg(long)]
+        enable: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum McpAction {
     /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio) or `add NAME --url URL` (http)
     Add {
@@ -274,6 +310,7 @@ fn main() -> Result<()> {
         Some(Cmd::Doctor) => doctor(paths),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
+        Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Gc) => {
             let cfg = Config::load(&paths)?;
             let store = formless_core::Store::open(&paths.db_file())?;
@@ -1149,6 +1186,63 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
                 println!("enable it with `formless skills enable {name}`\n");
             }
         }
+    }
+    Ok(())
+}
+
+fn memory_cmd(paths: Paths, action: MemoryAction) -> Result<()> {
+    let daemon = |req: Request| -> Result<serde_json::Value> {
+        formless_core::daemon::ensure_daemon(&paths)?;
+        formless_tui::client::request_once(&paths, req)
+    };
+    let show = |m: &serde_json::Value| {
+        println!(
+            "{:<10} {:<8} {:<20} {}{}",
+            m["id"].as_str().unwrap_or_default(),
+            if m["enabled"] == true { "on" } else { "off" },
+            m["scope"].as_str().unwrap_or_default(),
+            m["text"].as_str().unwrap_or_default(),
+            match m["session_id"].as_str() {
+                Some(s) => format!("  (from session {})", &s[..s.len().min(8)]),
+                None => format!("  ({})", m["author"].as_str().unwrap_or_default()),
+            }
+        )
+    };
+    match action {
+        MemoryAction::List { json } => {
+            let list = daemon(Request::ListMemories)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
+            let notes = list.as_array().cloned().unwrap_or_default();
+            if notes.is_empty() {
+                println!("no memories (the agent saves preferences with `remember`; or formless memory add …)");
+            }
+            notes.iter().for_each(show);
+        }
+        MemoryAction::Add { text, scope } => show(&daemon(Request::UpsertMemory {
+            id: None,
+            text: Some(text),
+            scope: Some(scope),
+            enabled: None,
+        })?),
+        MemoryAction::Rm { id } => {
+            daemon(Request::DeleteMemory { id: id.clone() })?;
+            println!("deleted {id}");
+        }
+        MemoryAction::Edit {
+            id,
+            text,
+            scope,
+            disable,
+            enable,
+        } => show(&daemon(Request::UpsertMemory {
+            id: Some(id),
+            text,
+            scope,
+            enabled: (disable || enable).then_some(enable),
+        })?),
     }
     Ok(())
 }

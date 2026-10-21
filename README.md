@@ -449,6 +449,15 @@ formless skills export pdf -o pdf.skill.json   # files only, no metrics
 formless skills import pdf.skill.json          # imported disabled, contents printed
 ```
 
+The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes that go into new sessions. You see every one, and you can edit them:
+
+```bash
+formless memory list
+formless memory add "Projects live in ~/code"
+formless memory edit m1a2b3c4 --disable
+formless memory rm m1a2b3c4
+```
+
 ## 6. Invocations: async by design
 
 * Every Tool call is an **Invocation**: one Tool version, one input, recorded and measured.
