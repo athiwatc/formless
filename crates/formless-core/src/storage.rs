@@ -1356,6 +1356,13 @@ impl Store {
                ORDER BY created_at DESC, rowid DESC LIMIT 1) AND followup=''",
             params![session_id, followup],
         )?;
+        // A primary role's task that the user corrected was not good
+        // (SPEC §4.6).
+        self.conn.execute(
+            "UPDATE task_stats SET outcome=?2 WHERE run_id=(SELECT id FROM runs WHERE session_id=?1
+               ORDER BY created_at DESC, rowid DESC LIMIT 1) AND outcome='completed'",
+            params![session_id, followup],
+        )?;
         Ok(())
     }
 

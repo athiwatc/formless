@@ -362,3 +362,84 @@ async fn an_auto_role_uses_the_measured_winner() {
     assert!(r.contains("ok"), "{r}");
     assert_eq!(seen.lock().unwrap().last().unwrap()["model"], "good");
 }
+
+#[test]
+fn global_auto_migrates_to_a_primary_role() {
+    let mut cfg = Config::default();
+    assert_eq!(cfg.migrate_global_auto(), None);
+    cfg.provider.model = "auto".into();
+    cfg.provider.routing_models = vec!["m1".into(), "m2".into()];
+    let warning = cfg.migrate_global_auto().unwrap();
+    assert!(
+        warning.contains("deprecated") && warning.contains("m1, m2"),
+        "{warning}"
+    );
+    assert_eq!(cfg.provider.model, "role:primary");
+    let role = &cfg.roles["primary"];
+    assert_eq!(
+        (role.model.as_str(), role.candidates.clone()),
+        ("auto", vec!["m1".to_string(), "m2".to_string()])
+    );
+    assert_eq!(cfg.migrate_global_auto(), None, "once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn old_auto_configs_migrate_on_start_and_primary_runs_feed_routing() {
+    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let (a, seen) = mock("done").await;
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-mig-{short}"));
+    let paths = Paths {
+        data_dir: dir.join("d"),
+        config_dir: dir.join("c"),
+        profile: format!("test-mig-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = a;
+    cfg.provider.model = "auto".into();
+    cfg.provider.routing_models = vec!["alpha".into(), "beta".into()];
+    cfg.provider.max_retries = 1;
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.tools.task_explore_rate = 0.0;
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let saved = Config::load_file_only(&paths).unwrap();
+    assert_eq!(
+        saved.provider.model, "role:primary",
+        "the file was rewritten"
+    );
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    daemon
+        .handle(Request::SendMessage {
+            session_id: sid.clone(),
+            content: "hi".into(),
+            mode: formless_protocol::SendMode::Send,
+        })
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if store
+            .last_run(&sid)
+            .unwrap()
+            .is_some_and(|(_, s)| s == "completed")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Too few samples: the first candidate; the Run became a task.
+    assert_eq!(seen.lock().unwrap().last().unwrap()["model"], "alpha");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let stats = store.task_stats("primary").unwrap();
+    assert_eq!(
+        (stats.len(), stats[0].model.as_str(), stats[0].good),
+        (1, "alpha", 1)
+    );
+    // The user's "that's wrong" marks it bad.
+    store.mark_last_run_followup(&sid, "corrected").unwrap();
+    assert_eq!(store.task_stats("primary").unwrap()[0].good, 0);
+}

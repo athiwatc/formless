@@ -150,6 +150,10 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+    /// Shown to each client as it connects (deprecation migrations).
+    startup_warnings: Vec<String>,
+    /// The model each active Run resolved to (per-task routing, §4.6).
+    run_models: StdMutex<HashMap<String, String>>,
     /// A prompt proposal is being generated (one at a time).
     pub(crate) proposing: Arc<AtomicBool>,
     /// Hook commands the user approved this daemon lifetime (SPEC §9.8).
@@ -187,6 +191,20 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(paths: Paths) -> Result<Self> {
         let store = Store::open(&paths.db_file())?;
+        // Deprecated global auto (SPEC §4.6): rewrite the file once and
+        // tell every client that connects this lifetime.
+        let mut startup_warnings = Vec::new();
+        if paths.config_file().exists() {
+            if let Ok(mut cfg) = Config::load_file_only(&paths) {
+                if let Some(w) = cfg.migrate_global_auto() {
+                    if cfg.save(&paths).is_ok() {
+                        tracing::warn!("{w}");
+                        let _ = store.audit("daemon", "config.migrate_auto", &w);
+                        startup_warnings.push(w);
+                    }
+                }
+            }
+        }
         store.mark_orphan_runs_interrupted()?;
         // Pending handles do not survive a restart; tell each Session's
         // agent instead of leaving a handle that later reads "unknown".
@@ -211,6 +229,8 @@ impl Daemon {
             web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
             proposing: Arc::new(AtomicBool::new(false)),
+            startup_warnings,
+            run_models: StdMutex::new(HashMap::new()),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
@@ -503,6 +523,23 @@ impl Daemon {
                 model,
                 reasoning_effort,
             } => {
+                // A Session's model "auto" is deprecated too (SPEC §4.6):
+                // with a primary role it means that role.
+                let model = match model {
+                    Some(m) if ProviderCfg::is_auto_model(&m) => {
+                        let cfg = self.config()?;
+                        if cfg.roles.contains_key(crate::config::PRIMARY_ROLE) {
+                            self.broadcast(Event::Note {
+                                session_id: Some(id.clone()),
+                                text: format!("model \"auto\" is deprecated; using role:{} (per-role, per-task routing)", crate::config::PRIMARY_ROLE),
+                            });
+                            Some(format!("role:{}", crate::config::PRIMARY_ROLE))
+                        } else {
+                            Some(m)
+                        }
+                    }
+                    other => other,
+                };
                 let s = self
                     .with_store(|st| st.set_session_model(&id, model, reasoning_effort))?
                     .context("session not found")?;
@@ -1512,6 +1549,7 @@ impl Daemon {
         });
         self.maybe_name_session(&session_id);
         self.maybe_auto_skill(&session_id, &run_id, final_status);
+        self.record_primary_task(&session_id, &run_id, final_status);
         // run_end hooks (SPEC §9.8): automation, results only logged.
         if let Ok(cfg) = self.config() {
             let hooks: Vec<_> = cfg
@@ -1818,6 +1856,10 @@ impl Daemon {
             cfg.provider.routing_complex_chars,
         );
         let model = self.resolve_model(&requested_model, &cfg, complex)?;
+        self.run_models
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), model.clone());
         if ProviderCfg::is_auto_model(&requested_model) {
             self.broadcast(Event::Note {
                 session_id: Some(session_id.to_string()),
@@ -3544,6 +3586,43 @@ impl Daemon {
         (model, effort)
     }
 
+    /// A primary Run on a role counts as one task for that role's per-task
+    /// routing (SPEC §4.6); a later edit or correction marks it bad.
+    fn record_primary_task(&self, session_id: &str, run_id: &str, status: &str) {
+        let model = self.run_models.lock().unwrap().remove(run_id);
+        if status == "interrupted" {
+            return;
+        }
+        let Some(model) = model else { return };
+        let Ok(cfg) = self.config() else { return };
+        let (session_model, _) = self.session_model_effort(session_id, &cfg);
+        let Some(role) = session_model.strip_prefix("role:") else {
+            return;
+        };
+        let Ok(Some(m)) =
+            self.with_reader(|st| Ok(st.run_metrics(50)?.into_iter().find(|m| m.run_id == run_id)))
+        else {
+            return;
+        };
+        let _ = self.with_store(|st| {
+            st.record_task(
+                role,
+                &model,
+                session_id,
+                run_id,
+                "",
+                m.duration_ms,
+                m.prompt_tokens + m.completion_tokens,
+                m.steps,
+                if status == "completed" {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            )
+        });
+    }
+
     /// Usage of a Run or Session, priced with `provider.prices` when every
     /// model used has a price (SPEC §10.6).
     pub fn usage_info(
@@ -5195,6 +5274,12 @@ impl Daemon {
             tx: tx.clone(),
             filter: filter.clone(),
         });
+        for w in &self.startup_warnings {
+            let _ = tx.send(ServerMessage::Event(Event::Note {
+                session_id: None,
+                text: w.clone(),
+            }));
+        }
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let Ok(line) = serde_json::to_string(&msg) {

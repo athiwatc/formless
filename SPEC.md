@@ -119,6 +119,13 @@ without redesign.
   `routing_fast_models` / `routing_strong_models` subsets constrain
   simple vs complex tasks (`routing_complex_chars`). No vendor ranking
   is hard-coded. Stats are visible in the Metrics view and `doctor`.
+  **Deprecated (§4.6):** a global `provider.model = "auto"` is migrated on
+  daemon start. A `primary` role is created with `model = "auto"` and the
+  former routing pool as `candidates`, `provider.model` becomes
+  `role:primary`, the file is rewritten, and every client gets the warning
+  as a note when it connects. A Session set to `auto` uses `role:primary`
+  when that role exists. The global per-call pool remains only for an
+  `auto` role without `candidates`.
 - v2 subscription/OAuth providers use the same OpenAI-compatible HTTP
   surface with a Bearer access token obtained by OAuth2
   authorization-code + PKCE (`provider.auth.mode = "oauth"`). This is a
@@ -264,6 +271,11 @@ task, with quality as a gate**.
   - With no qualifier, the role's first candidate. With probability
     `tools.task_explore_rate` (0.1), the least-sampled under-sampled
     candidate instead, so the others earn samples.
+- **The primary Session counts too.** A Run on a role (for example the
+  migrated `primary`) is recorded as one task with the model it resolved
+  to. When the user edits and re-runs it, or corrects it ("that's
+  wrong", §8.7), the task becomes bad, so per-role `auto` has a quality
+  signal for the primary role as well.
 - Per-call outcomes stay as they were, for failover and the Models
   metrics view.
 - Pinned roles (a concrete `model`) are unaffected.
