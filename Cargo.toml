@@ -35,6 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 aes-gcm = "0.10"
 sha2 = "0.10"
+hkdf = "0.12"
 base64 = "0.22"
 rand = "0.8"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

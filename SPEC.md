@@ -775,7 +775,13 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   can neither read traffic nor derive the key. The daemon connects with
   `?mux=1`: the Relay gives every browser a client id, announces
   `client_open`/`client_close`, and routes `{cid, f}` frames, so each
-  browser has its own daemon connection. The relay link itself is not a
+  browser has its own daemon connection. Frames are version 2: each
+  browser connection opens with a handshake (`{"v":2,"hello":<16 random
+  bytes>}` from each side) and derives a session key with HKDF-SHA256
+  over the pairing key, salted with both nonces; every frame carries a
+  per-direction `seq` bound into the AES-GCM associated data and must
+  increase, so the Relay cannot replay, reorder or reflect frames, nor
+  reuse them in another connection. The relay link itself is not a
   subscriber: with no browser attached, approvals fail closed and the
   daemon can idle-close. The browser URL carries
   the secret in the `#k=` fragment, which is never sent to a server.

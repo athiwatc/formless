@@ -54,6 +54,7 @@ function wsAccept(req, socket) {
       }
     }
   });
+  socket.on("end", () => close(conn)); // peer went away (e.g. a killed daemon)
   socket.on("close", () => close(conn));
   socket.on("error", () => close(conn));
   return conn;

@@ -1,6 +1,9 @@
 // Formless Web frontend (SPEC §12, v2). Talks the normal daemon protocol
 // through the encrypted relay: every line is AES-256-GCM encrypted here
-// with the pairing secret, which never leaves this browser. Feature parity
+// under a per-connection session key derived (HKDF) from the pairing
+// secret, which never leaves this browser, and both sides' handshake
+// nonces. Frames carry a sequence number bound into the authenticated
+// data, so the relay cannot replay or reflect them. Feature parity
 // with the TUI: Sessions (new/fork/rename/delete/search/import/export),
 // streaming chat with thinking + Tool calls, steer/queue/stop/edit,
 // approvals and promotions, Tools (detail, edit code, optimise, retire,
@@ -50,7 +53,11 @@
   // ---------------------------------------------------------------- state
   const S = {
     ws: null,
-    key: null,
+    key: null, // HKDF root key from the pairing secret
+    hello: null, // this connection's handshake nonce
+    channel: null, // { key, sent, received } once the handshake is done
+    sendChain: Promise.resolve(),
+    recvChain: Promise.resolve(),
     secret: "",
     userClosed: false,
     backoff: 1000,
@@ -103,14 +110,38 @@
     const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", keyBytes));
     return Array.from(digest.slice(0, 16), (b) => b.toString(16).padStart(2, "0")).join("");
   }
+  // Relay frame protocol v2 (must match crates/formless-core/src/relay.rs).
+  const FRAME_VERSION = 2;
+  const enc = (s) => new TextEncoder().encode(s);
+  const aad = (direction, seq) => enc("formless-relay/2 " + direction + " " + seq);
+  function startHandshake() {
+    S.channel = null;
+    S.hello = crypto.getRandomValues(new Uint8Array(16));
+    S.ws.send(JSON.stringify({ v: FRAME_VERSION, hello: bytesToB64(S.hello) }));
+  }
+  async function finishHandshake(daemonHello) {
+    const salt = new Uint8Array(32);
+    salt.set(S.hello, 0);
+    salt.set(daemonHello, 16);
+    const key = await crypto.subtle.deriveKey(
+      { name: "HKDF", hash: "SHA-256", salt, info: enc("formless-relay/2") },
+      S.key, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    S.channel = { key, sent: 0, received: 0 };
+  }
   async function encrypt(text) {
+    const ch = S.channel;
+    const seq = ++ch.sent;
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, S.key, new TextEncoder().encode(text));
-    return JSON.stringify({ v: 1, iv: bytesToB64(iv), ct: bytesToB64(ct) });
+    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aad("b2d", seq) }, ch.key, enc(text));
+    return JSON.stringify({ v: FRAME_VERSION, seq, iv: bytesToB64(iv), ct: bytesToB64(ct) });
   }
   async function decrypt(frame) {
+    const ch = S.channel;
     const v = JSON.parse(frame);
-    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(v.iv) }, S.key, b64ToBytes(v.ct));
+    if (!ch || v.v !== FRAME_VERSION || !(v.seq > ch.received)) throw new Error("rejected frame");
+    const pt = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: b64ToBytes(v.iv), additionalData: aad("d2b", v.seq) }, ch.key, b64ToBytes(v.ct));
+    ch.received = v.seq;
     return new TextDecoder().decode(pt);
   }
 
@@ -119,6 +150,7 @@
   function request(req, timeoutMs) {
     return new Promise((resolve, reject) => {
       if (!S.ws || S.ws.readyState !== 1) return reject(new Error("not connected to the relay"));
+      if (!S.channel) return reject(new Error("still connecting to the daemon"));
       const id = S.nextId++;
       const timer = setTimeout(() => {
         S.pending.delete(id);
@@ -128,8 +160,11 @@
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      encrypt(JSON.stringify({ id, protocol: PROTOCOL, request: req }))
-        .then((frame) => S.ws.send(frame))
+      // Serialised so frames leave in sequence-number order.
+      const ws = S.ws;
+      S.sendChain = S.sendChain
+        .then(() => encrypt(JSON.stringify({ id, protocol: PROTOCOL, request: req })))
+        .then((frame) => ws.send(frame))
         .catch((e) => { S.pending.delete(id); clearTimeout(timer); reject(e); });
     });
   }
@@ -1601,7 +1636,8 @@
     }
     S.secret = secret;
     S.userClosed = false;
-    S.key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+    S.key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveKey"]);
+    S.channel = null;
     const room = await roomFor(keyBytes);
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(proto + "//" + location.host + "/relay/" + room + "?role=client");
@@ -1615,30 +1651,47 @@
       $("app").classList.remove("hidden");
       renderAll();
     };
-    ws.onmessage = async (e) => {
-      const frame = String(e.data);
+    // Frames are handled one at a time, in arrival order.
+    ws.onmessage = (e) => {
+      S.recvChain = S.recvChain.then(() => onFrame(ws, String(e.data))).catch(() => {});
+    };
+    async function onFrame(ws, frame) {
+      if (S.ws !== ws) return;
       if (frame.startsWith('{"relay":')) {
         const online = JSON.parse(frame).relay === "daemon_online";
         const was = S.daemonOnline;
         S.daemonOnline = online;
-        if (online && !was) { note("daemon online"); loadAll(); }
-        if (!online && was) note("daemon went offline", true);
+        if (online && !was) startHandshake();
+        if (!online && was) { S.channel = null; note("daemon went offline", true); }
         renderChrome();
         renderHistory();
+        return;
+      }
+      if (!S.channel) {
+        let hello = null;
+        try {
+          const v = JSON.parse(frame);
+          if (v.v === FRAME_VERSION && typeof v.hello === "string") hello = b64ToBytes(v.hello);
+        } catch (_) {}
+        if (!hello || hello.length !== 16 || !S.hello) return;
+        await finishHandshake(hello);
+        note("daemon online");
+        loadAll();
         return;
       }
       let msg;
       try { msg = JSON.parse(await decrypt(frame)); } catch (_) { return; }
       if (msg.kind === "response") {
         const p = S.pending.get(msg.id);
-        if (!p) return; // another browser's request on the shared daemon link
+        if (!p) return; // timed out already
         S.pending.delete(msg.id);
         if (msg.ok) p.resolve(msg.result); else p.reject(new Error(msg.error || "daemon error"));
       } else if (msg.kind === "event") onEvent(msg);
-    };
+    }
     ws.onclose = () => {
       if (S.ws !== ws) return;
       S.daemonOnline = false;
+      S.channel = null;
       S.running.clear();
       S.activity = null;
       for (const p of S.pending.values()) p.reject(new Error("relay connection closed"));
