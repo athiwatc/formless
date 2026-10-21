@@ -238,6 +238,15 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup ON memories(scope, dedup_key);
 ";
 
+/// Applied memory-kind proposals move into the memory store (author
+/// `optimiser`, linked for rollback).
+const SCHEMA_V18: &str = "
+INSERT OR IGNORE INTO memories(id,text,dedup_key,scope,author,enabled,created_at,updated_at,proposal_id)
+  SELECT 'm' || lower(hex(randomblob(4))), trim(content), lower(trim(content)), 'global', 'optimiser', 1,
+         COALESCE(applied_at, created_at), COALESCE(applied_at, created_at), id
+  FROM prompt_proposals WHERE kind='memory' AND status='applied';
+";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -261,7 +270,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -276,7 +285,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 17] = [
+const MIGRATIONS: [(i64, MigrationStep); 18] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -315,6 +324,10 @@ const MIGRATIONS: [(i64, MigrationStep); 17] = [
     }),
     (16, |c| Ok(c.execute_batch(SCHEMA_V16)?)),
     (17, |c| Ok(c.execute_batch(SCHEMA_V17)?)),
+    (18, |c| {
+        add_column(c, "memories", "proposal_id TEXT")?;
+        Ok(c.execute_batch(SCHEMA_V18)?)
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1479,24 +1492,43 @@ impl Store {
         if changed == 0 {
             return Ok(None);
         }
-        self.get_proposal(id)
+        let p = self.get_proposal(id)?;
+        // A memory proposal lives in the memory store (SPEC §7.11).
+        if let Some(p) = p.as_ref().filter(|p| p.kind == "memory") {
+            match status {
+                "applied" => {
+                    let (m, _) = self.add_memory(&p.content, "global", "optimiser", None)?;
+                    self.conn.execute(
+                        "UPDATE memories SET proposal_id=?2 WHERE id=?1",
+                        params![m.id, p.id],
+                    )?;
+                }
+                "rolled_back" => {
+                    self.conn
+                        .execute("DELETE FROM memories WHERE proposal_id=?1", params![p.id])?;
+                }
+                _ => {}
+            }
+        }
+        Ok(p)
     }
 
-    /// Effective system prompt: frozen bootstrap + applied proposals as
-    /// versioned learned guidance/memory sections (oldest first).
+    /// Effective system prompt: frozen bootstrap + applied guidance
+    /// proposals as versioned sections (oldest first). Memory proposals
+    /// are in the memory store instead.
     pub fn effective_system_prompt(&self, base: &str) -> Result<String> {
-        let applied = self.applied_proposals()?;
-        if applied.is_empty() {
-            return Ok(base.to_string());
-        }
+        let applied: Vec<_> = self
+            .applied_proposals()?
+            .into_iter()
+            .filter(|p| p.kind != "memory")
+            .collect();
         let mut out = base.to_string();
         for (i, p) in applied.iter().enumerate() {
-            let label = if p.kind == "memory" {
-                "Learned memory"
-            } else {
-                "Learned guidance"
-            };
-            out.push_str(&format!("\n\n{label} (v{}): {}", i + 1, p.content.trim()));
+            out.push_str(&format!(
+                "\n\nLearned guidance (v{}): {}",
+                i + 1,
+                p.content.trim()
+            ));
         }
         Ok(out)
     }
@@ -2225,7 +2257,12 @@ impl Store {
         author: &str,
         session_id: Option<&str>,
     ) -> Result<(formless_protocol::MemoryInfo, bool)> {
-        crate::memory::validate(text, scope)?;
+        if author == "optimiser" {
+            crate::memory::validate_len(text, crate::memory::MAX_OPTIMISER_CHARS)?;
+            crate::memory::validate_scope(scope)?;
+        } else {
+            crate::memory::validate(text, scope)?;
+        }
         let key = crate::memory::dedup_key(text);
         let t = now();
         let existing: Option<String> = self
