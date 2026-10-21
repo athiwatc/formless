@@ -18,7 +18,8 @@ pub const ABANDON_INVOCATION: &str = "abandon_invocation";
 pub const FIND_TOOLS: &str = "find_tools";
 pub const READ_TOOL: &str = "read_tool";
 pub const TEST_TOOL: &str = "test_tool";
-pub const RESERVED: [&str; 10] = [
+pub const UNLOAD_TOOLS: &str = "unload_tools";
+pub const RESERVED: [&str; 11] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -29,6 +30,7 @@ pub const RESERVED: [&str; 10] = [
     FIND_TOOLS,
     READ_TOOL,
     TEST_TOOL,
+    UNLOAD_TOOLS,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -225,6 +227,23 @@ fn find_tools_definition() -> Value {
                     "limit": {"type": "integer", "description": "Max results (default 8, max 25)"}
                 },
                 "required": ["query"]
+            }
+        }
+    })
+}
+
+fn unload_tools_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": UNLOAD_TOOLS,
+            "description": "Stop listing Tools this session no longer needs (fewer, more relevant functions). Takes effect at the next context compaction, so the listing stays stable until then; find_tools loads them again later.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "names": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["names"]
             }
         }
     })
@@ -509,6 +528,7 @@ pub fn tool_definitions(
         retire_tool_definition(),
         find_tools_definition(),
         read_tool_definition(),
+        unload_tools_definition(),
         test_tool_definition(),
         pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
         pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),

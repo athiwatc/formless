@@ -882,6 +882,7 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 | `tools.default_memory_mb` | 256 | Default per-Invocation heap (§7.4) |
 | `tools.max_memory_mb` | 4096 | Daemon bound on declared memory (§7.4) |
 | `tools.artifact_preview_chars` | 2000 | Context preview of artifact outputs (§9.6) |
+| `tools.session_max_loaded` | 60 | Most Tools a Session keeps listed; at compaction the oldest loaded ones are dropped (own creations stay) |
 | `tools.search` | `bm25` | `find_tools` ranking: BM25 over names, descriptions and input fields with stemming and synonyms, or `keyword` |
 | `tools.inline_limit` | 40 | Tools listed in a Session's frozen first-step listing; others load via `find_tools` (§7.1) |
 | `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |

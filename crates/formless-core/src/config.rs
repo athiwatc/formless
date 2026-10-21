@@ -311,10 +311,18 @@ pub struct ToolsCfg {
     /// fields, with stemming and synonyms) or "keyword" (word matches).
     #[serde(default = "default_tool_search")]
     pub search: String,
+    /// Most Tools a Session keeps listed; the oldest loaded ones are
+    /// dropped at compaction (a Session's own creations stay).
+    #[serde(default = "default_session_max_loaded")]
+    pub session_max_loaded: usize,
     /// How deep `agents.run` sub-agents may nest (1 = the main agent's
     /// Tools may spawn sub-agents; theirs may not).
     pub max_agent_depth: usize,
 }
+fn default_session_max_loaded() -> usize {
+    60
+}
+
 fn default_tool_search() -> String {
     "bm25".into()
 }
@@ -328,6 +336,7 @@ impl Default for ToolsCfg {
             artifact_preview_chars: 2000,
             inline_limit: 40,
             search: default_tool_search(),
+            session_max_loaded: default_session_max_loaded(),
             max_agent_depth: 1,
         }
     }

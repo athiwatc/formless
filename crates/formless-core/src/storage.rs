@@ -227,7 +227,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -242,7 +242,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 13] = [
+const MIGRATIONS: [(i64, MigrationStep); 14] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -271,6 +271,9 @@ const MIGRATIONS: [(i64, MigrationStep); 13] = [
         add_column(c, "session_tools", "pinned_def TEXT")
     }),
     (13, |c| add_column(c, "sessions", "system_prompt TEXT")),
+    (14, |c| {
+        add_column(c, "session_tools", "unload INTEGER NOT NULL DEFAULT 0")
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1507,7 +1510,10 @@ impl Store {
     ) -> Result<()> {
         for id in tool_ids {
             self.conn.execute(
-                "INSERT OR IGNORE INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, ?3, ?4)",
+                // Loading again revives a Tool the Session had unloaded.
+                "INSERT INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(session_id, tool_id) DO UPDATE SET source=excluded.source, loaded_at=excluded.loaded_at, unload=0 \
+                 WHERE session_tools.source='unloaded'",
                 params![session_id, id, source, now()],
             )?;
         }
@@ -1515,6 +1521,48 @@ impl Store {
     }
 
     /// Has this Session frozen its most-used filler Tools yet?
+    /// Mark Tools to drop from a Session's listing at its next compaction.
+    /// Returns how many were marked.
+    pub fn request_unload(&self, session_id: &str, tool_ids: &[String]) -> Result<usize> {
+        let mut n = 0;
+        for id in tool_ids {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, 'called', ?3)",
+                params![session_id, id, now()],
+            )?;
+            n += self.conn.execute(
+                "UPDATE session_tools SET unload=1 WHERE session_id=?1 AND tool_id=?2 AND source!='created'",
+                params![session_id, id],
+            )?;
+        }
+        Ok(n)
+    }
+
+    /// At a compaction: apply requested unloads, then keep at most
+    /// `max_loaded` listed Tools (oldest found/filler/called first; a
+    /// Session's own creations stay). Returns how many were unloaded.
+    pub fn apply_unloads(&self, session_id: &str, max_loaded: usize) -> Result<usize> {
+        let mut n = self.conn.execute(
+            "UPDATE session_tools SET source='unloaded', unload=0, pinned_def=NULL, pinned_version=NULL WHERE session_id=?1 AND unload=1",
+            params![session_id],
+        )?;
+        let loaded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_tools WHERE session_id=?1 AND source!='unloaded'",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let excess = (loaded as usize).saturating_sub(max_loaded.max(1));
+        if excess > 0 {
+            n += self.conn.execute(
+                "UPDATE session_tools SET source='unloaded', pinned_def=NULL, pinned_version=NULL WHERE rowid IN (
+                   SELECT rowid FROM session_tools WHERE session_id=?1 AND source NOT IN ('unloaded','created')
+                   ORDER BY loaded_at LIMIT ?2)",
+                params![session_id, excess as i64],
+            )?;
+        }
+        Ok(n)
+    }
+
     pub fn session_has_filler(&self, session_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM session_tools WHERE session_id=?1 AND source='filler')",
@@ -1608,8 +1656,9 @@ impl Store {
 
     pub fn session_tool_ids(&self, session_id: &str) -> Result<std::collections::HashSet<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tool_id FROM session_tools WHERE session_id=?1
-             UNION SELECT DISTINCT tool_id FROM invocations WHERE session_id=?1",
+            "SELECT tool_id FROM session_tools WHERE session_id=?1 AND source!='unloaded'
+             UNION SELECT DISTINCT tool_id FROM invocations WHERE session_id=?1
+               AND tool_id NOT IN (SELECT tool_id FROM session_tools WHERE session_id=?1 AND source='unloaded')",
         )?;
         let rows = stmt
             .query_map(params![session_id], |r| r.get::<_, String>(0))?
