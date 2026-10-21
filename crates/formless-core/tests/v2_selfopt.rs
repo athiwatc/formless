@@ -318,3 +318,80 @@ fn optimiser_queue_persists_and_waits_only_for_busy_tools() {
     store.dequeue_optimise(&a).unwrap();
     assert_eq!(store.optimise_queue().unwrap(), vec![b]);
 }
+
+#[test]
+fn near_duplicate_proposals() {
+    use formless_core::optimiser::near_duplicate;
+    assert!(near_duplicate(
+        "Always stream large files in chunks.",
+        "always stream large file in chunks"
+    ));
+    assert!(!near_duplicate(
+        "Always stream large files in chunks.",
+        "Retire Tools that keep failing validation."
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generate_does_not_repeat_or_run_twice() {
+    use axum::routing::post;
+    use formless_protocol::Request;
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        post({
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let proposal = r#"{"kind":"prompt","content":"Always stream large files in chunks.","rationale":"oom"}"#;
+                    axum::Json(serde_json::json!({"choices": [{"message": {"content": proposal}}]}))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-gen-{short}"));
+    let paths = Paths {
+        data_dir: dir.join("d"),
+        config_dir: dir.join("c"),
+        profile: format!("test-gen-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut cfg = formless_core::Config::default();
+    cfg.provider.base_url = base;
+    cfg.provider.model = "m".into();
+    cfg.provider.max_retries = 1;
+    cfg.naming.enabled = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    // The same lesson was already proposed and rejected.
+    let p = store
+        .create_proposal("prompt", "Always stream large files in chunks.", "x", 1)
+        .unwrap();
+    store.set_proposal_status(&p.id, "rejected").unwrap();
+    let daemon = std::sync::Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let first = daemon.handle(Request::GenerateProposal).await.unwrap();
+    let second = daemon.handle(Request::GenerateProposal).await.unwrap();
+    assert_eq!(first["started"], true);
+    assert_eq!(second["started"], false, "no parallel generation");
+    for _ in 0..50 {
+        if daemon.handle(Request::GenerateProposal).await.unwrap()["started"] == true {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Both attempts repeated the rejected lesson: nothing new was stored.
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "retried once"
+    );
+    assert_eq!(store.list_proposals().unwrap().len(), 1);
+}

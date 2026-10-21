@@ -137,6 +137,7 @@ enum Pending {
     SessionUsage,
     ListInvocations,
     GetArtifact,
+    GenerateProposal,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -489,6 +490,8 @@ struct App {
     enhanced_keys: bool,
     /// Mouse capture (wheel scrolling); off lets the terminal select text.
     mouse_capture: bool,
+    /// A prompt proposal is being generated (Proposals view shows it).
+    proposal_generating: bool,
     /// Sessions with a Run in flight; run state is per session, not global.
     running_sessions: std::collections::HashSet<String>,
     notes: Vec<String>,
@@ -623,6 +626,7 @@ impl App {
             ctrl_c_at: None,
             enhanced_keys: false,
             mouse_capture: true,
+            proposal_generating: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -889,6 +893,22 @@ impl App {
                                     if i.abandoned { " · abandoned" } else { "" },
                                     truncate_chars(&i.handle, 8)
                                 ));
+                            }
+                        }
+                        Pending::GenerateProposal => {
+                            if result["started"] == true {
+                                self.proposal_generating = true;
+                                self.notes.push(
+                                    "generating a proposal: one model call plus the eval suite (costs tokens)"
+                                        .into(),
+                                );
+                            } else {
+                                self.notes.push(
+                                    result["reason"]
+                                        .as_str()
+                                        .unwrap_or("not started")
+                                        .to_string(),
+                                );
                             }
                         }
                         Pending::GetArtifact => {
@@ -1523,6 +1543,13 @@ impl App {
             }
             Event::ToolDeleted { id } => self.tools.retain(|x| x.id != id),
             Event::OptimiserActivity { tool_name, text } => {
+                if tool_name == "prompt"
+                    && ["measured", "no new proposal", "failed"]
+                        .iter()
+                        .any(|w| text.contains(w))
+                {
+                    self.proposal_generating = false;
+                }
                 self.notes.push(format!("optimiser {tool_name}: {text}"));
                 self.request(Pending::ListTools, Request::ListTools);
             }
@@ -1851,10 +1878,7 @@ impl App {
             },
             "metrics" => self.open_view(View::Metrics),
             "proposals" => self.open_view(View::Proposals),
-            "propose" => {
-                self.fire(Request::GenerateProposal);
-                self.notes.push("generating a measured proposal...".into());
-            }
+            "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             "settings" => self.open_view(View::Settings),
             "model" => {
@@ -2530,10 +2554,7 @@ impl App {
                     self.proposal_idx =
                         (self.proposal_idx + 1).min(self.proposals.len().saturating_sub(1))
                 }
-                KeyCode::Char('g') => {
-                    self.fire(Request::GenerateProposal);
-                    self.notes.push("generating a measured proposal...".into());
-                }
+                KeyCode::Char('g') => self.generate_proposal(),
                 KeyCode::Char('a') | KeyCode::Enter => {
                     if let Some(p) = self.proposals.get(self.proposal_idx).cloned() {
                         self.fire(Request::ProposalDecision {
@@ -3167,6 +3188,16 @@ fn osc52(text: &str) -> String {
 }
 
 impl App {
+    /// `g` / `/propose`: ask for one new measured proposal.
+    fn generate_proposal(&mut self) {
+        if self.proposal_generating {
+            self.notes
+                .push("a proposal is already being generated".into());
+            return;
+        }
+        self.request(Pending::GenerateProposal, Request::GenerateProposal);
+    }
+
     /// `/copy` (last answer) or `/copy code [n]` (its n-th code block,
     /// default the last): to the clipboard via OSC 52, and the OS
     /// clipboard too when this is a local terminal.
@@ -3951,8 +3982,13 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 }
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
-    let block = ui::panel(" Prompt proposals ", app.color, Color::Blue).title_bottom(ui::hint(
-        "g generate · a apply measured · r reject · b roll back",
+    let title = if app.proposal_generating {
+        format!(" Prompt proposals · {} generating… ", app.spinner())
+    } else {
+        " Prompt proposals ".to_string()
+    };
+    let block = ui::panel(title, app.color, Color::Blue).title_bottom(ui::hint(
+        "g generate a new one (model call + evals, costs tokens) · a apply measured · r reject · b roll back",
         app.color,
     ));
     if app.proposals.is_empty() {
@@ -4821,6 +4857,7 @@ mod tests {
             ctrl_c_at: None,
             enhanced_keys: false,
             mouse_capture: true,
+            proposal_generating: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),

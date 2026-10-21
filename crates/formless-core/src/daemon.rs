@@ -150,6 +150,8 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+    /// A prompt proposal is being generated (one at a time).
+    pub(crate) proposing: Arc<AtomicBool>,
     /// Hook commands the user approved this daemon lifetime (SPEC §9.8).
     hook_approvals: StdMutex<std::collections::HashSet<String>>,
     /// The opt-in localhost web UI, while running (SPEC §12).
@@ -208,6 +210,7 @@ impl Daemon {
             attachments: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
+            proposing: Arc::new(AtomicBool::new(false)),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
@@ -1098,9 +1101,16 @@ impl Daemon {
                 Ok(serde_json::to_value(stats)?)
             }
             Request::GenerateProposal => {
+                // One at a time: each costs model calls and an eval run.
+                if self.proposing.swap(true, Ordering::SeqCst) {
+                    return Ok(
+                        json!({"started": false, "reason": "a proposal is already being generated"}),
+                    );
+                }
                 let this = self.clone();
                 tokio::spawn(async move {
-                    this.generate_and_measure_proposal().await;
+                    this.clone().generate_and_measure_proposal().await;
+                    this.proposing.store(false, Ordering::SeqCst);
                 });
                 Ok(json!({"started": true}))
             }

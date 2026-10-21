@@ -599,7 +599,14 @@ pattern (§4.4).
   it against the current prompt on the scenario eval suite (§8.6; baseline vs
   candidate scores are stored), and only a measured proposal that beats
   the baseline by the promotion margin can be applied — always by the
-  user's decision (`formless prompts`, TUI `/proposals`). Applied
+  user's decision (`formless prompts`, TUI `/proposals`). The generator
+  sees every earlier proposal (proposed, measured, applied, rejected and
+  rolled back) and must not repeat them. A near-duplicate (≥ 80% of words
+  shared) gets one retry that names the repeat; a second repeat, or the
+  model saying it has nothing new, stores nothing and reports "no new
+  proposal". Only one generation runs at a time, so a second request
+  answers `started: false`. The TUI Proposals view states what `g` costs
+  and shows "generating…". Applied
   proposals append to the bootstrap prompt in version order and can be
   rolled back individually; the bootstrap text itself is never edited. It states: you have only `create_tool`; build small,
   single-purpose, minimally-Capabilitied Tools on demand; validate/test each
