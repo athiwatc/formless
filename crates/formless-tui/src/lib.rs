@@ -1753,7 +1753,30 @@ impl App {
                     self.fire(Request::InterruptRun { session_id: id });
                 }
             }
-            "approve" => self.notes.push("Approvals arrive with Tools in M2.".into()),
+            "approve" | "approvals" => {
+                // The dialog opens by itself while any approval waits; this
+                // lists them (and says so when none do).
+                if self.approvals.is_empty() && self.promotions.is_empty() {
+                    self.notes.push(
+                        "no approvals waiting; sensitive Tools ask here when they are called"
+                            .into(),
+                    );
+                }
+                let waiting: Vec<String> = self
+                    .approvals
+                    .iter()
+                    .map(|a| format!("approval: {} ({})", a.tool_name, a.capabilities.join(", ")))
+                    .chain(
+                        self.promotions
+                            .iter()
+                            .map(|p| format!("promotion: {}", p.tool_name)),
+                    )
+                    .collect();
+                for w in waiting {
+                    self.notes
+                        .push(format!("{w} · answer in the dialog: y always, o once, n deny"));
+                }
+            }
             "panes" => {
                 self.multi_pane = !self.multi_pane;
                 // Settings go through the daemon (principle 6).
@@ -2026,7 +2049,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -4966,5 +4989,29 @@ mod tests {
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
+    }
+
+    #[test]
+    fn approve_lists_waiting_approvals() {
+        let mut app = test_app();
+        app.slash("approve");
+        assert!(app.notes.last().unwrap().contains("no approvals waiting"));
+        app.approvals.push_back(ApprovalReq {
+            approval_id: "a".into(),
+            tool_name: "fetch_page".into(),
+            version: 1,
+            capabilities: vec!["net:example.com".into()],
+            memory_mb: 256,
+            detail: None,
+            already_allowed: Vec::new(),
+            code_preview: None,
+        });
+        app.slash("approve");
+        let last = app.notes.last().unwrap();
+        assert!(
+            last.contains("fetch_page (net:example.com)") && last.contains("o once"),
+            "{last}"
+        );
+        assert!(!app.notes.iter().any(|n| n.contains("M2")));
     }
 }
