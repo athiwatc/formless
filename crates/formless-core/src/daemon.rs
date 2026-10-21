@@ -1376,7 +1376,7 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: find_tools failed: {e}"),
             },
-            toolreg::READ_TOOL => match self.read_tool_impl(&args) {
+            toolreg::READ_TOOL => match self.read_tool_impl(session_id, &args) {
                 Ok(text) => text,
                 Err(e) => format!("error: read_tool failed: {e}"),
             },
@@ -2128,6 +2128,7 @@ impl Daemon {
         let hits = self.with_store(|st| toolreg::search_tools(st, query, limit))?;
         let ids: Vec<String> = hits.iter().map(|t| t.id.clone()).collect();
         self.with_store(|st| st.load_session_tools(session_id, &ids, "found"))?;
+        let upgraded = self.refresh_pins(session_id, &ids)?;
         let tools: Vec<Value> = hits
             .iter()
             .map(|t| {
@@ -2142,6 +2143,7 @@ impl Daemon {
             .collect();
         Ok(json!({
             "tools": tools,
+            "upgraded": upgraded,
             "note": if tools.is_empty() {
                 "No matching Tool; create one."
             } else {
@@ -2151,11 +2153,30 @@ impl Daemon {
         .to_string())
     }
 
-    fn read_tool_impl(&self, args: &Value) -> Result<String> {
+    /// Re-list these Tools' current definitions from the next step, and
+    /// say which changed since the Session pinned them.
+    fn refresh_pins(&self, session_id: &str, tool_ids: &[String]) -> Result<Vec<String>> {
+        let dropped = self.with_store(|st| st.unpin_definitions(session_id, Some(tool_ids)))?;
+        let mut notes = Vec::new();
+        for (id, pinned) in dropped {
+            if let Some((info, v)) = self.with_store(|st| st.get_tool_current(&id))? {
+                if v.version != pinned {
+                    notes.push(format!(
+                        "{} was upgraded from v{pinned} to v{}; its listed definition updates from your next step",
+                        info.name, v.version
+                    ));
+                }
+            }
+        }
+        Ok(notes)
+    }
+
+    fn read_tool_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let name = args["name"].as_str().context("name required")?;
         let (info, _) = self
             .with_store(|st| st.get_tool_by_name(name))?
             .with_context(|| format!("no tool named '{name}'"))?;
+        let upgraded = self.refresh_pins(session_id, std::slice::from_ref(&info.id))?;
         let detail = self
             .with_store(|st| st.tool_detail(&info.id))?
             .context("tool vanished")?;
@@ -2172,6 +2193,7 @@ impl Daemon {
             "description": info.description,
             "version": ver.version,
             "current_version": info.current_version,
+            "upgraded": upgraded,
             "versions": detail.versions.iter().map(|v| json!({"version": v.version, "author": v.author, "created_at": v.created_at})).collect::<Vec<_>>(),
             "input_schema": parse(&ver.input_schema),
             "output_schema": parse(&ver.output_schema),
@@ -2841,6 +2863,8 @@ impl Daemon {
             provider.summarize(&input, &cmodel).await?
         };
         self.with_store(|st| st.save_checkpoint(session_id, &summary, compact_up_to))?;
+        // The cached prefix is rebuilt anyway: list current Tool definitions.
+        self.with_store(|st| st.unpin_definitions(session_id, None))?;
         let preview: String = summary.chars().take(200).collect();
         self.broadcast(Event::CompactionNotice {
             session_id: session_id.to_string(),

@@ -310,7 +310,11 @@ pattern (§4.4).
   Tools it has **loaded** (found, created or called there) plus the
   most-used Tools up to `tools.inline_limit` (default 40), **frozen** the
   first time the Session lists Tools (so Tools created elsewhere never
-  change its cached prompt prefix); `find_tools` reaches the rest, and its description
+  change its cached prompt prefix). Each listed definition (description +
+  input schema) is pinned too: a promotion or rollback elsewhere reaches
+  the Session's listing only when it calls `find_tools`/`read_tool` for
+  that Tool (whose result says "upgraded from vA to vB") or after
+  compaction. Execution always uses the current version; `find_tools` reaches the rest, and its description
   states how many exist. The listing is sorted by name and changes only
   when the Session loads a Tool, so usage elsewhere never reshuffles it and
   the request prefix stays cacheable. Found Tools are declared as real

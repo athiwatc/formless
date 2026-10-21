@@ -375,13 +375,28 @@ pub fn tool_definitions(
         pending_definition(ABANDON_INVOCATION, "Abandon a Pending Invocation handle: it still finishes and is recorded, but its result will not be delivered."),
     ];
     for info in shown {
+        // A Session keeps the definition it first listed (a promotion or
+        // rollback elsewhere must not rewrite its cached prefix); it picks
+        // up the current one after find_tools/read_tool or compaction.
+        if let Some(s) = session_id {
+            if let Some((_, def)) = store.pinned_definition(s, &info.id)? {
+                if let Ok(def) = serde_json::from_str(&def) {
+                    defs.push(def);
+                    continue;
+                }
+            }
+        }
         if let Some((_i, v)) = store.get_tool_current(&info.id)? {
             let params: Value =
                 serde_json::from_str(&v.input_schema).unwrap_or_else(|_| json!({"type": "object"}));
-            defs.push(json!({
+            let def = json!({
                 "type": "function",
                 "function": {"name": info.name, "description": info.description, "parameters": params}
-            }));
+            });
+            if let Some(s) = session_id {
+                store.pin_definition(s, &info.id, v.version, &def.to_string())?;
+            }
+            defs.push(def);
         }
     }
     Ok(defs)
