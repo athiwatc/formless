@@ -705,8 +705,15 @@ suite cannot measure preferences.
    the output schema. (No time term — §6 removed timeouts by design.)
 2. **Retry Rate:** share of “successful” Invocations immediately retried or
    rewritten by the agent (hidden-failure signal; optimiser context).
-3. **Latency p50/p95** and **Cost per Success** (wall time + provider tokens
-   attributable per successful Invocation; optimiser context).
+3. **Latency p50/p95** and **Cost per Success**: the total wall time and
+   provider tokens of all Invocations (failures included), divided by the
+   successes. Tokens are attributed as follows:
+   - A model step's prompt and completion tokens are split evenly across
+     the tool calls it made, and built-in calls absorb their share.
+   - The tokens of a Tool's own `llm.complete` calls go to that
+     Invocation.
+   The `invocations.tokens` column is schema v21. The metric appears in
+   the Tools and Metrics views (TUI and web).
 4. **Validation Failure Rate:** share of Invocations rejected on input/output
    schema (points at a badly described Tool; optimiser context).
 5. **Session spread (v2.1):** distinct Sessions that invoked the Tool. A

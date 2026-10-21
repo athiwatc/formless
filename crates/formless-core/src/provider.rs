@@ -417,6 +417,16 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<String> {
+        Ok(self.complete_with_usage(messages, model, effort).await?.0)
+    }
+
+    /// [`Provider::complete`] plus the reported token usage.
+    pub async fn complete_with_usage(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<(String, Option<Usage>)> {
         let mut body = if self.cfg.responses() {
             json!({"model": model, "input": responses_input(messages), "stream": false})
         } else {
@@ -424,13 +434,17 @@ impl Provider {
         };
         let resp = self.post_chat(&mut body, effort).await?;
         let v: Value = resp.json().await.context("parse chat completion")?;
+        let usage = Usage::parse(&v["usage"]);
         if self.cfg.responses() {
-            return Ok(responses_text(&v));
+            return Ok((responses_text(&v), usage));
         }
-        Ok(v["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+        Ok((
+            v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            usage,
+        ))
     }
 
     /// POST /chat/completions with bounded retries (SPEC §4.4). Returns the

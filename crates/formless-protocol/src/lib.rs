@@ -82,6 +82,12 @@ pub struct ToolMetricsInfo {
     /// Distinct Sessions that invoked the Tool: a reuse/generality signal.
     #[serde(default)]
     pub sessions: i64,
+    /// Cost per Success (SPEC §8.1 metric 3): total wall time and provider
+    /// tokens of all Invocations, divided by the successes.
+    #[serde(default)]
+    pub ms_per_success: Option<f64>,
+    #[serde(default)]
+    pub tokens_per_success: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

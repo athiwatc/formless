@@ -1609,6 +1609,7 @@ impl Daemon {
                 .approve_calls(&cfg, session_id, run_id, &result.tool_calls, cancel)
                 .await?;
             // Execute the batch in parallel (isolated sandboxes).
+            let step_started = chrono::Utc::now().to_rfc3339();
             let mut futs = Vec::new();
             for tc in &result.tool_calls {
                 let this = self.clone();
@@ -1626,6 +1627,13 @@ impl Daemon {
                 });
             }
             let results = futures_util::future::join_all(futs).await;
+            // Cost per Success (§8.1): this step's tokens, shared by its calls.
+            if let Some(u) = &result.usage {
+                let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
+                let _ = self.with_store(|st| {
+                    st.attribute_step_tokens(run_id, &step_started, tokens, result.tool_calls.len())
+                });
+            }
             for (tc, text) in results {
                 let msg = self.with_store(|st| {
                     st.append_message_meta(
@@ -4654,7 +4662,19 @@ impl HostOps for NestedOps {
         }
         messages.push(json!({"role": "user", "content": prompt}));
         let effort = self.cfg.provider.reasoning_effort.clone();
-        self.block_cancellable(provider.complete(&messages, &model, effort.as_deref()))
+        let (text, usage) = self.block_cancellable(provider.complete_with_usage(
+            &messages,
+            &model,
+            effort.as_deref(),
+        ))?;
+        // A Tool's own model calls count toward its Cost per Success.
+        if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
+            let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
+            let _ = self
+                .daemon
+                .with_store(|st| st.add_invocation_tokens(inv, tokens));
+        }
+        Ok(text)
     }
 
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {

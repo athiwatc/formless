@@ -3137,11 +3137,12 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::styled(
                     format!(
-                        "  retry {}  p50 {}  p95 {}  sessions {}",
+                        "  retry {}  p50 {}  p95 {}  sessions {}  per success {}",
                         pct(m.retry_rate),
                         ms(m.p50_ms),
                         ms(m.p95_ms),
-                        m.sessions
+                        m.sessions,
+                        cost_per_success(m)
                     ),
                     ui::dim(app.color),
                 ),
@@ -3296,20 +3297,19 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
 fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
     let now = chrono::Utc::now();
     let label = |k: &str| Span::styled(format!("{} ", ui::pad(k, 9)), ui::dim(app.color));
-    let mut lines =
-        match &app.tool_detail {
-            Some(d) => {
-                let m = &d.metrics;
-                let mut versions: Vec<Span> = vec![label("versions")];
-                for v in &d.versions {
-                    let text = format!("v{} {}  ", v.version, v.author);
-                    versions.push(if v.version == d.tool.current_version {
-                        Span::styled(text, bold_fg(app.color, Color::Yellow))
-                    } else {
-                        Span::styled(text, ui::dim(app.color))
-                    });
-                }
-                let mut lines =
+    let mut lines = match &app.tool_detail {
+        Some(d) => {
+            let m = &d.metrics;
+            let mut versions: Vec<Span> = vec![label("versions")];
+            for v in &d.versions {
+                let text = format!("v{} {}  ", v.version, v.author);
+                versions.push(if v.version == d.tool.current_version {
+                    Span::styled(text, bold_fg(app.color, Color::Yellow))
+                } else {
+                    Span::styled(text, ui::dim(app.color))
+                });
+            }
+            let mut lines =
                     vec![
                         Line::from(vec![
                             Span::styled(d.tool.name.clone(), bold_fg(app.color, Color::Yellow)),
@@ -3343,95 +3343,96 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             ),
                             Span::styled(
                                 format!(
-                            "  {} calls · {} failed · {} denied · {} invalid · p50 {} · p95 {}",
+                            "  {} calls · {} failed · {} denied · {} invalid · p50 {} · p95 {} · per success {}",
                             m.total,
                             m.failure,
                             m.denied,
                             m.validation_failures,
                             m.p50_ms.map(|v| format!("{v:.0}ms")).unwrap_or_else(|| "-".into()),
                             m.p95_ms.map(|v| format!("{v:.0}ms")).unwrap_or_else(|| "-".into()),
+                            cost_per_success(m),
                         ),
                                 ui::dim(app.color),
                             ),
                         ]),
                     ];
-                if !d.optimiser_attempts.is_empty() {
-                    lines.push(Line::raw(""));
-                    lines.push(Line::styled("Optimiser", bold_fg(app.color, Color::Cyan)));
-                    for a in d.optimiser_attempts.iter().take(5) {
-                        let style = match a.status.as_str() {
-                            "promoted" => fg(app.color, Color::Green),
-                            "discarded" | "failed" => fg(app.color, Color::Red),
-                            _ => fg(app.color, Color::Yellow),
-                        };
-                        let score = |s: Option<f64>| {
-                            s.map(|s| format!("{:.0}%", s * 100.0))
-                                .unwrap_or_else(|| "-".into())
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("  {} ", ui::pad(&a.status, 10)), style),
-                            Span::raw(format!(
-                                "cand {} vs base {} · {} replays  ",
-                                score(a.candidate_score),
-                                score(a.baseline_score),
-                                a.replay_total
-                            )),
-                            Span::styled(
-                                format!("{} · {}", ui::relative_time(&a.created_at, now), a.detail),
-                                ui::dim(app.color),
-                            ),
-                        ]));
-                    }
+            if !d.optimiser_attempts.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("Optimiser", bold_fg(app.color, Color::Cyan)));
+                for a in d.optimiser_attempts.iter().take(5) {
+                    let style = match a.status.as_str() {
+                        "promoted" => fg(app.color, Color::Green),
+                        "discarded" | "failed" => fg(app.color, Color::Red),
+                        _ => fg(app.color, Color::Yellow),
+                    };
+                    let score = |s: Option<f64>| {
+                        s.map(|s| format!("{:.0}%", s * 100.0))
+                            .unwrap_or_else(|| "-".into())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {} ", ui::pad(&a.status, 10)), style),
+                        Span::raw(format!(
+                            "cand {} vs base {} · {} replays  ",
+                            score(a.candidate_score),
+                            score(a.baseline_score),
+                            a.replay_total
+                        )),
+                        Span::styled(
+                            format!("{} · {}", ui::relative_time(&a.created_at, now), a.detail),
+                            ui::dim(app.color),
+                        ),
+                    ]));
                 }
-                let current = d
-                    .versions
-                    .iter()
-                    .position(|v| v.version == d.tool.current_version);
-                if let Some(i) = current.filter(|i| *i > 0) {
-                    // What the current version changed (optimiser or agent edit).
-                    let (prev, cur) = (&d.versions[i - 1], &d.versions[i]);
-                    lines.push(Line::raw(""));
-                    lines.push(Line::styled(
-                        format!("Changes v{} → v{}", prev.version, cur.version),
-                        bold_fg(app.color, Color::Cyan),
-                    ));
-                    for l in formless_core::diff::version_diff(prev, cur)
-                        .lines()
-                        .take(40)
-                    {
-                        let style = match l.chars().next() {
-                            Some('+') => fg(app.color, Color::Green),
-                            Some('-') => fg(app.color, Color::Red),
-                            Some('@') => ui::dim(app.color),
-                            _ => Style::default(),
-                        };
-                        lines.push(Line::styled(format!("  {l}"), style));
-                    }
-                }
-                if let Some(cur) = d
-                    .versions
-                    .iter()
-                    .find(|v| v.version == d.tool.current_version)
-                {
-                    lines.push(Line::raw(""));
-                    lines.push(Line::styled(
-                        format!("Code v{} · Shift+E to edit", cur.version),
-                        bold_fg(app.color, Color::Cyan),
-                    ));
-                    for (i, l) in cur.code.lines().take(40).enumerate() {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("{:>4} ", i + 1), ui::dim(app.color)),
-                            Span::raw(l.to_string()),
-                        ]));
-                    }
-                }
-                lines
             }
-            None => vec![Line::styled(
-                "Select a Tool and press Enter for detail.",
-                ui::dim(app.color),
-            )],
-        };
+            let current = d
+                .versions
+                .iter()
+                .position(|v| v.version == d.tool.current_version);
+            if let Some(i) = current.filter(|i| *i > 0) {
+                // What the current version changed (optimiser or agent edit).
+                let (prev, cur) = (&d.versions[i - 1], &d.versions[i]);
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("Changes v{} → v{}", prev.version, cur.version),
+                    bold_fg(app.color, Color::Cyan),
+                ));
+                for l in formless_core::diff::version_diff(prev, cur)
+                    .lines()
+                    .take(40)
+                {
+                    let style = match l.chars().next() {
+                        Some('+') => fg(app.color, Color::Green),
+                        Some('-') => fg(app.color, Color::Red),
+                        Some('@') => ui::dim(app.color),
+                        _ => Style::default(),
+                    };
+                    lines.push(Line::styled(format!("  {l}"), style));
+                }
+            }
+            if let Some(cur) = d
+                .versions
+                .iter()
+                .find(|v| v.version == d.tool.current_version)
+            {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("Code v{} · Shift+E to edit", cur.version),
+                    bold_fg(app.color, Color::Cyan),
+                ));
+                for (i, l) in cur.code.lines().take(40).enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:>4} ", i + 1), ui::dim(app.color)),
+                        Span::raw(l.to_string()),
+                    ]));
+                }
+            }
+            lines
+        }
+        None => vec![Line::styled(
+            "Select a Tool and press Enter for detail.",
+            ui::dim(app.color),
+        )],
+    };
     if !app.modules.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -3960,6 +3961,14 @@ pub fn run(paths: Paths) -> Result<()> {
     let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
     result
+}
+
+/// Cost per Success (SPEC §8.1): "1.2s, 3400 tok", or "-".
+fn cost_per_success(m: &formless_protocol::ToolMetricsInfo) -> String {
+    match (m.ms_per_success, m.tokens_per_success) {
+        (Some(ms), Some(tok)) => format!("{:.1}s, {tok:.0} tok", ms / 1000.0),
+        _ => "-".into(),
+    }
 }
 
 /// " · 80% of 5 Runs completed" for a skill loaded in Runs, else "".

@@ -159,3 +159,56 @@ async fn built_in_calls_are_recorded_without_payloads() {
     assert_eq!(stats[0]["name"], "find_tools");
     assert_eq!(stats[0]["kinds"]["empty"], 1);
 }
+
+#[test]
+fn cost_per_success_counts_attributed_tokens_and_time() {
+    let store = Store::open_in_memory().unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let (t, v) = store
+        .create_tool_version(
+            "echo",
+            "d",
+            "{}",
+            "{}",
+            "function run(i){return i;}",
+            &caps,
+            64,
+            "agent",
+        )
+        .unwrap();
+    let s = store.create_session(None).unwrap().id;
+    let run = store.create_run(&s).unwrap();
+    let since = "2000-01-01T00:00:00+00:00";
+    let mut ids = Vec::new();
+    for (status, ms) in [("success", 100), ("failure", 300), ("success", 200)] {
+        ids.push(
+            store
+                .record_invocation(
+                    &t.id,
+                    v,
+                    Some(&s),
+                    Some(&run),
+                    None,
+                    status,
+                    "",
+                    "{}",
+                    "",
+                    "",
+                    ms,
+                    100,
+                )
+                .unwrap(),
+        );
+    }
+    // A step of 900 tokens that made 3 calls; one Tool also spent 60 itself.
+    store.attribute_step_tokens(&run, since, 900, 3).unwrap();
+    store.add_invocation_tokens(&ids[0], 60).unwrap();
+    let m = store.tool_metrics(&t.id, None).unwrap();
+    assert_eq!(m.success, 2);
+    assert_eq!(m.ms_per_success, Some(300.0), "600ms over 2 successes");
+    assert_eq!(
+        m.tokens_per_success,
+        Some(480.0),
+        "960 tokens over 2 successes"
+    );
+}

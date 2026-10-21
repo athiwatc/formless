@@ -280,7 +280,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -295,7 +295,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 20] = [
+const MIGRATIONS: [(i64, MigrationStep); 21] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -344,6 +344,10 @@ const MIGRATIONS: [(i64, MigrationStep); 20] = [
         add_column(c, "runs", "followup TEXT NOT NULL DEFAULT ''")
     }),
     (20, |c| Ok(c.execute_batch(SCHEMA_V20)?)),
+    // Provider tokens attributed to Invocations (SPEC §8.1 metric 3).
+    (21, |c| {
+        add_column(c, "invocations", "tokens INTEGER NOT NULL DEFAULT 0")
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -841,6 +845,35 @@ impl Store {
             };
         }
         Ok(out)
+    }
+
+    /// Split a step's tokens evenly over the tool calls it made: each
+    /// top-level Invocation the Run started since `since` gets one share
+    /// (built-in calls absorb theirs).
+    pub fn attribute_step_tokens(
+        &self,
+        run_id: &str,
+        since: &str,
+        tokens: i64,
+        calls: usize,
+    ) -> Result<()> {
+        if tokens <= 0 || calls == 0 {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE invocations SET tokens=tokens+?3 WHERE run_id=?1 AND parent_id IS NULL AND created_at>=?2",
+            params![run_id, since, tokens / calls as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Tokens a Tool spent itself (`llm.complete` inside it).
+    pub fn add_invocation_tokens(&self, inv_id: &str, tokens: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE invocations SET tokens=tokens+?2 WHERE id=?1",
+            params![inv_id, tokens],
+        )?;
+        Ok(())
     }
 
     /// One model call made in a Run (a step).
@@ -2106,6 +2139,14 @@ impl Store {
             params![tool_id, version],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )?;
+        // Cost per Success (§8.1 metric 3): everything spent, failures
+        // included, over the successes it bought.
+        let (all_ms, all_tokens): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(duration_ms),0), COALESCE(SUM(tokens),0) FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2)",
+            params![tool_id, version],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let per_success = |v: i64| (success > 0).then(|| v as f64 / success as f64);
         let mut durations: Vec<i64> = {
             let mut stmt = self.conn.prepare("SELECT duration_ms FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2) AND status='success' ORDER BY duration_ms")?;
             let rows = stmt
@@ -2148,6 +2189,8 @@ impl Store {
             p50_ms: pct(0.50),
             p95_ms: pct(0.95),
             sessions,
+            ms_per_success: per_success(all_ms),
+            tokens_per_success: per_success(all_tokens),
         })
     }
 
