@@ -238,6 +238,36 @@ The user talks to one **primary** model; work can go to others.
     built-in roles.
   - Per-role `auto` with per-task scoring follows in #201 and #202.
 
+### 4.6 Per-task routing for roles
+
+Per-call success and latency (§4.1 routing) cannot tell whether a
+sub-agent's answer was good, and per-call latency is the wrong unit. A
+role with `model = "auto"` and `candidates` is therefore routed **per
+task, with quality as a gate**.
+
+- **Recorded per task,** for each finished sub-agent in a role
+  (`task_stats`, schema v30): role, model, wall-clock, tokens and turns
+  for the whole task, and an outcome:
+  - `completed`
+  - `failed`
+  - `limit`: it hit `max_turns`, set by the role or by
+    `tools.subagent_max_turns` (40); every sub-agent now stops there.
+  - `respawned`: the primary agent started the same task again in the
+    same Run, so the first result wasn't good enough.
+  Interrupted tasks are not recorded.
+- **Selection** (`routing::select_task_model`):
+  - A candidate qualifies once it has `tools.task_min_samples` (5) tasks
+    and at least `tools.task_quality_bar` (0.8) of them completed and not
+    re-run.
+  - Among qualifiers the cheapest per task wins: time plus tokens, each
+    relative to the best qualifier.
+  - With no qualifier, the role's first candidate. With probability
+    `tools.task_explore_rate` (0.1), the least-sampled under-sampled
+    candidate instead, so the others earn samples.
+- Per-call outcomes stay as they were, for failover and the Models
+  metrics view.
+- Pinned roles (a concrete `model`) are unaffected.
+
 ## 5. Agent loop, Sessions, and Runs
 
 ### 5.1 Session
@@ -1653,6 +1683,8 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
+| `tools.subagent_max_turns` | 40 | Model turns a sub-agent may take (roles can override) (§4.6) |
+| `tools.task_min_samples` / `task_quality_bar` / `task_explore_rate` | 5 / 0.8 / 0.1 | Per-task routing for `auto` roles (§4.6) |
 | `tools.smoke_timeout_secs` | 10 | Creation smoke-test bound (§7.1) |
 | `tools.replay_timeout_secs` | 60 | Optimiser replay bound per Invocation (§8.4) |
 | `scripts.max_parallel` | 8 | Nested `tools.call` Invocations in flight per sandbox; the rest queue (§7.5, §7.12) |

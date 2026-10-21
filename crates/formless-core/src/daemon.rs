@@ -295,6 +295,18 @@ impl Daemon {
             let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
             let model = if role.model.is_empty() {
                 cfg.provider_cfg(role.provider.as_deref())?.model
+            } else if ProviderCfg::is_auto_model(&role.model) && !role.candidates.is_empty() {
+                // Per-task choice: quality gate, then cost (SPEC §4.6).
+                let stats = self.with_reader(|st| st.task_stats(role_name))?;
+                let explore = rand::random::<f64>() < cfg.tools.task_explore_rate;
+                crate::routing::select_task_model(
+                    &role.candidates,
+                    &stats,
+                    cfg.tools.task_min_samples,
+                    cfg.tools.task_quality_bar,
+                    explore,
+                )
+                .unwrap_or_else(|| role.model.clone())
             } else {
                 role.model.clone()
             };
@@ -3127,6 +3139,23 @@ impl Daemon {
             let session_effort = target.effort;
             let requested = target.model;
             let role = target.role;
+            let max_turns = role
+                .as_deref()
+                .and_then(|r| cfg.roles.get(r))
+                .and_then(|r| r.max_turns)
+                .unwrap_or(cfg.tools.subagent_max_turns)
+                .max(1) as i64;
+            let task_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                task.trim().to_lowercase().hash(&mut h);
+                format!("{:016x}", h.finish())
+            };
+            if let Some(r) = &role {
+                let _ = self.with_store(|st| st.mark_task_respawned(r, run_id, &task_hash));
+            }
+            let task_started = std::time::Instant::now();
+            let mut task_tokens = 0i64;
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -3183,6 +3212,9 @@ impl Daemon {
                     if cancel.is_cancelled() {
                         return Err(anyhow!("interrupted"));
                     }
+                    if step >= max_turns {
+                        return Err(anyhow!("sub-agent hit its turn limit ({max_turns})"));
+                    }
                     // Rebuilt each step: find_tools/create_tool load new Tools.
                     let defs = sub_defs()?;
                     let result = provider
@@ -3196,6 +3228,9 @@ impl Daemon {
                         )
                         .await?;
                     step += 1;
+                    if let Some(u) = &result.usage {
+                        task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
+                    }
                     let _ = self.with_store(|st| st.set_subagent_steps(&sub_id, step));
                     self.broadcast(Event::SubagentStep {
                         session_id: session_id.to_string(),
@@ -3248,6 +3283,35 @@ impl Daemon {
                 Ok(text) => ("completed", text.clone()),
                 Err(e) => ("failed", e.to_string()),
             };
+            // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
+            // turns of the whole task, and whether it ended well.
+            // An interrupt says nothing about the model: not recorded.
+            let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
+            if let Some(r) = role.as_ref().filter(|_| !interrupted) {
+                let kind = match &outcome {
+                    Ok(_) => "completed",
+                    Err(e) if e.to_string().contains("turn limit") => "limit",
+                    Err(_) => "failed",
+                };
+                let turns = self
+                    .with_reader(|st| st.get_subagent(&sub_id))
+                    .ok()
+                    .flatten()
+                    .map_or(0, |s| s.steps);
+                let _ = self.with_store(|st| {
+                    st.record_task(
+                        r,
+                        &model,
+                        session_id,
+                        run_id,
+                        &task_hash,
+                        task_started.elapsed().as_millis() as i64,
+                        task_tokens,
+                        turns,
+                        kind,
+                    )
+                });
+            }
             if let Ok(sub) = self.with_store(|st| st.finish_subagent(&sub_id, status, &result)) {
                 self.broadcast(Event::SubagentFinished {
                     session_id: session_id.to_string(),
