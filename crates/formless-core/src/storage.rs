@@ -166,6 +166,14 @@ CREATE TABLE IF NOT EXISTS queued_messages (
 CREATE INDEX IF NOT EXISTS idx_queued_session ON queued_messages(session_id, id);
 ";
 
+const SCHEMA_V9: &str = "
+CREATE TABLE IF NOT EXISTS pending_handles (
+  handle TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  tool_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL);
+";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -189,7 +197,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -204,7 +212,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 8] = [
+const MIGRATIONS: [(i64, MigrationStep); 9] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -225,6 +233,7 @@ const MIGRATIONS: [(i64, MigrationStep); 8] = [
     (6, |c| Ok(c.execute_batch(SCHEMA_V6)?)),
     (7, |c| Ok(c.execute_batch(SCHEMA_V7)?)),
     (8, |c| Ok(c.execute_batch(SCHEMA_V8)?)),
+    (9, |c| Ok(c.execute_batch(SCHEMA_V9)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -613,6 +622,53 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Record a Pending Invocation handle the agent was given (§6.2), so it
+    /// can still be answered after a daemon restart.
+    pub fn add_pending_handle(&self, handle: &str, session_id: &str, tool: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pending_handles(handle,session_id,tool_name,status,created_at) VALUES(?1,?2,?3,'pending',?4)",
+            params![handle, session_id, tool, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The handle's result was delivered (or dropped): forget it.
+    pub fn remove_pending_handle(&self, handle: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_handles WHERE handle=?1",
+            params![handle],
+        )?;
+        Ok(())
+    }
+
+    /// (tool name, status) of a recorded handle.
+    pub fn pending_handle(&self, handle: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tool_name, status FROM pending_handles WHERE handle=?1",
+                params![handle],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok())
+    }
+
+    /// On daemon startup: every handle still pending lost its in-memory
+    /// work. Marks them interrupted and returns (handle, session, tool).
+    pub fn interrupt_pending_handles(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT handle, session_id, tool_name FROM pending_handles WHERE status='pending'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.conn.execute(
+            "UPDATE pending_handles SET status='interrupted' WHERE status='pending'",
+            [],
+        )?;
+        Ok(rows)
+    }
+
     /// Queue a message to start its own Run after the current one (§5.3).
     pub fn enqueue_message(&self, session_id: &str, content: &str) -> Result<()> {
         self.conn.execute(
