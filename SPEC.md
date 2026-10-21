@@ -648,7 +648,10 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - Large Tool outputs are stored as artifact files (streamed writes, §7.5);
   only a bounded preview (configurable length) enters model context. Outputs
   are referenced by artifact id in transcripts so compaction/resume can
-  re-read them. Retention caps apply (§13, §15).
+  re-read them. Retention caps apply (§13, §15): artifacts older than
+  `artifacts.max_age_days` (30) are removed, then the oldest beyond
+  `artifacts.max_total_mb` (1024), at daemon start and hourly or on
+  `formless gc`; deleting a Session deletes its artifact files.
 
 ## 10. TUI (v1 user interface)
 
@@ -846,6 +849,7 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 | `daemon.stall_warning_secs` | 300 | Silence before `possibly stalled` flag (§6.1) |
 | `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
 | `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
+| `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |
 | `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |

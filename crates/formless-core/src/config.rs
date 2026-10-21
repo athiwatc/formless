@@ -17,6 +17,25 @@ pub struct Config {
     pub compaction: CompactionCfg,
     pub tui: TuiCfg,
     pub naming: NamingCfg,
+    pub artifacts: ArtifactsCfg,
+}
+
+/// Retention for stored Tool outputs (SPEC §9.6). 0 disables a limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArtifactsCfg {
+    /// Oldest artifacts are removed beyond this total size.
+    pub max_total_mb: u64,
+    /// Artifacts older than this are removed.
+    pub max_age_days: u64,
+}
+impl Default for ArtifactsCfg {
+    fn default() -> Self {
+        Self {
+            max_total_mb: 1024,
+            max_age_days: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

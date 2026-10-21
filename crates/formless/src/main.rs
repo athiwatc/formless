@@ -32,6 +32,8 @@ enum Cmd {
     },
     /// Diagnostics: config, dirs, keychain, endpoint probe
     Doctor,
+    /// Apply artifact retention now (artifacts.max_total_mb / max_age_days)
+    Gc,
     /// Provider credential login/status/logout (API key or OAuth)
     Auth {
         #[command(subcommand)]
@@ -187,6 +189,19 @@ fn main() -> Result<()> {
         None | Some(Cmd::Tui) => formless_tui::run(paths),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Doctor) => doctor(paths),
+        Some(Cmd::Gc) => {
+            let cfg = Config::load(&paths)?;
+            let store = formless_core::Store::open(&paths.db_file())?;
+            let c = formless_core::artifacts::gc(&store, &cfg.artifacts)?;
+            let (left, bytes) = formless_core::artifacts::usage(&store)?;
+            println!(
+                "removed {} artifact(s), {:.1} MB; {left} left ({:.1} MB)",
+                c.files,
+                c.bytes as f64 / 1e6,
+                bytes as f64 / 1e6
+            );
+            Ok(())
+        }
         Some(Cmd::Auth { action }) => auth_cmd(paths, action),
         Some(Cmd::Relay { action }) => relay_cmd(paths, action),
         Some(Cmd::Prompts { action }) => prompts_cmd(paths, action),
@@ -576,6 +591,16 @@ fn doctor(paths: Paths) -> Result<()> {
         }
     );
     let cfg = Config::load(&paths)?;
+    if let Ok((n, bytes)) =
+        Store::open(&paths.db_file()).and_then(|s| formless_core::artifacts::usage(&s))
+    {
+        println!(
+            "artifacts:  {n} ({:.1} MB; caps {} MB, {} days)",
+            bytes as f64 / 1e6,
+            cfg.artifacts.max_total_mb,
+            cfg.artifacts.max_age_days
+        );
+    }
     println!(
         "logs:       {:.1} MB (rotates at {:.1} MB, keeps {})",
         formless_core::logs::log_usage(&paths) as f64 / 1e6,

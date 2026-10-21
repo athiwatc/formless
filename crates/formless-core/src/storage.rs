@@ -1749,6 +1749,44 @@ impl Store {
         Ok(())
     }
 
+    /// (id, path, bytes, created_at) of every artifact, oldest first.
+    pub fn list_artifacts(&self) -> Result<Vec<(String, String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, bytes, created_at FROM artifacts ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Paths of a Session's artifacts (to delete with it).
+    pub fn session_artifact_paths(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM artifacts WHERE session_id=?1")?;
+        let rows = stmt
+            .query_map(params![session_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_artifact_rows(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.conn
+                .execute("DELETE FROM artifacts WHERE id=?1", params![id])?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_session_artifact_rows(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM artifacts WHERE session_id=?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn save_artifact(
         &self,
         session_id: Option<&str>,
