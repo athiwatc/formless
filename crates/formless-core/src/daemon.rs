@@ -53,6 +53,9 @@ fn truncated_call_message(tool: &str) -> String {
     )
 }
 
+/// Read-only database connections for client queries (see `with_reader`).
+const READER_CONNECTIONS: usize = 4;
+
 /// What identifies a version of config.toml on disk: (mtime, length).
 type ConfigStamp = Option<(std::time::SystemTime, u64)>;
 
@@ -82,6 +85,9 @@ pub(crate) struct RunCtl {
 pub struct Daemon {
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
+    /// Read-only connections for client queries (lists, search, exports),
+    /// so a slow read never holds up writes behind the main store lock.
+    readers: Vec<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
@@ -114,9 +120,13 @@ impl Daemon {
             );
             store.append_message(&session_id, "system-note", &note)?;
         }
+        let readers = (0..READER_CONNECTIONS)
+            .map(|_| Store::open_reader(&paths.db_file()).map(StdMutex::new))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
+            readers,
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
@@ -162,6 +172,19 @@ impl Daemon {
         send_all(&self.subs, ev);
     }
 
+    /// Run a read-only query on a free reader connection (waiting on the
+    /// first one only when all are busy).
+    pub(crate) fn with_reader<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let free = self.readers.iter().find_map(|r| r.try_lock().ok());
+        let guard = match free {
+            Some(g) => g,
+            None => self.readers[0]
+                .lock()
+                .map_err(|_| anyhow!("store poisoned"))?,
+        };
+        f(&guard)
+    }
+
     pub(crate) fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let guard = self.store.lock().map_err(|_| anyhow!("store poisoned"))?;
         f(&guard)
@@ -171,7 +194,7 @@ impl Daemon {
         match req {
             Request::Ping => Ok(json!({"pong": true, "protocol": PROTOCOL_VERSION})),
             Request::Status => {
-                let sessions = self.with_store(|s| Ok(s.list_sessions()?.len()))?;
+                let sessions = self.with_reader(|s| Ok(s.list_sessions()?.len()))?;
                 let auth = self.config().map(|cfg| {
                     let status = crate::auth::auth_status(&self.paths, &cfg.provider);
                     json!({
@@ -198,7 +221,7 @@ impl Daemon {
                 Ok(json!({"shutting_down": true}))
             }
             Request::ListSessions => Ok(serde_json::to_value(
-                self.with_store(|s| s.list_sessions())?,
+                self.with_reader(|s| s.list_sessions())?,
             )?),
             Request::CreateSession { name } => {
                 let s = self.with_store(|st| st.create_session(name))?;
@@ -221,7 +244,7 @@ impl Daemon {
                 Ok(json!({"deleted": existed}))
             }
             Request::GetSession { id } => {
-                let (session, messages, queued) = self.with_store(|st| {
+                let (session, messages, queued) = self.with_reader(|st| {
                     let s = st.get_session(&id)?.context("session not found")?;
                     let m = st.list_messages(&id)?;
                     let q = st.list_queued_messages(&id)?;
@@ -241,7 +264,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::SearchSessions { query, limit } => {
-                Ok(serde_json::to_value(self.with_store(|st| {
+                Ok(serde_json::to_value(self.with_reader(|st| {
                     st.search_sessions(&query, limit.unwrap_or(50))
                 })?)?)
             }
@@ -315,10 +338,10 @@ impl Daemon {
                 Ok(json!({"abandoned": abandoned}))
             }
             Request::ListSubagents { session_id } => Ok(serde_json::to_value(
-                self.with_store(|st| st.list_subagents(&session_id))?,
+                self.with_reader(|st| st.list_subagents(&session_id))?,
             )?),
             Request::GetSubagent { id } => {
-                let (info, messages) = self.with_store(|st| {
+                let (info, messages) = self.with_reader(|st| {
                     let info = st.get_subagent(&id)?.context("sub-agent not found")?;
                     Ok((info, st.subagent_messages(&id)?))
                 })?;
@@ -351,10 +374,10 @@ impl Daemon {
                 }
             }
             Request::ListTools => Ok(serde_json::to_value(
-                self.with_store(|s| s.list_tools(true))?,
+                self.with_reader(|s| s.list_tools(true))?,
             )?),
             Request::ListModules => Ok(serde_json::to_value(
-                self.with_store(|s| s.list_modules())?,
+                self.with_reader(|s| s.list_modules())?,
             )?),
             Request::UpdateToolCode { id, code } => {
                 // In-TUI editor save: a new immutable version with the same
@@ -378,7 +401,7 @@ impl Daemon {
             }
             Request::GetTool { id } => {
                 let d = self
-                    .with_store(|st| st.tool_detail(&id))?
+                    .with_reader(|st| st.tool_detail(&id))?
                     .context("tool not found")?;
                 Ok(serde_json::to_value(d)?)
             }
@@ -459,7 +482,7 @@ impl Daemon {
                 }
             }
             Request::ExportSession { id } => {
-                let bundle = self.with_store(|st| {
+                let bundle = self.with_reader(|st| {
                     let s = st.get_session(&id)?.context("session not found")?;
                     let msgs = st.list_messages(&id)?;
                     let cps = st.list_checkpoints(&id)?;
@@ -520,11 +543,11 @@ impl Daemon {
                 Ok(json!({"started": true}))
             }
             Request::ListProposals => Ok(serde_json::to_value(
-                self.with_store(|s| s.list_proposals())?,
+                self.with_reader(|s| s.list_proposals())?,
             )?),
             Request::ListModelStats => {
                 let stats: Vec<ModelStatInfo> = self
-                    .with_store(|s| s.list_model_stats())?
+                    .with_reader(|s| s.list_model_stats())?
                     .into_iter()
                     .map(|s| ModelStatInfo {
                         model: s.model,

@@ -311,6 +311,17 @@ impl Store {
         })
     }
 
+    /// An extra connection for reads only (the database must already be
+    /// migrated). WAL lets it read while the main connection writes.
+    pub fn open_reader(file: &Path) -> Result<Self> {
+        let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
+        Ok(Self {
+            conn,
+            rewrites: Default::default(),
+        })
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
