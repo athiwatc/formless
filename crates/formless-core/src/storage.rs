@@ -451,21 +451,25 @@ impl Store {
         content: &str,
         meta: Option<String>,
     ) -> Result<MessageInfo> {
-        let seq: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?1",
-            params![session_id],
-            |r| r.get(0),
-        )?;
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
-        self.conn.execute(
-            "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![id, session_id, seq, role, content, t, meta],
+        // One write transaction, taken up front (IMMEDIATE): the next seq is
+        // computed inside the INSERT itself, so two writers can never pick
+        // the same one, and the session's timestamp moves with the message.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
         )?;
-        self.conn.execute(
-            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
-            params![session_id, t],
-        )?;
+        let seq: i64 = tx
+            .prepare_cached(
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
+                 SELECT ?1, ?2, COALESCE(MAX(seq),0)+1, ?3, ?4, ?5, ?6 FROM messages WHERE session_id=?2 \
+                 RETURNING seq",
+            )?
+            .query_row(params![id, session_id, role, content, t, meta], |r| r.get(0))?;
+        tx.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
+            .execute(params![session_id, t])?;
+        tx.commit()?;
         Ok(MessageInfo {
             id,
             session_id: session_id.into(),
