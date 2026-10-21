@@ -480,16 +480,19 @@ impl Provider {
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut buf = String::new();
+        // Raw bytes: a chunk boundary can split a multibyte character, so
+        // only complete lines are decoded.
+        let mut buf: Vec<u8> = Vec::new();
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 next = stream.next() => {
                     let Some(chunk) = next else { break };
                     let chunk = chunk.context("stream read")?;
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(pos) = buf.find('\n') {
-                        let line: String = buf.drain(..=pos).collect();
+                    buf.extend_from_slice(&chunk);
+                    while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                        let raw: Vec<u8> = buf.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&raw);
                         let line = line.trim();
                         if let Some(data) = line.strip_prefix("data:") {
                             let data = data.trim();
