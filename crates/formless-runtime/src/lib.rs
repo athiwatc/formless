@@ -351,22 +351,94 @@ fn host_in_scope(domains: &[String], host: &str) -> bool {
 /// same PATH binary; a path grant matches only that file. A look-alike
 /// binary elsewhere (`/tmp/x/ls` under `process:ls`) never matches.
 /// Send a built request; a scope-denied redirect surfaces as "denied: …".
-fn send_request(
-    req: reqwest::blocking::RequestBuilder,
-) -> Result<reqwest::blocking::Response, String> {
-    req.send().map_err(|e| {
-        use std::error::Error as _;
-        let mut msg = e.to_string();
-        let mut src = e.source();
-        while let Some(s) = src {
-            if s.to_string().starts_with("denied:") {
-                return s.to_string();
-            }
-            msg = format!("{msg}: {s}");
-            src = s.source();
-        }
-        msg
+/// A fetch kept as data, so each redirect hop can be sent again.
+struct FetchRequest {
+    method: reqwest::Method,
+    url: reqwest::Url,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+    /// Granted hosts (empty = unscoped `net`).
+    scope: Vec<String>,
+}
+
+/// One blocking client for every fetch (connection pool and TLS sessions
+/// survive between calls). Redirects are off: [`send_request`] follows
+/// them itself so it can scope-check every hop.
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(None)
+            .build()
+            .expect("build HTTP client")
     })
+}
+
+/// Send a fetch, following up to 10 redirects. Every hop is scope-checked,
+/// so a scoped Tool can never be bounced to a host it was not granted.
+/// Like reqwest's own policy: 303 (and 301/302 after a POST) become a
+/// bodiless GET, and credentials are not sent on to another host.
+fn send_request(mut req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
+    use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION};
+    for _ in 0..=10 {
+        let mut builder = http_client().request(req.method.clone(), req.url.clone());
+        for (k, v) in &req.headers {
+            builder = builder.header(k, v);
+        }
+        if let Some(body) = &req.body {
+            builder = builder.body(body.clone());
+        }
+        let resp = builder.send().map_err(|e| {
+            use std::error::Error as _;
+            let mut msg = e.to_string();
+            let mut src = e.source();
+            while let Some(s) = src {
+                msg = format!("{msg}: {s}");
+                src = s.source();
+            }
+            msg
+        })?;
+        let status = resp.status().as_u16();
+        let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
+        let (true, Some(location)) = (matches!(status, 301 | 302 | 303 | 307 | 308), location)
+        else {
+            return Ok(resp);
+        };
+        let next = req
+            .url
+            .join(location)
+            .map_err(|e| format!("bad redirect location {location}: {e}"))?;
+        if !matches!(next.scheme(), "http" | "https") {
+            return Err(denied(format!(
+                "redirect to scheme {} not allowed",
+                next.scheme()
+            )));
+        }
+        let host = next.host_str().unwrap_or_default().to_lowercase();
+        if !req.scope.is_empty() && !host_in_scope(&req.scope, &host) {
+            return Err(denied(format!("redirect to {host} not in net scope")));
+        }
+        if status == 303 || (matches!(status, 301 | 302) && req.method == reqwest::Method::POST) {
+            req.method = reqwest::Method::GET;
+            req.body = None;
+            req.headers.retain(|(k, _)| {
+                !k.eq_ignore_ascii_case(CONTENT_TYPE.as_str())
+                    && !k.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
+            });
+        }
+        if next.host_str() != req.url.host_str()
+            || next.port_or_known_default() != req.url.port_or_known_default()
+        {
+            req.headers.retain(|(k, _)| {
+                !k.eq_ignore_ascii_case(AUTHORIZATION.as_str())
+                    && !k.eq_ignore_ascii_case(COOKIE.as_str())
+                    && !k.eq_ignore_ascii_case("proxy-authorization")
+            });
+        }
+        req.url = next;
+    }
+    Err("too many redirects".into())
 }
 
 /// Kill a `process.run` child and everything it started.
@@ -921,41 +993,28 @@ impl State {
     fn build_request(
         &self,
         a: &Value,
-        parsed: reqwest::Url,
+        url: reqwest::Url,
         scope: Vec<String>,
-    ) -> Result<reqwest::blocking::RequestBuilder, String> {
-        // Redirects are followed, but every hop is scope-checked: a
-        // scoped Tool can never be bounced to a host it was not granted.
-        let unscoped = scope.is_empty();
-        let policy = reqwest::redirect::Policy::custom(move |attempt| {
-            let host = attempt.url().host_str().unwrap_or_default().to_lowercase();
-            if attempt.previous().len() >= 10 {
-                attempt.error("too many redirects")
-            } else if unscoped || host_in_scope(&scope, &host) {
-                attempt.follow()
-            } else {
-                attempt.error(denied(format!("redirect to {host} not in net scope")))
-            }
-        });
-        let client = reqwest::blocking::Client::builder()
-            .redirect(policy)
-            .timeout(None)
-            .build()
-            .map_err(|e| e.to_string())?;
+    ) -> Result<FetchRequest, String> {
         let method = reqwest::Method::from_bytes(a["method"].as_str().unwrap_or("GET").as_bytes())
             .map_err(|e| format!("bad method: {e}"))?;
-        let mut req = client.request(method, parsed);
-        if let Some(h) = a["headers"].as_object() {
-            for (k, v) in h {
-                if let Some(v) = v.as_str() {
-                    req = req.header(k, v);
-                }
-            }
-        }
-        if let Some(b) = a["body"].as_str() {
-            req = req.body(decode(b, enc_of(&a["body_encoding"])?)?);
-        }
-        Ok(req)
+        let headers = a["headers"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+            .collect();
+        let body = match a["body"].as_str() {
+            Some(b) => Some(decode(b, enc_of(&a["body_encoding"])?)?),
+            None => None,
+        };
+        Ok(FetchRequest {
+            method,
+            url,
+            headers,
+            body,
+            scope,
+        })
     }
 
     fn response_meta(resp: &reqwest::blocking::Response) -> Value {
