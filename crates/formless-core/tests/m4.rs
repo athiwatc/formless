@@ -822,3 +822,105 @@ async fn length_truncated_tool_call_is_explained_not_run() {
     assert!(noted, "a truncated answer is flagged");
     server.abort();
 }
+
+/// Interrupting a Run releases a Tool blocked in llm.complete at once,
+/// instead of waiting out the nested provider call.
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupt_releases_a_tool_waiting_on_llm_complete() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4llm");
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let schema = r#"{"type":"object","properties":{}}"#;
+        store
+            .create_tool_version(
+                "asker",
+                "asks the model",
+                schema,
+                r#"{"type":"string"}"#,
+                "function run(i){ return llm.complete('think hard'); }",
+                &Capabilities::parse(&["llm".to_string()]).unwrap(),
+                256,
+                "agent",
+            )
+            .unwrap();
+    }
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                if body["stream"] == json!(false) {
+                    // The nested llm.complete call never answers in time.
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+                sse_tool("c1", "asker", json!({}))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let (mut interrupted_at, mut run_done, mut tool_done) = (None, false, false);
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), c.lines.next_line())
+            .await
+            .expect("run or tool did not stop")
+            .unwrap()
+            .unwrap();
+        let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) else {
+            continue;
+        };
+        match ev {
+            Event::ApprovalRequested { approval_id, .. } => {
+                c.send(Request::ApprovalDecision {
+                    approval_id,
+                    approved: true,
+                    scope: formless_protocol::ApprovalScope::Once,
+                })
+                .await;
+            }
+            Event::ToolCallStarted { tool_name, .. } if tool_name == "asker" => {
+                // Let the Tool reach the blocking provider call first.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                interrupted_at = Some(std::time::Instant::now());
+                c.send(Request::InterruptRun {
+                    session_id: sid.clone(),
+                })
+                .await;
+            }
+            Event::RunFinished { status, .. } => {
+                assert_eq!(status, "interrupted");
+                run_done = true;
+            }
+            // The sandbox thread itself must come back, not just the Run.
+            Event::ToolCallFinished { tool_name, .. } if tool_name == "asker" => tool_done = true,
+            _ => {}
+        }
+        if run_done && tool_done {
+            break;
+        }
+    }
+    let took = interrupted_at.expect("tool started").elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    server.abort();
+}
