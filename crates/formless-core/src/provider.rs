@@ -1110,6 +1110,42 @@ pub fn list_models_blocking(cfg: &ProviderCfg, api_key: &str) -> Result<Vec<Stri
     rt.block_on(Provider::new(cfg.clone(), api_key.to_string())?.list_models())
 }
 
+/// Whether the endpoint serves repeated prompt prefixes from a cache: the
+/// same long prompt is sent twice and the second answer's reported cached
+/// tokens are returned (None when it reports no usage at all).
+pub async fn cache_probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Option<Usage>> {
+    let p = Provider::new(cfg.clone(), api_key.to_string())?;
+    // Long enough for providers that cache only prefixes of 1024+ tokens.
+    let filler = "Formless prompt-cache probe. ".repeat(300);
+    let messages = [
+        json!({"role": "system", "content": filler}),
+        json!({"role": "user", "content": "Reply with the single word: ok"}),
+    ];
+    let mut last = None;
+    for _ in 0..2 {
+        last = p
+            .chat_stream(
+                &messages,
+                &[],
+                model,
+                None,
+                &CancellationToken::new(),
+                |_, _| {},
+            )
+            .await?
+            .usage;
+    }
+    Ok(last)
+}
+
+pub fn cache_probe_blocking(
+    cfg: &ProviderCfg,
+    api_key: &str,
+    model: &str,
+) -> Result<Option<Usage>> {
+    tokio::runtime::Runtime::new()?.block_on(cache_probe(cfg, api_key, model))
+}
+
 pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<ProbeResult> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(probe(cfg, api_key, model))

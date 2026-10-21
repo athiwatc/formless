@@ -712,6 +712,24 @@ fn doctor(paths: Paths) -> Result<()> {
                         if !r.tool_calling {
                             println!("WARNING: endpoint/model does not support tool-calling; sessions will be refused (SPEC §4.3).");
                         }
+                        match formless_core::provider::cache_probe_blocking(
+                            &cfg.provider,
+                            credential,
+                            &probe_model,
+                        ) {
+                            Ok(Some(u)) if u.cached_tokens > 0 => println!(
+                                "cache:      yes ({} of {} prompt tokens cached on a repeat)",
+                                u.cached_tokens, u.prompt_tokens
+                            ),
+                            Ok(Some(u)) => println!(
+                                "cache:      no cached tokens on a repeated {}-token prompt",
+                                u.prompt_tokens
+                            ),
+                            Ok(None) => {
+                                println!("cache:      unknown (endpoint reports no token usage)")
+                            }
+                            Err(e) => println!("cache:      probe failed: {e}"),
+                        }
                     }
                     Err(e) => println!("probe:      FAILED: {e}"),
                 }

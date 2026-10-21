@@ -609,14 +609,22 @@ impl Daemon {
                 self.with_reader(|s| s.list_proposals())?,
             )?),
             Request::ListModelStats => {
-                let stats: Vec<ModelStatInfo> = self
-                    .with_reader(|s| s.list_model_stats())?
+                let (stats, usage) =
+                    self.with_reader(|s| Ok((s.list_model_stats()?, s.usage_by_model()?)))?;
+                let stats: Vec<ModelStatInfo> = stats
                     .into_iter()
-                    .map(|s| ModelStatInfo {
-                        model: s.model,
-                        successes: s.successes,
-                        failures: s.failures,
-                        total_ms: s.total_ms,
+                    .map(|s| {
+                        let (prompt, completion, cached) =
+                            usage.get(&s.model).copied().unwrap_or_default();
+                        ModelStatInfo {
+                            model: s.model,
+                            successes: s.successes,
+                            failures: s.failures,
+                            total_ms: s.total_ms,
+                            prompt_tokens: prompt,
+                            completion_tokens: completion,
+                            cached_tokens: cached,
+                        }
                     })
                     .collect();
                 Ok(serde_json::to_value(stats)?)

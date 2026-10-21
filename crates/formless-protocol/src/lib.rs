@@ -152,6 +152,15 @@ pub struct ModelStatInfo {
     pub successes: i64,
     pub failures: i64,
     pub total_ms: i64,
+    /// Provider-reported tokens over all recorded requests (0 when the
+    /// endpoint reports none).
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens: i64,
+    /// Part of `prompt_tokens` served from the prompt cache.
+    #[serde(default)]
+    pub cached_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

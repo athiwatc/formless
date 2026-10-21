@@ -285,6 +285,18 @@ struct LiveToolCall {
     stalled_secs: Option<u64>,
 }
 
+/// Share of a model's prompt tokens served from the provider's cache.
+fn cache_hit_text(st: &ModelStatInfo) -> String {
+    if st.prompt_tokens > 0 {
+        format!(
+            "{:.0}%",
+            100.0 * st.cached_tokens as f64 / st.prompt_tokens as f64
+        )
+    } else {
+        "-".into()
+    }
+}
+
 /// One line of a sub-agent transcript (provider-shaped message).
 fn subagent_line(m: &serde_json::Value) -> String {
     let role = m["role"].as_str().unwrap_or("?");
@@ -2733,6 +2745,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                         })
                         .right_aligned(),
                     ),
+                    Cell::from(Line::raw(cache_hit_text(st)).right_aligned()),
                 ])
             })
             .collect();
@@ -2744,10 +2757,11 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                     Constraint::Length(7),
                     Constraint::Length(8),
                     Constraint::Length(9),
+                    Constraint::Length(7),
                 ],
             )
             .header(table_header(
-                &["MODEL", "CALLS", "SUCCESS", "AVG"],
+                &["MODEL", "CALLS", "SUCCESS", "AVG", "CACHED"],
                 app.color,
             ))
             .column_spacing(2)
