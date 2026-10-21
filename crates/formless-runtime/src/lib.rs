@@ -1510,7 +1510,16 @@ fn reported_error(output: &Value) -> Option<String> {
 /// Syntax + `run` presence check, without executing `run` (SPEC §7.1).
 pub fn check_syntax(code: &str) -> Result<(), String> {
     let runtime = Runtime::new().map_err(|e| e.to_string())?;
+    // The check evaluates the top level: bound it, so a loop or a huge
+    // allocation outside run() fails the check instead of hanging it.
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + LIMIT;
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        std::time::Instant::now() >= deadline
+    })));
+    runtime.set_memory_limit(256 * 1024 * 1024);
     let ctx = Context::full(&runtime).map_err(|e| e.to_string())?;
+    let timed_out = move || std::time::Instant::now() >= deadline;
     ctx.with(|ctx| {
         let host = Function::new(ctx.clone(), |_op: String, _a: String| {
             r#"{"ok":true,"value":null}"#.to_string()
@@ -1520,7 +1529,16 @@ pub fn check_syntax(code: &str) -> Result<(), String> {
             .set("__host", host)
             .map_err(|e: rquickjs::Error| e.to_string())?;
         ctx.eval::<(), _>(PRELUDE).map_err(|e| e.to_string())?;
-        ctx.eval::<(), _>(code).map_err(|e| e.to_string())?;
+        ctx.eval::<(), _>(code).map_err(|e| {
+            if timed_out() {
+                format!(
+                    "top-level code did not finish within {}s (an endless loop outside run()?)",
+                    LIMIT.as_secs()
+                )
+            } else {
+                e.to_string()
+            }
+        })?;
         let has: bool = ctx
             .eval("typeof run === 'function'")
             .map_err(|e| e.to_string())?;

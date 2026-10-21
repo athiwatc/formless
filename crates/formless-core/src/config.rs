@@ -433,6 +433,19 @@ pub struct ToolsCfg {
     /// How deep `agents.run` sub-agents may nest (1 = the main agent's
     /// Tools may spawn sub-agents; theirs may not).
     pub max_agent_depth: usize,
+    /// A creation smoke test (synthetic input) that runs longer than this
+    /// is stopped: inconclusive for a Tool, a failure for a module.
+    #[serde(default = "default_smoke_timeout_secs")]
+    pub smoke_timeout_secs: u64,
+    /// One optimiser replay Invocation is stopped after this long.
+    #[serde(default = "default_replay_timeout_secs")]
+    pub replay_timeout_secs: u64,
+}
+fn default_smoke_timeout_secs() -> u64 {
+    10
+}
+fn default_replay_timeout_secs() -> u64 {
+    60
 }
 fn default_session_max_loaded() -> usize {
     60
@@ -453,6 +466,8 @@ impl Default for ToolsCfg {
             search: default_tool_search(),
             session_max_loaded: default_session_max_loaded(),
             max_agent_depth: 1,
+            smoke_timeout_secs: default_smoke_timeout_secs(),
+            replay_timeout_secs: default_replay_timeout_secs(),
         }
     }
 }

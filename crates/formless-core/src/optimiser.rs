@@ -807,12 +807,21 @@ impl Daemon {
                 cancel: Arc::new(AtomicBool::new(false)),
             };
             let ops_dyn: Arc<dyn HostOps> = ops;
-            match tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn))
-                .await
-            {
-                Ok(Ok(out)) => Ok(out.output),
-                Ok(Err(e)) => Err(e.message),
-                Err(e) => Err(format!("replay panicked: {e}")),
+            let limit = std::time::Duration::from_secs(
+                ops_daemon
+                    .config()
+                    .map(|c| c.tools.replay_timeout_secs)
+                    .unwrap_or(60)
+                    .max(1),
+            );
+            match crate::daemon::execute_bounded(req, ops_dyn, None, limit).await {
+                crate::daemon::Bounded::Done(Ok(out)) => Ok(out.output),
+                crate::daemon::Bounded::Done(Err(e)) => Err(e.message),
+                crate::daemon::Bounded::TimedOut => {
+                    Err(format!("replay did not finish within {}s", limit.as_secs()))
+                }
+                crate::daemon::Bounded::Cancelled => Err("interrupted".into()),
+                crate::daemon::Bounded::Panicked(e) => Err(format!("replay panicked: {e}")),
             }
         })
     }

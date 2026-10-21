@@ -380,6 +380,17 @@ pattern (§4.4).
   reported as **inconclusive** and the Tool is saved, since the fake data
   rather than the Tool may be at fault. Failures before any stub, and
   denials of undeclared Capabilities, still reject.
+- **The gate is bounded and cancellable.** The smoke test is a check on
+  synthetic input, not user work, so it stops after
+  `tools.smoke_timeout_secs` (10) or when the Run is cancelled.
+  - A Tool that doesn't finish is saved as **inconclusive** ("did not
+    finish… check for an endless loop").
+  - A module that doesn't finish loading is rejected, because its top
+    level runs in every Tool that loads it.
+  - The syntax check, which evaluates the top level, stops after 3 s and
+    is capped at 256 MB.
+  - Optimiser replay Invocations stop after `tools.replay_timeout_secs`
+    (60).
 - `create_tool` is **immutable, excluded from Self-Optimisation**, and cannot
   be retired, edited, or widened by the agent or the optimiser.
 

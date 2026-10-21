@@ -747,7 +747,7 @@ impl Daemon {
                     "capabilities": ver.capabilities,
                     "memory_mb": ver.memory_mb,
                 });
-                let (info, version, _) = self.create_tool_as(&args, &cfg, "user").await?;
+                let (info, version, _) = self.create_tool_as(&args, &cfg, "user", None).await?;
                 Ok(json!({"tool": info, "version": version}))
             }
             Request::GetTool { id } => {
@@ -1855,7 +1855,7 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
-            toolreg::CREATE_TOOL => match self.create_tool_impl(&args, cfg).await {
+            toolreg::CREATE_TOOL => match self.create_tool_impl(&args, cfg, cancel_flag).await {
                 Ok((text, tool_id)) => {
                     let _ = self.with_store(|st| {
                         st.load_session_tools(session_id, std::slice::from_ref(&tool_id), "created")
@@ -1984,10 +1984,12 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: test_tool failed: {e}"),
             },
-            toolreg::CREATE_MODULE => match self.create_module_impl(&args, cfg).await {
-                Ok(text) => text,
-                Err(e) => format!("error: create_module failed: {e}"),
-            },
+            toolreg::CREATE_MODULE => {
+                match self.create_module_impl(&args, cfg, cancel_flag).await {
+                    Ok(text) => text,
+                    Err(e) => format!("error: create_module failed: {e}"),
+                }
+            }
             toolreg::RETIRE_TOOL => {
                 let name = args["name"].as_str().unwrap_or_default();
                 let reason = args["reason"].as_str().unwrap_or_default();
@@ -2557,7 +2559,7 @@ impl Daemon {
         }
         let mut args = bundle.clone();
         args["name"] = json!(name);
-        let (info, _v, _) = self.create_tool_as(&args, cfg, "import").await?;
+        let (info, _v, _) = self.create_tool_as(&args, cfg, "import", None).await?;
         Ok(info)
     }
 
@@ -2644,7 +2646,12 @@ impl Daemon {
         code
     }
 
-    async fn create_module_impl(self: &Arc<Self>, args: &Value, cfg: &Config) -> Result<String> {
+    async fn create_module_impl(
+        self: &Arc<Self>,
+        args: &Value,
+        cfg: &Config,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<String> {
         let name = args["name"]
             .as_str()
             .context("create_module: name required")?;
@@ -2676,15 +2683,20 @@ impl Daemon {
             modules,
             cancel: Arc::new(AtomicBool::new(false)),
         };
-        let smoke = tokio::task::spawn_blocking(move || {
-            formless_runtime::execute(&req, Arc::new(formless_runtime::NoHostOps))
-        })
-        .await
-        .map_err(|e| anyhow!("module smoke test panicked: {e}"))?;
-        if let Err(e) = smoke {
-            if !e.after_stub {
-                return Err(anyhow!("module smoke test failed: {}", e.message));
+        let limit = std::time::Duration::from_secs(cfg.tools.smoke_timeout_secs.max(1));
+        match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), Some(cancel.clone()), limit).await {
+            Bounded::Done(Ok(_)) => {}
+            Bounded::Done(Err(e)) if e.after_stub => {}
+            Bounded::Done(Err(e)) => return Err(anyhow!("module smoke test failed: {}", e.message)),
+            // A module's top level runs in every Tool that loads it.
+            Bounded::TimedOut => {
+                return Err(anyhow!(
+                    "module smoke test failed: loading it did not finish within {}s (a loop at the top level?)",
+                    limit.as_secs()
+                ))
             }
+            Bounded::Cancelled => return Err(anyhow!("interrupted")),
+            Bounded::Panicked(e) => return Err(anyhow!("module smoke test panicked: {e}")),
         }
         let (info, version) =
             self.with_store(|st| st.create_module_version(name, &description, &code, "agent"))?;
@@ -2846,8 +2858,11 @@ impl Daemon {
         self: &Arc<Self>,
         args: &Value,
         cfg: &Config,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<(String, String)> {
-        let (info, version, smoke_note) = self.create_tool_as(args, cfg, "agent").await?;
+        let (info, version, smoke_note) = self
+            .create_tool_as(args, cfg, "agent", Some(cancel.clone()))
+            .await?;
         let mut out = json!({"created": info.name, "version": version});
         if let Some(note) = smoke_note {
             out["smoke_test"] = json!(note);
@@ -2864,6 +2879,7 @@ impl Daemon {
         args: &Value,
         cfg: &Config,
         author: &str,
+        cancel: Option<Arc<AtomicBool>>,
     ) -> Result<(ToolInfo, i64, Option<String>)> {
         let d = ToolDraft::parse(args, cfg, true)?;
         // Smoke test in the stubbed sandbox with a schema-minimal input.
@@ -2879,18 +2895,22 @@ impl Daemon {
             modules: self.module_code(),
             cancel: Arc::new(AtomicBool::new(false)),
         };
-        let smoke = tokio::task::spawn_blocking(move || {
-            formless_runtime::execute(&req, Arc::new(formless_runtime::NoHostOps))
-        })
-        .await
-        .map_err(|e| anyhow!("smoke test panicked: {e}"))?;
-        let smoke_note = match smoke {
-            Ok(_) => None,
-            Err(e) if e.after_stub && e.kind != ExecErrorKind::Resource => Some(format!(
+        // Bounded and cancellable (SPEC §7.1): it is a validation gate on
+        // synthetic input, not user work.
+        let limit = std::time::Duration::from_secs(cfg.tools.smoke_timeout_secs.max(1));
+        let smoke_note = match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), cancel, limit).await {
+            Bounded::Done(Ok(_)) => None,
+            Bounded::Done(Err(e)) if e.after_stub && e.kind != ExecErrorKind::Resource => Some(format!(
                 "inconclusive (failed after a stubbed effect: {}); call the Tool or test_tool it with real input",
                 e.message.lines().next().unwrap_or_default()
             )),
-            Err(e) => return Err(anyhow!("smoke test failed: {}", e.message)),
+            Bounded::Done(Err(e)) => return Err(anyhow!("smoke test failed: {}", e.message)),
+            Bounded::TimedOut => Some(format!(
+                "inconclusive (did not finish within {}s on the synthetic input; check for an endless loop, then test_tool it with real input)",
+                limit.as_secs()
+            )),
+            Bounded::Cancelled => return Err(anyhow!("interrupted")),
+            Bounded::Panicked(e) => return Err(anyhow!("smoke test panicked: {e}")),
         };
         let (info, version) = self.with_store(|st| {
             st.create_tool_version(
@@ -5405,5 +5425,53 @@ pub fn guess_mime(name: &str) -> &'static str {
         "txt" | "log" | "rs" | "py" | "js" | "ts" | "toml" | "yaml" | "yml" | "sh" | "go" | "c"
         | "h" | "java" | "sql" | "xml" => "text/plain",
         _ => "application/octet-stream",
+    }
+}
+
+/// How a bounded sandbox run ended.
+pub(crate) enum Bounded {
+    Done(std::result::Result<formless_runtime::ExecOutcome, formless_runtime::ExecError>),
+    TimedOut,
+    Cancelled,
+    Panicked(String),
+}
+
+/// Run the sandbox on the blocking pool, stopping it (through its own
+/// cancel flag, which the interpreter polls) when `parent` is set or
+/// `limit` passes. Never leaves a busy loop running.
+pub(crate) async fn execute_bounded(
+    mut req: ExecRequest,
+    ops: Arc<dyn HostOps>,
+    parent: Option<Arc<AtomicBool>>,
+    limit: std::time::Duration,
+) -> Bounded {
+    let flag = Arc::new(AtomicBool::new(false));
+    req.cancel = flag.clone();
+    let job = tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops));
+    tokio::pin!(job);
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut why = None;
+    loop {
+        tokio::select! {
+            r = &mut job => {
+                return match (r, why) {
+                    (Err(e), _) => Bounded::Panicked(e.to_string()),
+                    (Ok(_), Some(b)) => b,
+                    (Ok(r), None) => Bounded::Done(r),
+                };
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                if why.is_none() {
+                    if parent.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+                        why = Some(Bounded::Cancelled);
+                    } else if tokio::time::Instant::now() >= deadline {
+                        why = Some(Bounded::TimedOut);
+                    }
+                    if why.is_some() {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
     }
 }
