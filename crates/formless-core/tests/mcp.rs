@@ -639,3 +639,72 @@ async fn oauth_protected_servers_log_in_and_refresh() {
     formless_core::mcp_auth::logout(&paths, "secure");
     assert!(!formless_core::mcp_auth::has_login(&paths, "secure"));
 }
+
+/// Servers are managed through the daemon: add lists tools in, list shows
+/// state, restart re-lists, remove retires the tools and edits config.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_servers_are_managed_through_the_daemon() {
+    use formless_protocol::Request;
+    use std::sync::Arc;
+    let paths = temp_paths("mcpmanage");
+    formless_core::Config::default().save(&paths).unwrap();
+    let (cfg, _) = fake_server(&paths);
+    let server = serde_json::to_value(&cfg.servers["fake"]).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let bad = daemon
+        .handle(Request::AddMcpServer {
+            name: "a__b".into(),
+            server: server.clone(),
+        })
+        .await;
+    assert!(bad.is_err(), "names may not contain '__'");
+    let added = daemon
+        .handle(Request::AddMcpServer {
+            name: "fake".into(),
+            server,
+        })
+        .await
+        .unwrap();
+    assert_eq!(added["tools"], 4);
+    assert!(formless_core::Config::load(&paths)
+        .unwrap()
+        .mcp
+        .servers
+        .contains_key("fake"));
+    let list = daemon.handle(Request::ListMcpServers).await.unwrap();
+    assert_eq!(list[0]["name"], "fake");
+    assert_eq!(list[0]["running"], true);
+    assert_eq!(list[0]["tool_count"], 4);
+    let restarted = daemon
+        .handle(Request::RestartMcpServer {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(restarted["tools"], 4);
+    let removed = daemon
+        .handle(Request::RemoveMcpServer {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed["retired_tools"], 4);
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert!(
+        store
+            .get_tool_by_name("mcp__fake__echo")
+            .unwrap()
+            .unwrap()
+            .0
+            .retired
+    );
+    assert!(!formless_core::Config::load(&paths)
+        .unwrap()
+        .mcp
+        .servers
+        .contains_key("fake"));
+    assert_eq!(
+        daemon.handle(Request::ListMcpServers).await.unwrap(),
+        json!([])
+    );
+}

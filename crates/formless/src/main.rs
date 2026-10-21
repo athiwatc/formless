@@ -162,6 +162,28 @@ enum ToolsAction {
 
 #[derive(Subcommand)]
 enum McpAction {
+    /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio) or `add NAME --url URL` (http)
+    Add {
+        name: String,
+        /// Remote server URL (Streamable HTTP or HTTP+SSE)
+        #[arg(long)]
+        url: Option<String>,
+        /// Static HTTP header, `Key=Value` (repeatable)
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Daemon environment variable to pass to a stdio server (repeatable)
+        #[arg(long = "env-key")]
+        env_keys: Vec<String>,
+        /// stdio: the command and its arguments, after `--`
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Remove a server (its tools are retired, metrics kept)
+    Remove { name: String },
+    /// Configured servers: state, tool count, last error
+    List,
+    /// Restart a server and list its tools again
+    Test { name: String },
     /// Authorize Formless with a remote (http) MCP server via OAuth
     Login { server: String },
     /// Delete a server's stored OAuth tokens
@@ -937,7 +959,83 @@ fn count_sigints() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
 
 fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
     let cfg = Config::load(&paths)?;
+    let daemon = |req: Request| -> Result<serde_json::Value> {
+        formless_core::daemon::ensure_daemon(&paths)?;
+        formless_tui::client::request_once(&paths, req)
+    };
+    let report = |r: &serde_json::Value| match r["error"].as_str() {
+        Some(e) => println!("error:   {e}"),
+        None => println!("tools:   {}", r["tools"]),
+    };
     match action {
+        McpAction::Add {
+            name,
+            url,
+            headers,
+            env_keys,
+            command,
+        } => {
+            let server = match url {
+                Some(url) => {
+                    let headers: serde_json::Map<String, serde_json::Value> = headers
+                        .iter()
+                        .map(|h| {
+                            let (k, v) = h.split_once('=').context("--header takes Key=Value")?;
+                            Ok((k.trim().to_string(), serde_json::json!(v.trim())))
+                        })
+                        .collect::<Result<_>>()?;
+                    serde_json::json!({"transport": "http", "url": url, "headers": headers})
+                }
+                None => {
+                    let (cmd, args) = command
+                        .split_first()
+                        .context("give the server command after `--`, or --url")?;
+                    serde_json::json!({"command": cmd, "args": args, "env_keys": env_keys})
+                }
+            };
+            let r = daemon(Request::AddMcpServer {
+                name: name.clone(),
+                server,
+            })?;
+            println!("added:   {name}");
+            report(&r);
+        }
+        McpAction::Remove { name } => {
+            let r = daemon(Request::RemoveMcpServer { name: name.clone() })?;
+            println!("removed: {name} ({} tool(s) retired)", r["retired_tools"]);
+        }
+        McpAction::List => {
+            let list = daemon(Request::ListMcpServers)?;
+            let servers = list.as_array().cloned().unwrap_or_default();
+            if servers.is_empty() {
+                println!("no MCP servers configured (formless mcp add …)");
+            }
+            for s in servers {
+                println!(
+                    "{:<16} {:<5} {:<8} {:>3} tools  {}{}",
+                    s["name"].as_str().unwrap_or_default(),
+                    s["transport"].as_str().unwrap_or_default(),
+                    if s["disabled"] == true {
+                        "disabled"
+                    } else if s["running"] == true {
+                        "running"
+                    } else {
+                        "idle"
+                    },
+                    s["tool_count"],
+                    s["target"].as_str().unwrap_or_default(),
+                    s["last_error"]
+                        .as_str()
+                        .map(|e| format!("\n  last error: {e}"))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        McpAction::Test { name } => {
+            let r = daemon(Request::RestartMcpServer { name: name.clone() })?;
+            println!("server:  {name}");
+            report(&r);
+        }
         McpAction::Login { server } => {
             let scfg = cfg
                 .mcp

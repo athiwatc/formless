@@ -655,6 +655,8 @@ pub fn call_result(result: &Value) -> std::result::Result<Value, String> {
 #[derive(Default)]
 pub struct Manager {
     conns: Mutex<HashMap<String, Arc<Connection>>>,
+    /// The last start/list failure per server, for status views.
+    errors: StdMutex<HashMap<String, String>>,
 }
 
 impl Manager {
@@ -675,9 +677,20 @@ impl Manager {
         if let Some(c) = conns.get(server).filter(|c| c.is_alive()) {
             return Ok(c.clone());
         }
-        let conn = Connection::start(paths, server, scfg).await?;
-        conns.insert(server.to_string(), conn.clone());
-        Ok(conn)
+        match Connection::start(paths, server, scfg).await {
+            Ok(conn) => {
+                self.errors.lock().unwrap().remove(server);
+                conns.insert(server.to_string(), conn.clone());
+                Ok(conn)
+            }
+            Err(e) => {
+                self.errors
+                    .lock()
+                    .unwrap()
+                    .insert(server.to_string(), format!("{e:#}"));
+                Err(e)
+            }
+        }
     }
 
     pub async fn call(
@@ -704,6 +717,33 @@ impl Manager {
             }
             keep
         });
+    }
+
+    pub async fn is_running(&self, server: &str) -> bool {
+        self.conns
+            .lock()
+            .await
+            .get(server)
+            .is_some_and(|c| c.is_alive())
+    }
+
+    pub fn last_error(&self, server: &str) -> Option<String> {
+        self.errors.lock().unwrap().get(server).cloned()
+    }
+
+    pub fn set_error(&self, server: &str, error: Option<String>) {
+        let mut errors = self.errors.lock().unwrap();
+        match error {
+            Some(e) => errors.insert(server.to_string(), e),
+            None => errors.remove(server),
+        };
+    }
+
+    /// Stop one server (it starts again on its next use).
+    pub async fn stop(&self, server: &str) {
+        if let Some(c) = self.conns.lock().await.remove(server) {
+            c.stop();
+        }
     }
 
     /// Running servers that announced a changed tool list since asked.
