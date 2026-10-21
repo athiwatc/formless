@@ -444,3 +444,62 @@ async fn daemon_idle_closes_after_grace() {
     assert!(done.is_ok(), "daemon did not idle-close");
     assert!(!paths.socket_path().exists(), "socket must be cleaned up");
 }
+
+#[test]
+fn migrating_an_older_database_takes_a_backup_first() {
+    use formless_core::storage::SCHEMA_VERSION;
+    let paths = temp_paths("migrate");
+    let db = paths.db_file();
+    {
+        let store = Store::open(&db).unwrap();
+        store.create_session(Some("keep me".into())).unwrap();
+    }
+    // Pretend the file was written by an older build.
+    let user_version = |c: &rusqlite::Connection| -> i64 {
+        c.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    };
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch("PRAGMA user_version=3;").unwrap();
+    }
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.list_sessions().unwrap()[0].name, "keep me");
+    let backups: Vec<_> = std::fs::read_dir(db.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().contains(".db.v3-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "one backup of the v3 database");
+    let backup = rusqlite::Connection::open(&backups[0]).unwrap();
+    assert_eq!(user_version(&backup), 3);
+    let n: i64 = backup
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "backup holds the data");
+    assert_eq!(
+        user_version(&rusqlite::Connection::open(&db).unwrap()),
+        SCHEMA_VERSION
+    );
+
+    // Up to date: no new backup. Newer than this build: refuse.
+    drop(store);
+    Store::open(&db).unwrap();
+    let count = std::fs::read_dir(db.parent().unwrap())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .to_string_lossy()
+                .contains(".bak")
+        })
+        .count();
+    assert_eq!(count, 1);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(&format!("PRAGMA user_version={};", SCHEMA_VERSION + 1))
+        .unwrap();
+    let err = Store::open(&db).err().unwrap().to_string();
+    assert!(err.contains("newer than this build"), "{err}");
+}
