@@ -133,6 +133,14 @@ enum ImportKind {
     Session,
 }
 
+/// Choosing a version to roll a Tool back to; `armed` after the first
+/// Enter, so a second one confirms.
+struct RollbackPick {
+    tool_id: String,
+    idx: usize,
+    armed: bool,
+}
+
 #[derive(Clone)]
 struct ApprovalReq {
     approval_id: String,
@@ -422,6 +430,8 @@ struct App {
     tools: Vec<ToolInfo>,
     tool_idx: usize,
     tool_detail: Option<ToolDetail>,
+    /// Open rollback version picker (Tools view, `b`).
+    rollback_pick: Option<RollbackPick>,
     approvals: std::collections::VecDeque<ApprovalReq>,
     promotions: std::collections::VecDeque<ApprovalReq>,
     purge_arm: Option<String>,
@@ -533,6 +543,7 @@ impl App {
             tools: Vec::new(),
             tool_idx: 0,
             tool_detail: None,
+            rollback_pick: None,
             approvals: std::collections::VecDeque::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -773,6 +784,63 @@ impl App {
                 ServerMessage::Event(ev) => self.on_event(ev),
             }
         }
+    }
+
+    fn rollback_key(&mut self, key: KeyEvent) {
+        let Some(pick) = self.rollback_pick.take() else {
+            return;
+        };
+        let Some(d) = self
+            .tool_detail
+            .as_ref()
+            .filter(|d| d.tool.id == pick.tool_id)
+        else {
+            return;
+        };
+        let (last, name, current) = (
+            d.versions.len().saturating_sub(1),
+            d.tool.name.clone(),
+            d.tool.current_version,
+        );
+        let version = d.versions[pick.idx].version;
+        let next = match key.code {
+            KeyCode::Up => Some(RollbackPick {
+                idx: pick.idx.saturating_sub(1),
+                armed: false,
+                ..pick
+            }),
+            KeyCode::Down => Some(RollbackPick {
+                idx: (pick.idx + 1).min(last),
+                armed: false,
+                ..pick
+            }),
+            KeyCode::Enter if version == current => {
+                self.notes.push(format!("v{version} is already current"));
+                Some(pick)
+            }
+            KeyCode::Enter if pick.armed => {
+                self.fire(Request::RollbackTool {
+                    id: pick.tool_id,
+                    version,
+                });
+                self.notes.push(format!("rolled {name} back to v{version}"));
+                None
+            }
+            KeyCode::Enter => {
+                self.notes.push(format!(
+                    "press Enter again to roll {name} back to v{version}"
+                ));
+                Some(RollbackPick {
+                    armed: true,
+                    ..pick
+                })
+            }
+            _ => {
+                self.notes.push("rollback cancelled".into());
+                None
+            }
+        };
+        self.rollback_pick = next;
     }
 
     /// The current Session's newest running call of `tool_name`.
@@ -1700,6 +1768,10 @@ impl App {
             self.editor_key(key);
             return;
         }
+        if self.rollback_pick.is_some() {
+            self.rollback_key(key);
+            return;
+        }
         if let KeyCode::Char(c) = key.code {
             if c == 'o' && self.input.is_empty() && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
@@ -1933,11 +2005,29 @@ impl App {
                 }
                 KeyCode::Char('b') => {
                     if let Some(tool) = self.tools.get(self.tool_idx).cloned() {
-                        if tool.current_version > 1 {
-                            self.fire(Request::RollbackTool {
-                                id: tool.id,
-                                version: tool.current_version - 1,
-                            });
+                        match &self.tool_detail {
+                            Some(d) if d.tool.id == tool.id && d.versions.len() > 1 => {
+                                // Start on the version before the current one.
+                                let idx = d
+                                    .versions
+                                    .iter()
+                                    .position(|v| v.version == tool.current_version)
+                                    .unwrap_or(d.versions.len() - 1)
+                                    .saturating_sub(1);
+                                self.rollback_pick = Some(RollbackPick {
+                                    tool_id: tool.id,
+                                    idx,
+                                    armed: false,
+                                });
+                            }
+                            Some(d) if d.tool.id == tool.id => self
+                                .notes
+                                .push(format!("{} has only one version", tool.name)),
+                            _ => {
+                                self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                                self.notes
+                                    .push("loading versions… press b again to pick one".into());
+                            }
                         }
                     }
                 }
@@ -2029,7 +2119,80 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some((req, promotion)) = modal {
         let more = app.approvals.len() + app.promotions.len() - 1;
         draw_approval(f, req, promotion, more, app.color);
+    } else if let Some(pick) = &app.rollback_pick {
+        draw_rollback_picker(f, app, pick);
     }
+}
+
+fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
+    let Some(d) = app
+        .tool_detail
+        .as_ref()
+        .filter(|d| d.tool.id == pick.tool_id)
+    else {
+        return;
+    };
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(
+            "  VER  AUTHOR      CREATED            CALLS  SUCCESS",
+            ui::dim(app.color),
+        ),
+    ];
+    for (i, v) in d.versions.iter().enumerate() {
+        let m = d
+            .version_metrics
+            .iter()
+            .find(|(n, _)| *n == v.version)
+            .map(|(_, m)| m);
+        let current = if v.version == d.tool.current_version {
+            " (current)"
+        } else {
+            ""
+        };
+        let text = format!(
+            "{} v{:<3} {:<11} {:<18} {:>5}  {}{current}",
+            if i == pick.idx { "›" } else { " " },
+            v.version,
+            truncate_chars(&v.author, 11),
+            ui::clock_time(&v.created_at).unwrap_or_else(|| truncate_chars(&v.created_at, 18)),
+            m.map_or(0, |m| m.total),
+            ui::rate_text(m.and_then(|m| m.success_rate)),
+        );
+        let style = if i == pick.idx {
+            bold_fg(app.color, Color::Yellow)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(text, style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        if pick.armed {
+            "  Enter again to confirm · Esc cancel"
+        } else {
+            "  ↑/↓ choose · Enter roll back · Esc cancel"
+        },
+        ui::dim(app.color),
+    ));
+    let area = f.area();
+    let w = 64.min(area.width.saturating_sub(2)).max(1);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(ui::panel(
+            format!(" Roll back {} ", d.tool.name),
+            app.color,
+            Color::Yellow,
+        )),
+        rect,
+    );
 }
 
 fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
@@ -3531,6 +3694,7 @@ mod tests {
             tools: Vec::new(),
             tool_idx: 0,
             tool_detail: None,
+            rollback_pick: None,
             approvals: std::collections::VecDeque::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -3913,6 +4077,62 @@ mod tests {
             let full = markdown::render(&app.streaming, app.color, "  ", 60);
             assert_eq!(app.streaming_markdown(60), full, "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn rollback_picker_chooses_any_version_and_confirms() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let tool: ToolInfo = serde_json::from_value(serde_json::json!({
+            "id": "t1", "name": "page_title", "description": "", "retired": false,
+            "current_version": 3, "capabilities": [], "memory_mb": 256, "invocations": 9,
+            "success_rate": 0.5, "needs_attention": false, "created_at": "", "updated_at": ""
+        }))
+        .unwrap();
+        let version = |v: i64| {
+            serde_json::json!({"version": v, "author": if v == 2 { "optimiser" } else { "agent" },
+                "created_at": "2026-10-21T10:00:00Z", "capabilities": [], "memory_mb": 256,
+                "input_schema": "{}", "output_schema": "{}", "code": ""})
+        };
+        app.tool_detail = Some(
+            serde_json::from_value(serde_json::json!({
+                "tool": tool, "versions": [version(1), version(2), version(3)],
+                "metrics": {"total": 0, "success": 0, "failure": 0, "denied": 0, "cancelled": 0,
+                    "validation_failures": 0, "success_rate": null, "retry_rate": null,
+                    "p50_ms": null, "p95_ms": null},
+            }))
+            .unwrap(),
+        );
+        app.tools = vec![tool];
+        app.view = View::Tools;
+        app.key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.rollback_pick.as_ref().map(|p| p.idx),
+            Some(1),
+            "starts at v2"
+        );
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("Roll back page_title") && screen.contains("optimiser"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::Up));
+        app.key(key(KeyCode::Enter));
+        assert!(
+            app.rollback_pick.as_ref().unwrap().armed,
+            "first Enter only arms"
+        );
+        app.key(key(KeyCode::Enter));
+        assert!(app.rollback_pick.is_none());
+        assert!(
+            app.notes.last().unwrap().contains("back to v1"),
+            "{:?}",
+            app.notes
+        );
+        // Any other key cancels.
+        app.key(key(KeyCode::Char('b')));
+        app.key(key(KeyCode::Char('x')));
+        assert!(app.rollback_pick.is_none());
     }
 
     #[test]

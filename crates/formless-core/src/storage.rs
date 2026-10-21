@@ -1522,11 +1522,16 @@ impl Store {
         };
         let metrics = self.tool_metrics(id, None)?;
         let optimiser_attempts = self.list_attempts(id, 20)?;
+        let version_metrics = versions
+            .iter()
+            .map(|v| Ok((v.version, self.tool_metrics(id, Some(v.version))?)))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Some(formless_protocol::ToolDetail {
             tool,
             versions,
             metrics,
             optimiser_attempts,
+            version_metrics,
         }))
     }
 
