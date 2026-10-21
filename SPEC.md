@@ -245,7 +245,7 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   `GetSession` lists them. When idle, Enter
   simply starts a new Run.
 - `Esc` interrupts the current Run (in-flight Invocations are cancelled and
-  recorded as user-cancelled, §8.2). `Ctrl+C` detaches the TUI client only.
+  recorded as user-cancelled, §8.2). `Ctrl+C` clears a typed message, and a second `Ctrl+C` within 2 s detaches the TUI client only.
 
 ### 5.4 Interruption and resumption
 
@@ -1239,7 +1239,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 ### 10.5 Input and keys
 
 - Enter: send / Steer while running (Ctrl+Enter: queue; configurable).
-  `Esc`: interrupt Run. `Ctrl+C`: detach client. `Tab`/`Shift+Tab` (and slash commands)
+  `Esc`: interrupt Run. `Ctrl+C`: clear the typed message; twice within 2 s: detach client. `Tab`/`Shift+Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
   `/model`, `/settings`, `/stop`, `/resend`, `/resume`, `/abandon`, `/approve`,
