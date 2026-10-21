@@ -808,7 +808,11 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   (rolling window: last 100). Only the primary metric triggers.
 - A **background optimiser job** in the daemon queues on trigger and executes
   only when no active Run is waiting on that Tool (B-with-C politeness: it
-  never interrupts a Session). It uses the session model by default, or an
+  never interrupts a Session). A Tool counts as in use while an
+  Invocation of it is running, or while any active Run has called it.
+  Other Tools are optimised even while Runs are going. The queue is
+  persisted (`optimiser_queue`, schema v25), so triggers survive restarts
+  and busy periods. It uses the session model by default, or an
   optional separate optimiser model + reasoning effort.
 - **Guardrails (all configurable):** per-Tool cooldown (default 1h), max
   attempts per Tool per day (default 3), daemon-wide optimisation token

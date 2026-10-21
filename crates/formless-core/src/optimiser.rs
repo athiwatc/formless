@@ -38,7 +38,6 @@ impl Daemon {
     }
 
     pub(crate) async fn optimiser_loop(self: Arc<Self>) {
-        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return,
@@ -52,19 +51,39 @@ impl Daemon {
             }
             if let Ok(triggered) = self.scan_triggers(&cfg) {
                 for id in triggered {
-                    if !queue.contains(&id) {
-                        queue.push_back(id);
-                    }
+                    let _ = self.with_store(|st| st.enqueue_optimise(&id));
                 }
             }
-            // Politeness (§8.3): never run while a Run is active.
-            if !self.runs.lock().unwrap().is_empty() {
-                continue;
-            }
-            if let Some(tool_id) = queue.pop_front() {
+            // Politeness (§8.3): skip only Tools an active Run is using;
+            // the queue is persisted, so nothing is lost meanwhile.
+            if let Some(tool_id) = self.next_idle_queued() {
+                let _ = self.with_store(|st| st.dequeue_optimise(&tool_id));
                 self.optimise_tool(&tool_id, &cfg).await;
             }
         }
+    }
+
+    /// Run ids of the Runs in progress.
+    fn active_run_ids(&self) -> Vec<String> {
+        self.runs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|r| r.run_id.clone())
+            .collect()
+    }
+
+    /// Whether an active Run is using this Tool.
+    pub(crate) fn tool_in_use(&self, tool_id: &str) -> bool {
+        let active = self.active_run_ids();
+        self.with_store(|st| st.tool_busy(tool_id, &active))
+            .unwrap_or(true)
+    }
+
+    /// The oldest queued Tool no active Run is using.
+    pub fn next_idle_queued(&self) -> Option<String> {
+        let queue = self.with_store(|st| st.optimise_queue()).ok()?;
+        queue.into_iter().find(|id| !self.tool_in_use(id))
     }
 
     fn scan_triggers(&self, cfg: &Config) -> Result<Vec<String>> {
@@ -100,8 +119,9 @@ impl Daemon {
             None => {
                 if let Ok(ids) = self.scan_triggers(&cfg) {
                     for id in ids {
-                        if !self.runs.lock().unwrap().is_empty() {
-                            break;
+                        if self.tool_in_use(&id) {
+                            let _ = self.with_store(|st| st.enqueue_optimise(&id));
+                            continue;
                         }
                         self.optimise_tool(&id, &cfg).await;
                     }

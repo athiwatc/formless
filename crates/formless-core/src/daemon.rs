@@ -130,6 +130,7 @@ enum McpApproval {
 type ApprovalReply = oneshot::Sender<(bool, ApprovalScope)>;
 
 pub(crate) struct RunCtl {
+    pub(crate) run_id: String,
     cancel: CancellationToken,
     cancel_flag: Arc<AtomicBool>,
     steer_tx: mpsc::UnboundedSender<()>,
@@ -1071,6 +1072,7 @@ impl Daemon {
         self.runs.lock().unwrap().insert(
             session_id.clone(),
             RunCtl {
+                run_id: run_id.clone(),
                 cancel: cancel.clone(),
                 cancel_flag: cancel_flag.clone(),
                 steer_tx,
