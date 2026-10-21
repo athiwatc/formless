@@ -264,6 +264,10 @@ purity is untouched):
   pending, the daemon reminds it **once**. The agent may then await them or
   explicitly **abandon** them. Abandoned ≠ cancelled: the Invocation still
   finishes and is recorded; abandonment is noted on the record.
+- Handles are persisted. After a daemon restart (§9.5) each Session with a
+  handle still pending gets a harness note that it was interrupted (outcome
+  unknown, not re-run), and polling/awaiting it answers `interrupted`
+  instead of "unknown handle".
 
 ### 6.4 Outcomes
 

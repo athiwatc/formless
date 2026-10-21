@@ -1198,3 +1198,66 @@ async fn queued_message_is_persisted_and_runs_next() {
     assert_eq!(got["queued"], json!([]));
     server.abort();
 }
+
+/// A handle that was pending when the daemon stopped is reported to its
+/// Session on restart, and check_invocation answers "interrupted" for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn pending_handle_survives_restart_as_interrupted() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4handle");
+    let sid = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let s = store.create_session(None).unwrap();
+        store.add_pending_handle("h-old", &s.id, "sleeper").unwrap();
+        s.id
+    };
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                match msgs.iter().find(|m| m["role"] == "tool") {
+                    None => sse_tool("c1", "check_invocation", json!({"invocation_id": "h-old"})),
+                    Some(t) => sse_text(t["content"].as_str().unwrap_or_default()),
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let msgs = store.list_messages(&sid).unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == "system-note" && m.content.contains("h-old")),
+            "the Session is told about the lost handle"
+        );
+    }
+    let mut c = Client::connect(&paths).await;
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "how did it go?".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let answer = c.run_to_finish().await;
+    let v: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(v["status"], "interrupted", "{answer}");
+    // Answered once, then forgotten.
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert!(store.pending_handle("h-old").unwrap().is_none());
+    server.abort();
+}

@@ -91,6 +91,15 @@ impl Daemon {
     pub fn new(paths: Paths) -> Result<Self> {
         let store = Store::open(&paths.db_file())?;
         store.mark_orphan_runs_interrupted()?;
+        // Pending handles do not survive a restart; tell each Session's
+        // agent instead of leaving a handle that later reads "unknown".
+        for (handle, session_id, tool) in store.interrupt_pending_handles()? {
+            let note = format!(
+                "Invocation {handle} ({tool}) was interrupted by a daemon restart; its outcome \
+                 is unknown and it was not re-run. Check its side effects or run it again."
+            );
+            store.append_message(&session_id, "system-note", &note)?;
+        }
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -1284,12 +1293,12 @@ impl Daemon {
                     Some(entry) => match self.wait_pending(&entry, None, cancel).await {
                         Some((_ok, text)) => {
                             entry.delivered.store(true, Ordering::SeqCst);
-                            self.pending.lock().unwrap().remove(handle);
+                            self.forget_pending(handle);
                             text
                         }
                         None => "error: interrupted while awaiting invocation".to_string(),
                     },
-                    None => format!("error: unknown invocation handle '{handle}'"),
+                    None => self.stale_handle_answer(handle),
                 }
             }
             toolreg::CHECK_INVOCATION => {
@@ -1300,7 +1309,7 @@ impl Daemon {
                         match done {
                             Some((_ok, text)) => {
                                 entry.delivered.store(true, Ordering::SeqCst);
-                                self.pending.lock().unwrap().remove(handle);
+                                self.forget_pending(handle);
                                 json!({"status": "completed", "result": text}).to_string()
                             }
                             None => {
@@ -1308,7 +1317,7 @@ impl Daemon {
                             }
                         }
                     }
-                    None => format!("error: unknown invocation handle '{handle}'"),
+                    None => self.stale_handle_answer(handle),
                 }
             }
             toolreg::ABANDON_INVOCATION => {
@@ -1318,7 +1327,7 @@ impl Daemon {
                         entry.abandoned.store(true, Ordering::SeqCst);
                         json!({"abandoned": handle}).to_string()
                     }
-                    None => format!("error: unknown invocation handle '{handle}'"),
+                    None => self.stale_handle_answer(handle),
                 }
             }
             name => {
@@ -1397,6 +1406,34 @@ impl Daemon {
 
     fn pending_get(&self, handle: &str) -> Option<Arc<PendingEntry>> {
         self.pending.lock().unwrap().get(handle).cloned()
+    }
+
+    /// Drop a handle from memory and from the persisted record.
+    fn forget_pending(&self, handle: &str) {
+        self.pending.lock().unwrap().remove(handle);
+        let _ = self.with_store(|st| st.remove_pending_handle(handle));
+    }
+
+    /// Answer for a handle that is not live in memory: one a restart
+    /// interrupted (answered once, then forgotten), else unknown.
+    fn stale_handle_answer(&self, handle: &str) -> String {
+        match self
+            .with_store(|st| st.pending_handle(handle))
+            .ok()
+            .flatten()
+        {
+            Some((tool, status)) if status == "interrupted" => {
+                let _ = self.with_store(|st| st.remove_pending_handle(handle));
+                json!({
+                    "status": "interrupted",
+                    "invocation_id": handle,
+                    "tool": tool,
+                    "note": "interrupted by a daemon restart; outcome unknown, not re-run",
+                })
+                .to_string()
+            }
+            _ => format!("error: unknown invocation handle '{handle}'"),
+        }
     }
 
     async fn wait_pending(
@@ -1497,7 +1534,7 @@ impl Daemon {
                     ok,
                 });
                 if entry2.abandoned.load(Ordering::SeqCst) {
-                    this.pending.lock().unwrap().remove(&handle2);
+                    this.forget_pending(&handle2);
                 }
             });
         }
@@ -1505,10 +1542,11 @@ impl Daemon {
         match self.wait_pending(&entry, Some(threshold), cancel).await {
             Some((_ok, text)) => {
                 entry.delivered.store(true, Ordering::SeqCst);
-                self.pending.lock().unwrap().remove(&handle);
+                self.forget_pending(&handle);
                 text
             }
             None => {
+                let _ = self.with_store(|st| st.add_pending_handle(&handle, session_id, name));
                 self.broadcast(Event::InvocationPending {
                     session_id: session_id.to_string(),
                     run_id: run_id.to_string(),
@@ -1560,7 +1598,7 @@ impl Daemon {
                 });
             }
             entry.delivered.store(true, Ordering::SeqCst);
-            self.pending.lock().unwrap().remove(&handle);
+            self.forget_pending(&handle);
         }
     }
 
