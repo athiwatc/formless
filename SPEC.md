@@ -539,8 +539,11 @@ None ship by default (principle 1).
   Session's next compaction, so its cached prefix survives; calling it
   reports that it is retired. They are found, listed, pinned and
   **measured** like Tools, but
-  run on the server, and the optimiser never rewrites them. The `mcp__`
-  prefix is reserved.
+  run on the server, and the optimiser never rewrites them. Failures are
+  classified `mcp-transport` (server unreachable, failed to start, died)
+  or `mcp-tool-error` (the tool reported `isError`); `find_tools` warns
+  about any Tool measured below 50% success over 5+ calls, so the agent can
+  prefer another or build its own. The `mcp__` prefix is reserved.
 - **HTTP transport** (`transport = "http"`, `url`, static `headers`):
   Streamable HTTP (every message POSTed; the answer comes back as the JSON
   body or an SSE body; `Mcp-Session-Id` carried; 429/5xx retried with

@@ -919,3 +919,70 @@ fn dropped_mcp_tools_leave_session_listings_alone_until_compaction() {
         ["mcp__srv__alpha", "mcp__srv__gamma"]
     );
 }
+
+/// MCP calls are measured with error classes, and a tool that keeps
+/// failing is flagged in find_tools.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_calls_are_measured_with_error_classes() {
+    use std::sync::Arc;
+    let paths = temp_paths("mcpmetrics");
+    let (mcp, _) = fake_server(&paths);
+    let mut cfg = formless_core::Config {
+        mcp,
+        ..Default::default()
+    };
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    daemon
+        .handle(formless_protocol::Request::RestartMcpServer {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    store.approve_mcp_server("fake").unwrap();
+    let (boom, _) = store.get_tool_by_name("mcp__fake__boom").unwrap().unwrap();
+    let caps = formless_runtime::Capabilities::parse(&["mcp:fake".to_string()]).unwrap();
+    store.set_approval(&boom.id, &caps, 256).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    for _ in 0..5 {
+        let out = daemon
+            .call_tool_direct(&session, "mcp__fake__boom", json!({}))
+            .await;
+        assert!(out.contains("it broke"), "{out}");
+    }
+    let fails = store.recent_failures(&boom.id, 10).unwrap();
+    assert!(fails.iter().all(|f| f.1 == "mcp-tool-error"), "{fails:?}");
+    let found: Value = serde_json::from_str(
+        &daemon
+            .call_tool_direct(&session, "find_tools", json!({"query": "always fails"}))
+            .await,
+    )
+    .unwrap();
+    let hit = found["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "mcp__fake__boom")
+        .unwrap()
+        .clone();
+    assert!(
+        hit["warning"].as_str().unwrap().contains("unreliable"),
+        "{hit}"
+    );
+    // A server that cannot start is a transport failure.
+    cfg.mcp.servers.get_mut("fake").unwrap().command = "/no/such/server".into();
+    cfg.save(&paths).unwrap();
+    daemon
+        .handle(formless_protocol::Request::RestartMcpServer {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    daemon
+        .call_tool_direct(&session, "mcp__fake__boom", json!({}))
+        .await;
+    let fails = store.recent_failures(&boom.id, 1).unwrap();
+    assert_eq!(fails[0].1, "mcp-transport", "{fails:?}");
+}
