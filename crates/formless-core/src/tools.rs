@@ -49,6 +49,12 @@ pub fn validate_name(name: &str) -> Result<()> {
     if RESERVED.contains(&name.to_lowercase().as_str()) {
         return Err(anyhow!("'{name}' is reserved"));
     }
+    if name.to_lowercase().starts_with(crate::mcp::PREFIX) {
+        return Err(anyhow!(
+            "names starting with '{}' are reserved for MCP tools",
+            crate::mcp::PREFIX
+        ));
+    }
     let ok = name
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')

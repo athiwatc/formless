@@ -24,6 +24,10 @@ pub struct Capabilities {
     pub llm: Option<Vec<String>>,
     /// None = no sub-agents. Some(empty) = any configured model. Some(list) = those models.
     pub agent: Option<Vec<String>>,
+    /// MCP servers whose tools this entry calls (`mcp:<server>`); set only
+    /// on the registry rows that stand for MCP tools.
+    #[serde(default)]
+    pub mcp: Vec<String>,
 }
 
 impl Capabilities {
@@ -86,6 +90,11 @@ impl Capabilities {
                     return Err("llm needs a model name".into());
                 }
                 c.llm.get_or_insert_with(Vec::new).push(m.to_string());
+            } else if let Some(server) = s.strip_prefix("mcp:") {
+                if server.is_empty() {
+                    return Err("mcp needs a server name".into());
+                }
+                c.mcp.push(server.to_string());
             } else if s == "agent" {
                 c.agent = Some(Vec::new());
             } else if let Some(m) = s.strip_prefix("agent:") {
@@ -138,6 +147,7 @@ impl Capabilities {
             Some(v) => out.extend(v.iter().map(|m| format!("agent:{m}"))),
             None => {}
         }
+        out.extend(self.mcp.iter().map(|s| format!("mcp:{s}")));
         out
     }
 
@@ -238,6 +248,7 @@ impl Capabilities {
             notify: self.notify || other.notify,
             llm: merge_scoped(&self.llm, &other.llm),
             agent: merge_scoped(&self.agent, &other.agent),
+            mcp: merge(&self.mcp, &other.mcp),
         }
     }
 
@@ -252,6 +263,7 @@ impl Capabilities {
             || self.notify
             || self.llm.is_some()
             || self.agent.is_some()
+            || !self.mcp.is_empty()
     }
 
     /// Does `self` (approved) fully cover `other` (requested)?
@@ -267,6 +279,7 @@ impl Capabilities {
             && (!other.notify || self.notify)
             && scoped_covers(&self.llm, &other.llm, |a, b| a == b)
             && scoped_covers(&self.agent, &other.agent, |a, b| a == b)
+            && other.mcp.iter().all(|s| self.mcp.contains(s))
     }
 }
 

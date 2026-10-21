@@ -145,6 +145,8 @@ pub struct Daemon {
     http: reqwest::Client,
     /// Module code snapshot keyed by its fingerprint (see `module_code`).
     modules: StdMutex<Option<(String, ModuleCode)>>,
+    /// Running MCP servers ((SPEC §7.9)).
+    pub(crate) mcp: crate::mcp::Manager,
     /// Parsed config.toml, re-read only when the file changes.
     config: StdMutex<Option<(ConfigStamp, Config)>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
@@ -185,6 +187,7 @@ impl Daemon {
             subs: Arc::new(StdMutex::new(Vec::new())),
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
+            mcp: Default::default(),
             modules: StdMutex::new(None),
             http: reqwest::Client::builder().build()?,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2827,6 +2830,38 @@ impl Daemon {
                 Ok(id) => id,
                 Err(e) => return Err(e.to_string()),
             };
+            if let Some(server) = caps.mcp.first().cloned() {
+                // An MCP tool: the server runs it ((SPEC §7.9)). Cancelling
+                // the Invocation drops the request, which tells the server.
+                let tool = crate::mcp::server_tool_name(&ver.code)
+                    .unwrap_or_default()
+                    .to_string();
+                let call = self
+                    .mcp
+                    .call(&self.paths, &cfg.mcp, &server, &tool, input.clone());
+                let outcome = tokio::select! {
+                    _ = cancel.cancelled() => Err("interrupted".to_string()),
+                    r = call => r.map_err(|e| e.to_string()).and_then(|v| crate::mcp::call_result(&v)),
+                };
+                let elapsed = dur(&started);
+                let ok = outcome.is_ok();
+                let (status, tag, out, err) = match &outcome {
+                    Ok(v) => ("success", "", toolreg::redact(v).to_string(), String::new()),
+                    Err(e) if cancel.is_cancelled() => {
+                        ("cancelled", "user-cancelled", String::new(), e.clone())
+                    }
+                    Err(e) => ("failure", "mcp", String::new(), e.clone()),
+                };
+                self.finish_inv(&inv_id, &info, status, tag, &out, &err, elapsed, &cfg);
+                self.broadcast(Event::ToolCallFinished {
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    tool_name: name.clone(),
+                    ok,
+                    elapsed_ms: elapsed,
+                });
+                return outcome.map(|v| (v, inv_id));
+            }
             let ops = Arc::new(NestedOps {
                 daemon: self.clone(),
                 session_id: session_id.clone(),
@@ -3122,6 +3157,41 @@ impl Daemon {
 
     /// A detached daemon writes its stdout/stderr to `daemon.log`; keep
     /// that file within `daemon.log_max_bytes` (SPEC §9.4).
+    /// List every enabled MCP server's tools into the registry, then keep
+    /// it current (`tools/list_changed`) and stop idle servers.
+    async fn mcp_loop(self: Arc<Self>) {
+        if let Ok(cfg) = self.config() {
+            for name in cfg.mcp.servers.keys() {
+                if let Err(e) = self.sync_mcp_server(&cfg, name).await {
+                    tracing::warn!("MCP server '{name}': {e}");
+                }
+            }
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let Ok(cfg) = self.config() else { continue };
+            // Only running servers can announce changes; idle ones are
+            // never started just to check.
+            for name in self.mcp.changed_servers().await {
+                if let Err(e) = self.sync_mcp_server(&cfg, &name).await {
+                    tracing::warn!("MCP server '{name}': {e}");
+                }
+            }
+            self.mcp.reap_idle(cfg.mcp.idle_secs).await;
+        }
+    }
+
+    /// Fetch one server's tool list and mirror it into the registry.
+    pub(crate) async fn sync_mcp_server(&self, cfg: &Config, name: &str) -> Result<usize> {
+        if cfg.mcp.servers.get(name).is_none_or(|s| s.disabled) {
+            return Ok(0);
+        }
+        let conn = self.mcp.connection(&self.paths, &cfg.mcp, name).await?;
+        let tools = conn.list_tools().await?;
+        self.with_store(|st| crate::mcp::sync_registry(st, name, &tools))?;
+        Ok(tools.len())
+    }
+
     /// Apply artifact retention at start and then hourly.
     async fn artifact_gc_loop(self: Arc<Self>) {
         loop {
@@ -3252,9 +3322,15 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.artifact_gc_loop().await })
         };
+        let mcp = {
+            let this = self.clone();
+            tokio::spawn(async move { this.mcp_loop().await })
+        };
         let result = self.accept_loop().await;
         logs.abort();
         artifact_gc.abort();
+        mcp.abort();
+        self.mcp.stop_all().await;
         relay.abort();
         optimiser.abort();
         watcher.abort();
