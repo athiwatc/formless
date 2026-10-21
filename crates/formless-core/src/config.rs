@@ -110,8 +110,11 @@ pub struct ProviderCfg {
     /// clients are told it looks stalled (0 = never).
     pub stall_notice_secs: u64,
     /// Re-send the request automatically when no first byte arrives within
-    /// this many seconds (0 = off; the user can always `/retry`).
+    /// this many seconds (0 = off; the user can always `/resend`).
     pub first_byte_timeout_secs: u64,
+    /// Longest wait between retries when the server gives no hint (full
+    /// jitter below it). A server's `Retry-After` is honoured up to 5 min.
+    pub max_backoff_secs: u64,
 }
 
 /// OAuth2 authorization-code + PKCE settings for subscription providers.
@@ -180,6 +183,7 @@ impl Default for ProviderCfg {
             auth: AuthCfg::default(),
             stall_notice_secs: 120,
             first_byte_timeout_secs: 0,
+            max_backoff_secs: 30,
         }
     }
 }
