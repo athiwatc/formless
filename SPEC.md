@@ -1091,6 +1091,17 @@ such as `read_file`, `read_text_file` and `file_read`.
   `artifacts.max_age_days` (30) are removed, then the oldest beyond
   `artifacts.max_total_mb` (1024), at daemon start and hourly or on
   `formless gc`; deleting a Session deletes its artifact files.
+- **Opening a stored output:** the transcript note reads `[full output (N
+  bytes) stored as artifact ID; read it with read_artifact]`, with no
+  filesystem path, because transcripts also reach remote web clients.
+  `GetArtifact {id, offset?, length?}` returns a text slice (200 000
+  characters by default) with `total_chars` and `end`, never the path.
+  - TUI: a tool result that references an artifact shows `/open <id>`,
+    and `/open` (the newest) or `/open <id-prefix>` shows a full-screen
+    pager (↑↓, PgUp/PgDn, g/G, Esc).
+  - Web: the result gets an "Open full output" button that opens a viewer
+    with "Load more" and Download, which fetches the rest and saves it as
+    a file.
 
 ### 9.7 Scheduled jobs
 

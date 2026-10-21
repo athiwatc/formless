@@ -626,6 +626,20 @@ impl Daemon {
                 })?;
                 Ok(json!({"last_run": last_run, "total": total, "runs": runs}))
             }
+            Request::GetArtifact { id, offset, length } => {
+                let (session, path, bytes) = self
+                    .with_reader(|st| st.get_artifact(&id))?
+                    .with_context(|| format!("no artifact '{id}'"))?;
+                let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
+                let total = text.chars().count();
+                let offset = offset.unwrap_or(0);
+                let length = length.unwrap_or(200_000).min(1_000_000);
+                let slice: String = text.chars().skip(offset).take(length).collect();
+                let end = offset + slice.chars().count();
+                // Never the filesystem path (SPEC §9.6).
+                Ok(json!({"id": id, "session_id": session, "bytes": bytes,
+                          "total_chars": total, "offset": offset, "end": end, "text": slice}))
+            }
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
             )?),
@@ -4260,10 +4274,10 @@ impl Daemon {
                     )
                 })
                 .unwrap_or_default();
+            // No filesystem path: transcripts reach remote clients too.
             return format!(
-                "{preview}\n[full output ({} bytes) stored as artifact {id} at {}]",
-                text.len(),
-                path.display()
+                "{preview}\n[full output ({} bytes) stored as artifact {id}; read it with read_artifact]",
+                text.len()
             );
         }
         preview

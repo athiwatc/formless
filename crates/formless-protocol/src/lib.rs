@@ -533,6 +533,15 @@ pub enum Request {
     RestoreSession {
         id: String,
     },
+    /// Read a stored output (SPEC §9.6): a text slice from `offset`
+    /// characters (default 200 000 long). Never returns the file path.
+    GetArtifact {
+        id: String,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        length: Option<usize>,
+    },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
     /// Add a job as the user (approved): `cron` for recurring, else `at`.
@@ -982,6 +991,26 @@ impl ServerMessage {
             error: Some(error),
         }
     }
+}
+
+/// Artifact ids referenced in a tool result: the "stored as artifact <id>"
+/// note and `"emitted_artifact": "<id>"` (clients make them openable).
+pub fn artifact_refs(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for marker in ["stored as artifact ", "\"emitted_artifact\":\""] {
+        let mut rest = text;
+        while let Some(i) = rest.find(marker) {
+            rest = &rest[i + marker.len()..];
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+                .collect();
+            if id.len() == 36 && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
