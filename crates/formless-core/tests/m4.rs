@@ -1636,3 +1636,82 @@ async fn subscriptions_scope_live_events_per_client() {
     );
     server.abort();
 }
+
+/// Applying learned guidance does not rewrite a running Session's system
+/// prompt (its cached prefix); new Sessions get it.
+#[cfg(unix)]
+#[tokio::test]
+async fn sessions_keep_their_system_prompt_when_guidance_changes() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4prompt");
+    let systems = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let systems = systems.clone();
+                move |Json(body): Json<Value>| {
+                    let system = body["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    systems.lock().unwrap().push(system);
+                    async { sse_text("ok") }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let send = |sid: String| Request::SendMessage {
+        session_id: sid,
+        content: "hi".into(),
+        mode: SendMode::Send,
+    };
+    let s1 = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(send(s1.clone())).await;
+    c.run_to_finish().await;
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let p = store
+            .create_proposal("prompt", "ALWAYS-SAY-PLEASE", "test", 0)
+            .unwrap();
+        store.update_proposal_eval(&p.id, 0.5, 0.9, 7).unwrap();
+        assert!(store
+            .set_proposal_status(&p.id, "applied")
+            .unwrap()
+            .is_some());
+    }
+    c.send(send(s1.clone())).await;
+    c.run_to_finish().await;
+    let s2 = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(send(s2)).await;
+    c.run_to_finish().await;
+    let systems = systems.lock().unwrap().clone();
+    assert_eq!(systems.len(), 3);
+    assert_eq!(systems[0], systems[1], "running Session keeps its prompt");
+    assert!(!systems[1].contains("ALWAYS-SAY-PLEASE"));
+    assert!(
+        systems[2].contains("ALWAYS-SAY-PLEASE"),
+        "new Sessions get it"
+    );
+    server.abort();
+}
