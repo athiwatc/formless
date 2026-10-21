@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod daemon;
 pub mod diff;
+pub mod jobs;
 pub mod logs;
 pub mod mcp;
 pub mod mcp_auth;

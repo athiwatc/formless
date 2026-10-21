@@ -39,6 +39,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
+    Jobs {
+        #[command(subcommand)]
+        action: JobsAction,
+    },
     /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
     Runs {
         #[arg(long, default_value_t = 20)]
@@ -225,6 +230,32 @@ enum SkillsAction {
 }
 
 #[derive(Subcommand)]
+enum JobsAction {
+    List,
+    /// Schedule a prompt: --cron "0 3 * * *" (recurring) or --at "in 30m"
+    Add {
+        prompt: String,
+        #[arg(long)]
+        cron: Option<String>,
+        #[arg(long)]
+        at: Option<String>,
+        /// Run in this Session (default: a new Session each time)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Enable (and approve) a job
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Rm {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum MemoryAction {
     /// List notes with id, scope and source
     List {
@@ -323,6 +354,7 @@ fn main() -> Result<()> {
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs { limit, json }) => runs_cmd(paths, limit, json),
+        Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Gc) => {
             let cfg = Config::load(&paths)?;
             let store = formless_core::Store::open(&paths.db_file())?;
@@ -1232,6 +1264,77 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
                 }
                 println!("enable it with `formless skills enable {name}`\n");
             }
+        }
+    }
+    Ok(())
+}
+
+fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
+    formless_core::daemon::ensure_daemon(&paths)?;
+    let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
+    match action {
+        JobsAction::List => {
+            let list = daemon(Request::ListJobs)?;
+            let jobs = list.as_array().cloned().unwrap_or_default();
+            if jobs.is_empty() {
+                println!("no scheduled jobs (formless jobs add …)");
+            }
+            for j in jobs {
+                println!(
+                    "{:<10} {:<18} {:<14} next {:<25} last: {}\n           {}",
+                    j["id"].as_str().unwrap_or_default(),
+                    if j["approved"] == false {
+                        "awaiting approval"
+                    } else if j["enabled"] == true {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    j["cron"].as_str().unwrap_or("once"),
+                    j["next_run"].as_str().unwrap_or("-"),
+                    j["last_status"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("-"),
+                    j["prompt"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        JobsAction::Add {
+            prompt,
+            cron,
+            at,
+            session,
+        } => {
+            let j = daemon(Request::AddJob {
+                prompt,
+                session_id: session,
+                cron,
+                at,
+            })?;
+            println!(
+                "scheduled {} — next run {}",
+                j["id"].as_str().unwrap_or_default(),
+                j["next_run"].as_str().unwrap_or("-")
+            );
+        }
+        JobsAction::Enable { id } => {
+            daemon(Request::SetJobEnabled {
+                id: id.clone(),
+                enabled: true,
+            })?;
+            println!("enabled {id}");
+        }
+        JobsAction::Disable { id } => {
+            daemon(Request::SetJobEnabled {
+                id: id.clone(),
+                enabled: false,
+            })?;
+            println!("disabled {id}");
+        }
+        JobsAction::Rm { id } => {
+            daemon(Request::DeleteJob { id: id.clone() })?;
+            println!("deleted {id}");
         }
     }
     Ok(())

@@ -238,6 +238,15 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup ON memories(scope, dedup_key);
 ";
 
+/// Scheduled jobs (SPEC §9.7).
+const SCHEMA_V22: &str = "
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY, prompt TEXT NOT NULL, session_id TEXT,
+  cron TEXT, next_run TEXT, last_run TEXT, last_status TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1, approved INTEGER NOT NULL DEFAULT 0,
+  author TEXT NOT NULL DEFAULT 'user', created_at TEXT NOT NULL);
+";
+
 /// Built-in calls, without payloads (SPEC §8.8).
 const SCHEMA_V20: &str = "
 CREATE TABLE IF NOT EXISTS builtin_calls (
@@ -280,7 +289,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -295,7 +304,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 21] = [
+const MIGRATIONS: [(i64, MigrationStep); 22] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -348,6 +357,7 @@ const MIGRATIONS: [(i64, MigrationStep); 21] = [
     (21, |c| {
         add_column(c, "invocations", "tokens INTEGER NOT NULL DEFAULT 0")
     }),
+    (22, |c| Ok(c.execute_batch(SCHEMA_V22)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -874,6 +884,109 @@ impl Store {
             params![inv_id, tokens],
         )?;
         Ok(())
+    }
+
+    fn row_job(r: &rusqlite::Row) -> rusqlite::Result<formless_protocol::JobInfo> {
+        Ok(formless_protocol::JobInfo {
+            id: r.get("id")?,
+            prompt: r.get("prompt")?,
+            session_id: r.get("session_id")?,
+            cron: r.get("cron")?,
+            next_run: r.get("next_run")?,
+            last_run: r.get("last_run")?,
+            last_status: r.get("last_status")?,
+            enabled: r.get::<_, i64>("enabled")? != 0,
+            approved: r.get::<_, i64>("approved")? != 0,
+            author: r.get("author")?,
+            created_at: r.get("created_at")?,
+        })
+    }
+
+    pub fn create_job(
+        &self,
+        prompt: &str,
+        session_id: Option<&str>,
+        cron: Option<&str>,
+        next_run: &str,
+        approved: bool,
+        author: &str,
+    ) -> Result<formless_protocol::JobInfo> {
+        let id = format!("j{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        self.conn.execute(
+            "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)",
+            params![id, prompt, session_id, cron, next_run, approved, author, now()],
+        )?;
+        self.get_job(&id)?.context("job vanished")
+    }
+
+    pub fn get_job(&self, id: &str) -> Result<Option<formless_protocol::JobInfo>> {
+        Ok(self
+            .conn
+            .query_row("SELECT * FROM jobs WHERE id=?1", params![id], Self::row_job)
+            .ok())
+    }
+
+    pub fn list_jobs(&self) -> Result<Vec<formless_protocol::JobInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM jobs ORDER BY created_at, rowid")?;
+        let rows = stmt
+            .query_map([], Self::row_job)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Enabled, approved jobs whose time has come.
+    pub fn due_jobs(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<formless_protocol::JobInfo>> {
+        Ok(self
+            .list_jobs()?
+            .into_iter()
+            .filter(|j| j.enabled && j.approved)
+            .filter(|j| {
+                j.next_run
+                    .as_deref()
+                    .and_then(|n| chrono::DateTime::parse_from_rfc3339(n).ok())
+                    .is_some_and(|n| n <= now)
+            })
+            .collect())
+    }
+
+    /// The user enables (which also approves) or disables a job.
+    pub fn set_job_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE jobs SET enabled=?2, approved=CASE WHEN ?2 THEN 1 ELSE approved END WHERE id=?1",
+            params![id, enabled],
+        )? > 0)
+    }
+
+    /// Record a job's run; `next_run` None ends a one-shot job.
+    pub fn job_ran(&self, id: &str, status: &str, next_run: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET last_run=?2, last_status=?3, next_run=?4,
+               enabled=CASE WHEN ?4 IS NULL THEN 0 ELSE enabled END WHERE id=?1",
+            params![id, now(), status, next_run],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_job(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM jobs WHERE id=?1", params![id])?
+            > 0)
+    }
+
+    /// Whether any job is waiting to run (keeps the daemon up when the
+    /// user enabled `daemon.keep_alive_for_jobs`).
+    pub fn has_active_jobs(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE enabled=1 AND approved=1 AND next_run IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// One model call made in a Run (a step).

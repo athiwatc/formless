@@ -489,6 +489,48 @@ impl Daemon {
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
             }
+            Request::ListJobs => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_jobs())?,
+            )?),
+            Request::AddJob {
+                prompt,
+                session_id,
+                cron,
+                at,
+            } => {
+                let next =
+                    crate::jobs::first_run(cron.as_deref(), at.as_deref(), chrono::Local::now())?;
+                let job = self.with_store(|st| {
+                    st.create_job(
+                        &prompt,
+                        session_id.as_deref(),
+                        cron.as_deref(),
+                        &next.to_rfc3339(),
+                        true,
+                        "user",
+                    )
+                })?;
+                let _ = self.with_store(|st| st.audit("user", "job.add", &job.id));
+                self.broadcast(Event::JobsChanged);
+                Ok(serde_json::to_value(job)?)
+            }
+            Request::SetJobEnabled { id, enabled } => {
+                if !self.with_store(|st| st.set_job_enabled(&id, enabled))? {
+                    return Err(anyhow!("no job '{id}'"));
+                }
+                let action = if enabled { "job.enable" } else { "job.disable" };
+                let _ = self.with_store(|st| st.audit("user", action, &id));
+                self.broadcast(Event::JobsChanged);
+                Ok(json!({"id": id, "enabled": enabled}))
+            }
+            Request::DeleteJob { id } => {
+                if !self.with_store(|st| st.delete_job(&id))? {
+                    return Err(anyhow!("no job '{id}'"));
+                }
+                let _ = self.with_store(|st| st.audit("user", "job.delete", &id));
+                self.broadcast(Event::JobsChanged);
+                Ok(json!({"deleted": id}))
+            }
             Request::AnswerQuestion {
                 question_id,
                 answer,
@@ -1790,6 +1832,12 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: load_skill failed: {e}"),
             },
+            toolreg::SCHEDULE_RUN => {
+                match self.schedule_run_impl(session_id, &args, cancel).await {
+                    Ok(text) => text,
+                    Err(e) => format!("error: schedule_run failed: {e}"),
+                }
+            }
             toolreg::ASK_USER => match self.ask_user_impl(session_id, &args, cancel).await {
                 Ok(text) => text,
                 Err(e) => format!("error: ask_user failed: {e}"),
@@ -2786,6 +2834,120 @@ impl Daemon {
         self.with_store(|st| st.get_skill(name))?
             .filter(|s| s.enabled && !s.retired)
             .with_context(|| format!("no enabled skill named '{name}'"))
+    }
+
+    /// `schedule_run` (SPEC §9.7): a one-shot job is scheduled at once; a
+    /// recurring one needs the user's approval (asked now, or later by
+    /// enabling it when nobody is connected).
+    async fn schedule_run_impl(
+        &self,
+        session_id: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let prompt = args["prompt"]
+            .as_str()
+            .filter(|p| !p.trim().is_empty())
+            .context("prompt required")?;
+        let cron = args["cron"].as_str().filter(|c| !c.trim().is_empty());
+        let at = args["at"].as_str().filter(|a| !a.trim().is_empty());
+        let target = match args["session_id"].as_str() {
+            Some("current") => Some(session_id.to_string()),
+            Some(s) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        };
+        let next = crate::jobs::first_run(cron, at, chrono::Local::now())?;
+        let approved = match cron {
+            None => true,
+            Some(c) => {
+                let (ok, _) = self
+                    .ask_user_approval(
+                        session_id,
+                        "schedule_run",
+                        vec![format!("cron {c}")],
+                        format!(
+                            "Recurring job ({c}, first {}): {prompt}",
+                            next.format("%Y-%m-%d %H:%M")
+                        ),
+                        cancel,
+                    )
+                    .await;
+                ok
+            }
+        };
+        let job = self.with_store(|st| {
+            st.create_job(
+                prompt,
+                target.as_deref(),
+                cron,
+                &next.to_rfc3339(),
+                approved,
+                "agent",
+            )
+        })?;
+        let _ = self.with_store(|st| st.audit("agent", "job.schedule", &job.id));
+        self.broadcast(Event::JobsChanged);
+        Ok(json!({
+            "id": job.id,
+            "next_run": job.next_run,
+            "status": if approved { "scheduled" } else { "awaiting the user's approval (formless jobs enable ID, or the Jobs view)" },
+        })
+        .to_string())
+    }
+
+    /// Start due jobs (SPEC §9.7), every 20 s. A job missed while the
+    /// daemon was down runs once, then continues from now.
+    async fn job_loop(self: Arc<Self>) {
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {}
+            }
+            self.run_due_jobs().await;
+        }
+    }
+
+    pub async fn run_due_jobs(self: &Arc<Self>) {
+        let Ok(due) = self.with_store(|st| st.due_jobs(chrono::Utc::now())) else {
+            return;
+        };
+        for job in due {
+            let next = job
+                .cron
+                .as_deref()
+                .and_then(|c| crate::jobs::Cron::parse(c).ok())
+                .and_then(|c| c.next_after(chrono::Local::now()))
+                .map(|t| t.to_rfc3339());
+            let session = match job.session_id.clone().filter(|s| {
+                self.with_store(|st| st.get_session(s))
+                    .ok()
+                    .flatten()
+                    .is_some()
+            }) {
+                Some(s) => Ok(s),
+                None => {
+                    let name: String = job.prompt.chars().take(40).collect();
+                    self.with_store(|st| st.create_session(Some(format!("Job: {name}"))))
+                        .map(|s| {
+                            self.broadcast(Event::SessionUpdated { session: s.clone() });
+                            s.id
+                        })
+                }
+            };
+            let status = match session {
+                Ok(sid) => match self
+                    .send_message(sid.clone(), job.prompt.clone(), SendMode::Queue)
+                    .await
+                {
+                    Ok(_) => format!("started in session {sid}"),
+                    Err(e) => format!("error: {e}"),
+                },
+                Err(e) => format!("error: {e}"),
+            };
+            let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
+            let _ = self.with_store(|st| st.audit("daemon", "job.run", &job.id));
+            self.broadcast(Event::JobsChanged);
+        }
     }
 
     /// `ask_user` (SPEC §5.5): ask the user mid-Run and wait for the
@@ -4289,7 +4451,10 @@ impl Daemon {
                     }
                 }
             }
+            let jobs_waiting = self.config().is_ok_and(|c| c.daemon.keep_alive_for_jobs)
+                && self.with_store(|st| st.has_active_jobs()).unwrap_or(false);
             let busy = pending_running
+                || jobs_waiting
                 || !self.runs.lock().unwrap().is_empty()
                 || self.subscriber_count() > 0;
             if busy {
@@ -4331,10 +4496,15 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.mcp_loop().await })
         };
+        let jobs = {
+            let this = self.clone();
+            tokio::spawn(async move { this.job_loop().await })
+        };
         let result = self.accept_loop().await;
         logs.abort();
         artifact_gc.abort();
         mcp.abort();
+        jobs.abort();
         self.mcp.stop_all().await;
         relay.abort();
         optimiser.abort();

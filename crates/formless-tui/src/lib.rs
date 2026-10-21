@@ -132,6 +132,7 @@ enum Pending {
     ListMemories,
     RunMetrics,
     ListBuiltinStats,
+    ListJobs,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -788,6 +789,37 @@ impl App {
                                 ));
                             }
                         }
+                        Pending::ListJobs => {
+                            let list: Vec<formless_protocol::JobInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push("no scheduled jobs".into());
+                            }
+                            for j in list {
+                                self.notes.push(format!(
+                                    "job {} [{}] {} · next {} · last {} · {}",
+                                    j.id,
+                                    if !j.approved {
+                                        "awaiting approval"
+                                    } else if j.enabled {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    },
+                                    j.cron.as_deref().unwrap_or("once"),
+                                    j.next_run
+                                        .as_deref()
+                                        .map(|t| truncate_chars(t, 16))
+                                        .unwrap_or_else(|| "-".into()),
+                                    if j.last_status.is_empty() {
+                                        "-"
+                                    } else {
+                                        &j.last_status
+                                    },
+                                    truncate_chars(&j.prompt, 60)
+                                ));
+                            }
+                        }
                         Pending::ListMemories => {
                             let list: Vec<formless_protocol::MemoryInfo> =
                                 serde_json::from_value(result).unwrap_or_default();
@@ -1184,7 +1216,10 @@ impl App {
                 self.notes.push(format!("compacted: {summary_preview}"));
             }
             Event::Note { text, .. } => self.notes.push(text),
-            Event::McpServersChanged | Event::SkillsChanged | Event::MemoryUpdated => {}
+            Event::McpServersChanged
+            | Event::SkillsChanged
+            | Event::MemoryUpdated
+            | Event::JobsChanged => {}
             Event::SettingsChanged => {
                 if let Ok(cfg) = Config::load(&self.paths) {
                     self.model_label = cfg.provider.model;
@@ -1650,6 +1685,27 @@ impl App {
             "prompts" => self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts),
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
+            "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            cmd if cmd.starts_with("jobs ") => {
+                let mut words = cmd.split_whitespace().skip(1);
+                let (verb, id) = (
+                    words.next().unwrap_or_default(),
+                    words.next().unwrap_or_default().to_string(),
+                );
+                let req = match verb {
+                    "enable" | "approve" => Some(Request::SetJobEnabled { id: id.clone(), enabled: true }),
+                    "disable" => Some(Request::SetJobEnabled { id: id.clone(), enabled: false }),
+                    "rm" | "delete" => Some(Request::DeleteJob { id: id.clone() }),
+                    _ => None,
+                };
+                match req {
+                    Some(req) if !id.is_empty() => {
+                        self.fire(req);
+                        self.notes.push(format!("job {verb} {id}"));
+                    }
+                    _ => self.notes.push("usage: /jobs [enable|disable|rm ID]".into()),
+                }
+            }
             cmd if cmd.starts_with("memory ") => {
                 let mut words = cmd.split_whitespace().skip(1);
                 let (verb, id) = (
@@ -1776,7 +1832,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

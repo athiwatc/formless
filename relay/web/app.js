@@ -1325,6 +1325,19 @@
               if (await ask({ title: "Remove skill " + sk.name + "?", text: "All its versions are deleted.", ok: "Remove", danger: true })) { await act({ type: "remove_skill", name: sk.name }, "Removed " + sk.name); refreshSettings(); }
             } }, "Remove"))))))
         : h("p", { class: "muted" }, "None. Install one with formless skills add FOLDER | GIT_URL | FILE.zip")));
+    const jobs = S.jobs || [];
+    grid.append(h("section", null, h("h3", null, "Jobs"),
+      jobs.length ? h("table", { class: "table" },
+        h("tbody", null, jobs.map((j) => h("tr", null,
+          h("td", null, h("div", null, j.prompt),
+            h("div", { class: "muted" }, (j.cron || "once") + " · next " + (j.next_run ? new Date(j.next_run).toLocaleString() : "-") + (j.last_status ? " · last: " + j.last_status : "") + " · " + j.author)),
+          h("td", null,
+            h("button", { class: "btn small" + (j.enabled && j.approved ? "" : " primary"), type: "button", onclick: () => act({ type: "set_job_enabled", id: j.id, enabled: !(j.enabled && j.approved) }, "Updated").then(refreshSettings) },
+              !j.approved ? "Approve" : j.enabled ? "Disable" : "Enable"),
+            h("button", { class: "btn small danger", type: "button", onclick: async () => {
+              if (await ask({ title: "Delete this job?", text: j.prompt, ok: "Delete", danger: true })) { await act({ type: "delete_job", id: j.id }, "Deleted"); refreshSettings(); }
+            } }, "Delete"))))))
+        : h("p", { class: "muted" }, "None. The agent can schedule_run, or: formless jobs add PROMPT --cron \"0 3 * * *\"")));
     const memories = S.memories || [];
     grid.append(h("section", null, h("h3", null, "Memory"),
       h("p", { class: "muted" }, "Notes the agent keeps about your preferences; they go into new sessions' prompts."),
@@ -1395,6 +1408,7 @@
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
+    S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
     try {
       S.settings = await request({ type: "get_settings" });
     } catch (e) {
@@ -1794,6 +1808,7 @@
       case "mcp_servers_changed":
       case "skills_changed":
       case "memory_updated":
+      case "jobs_changed":
         refreshSettings();
         break;
       case "subagent_started":
