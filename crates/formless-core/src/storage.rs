@@ -238,6 +238,16 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedup ON memories(scope, dedup_key);
 ";
 
+/// Built-in calls, without payloads (SPEC §8.8).
+const SCHEMA_V20: &str = "
+CREATE TABLE IF NOT EXISTS builtin_calls (
+  name TEXT NOT NULL, session_id TEXT, run_id TEXT, ok INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT '', duration_ms INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_builtin_calls ON builtin_calls(name, created_at);
+CREATE INDEX IF NOT EXISTS idx_builtin_calls_run ON builtin_calls(run_id);
+";
+
 /// Applied memory-kind proposals move into the memory store (author
 /// `optimiser`, linked for rollback).
 const SCHEMA_V18: &str = "
@@ -270,7 +280,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -285,7 +295,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 19] = [
+const MIGRATIONS: [(i64, MigrationStep); 20] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -333,6 +343,7 @@ const MIGRATIONS: [(i64, MigrationStep); 19] = [
         add_column(c, "runs", "steps INTEGER NOT NULL DEFAULT 0")?;
         add_column(c, "runs", "followup TEXT NOT NULL DEFAULT ''")
     }),
+    (20, |c| Ok(c.execute_batch(SCHEMA_V20)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -764,6 +775,74 @@ impl Store {
             )
             .ok())
     }
+    /// Record a built-in call: outcome and a short kind, never its input
+    /// or output.
+    pub fn record_builtin_call(
+        &self,
+        name: &str,
+        session_id: &str,
+        run_id: &str,
+        ok: bool,
+        kind: &str,
+        duration_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO builtin_calls(name,session_id,run_id,ok,kind,duration_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![name, session_id, run_id, ok, kind, duration_ms, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this Run already had a `find_tools` call that found nothing.
+    pub fn run_had_empty_find(&self, run_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM builtin_calls WHERE run_id=?1 AND name='find_tools' AND kind='empty')",
+            params![run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Per built-in: calls, failures, and counts per kind.
+    pub fn builtin_stats(&self) -> Result<Vec<formless_protocol::BuiltinStatInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, kind, COUNT(*), SUM(ok=0), AVG(duration_ms) FROM builtin_calls GROUP BY name, kind ORDER BY name, kind",
+        )?;
+        let mut out: Vec<formless_protocol::BuiltinStatInfo> = Vec::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (name, kind, calls, failures, avg_ms) = row?;
+            if out.last().is_none_or(|s| s.name != name) {
+                out.push(formless_protocol::BuiltinStatInfo {
+                    name: name.clone(),
+                    ..Default::default()
+                });
+            }
+            let s = out.last_mut().unwrap();
+            s.total_ms += avg_ms * calls as f64;
+            s.calls += calls;
+            s.failures += failures;
+            if !kind.is_empty() {
+                s.kinds.insert(kind, calls);
+            }
+        }
+        for s in &mut out {
+            s.avg_ms = if s.calls > 0 {
+                s.total_ms / s.calls as f64
+            } else {
+                0.0
+            };
+        }
+        Ok(out)
+    }
+
     /// One model call made in a Run (a step).
     pub fn bump_run_steps(&self, run_id: &str) -> Result<()> {
         self.conn

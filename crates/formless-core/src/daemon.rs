@@ -485,6 +485,9 @@ impl Daemon {
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
             }
+            Request::ListBuiltinStats => Ok(serde_json::to_value(
+                self.with_reader(|st| st.builtin_stats())?,
+            )?),
             Request::RunMetrics { limit } => {
                 let runs = self.with_reader(|st| st.run_metrics(limit.unwrap_or(200)))?;
                 let summary = crate::runs::summarize(&runs);
@@ -1733,6 +1736,7 @@ impl Daemon {
         // broadcast their lifecycle here (registry Tools broadcast there).
         let bootstrap = toolreg::is_builtin(&tc.name);
         let started = std::time::Instant::now();
+        let mut created_kind = "";
         if bootstrap {
             self.broadcast(Event::ToolCallStarted {
                 session_id: session_id.to_string(),
@@ -1745,8 +1749,13 @@ impl Daemon {
         let text = match tc.name.as_str() {
             toolreg::CREATE_TOOL => match self.create_tool_impl(&args, cfg).await {
                 Ok((text, tool_id)) => {
-                    let _ = self
-                        .with_store(|st| st.load_session_tools(session_id, &[tool_id], "created"));
+                    let _ = self.with_store(|st| {
+                        st.load_session_tools(session_id, std::slice::from_ref(&tool_id), "created")
+                    });
+                    // The search missed a Tool this one duplicates (§8.8).
+                    if self.near_duplicate_after_empty_find(run_id, &tool_id, &args) {
+                        created_kind = "near-duplicate";
+                    }
                     text
                 }
                 Err(e) => format!("error: create_tool failed: {e}"),
@@ -1939,15 +1948,45 @@ impl Daemon {
             }
         };
         if bootstrap {
+            let elapsed_ms = started.elapsed().as_millis() as i64;
+            let (ok, kind) = builtin_outcome(&tc.name, &text);
+            let kind = if created_kind.is_empty() {
+                kind
+            } else {
+                created_kind
+            };
+            let _ = self.with_store(|st| {
+                st.record_builtin_call(&tc.name, session_id, run_id, ok, kind, elapsed_ms)
+            });
             self.broadcast(Event::ToolCallFinished {
                 session_id: session_id.to_string(),
                 run_id: run_id.to_string(),
                 tool_name: tc.name.clone(),
                 ok: !text.starts_with("error:"),
-                elapsed_ms: started.elapsed().as_millis() as i64,
+                elapsed_ms,
             });
         }
         text
+    }
+
+    /// After an empty `find_tools` in this Run, does the new Tool's
+    /// description now match another active Tool?
+    fn near_duplicate_after_empty_find(&self, run_id: &str, tool_id: &str, args: &Value) -> bool {
+        if !self
+            .with_store(|st| st.run_had_empty_find(run_id))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let query = format!(
+            "{} {}",
+            args["name"].as_str().unwrap_or_default().replace('_', " "),
+            args["description"].as_str().unwrap_or_default()
+        );
+        let method = self.config().map(|c| c.tools.search).unwrap_or_default();
+        self.with_store(|st| toolreg::search_tools_with(st, &query, 3, &method))
+            .map(|hits| hits.iter().any(|t| t.id != tool_id))
+            .unwrap_or(false)
     }
 
     /// Run one built-in or registry Tool call outside a model turn, as the
@@ -4673,5 +4712,35 @@ impl HostOps for NestedOps {
         f.write_all(chunk.as_bytes()).map_err(|e| e.to_string())?;
         *bytes += chunk.len() as i64;
         Ok(())
+    }
+}
+
+/// Outcome of a built-in call from its result text (no payload kept):
+/// whether it succeeded and a short kind for the failure or notable
+/// success (an empty `find_tools`, a failed `test_tool`).
+pub fn builtin_outcome(name: &str, text: &str) -> (bool, &'static str) {
+    if let Some(err) = text.strip_prefix("error:") {
+        let kind = if err.contains("syntax check failed") {
+            "syntax"
+        } else if err.contains("smoke test failed") {
+            "smoke"
+        } else if err.contains("schema") {
+            "schema"
+        } else if err.contains("denied") || err.contains("not approved") {
+            "denied"
+        } else if err.contains("invalid JSON arguments") {
+            "bad-arguments"
+        } else {
+            "error"
+        };
+        return (false, kind);
+    }
+    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    match name {
+        toolreg::FIND_TOOLS if v["tools"].as_array().is_some_and(|t| t.is_empty()) => {
+            (true, "empty")
+        }
+        toolreg::TEST_TOOL if v["ok"] == false => (false, "test-failed"),
+        _ => (true, ""),
     }
 }

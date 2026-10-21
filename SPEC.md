@@ -832,6 +832,24 @@ status. The outcomes are used in three places:
 - Skill measurement (§7.10) counts a completed Run that was later edited
   or corrected as unsuccessful.
 
+### 8.8 Built-in metrics
+
+Built-in calls are measured too, since they are the main signal for
+improving the bootstrap prompt and search. The `builtin_calls` table
+(schema v20) records the name, Session, Run, ok, duration and a short
+**kind**. It never stores input or output. The kinds are:
+
+- `create_tool`: `syntax`, `smoke` or `schema` failures, and
+  `near-duplicate`. A near-duplicate is a Tool created after an empty
+  `find_tools` in the same Run whose description matches another active
+  Tool, meaning the search missed it.
+- `find_tools`: `empty`.
+- `test_tool`: `test-failed`.
+- any built-in: `denied` and `error`.
+
+`ListBuiltinStats` returns calls, failures and kind counts per built-in,
+and the TUI Metrics view shows them in a "Built-ins" table.
+
 ## 9. Daemon Core
 
 ### 9.1 Lifecycle

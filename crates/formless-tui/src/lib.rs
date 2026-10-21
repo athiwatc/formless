@@ -131,6 +131,7 @@ enum Pending {
     ListSkills,
     ListMemories,
     RunMetrics,
+    ListBuiltinStats,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -453,6 +454,8 @@ struct App {
     model_stats: Vec<ModelStatInfo>,
     /// Run outcomes for the Metrics title (SPEC §8.7).
     run_summary: Option<formless_protocol::RunSummary>,
+    /// Built-in call stats (SPEC §8.8).
+    builtin_stats: Vec<formless_protocol::BuiltinStatInfo>,
     proposals: Vec<PromptProposalInfo>,
     proposal_idx: usize,
     editor: Option<EditorState>,
@@ -564,6 +567,7 @@ impl App {
             modules: Vec::new(),
             model_stats: Vec::new(),
             run_summary: None,
+            builtin_stats: Vec::new(),
             proposals: Vec::new(),
             proposal_idx: 0,
             editor: None,
@@ -676,6 +680,9 @@ impl App {
                                 self.search_idx = 0;
                                 self.view = View::Search;
                             }
+                        }
+                        Pending::ListBuiltinStats => {
+                            self.builtin_stats = serde_json::from_value(result).unwrap_or_default();
                         }
                         Pending::RunMetrics => {
                             self.run_summary =
@@ -1497,6 +1504,7 @@ impl App {
                     Pending::RunMetrics,
                     Request::RunMetrics { limit: Some(200) },
                 );
+                self.request(Pending::ListBuiltinStats, Request::ListBuiltinStats);
             }
             View::Proposals => self.request(Pending::ListProposals, Request::ListProposals),
             View::Chat | View::Settings | View::Search => {}
@@ -2992,12 +3000,63 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.model_stats.len() as u16 + 3
     };
+    let builtins_h = if app.builtin_stats.is_empty() {
+        0
+    } else {
+        app.builtin_stats.len().min(8) as u16 + 3
+    };
     let parts = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(detail_h),
         Constraint::Length(routing_h),
+        Constraint::Length(builtins_h),
     ])
     .split(area);
+    if !app.builtin_stats.is_empty() {
+        let mut stats: Vec<&formless_protocol::BuiltinStatInfo> =
+            app.builtin_stats.iter().collect();
+        stats.sort_by_key(|s| std::cmp::Reverse(s.calls));
+        let rows: Vec<Row> = stats
+            .iter()
+            .take(8)
+            .map(|s| {
+                let rate = (s.calls > 0).then(|| (s.calls - s.failures) as f64 / s.calls as f64);
+                Row::new(vec![
+                    Cell::from(s.name.clone()),
+                    Cell::from(Line::raw(s.calls.to_string()).right_aligned()),
+                    Cell::from(
+                        Line::styled(ui::rate_text(rate), ui::rate_style(app.color, rate))
+                            .right_aligned(),
+                    ),
+                    Cell::from(
+                        s.kinds
+                            .iter()
+                            .map(|(k, n)| format!("{k} {n}"))
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ),
+                ])
+            })
+            .collect();
+        f.render_widget(
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(20),
+                    Constraint::Length(7),
+                    Constraint::Length(8),
+                    Constraint::Min(10),
+                ],
+            )
+            .header(table_header(
+                &["BUILT-IN", "CALLS", "SUCCESS", "OUTCOMES"],
+                app.color,
+            ))
+            .column_spacing(2)
+            .block(ui::panel(" Built-ins ", app.color, Color::Green)),
+            parts[3],
+        );
+    }
     let mut sorted: Vec<&ToolInfo> = app.tools.iter().collect();
     sorted.sort_by_key(|t| std::cmp::Reverse(t.invocations));
     let rows: Vec<Row> = sorted
@@ -3966,6 +4025,7 @@ mod tests {
             modules: Vec::new(),
             model_stats: Vec::new(),
             run_summary: None,
+            builtin_stats: Vec::new(),
             proposals: Vec::new(),
             proposal_idx: 0,
             editor: None,
