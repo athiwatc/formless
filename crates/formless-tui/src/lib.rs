@@ -891,6 +891,11 @@ impl App {
                 self.notes.push(format!("compacted: {summary_preview}"));
             }
             Event::Note { text, .. } => self.notes.push(text),
+            Event::SettingsChanged => {
+                if let Ok(cfg) = Config::load(&self.paths) {
+                    self.model_label = cfg.provider.model;
+                }
+            }
             Event::ToolCallStarted {
                 session_id,
                 tool_name,

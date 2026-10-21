@@ -53,6 +53,14 @@ fn truncated_call_message(tool: &str) -> String {
     )
 }
 
+/// What identifies a version of config.toml on disk: (mtime, length).
+type ConfigStamp = Option<(std::time::SystemTime, u64)>;
+
+fn config_stamp(paths: &Paths) -> ConfigStamp {
+    let meta = std::fs::metadata(paths.config_file()).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 pub(crate) fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -80,6 +88,8 @@ pub struct Daemon {
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
     subs: Subs,
+    /// Parsed config.toml, re-read only when the file changes.
+    config: StdMutex<Option<(ConfigStamp, Config)>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -113,6 +123,7 @@ impl Daemon {
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
             contexts: StdMutex::new(HashMap::new()),
+            config: StdMutex::new(None),
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
@@ -124,6 +135,27 @@ impl Daemon {
         let mut subs = self.subs.lock().unwrap();
         subs.retain(|tx| !tx.is_closed());
         subs.len()
+    }
+
+    /// Current settings. config.toml is parsed again only when its
+    /// modification time or size changed (one `stat` per call otherwise),
+    /// and clients are told when that happens.
+    pub(crate) fn config(&self) -> Result<Config> {
+        let stamp = config_stamp(&self.paths);
+        let mut slot = self.config.lock().unwrap();
+        if let Some((cached, cfg)) = slot.as_ref() {
+            if *cached == stamp {
+                return Ok(cfg.clone());
+            }
+        }
+        let cfg = Config::load(&self.paths)?;
+        let changed = slot.is_some();
+        *slot = Some((stamp, cfg.clone()));
+        drop(slot);
+        if changed {
+            self.broadcast(Event::SettingsChanged);
+        }
+        Ok(cfg)
     }
 
     pub(crate) fn broadcast(&self, ev: Event) {
@@ -140,7 +172,7 @@ impl Daemon {
             Request::Ping => Ok(json!({"pong": true, "protocol": PROTOCOL_VERSION})),
             Request::Status => {
                 let sessions = self.with_store(|s| Ok(s.list_sessions()?.len()))?;
-                let auth = Config::load(&self.paths).map(|cfg| {
+                let auth = self.config().map(|cfg| {
                     let status = crate::auth::auth_status(&self.paths, &cfg.provider);
                     json!({
                         "mode": status.mode,
@@ -156,7 +188,7 @@ impl Daemon {
                     "auth": auth.ok(),
                 }))
             }
-            Request::GetSettings => Ok(Config::load(&self.paths)?.settings_summary(&self.paths)),
+            Request::GetSettings => Ok(self.config()?.settings_summary(&self.paths)),
             Request::Shutdown => {
                 let token = self.shutdown.clone();
                 tokio::spawn(async move {
@@ -331,7 +363,7 @@ impl Daemon {
                 let (info, ver) = self
                     .with_store(|st| st.get_tool_current(&id))?
                     .context("tool not found")?;
-                let cfg = Config::load(&self.paths)?;
+                let cfg = self.config()?;
                 let args = json!({
                     "name": info.name,
                     "description": info.description,
@@ -413,7 +445,7 @@ impl Daemon {
                 Ok(json!({"format": "formless.tools/1", "tools": tools}))
             }
             Request::ImportTool { bundle } => {
-                let cfg = Config::load(&self.paths)?;
+                let cfg = self.config()?;
                 if bundle["format"].as_str() == Some("formless.tools/1") {
                     let mut imported = Vec::new();
                     for b in bundle["tools"].as_array().cloned().unwrap_or_default() {
@@ -739,7 +771,7 @@ impl Daemon {
     /// timeout, and nothing awaits it, so Runs and requests never wait on
     /// the model. The result lands as a SessionUpdated event.
     fn maybe_name_session(self: &Arc<Self>, session_id: &str) {
-        let Ok(cfg) = Config::load(&self.paths) else {
+        let Ok(cfg) = self.config() else {
             return;
         };
         if !cfg.naming.enabled {
@@ -834,7 +866,7 @@ impl Daemon {
         cancel: &CancellationToken,
         cancel_flag: &Arc<AtomicBool>,
     ) -> Result<()> {
-        let cfg = Config::load(&self.paths)?;
+        let cfg = self.config()?;
         if !cfg.provider.is_configured() {
             return Err(anyhow!(
                 "provider not configured; run the onboarding wizard"
@@ -1377,7 +1409,7 @@ impl Daemon {
         name: &str,
         args: Value,
     ) -> String {
-        let cfg = match Config::load(&self.paths) {
+        let cfg = match self.config() {
             Ok(c) => c,
             Err(e) => return format!("error: {e}"),
         };
@@ -2765,7 +2797,8 @@ impl Daemon {
                 _ = self.shutdown.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
-            let grace = Config::load(&self.paths)
+            let grace = self
+                .config()
                 .map(|c| c.daemon.idle_grace_secs)
                 .unwrap_or(60);
             if grace == u64::MAX {
@@ -2778,7 +2811,7 @@ impl Daemon {
                 .values()
                 .any(|e| e.result.lock().unwrap().is_none());
             // Stall warnings (SPEC §6.1): advisory only, never auto-kill.
-            if let Ok(cfg) = Config::load(&self.paths) {
+            if let Ok(cfg) = self.config() {
                 let stall_ms = cfg.daemon.stall_warning_secs.saturating_mul(1000);
                 let now = epoch_ms();
                 let entries: Vec<(String, Arc<PendingEntry>)> = self

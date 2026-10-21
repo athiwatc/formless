@@ -44,7 +44,7 @@ impl Daemon {
                 _ = self.shutdown.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
             }
-            let Ok(cfg) = Config::load(&self.paths) else {
+            let Ok(cfg) = self.config() else {
                 continue;
             };
             if !cfg.provider.is_configured() {
@@ -87,7 +87,7 @@ impl Daemon {
     }
 
     pub(crate) async fn run_optimiser_now(self: Arc<Self>, tool_id: Option<String>) {
-        let Ok(cfg) = Config::load(&self.paths) else {
+        let Ok(cfg) = self.config() else {
             return;
         };
         if !cfg.provider.is_configured() {
@@ -111,7 +111,7 @@ impl Daemon {
     }
 
     pub(crate) async fn generate_and_measure_proposal(self: Arc<Self>) {
-        let Ok(cfg) = Config::load(&self.paths) else {
+        let Ok(cfg) = self.config() else {
             return;
         };
         if !cfg.provider.is_configured() {
@@ -227,7 +227,7 @@ impl Daemon {
     /// Apply gate: only measured proposals that beat the baseline by the
     /// configured promotion margin (or match a perfect baseline) apply.
     pub(crate) fn apply_proposal_checked(&self, id: &str) -> Result<Option<PromptProposalInfo>> {
-        let cfg = Config::load(&self.paths)?;
+        let cfg = self.config()?;
         let Some(p) = self.with_store(|st| st.get_proposal(id))? else {
             return Ok(None);
         };
@@ -435,7 +435,7 @@ impl Daemon {
         kind: String,
         approved: bool,
     ) {
-        let Ok(cfg) = Config::load(&self.paths) else {
+        let Ok(cfg) = self.config() else {
             return;
         };
         let Ok(Some(attempt)) = self.with_store(|st| st.get_attempt(&attempt_id)) else {
