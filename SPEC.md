@@ -1233,6 +1233,17 @@ run_tool = "network_policy"     # a registry Tool, or…
   used only when the terminal is at least 110 columns wide; narrower
   terminals fall back to the single-column chat automatically.
 
+- **Web shortcuts.** The web client mirrors the TUI where a browser
+  allows. Tab stays focus navigation, so views switch with `1`–`5` and
+  `[` / `]`.
+  - `j`/`k` (or ↓/↑) move through Sessions (Chat) or Tools (Tools).
+  - `/` focuses the message box and `n` starts a new Session.
+  - On the selected Tool: `x` retire/restore, `b` roll back one version,
+    `e` export, `o` optimise, `p` purge (typed confirmation).
+  - `?` shows a help overlay built from the same table.
+  Shortcuts never fire while typing or while a dialog is open. Approvals
+  keep `y`/`o`/`n`.
+
 ### 10.6 Live feedback (v2)
 
 - **Live call tree:** `ToolCallStarted.depth` gives a call's `tools.call`

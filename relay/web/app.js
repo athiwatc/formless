@@ -2186,12 +2186,57 @@
     const sb = $("sidebar");
     if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== $("menu-btn")) closeSidebar();
   });
+  // Keyboard shortcuts (SPEC §10.5): one table drives both the handler
+  // and the `?` overlay. Keys mirror the TUI where a browser allows: Tab
+  // stays focus navigation, so views move with 1–5 and [ ].
+  const VIEWS = ["chat", "tools", "metrics", "proposals", "settings"];
+  const selectedTool = () => S.tools.find((t) => t.id === S.selectedTool);
+  function moveSelection(delta) {
+    if (S.view === "tools") {
+      const list = S.tools;
+      if (!list.length) return;
+      const i = list.findIndex((t) => t.id === S.selectedTool);
+      selectTool(list[Math.max(0, Math.min(list.length - 1, (i < 0 ? 0 : i + delta)))].id);
+    } else {
+      const list = S.sessions;
+      if (!list.length) return;
+      const i = list.findIndex((s) => s.id === S.current);
+      openSession(list[Math.max(0, Math.min(list.length - 1, (i < 0 ? 0 : i + delta)))].id);
+    }
+  }
+  const SHORTCUTS = [
+    { keys: ["/"], help: "focus the message box", run: () => { if (S.view !== "chat") setView("chat"); $("input").focus(); } },
+    { keys: ["?"], help: "this help", run: () => showShortcuts() },
+    { keys: ["1", "2", "3", "4", "5"], help: "Chat · Tools · Metrics · Proposals · Settings", run: (k) => setView(VIEWS[Number(k) - 1]) },
+    { keys: ["[", "]"], help: "previous / next view (TUI Shift+Tab / Tab)", run: (k) => setView(VIEWS[(VIEWS.indexOf(S.view) + (k === "]" ? 1 : VIEWS.length - 1)) % VIEWS.length]) },
+    { keys: ["j", "ArrowDown"], help: "next Session (Chat) or Tool (Tools)", run: () => moveSelection(1) },
+    { keys: ["k", "ArrowUp"], help: "previous Session or Tool", run: () => moveSelection(-1) },
+    { keys: ["n"], help: "new Session", run: () => newSession() },
+    { keys: ["x"], view: "tools", help: "retire / restore the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name); } },
+    { keys: ["b"], view: "tools", help: "roll the selected Tool back one version", run: () => { const t = selectedTool(); if (t && t.current_version > 1) rollbackTool(t, t.current_version - 1); } },
+    { keys: ["e"], view: "tools", help: "export the selected Tool", run: () => { const t = selectedTool(); if (t) exportTool(t); } },
+    { keys: ["o"], view: "tools", help: "optimise the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name); } },
+    { keys: ["p"], view: "tools", help: "purge the selected Tool (typed confirmation)", run: () => { const t = selectedTool(); if (t) purgeTool(t); } },
+  ];
+  function showShortcuts() {
+    const keyName = (k) => (k === "ArrowDown" ? "↓" : k === "ArrowUp" ? "↑" : k);
+    const lines = SHORTCUTS.map((s) => s.keys.map(keyName).join(" ") + "  —  " + (s.view ? "(" + s.view + ") " : "") + s.help);
+    lines.push("", "Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · Esc close or stop", "Approvals: y always · o once · n deny");
+    ask({ title: "Keyboard shortcuts", text: lines.join("\n"), ok: "Close" });
+  }
+  const typingIn = (el) => el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
+
   document.addEventListener("keydown", (e) => {
     const modalOpen = !$("modal-backdrop").classList.contains("hidden");
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
       if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
+    }
+    const dialogOpen = modalOpen || !$("ask-backdrop").classList.contains("hidden");
+    if (!dialogOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !typingIn(document.activeElement) && S.channel) {
+      const sc = SHORTCUTS.find((s) => s.keys.includes(e.key) && (!s.view || s.view === S.view));
+      if (sc) { e.preventDefault(); sc.run(e.key); return; }
     }
     if (e.key === "Escape") {
       if (!$("ask-backdrop").classList.contains("hidden")) closeAsk(null);

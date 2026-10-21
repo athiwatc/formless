@@ -383,3 +383,6 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .run-banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 10px; margin-bottom: 6px;
   border: 1px solid var(--warn, #e0b050); border-radius: 6px; font-size: 13px; }
 .run-banner span { flex: 1; min-width: 200px; }
+
+/* Multi-line dialog text (shortcut help, questions) */
+#ask-text { white-space: pre-wrap; font-variant-numeric: tabular-nums; }
