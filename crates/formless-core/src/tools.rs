@@ -19,7 +19,8 @@ pub const FIND_TOOLS: &str = "find_tools";
 pub const READ_TOOL: &str = "read_tool";
 pub const TEST_TOOL: &str = "test_tool";
 pub const UNLOAD_TOOLS: &str = "unload_tools";
-pub const RESERVED: [&str; 11] = [
+pub const READ_MODULE: &str = "read_module";
+pub const RESERVED: [&str; 12] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -31,6 +32,7 @@ pub const RESERVED: [&str; 11] = [
     READ_TOOL,
     TEST_TOOL,
     UNLOAD_TOOLS,
+    READ_MODULE,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -227,6 +229,24 @@ fn find_tools_definition() -> Value {
                     "limit": {"type": "integer", "description": "Max results (default 8, max 25)"}
                 },
                 "required": ["query"]
+            }
+        }
+    })
+}
+
+fn read_module_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": READ_MODULE,
+            "description": "Read a shared module's source (implementation_js), description, version history and the Tools that require it. Read a module before creating a new version of it. find_tools also lists matching modules.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "version": {"type": "integer", "description": "Optional; defaults to the current version"}
+                },
+                "required": ["name"]
             }
         }
     })
@@ -529,6 +549,7 @@ pub fn tool_definitions(
         find_tools_definition(),
         read_tool_definition(),
         unload_tools_definition(),
+        read_module_definition(),
         test_tool_definition(),
         pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
         pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),

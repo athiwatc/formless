@@ -1389,6 +1389,10 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: find_tools failed: {e}"),
             },
+            toolreg::READ_MODULE => match self.read_module_impl(&args) {
+                Ok(text) => text,
+                Err(e) => format!("error: read_module failed: {e}"),
+            },
             toolreg::UNLOAD_TOOLS => {
                 let names: Vec<String> = args["names"]
                     .as_array()
@@ -2199,8 +2203,27 @@ impl Daemon {
                 })
             })
             .collect();
+        // Shared modules match too, so the agent reuses (and reads, with
+        // read_module) a helper instead of rewriting it.
+        let words: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3)
+            .map(str::to_lowercase)
+            .collect();
+        let modules: Vec<Value> = self
+            .with_store(|st| st.list_modules())?
+            .into_iter()
+            .filter(|m| !m.retired)
+            .filter(|m| {
+                let hay = format!("{} {}", m.name, m.description).to_lowercase();
+                words.iter().any(|w| hay.contains(w.as_str()))
+            })
+            .take(limit)
+            .map(|m| json!({"name": m.name, "description": m.description, "version": m.current_version}))
+            .collect();
         Ok(json!({
             "tools": tools,
+            "modules": modules,
             "upgraded": upgraded,
             "note": if tools.is_empty() {
                 "No matching Tool; create one."
@@ -2227,6 +2250,35 @@ impl Daemon {
             }
         }
         Ok(notes)
+    }
+
+    fn read_module_impl(&self, args: &Value) -> Result<String> {
+        let name = args["name"].as_str().context("name required")?;
+        let (info, _) = self
+            .with_store(|st| st.get_module_by_name(name))?
+            .with_context(|| format!("no module named '{name}'"))?;
+        let (versions, dependents) = self.with_store(|st| {
+            Ok((
+                st.module_versions(&info.id)?,
+                st.module_dependents(&info.name)?,
+            ))
+        })?;
+        let want = args["version"].as_i64().unwrap_or(info.current_version);
+        let (version, code, ..) = versions
+            .iter()
+            .find(|v| v.0 == want)
+            .with_context(|| format!("module '{name}' has no version {want}"))?;
+        Ok(json!({
+            "name": info.name,
+            "description": info.description,
+            "version": version,
+            "current_version": info.current_version,
+            "retired": info.retired,
+            "versions": versions.iter().map(|(v, _, a, c)| json!({"version": v, "author": a, "created_at": c})).collect::<Vec<_>>(),
+            "implementation_js": code,
+            "required_by": dependents,
+        })
+        .to_string())
     }
 
     fn read_tool_impl(&self, session_id: &str, args: &Value) -> Result<String> {

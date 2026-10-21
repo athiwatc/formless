@@ -291,14 +291,18 @@ pattern (§4.4).
 - The **agent writes the JavaScript** (plain JS; QuickJS has no TypeScript).
 - **Built-ins (v2.2).** The minimal set the harness needs to grow itself:
   `create_tool`, `create_module`, `retire_tool`,
-  `find_tools`, `read_tool`, `test_tool`, and the Pending Invocation
-  handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
+  `find_tools`, `read_tool`, `read_module`, `test_tool`, `unload_tools`,
+  and the Pending Invocation handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
   former built-in; sub-agents are now the `agent` Capability, §7.6), so no
   registry Tool can impersonate one.
-  - `find_tools(query, limit?)` — keyword search over active Tools (names
-    outrank descriptions; ties go to the more used, more reliable Tool).
+  - `find_tools(query, limit?)` — ranked search over active Tools
+    (`tools.search`; ties go to the more used, more reliable Tool).
     Matches are **loaded** into the Session and become callable functions
-    from the next step.
+    from the next step. Matching shared modules are listed too.
+  - `read_module(name, version?)` — a module's source, description,
+    version list and the Tools that require it.
+  - `unload_tools(names)` — drop Tools from the Session's listing at its
+    next compaction.
   - `read_tool(name, version?)` — the full definition (code, schemas,
     Capabilities, `memory_mb`), version list, metrics and the last few
     failures, so a new version is built from the real code.
