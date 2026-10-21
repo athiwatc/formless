@@ -252,6 +252,8 @@ Type a task at the bottom and press **Enter**. Formless starts with only `create
 | Key | Action |
 |---|---|
 | `Enter` | send the message, or steer the Run that is in flight |
+| `/copy`, `/copy code [n]` | copy the last answer or one of its code blocks (OSC 52, works over SSH) |
+| `/mouse` | release the mouse so you can select text with the terminal (again: wheel scrolling back) |
 | `Ctrl+J` (or `Ctrl+Enter` / `Alt+Enter`) | queue the message for after the current Run; `Ctrl+Enter` needs a terminal with the kitty keyboard protocol (kitty, WezTerm, Ghostty, recent iTerm2) |
 | `Esc` | stop the current Run / leave a dialog |
 | `Tab` / `Shift+Tab` | cycle views (Chat, Sessions, Tools, Metrics, Proposals, Settings) — the bar at the top shows where you are |

@@ -487,6 +487,8 @@ struct App {
     /// The terminal reports Ctrl+Enter apart from Enter (kitty keyboard
     /// protocol); otherwise queueing uses Ctrl+J / Alt+Enter.
     enhanced_keys: bool,
+    /// Mouse capture (wheel scrolling); off lets the terminal select text.
+    mouse_capture: bool,
     /// Sessions with a Run in flight; run state is per session, not global.
     running_sessions: std::collections::HashSet<String>,
     notes: Vec<String>,
@@ -620,6 +622,7 @@ impl App {
             input: String::new(),
             ctrl_c_at: None,
             enhanced_keys: false,
+            mouse_capture: true,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -1922,6 +1925,22 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            "copy" => self.copy_cmd(""),
+            cmd if cmd.starts_with("copy ") => self.copy_cmd(cmd[5..].trim()),
+            "mouse" => {
+                self.mouse_capture = !self.mouse_capture;
+                let mut out = stdout();
+                if self.mouse_capture {
+                    let _ = out.execute(crossterm::event::EnableMouseCapture);
+                } else {
+                    let _ = out.execute(crossterm::event::DisableMouseCapture);
+                }
+                self.notes.push(if self.mouse_capture {
+                    "mouse on: the wheel scrolls the chat (/mouse to select text instead)".into()
+                } else {
+                    "mouse off: drag to select and copy text with your terminal (/mouse for wheel scrolling)".into()
+                });
+            }
             "open" => self.open_artifact(""),
             cmd if cmd.starts_with("open ") => self.open_artifact(cmd[5..].trim()),
             "undo" => match self.last_deleted.take() {
@@ -2180,7 +2199,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /quit".into(),
+                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -3084,7 +3103,79 @@ fn is_queue_key(key: &KeyEvent) -> bool {
 /// How soon a second Ctrl+C must follow the first to detach.
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Fenced code blocks in Markdown text, in order (fence lines dropped).
+fn code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            match current.take() {
+                Some(lines) => blocks.push(lines.join("\n")),
+                None => current = Some(Vec::new()),
+            }
+        } else if let Some(lines) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    blocks
+}
+
+/// OSC 52: the terminal puts `text` on the clipboard (works over SSH;
+/// inside tmux it needs passthrough, `set -g allow-passthrough on`).
+fn osc52(text: &str) -> String {
+    use base64::Engine;
+    let seq = format!(
+        "\x1b]52;c;{}\x07",
+        base64::engine::general_purpose::STANDARD.encode(text)
+    );
+    if std::env::var_os("TMUX").is_some() {
+        format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
+    } else {
+        seq
+    }
+}
+
 impl App {
+    /// `/copy` (last answer) or `/copy code [n]` (its n-th code block,
+    /// default the last): to the clipboard via OSC 52, and the OS
+    /// clipboard too when this is a local terminal.
+    fn copy_cmd(&mut self, arg: &str) {
+        let Some(last) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+        else {
+            self.notes.push("nothing to copy yet".into());
+            return;
+        };
+        let (text, what) = if let Some(rest) = arg.strip_prefix("code") {
+            let blocks = code_blocks(&last.content);
+            let n = rest.trim().parse::<usize>().unwrap_or(blocks.len());
+            match blocks.get(n.wrapping_sub(1)) {
+                Some(b) => (b.clone(), format!("code block {n} of {}", blocks.len())),
+                None => {
+                    self.notes.push(format!(
+                        "the last answer has {} code block(s)",
+                        blocks.len()
+                    ));
+                    return;
+                }
+            }
+        } else {
+            (last.content.clone(), "the last answer".to_string())
+        };
+        use std::io::Write;
+        let mut out = stdout();
+        let _ = out.write_all(osc52(&text).as_bytes());
+        let _ = out.flush();
+        if std::env::var_os("SSH_CONNECTION").is_none() {
+            let _ = formless_runtime::clipboard_write(&text);
+        }
+        self.notes
+            .push(format!("copied {what} ({} chars)", text.chars().count()));
+    }
+
     /// The queue binding to advertise: one that works in this terminal.
     fn queue_label(&self) -> &'static str {
         if self.enhanced_keys {
@@ -4699,6 +4790,7 @@ mod tests {
             input: String::new(),
             ctrl_c_at: None,
             enhanced_keys: false,
+            mouse_capture: true,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -5377,5 +5469,17 @@ mod tests {
         assert_eq!(app.queue_label(), "Ctrl+J", "advertise what works");
         app.enhanced_keys = true;
         assert_eq!(app.queue_label(), "Ctrl+Enter");
+    }
+
+    #[test]
+    fn code_blocks_and_osc52() {
+        let md = "Intro\n```rust\nfn a() {}\n```\ntext\n```\nls -la\necho hi\n```\n";
+        assert_eq!(
+            code_blocks(md),
+            vec!["fn a() {}".to_string(), "ls -la\necho hi".to_string()]
+        );
+        assert!(code_blocks("no code").is_empty());
+        let seq = osc52("hi");
+        assert!(seq.contains("]52;c;aGk="), "{seq:?}");
     }
 }
