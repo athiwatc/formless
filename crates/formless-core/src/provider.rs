@@ -420,6 +420,45 @@ impl Provider {
         Ok(self.complete_with_usage(messages, model, effort).await?.0)
     }
 
+    /// Resolve attachment markers (`_attachments` on user messages, from
+    /// `storage::provider_message`): images become `image_url` parts for
+    /// a vision model on Chat Completions; otherwise only the reference
+    /// line in the text remains. The marker never reaches the endpoint.
+    pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
+        use base64::Engine;
+        let vision = !self.cfg.responses()
+            && !self.cfg.prompt_tools()
+            && self.cfg.vision.unwrap_or_else(|| is_vision_model(model));
+        messages
+            .iter()
+            .map(|m| {
+                let Some(atts) = m.get("_attachments").and_then(Value::as_array) else {
+                    return m.clone();
+                };
+                let mut m = m.clone();
+                m.as_object_mut().map(|o| o.remove("_attachments"));
+                if !vision {
+                    return m;
+                }
+                let mut parts = vec![json!({"type": "text", "text": m["content"]})];
+                for a in atts {
+                    let (Some(path), Some(mime)) = (a["path"].as_str(), a["mime"].as_str()) else {
+                        continue;
+                    };
+                    match std::fs::read(path) {
+                        Ok(bytes) if bytes.len() <= MAX_IMAGE_BYTES => {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                            parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}));
+                        }
+                        _ => {}
+                    }
+                }
+                m["content"] = json!(parts);
+                m
+            })
+            .collect()
+    }
+
     /// [`Provider::complete`] plus the reported token usage.
     pub async fn complete_with_usage(
         &self,
@@ -583,6 +622,8 @@ impl Provider {
         cancel: &CancellationToken,
         mut on_delta: F,
     ) -> Result<ChatResult> {
+        let prepared = self.prepare_attachments(messages, model);
+        let messages: &[Value] = &prepared;
         // Prompt-based fallback: describe tools in-band, send none natively,
         // and buffer content so tool-call JSON never streams to the user.
         let prompt_mode = self.cfg.prompt_tools() && !tools.is_empty();
@@ -900,6 +941,36 @@ impl Provider {
         )
         .await
     }
+}
+
+/// Largest image sent inline to a vision model.
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A guess at whether a model accepts image input, from its name.
+pub fn is_vision_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    [
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "o3",
+        "o4",
+        "claude",
+        "gemini",
+        "vision",
+        "-vl",
+        "vl-",
+        "llava",
+        "pixtral",
+        "llama-4",
+        "llama4",
+        "gemma-3",
+        "gemma3",
+        "minicpm-v",
+        "moondream",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
 fn parse_models(body: &Value) -> Vec<String> {

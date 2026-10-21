@@ -147,6 +147,8 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+    /// Files attached to each Session's next user message (SPEC §5.6).
+    attachments: StdMutex<HashMap<String, Vec<Value>>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
@@ -196,6 +198,7 @@ impl Daemon {
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             questions: Arc::new(StdMutex::new(HashMap::new())),
+            attachments: StdMutex::new(HashMap::new()),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
@@ -488,6 +491,15 @@ impl Daemon {
                 let files = crate::skills::files(&dir)?;
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
+            }
+            Request::AttachFile {
+                session_id,
+                name,
+                data_b64,
+                mime,
+            } => {
+                let r = self.attach_file(&session_id, &name, &data_b64, mime)?;
+                Ok(r)
             }
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
@@ -1021,7 +1033,7 @@ impl Daemon {
             }
             (true, _) => {
                 // Steer (Enter) or Send-while-busy: persist + notify run (SPEC §5.3).
-                let msg = self.with_store(|st| st.append_message(&session_id, "user", &content))?;
+                let msg = self.append_user_message(&session_id, &content)?;
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
@@ -1036,7 +1048,7 @@ impl Daemon {
                     let _ =
                         self.with_store(|st| st.mark_last_run_followup(&session_id, "corrected"));
                 }
-                let msg = self.with_store(|st| st.append_message(&session_id, "user", &content))?;
+                let msg = self.append_user_message(&session_id, &content)?;
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
@@ -1132,8 +1144,7 @@ impl Daemon {
             .ok()
             .flatten();
         if let Some(content) = next {
-            if let Ok(msg) = self.with_store(|st| st.append_message(&session_id, "user", &content))
-            {
+            if let Ok(msg) = self.append_user_message(&session_id, &content) {
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
@@ -2834,6 +2845,71 @@ impl Daemon {
         self.with_store(|st| st.get_skill(name))?
             .filter(|s| s.enabled && !s.retired)
             .with_context(|| format!("no enabled skill named '{name}'"))
+    }
+
+    /// Store an attachment as a Session artifact and hold it for the
+    /// Session's next user message.
+    fn attach_file(
+        &self,
+        session_id: &str,
+        name: &str,
+        data_b64: &str,
+        mime: Option<String>,
+    ) -> Result<Value> {
+        use base64::Engine;
+        self.with_store(|st| st.get_session(session_id))?
+            .context("session not found")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_b64.trim())
+            .context("attachment is not valid base64")?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(anyhow!(
+                "attachment is larger than {} MB",
+                MAX_ATTACHMENT_BYTES / 1024 / 1024
+            ));
+        }
+        let name = std::path::Path::new(name)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "attachment".into());
+        let mime = mime
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| guess_mime(&name).to_string());
+        let dir = self.paths.data_dir.join("artifacts");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}-{name}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, &bytes)?;
+        let path_s = path.to_string_lossy().into_owned();
+        let id = self.with_store(|st| {
+            st.save_artifact(
+                Some(session_id),
+                &path_s,
+                &format!("attachment: {name}"),
+                bytes.len() as i64,
+            )
+        })?;
+        let att =
+            json!({"id": id, "name": name, "mime": mime, "bytes": bytes.len(), "path": path_s});
+        self.attachments
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .push(att.clone());
+        Ok(json!({"id": id, "name": name, "mime": mime, "bytes": bytes.len()}))
+    }
+
+    /// Append a user message, carrying the Session's pending attachments.
+    fn append_user_message(&self, session_id: &str, content: &str) -> Result<MessageInfo> {
+        let atts = self
+            .attachments
+            .lock()
+            .unwrap()
+            .remove(session_id)
+            .unwrap_or_default();
+        let meta = (!atts.is_empty()).then(|| json!({"attachments": atts}).to_string());
+        self.with_store(|st| st.append_message_meta(session_id, "user", content, meta))
     }
 
     /// `schedule_run` (SPEC §9.7): a one-shot job is scheduled at once; a
@@ -5027,5 +5103,27 @@ pub fn builtin_outcome(name: &str, text: &str) -> (bool, &'static str) {
         }
         toolreg::TEST_TOOL if v["ok"] == false => (false, "test-failed"),
         _ => (true, ""),
+    }
+}
+
+/// Largest attachment accepted (SPEC §5.6).
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// A MIME type from a file name's extension.
+pub fn guess_mime(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or_default().to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "md" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "txt" | "log" | "rs" | "py" | "js" | "ts" | "toml" | "yaml" | "yml" | "sh" | "go" | "c"
+        | "h" | "java" | "sql" | "xml" => "text/plain",
+        _ => "application/octet-stream",
     }
 }

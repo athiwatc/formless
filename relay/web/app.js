@@ -1975,6 +1975,22 @@
     if (!panel.classList.contains("hidden")) { S.unread = 0; renderStatus(); }
   };
   $("notes-close").onclick = () => $("notes-panel").classList.add("hidden");
+  // Attachments (SPEC §5.6): stored by the daemon, sent with the next message.
+  async function attachFiles(files) {
+    if (!S.current) { note("Open a session first", true); return; }
+    for (const file of files) {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      const r = await act({ type: "attach_file", session_id: S.current, name: file.name || "pasted-image.png", data_b64: btoa(bin), mime: file.type || null });
+      if (r) note("attached " + r.name + " (" + Math.round(r.bytes / 1024) + " KB); it goes with your next message");
+    }
+  }
+  $("attach-input").addEventListener("change", (e) => { attachFiles([...e.target.files]); e.target.value = ""; });
+  $("input").addEventListener("paste", (e) => {
+    const files = [...((e.clipboardData && e.clipboardData.files) || [])];
+    if (files.length) { e.preventDefault(); attachFiles(files); }
+  });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
   $("input").addEventListener("input", autosize);
   $("input").addEventListener("keydown", (e) => {

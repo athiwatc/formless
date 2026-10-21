@@ -212,6 +212,10 @@ pub struct ProviderCfg {
     /// Credential mode: API key (default) or OAuth2 subscription login.
     #[serde(default)]
     pub auth: AuthCfg,
+    /// Send attached images to the model as image parts. Unset: guessed
+    /// from the model name (see `provider::is_vision_model`).
+    #[serde(default)]
+    pub vision: Option<bool>,
     /// Seconds without any bytes from an open provider stream before
     /// clients are told it looks stalled (0 = never).
     pub stall_notice_secs: u64,
@@ -290,6 +294,7 @@ impl Default for ProviderCfg {
             routing_strong_models: Vec::new(),
             routing_complex_chars: default_routing_complex_chars(),
             auth: AuthCfg::default(),
+            vision: None,
             stall_notice_secs: 120,
             first_byte_timeout_secs: 0,
             max_backoff_secs: 30,

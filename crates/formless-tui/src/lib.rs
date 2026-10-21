@@ -1686,6 +1686,39 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            cmd if cmd.starts_with("attach ") => {
+                let path = cmd["attach ".len()..].trim().trim_matches(['"', '\'']);
+                let path = match path.strip_prefix("~/") {
+                    Some(rest) => std::env::var("HOME")
+                        .map(|h| format!("{h}/{rest}"))
+                        .unwrap_or_else(|_| path.to_string()),
+                    None => path.to_string(),
+                };
+                let Some(session_id) = self.current.clone() else {
+                    self.notes.push("open a session first".into());
+                    return;
+                };
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let name = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "attachment".into());
+                        self.notes.push(format!(
+                            "attached {name} ({} KB); it goes with your next message",
+                            bytes.len() / 1024
+                        ));
+                        self.fire(Request::AttachFile {
+                            session_id,
+                            name,
+                            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                            mime: None,
+                        });
+                    }
+                    Err(e) => self.notes.push(format!("cannot attach {path}: {e}")),
+                }
+            }
             cmd if cmd.starts_with("jobs ") => {
                 let mut words = cmd.split_whitespace().skip(1);
                 let (verb, id) = (
@@ -1832,7 +1865,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

@@ -251,6 +251,26 @@ in-flight state carry on.
 - With no client connected, `ask_user` fails at once with an error
   telling the agent to proceed on a stated assumption.
 
+### 5.6 Attachments
+
+Users attach files and screenshots to their next message instead of
+pasting paths.
+
+- **Clients:** in the TUI, `/attach PATH` reads the file on the client's
+  machine. The web composer has a 📎 file picker and accepts pasted
+  images.
+- **`AttachFile {session_id, name, data_b64, mime?}`** stores the file as
+  an artifact of that Session (20 MB max; the MIME type is guessed from
+  the extension when not given). The file waits for the Session's next
+  user message, whether sent, steered or queued, and is recorded in that
+  message's metadata.
+- **What the model sees:** each attachment adds a reference line to the
+  message, `[attached: name (mime, bytes), artifact ID; read it with
+  read_artifact]`. Images also go inline as `image_url` parts (8 MB max)
+  when the model accepts images: `provider.vision`, or a guess from the
+  model name when unset. This works on Chat Completions with native tool
+  calling; elsewhere the reference line alone is sent.
+
 ## 6. Invocations: async by design
 
 ### 6.1 Execution model
