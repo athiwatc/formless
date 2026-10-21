@@ -728,6 +728,13 @@ impl App {
                 self.set_activity("responding");
                 self.streaming.push_str(&delta);
             }
+            Event::StreamRestarted { session_id, .. } => {
+                if self.is_current(&session_id) {
+                    self.streaming.clear();
+                    self.thinking.clear();
+                    self.notes.push("provider stream dropped; retrying".into());
+                }
+            }
             Event::ReasoningDelta {
                 session_id, delta, ..
             } => {

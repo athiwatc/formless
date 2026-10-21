@@ -339,6 +339,12 @@ pub enum Event {
         run_id: String,
         message: MessageInfo,
     },
+    /// The provider stream dropped and the request is being re-sent:
+    /// clients discard the partial answer and reasoning shown so far.
+    StreamRestarted {
+        session_id: String,
+        run_id: String,
+    },
     RunFinished {
         session_id: String,
         run_id: String,
@@ -438,6 +444,7 @@ impl Event {
             | Event::MessageDelta { session_id, .. }
             | Event::ReasoningDelta { session_id, .. }
             | Event::MessageComplete { session_id, .. }
+            | Event::StreamRestarted { session_id, .. }
             | Event::RunFinished { session_id, .. }
             | Event::RunPaused { session_id, .. }
             | Event::CompactionNotice { session_id, .. }

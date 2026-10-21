@@ -83,6 +83,9 @@ pub struct ChatResult {
 pub enum DeltaKind {
     Content,
     Reasoning,
+    /// The stream dropped and the request is being re-sent: discard the
+    /// partial content and reasoning delivered so far (text is empty).
+    Restart,
 }
 
 /// Convert Chat-Completions messages to Responses-API input items.
@@ -530,7 +533,26 @@ impl Provider {
                     _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                     next = stream.next() => {
                         let Some(chunk) = next else { break };
-                        let chunk = chunk.context("stream read")?;
+                        let chunk = match chunk {
+                            Ok(chunk) => chunk,
+                            // A dropped stream is retried like a failed request
+                            // (SPEC §4.4); partial output is discarded, and
+                            // clients are told to clear what they showed.
+                            Err(e) if attempt < self.cfg.max_retries => {
+                                tracing::warn!("provider stream dropped ({e}); re-sending the request");
+                                if !content.is_empty() || !reasoning.is_empty() {
+                                    on_delta(DeltaKind::Restart, "");
+                                }
+                                content.clear();
+                                reasoning.clear();
+                                tool_calls.clear();
+                                truncated = false;
+                                tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
+                                attempt += 1;
+                                continue 'request;
+                            }
+                            Err(e) => return Err(e).context("stream read"),
+                        };
                         buf.extend_from_slice(&chunk);
                         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                             let raw: Vec<u8> = buf.drain(..=pos).collect();

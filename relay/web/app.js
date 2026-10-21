@@ -1513,6 +1513,9 @@
       case "message_delta":
         if (here) { S.streaming += ev.delta; if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else renderLive(); }
         break;
+      case "stream_restarted":
+        if (here) { S.streaming = ""; S.thinking = ""; note("provider stream dropped; retrying"); renderLive(); }
+        break;
       case "reasoning_delta":
         if (here) { S.thinking += ev.delta; if (!S.activity || S.activity.label !== "thinking") setActivity("thinking"); else renderLive(); }
         break;
