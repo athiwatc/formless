@@ -282,3 +282,71 @@ async fn session_usage_totals_and_priced_cost() {
         .unwrap();
     assert!(r["total"]["cost"].is_null());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn running_invocations_are_listed_abandoned_and_cancelled() {
+    use formless_protocol::{InvocationInfo, Request};
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-inv-{short}"));
+    let paths = formless_core::Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-inv-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let daemon = std::sync::Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let out = daemon
+        .call_tool_direct(&sid, "create_tool", serde_json::json!({
+            "name": "slowpoke", "description": "waits", "input_schema": {"type": "object"},
+            "output_schema": {}, "implementation_js": "async function run(i){ await sleep(i.ms || 0); return {}; }",
+            "capabilities": []}))
+        .await;
+    assert!(out.contains("\"created\""), "{out}");
+    let call = tokio::spawn({
+        let (d, s) = (daemon.clone(), sid.clone());
+        async move {
+            d.call_tool_direct(&s, "slowpoke", serde_json::json!({"ms": 20000}))
+                .await
+        }
+    });
+    let list = loop {
+        let v = daemon.handle(Request::ListInvocations).await.unwrap();
+        let list: Vec<InvocationInfo> = serde_json::from_value(v).unwrap();
+        if !list.is_empty() {
+            break list;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        (list[0].tool_name.as_str(), list[0].session_id.as_str()),
+        ("slowpoke", sid.as_str())
+    );
+    assert!(!list[0].stalled && !list[0].abandoned);
+    let handle = list[0].handle.clone();
+    daemon
+        .handle(Request::AbandonInvocation {
+            handle: handle.clone(),
+        })
+        .await
+        .unwrap();
+    let v = daemon.handle(Request::ListInvocations).await.unwrap();
+    assert_eq!(v[0]["abandoned"], true);
+    daemon
+        .handle(Request::CancelInvocation { handle })
+        .await
+        .unwrap();
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        r.contains("cancel") || r.contains("interrupt") || r.contains("abandon"),
+        "{r}"
+    );
+    let v = daemon.handle(Request::ListInvocations).await.unwrap();
+    assert_eq!(v, serde_json::json!([]));
+}

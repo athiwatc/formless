@@ -158,6 +158,20 @@ pub struct BuiltinStatInfo {
     pub total_ms: f64,
 }
 
+/// A running Invocation, for the Invocations panel (SPEC §6.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InvocationInfo {
+    pub handle: String,
+    pub tool_name: String,
+    pub session_id: String,
+    pub elapsed_ms: u64,
+    /// Since its last sign of activity.
+    pub silent_ms: u64,
+    pub stalled: bool,
+    /// The agent no longer waits for it (it may still finish).
+    pub abandoned: bool,
+}
+
 /// Token use (and, with prices configured, cost) of a Run or Session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UsageInfo {
@@ -588,6 +602,12 @@ pub enum Request {
     /// Stop one running Tool Invocation without interrupting its Run (it is
     /// recorded as user-cancelled, and the agent gets the error result).
     CancelInvocation {
+        handle: String,
+    },
+    /// Running Invocations across Sessions, oldest first.
+    ListInvocations,
+    /// Stop waiting for an Invocation (the agent is told it was abandoned).
+    AbandonInvocation {
         handle: String,
     },
     /// Abort the active Run's in-flight provider request and send it again
