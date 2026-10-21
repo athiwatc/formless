@@ -66,3 +66,57 @@ async fn agent_reads_tools_audit_models_and_runs() {
         .await;
     assert!(bad.starts_with("error:"), "{bad}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_log_is_listed_filtered_and_paged() {
+    use formless_protocol::{AuditEntry, Request};
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-aud-{short}"));
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-aud-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    for (actor, action, detail) in [
+        ("user", "tool.approve", "fetch_page"),
+        ("agent", "tool.create", "csv_sum v1"),
+        ("user", "skill.enable", "pdf"),
+        ("user", "tool.retire", "old_csv"),
+    ] {
+        store.audit(actor, action, detail).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let list = |filter: Option<&str>, limit: usize, before: Option<String>| {
+        let d = daemon.clone();
+        let filter = filter.map(str::to_string);
+        async move {
+            let v = d
+                .handle(Request::ListAudit {
+                    filter,
+                    limit: Some(limit),
+                    before,
+                })
+                .await
+                .unwrap();
+            serde_json::from_value::<Vec<AuditEntry>>(v).unwrap()
+        }
+    };
+    let all = list(None, 100, None).await;
+    assert_eq!(all[0].action, "tool.retire", "newest first");
+    let csv = list(Some("CSV"), 100, None).await;
+    assert_eq!(
+        csv.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(),
+        ["tool.retire", "tool.create"]
+    );
+    let first = list(None, 2, None).await;
+    let next = list(None, 2, Some(first[1].created_at.clone())).await;
+    assert_eq!(
+        next.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(),
+        ["tool.create", "tool.approve"]
+    );
+}

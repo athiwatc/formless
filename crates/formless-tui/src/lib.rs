@@ -133,6 +133,7 @@ enum Pending {
     RunMetrics,
     ListBuiltinStats,
     ListJobs,
+    ListAudit,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -786,6 +787,22 @@ impl App {
                                     s.last_error
                                         .map(|e| format!(" · error: {}", truncate_chars(&e, 80)))
                                         .unwrap_or_default()
+                                ));
+                            }
+                        }
+                        Pending::ListAudit => {
+                            let list: Vec<formless_protocol::AuditEntry> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push("no audit entries match".into());
+                            }
+                            for e in list.iter().rev() {
+                                self.notes.push(format!(
+                                    "audit {} {} {} {}",
+                                    truncate_chars(&e.created_at, 19),
+                                    e.actor,
+                                    e.action,
+                                    truncate_chars(&e.detail, 80)
                                 ));
                             }
                         }
@@ -1686,6 +1703,22 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            "audit" => self.request(
+                Pending::ListAudit,
+                Request::ListAudit {
+                    filter: None,
+                    limit: Some(50),
+                    before: None,
+                },
+            ),
+            cmd if cmd.starts_with("audit ") => self.request(
+                Pending::ListAudit,
+                Request::ListAudit {
+                    filter: Some(cmd["audit ".len()..].trim().to_string()),
+                    limit: Some(50),
+                    before: None,
+                },
+            ),
             cmd if cmd.starts_with("attach ") => {
                 let path = cmd["attach ".len()..].trim().trim_matches(['"', '\'']);
                 let path = match path.strip_prefix("~/") {
@@ -1865,7 +1898,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

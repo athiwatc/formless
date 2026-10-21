@@ -1328,6 +1328,18 @@
               if (await ask({ title: "Remove skill " + sk.name + "?", text: "All its versions are deleted.", ok: "Remove", danger: true })) { await act({ type: "remove_skill", name: sk.name }, "Removed " + sk.name); refreshSettings(); }
             } }, "Remove"))))))
         : h("p", { class: "muted" }, "None. Install one with formless skills add FOLDER | GIT_URL | FILE.zip")));
+    const audit = S.audit || [];
+    const auditFilter = h("input", { type: "search", placeholder: "Filter: tool.approve, skill, a Tool name…", value: S.auditFilter || "" });
+    auditFilter.addEventListener("change", () => { S.auditFilter = auditFilter.value; loadAudit(false); });
+    grid.append(h("section", null, h("h3", null, "Audit log"),
+      auditFilter,
+      audit.length ? h("table", { class: "table" },
+        h("tbody", null, audit.map((e) => h("tr", null,
+          h("td", { class: "muted" }, relTime(e.created_at)),
+          h("td", null, h("strong", null, e.action), h("div", { class: "muted" }, e.actor + (e.detail ? " · " + e.detail : "")))))))
+        : h("p", { class: "muted" }, "No entries."),
+      audit.length >= 50 * (S.auditPages || 1) ? h("div", { class: "detail-actions" },
+        h("button", { class: "btn small", type: "button", onclick: () => loadAudit(true) }, "Older")) : null));
     const jobs = S.jobs || [];
     grid.append(h("section", null, h("h3", null, "Jobs"),
       jobs.length ? h("table", { class: "table" },
@@ -1407,11 +1419,19 @@
     if (!r) return;
     await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), ok: "Close" });
   }
+  async function loadAudit(older) {
+    const before = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1].created_at : null;
+    const page = (await request({ type: "list_audit", filter: S.auditFilter || null, limit: 50, before }).catch(() => null)) || [];
+    S.audit = older ? (S.audit || []).concat(page) : page;
+    S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
+    renderView();
+  }
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
+    if (!S.auditPages || S.auditPages === 1) S.audit = (await request({ type: "list_audit", filter: S.auditFilter || null, limit: 50 }).catch(() => null)) || [];
     try {
       S.settings = await request({ type: "get_settings" });
     } catch (e) {

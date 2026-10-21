@@ -1429,8 +1429,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   any Capability widening (including Candidate/optimizer-originated changes).
 - **Audit log:** every approval decision, promotion, rollback, discard,
   retirement, restore, purge, import, reset, and optimiser give-up is
-  recorded (actor, time, Tool, capability diff) and viewable in the Tools
-  view. Tool inputs/outputs recording follows §15 redaction.
+  recorded (actor, time, Tool, capability diff). `ListAudit {filter,
+  limit, before}` reads it newest first. `filter` matches the actor,
+  action or detail, and `before` pages back. The log is viewable in the
+  TUI (`/audit [filter]`), the web Settings "Audit log" section (filter
+  and "Older") and, for the agent, `read_metrics` (§8.9). Tool
+  inputs/outputs recording follows §15 redaction.
 
 ## 15. Privacy and data lifecycle
 

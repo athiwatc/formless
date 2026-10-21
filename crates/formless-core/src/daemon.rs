@@ -536,6 +536,17 @@ impl Daemon {
                 let stopped = self.web.lock().await.take().map(|w| w.stop()).is_some();
                 Ok(json!({"stopped": stopped}))
             }
+            Request::ListAudit {
+                filter,
+                limit,
+                before,
+            } => Ok(serde_json::to_value(self.with_reader(|st| {
+                st.list_audit(
+                    filter.as_deref().filter(|f| !f.trim().is_empty()),
+                    before.as_deref(),
+                    limit.unwrap_or(100),
+                )
+            })?)?),
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
             )?),

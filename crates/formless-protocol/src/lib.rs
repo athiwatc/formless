@@ -116,6 +116,15 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// One audit-log entry (SPEC §14).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditEntry {
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+    pub created_at: String,
+}
+
 /// A scheduled job (SPEC §9.7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobInfo {
@@ -458,6 +467,16 @@ pub enum Request {
         port: Option<u16>,
     },
     StopWebUi,
+    /// The audit log, newest first (SPEC §14): `filter` matches actor,
+    /// action or detail; `before` (an entry's `created_at`) pages back.
+    ListAudit {
+        #[serde(default)]
+        filter: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        before: Option<String>,
+    },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
     /// Add a job as the user (approved): `cron` for recurring, else `at`.
