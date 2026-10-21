@@ -25,7 +25,9 @@ pub const ADD_MCP_SERVER: &str = "add_mcp_server";
 pub const REMOVE_MCP_SERVER: &str = "remove_mcp_server";
 pub const LIST_MCP_RESOURCES: &str = "list_mcp_resources";
 pub const READ_MCP_RESOURCE: &str = "read_mcp_resource";
-pub const RESERVED: [&str; 17] = [
+pub const LOAD_SKILL: &str = "load_skill";
+pub const READ_SKILL_FILE: &str = "read_skill_file";
+pub const RESERVED: [&str; 19] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -43,6 +45,8 @@ pub const RESERVED: [&str; 17] = [
     REMOVE_MCP_SERVER,
     LIST_MCP_RESOURCES,
     READ_MCP_RESOURCE,
+    LOAD_SKILL,
+    READ_SKILL_FILE,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -306,6 +310,36 @@ fn add_mcp_server_definition() -> Value {
                     "reason": {"type": "string", "description": "Why this server is needed, shown to the user"}
                 },
                 "required": ["name", "transport", "reason"]
+            }
+        }
+    })
+}
+
+fn load_skill_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": LOAD_SKILL,
+            "description": "Load an enabled skill's instructions (see the Skills list in the system prompt, or find_tools) before doing the kind of task it covers. Returns its SKILL.md body and the names of its extra files.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }
+        }
+    })
+}
+
+fn read_skill_file_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": READ_SKILL_FILE,
+            "description": "Read one of a loaded skill's extra files (reference docs, templates) by its relative path.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "path": {"type": "string"}},
+                "required": ["name", "path"]
             }
         }
     })
@@ -660,6 +694,8 @@ pub fn tool_definitions(
         read_artifact_definition(),
         add_mcp_server_definition(),
         remove_mcp_server_definition(),
+        load_skill_definition(),
+        read_skill_file_definition(),
         list_mcp_resources_definition(),
         read_mcp_resource_definition(),
         test_tool_definition(),

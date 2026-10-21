@@ -2043,3 +2043,73 @@ async fn agent_adds_an_mcp_server_after_approval() {
         .contains_key("web"));
     server.abort();
 }
+
+/// Enabled skills are listed in new Sessions' system prompt.
+#[cfg(unix)]
+#[tokio::test]
+async fn enabled_skills_are_indexed_in_the_system_prompt() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4skills");
+    let src = paths.data_dir.join("src/tidy");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("SKILL.md"),
+        "---\nname: tidy-csv\ndescription: Clean up CSV files\n---\nSteps.",
+    )
+    .unwrap();
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        formless_core::skills::install(&paths, &store, src.to_str().unwrap(), None, None, "user")
+            .unwrap();
+        store.set_skill_enabled("tidy-csv", true).unwrap();
+    }
+    let systems = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let systems = systems.clone();
+                move |Json(body): Json<Value>| {
+                    systems.lock().unwrap().push(
+                        body["messages"][0]["content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    async { sse_text("ok") }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let sid = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: sid,
+        content: "hi".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    c.run_to_finish().await;
+    let system = systems.lock().unwrap()[0].clone();
+    assert!(
+        system.contains("- tidy-csv: Clean up CSV files"),
+        "{system}"
+    );
+    server.abort();
+}
