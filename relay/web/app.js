@@ -1413,7 +1413,7 @@
     if (S.view === "settings") renderSettings();
   }
 
-  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /resume /abandon /help";
+  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /resend /resume /abandon /help";
   async function slash(cmd) {
     const [name, ...rest] = cmd.split(/\s+/);
     const arg = rest.join(" ");
@@ -1430,6 +1430,9 @@
       case "propose": act({ type: "generate_proposal" }); return note("generating a measured proposal…");
       case "thinking": setThinking(!S.showThinking); return note("thinking display " + (S.showThinking ? "on" : "off"));
       case "stop": return stop();
+      case "resend":
+        if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
+        return;
       case "resume":
         if (S.current) await act({ type: "resume_run", session_id: S.current });
         return;
@@ -1512,6 +1515,9 @@
         break;
       case "message_delta":
         if (here) { S.streaming += ev.delta; if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else renderLive(); }
+        break;
+      case "provider_stalled":
+        if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
         break;
       case "stream_restarted":
         if (here) { S.streaming = ""; S.thinking = ""; note("provider stream dropped; retrying"); renderLive(); }

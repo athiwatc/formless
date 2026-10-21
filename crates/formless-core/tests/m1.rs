@@ -232,7 +232,8 @@ async fn provider_models_probe_stream_and_effort_retry() {
             |kind, d| match kind {
                 formless_core::provider::DeltaKind::Content => deltas.push_str(d),
                 formless_core::provider::DeltaKind::Reasoning => reasoning_deltas.push_str(d),
-                formless_core::provider::DeltaKind::Restart => {}
+                formless_core::provider::DeltaKind::Restart
+                | formless_core::provider::DeltaKind::Bytes => {}
             },
         )
         .await

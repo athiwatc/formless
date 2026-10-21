@@ -1019,3 +1019,103 @@ async fn resume_continues_an_interrupted_run_and_abandon_drops_it() {
     assert_eq!(store.last_run(&session_id).unwrap().unwrap().1, "abandoned");
     server.abort();
 }
+
+/// A stream that goes quiet is flagged (ProviderStalled); RetryProviderRequest
+/// re-sends it and the Run completes without losing anything.
+#[cfg(unix)]
+#[tokio::test]
+async fn stalled_stream_is_flagged_and_can_be_resent() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4stall");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(move || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let first = format!(
+                        "data: {}\n\n",
+                        json!({"choices": [{"delta": {"content": if n == 0 { "hmm" } else { "done" }}}]})
+                    );
+                    let stream = futures_util::stream::unfold(0, move |i| {
+                        let first = first.clone();
+                        async move {
+                            match (i, n) {
+                                (0, _) => Some((Ok::<_, std::io::Error>(first), 1)),
+                                // First request: open but silent from here on.
+                                (_, 0) => {
+                                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                    None
+                                }
+                                (1, _) => Some((Ok("data: [DONE]\n\n".to_string()), 2)),
+                                _ => None,
+                            }
+                        }
+                    });
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let mut cfg = formless_core::Config::load(&paths).unwrap();
+    cfg.provider.stall_notice_secs = 1;
+    cfg.save(&paths).unwrap();
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let (mut stalled, mut restarted) = (false, false);
+    let mut final_text = None;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(15), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) else {
+            continue;
+        };
+        match ev {
+            Event::ProviderStalled { idle_secs, .. } => {
+                assert!(idle_secs >= 1);
+                stalled = true;
+                c.send(Request::RetryProviderRequest {
+                    session_id: sid.clone(),
+                })
+                .await;
+            }
+            Event::StreamRestarted { .. } => restarted = true,
+            Event::MessageComplete { message, .. } => final_text = Some(message.content),
+            Event::RunFinished { status, .. } => {
+                assert_eq!(status, "completed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(stalled && restarted);
+    assert_eq!(final_text.as_deref(), Some("done"));
+    server.abort();
+}

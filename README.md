@@ -183,7 +183,7 @@ Type a task at the bottom and press **Enter**. Formless starts with only `create
 | `PgUp` / `PgDn` | scroll the transcript |
 | `Ctrl+C` | detach — the daemon keeps running, nothing is lost |
 
-Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /resume /abandon /quit`. `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
+Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /resend /resume /abandon /quit`. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
 
 Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.2](#52-lifecycle-and-versioning)).
 

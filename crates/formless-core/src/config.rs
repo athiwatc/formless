@@ -106,6 +106,12 @@ pub struct ProviderCfg {
     /// Credential mode: API key (default) or OAuth2 subscription login.
     #[serde(default)]
     pub auth: AuthCfg,
+    /// Seconds without any bytes from an open provider stream before
+    /// clients are told it looks stalled (0 = never).
+    pub stall_notice_secs: u64,
+    /// Re-send the request automatically when no first byte arrives within
+    /// this many seconds (0 = off; the user can always `/retry`).
+    pub first_byte_timeout_secs: u64,
 }
 
 /// OAuth2 authorization-code + PKCE settings for subscription providers.
@@ -172,6 +178,8 @@ impl Default for ProviderCfg {
             routing_strong_models: Vec::new(),
             routing_complex_chars: default_routing_complex_chars(),
             auth: AuthCfg::default(),
+            stall_notice_secs: 120,
+            first_byte_timeout_secs: 0,
         }
     }
 }

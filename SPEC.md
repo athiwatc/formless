@@ -692,7 +692,7 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   `Esc`: interrupt Run. `Ctrl+C`: detach client. `Tab`/`Shift+Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
-  `/model`, `/settings`, `/stop`, `/resume`, `/abandon`, `/approve`,
+  `/model`, `/settings`, `/stop`, `/resend`, `/resume`, `/abandon`, `/approve`,
   `/thinking`, `/help`
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`). Plain text is always chat.
@@ -832,6 +832,8 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
+| `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this long (`ProviderStalled`; `/resend` re-sends); 0 = never |
+| `provider.first_byte_timeout_secs` | 0 | Auto re-send when no first byte arrives in time (up to `max_retries`); 0 = off |
 | `provider.api_style` | `chat` | `chat` or `responses` (§4.1) |
 | `provider.tool_mode` | `native` | `native` or prompt-based fallback (§4.1) |
 | `provider.fallback_models` | [] | Failover models, in order (§4.1) |
