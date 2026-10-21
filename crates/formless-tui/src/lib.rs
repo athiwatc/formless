@@ -128,6 +128,7 @@ enum Pending {
     ListMcpServers,
     ListMcpPrompts,
     GetMcpPrompt,
+    ListSkills,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -767,6 +768,26 @@ impl App {
                                 ));
                             }
                         }
+                        Pending::ListSkills => {
+                            let list: Vec<SkillInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push(
+                                    "no skills (install one with `formless skills add`)".into(),
+                                );
+                            }
+                            for s in list {
+                                self.notes.push(format!(
+                                    "skill {} v{} {} · {} loads · {}{}",
+                                    s.name,
+                                    s.version,
+                                    if s.enabled { "enabled" } else { "disabled" },
+                                    s.loads,
+                                    truncate_chars(&s.description, 70),
+                                    if s.has_scripts { " · scripts" } else { "" }
+                                ));
+                            }
+                        }
                         Pending::ListMcpPrompts => {
                             let list = result.as_array().cloned().unwrap_or_default();
                             if list.is_empty() {
@@ -1113,7 +1134,7 @@ impl App {
                 self.notes.push(format!("compacted: {summary_preview}"));
             }
             Event::Note { text, .. } => self.notes.push(text),
-            Event::McpServersChanged => {}
+            Event::McpServersChanged | Event::SkillsChanged => {}
             Event::SettingsChanged => {
                 if let Ok(cfg) = Config::load(&self.paths) {
                     self.model_label = cfg.provider.model;
@@ -1536,6 +1557,16 @@ impl App {
             }
             "mcp" => self.request(Pending::ListMcpServers, Request::ListMcpServers),
             "prompts" => self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts),
+            "skills" => self.request(Pending::ListSkills, Request::ListSkills),
+            cmd if cmd.starts_with("skills enable ") || cmd.starts_with("skills disable ") => {
+                let enabled = cmd.starts_with("skills enable ");
+                let name = cmd.split_whitespace().nth(2).unwrap_or_default().to_string();
+                self.fire(Request::SetSkillEnabled { name: name.clone(), enabled });
+                self.notes.push(format!(
+                    "{} skill {name}",
+                    if enabled { "enabling" } else { "disabling" }
+                ));
+            }
             cmd if cmd.starts_with("prompt ") => {
                 let mut words = cmd["prompt ".len()..].split_whitespace();
                 let target = words.next().unwrap_or_default();
@@ -1620,7 +1651,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

@@ -204,6 +204,23 @@ CREATE INDEX IF NOT EXISTS idx_run_usage_run ON run_usage(run_id);
 
 /// Tool definitions as a Session last listed them (pinned for the prompt
 /// cache until that Session refreshes them).
+const SCHEMA_V16: &str = "
+CREATE TABLE IF NOT EXISTS skills (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL,
+  current_version INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT '', author TEXT NOT NULL DEFAULT 'user',
+  has_scripts INTEGER NOT NULL DEFAULT 0, retired INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS skill_versions (
+  skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY (skill_id, version));
+CREATE TABLE IF NOT EXISTS skill_loads (
+  skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  session_id TEXT, run_id TEXT, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_skill_loads ON skill_loads(skill_id, created_at);
+";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -227,7 +244,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -242,7 +259,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 15] = [
+const MIGRATIONS: [(i64, MigrationStep); 16] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -279,6 +296,7 @@ const MIGRATIONS: [(i64, MigrationStep); 15] = [
             "CREATE TABLE IF NOT EXISTS mcp_server_grants (server TEXT PRIMARY KEY, approved_at TEXT NOT NULL);",
         )?)
     }),
+    (16, |c| Ok(c.execute_batch(SCHEMA_V16)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1961,6 +1979,112 @@ impl Store {
             params![tool_id, serde_json::to_string(&caps.to_specs())?, memory_mb, now()],
         )?;
         Ok(())
+    }
+
+    pub fn next_skill_version(&self, name: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(v.version),0)+1 FROM skill_versions v JOIN skills s ON s.id=v.skill_id WHERE s.name=?1",
+            params![name],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Record an installed skill version as current. A new install (or new
+    /// version) is disabled until the user enables it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_skill_version(
+        &self,
+        name: &str,
+        description: &str,
+        version: i64,
+        path: &str,
+        source: &str,
+        author: &str,
+        has_scripts: bool,
+    ) -> Result<formless_protocol::SkillInfo> {
+        let t = now();
+        self.conn.execute(
+            "INSERT INTO skills(id,name,description,current_version,enabled,source,author,has_scripts,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?8)
+             ON CONFLICT(name) DO UPDATE SET description=excluded.description, current_version=excluded.current_version,
+               enabled=0, source=excluded.source, author=excluded.author, has_scripts=excluded.has_scripts,
+               retired=0, updated_at=excluded.updated_at",
+            params![uuid::Uuid::new_v4().to_string(), name, description, version, source, author, has_scripts, t],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO skill_versions(skill_id,version,path,created_at) SELECT id,?2,?3,?4 FROM skills WHERE name=?1",
+            params![name, version, path, t],
+        )?;
+        self.get_skill(name)?.context("skill vanished")
+    }
+
+    fn row_skill(r: &rusqlite::Row) -> rusqlite::Result<formless_protocol::SkillInfo> {
+        Ok(formless_protocol::SkillInfo {
+            name: r.get("name")?,
+            description: r.get("description")?,
+            version: r.get("current_version")?,
+            enabled: r.get::<_, i64>("enabled")? != 0,
+            source: r.get("source")?,
+            author: r.get("author")?,
+            has_scripts: r.get::<_, i64>("has_scripts")? != 0,
+            retired: r.get::<_, i64>("retired")? != 0,
+            loads: r.get("loads")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+        })
+    }
+
+    pub fn list_skills(&self) -> Result<Vec<formless_protocol::SkillInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.*, (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads FROM skills s ORDER BY s.name",
+        )?;
+        let rows = stmt
+            .query_map([], Self::row_skill)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_skill(&self, name: &str) -> Result<Option<formless_protocol::SkillInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT s.*, (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads FROM skills s WHERE s.name=?1",
+                params![name],
+                Self::row_skill,
+            )
+            .ok())
+    }
+
+    /// Installed folder of the skill's current version.
+    pub fn skill_path(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT v.path FROM skills s JOIN skill_versions v ON v.skill_id=s.id AND v.version=s.current_version WHERE s.name=?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .ok())
+    }
+
+    pub fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE skills SET enabled=?2, updated_at=?3 WHERE name=?1",
+            params![name, enabled, now()],
+        )? > 0)
+    }
+
+    /// Delete a skill's rows; returns its version folders to remove.
+    pub fn remove_skill(&self, name: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT v.path FROM skill_versions v JOIN skills s ON s.id=v.skill_id WHERE s.name=?1",
+        )?;
+        let paths: Vec<String> = stmt
+            .query_map(params![name], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        self.conn
+            .execute("DELETE FROM skills WHERE name=?1", params![name])?;
+        Ok(paths)
     }
 
     /// Whether the user has approved using this MCP server at all.

@@ -425,6 +425,59 @@ impl Daemon {
                 Ok(json!({"diff": crate::diff::version_diff(a, b)}))
             }
             Request::ListMcpServers => Ok(serde_json::to_value(self.mcp_servers().await?)?),
+            Request::ListSkills => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_skills())?,
+            )?),
+            Request::AddSkill {
+                source,
+                subdir,
+                git_ref,
+            } => {
+                // git/unzip block: fetch off the async workers and without
+                // the store lock; only the final copy + insert hold it.
+                let paths = self.paths.clone();
+                let staged = tokio::task::spawn_blocking(move || {
+                    crate::skills::prepare(&paths, &source, subdir.as_deref(), git_ref.as_deref())
+                })
+                .await??;
+                let info =
+                    self.with_store(|st| crate::skills::commit(&self.paths, st, &staged, "user"))?;
+                let _ = self.with_store(|st| st.audit("user", "skill.add", &info.name));
+                self.broadcast(Event::SkillsChanged);
+                Ok(serde_json::to_value(info)?)
+            }
+            Request::RemoveSkill { name } => {
+                let dirs = self.with_store(|st| st.remove_skill(&name))?;
+                if dirs.is_empty() {
+                    return Err(anyhow!("no skill named '{name}'"));
+                }
+                let _ = std::fs::remove_dir_all(self.paths.data_dir.join("skills").join(&name));
+                let _ = self.with_store(|st| st.audit("user", "skill.remove", &name));
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"removed": name}))
+            }
+            Request::SetSkillEnabled { name, enabled } => {
+                if !self.with_store(|st| st.set_skill_enabled(&name, enabled))? {
+                    return Err(anyhow!("no skill named '{name}'"));
+                }
+                let action = if enabled {
+                    "skill.enable"
+                } else {
+                    "skill.disable"
+                };
+                let _ = self.with_store(|st| st.audit("user", action, &name));
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"name": name, "enabled": enabled}))
+            }
+            Request::GetSkill { name } => {
+                let info = self
+                    .with_reader(|st| st.get_skill(&name))?
+                    .with_context(|| format!("no skill named '{name}'"))?;
+                let dir = self.with_reader(|st| crate::skills::current_dir(st, &name))?;
+                let text = std::fs::read_to_string(dir.join("SKILL.md"))?;
+                let body = crate::skills::parse_skill_md(&text)?.body;
+                Ok(json!({"skill": info, "body": body, "files": crate::skills::files(&dir)?}))
+            }
             Request::ListMcpPrompts => {
                 let cfg = self.config()?;
                 let mut out = Vec::new();
