@@ -74,6 +74,9 @@ pub struct ChatResult {
     pub dropped_reasoning_effort: bool,
     /// Model that actually served the request (failover routing).
     pub model_used: String,
+    /// Output stopped at the token limit (`finish_reason: "length"`): the
+    /// answer or the tool-call arguments are cut off.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +512,7 @@ impl Provider {
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut truncated = false;
         let mut attempt = 0;
         let (dropped, model_used) = 'request: loop {
             // Waiting for the response headers is cancellable too (a slow or
@@ -623,6 +627,9 @@ impl Provider {
                                         }
                                         continue;
                                     }
+                                    if v["choices"][0]["finish_reason"].as_str() == Some("length") {
+                                        truncated = true;
+                                    }
                                     let delta = &v["choices"][0]["delta"];
                                     if let Some(d) = delta["content"].as_str() {
                                         if !d.is_empty() {
@@ -699,6 +706,7 @@ impl Provider {
             tool_calls,
             dropped_reasoning_effort: dropped,
             model_used,
+            truncated,
         })
     }
 
