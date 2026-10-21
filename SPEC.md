@@ -792,6 +792,77 @@ suite cannot measure preferences.
   applied memory-kind proposals (§8). Schema v18 migrated the applied
   ones, and rolling such a proposal back deletes its note.
 
+### 7.12 Orchestration scripts (`run_script`) — DRAFT
+
+> **Status: proposed** ([ADR 0005](docs/adr/0005-run-script-orchestration.md)).
+> Nothing here is implemented. The settings below are not yet in §13.
+
+- **Purpose.** One step can call many Tools with loops, filters, branches
+  and parallel fan-out. Intermediate results stay in the sandbox and only
+  the script's return value reaches model context. Scripts **connect**
+  Tools; they never replace them.
+- **Built-in.** `run_script(code, uses[], save_as?)`. The name is
+  reserved (§7.1). `code` is plain JS whose top level may `await`, and its
+  final `return` value is the result. `uses` names the registry Tools the
+  script may call.
+- **No ambient authority, and no Capabilities.** The script global scope
+  has the Tools in `uses` as async functions (`await tools.search_repo({…})`
+  or `await tools.call("search_repo", {…})`), plus `console`, timers,
+  `JSON`, `cryptoRandom()` and `requireModule` (§7.6). These are **absent**:
+  `fetch`, `fs`, `process`, `env`, `clipboard`, `notify`, `llm`, `agents`
+  and `store`. The script itself has no side effects. Every effect is a
+  nested Invocation of a Tool, under that Tool's own Capabilities.
+- **Approval.** Before execution, the `uses` set goes through the normal
+  approval pre-pass (§5.2/§10.3): one prompt per unapproved Tool, and
+  input-bound scopes (§7.4) still bind per nested call. A call to a Tool
+  outside `uses`, or to a retired or unknown Tool, rejects that call's
+  Promise with an error. It never prompts partway through a script.
+  Built-ins are not callable from scripts, `run_script` included, so
+  scripts do not nest.
+- **Async host calls.** Nested `tools.call` returns a Promise that the
+  daemon settles when the nested Invocation ends. Each nested Invocation
+  runs on its own sandbox thread (§6.1), so `Promise.all` truly runs in
+  parallel. At most `scripts.max_parallel` (default 8) nested Invocations
+  per script are in flight, and the rest queue. This change to `tools.call`
+  applies to composed registry Tools too (§7.6).
+- **Bounds.**
+  - Source is capped at `scripts.max_source_kb` (default 64).
+  - The script heap is capped at `scripts.memory_mb` (default 256).
+  - The script ends on its return value, a thrown error, the Run being
+    cancelled, or `scripts.timeout_secs` (default 600) of wall time.
+    Nested Invocations are not timed out; when the script ends, any still
+    running are **abandoned** (§6.3), not cancelled.
+  - The soft threshold and Pending Invocation handle (§6.2) apply to the
+    script as a whole.
+- **Output.** The return value is JSON-serialised. A large result becomes
+  an artifact (§9.6) with a bounded preview, as for Tool output. Console
+  output is kept with the Invocation and is not sent to the model unless
+  the script fails.
+- **Recording.** Each run is an Invocation of `run_script` with its source,
+  `uses`, result and duration. Nested Invocations record it as their
+  `parent`, so the live tree (§10.6) and `/invocations` show them as
+  children. The model step's tokens are attributed across the nested Tool
+  calls by the §8.1 rule; the script absorbs none. `run_script` is excluded
+  from Self-Optimisation, is never replayed, and has no success-rate
+  trigger.
+- **Promotion to a Tool.** `save_as: {name, description, input_schema,
+  output_schema}` saves a successful script as a registry Tool through the
+  full `create_tool` gate (§7.1):
+  - The script body becomes `run(input)`, with `input` replacing literals
+    the agent marks as parameters.
+  - Its Capabilities are those needed for `tools.call` composition (§7.6),
+    and its author is `agent`.
+  - A failed gate leaves the script result intact and reports why the save
+    was refused.
+- **Recurrence signal.** The daemon hashes each script's normalised source
+  (whitespace and string/number literals stripped). When one hash is run in
+  `scripts.recurrence_threshold` (default 3) distinct Sessions, the
+  prompt-proposal generator (§7.7) and the Tools view flag it as "save as
+  a Tool", in the same way §8.1 #5 flags over-specific Tools.
+- **Bootstrap prompt.** A version bump adds: use `run_script` to connect
+  existing Tools; anything that reads or changes the world is a Tool, not
+  script code; save with `save_as` any script you would run twice.
+
 ## 8. Metrics and Self-Optimisation
 
 ### 8.1 What is measured (per Tool, pooled across all Sessions)
