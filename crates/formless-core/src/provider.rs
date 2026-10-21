@@ -83,6 +83,42 @@ pub enum DeltaKind {
 }
 
 /// Convert Chat-Completions messages to Responses-API input items.
+/// A mid-stream failure event (Responses `error` / `response.failed` /
+/// `response.incomplete`, or a Chat Completions `{"error": ...}` chunk)
+/// as (retryable, message). Server and rate-limit failures are
+/// retryable; an incomplete response (token limit, content filter) is not.
+pub fn responses_failure(v: &Value) -> (bool, String) {
+    let kind = v["type"].as_str().unwrap_or("error");
+    if kind == "response.incomplete" {
+        let reason = v["response"]["incomplete_details"]["reason"]
+            .as_str()
+            .unwrap_or("unknown reason");
+        return (false, format!("response incomplete: {reason}"));
+    }
+    let err = if v["response"]["error"].is_object() {
+        &v["response"]["error"]
+    } else if v["error"].is_object() {
+        &v["error"]
+    } else {
+        v
+    };
+    let code = err["code"]
+        .as_str()
+        .or_else(|| err["type"].as_str())
+        .unwrap_or("unknown");
+    let message = err["message"].as_str().unwrap_or("no message");
+    let retryable = [
+        "server",
+        "rate_limit",
+        "overloaded",
+        "unavailable",
+        "timeout",
+    ]
+    .iter()
+    .any(|k| code.contains(k));
+    (retryable, format!("{kind} ({code}): {message}"))
+}
+
 pub fn responses_input(messages: &[Value]) -> Vec<Value> {
     let mut out = Vec::new();
     for m in messages {
@@ -470,143 +506,169 @@ impl Provider {
             }
             b
         };
-        // Waiting for the response headers is cancellable too (a slow or
-        // stuck endpoint must not outlive an interrupt).
-        let (resp, dropped, model_used) = tokio::select! {
-            _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-            r = self.post_chat_flagged(&mut body, effort) => r?,
-        };
-        let mut stream = resp.bytes_stream();
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        // Raw bytes: a chunk boundary can split a multibyte character, so
-        // only complete lines are decoded.
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            tokio::select! {
+        let mut attempt = 0;
+        let (dropped, model_used) = 'request: loop {
+            // Waiting for the response headers is cancellable too (a slow or
+            // stuck endpoint must not outlive an interrupt).
+            let (resp, dropped, model_used) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                next = stream.next() => {
-                    let Some(chunk) = next else { break };
-                    let chunk = chunk.context("stream read")?;
-                    buf.extend_from_slice(&chunk);
-                    while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                        let raw: Vec<u8> = buf.drain(..=pos).collect();
-                        let line = String::from_utf8_lossy(&raw);
-                        let line = line.trim();
-                        if let Some(data) = line.strip_prefix("data:") {
-                            let data = data.trim();
-                            if data == "[DONE]" { continue; }
-                            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                if self.cfg.responses() {
-                                    match v["type"].as_str().unwrap_or_default() {
-                                        "response.output_text.delta" => {
-                                            if let Some(d) = v["delta"].as_str() {
-                                                content.push_str(d);
-                                                if !prompt_mode {
-                                                    on_delta(DeltaKind::Content, d);
+                r = self.post_chat_flagged(&mut body, effort) => r?,
+            };
+            let mut stream = resp.bytes_stream();
+            // Raw bytes: a chunk boundary can split a multibyte character, so
+            // only complete lines are decoded.
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+                    next = stream.next() => {
+                        let Some(chunk) = next else { break };
+                        let chunk = chunk.context("stream read")?;
+                        buf.extend_from_slice(&chunk);
+                        while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                            let raw: Vec<u8> = buf.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&raw);
+                            let line = line.trim();
+                            if let Some(data) = line.strip_prefix("data:") {
+                                let data = data.trim();
+                                if data == "[DONE]" { continue; }
+                                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                    // Mid-stream failures: Responses `error` / `response.failed` /
+                                    // `response.incomplete` events, or a Chat Completions `{"error": ...}`
+                                    // chunk. Retry only before anything streamed, so the user never sees
+                                    // duplicated output; otherwise the Run fails loudly (SPEC §4.4).
+                                    let failed = if self.cfg.responses() {
+                                        matches!(
+                                            v["type"].as_str(),
+                                            Some("error" | "response.failed" | "response.incomplete")
+                                        )
+                                    } else {
+                                        v["error"].is_object()
+                                    };
+                                    if failed {
+                                        let (retryable, message) = responses_failure(&v);
+                                        let nothing_streamed =
+                                            content.is_empty() && reasoning.is_empty() && tool_calls.is_empty();
+                                        if retryable && nothing_streamed && attempt < self.cfg.max_retries {
+                                            tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
+                                            attempt += 1;
+                                            continue 'request;
+                                        }
+                                        return Err(anyhow!("provider error: {message}"));
+                                    }
+                                    if self.cfg.responses() {
+                                        match v["type"].as_str().unwrap_or_default() {
+                                            "response.output_text.delta" => {
+                                                if let Some(d) = v["delta"].as_str() {
+                                                    content.push_str(d);
+                                                    if !prompt_mode {
+                                                        on_delta(DeltaKind::Content, d);
+                                                    }
                                                 }
                                             }
-                                        }
-                                        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                                            if let Some(d) = v["delta"].as_str() {
-                                                reasoning.push_str(d);
-                                                on_delta(DeltaKind::Reasoning, d);
+                                            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                                                if let Some(d) = v["delta"].as_str() {
+                                                    reasoning.push_str(d);
+                                                    on_delta(DeltaKind::Reasoning, d);
+                                                }
                                             }
-                                        }
-                                        "response.output_item.added" | "response.output_item.done" => {
-                                            let item = &v["item"];
-                                            if item["type"].as_str() == Some("function_call") {
+                                            "response.output_item.added" | "response.output_item.done" => {
+                                                let item = &v["item"];
+                                                if item["type"].as_str() == Some("function_call") {
+                                                    let idx = v["output_index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
+                                                    while tool_calls.len() <= idx {
+                                                        tool_calls.push(ToolCall::default());
+                                                    }
+                                                    let slot = &mut tool_calls[idx];
+                                                    if let Some(id) = item["call_id"].as_str().or_else(|| item["id"].as_str()) {
+                                                        slot.id = id.to_string();
+                                                    }
+                                                    if let Some(n) = item["name"].as_str() {
+                                                        slot.name = n.to_string();
+                                                    }
+                                                    if let Some(a) = item["arguments"].as_str() {
+                                                        if !a.is_empty() {
+                                                            slot.arguments = a.to_string();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            "response.function_call_arguments.delta" => {
                                                 let idx = v["output_index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
                                                 while tool_calls.len() <= idx {
                                                     tool_calls.push(ToolCall::default());
                                                 }
-                                                let slot = &mut tool_calls[idx];
-                                                if let Some(id) = item["call_id"].as_str().or_else(|| item["id"].as_str()) {
-                                                    slot.id = id.to_string();
-                                                }
-                                                if let Some(n) = item["name"].as_str() {
-                                                    slot.name = n.to_string();
-                                                }
-                                                if let Some(a) = item["arguments"].as_str() {
-                                                    if !a.is_empty() {
-                                                        slot.arguments = a.to_string();
-                                                    }
+                                                if let Some(d) = v["delta"].as_str() {
+                                                    tool_calls[idx].arguments.push_str(d);
                                                 }
                                             }
+                                            "response.completed" => {
+                                                if content.is_empty() {
+                                                    let t = responses_text(&v["response"]);
+                                                    if !t.is_empty() {
+                                                        content.push_str(&t);
+                                                        if !prompt_mode {
+                                                            on_delta(DeltaKind::Content, &t);
+                                                        }
+                                                    }
+                                                }
+                                                if tool_calls.iter().all(|c| c.name.is_empty()) {
+                                                    tool_calls = responses_tool_calls(&v["response"]);
+                                                }
+                                            }
+                                            _ => {}
                                         }
-                                        "response.function_call_arguments.delta" => {
-                                            let idx = v["output_index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
+                                        continue;
+                                    }
+                                    let delta = &v["choices"][0]["delta"];
+                                    if let Some(d) = delta["content"].as_str() {
+                                        if !d.is_empty() {
+                                            content.push_str(d);
+                                            if !prompt_mode {
+                                                on_delta(DeltaKind::Content, d);
+                                            }
+                                        }
+                                    }
+                                    // Thinking-mode endpoints stream reasoning separately
+                                    // (`reasoning_content`, e.g. DeepSeek; some use `reasoning`).
+                                    for key in ["reasoning_content", "reasoning"] {
+                                        if let Some(d) = delta[key].as_str() {
+                                            if !d.is_empty() {
+                                                reasoning.push_str(d);
+                                                on_delta(DeltaKind::Reasoning, d);
+                                            }
+                                        }
+                                    }
+                                    if let Some(tcs) = delta["tool_calls"].as_array() {
+                                        for tc in tcs {
+                                            let idx = tc["index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
                                             while tool_calls.len() <= idx {
                                                 tool_calls.push(ToolCall::default());
                                             }
-                                            if let Some(d) = v["delta"].as_str() {
-                                                tool_calls[idx].arguments.push_str(d);
+                                            let slot = &mut tool_calls[idx];
+                                            if let Some(id) = tc["id"].as_str() {
+                                                if !id.is_empty() { slot.id = id.to_string(); }
+                                            }
+                                            if let Some(n) = tc["function"]["name"].as_str() {
+                                                slot.name.push_str(n);
+                                            }
+                                            if let Some(a) = tc["function"]["arguments"].as_str() {
+                                                slot.arguments.push_str(a);
                                             }
                                         }
-                                        "response.completed" => {
-                                            if content.is_empty() {
-                                                let t = responses_text(&v["response"]);
-                                                if !t.is_empty() {
-                                                    content.push_str(&t);
-                                                    if !prompt_mode {
-                                                        on_delta(DeltaKind::Content, &t);
-                                                    }
-                                                }
-                                            }
-                                            if tool_calls.iter().all(|c| c.name.is_empty()) {
-                                                tool_calls = responses_tool_calls(&v["response"]);
-                                            }
-                                        }
-                                        _ => {}
                                     }
-                                    continue;
-                                }
-                                let delta = &v["choices"][0]["delta"];
-                                if let Some(d) = delta["content"].as_str() {
-                                    if !d.is_empty() {
-                                        content.push_str(d);
-                                        if !prompt_mode {
-                                            on_delta(DeltaKind::Content, d);
+                                    // Non-streaming-shaped servers may put message.tool_calls in one chunk.
+                                    if let Some(tcs) = v["choices"][0]["message"]["tool_calls"].as_array() {
+                                        for tc in tcs {
+                                            tool_calls.push(ToolCall {
+                                                id: tc["id"].as_str().unwrap_or_default().to_string(),
+                                                name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
+                                                arguments: tc["function"]["arguments"].as_str().unwrap_or_default().to_string(),
+                                            });
                                         }
-                                    }
-                                }
-                                // Thinking-mode endpoints stream reasoning separately
-                                // (`reasoning_content`, e.g. DeepSeek; some use `reasoning`).
-                                for key in ["reasoning_content", "reasoning"] {
-                                    if let Some(d) = delta[key].as_str() {
-                                        if !d.is_empty() {
-                                            reasoning.push_str(d);
-                                            on_delta(DeltaKind::Reasoning, d);
-                                        }
-                                    }
-                                }
-                                if let Some(tcs) = delta["tool_calls"].as_array() {
-                                    for tc in tcs {
-                                        let idx = tc["index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
-                                        while tool_calls.len() <= idx {
-                                            tool_calls.push(ToolCall::default());
-                                        }
-                                        let slot = &mut tool_calls[idx];
-                                        if let Some(id) = tc["id"].as_str() {
-                                            if !id.is_empty() { slot.id = id.to_string(); }
-                                        }
-                                        if let Some(n) = tc["function"]["name"].as_str() {
-                                            slot.name.push_str(n);
-                                        }
-                                        if let Some(a) = tc["function"]["arguments"].as_str() {
-                                            slot.arguments.push_str(a);
-                                        }
-                                    }
-                                }
-                                // Non-streaming-shaped servers may put message.tool_calls in one chunk.
-                                if let Some(tcs) = v["choices"][0]["message"]["tool_calls"].as_array() {
-                                    for tc in tcs {
-                                        tool_calls.push(ToolCall {
-                                            id: tc["id"].as_str().unwrap_or_default().to_string(),
-                                            name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
-                                            arguments: tc["function"]["arguments"].as_str().unwrap_or_default().to_string(),
-                                        });
                                     }
                                 }
                             }
@@ -614,7 +676,8 @@ impl Provider {
                     }
                 }
             }
-        }
+            break (dropped, model_used);
+        };
         if prompt_mode {
             let (clean, calls) = parse_prompt_tool_calls(&content);
             if !clean.is_empty() {
