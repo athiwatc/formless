@@ -1,4 +1,4 @@
-//! External MCP servers ((SPEC §7.9)): JSON-RPC clients for configured
+//! External MCP servers (SPEC §7.9): JSON-RPC clients for configured
 //! servers, supervised by the daemon, whose tools appear in the registry as
 //! `mcp__<server>__<tool>` entries (listed, approved and measured like
 //! Tools; executed by the server, never by the sandbox).
@@ -87,12 +87,37 @@ fn server_env(cfg: &McpServerCfg) -> Vec<(String, String)> {
     out
 }
 
-/// One running stdio server: newline-delimited JSON-RPC over its stdin and
-/// stdout; stderr goes to `<data>/mcp/<server>.log`.
+type Pending = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+/// How messages reach the server.
+enum Io {
+    /// A child process: newline-delimited JSON-RPC on stdin/stdout.
+    Stdio {
+        stdin: Mutex<tokio::process::ChildStdin>,
+        child: StdMutex<Option<tokio::process::Child>>,
+    },
+    /// Streamable HTTP: every message is a POST; an answer comes back as
+    /// the JSON body or on an SSE body. The session id rides on a header.
+    Http {
+        client: reqwest::Client,
+        url: String,
+        headers: Vec<(String, String)>,
+        session: StdMutex<Option<String>>,
+    },
+    /// Legacy HTTP+SSE: answers arrive on a long-lived GET event stream;
+    /// messages are POSTed to the endpoint it announced.
+    LegacySse {
+        client: reqwest::Client,
+        post_url: String,
+        headers: Vec<(String, String)>,
+        reader: tokio::task::JoinHandle<()>,
+    },
+}
+
+/// One live server connection (any transport).
 pub struct Connection {
-    child: StdMutex<Option<tokio::process::Child>>,
-    stdin: Mutex<tokio::process::ChildStdin>,
-    pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    io: Io,
+    pending: Pending,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
     last_used: AtomicU64,
@@ -107,9 +132,111 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Route one message from the server: an answer to a waiting request, a
+/// tools-changed notice, or a server request (answered via `reply`).
+fn route(msg: &Value, pending: &Pending, changed: &AtomicBool) -> Option<Value> {
+    match (msg.get("id").and_then(Value::as_u64), msg.get("method")) {
+        (Some(id), None) => {
+            if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                let out = match msg.get("error") {
+                    Some(e) => Err(e["message"].as_str().unwrap_or("MCP error").to_string()),
+                    None => Ok(msg["result"].clone()),
+                };
+                let _ = tx.send(out);
+            }
+            None
+        }
+        (_, Some(m)) if m == "notifications/tools/list_changed" => {
+            changed.store(true, Ordering::SeqCst);
+            None
+        }
+        // A request from the server: only `ping` is supported.
+        (_, Some(m)) if msg.get("id").is_some() => Some(if m == "ping" {
+            json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+        } else {
+            json!({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "method not supported"}})
+        }),
+        _ => None,
+    }
+}
+
+/// JSON messages in an SSE body (`data:` lines, events split by a blank line).
+fn sse_messages(body: &str) -> Vec<Value> {
+    body.split("\n\n")
+        .filter_map(|event| {
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|l| l.strip_prefix("data:").map(str::trim_start))
+                .collect();
+            serde_json::from_str(&data.join("\n")).ok()
+        })
+        .collect()
+}
+
+fn with_headers(
+    mut req: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    req
+}
+
 impl Connection {
-    /// Spawn the server and complete the MCP initialize handshake.
+    /// Connect to a configured server and complete the MCP handshake.
     pub async fn start(paths: &Paths, name: &str, cfg: &McpServerCfg) -> Result<Arc<Self>> {
+        let conn = match cfg.transport.as_str() {
+            "" | "stdio" => Self::spawn_stdio(paths, name, cfg)?,
+            "http" => {
+                let conn = Self::http(cfg)?;
+                match conn.initialize().await {
+                    Ok(()) => return Ok(conn),
+                    // An older server: fall back to HTTP+SSE.
+                    Err(e) if e.to_string().contains("legacy") => Self::legacy_sse(cfg).await?,
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("initialize MCP server '{name}'"))
+                    }
+                }
+            }
+            other => return Err(anyhow!("unknown MCP transport '{other}'")),
+        };
+        conn.initialize()
+            .await
+            .with_context(|| format!("initialize MCP server '{name}'"))?;
+        Ok(conn)
+    }
+
+    async fn initialize(self: &Arc<Self>) -> Result<()> {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        )
+        .await?;
+        self.notify("notifications/initialized", json!({})).await
+    }
+
+    fn new(
+        io: Io,
+        pending: Pending,
+        alive: Arc<AtomicBool>,
+        changed: Arc<AtomicBool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            io,
+            pending,
+            next_id: AtomicU64::new(1),
+            alive,
+            last_used: AtomicU64::new(now_secs()),
+            tools_changed: changed,
+        })
+    }
+
+    fn spawn_stdio(paths: &Paths, name: &str, cfg: &McpServerCfg) -> Result<Arc<Self>> {
         if cfg.command.is_empty() {
             return Err(anyhow!("MCP server '{name}' has no command"));
         }
@@ -137,88 +264,229 @@ impl Connection {
             .with_context(|| format!("start MCP server '{name}' ({})", cfg.command))?;
         let stdin = child.stdin.take().context("server stdin")?;
         let stdout = child.stdout.take().context("server stdout")?;
-        let conn = Arc::new(Self {
-            child: StdMutex::new(Some(child)),
-            stdin: Mutex::new(stdin),
-            pending: Default::default(),
-            next_id: AtomicU64::new(1),
-            alive: Arc::new(AtomicBool::new(true)),
-            last_used: AtomicU64::new(now_secs()),
-            tools_changed: Default::default(),
+        let (pending, alive, changed): (Pending, _, _) = (
+            Default::default(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let conn = Self::new(
+            Io::Stdio {
+                stdin: Mutex::new(stdin),
+                child: StdMutex::new(Some(child)),
+            },
+            pending.clone(),
+            alive.clone(),
+            changed.clone(),
+        );
+        let weak = Arc::downgrade(&conn);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Servers may print non-protocol lines; skip them.
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if let Some(reply) = route(&msg, &pending, &changed) {
+                    if let Some(c) = weak.upgrade() {
+                        let _ = c.write(&reply).await;
+                    }
+                }
+            }
+            alive.store(false, Ordering::SeqCst);
+            // Fail whatever was waiting: the server is gone.
+            pending.lock().unwrap().clear();
         });
-        // Reader: answers, server notifications, and the server's own pings.
-        {
-            let (pending, alive, changed) = (
-                conn.pending.clone(),
-                conn.alive.clone(),
-                conn.tools_changed.clone(),
-            );
-            let weak = Arc::downgrade(&conn);
+        Ok(conn)
+    }
+
+    fn http(cfg: &McpServerCfg) -> Result<Arc<Self>> {
+        if cfg.url.is_empty() {
+            return Err(anyhow!("an http MCP server needs a url"));
+        }
+        Ok(Self::new(
+            Io::Http {
+                client: reqwest::Client::new(),
+                url: cfg.url.clone(),
+                headers: cfg.headers.clone().into_iter().collect(),
+                session: StdMutex::new(None),
+            },
+            Default::default(),
+            Arc::new(AtomicBool::new(true)),
+            Default::default(),
+        ))
+    }
+
+    /// Legacy HTTP+SSE: open the event stream, wait for the `endpoint`
+    /// event, then read answers from the stream in the background.
+    async fn legacy_sse(cfg: &McpServerCfg) -> Result<Arc<Self>> {
+        let client = reqwest::Client::new();
+        let headers: Vec<(String, String)> = cfg.headers.clone().into_iter().collect();
+        let resp = with_headers(client.get(&cfg.url), &headers)
+            .header("accept", "text/event-stream")
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let endpoint = loop {
+            let chunk = futures_util::StreamExt::next(&mut stream)
+                .await
+                .context("SSE stream ended before the endpoint event")??;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            if let Some(end) = buf.find("\n\n") {
+                let event: String = buf.drain(..end + 2).collect();
+                if event.lines().any(|l| l.trim() == "event: endpoint") {
+                    let data = event
+                        .lines()
+                        .find_map(|l| l.strip_prefix("data:"))
+                        .context("endpoint event without data")?;
+                    break data.trim().to_string();
+                }
+            }
+        };
+        let post_url = reqwest::Url::parse(&cfg.url)?.join(&endpoint)?.to_string();
+        let (pending, alive, changed): (Pending, _, _) = (
+            Default::default(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let reader = {
+            let (pending, alive, changed) = (pending.clone(), alive.clone(), changed.clone());
+            let (client, post, headers) = (client.clone(), post_url.clone(), headers.clone());
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    // Servers may print non-protocol lines; skip them.
-                    let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                        continue;
-                    };
-                    match (msg.get("id").and_then(Value::as_u64), msg.get("method")) {
-                        (Some(id), None) => {
-                            if let Some(tx) = pending.lock().unwrap().remove(&id) {
-                                let out = match msg.get("error") {
-                                    Some(e) => Err(e["message"]
-                                        .as_str()
-                                        .unwrap_or("MCP error")
-                                        .to_string()),
-                                    None => Ok(msg["result"].clone()),
-                                };
-                                let _ = tx.send(out);
+                while let Some(Ok(chunk)) = futures_util::StreamExt::next(&mut stream).await {
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(end) = buf.find("\n\n") {
+                        let event: String = buf.drain(..end + 2).collect();
+                        for msg in sse_messages(&event) {
+                            if let Some(reply) = route(&msg, &pending, &changed) {
+                                let _ = with_headers(client.post(&post), &headers)
+                                    .json(&reply)
+                                    .send()
+                                    .await;
                             }
                         }
-                        (_, Some(m)) if m == "notifications/tools/list_changed" => {
-                            changed.store(true, Ordering::SeqCst);
-                        }
-                        (_, Some(m)) if msg.get("id").is_some() => {
-                            // A request from the server: only `ping` is supported.
-                            let reply = if m == "ping" {
-                                json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
-                            } else {
-                                json!({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "method not supported"}})
-                            };
-                            if let Some(c) = weak.upgrade() {
-                                let _ = c.write(&reply).await;
-                            }
-                        }
-                        _ => {}
                     }
                 }
                 alive.store(false, Ordering::SeqCst);
-                // Fail whatever was waiting: the server is gone.
                 pending.lock().unwrap().clear();
-            });
-        }
-        conn.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
-            }),
-        )
-        .await
-        .with_context(|| format!("initialize MCP server '{name}'"))?;
-        conn.notify("notifications/initialized", json!({})).await?;
-        Ok(conn)
+            })
+        };
+        Ok(Self::new(
+            Io::LegacySse {
+                client,
+                post_url,
+                headers,
+                reader,
+            },
+            pending,
+            alive,
+            changed,
+        ))
     }
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
 
+    /// Send a message whose answer (if any) arrives through `route`.
     async fn write(&self, msg: &Value) -> Result<()> {
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(format!("{msg}\n").as_bytes()).await?;
-        stdin.flush().await?;
+        match &self.io {
+            Io::Stdio { stdin, .. } => {
+                let mut stdin = stdin.lock().await;
+                stdin.write_all(format!("{msg}\n").as_bytes()).await?;
+                stdin.flush().await?;
+            }
+            Io::LegacySse {
+                client,
+                post_url,
+                headers,
+                ..
+            } => {
+                with_headers(client.post(post_url), headers)
+                    .json(msg)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+            Io::Http { .. } => {
+                self.http_post(msg, None).await?;
+            }
+        }
         Ok(())
+    }
+
+    /// Streamable HTTP: POST one message; with `want`, read its answer
+    /// from the JSON or SSE body. 429/5xx are retried with jittered backoff.
+    async fn http_post(&self, msg: &Value, want: Option<u64>) -> Result<Option<Value>> {
+        let Io::Http {
+            client,
+            url,
+            headers,
+            session,
+        } = &self.io
+        else {
+            return Err(anyhow!("not an HTTP connection"));
+        };
+        let mut attempt = 0u32;
+        let resp = loop {
+            let mut req = with_headers(client.post(url), headers)
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", PROTOCOL_VERSION)
+                .json(msg);
+            if let Some(id) = session.lock().unwrap().clone() {
+                req = req.header("mcp-session-id", id);
+            }
+            let resp = req.send().await?;
+            let status = resp.status().as_u16();
+            if (status == 429 || resp.status().is_server_error()) && attempt < 3 {
+                let wait = 250u64 << attempt;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    wait / 2 + rand::random::<u64>() % (wait / 2 + 1),
+                ))
+                .await;
+                attempt += 1;
+                continue;
+            }
+            // Servers without Streamable HTTP reject the initialize POST.
+            if msg["method"] == "initialize" && matches!(status, 404 | 405) {
+                return Err(anyhow!("server speaks the legacy HTTP+SSE transport"));
+            }
+            break resp.error_for_status()?;
+        };
+        if let Some(id) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *session.lock().unwrap() = Some(id.to_string());
+        }
+        let Some(want) = want else {
+            return Ok(None);
+        };
+        let is_sse = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.contains("text/event-stream"));
+        let body = resp.text().await?;
+        let messages = if is_sse {
+            sse_messages(&body)
+        } else {
+            match serde_json::from_str::<Value>(&body)? {
+                Value::Array(batch) => batch,
+                one => vec![one],
+            }
+        };
+        let mut answer = None;
+        for m in messages {
+            if m["id"].as_u64() == Some(want) && m.get("method").is_none() {
+                answer = Some(m);
+            } else if let Some(reply) = route(&m, &self.pending, &self.tools_changed) {
+                let _ = Box::pin(self.http_post(&reply, None)).await;
+            }
+        }
+        Ok(answer)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -234,8 +502,6 @@ impl Connection {
         }
         self.last_used.store(now_secs(), Ordering::SeqCst);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
         struct CancelOnDrop(Option<(Arc<Connection>, u64)>);
         impl Drop for CancelOnDrop {
             fn drop(&mut self) {
@@ -252,12 +518,24 @@ impl Connection {
                 }
             }
         }
+        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut guard = CancelOnDrop(Some((self.clone(), id)));
-        self.write(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await?;
-        let answer = rx
-            .await
-            .map_err(|_| anyhow!("MCP server stopped before answering"))?;
+        let answer = if let Io::Http { .. } = self.io {
+            let reply = self
+                .http_post(&msg, Some(id))
+                .await?
+                .context("the server sent no answer")?;
+            match reply.get("error") {
+                Some(e) => Err(e["message"].as_str().unwrap_or("MCP error").to_string()),
+                None => Ok(reply["result"].clone()),
+            }
+        } else {
+            let (tx, rx) = oneshot::channel();
+            self.pending.lock().unwrap().insert(id, tx);
+            self.write(&msg).await?;
+            rx.await
+                .map_err(|_| anyhow!("MCP server stopped before answering"))?
+        };
         guard.0 = None;
         answer.map_err(|e| anyhow!("{e}"))
     }
@@ -288,21 +566,27 @@ impl Connection {
         }
     }
 
-    /// Stop the server (its whole process group).
+    /// Stop the server: kill a stdio process group, close an event stream.
     pub fn stop(&self) {
         self.alive.store(false, Ordering::SeqCst);
-        if let Some(mut child) = self.child.lock().unwrap().take() {
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                extern "C" {
-                    fn kill(pid: i32, sig: i32) -> i32;
-                }
-                // SAFETY: plain syscall; the server leads its own group.
-                unsafe {
-                    kill(-(pid as i32), 9);
+        match &self.io {
+            Io::Stdio { child, .. } => {
+                if let Some(mut child) = child.lock().unwrap().take() {
+                    #[cfg(unix)]
+                    if let Some(pid) = child.id() {
+                        extern "C" {
+                            fn kill(pid: i32, sig: i32) -> i32;
+                        }
+                        // SAFETY: plain syscall; the server leads its own group.
+                        unsafe {
+                            kill(-(pid as i32), 9);
+                        }
+                    }
+                    let _ = child.start_kill();
                 }
             }
-            let _ = child.start_kill();
+            Io::LegacySse { reader, .. } => reader.abort(),
+            Io::Http { .. } => {}
         }
     }
 }
@@ -359,12 +643,6 @@ impl Manager {
             .get(server)
             .filter(|s| !s.disabled)
             .with_context(|| format!("no enabled MCP server '{server}'"))?;
-        if !scfg.transport.is_empty() && scfg.transport != "stdio" {
-            return Err(anyhow!(
-                "MCP transport '{}' is not supported yet",
-                scfg.transport
-            ));
-        }
         let mut conns = self.conns.lock().await;
         if let Some(c) = conns.get(server).filter(|c| c.is_alive()) {
             return Ok(c.clone());

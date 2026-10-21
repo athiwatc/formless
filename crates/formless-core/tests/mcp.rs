@@ -259,8 +259,10 @@ async fn daemon_registers_and_runs_mcp_tools() {
     use std::sync::Arc;
     let paths = temp_paths("mcpdaemon");
     let (mcp, _) = fake_server(&paths);
-    let mut cfg = formless_core::Config::default();
-    cfg.mcp = mcp;
+    let mut cfg = formless_core::Config {
+        mcp,
+        ..Default::default()
+    };
     cfg.daemon.idle_grace_secs = 3600;
     cfg.save(&paths).unwrap();
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
@@ -300,4 +302,159 @@ async fn daemon_registers_and_runs_mcp_tools() {
         .await
         .unwrap();
     let _ = server.await;
+}
+
+fn answer(id: &Value, method: &str, params: &Value) -> Value {
+    let result = match method {
+        "initialize" => {
+            json!({"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "http"}})
+        }
+        "tools/list" => {
+            json!({"tools": [{"name": "echo", "description": "Echo", "inputSchema": {"type": "object"}}]})
+        }
+        "tools/call" => json!({"content": [{"type": "text", "text": params["arguments"]["text"]}]}),
+        _ => json!({}),
+    };
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+/// Streamable HTTP: JSON and SSE answers, session id carried, static
+/// headers sent, transient 503s retried.
+#[tokio::test]
+async fn streamable_http_servers_work() {
+    use axum::{http::HeaderMap, response::IntoResponse, routing::post, Json, Router};
+    let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/mcp",
+        post(move |headers: HeaderMap, Json(msg): Json<Value>| {
+            let failures = failures.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer t0k");
+                let method = msg["method"].as_str().unwrap_or_default().to_string();
+                if msg.get("id").is_none() {
+                    return axum::http::StatusCode::ACCEPTED.into_response();
+                }
+                if method != "initialize" {
+                    assert_eq!(headers["mcp-session-id"], "sess-1", "session id is carried");
+                }
+                if method == "tools/call"
+                    && failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                let reply = answer(&msg["id"], &method, &msg["params"]);
+                if method == "tools/list" {
+                    // As an SSE body, with a server notice before the answer.
+                    let body = format!(
+                        "event: message\ndata: {}\n\nevent: message\ndata: {}\n\n",
+                        json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+                        reply
+                    );
+                    return ([("content-type", "text/event-stream")], body).into_response();
+                }
+                ([("mcp-session-id", "sess-1")], Json(reply)).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let server = McpServerCfg {
+        transport: "http".into(),
+        url,
+        headers: [("authorization".to_string(), "Bearer t0k".to_string())].into(),
+        ..Default::default()
+    };
+    let cfg = McpCfg {
+        servers: [("web".to_string(), server)].into(),
+        ..Default::default()
+    };
+    let paths = temp_paths("mcphttp");
+    let mcp = Manager::default();
+    let conn = mcp.connection(&paths, &cfg, "web").await.unwrap();
+    assert_eq!(conn.list_tools().await.unwrap()[0].name, "echo");
+    assert_eq!(
+        mcp.changed_servers().await,
+        ["web"],
+        "notice inside the SSE body"
+    );
+    let r = mcp
+        .call(&paths, &cfg, "web", "echo", json!({"text": "over http"}))
+        .await
+        .unwrap();
+    assert_eq!(call_result(&r).unwrap(), json!("over http"), "503 retried");
+}
+
+/// Legacy HTTP+SSE: answers arrive on the GET event stream after the
+/// `endpoint` event; messages are POSTed to the announced endpoint.
+#[tokio::test]
+async fn legacy_sse_servers_work() {
+    use axum::{
+        extract::State,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use tokio::sync::mpsc;
+    type Tx = std::sync::Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>;
+    let tx: Tx = Default::default();
+    let app = Router::new()
+        .route(
+            "/mcp",
+            post(|| async { axum::http::StatusCode::METHOD_NOT_ALLOWED }),
+        )
+        .route(
+            "/mcp",
+            get(|State(tx): State<Tx>| async move {
+                let (send, recv) = mpsc::unbounded_channel::<String>();
+                *tx.lock().await = Some(send.clone());
+                send.send("event: endpoint\ndata: /messages?session=1\n\n".into())
+                    .unwrap();
+                let stream = futures_util::stream::unfold(recv, |mut r| async move {
+                    r.recv().await.map(|m| (Ok::<_, std::io::Error>(m), r))
+                });
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/messages",
+            post(|State(tx): State<Tx>, Json(msg): Json<Value>| async move {
+                if msg.get("id").is_some() && msg.get("method").is_some() {
+                    let reply = answer(&msg["id"], msg["method"].as_str().unwrap(), &msg["params"]);
+                    if let Some(tx) = tx.lock().await.as_ref() {
+                        let _ = tx.send(format!("event: message\ndata: {reply}\n\n"));
+                    }
+                }
+                axum::http::StatusCode::ACCEPTED
+            }),
+        )
+        .with_state(tx);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let cfg = McpCfg {
+        servers: [(
+            "old".to_string(),
+            McpServerCfg {
+                transport: "http".into(),
+                url,
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let paths = temp_paths("mcpsse");
+    let mcp = Manager::default();
+    let conn = mcp.connection(&paths, &cfg, "old").await.unwrap();
+    assert_eq!(conn.list_tools().await.unwrap()[0].name, "echo");
+    let r = mcp
+        .call(&paths, &cfg, "old", "echo", json!({"text": "legacy"}))
+        .await
+        .unwrap();
+    assert_eq!(call_result(&r).unwrap(), json!("legacy"));
 }
