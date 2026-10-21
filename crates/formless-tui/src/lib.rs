@@ -138,6 +138,7 @@ enum Pending {
     ListInvocations,
     GetArtifact,
     GenerateProposal,
+    ListProviders,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -895,6 +896,38 @@ impl App {
                                 ));
                             }
                         }
+                        Pending::ListProviders => {
+                            for p in result["providers"].as_array().into_iter().flatten() {
+                                self.notes.push(format!(
+                                    "provider {} · {} · model {}{}",
+                                    p["name"].as_str().unwrap_or_default(),
+                                    p["base_url"].as_str().unwrap_or_default(),
+                                    p["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("-"),
+                                    if p["has_key"] == true {
+                                        ""
+                                    } else {
+                                        " · no key"
+                                    }
+                                ));
+                            }
+                            let roles = result["roles"].as_object().cloned().unwrap_or_default();
+                            if roles.is_empty() {
+                                self.notes.push(
+                                    "no roles · /role add NAME PROVIDER MODEL description…".into(),
+                                );
+                            }
+                            for (name, r) in roles {
+                                self.notes.push(format!(
+                                    "role {name} · {} · {} · {}",
+                                    r["provider"].as_str().unwrap_or("default"),
+                                    r["model"]
+                                        .as_str()
+                                        .filter(|m| !m.is_empty())
+                                        .unwrap_or("provider default"),
+                                    r["description"].as_str().unwrap_or_default()
+                                ));
+                            }
+                        }
                         Pending::GenerateProposal => {
                             if result["started"] == true {
                                 self.proposal_generating = true;
@@ -1616,7 +1649,15 @@ impl App {
                         .find(|c| c.status == "running")
                         .map_or(0, |c| c.depth + 1);
                     self.live_tools.push(LiveToolCall {
-                        name: format!("sub-agent: {}", truncate_chars(&subagent.task, 60)),
+                        name: format!(
+                            "sub-agent{}: {}",
+                            if subagent.model.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", subagent.model)
+                            },
+                            truncate_chars(&subagent.task, 60)
+                        ),
                         depth,
                         subagent: Some(subagent.id.clone()),
                         version: 0,
@@ -1949,6 +1990,34 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            "roles" | "providers" => self.request(Pending::ListProviders, Request::ListProviders),
+            cmd if cmd.starts_with("role add ") => {
+                let mut w = cmd["role add ".len()..].split_whitespace();
+                let (name, provider, model) = (w.next(), w.next(), w.next());
+                let description = w.collect::<Vec<_>>().join(" ");
+                match (name, provider, model) {
+                    (Some(name), Some(provider), Some(model)) if !description.is_empty() => {
+                        self.fire(Request::UpsertRole {
+                            name: name.to_string(),
+                            role: serde_json::json!({
+                                "provider": provider,
+                                "model": if model == "-" { "" } else { model },
+                                "description": description,
+                            }),
+                        });
+                        self.notes.push(format!("role {name} saved (new Sessions see it)"));
+                    }
+                    _ => self.notes.push(
+                        "usage: /role add NAME PROVIDER MODEL description… (MODEL - = provider default)"
+                            .into(),
+                    ),
+                }
+            }
+            cmd if cmd.starts_with("role rm ") => {
+                let name = cmd["role rm ".len()..].trim().to_string();
+                self.fire(Request::DeleteRole { name: name.clone() });
+                self.notes.push(format!("deleted role {name}"));
+            }
             "copy" => self.copy_cmd(""),
             cmd if cmd.starts_with("copy ") => self.copy_cmd(cmd[5..].trim()),
             "mouse" => {
@@ -2223,7 +2292,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
+                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /roles /role add|rm /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

@@ -51,6 +51,16 @@ enum Cmd {
         #[arg(long)]
         stop: bool,
     },
+    /// Extra model providers (SPEC §4.5)
+    Providers {
+        #[command(subcommand)]
+        action: ProvidersAction,
+    },
+    /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
+    Roles {
+        #[command(subcommand)]
+        action: RolesAction,
+    },
     /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
     Jobs {
         #[command(subcommand)]
@@ -242,6 +252,55 @@ enum SkillsAction {
 }
 
 #[derive(Subcommand)]
+enum ProvidersAction {
+    List,
+    /// Add or update a provider; the API key is read from stdin (not argv)
+    Add {
+        name: String,
+        #[arg(long)]
+        base_url: String,
+        /// Its default model
+        #[arg(long)]
+        model: Option<String>,
+        /// Skip asking for an API key (local servers)
+        #[arg(long)]
+        no_key: bool,
+    },
+    Remove {
+        name: String,
+    },
+    /// Fetch the provider's /models list
+    Test {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RolesAction {
+    List,
+    /// Create or replace a role
+    Add {
+        name: String,
+        /// When to use it, for the agent ("fast; broad read-only search")
+        #[arg(long)]
+        description: String,
+        /// Provider name (default: [provider])
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, default_value = "")]
+        model: String,
+        #[arg(long)]
+        effort: Option<String>,
+        /// Extra system prompt for sub-agents in this role
+        #[arg(long)]
+        system: Option<String>,
+    },
+    Rm {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum JobsAction {
     List,
     /// Schedule a prompt: --cron "0 3 * * *" (recurring) or --at "in 30m"
@@ -367,6 +426,8 @@ fn main() -> Result<()> {
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs { limit, json }) => runs_cmd(paths, limit, json),
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
+        Some(Cmd::Providers { action }) => providers_cmd(paths, action),
+        Some(Cmd::Roles { action }) => roles_cmd(paths, action),
         Some(Cmd::Web {
             port,
             no_open,
@@ -1309,6 +1370,112 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
         };
         if opener.map(|s| !s.success()).unwrap_or(true) {
             println!("(could not open a browser; open the link above)");
+        }
+    }
+    Ok(())
+}
+
+fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
+    formless_core::daemon::ensure_daemon(&paths)?;
+    let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
+    match action {
+        ProvidersAction::List => {
+            let r = daemon(Request::ListProviders)?;
+            for p in r["providers"].as_array().into_iter().flatten() {
+                println!(
+                    "{:<14} {:<40} model {:<24} {}",
+                    p["name"].as_str().unwrap_or_default(),
+                    p["base_url"].as_str().unwrap_or_default(),
+                    p["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("-"),
+                    if p["has_key"] == true {
+                        "key stored"
+                    } else {
+                        "no key"
+                    }
+                );
+            }
+        }
+        ProvidersAction::Add {
+            name,
+            base_url,
+            model,
+            no_key,
+        } => {
+            let api_key = if no_key {
+                None
+            } else {
+                eprint!("API key for {name} (empty for none): ");
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                Some(line.trim().to_string()).filter(|k| !k.is_empty())
+            };
+            daemon(Request::UpsertProvider {
+                name: name.clone(),
+                base_url,
+                model,
+                api_key,
+            })?;
+            println!("provider {name} saved; check it with `formless providers test {name}`");
+        }
+        ProvidersAction::Remove { name } => {
+            daemon(Request::RemoveProvider { name: name.clone() })?;
+            println!("removed {name}");
+        }
+        ProvidersAction::Test { name } => {
+            let r = daemon(Request::TestProvider { name })?;
+            let models = r["models"].as_array().cloned().unwrap_or_default();
+            println!("{} model(s):", models.len());
+            for m in models {
+                println!("  {}", m.as_str().unwrap_or_default());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn roles_cmd(paths: Paths, action: RolesAction) -> Result<()> {
+    formless_core::daemon::ensure_daemon(&paths)?;
+    let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
+    match action {
+        RolesAction::List => {
+            let r = daemon(Request::ListProviders)?;
+            let roles = r["roles"].as_object().cloned().unwrap_or_default();
+            if roles.is_empty() {
+                println!(
+                    "no roles (formless roles add NAME --description … --provider … --model …)"
+                );
+            }
+            for (name, role) in roles {
+                println!(
+                    "{:<14} {} · {}\n               {}",
+                    name,
+                    role["provider"].as_str().unwrap_or("default"),
+                    role["model"]
+                        .as_str()
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or("provider default"),
+                    role["description"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        RolesAction::Add {
+            name,
+            description,
+            provider,
+            model,
+            effort,
+            system,
+        } => {
+            daemon(Request::UpsertRole {
+                name: name.clone(),
+                role: serde_json::json!({"description": description, "provider": provider,
+                    "model": model, "reasoning_effort": effort, "system": system}),
+            })?;
+            println!("role {name} saved");
+        }
+        RolesAction::Rm { name } => {
+            daemon(Request::DeleteRole { name: name.clone() })?;
+            println!("deleted role {name}");
         }
     }
     Ok(())

@@ -191,6 +191,53 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   correction prompt and counted in a **separate** malformed-call counter —
   they never pollute Tool Success Rate.
 
+### 4.5 Providers and Roles
+
+The user talks to one **primary** model; work can go to others.
+
+- **Providers.** `[provider]` is the provider named `default`, unchanged
+  for existing setups. `[providers.<name>]` adds more, with the same
+  fields (`base_url`, `model`, headers, per-model `context_tokens`, …).
+  - Keys: a named provider's API key lives in the keychain or 0600 secret
+    `provider-key-<name>` (or the env var `FORMLESS_API_KEY_<NAME>`), and
+    is never in the config file or a listing. Named providers use API
+    keys; OAuth stays with `default`.
+  - Requests: `ListProviders` (with `has_key`), `UpsertProvider` (the key
+    goes straight to the keychain), `TestProvider` (lists `/models`) and
+    `RemoveProvider` (refused while a role uses it).
+- **Roles.** `[roles.<name>]` holds a `description` (when to use it,
+  written for the agent), a `provider` (default `default`), a `model`
+  (empty = that provider's default), an optional `reasoning_effort`, and
+  an optional `system` addendum for sub-agents in the role. Roles change
+  through `UpsertRole` and `DeleteRole`.
+  - CLI: `formless providers list|add|remove|test` and `formless roles
+    list|add|rm`. The CLI reads the key from stdin, never argv.
+  - TUI: `/roles`, `/role add NAME PROVIDER MODEL description…` and
+    `/role rm NAME`.
+- **Choosing a role.** The system prompt lists the roles with their
+  descriptions, so the agent picks by intent:
+  - inside a Tool, `agents.run(task, {role})` and `llm.complete(prompt,
+    {role})`; an explicit `model` still works
+  - for the primary Session, `/model role:<name>`, which runs the Session
+    on that role's provider and model.
+  No role means the Session's own model and effort. An unknown role is
+  an error naming the configured ones. Capability scopes apply as for
+  models (`agent:role:<name>` / `llm:role:<name>`). A sub-agent records
+  its role and model (`subagents.model`, schema v29), and the TUI shows
+  it on the sub-agent's node.
+- **Fallback.** A role's model may be `auto` and goes through the
+  existing routing and failover of `default`. If a role's provider is
+  unreachable, the call fails like any provider error (§4.4) rather than
+  silently using another provider.
+- **Design answers (#195).**
+  - Who decides: the user defines the roles; the primary model chooses
+    among them at call time.
+  - Nesting: sub-agents may spawn others only within
+    `tools.max_agent_depth`, as before.
+  - Not yet: per-role budgets, and making the optimiser and namer
+    built-in roles.
+  - Per-role `auto` with per-task scoring follows in #201 and #202.
+
 ## 5. Agent loop, Sessions, and Runs
 
 ### 5.1 Session

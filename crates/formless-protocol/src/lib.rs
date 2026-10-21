@@ -289,6 +289,9 @@ pub struct SubagentInfo {
     pub task: String,
     /// Sub-agent nesting (1 = started by the main agent).
     pub depth: u32,
+    /// The role and model it ran on ("explorer · qwen3", or just a model).
+    #[serde(default)]
+    pub model: String,
     pub status: String,
     pub steps: i64,
     pub result: Option<String>,
@@ -541,6 +544,34 @@ pub enum Request {
         offset: Option<usize>,
         #[serde(default)]
         length: Option<usize>,
+    },
+    /// Providers and Roles (SPEC §4.5): `{"providers": [...], "roles": {...}}`
+    /// (never API keys; `has_key` says whether one is stored).
+    ListProviders,
+    /// Add or replace a named provider; `api_key` goes to the keychain.
+    UpsertProvider {
+        name: String,
+        base_url: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+    /// Remove a named provider (refused while a role uses it).
+    RemoveProvider {
+        name: String,
+    },
+    /// List a provider's models (a connectivity test).
+    TestProvider {
+        name: String,
+    },
+    /// Create or replace a Role.
+    UpsertRole {
+        name: String,
+        role: serde_json::Value,
+    },
+    DeleteRole {
+        name: String,
     },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,

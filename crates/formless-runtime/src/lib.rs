@@ -290,10 +290,10 @@ globalThis.store = {
   list: (prefix, o) => __call("kv", { op: "list", key: String(prefix || ""), ns: (o && o.ns) || "" }),
 };
 globalThis.llm = {
-  complete: (prompt, opts) => __call("llm_complete", { prompt: String(prompt), system: (opts && opts.system) || null, model: (opts && opts.model) || null }),
+  complete: (prompt, opts) => __call("llm_complete", { prompt: String(prompt), system: (opts && opts.system) || null, model: (opts && opts.role) ? "role:" + opts.role : (opts && opts.model) || null }),
 };
 globalThis.agents = {
-  run: (task, opts) => __call("agent_run", { task: String(task), system: (opts && opts.system) || null, model: (opts && opts.model) || null }),
+  run: (task, opts) => __call("agent_run", { task: String(task), system: (opts && opts.system) || null, model: (opts && opts.role) ? "role:" + opts.role : (opts && opts.model) || null }),
 };
 globalThis.__moduleCache = {};
 globalThis.requireModule = (name) => {

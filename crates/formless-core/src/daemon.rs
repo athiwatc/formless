@@ -259,6 +259,67 @@ impl Daemon {
         Ok(cfg)
     }
 
+    /// A named provider (SPEC §4.5); `default`/unset is `[provider]`.
+    pub(crate) async fn provider_named(
+        &self,
+        cfg: &Config,
+        name: Option<&str>,
+    ) -> Result<Provider> {
+        match name.filter(|n| !n.is_empty() && *n != crate::config::DEFAULT_PROVIDER) {
+            None => self.provider(cfg).await,
+            Some(n) => {
+                let pcfg = cfg.provider_cfg(Some(n))?;
+                if pcfg.oauth() {
+                    return Err(anyhow!(
+                        "provider '{n}': OAuth is only supported for the default provider"
+                    ));
+                }
+                let key = crate::config::provider_key(&self.paths, n).unwrap_or_default();
+                Ok(Provider::with_key(pcfg, key, self.http.clone()))
+            }
+        }
+    }
+
+    /// Where a model call goes (SPEC §4.5): `requested` is a model id,
+    /// `role:<name>`, or None for the Session's own model and effort.
+    pub(crate) async fn target(
+        &self,
+        cfg: &Config,
+        session_id: &str,
+        requested: Option<&str>,
+    ) -> Result<Target> {
+        let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
+        let wanted = requested.map(str::to_string).unwrap_or(session_model);
+        if let Some(role_name) = wanted.strip_prefix("role:") {
+            let role = cfg.role(role_name)?;
+            let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
+            let model = if role.model.is_empty() {
+                cfg.provider_cfg(role.provider.as_deref())?.model
+            } else {
+                role.model.clone()
+            };
+            let effort = role.reasoning_effort.clone().or_else(|| {
+                cfg.provider_cfg(role.provider.as_deref())
+                    .ok()?
+                    .reasoning_effort
+            });
+            return Ok(Target {
+                provider,
+                model,
+                effort,
+                system: role.system.clone(),
+                role: Some(role_name.to_string()),
+            });
+        }
+        Ok(Target {
+            provider: self.provider(cfg).await?,
+            model: wanted,
+            effort: session_effort,
+            system: None,
+            role: None,
+        })
+    }
+
     /// A provider for `cfg` on the daemon's shared HTTP client.
     pub(crate) async fn provider(&self, cfg: &Config) -> Result<Provider> {
         Provider::for_profile_with(cfg.provider.clone(), self.paths.clone(), self.http.clone())
@@ -643,6 +704,111 @@ impl Daemon {
                 // Never the filesystem path (SPEC §9.6).
                 Ok(json!({"id": id, "session_id": session, "bytes": bytes,
                           "total_chars": total, "offset": offset, "end": end, "text": slice}))
+            }
+            Request::ListProviders => {
+                let cfg = self.config()?;
+                let mut providers = vec![json!({
+                    "name": crate::config::DEFAULT_PROVIDER,
+                    "base_url": cfg.provider.base_url,
+                    "model": cfg.provider.model,
+                    "has_key": crate::config::load_api_key(&self.paths).is_some() || cfg.provider.oauth(),
+                })];
+                for (name, p) in &cfg.providers {
+                    providers.push(json!({
+                        "name": name, "base_url": p.base_url, "model": p.model,
+                        "has_key": crate::config::provider_key(&self.paths, name).is_some(),
+                    }));
+                }
+                Ok(json!({"providers": providers, "roles": cfg.roles}))
+            }
+            Request::UpsertProvider {
+                name,
+                base_url,
+                model,
+                api_key,
+            } => {
+                if name == crate::config::DEFAULT_PROVIDER
+                    || name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!("provider names use letters, digits, '-' and '_' (and 'default' is [provider])"));
+                }
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                let p = cfg.providers.entry(name.clone()).or_default();
+                p.base_url = base_url.trim_end_matches('/').to_string();
+                if let Some(m) = model {
+                    p.model = m;
+                }
+                cfg.save(&self.paths)?;
+                if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+                    crate::config::save_provider_key(&self.paths, &name, &key)?;
+                }
+                let _ = self.with_store(|st| st.audit("user", "provider.upsert", &name));
+                let _ = self.config();
+                Ok(json!({"provider": name}))
+            }
+            Request::RemoveProvider { name } => {
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                let users: Vec<&String> = cfg
+                    .roles
+                    .iter()
+                    .filter(|(_, r)| r.provider.as_deref() == Some(name.as_str()))
+                    .map(|(n, _)| n)
+                    .collect();
+                if !users.is_empty() {
+                    return Err(anyhow!(
+                        "provider '{name}' is used by role(s) {}; change or delete them first",
+                        users
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if cfg.providers.remove(&name).is_none() {
+                    return Err(anyhow!("no provider '{name}'"));
+                }
+                cfg.save(&self.paths)?;
+                crate::config::delete_provider_key(&self.paths, &name);
+                let _ = self.with_store(|st| st.audit("user", "provider.remove", &name));
+                let _ = self.config();
+                Ok(json!({"removed": name}))
+            }
+            Request::TestProvider { name } => {
+                let cfg = self.config()?;
+                let provider = self.provider_named(&cfg, Some(&name)).await?;
+                let models = provider.list_models().await?;
+                Ok(json!({"provider": name, "models": models}))
+            }
+            Request::UpsertRole { name, role } => {
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!("role names use letters, digits, '-' and '_'"));
+                }
+                let role: crate::config::RoleCfg =
+                    serde_json::from_value(role).context("invalid role")?;
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                cfg.provider_cfg(role.provider.as_deref())?;
+                cfg.roles.insert(name.clone(), role);
+                cfg.save(&self.paths)?;
+                let _ = self.with_store(|st| st.audit("user", "role.upsert", &name));
+                let _ = self.config();
+                Ok(json!({"role": name}))
+            }
+            Request::DeleteRole { name } => {
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                if cfg.roles.remove(&name).is_none() {
+                    return Err(anyhow!("no role '{name}'"));
+                }
+                cfg.save(&self.paths)?;
+                let _ = self.with_store(|st| st.audit("user", "role.delete", &name));
+                let _ = self.config();
+                Ok(json!({"deleted": name}))
             }
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
@@ -1619,17 +1785,14 @@ impl Daemon {
                 "provider not configured; run the onboarding wizard"
             ));
         }
-        let provider = self
-            .provider(&cfg)
-            .await?
-            .with_cache_key(&format!("formless-{session_id}"));
-        let session = self
-            .with_store(|st| st.get_session(session_id))?
+        self.with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
-        let requested_model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| cfg.provider.model.clone());
+        // The Session's model, or its role's provider + model (SPEC §4.5).
+        let target = self.target(&cfg, session_id, None).await?;
+        let provider = target
+            .provider
+            .with_cache_key(&format!("formless-{session_id}"));
+        let requested_model = target.model.clone();
         let (context_chars, tool_count) = self.with_store(|st| {
             let chars = st.session_content_chars(session_id).unwrap_or(0);
             let tools = toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -1649,11 +1812,8 @@ impl Daemon {
                 text: format!("Routed to model {model} (measured auto-selection)."),
             });
         }
-        let effort = session
-            .reasoning_effort
-            .clone()
-            .or_else(|| cfg.provider.reasoning_effort.clone());
-        let context_tokens = cfg.provider.context_for(&model);
+        let effort = target.effort.clone();
+        let context_tokens = provider.settings().context_for(&model);
 
         self.maybe_compact(&provider, &cfg, session_id, &model, context_tokens)
             .await?;
@@ -2829,6 +2989,31 @@ impl Daemon {
             prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
             prompt.push_str(&skills.join("\n"));
         }
+        // Roles (SPEC §4.5): described so the agent picks one for
+        // sub-agents and llm calls by intent.
+        if let Ok(cfg) = self.config() {
+            if !cfg.roles.is_empty() {
+                prompt.push_str("\n\nRoles (pass {role: name} to agents.run or llm.complete from a Tool with the agent/llm Capability):");
+                for (name, r) in &cfg.roles {
+                    let model = if r.model.is_empty() {
+                        "provider default"
+                    } else {
+                        r.model.as_str()
+                    };
+                    prompt.push_str(&format!(
+                        "\n- {name}: {} [{} · {model}]",
+                        if r.description.is_empty() {
+                            "(no description)"
+                        } else {
+                            r.description.as_str()
+                        },
+                        r.provider
+                            .as_deref()
+                            .unwrap_or(crate::config::DEFAULT_PROVIDER)
+                    ));
+                }
+            }
+        }
         // User memory (SPEC §7.11), also part of the snapshot.
         let memories = self.with_store(|st| st.list_memories()).unwrap_or_default();
         prompt.push_str(&crate::memory::prompt_block(&memories));
@@ -2935,10 +3120,13 @@ impl Daemon {
             if task.trim().is_empty() {
                 return Err(anyhow!("sub-agent task is empty"));
             }
-            let provider = self.provider(cfg).await?;
-            // The Session's model/effort, not the daemon default (SPEC §7.6).
-            let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
-            let requested = model.map(str::to_string).unwrap_or(session_model);
+            // The Session's model/effort, or a role's provider + model
+            // (`role:<name>`), never the daemon default (SPEC §4.5, §7.6).
+            let target = self.target(cfg, session_id, model).await?;
+            let provider = target.provider;
+            let session_effort = target.effort;
+            let requested = target.model;
+            let role = target.role;
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -2960,14 +3148,21 @@ impl Daemon {
                 "role": "system",
                 "content": "You are a Formless sub-agent. Complete the single task you are given, building and using Tools as needed, then return a concise final result."
             })];
+            if let Some(sys) = target.system.as_deref() {
+                messages.push(json!({"role": "system", "content": sys}));
+            }
             if let Some(sys) = system {
                 messages.push(json!({"role": "system", "content": sys}));
             }
             messages.push(json!({"role": "user", "content": task}));
+            let label = match &role {
+                Some(r) => format!("{r} · {model}"),
+                None => model.clone(),
+            };
             // Visible and stored (not just a local Vec): clients see each
             // step, and the transcript outlives the call.
             let sub = self.with_store(|st| {
-                st.create_subagent(session_id, run_id, task, agent_depth as u32)
+                st.create_subagent(session_id, run_id, task, agent_depth as u32, &label)
             })?;
             let sub_id = sub.id.clone();
             for m in &messages {
@@ -5824,14 +6019,13 @@ impl HostOps for NestedOps {
         if self.cancel.is_cancelled() {
             return Err("interrupted".into());
         }
-        let provider = self
+        let target = self
             .handle
-            .block_on(self.daemon.provider(&self.cfg))
+            .block_on(self.daemon.target(&self.cfg, &self.session_id, model))
             .map_err(|e| e.to_string())?;
-        let (session_model, effort) = self
-            .daemon
-            .session_model_effort(&self.session_id, &self.cfg);
-        let requested = model.map(str::to_string).unwrap_or(session_model);
+        let provider = target.provider;
+        let effort = target.effort;
+        let requested = target.model;
         let model = self
             .daemon
             .resolve_model(
@@ -6042,4 +6236,16 @@ fn is_control(req: &Request) -> bool {
             | Request::PromotionDecision { .. }
             | Request::AnswerQuestion { .. }
     )
+}
+
+/// Where a model call goes (SPEC §4.5).
+pub(crate) struct Target {
+    pub provider: Provider,
+    /// The model to request (may still be `auto`, resolved by routing).
+    pub model: String,
+    pub effort: Option<String>,
+    /// A role's system prompt addendum.
+    pub system: Option<String>,
+    /// The role, when one was chosen.
+    pub role: Option<String>,
 }
