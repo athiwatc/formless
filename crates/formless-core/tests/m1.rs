@@ -60,6 +60,36 @@ fn storage_resume_is_byte_identical_and_compaction_flags() {
 }
 
 #[test]
+fn context_has_one_leading_system_message() {
+    let paths = temp_paths("onesystem");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap();
+    store.append_message(&s.id, "user", "old").unwrap();
+    store
+        .append_message(&s.id, "assistant", "old reply")
+        .unwrap();
+    store.save_checkpoint(&s.id, "earlier summary", 2).unwrap();
+    store.append_message(&s.id, "user", "question").unwrap();
+    store
+        .append_message(&s.id, "system-note", "joins the user turn")
+        .unwrap();
+    store.append_message(&s.id, "assistant", "answer").unwrap();
+    store
+        .append_message(&s.id, "system-note", "stands alone")
+        .unwrap();
+    let (ctx, _, _) = build_context(&store, &s.id, "sys", 1_000_000, 0.8).unwrap();
+    let roles: Vec<&str> = ctx.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "user"]);
+    let system = ctx[0]["content"].as_str().unwrap();
+    assert!(system.starts_with("sys") && system.contains("earlier summary"));
+    assert_eq!(
+        ctx[1]["content"],
+        "question\n\n[harness note] joins the user turn"
+    );
+    assert_eq!(ctx[3]["content"], "[harness note] stands alone");
+}
+
+#[test]
 fn provider_message_echoes_reasoning_only_on_tool_call_turns() {
     let meta = json!({
         "tool_calls": [{"id": "1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
