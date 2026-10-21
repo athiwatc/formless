@@ -536,6 +536,12 @@ None ship by default (principle 1).
   retired. They are found, listed, pinned and **measured** like Tools, but
   run on the server, and the optimiser never rewrites them. The `mcp__`
   prefix is reserved.
+- **HTTP transport** (`transport = "http"`, `url`, static `headers`):
+  Streamable HTTP (every message POSTed; the answer comes back as the JSON
+  body or an SSE body; `Mcp-Session-Id` carried; 429/5xx retried with
+  jittered backoff), falling back to the legacy HTTP+SSE transport (GET
+  event stream announcing an `endpoint`) when the initialize POST is
+  refused with 404/405.
 - `mcp:<server>` is sensitive: calls need approval (§10.3) and headless
   calls fail closed.
 
