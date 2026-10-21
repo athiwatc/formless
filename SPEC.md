@@ -839,6 +839,7 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 |---|---|---|
 | `daemon.idle_grace_secs` | 60 | Idle-close grace after last Run + last client (§9.1) |
 | `daemon.stall_warning_secs` | 300 | Silence before `possibly stalled` flag (§6.1) |
+| `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
 | `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |

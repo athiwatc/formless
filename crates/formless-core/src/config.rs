@@ -26,6 +26,9 @@ pub struct DaemonCfg {
     pub stall_warning_secs: u64,
     pub log_max_bytes: u64,
     pub log_keep: usize,
+    /// How long a client waits for an auto-started daemon to accept
+    /// connections (a first start may migrate and back up a large DB).
+    pub start_timeout_secs: u64,
 }
 impl Default for DaemonCfg {
     fn default() -> Self {
@@ -34,6 +37,7 @@ impl Default for DaemonCfg {
             stall_warning_secs: 300,
             log_max_bytes: 10_000_000,
             log_keep: 5,
+            start_timeout_secs: 60,
         }
     }
 }
