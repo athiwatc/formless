@@ -113,7 +113,13 @@ pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
         &spec.tokenizer_path(paths),
     )
     .await?;
-    fetch_verified(&http, spec.gguf_url, spec.gguf_sha256, &spec.gguf_path(paths)).await
+    fetch_verified(
+        &http,
+        spec.gguf_url,
+        spec.gguf_sha256,
+        &spec.gguf_path(paths),
+    )
+    .await
 }
 
 async fn fetch_verified(
@@ -251,9 +257,13 @@ pub fn llm_title(paths: &Paths, spec: &ModelSpec, user: &str) -> Result<String> 
             content, &mut file, &dev,
         )?),
     };
-    let tok = tokenizers::Tokenizer::from_file(spec.tokenizer_path(paths))
-        .map_err(anyhow::Error::msg)?;
-    let stops: Vec<u32> = spec.stop.iter().filter_map(|s| tok.token_to_id(s)).collect();
+    let tok =
+        tokenizers::Tokenizer::from_file(spec.tokenizer_path(paths)).map_err(anyhow::Error::msg)?;
+    let stops: Vec<u32> = spec
+        .stop
+        .iter()
+        .filter_map(|s| tok.token_to_id(s))
+        .collect();
     let ids = tok
         .encode(prompt(spec, user), false)
         .map_err(anyhow::Error::msg)?
@@ -278,7 +288,11 @@ pub fn llm_title(paths: &Paths, spec: &ModelSpec, user: &str) -> Result<String> 
         }
         out.push(next);
         // Titles are one line; stop as soon as the model starts another.
-        if tok.decode(&out, true).map_err(anyhow::Error::msg)?.contains('\n') {
+        if tok
+            .decode(&out, true)
+            .map_err(anyhow::Error::msg)?
+            .contains('\n')
+        {
             break;
         }
         input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
