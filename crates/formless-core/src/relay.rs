@@ -4,8 +4,16 @@
 //! secret (32 random bytes, base64url) *is* the key, and the room id is
 //! a truncated SHA-256 of the key, so the relay cannot read traffic or
 //! derive the key from the room it routes.
+//!
+//! Frames are protocol v2 (SPEC §12). Each browser connection starts with
+//! a handshake: both sides send `{"v":2,"hello":<16 random bytes>}` and
+//! derive a fresh session key with HKDF-SHA256 over the pairing key,
+//! salted with both nonces. Every later frame carries a per-direction
+//! sequence number that is bound into the AES-GCM associated data and
+//! must increase, so a captured frame cannot be replayed (in this or any
+//! other session) or reflected back to its sender.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -37,34 +45,144 @@ pub fn room_id(key: &[u8; 32]) -> String {
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn encrypt_line(key: &[u8; 32], plaintext: &str) -> Result<String> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let mut iv = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);
-    let ct = cipher
-        .encrypt(Nonce::from_slice(&iv), plaintext.as_bytes())
-        .map_err(|_| anyhow!("relay encryption failed"))?;
-    let b64 = base64::engine::general_purpose::STANDARD;
-    Ok(json!({"v": 1, "iv": b64.encode(iv), "ct": b64.encode(ct)}).to_string())
+pub const FRAME_VERSION: u64 = 2;
+const HELLO_BYTES: usize = 16;
+const KDF_INFO: &[u8] = b"formless-relay/2";
+
+/// Which end of a relay channel this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Browser,
+    Daemon,
 }
 
-pub fn decrypt_line(key: &[u8; 32], frame: &str) -> Result<String> {
-    let v: serde_json::Value = serde_json::from_str(frame).context("relay frame is not JSON")?;
-    if v["v"].as_u64() != Some(1) {
-        return Err(anyhow!("unsupported relay frame version"));
+impl Side {
+    fn direction(self) -> &'static str {
+        match self {
+            Side::Browser => "b2d",
+            Side::Daemon => "d2b",
+        }
     }
+
+    fn peer(self) -> Side {
+        match self {
+            Side::Browser => Side::Daemon,
+            Side::Daemon => Side::Browser,
+        }
+    }
+}
+
+/// A fresh handshake nonce.
+pub fn new_hello() -> [u8; HELLO_BYTES] {
+    let mut nonce = [0u8; HELLO_BYTES];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    nonce
+}
+
+pub fn hello_frame(nonce: &[u8]) -> String {
     let b64 = base64::engine::general_purpose::STANDARD;
-    let iv = b64
-        .decode(v["iv"].as_str().context("relay frame missing iv")?)
-        .context("bad relay iv")?;
-    let ct = b64
-        .decode(v["ct"].as_str().context("relay frame missing ct")?)
-        .context("bad relay ciphertext")?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let pt = cipher
-        .decrypt(Nonce::from_slice(&iv), ct.as_ref())
-        .map_err(|_| anyhow!("relay decryption failed (wrong pairing secret?)"))?;
-    String::from_utf8(pt).context("relay plaintext is not UTF-8")
+    json!({"v": FRAME_VERSION, "hello": b64.encode(nonce)}).to_string()
+}
+
+/// The nonce of a handshake frame, or `None` if `frame` is not one.
+pub fn parse_hello(frame: &str) -> Option<Vec<u8>> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    if v["v"].as_u64() != Some(FRAME_VERSION) {
+        return None;
+    }
+    let nonce = base64::engine::general_purpose::STANDARD
+        .decode(v["hello"].as_str()?)
+        .ok()?;
+    (nonce.len() == HELLO_BYTES).then_some(nonce)
+}
+
+/// One end of an established relay channel: a per-connection session key
+/// and per-direction sequence numbers.
+pub struct Channel {
+    cipher: Aes256Gcm,
+    side: Side,
+    sent: u64,
+    received: u64,
+}
+
+impl Channel {
+    pub fn new(key: &[u8; 32], browser_hello: &[u8], daemon_hello: &[u8], side: Side) -> Self {
+        let salt = [browser_hello, daemon_hello].concat();
+        let mut session_key = [0u8; 32];
+        hkdf::Hkdf::<Sha256>::new(Some(&salt), key)
+            .expand(KDF_INFO, &mut session_key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        Self {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&session_key)),
+            side,
+            sent: 0,
+            received: 0,
+        }
+    }
+
+    fn aad(side: Side, seq: u64) -> String {
+        format!("formless-relay/2 {} {seq}", side.direction())
+    }
+
+    pub fn seal(&mut self, plaintext: &str) -> Result<String> {
+        self.sent += 1;
+        let mut iv = [0u8; 12];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut iv);
+        let aad = Self::aad(self.side, self.sent);
+        let ct = self
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&iv),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow!("relay encryption failed"))?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        Ok(json!({
+            "v": FRAME_VERSION,
+            "seq": self.sent,
+            "iv": b64.encode(iv),
+            "ct": b64.encode(ct),
+        })
+        .to_string())
+    }
+
+    pub fn open(&mut self, frame: &str) -> Result<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(frame).context("relay frame is not JSON")?;
+        if v["v"].as_u64() != Some(FRAME_VERSION) {
+            return Err(anyhow!("unsupported relay frame version"));
+        }
+        let seq = v["seq"].as_u64().context("relay frame missing seq")?;
+        if seq <= self.received {
+            return Err(anyhow!("relay frame replayed (seq {seq})"));
+        }
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let iv = b64
+            .decode(v["iv"].as_str().context("relay frame missing iv")?)
+            .context("bad relay iv")?;
+        if iv.len() != 12 {
+            return Err(anyhow!("bad relay iv"));
+        }
+        let ct = b64
+            .decode(v["ct"].as_str().context("relay frame missing ct")?)
+            .context("bad relay ciphertext")?;
+        let aad = Self::aad(self.side.peer(), seq);
+        let pt = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&iv),
+                Payload {
+                    msg: &ct,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow!("relay decryption failed (wrong pairing secret?)"))?;
+        self.received = seq;
+        String::from_utf8(pt).context("relay plaintext is not UTF-8")
+    }
 }
 
 pub fn relay_ws_url(base: &str, secret: &str) -> Result<String> {
@@ -81,20 +199,28 @@ pub fn browser_url(cfg: &RelayCfg, secret: &str) -> String {
 }
 
 /// One daemon connection per attached browser. The relay tags frames with
-/// a client id (`cid`) and announces `client_open`/`client_close`, so each
-/// browser gets its own request/response stream and only browsers that are
-/// actually attached count as subscribers (approvals fail closed and the
-/// daemon can idle-close when none are).
+/// a client id (`cid`) and announces `client_open`/`client_close`; the
+/// browser's handshake opens a daemon connection with its own [`Channel`],
+/// so only browsers that are actually attached count as subscribers
+/// (approvals fail closed and the daemon can idle-close when none are).
 struct RelayClient {
+    channel: Channel,
+    /// Distinguishes this connection's output from an earlier one for
+    /// the same `cid` that is still draining.
+    generation: u64,
     write: Option<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
 }
 
+type Outbound = (String, u64, String);
+
 impl RelayClient {
-    /// Start a daemon connection; its output lines go to `out` tagged `cid`.
+    /// Start a daemon connection; its output lines go to `out`.
     fn open(
         daemon: &Arc<Daemon>,
-        cid: Option<String>,
-        out: mpsc::UnboundedSender<(Option<String>, String)>,
+        cid: String,
+        generation: u64,
+        channel: Channel,
+        out: mpsc::UnboundedSender<Outbound>,
     ) -> Self {
         let (relay_side, daemon_side) = tokio::io::duplex(64 * 1024);
         tokio::spawn(daemon.clone().handle_conn(daemon_side));
@@ -102,12 +228,16 @@ impl RelayClient {
         tokio::spawn(async move {
             let mut lines = BufReader::new(read_half).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if out.send((cid.clone(), line)).is_err() {
+                if out.send((cid.clone(), generation, line)).is_err() {
                     break;
                 }
             }
         });
-        Self { write: Some(write) }
+        Self {
+            channel,
+            generation,
+            write: Some(write),
+        }
     }
 
     async fn send_line(&mut self, line: &str) -> bool {
@@ -135,17 +265,16 @@ impl Drop for RelayClient {
 struct MuxFrame {
     #[serde(default)]
     relay: Option<String>,
-    #[serde(default)]
-    cid: Option<String>,
+    cid: String,
     #[serde(default)]
     f: Option<String>,
 }
 
-/// One relay connection. Browser protocol lines arrive encrypted and are
-/// fed to per-browser daemon connections over in-process duplex streams;
-/// everything the daemon sends back is encrypted to the relay, addressed
-/// to the browser it belongs to. Dropping a [`RelayClient`] closes its
-/// stream, which ends `handle_conn` and unsubscribes it.
+/// One relay connection. Each browser handshakes, then its encrypted
+/// protocol lines are fed to its own daemon connection over an in-process
+/// duplex stream, and everything the daemon sends back is encrypted on
+/// that browser's channel and addressed to it. Dropping a [`RelayClient`]
+/// closes its stream, which ends `handle_conn` and unsubscribes it.
 pub async fn connect_once(
     daemon: Arc<Daemon>,
     base_url: &str,
@@ -164,10 +293,9 @@ pub async fn connect_once(
         .await
         .with_context(|| format!("connect relay {base_url}"))?;
     let (mut ws_write, mut ws_read) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
-    // `None` is a legacy relay without client ids: one shared connection,
-    // opened on the first frame.
-    let mut clients: HashMap<Option<String>, RelayClient> = HashMap::new();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
+    let mut clients: HashMap<String, RelayClient> = HashMap::new();
+    let mut generation = 0u64;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
@@ -182,49 +310,48 @@ pub async fn connect_once(
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(anyhow!("relay websocket: {e}")),
                 };
-                let mux = serde_json::from_str::<MuxFrame>(&frame).ok();
-                let (cid, ciphertext) = match mux {
-                    Some(MuxFrame { relay: Some(kind), cid: Some(cid), .. }) => {
-                        match kind.as_str() {
-                            "client_open" => {
-                                clients.insert(
-                                    Some(cid.clone()),
-                                    RelayClient::open(&daemon, Some(cid), out_tx.clone()),
-                                );
-                            }
-                            "client_close" => {
-                                clients.remove(&Some(cid));
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    Some(MuxFrame { cid: Some(cid), f: Some(f), .. }) => (Some(cid), f),
-                    _ => (None, frame),
+                let Ok(MuxFrame { relay, cid, f }) = serde_json::from_str::<MuxFrame>(&frame) else {
+                    tracing::warn!("relay: dropping frame without a client id (relay too old?)");
+                    continue;
                 };
-                let line = match decrypt_line(&key, &ciphertext) {
-                    Ok(line) => line,
-                    Err(e) => {
-                        tracing::warn!("relay: dropping undecryptable frame: {e}");
-                        continue;
-                    }
-                };
-                if cid.is_none() && !clients.contains_key(&None) {
-                    clients.insert(None, RelayClient::open(&daemon, None, out_tx.clone()));
+                if relay.as_deref() == Some("client_close") {
+                    clients.remove(&cid);
+                    continue;
                 }
-                // A frame for a browser the relay already closed is dropped.
-                if let Some(client) = clients.get_mut(&cid) {
-                    if !client.send_line(&line).await {
-                        clients.remove(&cid);
+                let Some(f) = f else { continue };
+                if let Some(browser_hello) = parse_hello(&f) {
+                    // A (re)handshake starts a fresh connection and key.
+                    let daemon_hello = new_hello();
+                    let channel = Channel::new(&key, &browser_hello, &daemon_hello, Side::Daemon);
+                    generation += 1;
+                    clients.insert(
+                        cid.clone(),
+                        RelayClient::open(&daemon, cid.clone(), generation, channel, out_tx.clone()),
+                    );
+                    let reply = json!({"cid": cid, "f": hello_frame(&daemon_hello)}).to_string();
+                    if ws_write.send(Message::Text(reply)).await.is_err() {
+                        return Ok(());
                     }
+                    continue;
+                }
+                // Frames before a handshake, or for a closed browser, are dropped.
+                let Some(client) = clients.get_mut(&cid) else { continue };
+                match client.channel.open(&f) {
+                    Ok(line) => {
+                        if !client.send_line(&line).await {
+                            clients.remove(&cid);
+                        }
+                    }
+                    Err(e) => tracing::warn!("relay: dropping frame: {e}"),
                 }
             }
-            Some((cid, line)) = out_rx.recv() => {
-                let encrypted = encrypt_line(&key, &line)?;
-                let frame = match cid {
-                    Some(cid) => json!({"cid": cid, "f": encrypted}).to_string(),
-                    None => encrypted,
-                };
+            Some((cid, generation, line)) = out_rx.recv() => {
+                let Some(client) = clients.get_mut(&cid) else { continue };
+                if client.generation != generation {
+                    continue;
+                }
+                let sealed = client.channel.seal(&line)?;
+                let frame = json!({"cid": cid, "f": sealed}).to_string();
                 if ws_write.send(Message::Text(frame)).await.is_err() {
                     return Ok(());
                 }

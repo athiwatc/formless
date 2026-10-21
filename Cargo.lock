@@ -1270,6 +1270,7 @@ dependencies = [
  "formless-protocol",
  "formless-runtime",
  "futures-util",
+ "hkdf",
  "jsonschema",
  "keyring",
  "rand 0.8.8",

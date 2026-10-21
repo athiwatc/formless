@@ -1,25 +1,40 @@
 //! Relay crypto/URL contract (SPEC §17 v2): the pairing secret is the
-//! AES-256-GCM key; the room is a one-way hash of it.
+//! root key, each browser connection derives a fresh session key, frames
+//! cannot be replayed or reflected, and the room is a one-way hash.
 
 use formless_core::config::{generate_relay_secret, RelayCfg};
 use formless_core::relay::{
-    browser_url, decrypt_line, encrypt_line, key_from_secret, relay_ws_url, room_id,
+    browser_url, hello_frame, key_from_secret, new_hello, parse_hello, relay_ws_url, room_id,
+    Channel, Side,
 };
+
+fn pair(key: &[u8; 32]) -> (Channel, Channel) {
+    let (b, d) = (new_hello(), new_hello());
+    (
+        Channel::new(key, &b, &d, Side::Browser),
+        Channel::new(key, &b, &d, Side::Daemon),
+    )
+}
 
 #[test]
 fn relay_crypto_round_trips_and_room_is_one_way() {
     let secret = generate_relay_secret();
     let key = key_from_secret(&secret).unwrap();
-    let frame = encrypt_line(&key, "{\"hello\":\"world\"}").unwrap();
+    let (mut browser, mut daemon) = pair(&key);
+    let frame = browser.seal("{\"hello\":\"world\"}").unwrap();
     assert!(
         !frame.contains("world"),
         "ciphertext must not leak plaintext"
     );
-    assert_eq!(decrypt_line(&key, &frame).unwrap(), "{\"hello\":\"world\"}");
+    assert_eq!(daemon.open(&frame).unwrap(), "{\"hello\":\"world\"}");
 
     let other = key_from_secret(&generate_relay_secret()).unwrap();
-    assert!(decrypt_line(&other, &frame).is_err(), "wrong key must fail");
-    assert!(decrypt_line(&key, "not json").is_err());
+    let (_, mut wrong) = pair(&other);
+    assert!(
+        wrong.open(&browser.seal("x").unwrap()).is_err(),
+        "wrong key must fail"
+    );
+    assert!(daemon.open("not json").is_err());
 
     let room = room_id(&key);
     assert_eq!(room.len(), 32);
@@ -27,6 +42,43 @@ fn relay_crypto_round_trips_and_room_is_one_way() {
     assert_ne!(room, room_id(&other));
 
     assert!(key_from_secret("too-short").is_err());
+}
+
+#[test]
+fn relay_frames_cannot_be_replayed_or_reflected() {
+    let key = key_from_secret(&generate_relay_secret()).unwrap();
+    let (mut browser, mut daemon) = pair(&key);
+    let approve = browser.seal("approve").unwrap();
+    assert_eq!(daemon.open(&approve).unwrap(), "approve");
+    assert!(daemon.open(&approve).is_err(), "same frame twice");
+
+    // An older frame after a newer one is rejected too.
+    let first = browser.seal("1").unwrap();
+    let second = browser.seal("2").unwrap();
+    assert_eq!(daemon.open(&second).unwrap(), "2");
+    assert!(daemon.open(&first).is_err());
+
+    // A frame reflected back to its sender does not authenticate: the
+    // direction is bound into the associated data.
+    let (b, d) = (new_hello(), new_hello());
+    let mut sender = Channel::new(&key, &b, &d, Side::Daemon);
+    let mut same_side = Channel::new(&key, &b, &d, Side::Daemon);
+    let mut receiver = Channel::new(&key, &b, &d, Side::Browser);
+    let reply = sender.seal("reply").unwrap();
+    assert!(same_side.open(&reply).is_err(), "reflected frame");
+    assert_eq!(receiver.open(&reply).unwrap(), "reply");
+
+    // A frame captured in one session is useless in the next.
+    let (mut browser2, mut daemon2) = pair(&key);
+    assert!(daemon2.open(&approve).is_err(), "cross-session replay");
+    assert_eq!(daemon2.open(&browser2.seal("ok").unwrap()).unwrap(), "ok");
+
+    // Handshake frames round-trip; v1 frames are refused.
+    let nonce = new_hello();
+    assert_eq!(parse_hello(&hello_frame(&nonce)).unwrap(), nonce);
+    assert!(parse_hello(r#"{"v":1,"hello":"AAAAAAAAAAAAAAAAAAAAAA=="}"#).is_none());
+    let v1 = r#"{"v":1,"iv":"AAAAAAAAAAAAAAAA","ct":"AAAA"}"#;
+    assert!(daemon2.open(v1).is_err());
 }
 
 #[test]
@@ -138,31 +190,75 @@ async fn relay_gives_each_browser_its_own_connection() {
         let open = serde_json::json!({"relay": "client_open", "cid": cid});
         ws.send(Message::Text(open.to_string())).await.unwrap();
     }
-    settle(&daemon, 2).await;
+    // A browser is a subscriber only once it has completed the handshake.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(daemon.subscriber_count(), 0);
 
-    // Both browsers use request id 7; each must get its own answer.
-    for cid in ["a", "b"] {
-        let req = serde_json::json!({"id": 7, "protocol": 1, "request": {"type": "ping"}});
-        let f = encrypt_line(&key, &req.to_string()).unwrap();
-        let frame = serde_json::json!({"cid": cid, "f": f});
-        ws.send(Message::Text(frame.to_string())).await.unwrap();
-    }
-    let mut answered = Vec::new();
-    while answered.len() < 2 {
+    async fn recv(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> serde_json::Value {
         let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let frame: serde_json::Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-        let line = decrypt_line(&key, frame["f"].as_str().unwrap()).unwrap();
+        serde_json::from_str(msg.to_text().unwrap()).unwrap()
+    }
+
+    let mut channels = std::collections::HashMap::new();
+    for cid in ["a", "b"] {
+        let browser_hello = new_hello();
+        let frame = serde_json::json!({"cid": cid, "f": hello_frame(&browser_hello)});
+        ws.send(Message::Text(frame.to_string())).await.unwrap();
+        let reply = recv(&mut ws).await;
+        assert_eq!(reply["cid"], cid);
+        let daemon_hello = parse_hello(reply["f"].as_str().unwrap()).unwrap();
+        channels.insert(
+            cid,
+            Channel::new(&key, &browser_hello, &daemon_hello, Side::Browser),
+        );
+    }
+    settle(&daemon, 2).await;
+
+    // Both browsers use request id 7; each must get its own answer.
+    let req = serde_json::json!({"id": 7, "protocol": 1, "request": {"type": "ping"}});
+    let mut sent = Vec::new();
+    for cid in ["a", "b"] {
+        let f = channels
+            .get_mut(cid)
+            .unwrap()
+            .seal(&req.to_string())
+            .unwrap();
+        sent.push(f.clone());
+        let frame = serde_json::json!({"cid": cid, "f": f});
+        ws.send(Message::Text(frame.to_string())).await.unwrap();
+    }
+    let mut answered = Vec::new();
+    while answered.len() < 2 {
+        let frame = recv(&mut ws).await;
+        let cid = frame["cid"].as_str().unwrap().to_string();
+        let line = channels
+            .get_mut(cid.as_str())
+            .unwrap()
+            .open(frame["f"].as_str().unwrap())
+            .unwrap();
         let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
         if resp["kind"] == "response" && resp["id"] == 7 {
-            answered.push(frame["cid"].as_str().unwrap().to_string());
+            answered.push(cid);
         }
     }
     answered.sort();
     assert_eq!(answered, ["a", "b"]);
+
+    // Replaying a's request is dropped: no second response arrives.
+    let replay = serde_json::json!({"cid": "a", "f": sent[0]});
+    ws.send(Message::Text(replay.to_string())).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), ws.next())
+            .await
+            .is_err(),
+        "replayed frame must not be answered"
+    );
 
     let close = serde_json::json!({"relay": "client_close", "cid": "a"});
     ws.send(Message::Text(close.to_string())).await.unwrap();
