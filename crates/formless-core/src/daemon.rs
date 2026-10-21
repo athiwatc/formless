@@ -94,6 +94,9 @@ pub struct Daemon {
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
     subs: Subs,
+    /// One HTTP client (connection pool + TLS sessions) for every provider
+    /// call the daemon makes.
+    http: reqwest::Client,
     /// Parsed config.toml, re-read only when the file changes.
     config: StdMutex<Option<(ConfigStamp, Config)>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
@@ -134,6 +137,7 @@ impl Daemon {
             subs: Arc::new(StdMutex::new(Vec::new())),
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
+            http: reqwest::Client::builder().build()?,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
@@ -166,6 +170,12 @@ impl Daemon {
             self.broadcast(Event::SettingsChanged);
         }
         Ok(cfg)
+    }
+
+    /// A provider for `cfg` on the daemon's shared HTTP client.
+    pub(crate) async fn provider(&self, cfg: &Config) -> Result<Provider> {
+        Provider::for_profile_with(cfg.provider.clone(), self.paths.clone(), self.http.clone())
+            .await
     }
 
     pub(crate) fn broadcast(&self, ev: Event) {
@@ -895,7 +905,7 @@ impl Daemon {
                 "provider not configured; run the onboarding wizard"
             ));
         }
-        let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
+        let provider = self.provider(&cfg).await?;
         let session = self
             .with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
@@ -1842,7 +1852,7 @@ impl Daemon {
             if task.trim().is_empty() {
                 return Err(anyhow!("sub-agent task is empty"));
             }
-            let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
+            let provider = self.provider(&cfg).await?;
             let requested = model
                 .map(str::to_string)
                 .unwrap_or_else(|| cfg.provider.model.clone());
@@ -3263,10 +3273,7 @@ impl HostOps for NestedOps {
         }
         let provider = self
             .handle
-            .block_on(Provider::for_profile(
-                self.cfg.provider.clone(),
-                self.daemon.paths.clone(),
-            ))
+            .block_on(self.daemon.provider(&self.cfg))
             .map_err(|e| e.to_string())?;
         let requested = model
             .map(str::to_string)

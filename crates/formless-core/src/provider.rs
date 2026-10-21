@@ -309,8 +309,18 @@ impl Provider {
     /// before every request. The initial resolution also fails fast for a
     /// missing OAuth login rather than deferring that to the first POST.
     pub async fn for_profile(cfg: ProviderCfg, paths: Paths) -> Result<Self> {
+        Self::for_profile_with(cfg, paths, reqwest::Client::builder().build()?).await
+    }
+
+    /// [`Provider::for_profile`] on an existing HTTP client, so long-lived
+    /// callers (the daemon) keep one connection pool and TLS sessions
+    /// across Runs instead of a new handshake per call.
+    pub async fn for_profile_with(
+        cfg: ProviderCfg,
+        paths: Paths,
+        http: reqwest::Client,
+    ) -> Result<Self> {
         let api_key = crate::auth::resolve_provider_token(&paths, &cfg).await?;
-        let http = reqwest::Client::builder().build()?;
         Ok(Self {
             cfg,
             api_key,
