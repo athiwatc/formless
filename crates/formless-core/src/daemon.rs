@@ -3418,6 +3418,7 @@ impl Daemon {
         }
         let ops = Arc::new(NestedOps {
             daemon: self.clone(),
+            kv_scope: format!("test:{}", d.name),
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
             parent_inv: None,
@@ -3847,6 +3848,7 @@ impl Daemon {
             }
             let ops = Arc::new(NestedOps {
                 daemon: self.clone(),
+                kv_scope: format!("tool:{}", info.id),
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
                 parent_inv: Some(inv_id.clone()),
@@ -4783,6 +4785,8 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
 /// blocking QuickJS thread; nested calls block_on the daemon executor.
 struct NestedOps {
     daemon: Arc<Daemon>,
+    /// The Tool's own store namespace ("tool:<id>"; "test:<name>" drafts).
+    kv_scope: String,
     session_id: String,
     run_id: String,
     parent_inv: Option<String>,
@@ -4816,6 +4820,31 @@ impl NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn kv(
+        &self,
+        op: &str,
+        namespace: &str,
+        key: &str,
+        value: Option<&Value>,
+    ) -> std::result::Result<Value, String> {
+        let ns = if namespace.is_empty() {
+            self.kv_scope.clone()
+        } else {
+            format!("shared:{namespace}")
+        };
+        self.daemon
+            .with_store(|st| match op {
+                "get" => Ok(st.kv_get(&ns, key)?.unwrap_or(Value::Null)),
+                "set" => st
+                    .kv_set(&ns, key, value.unwrap_or(&Value::Null))
+                    .map(|_| Value::Null),
+                "delete" => Ok(json!(st.kv_delete(&ns, key)?)),
+                "list" => Ok(json!(st.kv_list(&ns, key)?)),
+                other => Err(anyhow!("unknown store op {other}")),
+            })
+            .map_err(|e| e.to_string())
+    }
+
     fn run_subagent(
         &self,
         task: &str,
