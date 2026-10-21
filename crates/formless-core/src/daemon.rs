@@ -66,6 +66,8 @@ type ExecFuture = std::pin::Pin<
 
 pub(crate) struct PendingEntry {
     tool_name: String,
+    /// When the call started (epoch ms), for the Invocations panel.
+    started_ms: u64,
     session_id: String,
     result: StdMutex<Option<(bool, String)>>,
     delivered: AtomicBool,
@@ -782,6 +784,49 @@ impl Daemon {
                     Ok((info, st.subagent_messages(&id)?))
                 })?;
                 Ok(json!({"subagent": info, "messages": messages}))
+            }
+            Request::ListInvocations => {
+                let now = epoch_ms();
+                let stall_ms = self
+                    .config()
+                    .map(|c| c.daemon.stall_warning_secs.saturating_mul(1000))
+                    .unwrap_or(300_000);
+                let mut list: Vec<(u64, formless_protocol::InvocationInfo)> = self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, e)| e.result.lock().unwrap().is_none())
+                    .map(|(h, e)| {
+                        let silent = now.saturating_sub(e.activity.load(Ordering::SeqCst));
+                        (
+                            e.order,
+                            formless_protocol::InvocationInfo {
+                                handle: h.clone(),
+                                tool_name: e.tool_name.clone(),
+                                session_id: e.session_id.clone(),
+                                elapsed_ms: now.saturating_sub(e.started_ms),
+                                silent_ms: silent,
+                                stalled: silent >= stall_ms,
+                                abandoned: e.abandoned.load(Ordering::SeqCst),
+                            },
+                        )
+                    })
+                    .collect();
+                list.sort_by_key(|(order, _)| *order);
+                Ok(serde_json::to_value(
+                    list.into_iter().map(|(_, i)| i).collect::<Vec<_>>(),
+                )?)
+            }
+            Request::AbandonInvocation { handle } => {
+                let entry = self
+                    .pending_get(&handle)
+                    .context("no invocation with that handle")?;
+                // The agent stops waiting for it; it may still finish.
+                entry.abandoned.store(true, Ordering::SeqCst);
+                let _ =
+                    self.with_store(|st| st.audit("user", "invocation.abandon", &entry.tool_name));
+                Ok(json!({"abandoned": handle}))
             }
             Request::CancelInvocation { handle } => {
                 let entry = self
@@ -2447,6 +2492,7 @@ impl Daemon {
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
             tool_name: name.to_string(),
+            started_ms: epoch_ms(),
             session_id: session_id.to_string(),
             result: StdMutex::new(None),
             delivered: AtomicBool::new(false),
@@ -5686,6 +5732,7 @@ fn is_control(req: &Request) -> bool {
             | Request::Status
             | Request::InterruptRun { .. }
             | Request::CancelInvocation { .. }
+            | Request::AbandonInvocation { .. }
             | Request::ApprovalDecision { .. }
             | Request::PromotionDecision { .. }
             | Request::AnswerQuestion { .. }

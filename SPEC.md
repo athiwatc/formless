@@ -324,6 +324,17 @@ purity is untouched):
   handle still pending gets a harness note that it was interrupted (outcome
   unknown, not re-run), and polling/awaiting it answers `interrupted`
   instead of "unknown handle".
+- **The user's view:** `ListInvocations` lists every running Invocation
+  across Sessions, oldest first. Each entry has the tool, its Session,
+  elapsed time, time since its last activity, and the stalled and
+  abandoned flags. Two actions apply:
+  - `CancelInvocation` stops one Invocation; it ends `user-cancelled`.
+  - `AbandonInvocation` stops the agent waiting for it; it may still
+    finish.
+  Both are control requests (§9.3). Clients: TUI `/invocations` (alias
+  `/pending`) with `/kill` and `/drop` by handle prefix; the web sidebar's
+  "Running tools" panel (open the Session, Cancel, Abandon), refreshed on
+  tool events.
 
 ### 6.4 Outcomes
 

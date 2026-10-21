@@ -395,6 +395,24 @@
     popover.querySelector("button").focus();
   }
 
+  // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
+  async function refreshRunning() {
+    const list = (await request({ type: "list_invocations" }).catch(() => null)) || [];
+    S.invocations = list;
+    const box = $("running");
+    box.classList.toggle("hidden", !list.length);
+    box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
+      const s = S.sessions.find((x) => x.id === i.session_id);
+      return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
+        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(i.session_id) },
+          h("strong", null, i.tool_name), " · " + Math.round(i.elapsed_ms / 1000) + "s" + (s ? " · " + s.name : "") +
+          (i.stalled ? " · silent " + Math.round(i.silent_ms / 1000) + "s" : "") + (i.abandoned ? " · abandoned" : "")),
+        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(refreshRunning) }, "Cancel"),
+        i.abandoned ? null : h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(refreshRunning) }, "Abandon"));
+    }));
+  }
+  setInterval(() => { if (S.channel && S.invocations && S.invocations.length) refreshRunning(); }, 2000);
+
   function renderSessions() {
     const list = $("sessions");
     list.replaceChildren();
@@ -1780,6 +1798,7 @@
         }
         break;
       case "tool_call_finished":
+        if (S.invocations && S.invocations.length) refreshRunning();
         if (here) {
           const t = S.liveTools.find((x) => x.name === ev.tool_name && x.status === "running");
           if (t) t.status = ev.ok ? "ok" : "failed";
@@ -1873,12 +1892,14 @@
         if (here) note("compacted earlier context: " + truncate(ev.summary_preview, 80));
         break;
       case "invocation_pending": {
+        refreshRunning();
         const t = here && runningTool(ev.tool_name);
         if (t) t.handle = ev.handle;
         note(ev.tool_name + " continues in the background (" + ev.handle + ")");
         break;
       }
       case "invocation_stalled": {
+        refreshRunning();
         const t = here && runningTool(ev.tool_name);
         if (t) {
           t.handle = ev.handle;

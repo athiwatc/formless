@@ -135,6 +135,7 @@ enum Pending {
     ListJobs,
     ListAudit,
     SessionUsage,
+    ListInvocations,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -453,6 +454,8 @@ struct App {
     questions: Vec<(String, String, Vec<String>)>,
     /// Latest Run usage per Session, for the status line (SPEC §10.6).
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
+    /// Last listed running Invocations (for /kill and /drop by prefix).
+    invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
     purge_arm: Option<String>,
     /// Session id armed for deletion by a first `d` press.
@@ -571,6 +574,7 @@ impl App {
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
+            invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,
@@ -794,6 +798,34 @@ impl App {
                                     s.last_error
                                         .map(|e| format!(" · error: {}", truncate_chars(&e, 80)))
                                         .unwrap_or_default()
+                                ));
+                            }
+                        }
+                        Pending::ListInvocations => {
+                            self.invocations = serde_json::from_value(result).unwrap_or_default();
+                            if self.invocations.is_empty() {
+                                self.notes.push("no running invocations".into());
+                            }
+                            for i in &self.invocations {
+                                let session = self
+                                    .sessions
+                                    .iter()
+                                    .find(|s| s.id == i.session_id)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_else(|| truncate_chars(&i.session_id, 8));
+                                self.notes.push(format!(
+                                    "{} {} · {}s · {}{}{} · /kill or /drop {}",
+                                    if i.stalled { "⚠" } else { "•" },
+                                    i.tool_name,
+                                    i.elapsed_ms / 1000,
+                                    session,
+                                    if i.stalled {
+                                        format!(" · silent {}s", i.silent_ms / 1000)
+                                    } else {
+                                        String::new()
+                                    },
+                                    if i.abandoned { " · abandoned" } else { "" },
+                                    truncate_chars(&i.handle, 8)
                                 ));
                             }
                         }
@@ -1735,6 +1767,32 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            "invocations" | "pending" => {
+                self.request(Pending::ListInvocations, Request::ListInvocations)
+            }
+            cmd if cmd.starts_with("kill ") || cmd.starts_with("drop ") => {
+                let prefix = cmd[5..].trim().trim_end_matches('…');
+                let found: Vec<String> = self
+                    .invocations
+                    .iter()
+                    .filter(|i| !prefix.is_empty() && i.handle.starts_with(prefix))
+                    .map(|i| i.handle.clone())
+                    .collect();
+                match found.as_slice() {
+                    [handle] => {
+                        let handle = handle.clone();
+                        if cmd.starts_with("kill ") {
+                            self.request(Pending::RunControl, Request::CancelInvocation { handle });
+                        } else {
+                            self.request(Pending::RunControl, Request::AbandonInvocation { handle });
+                        }
+                    }
+                    [] => self
+                        .notes
+                        .push("no such invocation (list them with /invocations)".into()),
+                    _ => self.notes.push("ambiguous handle; type more of it".into()),
+                }
+            }
             "usage" => match self.current.clone() {
                 Some(session_id) => {
                     self.request(Pending::SessionUsage, Request::SessionUsage { session_id })
@@ -1956,7 +2014,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -4315,6 +4373,7 @@ mod tests {
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
+            invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,

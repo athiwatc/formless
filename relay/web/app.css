@@ -371,3 +371,10 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 
 /* Non-Tool approvals spell out exactly what would happen. */
 .detail-text { white-space: pre-wrap; font-family: var(--mono); font-size: 13px; }
+
+/* Running Invocations panel (sidebar) */
+.running { border-top: 1px solid var(--border, #333); margin-top: 8px; padding: 8px 4px; font-size: 12px; }
+.running h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+.running-item { display: flex; align-items: center; gap: 4px; padding: 2px 0; }
+.running-item .linklike { flex: 1; text-align: left; background: none; border: 0; color: inherit; cursor: pointer; padding: 0; font: inherit; }
+.running-item.stalled .linklike { color: var(--warn, #e0b050); }
