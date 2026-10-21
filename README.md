@@ -343,7 +343,7 @@ The other built-ins are the minimum the agent needs to grow and maintain its own
 
 Sub-agents are not a built-in: the agent builds a Tool with the `agent` Capability (`function run(i){ return agents.run(i.task); }`), so delegation is a measured, approval-gated Invocation. Several such calls in one turn run in parallel, and nesting is capped by `tools.max_agent_depth` (default 1).
 
-Up to `tools.inline_limit` (default 40) active Tools, every Session lists them all. Beyond that a Session lists the Tools it has loaded plus the most-used ones, and reaches the rest with `find_tools`.
+Each Session's Tool list is frozen at its first step: up to `tools.inline_limit` (default 40) Tools, the most-used first, plus the Tools that Session creates or finds later. Tools created in other Sessions are reached with `find_tools`, so they never change this Session's cached prompt prefix.
 
 ### 5.2 Lifecycle and versioning
 

@@ -328,10 +328,12 @@ pub fn tool_definitions(
     inline_limit: usize,
 ) -> Result<Vec<Value>> {
     let tools = store.list_tools(false)?;
-    let total = tools.len();
-    let shown: Vec<ToolInfo> = if total <= inline_limit {
-        tools
-    } else {
+    // Every Session's listing is frozen at its first step (in small and
+    // large registries alike): Tool definitions are part of the cached
+    // prompt prefix, so a Tool created or used in another Session must not
+    // change this one's. A Session's own creations and `find_tools` results
+    // are added to it; everything else is reached through `find_tools`.
+    let shown: Vec<ToolInfo> = {
         let mut loaded: std::collections::HashSet<String> = match session_id {
             Some(s) => store.session_tool_ids(s)?,
             None => Default::default(),

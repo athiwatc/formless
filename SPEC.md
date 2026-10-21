@@ -306,12 +306,11 @@ pattern (§4.4).
     unsaved draft (the `create_tool` fields) live on a real input, with
     approval as for a normal call. Neither saved nor recorded as an
     Invocation; returns output or error, logs, and output-schema validity.
-- **Tool listing.** While the registry holds at most `tools.inline_limit`
-  (default 40) active Tools, every Session lists all of them as callable
-  functions (name + description + input schema). Past that, a Session
-  lists the Tools it has **loaded** (found, created or called there) plus
-  the most-used Tools up to the limit, **frozen** the first time the
-  Session lists Tools; `find_tools` reaches the rest, and its description
+- **Tool listing.** Whatever the registry's size, a Session lists the
+  Tools it has **loaded** (found, created or called there) plus the
+  most-used Tools up to `tools.inline_limit` (default 40), **frozen** the
+  first time the Session lists Tools (so Tools created elsewhere never
+  change its cached prompt prefix); `find_tools` reaches the rest, and its description
   states how many exist. The listing is sorted by name and changes only
   when the Session loads a Tool, so usage elsewhere never reshuffles it and
   the request prefix stays cacheable. Found Tools are declared as real
@@ -871,7 +870,7 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 | `tools.default_memory_mb` | 256 | Default per-Invocation heap (§7.4) |
 | `tools.max_memory_mb` | 4096 | Daemon bound on declared memory (§7.4) |
 | `tools.artifact_preview_chars` | 2000 | Context preview of artifact outputs (§9.6) |
-| `tools.inline_limit` | 40 | Registry size listed whole; larger registries load lazily (§7.1) |
+| `tools.inline_limit` | 40 | Tools listed in a Session's frozen first-step listing; others load via `find_tools` (§7.1) |
 | `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |
 | `metrics.success_window` | 100 | Rolling window for success rate (§8.3) |
 | `metrics.trigger_min_invocations` | 20 | Minimum sample before trigger (§8.3) |
