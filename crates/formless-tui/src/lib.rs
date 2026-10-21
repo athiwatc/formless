@@ -728,6 +728,18 @@ impl App {
                 self.set_activity("responding");
                 self.streaming.push_str(&delta);
             }
+            Event::ProviderStalled {
+                session_id,
+                idle_secs,
+                ..
+            } => {
+                if self.is_current(&session_id) {
+                    self.set_activity("provider stalled");
+                    self.notes.push(format!(
+                        "no data from the provider for {idle_secs}s; /resend re-sends the request"
+                    ));
+                }
+            }
             Event::StreamRestarted { session_id, .. } => {
                 if self.is_current(&session_id) {
                     self.streaming.clear();
@@ -1148,6 +1160,14 @@ impl App {
                     if self.show_thinking { "on" } else { "off" }
                 ));
             }
+            "resend" => {
+                if let Some(session_id) = self.current.clone() {
+                    self.request(
+                        Pending::RunControl,
+                        Request::RetryProviderRequest { session_id },
+                    );
+                }
+            }
             "resume" | "abandon" => {
                 if let Some(session_id) = self.current.clone() {
                     let req = if cmd == "resume" {
@@ -1159,7 +1179,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /resume /abandon /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /resend /resume /abandon /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

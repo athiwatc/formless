@@ -218,6 +218,11 @@ pub enum Request {
     AbandonRun {
         session_id: String,
     },
+    /// Abort the active Run's in-flight provider request and send it again
+    /// (for a stalled stream; nothing in the transcript is lost).
+    RetryProviderRequest {
+        session_id: String,
+    },
     ListTools,
     ListModules,
     GetTool {
@@ -345,6 +350,13 @@ pub enum Event {
         session_id: String,
         run_id: String,
     },
+    /// An open provider stream has sent nothing for `idle_secs` (sent once
+    /// per stall; any later delta means it recovered).
+    ProviderStalled {
+        session_id: String,
+        run_id: String,
+        idle_secs: u64,
+    },
     RunFinished {
         session_id: String,
         run_id: String,
@@ -445,6 +457,7 @@ impl Event {
             | Event::ReasoningDelta { session_id, .. }
             | Event::MessageComplete { session_id, .. }
             | Event::StreamRestarted { session_id, .. }
+            | Event::ProviderStalled { session_id, .. }
             | Event::RunFinished { session_id, .. }
             | Event::RunPaused { session_id, .. }
             | Event::CompactionNotice { session_id, .. }

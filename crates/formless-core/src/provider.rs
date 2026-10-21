@@ -86,6 +86,10 @@ pub enum DeltaKind {
     /// The stream dropped and the request is being re-sent: discard the
     /// partial content and reasoning delivered so far (text is empty).
     Restart,
+    /// Bytes arrived from the provider (text is empty): liveness only, for
+    /// stall detection; also covers tool-call streaming, which has no
+    /// visible deltas.
+    Bytes,
 }
 
 /// Convert Chat-Completions messages to Responses-API input items.
@@ -553,6 +557,7 @@ impl Provider {
                             }
                             Err(e) => return Err(e).context("stream read"),
                         };
+                        on_delta(DeltaKind::Bytes, "");
                         buf.extend_from_slice(&chunk);
                         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                             let raw: Vec<u8> = buf.drain(..=pos).collect();

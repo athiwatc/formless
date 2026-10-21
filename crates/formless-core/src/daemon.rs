@@ -65,6 +65,8 @@ pub(crate) struct RunCtl {
     cancel: CancellationToken,
     cancel_flag: Arc<AtomicBool>,
     steer_tx: mpsc::UnboundedSender<()>,
+    /// User-requested re-send of the in-flight provider request.
+    retry: Arc<tokio::sync::Notify>,
 }
 
 pub struct Daemon {
@@ -265,6 +267,14 @@ impl Daemon {
                     None => false,
                 };
                 Ok(json!({"abandoned": abandoned}))
+            }
+            Request::RetryProviderRequest { session_id } => {
+                let runs = self.runs.lock().unwrap();
+                let ctl = runs
+                    .get(&session_id)
+                    .context("no active run in this session")?;
+                ctl.retry.notify_one();
+                Ok(json!({"retrying": true}))
             }
             Request::InterruptRun { session_id } => {
                 let runs = self.runs.lock().unwrap();
@@ -612,6 +622,7 @@ impl Daemon {
                 cancel: cancel.clone(),
                 cancel_flag: cancel_flag.clone(),
                 steer_tx,
+                retry: Arc::new(tokio::sync::Notify::new()),
             },
         );
         self.broadcast(Event::RunStarted {
@@ -874,44 +885,104 @@ impl Daemon {
             let defs = self.with_store(|st| {
                 toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
             })?;
-            let (sid, rid) = (session_id.to_string(), run_id.to_string());
-            let subs = self.subs.clone();
-            let chat_fut = provider.chat_stream(
-                &ctx,
-                &defs,
-                &model,
-                effort.as_deref(),
-                cancel,
-                |kind, delta| {
-                    let ev = match kind {
-                        DeltaKind::Content => Event::MessageDelta {
-                            session_id: sid.clone(),
-                            run_id: rid.clone(),
-                            delta: delta.to_string(),
-                        },
-                        DeltaKind::Reasoning => Event::ReasoningDelta {
-                            session_id: sid.clone(),
-                            run_id: rid.clone(),
-                            delta: delta.to_string(),
-                        },
-                        DeltaKind::Restart => Event::StreamRestarted {
-                            session_id: sid.clone(),
-                            run_id: rid.clone(),
-                        },
-                    };
-                    send_all(&subs, ev);
-                },
-            );
-            let mut chat_fut = std::pin::pin!(chat_fut);
+            let retry = self
+                .runs
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .map(|c| c.retry.clone())
+                .unwrap_or_default();
+            let last_byte = Arc::new(std::sync::atomic::AtomicU64::new(epoch_ms()));
+            let got_bytes = Arc::new(AtomicBool::new(false));
             let started = std::time::Instant::now();
-            let outcome = tokio::select! {
-                r = &mut chat_fut => r,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(cfg.tools.pending_threshold_secs)) => {
-                    self.broadcast(Event::Note {
-                        session_id: Some(session_id.to_string()),
-                        text: "Provider request still pending; waiting (not terminated).".into(),
-                    });
-                    (&mut chat_fut).await
+            let mut auto_resends = 0;
+            let outcome = 'request: loop {
+                let (sid, rid) = (session_id.to_string(), run_id.to_string());
+                let subs = self.subs.clone();
+                let (last_byte2, got_bytes2) = (last_byte.clone(), got_bytes.clone());
+                last_byte.store(epoch_ms(), Ordering::SeqCst);
+                got_bytes.store(false, Ordering::SeqCst);
+                let chat_fut = provider.chat_stream(
+                    &ctx,
+                    &defs,
+                    &model,
+                    effort.as_deref(),
+                    cancel,
+                    move |kind, delta| {
+                        last_byte2.store(epoch_ms(), Ordering::SeqCst);
+                        got_bytes2.store(true, Ordering::SeqCst);
+                        let ev = match kind {
+                            DeltaKind::Bytes => return,
+                            DeltaKind::Content => Event::MessageDelta {
+                                session_id: sid.clone(),
+                                run_id: rid.clone(),
+                                delta: delta.to_string(),
+                            },
+                            DeltaKind::Reasoning => Event::ReasoningDelta {
+                                session_id: sid.clone(),
+                                run_id: rid.clone(),
+                                delta: delta.to_string(),
+                            },
+                            DeltaKind::Restart => Event::StreamRestarted {
+                                session_id: sid.clone(),
+                                run_id: rid.clone(),
+                            },
+                        };
+                        send_all(&subs, ev);
+                    },
+                );
+                let mut chat_fut = std::pin::pin!(chat_fut);
+                let sent_at = tokio::time::Instant::now();
+                let mut pending_noted = false;
+                let mut stall_noted = false;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        r = &mut chat_fut => break 'request r,
+                        _ = retry.notified() => {
+                            self.broadcast(Event::StreamRestarted {
+                                session_id: session_id.to_string(),
+                                run_id: run_id.to_string(),
+                            });
+                            continue 'request;
+                        }
+                        _ = tick.tick() => {}
+                    }
+                    let waited = sent_at.elapsed().as_secs();
+                    if !pending_noted && waited >= cfg.tools.pending_threshold_secs {
+                        pending_noted = true;
+                        self.broadcast(Event::Note {
+                            session_id: Some(session_id.to_string()),
+                            text: "Provider request still pending; waiting (not terminated)."
+                                .into(),
+                        });
+                    }
+                    let first_byte = cfg.provider.first_byte_timeout_secs;
+                    if first_byte > 0
+                        && !got_bytes.load(Ordering::SeqCst)
+                        && waited >= first_byte
+                        && auto_resends < cfg.provider.max_retries
+                    {
+                        auto_resends += 1;
+                        self.broadcast(Event::Note {
+                            session_id: Some(session_id.to_string()),
+                            text: format!("No response from the provider in {first_byte}s; re-sending the request."),
+                        });
+                        continue 'request;
+                    }
+                    // Stall notice (SPEC §6.1 spirit: advisory, never auto-kill).
+                    let idle = epoch_ms().saturating_sub(last_byte.load(Ordering::SeqCst)) / 1000;
+                    let notice = cfg.provider.stall_notice_secs;
+                    if notice > 0 && idle >= notice && !stall_noted {
+                        stall_noted = true;
+                        self.broadcast(Event::ProviderStalled {
+                            session_id: session_id.to_string(),
+                            run_id: run_id.to_string(),
+                            idle_secs: idle,
+                        });
+                    } else if idle < notice {
+                        stall_noted = false;
+                    }
                 }
             };
             let result = match outcome {
