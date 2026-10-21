@@ -570,6 +570,24 @@ impl Connection {
         answer.map_err(|e| anyhow!("{e}"))
     }
 
+    /// Every item of a paginated list method (`resources/list`, …).
+    pub async fn list_all(self: &Arc<Self>, method: &str, key: &str) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = match &cursor {
+                Some(c) => json!({"cursor": c}),
+                None => json!({}),
+            };
+            let page = self.request(method, params).await?;
+            out.extend(page[key].as_array().cloned().unwrap_or_default());
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                return Ok(out);
+            }
+        }
+    }
+
     pub async fn list_tools(self: &Arc<Self>) -> Result<Vec<McpTool>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
@@ -765,6 +783,37 @@ impl Manager {
             c.stop();
         }
     }
+}
+
+/// `resources/read` contents as text (binary parts are summarised).
+pub fn resource_text(result: &Value) -> String {
+    result["contents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| match (c["text"].as_str(), c["blob"].as_str()) {
+            (Some(t), _) => t.to_string(),
+            (None, Some(b)) => format!(
+                "[binary {} resource {}, {} base64 chars]",
+                c["mimeType"].as_str().unwrap_or("application/octet-stream"),
+                c["uri"].as_str().unwrap_or_default(),
+                b.len()
+            ),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `prompts/get` messages as one text block to put in the composer.
+pub fn prompt_text(result: &Value) -> String {
+    result["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["content"]["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Bring the registry in line with a server's tool list: new tools are

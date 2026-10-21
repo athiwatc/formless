@@ -566,6 +566,14 @@ None ship by default (principle 1).
   (`ApprovalRequested.detail`); headless they fail closed. Decisions are
   audit-logged with actor `agent`. There is no registry browsing: the
   agent can only propose servers it already knows.
+- **Resources and prompts:** the agent lists and reads servers' resources
+  with the built-ins `list_mcp_resources {server?, query?}` and
+  `read_mcp_resource {server, uri}` (server approval applies; large
+  contents become an artifact with a preview; contents are labelled as
+  untrusted data). Prompts are for the user: `ListMcpPrompts` /
+  `GetMcpPrompt {server, name, arguments}`, surfaced as `/prompts` and
+  `/prompt SERVER:NAME key=value …` in the TUI and web, which load the
+  rendered prompt into the composer.
 - **Approval** (MCP tools are not sandboxed, so approval is the gate):
   each server is approved once on first use (the modal shows its command
   or URL; "Always" remembers it); then each tool is approved like a Tool,

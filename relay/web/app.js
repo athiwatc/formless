@@ -1475,7 +1475,7 @@
     if (S.view === "settings") renderSettings();
   }
 
-  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /cancel /resend /resume /abandon /agents /help";
+  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /cancel /resend /resume /abandon /agents /prompts /help";
   async function slash(cmd) {
     const [name, ...rest] = cmd.split(/\s+/);
     const arg = rest.join(" ");
@@ -1492,6 +1492,20 @@
       case "propose": act({ type: "generate_proposal" }); return note("generating a measured proposal…");
       case "thinking": setThinking(!S.showThinking); return note("thinking display " + (S.showThinking ? "on" : "off"));
       case "stop": return stop();
+      case "prompts": {
+        const list = (await act({ type: "list_mcp_prompts" })) || [];
+        if (!list.length) return note("no MCP prompts available");
+        for (const p of list) note("/prompt " + p.server + ":" + p.name + " " + (p.arguments || []).map((a) => a.name + "=…").join(" ") + " — " + (p.description || ""));
+        return;
+      }
+      case "prompt": {
+        const [target, ...pairs] = arg.split(/\s+/);
+        const [server, name] = (target || "").split(":");
+        if (!server || !name) return note("usage: /prompt SERVER:NAME [key=value …] (see /prompts)", true);
+        const r = await act({ type: "get_mcp_prompt", server, name, arguments: Object.fromEntries(pairs.filter((p) => p.includes("=")).map((p) => p.split(/=(.*)/s).slice(0, 2))) });
+        if (r) { $("input").value = r.text; autosize(); $("input").focus(); note("prompt loaded into the composer; edit it, then send"); }
+        return;
+      }
       case "agents": {
         if (!S.current) return;
         if (!arg) {

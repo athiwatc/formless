@@ -425,6 +425,44 @@ impl Daemon {
                 Ok(json!({"diff": crate::diff::version_diff(a, b)}))
             }
             Request::ListMcpServers => Ok(serde_json::to_value(self.mcp_servers().await?)?),
+            Request::ListMcpPrompts => {
+                let cfg = self.config()?;
+                let mut out = Vec::new();
+                for (name, s) in &cfg.mcp.servers {
+                    if s.disabled {
+                        continue;
+                    }
+                    let Ok(conn) = self.mcp.connection(&self.paths, &cfg.mcp, name).await else {
+                        continue;
+                    };
+                    // Servers without prompts answer with an error: skip them.
+                    for p in conn
+                        .list_all("prompts/list", "prompts")
+                        .await
+                        .unwrap_or_default()
+                    {
+                        out.push(json!({
+                            "server": name,
+                            "name": p["name"],
+                            "description": p["description"],
+                            "arguments": p["arguments"],
+                        }));
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            Request::GetMcpPrompt {
+                server,
+                name,
+                arguments,
+            } => {
+                let cfg = self.config()?;
+                let conn = self.mcp.connection(&self.paths, &cfg.mcp, &server).await?;
+                let r = conn
+                    .request("prompts/get", json!({"name": name, "arguments": arguments}))
+                    .await?;
+                Ok(json!({"text": crate::mcp::prompt_text(&r)}))
+            }
             Request::AddMcpServer { name, server } => {
                 let server: crate::config::McpServerCfg =
                     serde_json::from_value(server).context("invalid MCP server config")?;
@@ -1430,6 +1468,18 @@ impl Daemon {
                 Err(e) => format!("error: find_tools failed: {e}"),
             },
             toolreg::ADD_MCP_SERVER => self.agent_add_mcp_server(session_id, &args, cancel).await,
+            toolreg::LIST_MCP_RESOURCES => {
+                match self.list_mcp_resources(session_id, &args, cancel).await {
+                    Ok(v) => v.to_string(),
+                    Err(e) => format!("error: list_mcp_resources failed: {e}"),
+                }
+            }
+            toolreg::READ_MCP_RESOURCE => {
+                match self.read_mcp_resource(session_id, &args, cfg, cancel).await {
+                    Ok(text) => text,
+                    Err(e) => format!("error: read_mcp_resource failed: {e}"),
+                }
+            }
             toolreg::REMOVE_MCP_SERVER => {
                 let name = args["name"].as_str().unwrap_or_default().to_string();
                 let reason = args["reason"].as_str().unwrap_or("(none given)");
@@ -2319,6 +2369,86 @@ impl Daemon {
             }
         }
         Ok(notes)
+    }
+
+    /// Server-level MCP approval for reading resources (tools have the
+    /// per-tool step on top, see `mcp_preapproval`).
+    async fn mcp_server_allowed(
+        &self,
+        session_id: &str,
+        server: &str,
+        cancel: &CancellationToken,
+    ) -> bool {
+        if self
+            .with_store(|st| st.mcp_server_approved(server))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let (ok, scope) = self
+            .ask_user_approval(
+                session_id,
+                &format!("mcp:{server}"),
+                vec![format!("read resources of MCP server '{server}'")],
+                format!("Allow Formless to use the MCP server '{server}'?"),
+                cancel,
+            )
+            .await;
+        if ok && scope == ApprovalScope::Always {
+            let _ = self.with_store(|st| st.approve_mcp_server(server));
+        }
+        ok
+    }
+
+    async fn list_mcp_resources(
+        &self,
+        session_id: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let cfg = self.config()?;
+        let query = args["query"].as_str().unwrap_or_default().to_lowercase();
+        let mut out = Vec::new();
+        for (name, s) in &cfg.mcp.servers {
+            if s.disabled || args["server"].as_str().is_some_and(|w| w != name) {
+                continue;
+            }
+            if !self.mcp_server_allowed(session_id, name, cancel).await {
+                continue;
+            }
+            let conn = self.mcp.connection(&self.paths, &cfg.mcp, name).await?;
+            for r in conn
+                .list_all("resources/list", "resources")
+                .await
+                .unwrap_or_default()
+            {
+                let hay = format!("{} {} {}", r["name"], r["uri"], r["description"]).to_lowercase();
+                if query.is_empty() || hay.contains(&query) {
+                    out.push(json!({"server": name, "uri": r["uri"], "name": r["name"],
+                        "description": r["description"], "mimeType": r["mimeType"]}));
+                }
+            }
+        }
+        Ok(json!({"resources": out}))
+    }
+
+    async fn read_mcp_resource(
+        &self,
+        session_id: &str,
+        args: &Value,
+        cfg: &Config,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let server = args["server"].as_str().context("server required")?;
+        let uri = args["uri"].as_str().context("uri required")?;
+        if !self.mcp_server_allowed(session_id, server, cancel).await {
+            return Ok("error: the user did not approve using this MCP server".into());
+        }
+        let conn = self.mcp.connection(&self.paths, &cfg.mcp, server).await?;
+        let r = conn.request("resources/read", json!({"uri": uri})).await?;
+        let wrapped = crate::mcp::untrusted(server, json!(crate::mcp::resource_text(&r)));
+        // Large contents become an artifact with a preview (§9.6).
+        Ok(self.model_text(session_id, &wrapped, cfg))
     }
 
     /// The `add_mcp_server` built-in: the user approves the exact command
