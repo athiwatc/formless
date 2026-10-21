@@ -850,6 +850,20 @@
       payload(content));
   }
 
+  // Rendered message bodies by message id: the turn layout is rebuilt on
+  // every change, but Markdown, highlighting, Mermaid and tool chips are
+  // built once per message (and keep their state, e.g. open <details>).
+  const rendered = new Map();
+  function messageBody(m, build) {
+    let node = rendered.get(m.id);
+    if (!node) {
+      node = h("div", { class: "msg" });
+      build(node);
+      rendered.set(m.id, node);
+    }
+    return node;
+  }
+
   function renderHistory() {
     const box = $("transcript");
     box.replaceChildren();
@@ -879,17 +893,18 @@
       if (m.role === "user") {
         // Each user message starts a fresh turn so its Edit button is exact.
         group = null;
-        open("user", m.created_at, m).append(h("div", { class: "bubble" }, m.content));
+        open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
       } else if (m.role === "tool") {
-        open("assistant", m.created_at).append(toolResultChip(m.content || ""));
+        open("assistant", m.created_at).append(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
       } else if (m.role === "system-note") {
-        open("system-note", m.created_at).append(h("div", { class: "bubble" }, m.content));
+        open("system-note", m.created_at).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
       } else {
-        const body = open("assistant", m.created_at);
-        if (m.content) body.append(markdown(m.content));
-        let calls = [];
-        try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
-        calls.forEach((c) => body.append(toolCallChip(c)));
+        open("assistant", m.created_at).append(messageBody(m, (n) => {
+          if (m.content) n.append(markdown(m.content));
+          let calls = [];
+          try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
+          calls.forEach((c) => n.append(toolCallChip(c)));
+        }));
       }
     }
     box.append(h("div", { id: "live", class: "turn" }));
@@ -1326,6 +1341,7 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    rendered.clear(); // a reload may carry edited messages
     prefs.set("session", id);
     S.streaming = "";
     S.thinking = "";
