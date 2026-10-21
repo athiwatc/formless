@@ -1563,6 +1563,16 @@ impl Store {
         Ok(n)
     }
 
+    /// Forget the frozen most-used "filler" picks, so the next listing
+    /// chooses them again from current usage (called at compaction).
+    pub fn reset_filler(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM session_tools WHERE session_id=?1 AND source='filler'",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn session_has_filler(&self, session_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM session_tools WHERE session_id=?1 AND source='filler')",

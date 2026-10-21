@@ -2934,6 +2934,8 @@ impl Daemon {
         // The cached prefix is rebuilt anyway: apply unloads and the cap,
         // list current Tool definitions and adopt the current guidance.
         self.with_store(|st| st.apply_unloads(session_id, cfg.tools.session_max_loaded))?;
+        // Re-pick the most-used filler: Tools that became popular since.
+        self.with_store(|st| st.reset_filler(session_id))?;
         self.with_store(|st| st.unpin_definitions(session_id, None))?;
         let current = self.effective_system_prompt();
         if self.session_prompt(session_id)? != current {

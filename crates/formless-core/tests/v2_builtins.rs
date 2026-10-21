@@ -938,3 +938,49 @@ fn session_tools_unload_at_compaction_and_respect_the_cap() {
     );
     assert_eq!(listed.len(), 2);
 }
+
+/// The frozen most-used filler is re-picked after compaction, so a
+/// long-lived Session sees Tools that became popular later.
+#[test]
+fn filler_is_repicked_after_compaction() {
+    let store = Store::open_in_memory().unwrap();
+    let make = |name: &str| {
+        store
+            .create_tool_version(
+                name,
+                name,
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){ return 1; }",
+                &Capabilities::default(),
+                256,
+                "agent",
+            )
+            .unwrap()
+            .0
+    };
+    let old = make("old_tool");
+    let s = store.create_session(None).unwrap().id;
+    let listed = |store: &Store| names(&toolreg::tool_definitions(store, Some(&s), 1).unwrap());
+    assert!(listed(&store).contains(&"old_tool".to_string()));
+    // A newer Tool becomes the most used elsewhere.
+    let hot = make("hot_tool");
+    let other = store.create_session(None).unwrap().id;
+    for _ in 0..5 {
+        let inv = store
+            .start_invocation(&hot.id, 1, Some(&other), None, None, "{}")
+            .unwrap();
+        store
+            .finish_invocation(&inv, &hot.id, "success", "", "{}", "", 1, 1000)
+            .unwrap();
+    }
+    assert!(
+        !listed(&store).contains(&"hot_tool".to_string()),
+        "frozen until compaction"
+    );
+    store.reset_filler(&s).unwrap();
+    let after = listed(&store);
+    assert!(after.contains(&"hot_tool".to_string()), "{after:?}");
+    assert!(!after.contains(&"old_tool".to_string()), "{after:?}");
+    let _ = old;
+}
