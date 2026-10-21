@@ -341,13 +341,22 @@ impl Daemon {
                 Ok(json!({"deleted": existed}))
             }
             Request::GetSession { id } => {
-                let (session, messages, queued) = self.with_reader(|st| {
+                let (session, messages, queued, last) = self.with_reader(|st| {
                     let s = st.get_session(&id)?.context("session not found")?;
                     let m = st.list_messages(&id)?;
                     let q = st.list_queued_messages(&id)?;
-                    Ok((s, m, q))
+                    let l = st.unfinished_last_run(&id)?;
+                    Ok((s, m, q, l))
                 })?;
-                Ok(json!({"session": session, "messages": messages, "queued": queued}))
+                // An unfinished last Run (interrupted/paused) gets a banner
+                // with Resume / Abandon in clients (SPEC §5.4).
+                let running = self.runs.lock().unwrap().contains_key(&id);
+                let last_run = last.filter(|_| !running).map(|(run_id, status, error)| {
+                    json!({"run_id": run_id, "status": status, "error": error})
+                });
+                Ok(
+                    json!({"session": session, "messages": messages, "queued": queued, "unfinished_run": last_run}),
+                )
             }
             Request::ForkSession {
                 id,
@@ -1247,11 +1256,13 @@ impl Daemon {
                 }
                 Err(e) if e.to_string().contains("interrupted") || cancel.is_cancelled() => {
                     final_status = "interrupted";
+                    let _ = self.with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
                     break;
                 }
                 Err(e) => {
                     final_status = "paused";
                     let _ = self.with_store(|st| st.set_run_status(&run_id, "paused"));
+                    let _ = self.with_store(|st| st.set_run_error(&run_id, &e.to_string()));
                     self.broadcast(Event::RunPaused {
                         session_id: session_id.clone(),
                         run_id: run_id.clone(),

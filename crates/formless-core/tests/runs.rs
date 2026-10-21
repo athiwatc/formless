@@ -350,3 +350,42 @@ async fn running_invocations_are_listed_abandoned_and_cancelled() {
     let v = daemon.handle(Request::ListInvocations).await.unwrap();
     assert_eq!(v, serde_json::json!([]));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unfinished_last_run_comes_with_the_session() {
+    use formless_protocol::Request;
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-unf-{short}"));
+    let paths = formless_core::Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-unf-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap().id;
+    let daemon = std::sync::Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let get = || {
+        let (d, s) = (daemon.clone(), s.clone());
+        async move { d.handle(Request::GetSession { id: s }).await.unwrap() }
+    };
+    assert!(get().await["unfinished_run"].is_null(), "no Runs yet");
+    let r = store.create_run(&s).unwrap();
+    store.set_run_status(&r, "paused").unwrap();
+    store.set_run_error(&r, "provider returned 503").unwrap();
+    let u = get().await["unfinished_run"].clone();
+    assert_eq!(
+        (u["status"].as_str(), u["error"].as_str()),
+        (Some("paused"), Some("provider returned 503"))
+    );
+    // A crash leaves the next Run "running"; recovery explains it.
+    let r2 = store.create_run(&s).unwrap();
+    store.mark_orphan_runs_interrupted().unwrap();
+    let u = get().await["unfinished_run"].clone();
+    assert_eq!(u["run_id"].as_str(), Some(r2.as_str()));
+    assert!(u["error"].as_str().unwrap().contains("daemon stopped"));
+    store.set_run_status(&r2, "completed").unwrap();
+    assert!(get().await["unfinished_run"].is_null());
+}

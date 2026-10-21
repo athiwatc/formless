@@ -454,6 +454,8 @@ struct App {
     questions: Vec<(String, String, Vec<String>)>,
     /// Latest Run usage per Session, for the status line (SPEC §10.6).
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
+    /// The current Session's unfinished last Run: (status, reason).
+    run_banner: Option<(String, String)>,
     /// Last listed running Invocations (for /kill and /drop by prefix).
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
@@ -574,6 +576,7 @@ impl App {
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
+            run_banner: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -1009,6 +1012,12 @@ impl App {
                                     self.follow_chat_bottom();
                                 }
                             }
+                            self.run_banner = result["unfinished_run"].as_object().map(|r| {
+                                (
+                                    r["status"].as_str().unwrap_or_default().to_string(),
+                                    r["error"].as_str().unwrap_or_default().to_string(),
+                                )
+                            });
                             let queued = result["queued"].as_array().map_or(0, Vec::len);
                             if queued > 0 {
                                 self.notes.push(format!(
@@ -1251,6 +1260,7 @@ impl App {
                 if !self.is_current(&session_id) {
                     return;
                 }
+                self.run_banner = None;
                 self.thinking.clear();
                 self.streaming.clear();
                 self.live_tools.clear();
@@ -1283,6 +1293,7 @@ impl App {
                 }
                 self.activity = None;
                 self.notes.push(format!("run paused: {error}"));
+                self.run_banner = Some(("paused".into(), error));
             }
             Event::CompactionNotice {
                 summary_preview, ..
@@ -2011,6 +2022,7 @@ impl App {
                         Request::AbandonRun { session_id }
                     };
                     self.request(Pending::RunControl, req);
+                    self.run_banner = None;
                 }
             }
             "help" => self.notes.push(
@@ -3026,6 +3038,24 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
             lines.push(Line::styled(format!("  {l}"), thinking_style(app.color)));
         }
         group = None;
+    }
+    if let Some((status, reason)) = app.run_banner.as_ref().filter(|_| !app.running()) {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(
+                "  ⏸ The last Run was {status}{}",
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", truncate_chars(reason, 200))
+                }
+            ),
+            bold_fg(app.color, Color::Yellow),
+        ));
+        lines.push(Line::styled(
+            "    /resume continues it · /abandon closes it",
+            ui::dim(app.color),
+        ));
     }
     if !app.streaming.is_empty() || app.running() {
         open_group(&mut lines, &mut group, "assistant", None);
@@ -4373,6 +4403,7 @@ mod tests {
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
+            run_banner: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,

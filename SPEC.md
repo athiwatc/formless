@@ -243,6 +243,15 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   and checkpoint are persisted before the Run is marked interrupted.
 - Resuming a Session (same or later daemon lifetime) restores transcript,
   pending handles (§6.4), and compaction checkpoints exactly.
+- **Why it stopped is shown on attach.** A Run records its stop reason
+  (`runs.error`, schema v26): the provider error when it paused, "the
+  daemon stopped while this Run was going" after a crash, or "interrupted
+  by you". When a Session's last Run is interrupted or paused, and no Run
+  is active, `GetSession` includes `unfinished_run {run_id, status,
+  error}`. Clients show a banner with the reason and **Resume / Abandon**:
+  the TUI shows it at the end of the chat with `/resume` and `/abandon`,
+  and the web shows it above the composer with buttons. The banner clears
+  when a Run starts or the Run is abandoned.
 
 ### 5.5 Asking the user mid-Run
 
