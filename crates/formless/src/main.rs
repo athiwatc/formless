@@ -739,9 +739,30 @@ fn run_headless(
         content: task,
         mode: SendMode::Send,
     });
+    let sigints = count_sigints();
+    let mut interrupting = false;
     let mut code = 1;
     loop {
-        match rx.recv() {
+        // Ctrl+C (SPEC §12): first interrupts the Run and waits for it to
+        // stop (exit 130); a second one exits at once.
+        match sigints.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => {}
+            1 if !interrupting => {
+                interrupting = true;
+                eprintln!("interrupting the run… (Ctrl+C again to quit now)");
+                client.send(Request::InterruptRun {
+                    session_id: session_id.clone(),
+                });
+            }
+            1 => {}
+            _ => return Ok(130),
+        }
+        let msg = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(msg) => Ok(msg),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(e) => Err(e),
+        };
+        match msg {
             Ok(ServerMessage::Event(ev)) => {
                 // The daemon broadcasts every Session's events; only act on ours.
                 if ev.session_id() != Some(session_id.as_str()) {
@@ -796,7 +817,11 @@ fn run_headless(
                         break;
                     }
                     Event::RunFinished { status, .. } => {
-                        code = if status == "completed" { 0 } else { 1 };
+                        code = match status.as_str() {
+                            "completed" => 0,
+                            "interrupted" => 130,
+                            _ => 1,
+                        };
                         break;
                     }
                     _ => {}
@@ -807,6 +832,40 @@ fn run_headless(
         }
     }
     Ok(code)
+}
+
+/// Count Ctrl+C presses on a background thread instead of dying on the
+/// first one, so the headless client can stop its Run cleanly.
+fn count_sigints() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use std::sync::atomic::Ordering;
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = count.clone();
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return count;
+    };
+    // Installed here, before the Run starts, so no early Ctrl+C is missed.
+    #[cfg(unix)]
+    let listener = rt.block_on(async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    });
+    std::thread::spawn(move || {
+        rt.block_on(async move {
+            #[cfg(unix)]
+            if let Ok(mut sig) = listener {
+                while sig.recv().await.is_some() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            #[cfg(not(unix))]
+            while tokio::signal::ctrl_c().await.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    });
+    count
 }
 
 fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
@@ -833,11 +892,18 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
                 println!("{} already installed", spec.id);
                 return Ok(());
             }
-            println!("downloading {} ({} MB)…", spec.id, spec.gguf_bytes / 1_000_000);
+            println!(
+                "downloading {} ({} MB)…",
+                spec.id,
+                spec.gguf_bytes / 1_000_000
+            );
             tokio::runtime::Runtime::new()?.block_on(namer::download(&paths, &spec))?;
             println!("installed {}", spec.gguf_path(&paths).display());
             if !id.eq_ignore_ascii_case(&cfg.naming.model) {
-                println!("set `[naming] model = \"{}\"` in config.toml to use it", spec.id);
+                println!(
+                    "set `[naming] model = \"{}\"` in config.toml to use it",
+                    spec.id
+                );
             }
         }
         NamingAction::Test { text } => {
@@ -857,7 +923,9 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
 
 fn naming_model_status(paths: &Paths, cfg: &Config) -> String {
     match cfg.naming.spec() {
-        _ if !formless_core::namer::embedded_available() => "heuristic (built without embedded-llm)".into(),
+        _ if !formless_core::namer::embedded_available() => {
+            "heuristic (built without embedded-llm)".into()
+        }
         Some(spec) if spec.installed(paths) => format!("{} (installed)", spec.id),
         Some(spec) => format!("{} (not installed: `formless naming pull`)", spec.id),
         None => format!("heuristic (unknown model '{}')", cfg.naming.model),
