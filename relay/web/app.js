@@ -1024,21 +1024,24 @@
         h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
-        : "Approval lasts for this Tool until its capabilities widen.")));
+        : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
+    $("modal-once").classList.toggle("hidden", promo);
+    $("modal-approve").replaceChildren(h("kbd", null, "y"), promo ? " Approve" : " Always");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
     setTimeout(() => $("modal-approve").focus(), 0);
   }
-  function decide(approved) {
+  function decide(approved, scope) {
     const req = S.approvals.shift();
     if (!req) return;
     if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
-    else act({ type: "approval_decision", approval_id: req.id, approved });
-    note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name);
+    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always" });
+    note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
     renderApproval();
     renderStatus();
   }
   $("modal-approve").onclick = () => decide(true);
+  $("modal-once").onclick = () => decide(true, "once");
   $("modal-deny").onclick = () => decide(false);
 
   // ------------------------------------------------------------- tools
@@ -1767,6 +1770,7 @@
     const modalOpen = !$("modal-backdrop").classList.contains("hidden");
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
+      if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
     }
     if (e.key === "Escape") {

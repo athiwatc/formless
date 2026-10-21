@@ -1374,12 +1374,23 @@ impl App {
             return;
         }
         if let KeyCode::Char(c) = key.code {
+            if c == 'o' && self.input.is_empty() && !self.approvals.is_empty() {
+                let req = self.approvals.pop_front().unwrap();
+                self.fire(Request::ApprovalDecision {
+                    approval_id: req.approval_id,
+                    approved: true,
+                    scope: ApprovalScope::Once,
+                });
+                self.notes.push(format!("approved {} once", req.tool_name));
+                return;
+            }
             if (c == 'y' || c == 'n') && self.input.is_empty() {
                 if !self.approvals.is_empty() {
                     let req = self.approvals.pop_front().unwrap();
                     self.fire(Request::ApprovalDecision {
                         approval_id: req.approval_id,
                         approved: c == 'y',
+                        scope: ApprovalScope::Always,
                     });
                     self.notes.push(format!(
                         "{} {}",
@@ -2723,7 +2734,7 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
         if promotion {
             "The new version replaces the current one; rollback stays available."
         } else {
-            "Approval lasts for this Tool until its capabilities widen."
+            "Always: lasts for this Tool until its capabilities widen. Once: this call only."
         },
         ui::dim(color),
     ));
@@ -2733,13 +2744,22 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
             " y ",
             bold_fg(color, Color::Green).add_modifier(Modifier::REVERSED),
         ),
-        Span::raw(" approve    "),
+        Span::raw(if promotion { " approve    " } else { " always    " }),
+    ];
+    if !promotion {
+        keys.push(Span::styled(
+            " o ",
+            bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
+        ));
+        keys.push(Span::raw(" once    "));
+    }
+    keys.extend([
         Span::styled(
             " n ",
             bold_fg(color, Color::Red).add_modifier(Modifier::REVERSED),
         ),
         Span::raw(" deny"),
-    ];
+    ]);
     if more > 0 {
         keys.push(Span::styled(
             format!("      +{more} more waiting"),
@@ -3519,7 +3539,7 @@ mod tests {
         });
         let screen = render(&mut app, 100, 24);
         assert!(
-            screen.contains("approve") && screen.contains("deny"),
+            screen.contains("always") && screen.contains("once") && screen.contains("deny"),
             "{screen}"
         );
         assert!(screen.contains("unscoped"), "{screen}");

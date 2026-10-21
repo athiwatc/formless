@@ -649,6 +649,10 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   highlighted, broad unscoped grants flagged). Replay-limited promotions
   (§8.4) use the same modal. In parallel batches, one combined modal covers
   all held calls (§5.2). Modals are keyboard-driven, never lose scrollback.
+- The answer has a scope (`ApprovalDecision.scope`): **always** (`y`, the
+  default for clients that omit it) stores the grant as above; **once**
+  (`o`) allows only the waiting call and stores nothing, so the next call
+  asks again. Headless `--yes` answers every prompt with *once*.
 
 ### 10.4 Sessions, Tools, and Settings views
 
@@ -750,7 +754,7 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   JSON event per line (the §9.3 event stream). **Approvals fail closed** in
   headless mode: an unapproved sensitive Invocation fails with a clear error
   (approve first in the TUI), unless `--yes` is passed (auto-approve for
-  that Run only). Exit codes: `0` answered, `1` Run errored/paused, `2`
+  that Run only: each prompt is answered *once*, nothing is stored). Exit codes: `0` answered, `1` Run errored/paused, `2`
   usage/config error, `130` interrupted.
 - `formless daemon start|stop|status` — daemon management (same lifecycle
   rules as §9.1).

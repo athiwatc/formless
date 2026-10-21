@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use formless_core::daemon::{daemon_reachable, Daemon};
 use formless_core::provider::probe_blocking;
 use formless_core::{Config, Paths};
-use formless_protocol::{Event, Request, SendMode, ServerMessage, SessionInfo};
+use formless_protocol::{ApprovalScope, Event, Request, SendMode, ServerMessage, SessionInfo};
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
@@ -777,15 +777,17 @@ fn run_headless(
                                 "[approval] {} -> {}",
                                 tool_name,
                                 if yes {
-                                    "approved (--yes)"
+                                    "approved once (--yes)"
                                 } else {
                                     "DENIED (fail closed; pass --yes or approve in the TUI)"
                                 }
                             );
                         }
+                        // `--yes` approves for this Run only (SPEC §12): nothing persists.
                         client.send(Request::ApprovalDecision {
                             approval_id,
                             approved: yes,
+                            scope: ApprovalScope::Once,
                         });
                     }
                     Event::RunPaused { error, .. } => {
