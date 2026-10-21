@@ -1842,3 +1842,85 @@ async fn compaction_appends_to_the_previous_summary() {
     assert_eq!(summary, "OLD-SUMMARY\n\nNEW-BLOCK");
     server.abort();
 }
+
+/// Results that complete together are delivered as one appended note in
+/// a fixed order, not one note each in whatever order they raced.
+#[cfg(unix)]
+#[tokio::test]
+async fn pending_results_are_delivered_in_one_ordered_note() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4batch");
+    seed_sleeper(&paths);
+    let notes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let notes = notes.clone();
+                move |Json(body): Json<Value>| {
+                    let notes = notes.clone();
+                    async move {
+                        let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                        let pushed: Vec<String> = msgs
+                            .iter()
+                            .filter_map(|m| m["content"].as_str())
+                            .filter(|c| c.contains("[Pending invocations completed]"))
+                            .map(str::to_string)
+                            .collect();
+                        if !pushed.is_empty() {
+                            *notes.lock().unwrap() = pushed;
+                            return sse_text("done");
+                        }
+                        let tools = msgs.iter().filter(|m| m["role"] == "tool").count();
+                        if tools == 0 {
+                            let d = json!({"choices": [{"delta": {"tool_calls": [
+                                {"index": 0, "id": "a", "function": {"name": "sleeper", "arguments": "{\"ms\":1300}"}},
+                                {"index": 1, "id": "b", "function": {"name": "sleeper", "arguments": "{\"ms\":1400}"}}
+                            ]}}]});
+                            return format!("data: {d}\n\ndata: [DONE]\n\n");
+                        }
+                        // Both finish while this step is in flight.
+                        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                        sse_tool(&format!("e{tools}"), "echo_fast", json!({"x": 1}))
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 1, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let sid = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: sid,
+        content: "two sleeps".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    assert_eq!(c.run_to_finish().await, "done");
+    let notes = notes.lock().unwrap().clone();
+    assert_eq!(notes.len(), 1, "one note for both: {notes:?}");
+    let lines: Vec<&str> = notes[0].lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(lines.len(), 2, "{}", notes[0]);
+    // Started first, listed first.
+    assert!(
+        lines[0].contains("1300") && lines[1].contains("1400"),
+        "{}",
+        notes[0]
+    );
+    server.abort();
+}

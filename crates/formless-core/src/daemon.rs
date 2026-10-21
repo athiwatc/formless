@@ -74,6 +74,8 @@ pub(crate) struct PendingEntry {
     notify: tokio::sync::Notify,
     /// Cancels just this Invocation (a child of the Run's token).
     cancel: CancellationToken,
+    /// Creation order of the handle (delivery order).
+    order: u64,
 }
 
 /// Fan an event out to every live subscriber, dropping disconnected ones.
@@ -1629,6 +1631,10 @@ impl Daemon {
             activity: Arc::new(std::sync::atomic::AtomicU64::new(epoch_ms())),
             notify: tokio::sync::Notify::new(),
             cancel: cancel.child_token(),
+            order: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            },
         });
         self.pending
             .lock()
@@ -1725,7 +1731,7 @@ impl Daemon {
     /// Push delivery (SPEC §6.3): completed, undelivered pending results for
     /// this Session become system-note messages at the step boundary.
     fn deliver_completed_pending(&self, session_id: &str) {
-        let ready: Vec<(String, Arc<PendingEntry>, String)> = {
+        let mut ready: Vec<(String, Arc<PendingEntry>, String)> = {
             let map = self.pending.lock().unwrap();
             map.iter()
                 .filter(|(_, e)| {
@@ -1742,19 +1748,28 @@ impl Daemon {
                 })
                 .collect()
         };
-        for (handle, entry, text) in ready {
-            let content = format!(
-                "[Pending invocation {handle} (tool {}) completed] {text}",
-                entry.tool_name
-            );
-            if let Ok(msg) =
-                self.with_store(|st| st.append_message(session_id, "system-note", &content))
-            {
-                self.broadcast(Event::MessageAppended {
-                    session_id: session_id.to_string(),
-                    message: msg,
-                });
-            }
+        if ready.is_empty() {
+            return;
+        }
+        // One appended note per step, in a fixed order and format, so the
+        // transcript (and the cached prefix) is the same however the
+        // completions raced.
+        ready.sort_by_key(|(_, entry, _)| entry.order);
+        let content = std::iter::once("[Pending invocations completed]".to_string())
+            .chain(ready.iter().map(|(handle, entry, text)| {
+                format!("- {handle} (tool {}): {text}", entry.tool_name)
+            }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(msg) =
+            self.with_store(|st| st.append_message(session_id, "system-note", &content))
+        {
+            self.broadcast(Event::MessageAppended {
+                session_id: session_id.to_string(),
+                message: msg,
+            });
+        }
+        for (handle, entry, _) in ready {
             entry.delivered.store(true, Ordering::SeqCst);
             self.forget_pending(&handle);
         }
