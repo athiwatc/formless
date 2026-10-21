@@ -1,11 +1,30 @@
-# Formless
+<a id="readme-top"></a>
 
-> **A general-purpose agent harness that boots with one bootstrap tool and grows its own capabilities for any use case.**
+<div align="center">
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](Cargo.toml)
-[![Latest release](https://img.shields.io/github/v/release/athiwatc/formless?sort=semver)](https://github.com/athiwatc/formless/releases/latest)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#32-install)
-[![Telemetry](https://img.shields.io/badge/telemetry-none-success.svg)](#10-security-and-privacy)
+<h1>Formless</h1>
+
+<p><strong>A general-purpose agent harness that boots with one bootstrap tool and grows its own capabilities for any use case.</strong></p>
+
+<p>
+  <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="https://github.com/athiwatc/formless/releases/latest"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Latest release"></a>
+  <a href="#32-install"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows"></a>
+  <a href="#10-security-and-privacy"><img src="https://img.shields.io/badge/telemetry-none-success.svg" alt="Telemetry: none"></a>
+</p>
+
+<p>
+  <a href="https://formless.athiwat.xyz"><strong>Explore the docs »</strong></a>
+  <br />
+  <br />
+  <a href="https://github.com/athiwatc/formless/issues/new?labels=bug">Report Bug</a>
+  &middot;
+  <a href="https://github.com/athiwatc/formless/issues/new?labels=enhancement">Request Feature</a>
+</p>
+
+</div>
+
+## About The Project
 
 A fresh install of Formless exposes exactly one Tool: `create_tool`. Everything else — web access, file surgery, shell work, domain logic — is written on demand by the agent, persisted, versioned, measured and reused. Formless does not specialise in coding.
 
@@ -49,22 +68,67 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 
 ---
 
-## Contents
+## Table of Contents
 
-1. [Principles](#1-principles)
-2. [Architecture](#2-architecture) — [crate map](#21-crate-map)
-3. [Running Formless](#3-running-formless) — [requirements](#31-requirements) · [install](#32-install) · [onboarding](#33-first-run-the-onboarding-wizard) · [TUI](#34-using-the-tui) · [headless](#35-headless-runs-no-tui) · [daemon & doctor](#36-daemon-diagnostics-and-reset) · [relay](#37-browser-access-via-the-relay-v2) · [providers](#38-provider-options-v2) · [profiles & env](#39-profiles-and-environment-variables) · [troubleshooting](#310-troubleshooting) · [CLI reference](#311-cli-reference) · [updating](#312-updating)
-4. [Data, config and profiles](#4-data-config-and-profiles)
-5. [The Tool system](#5-the-tool-system) — [`create_tool`](#51-create_tool--the-bootstrap-tool) · [versioning](#52-lifecycle-and-versioning) · [capabilities](#53-capabilities-closed-taxonomy) · [host API](#54-the-host-api-inside-a-tool) · [composition](#55-composition-rules)
-6. [Invocations: async by design](#6-invocations-async-by-design)
-7. [Sessions, Runs and Steer](#7-sessions-runs-and-steer)
-8. [Life of a Run](#8-life-of-a-run)
-9. [Self-Optimisation](#9-self-optimisation)
-10. [Security and privacy](#10-security-and-privacy)
-11. [Repository layout](#11-repository-layout)
-12. [Development](#12-development)
-13. [Non-goals](#13-non-goals)
-14. [Further reading](#further-reading) · [License](#license)
+<details open>
+  <summary>Expand</summary>
+
+  <ol>
+    <li><a href="#about-the-project">About The Project</a></li>
+    <li><a href="#quick-start">Quick start</a></li>
+    <li><a href="#what-a-session-looks-like">What a session looks like</a></li>
+    <li><a href="#1-principles">Principles</a></li>
+    <li>
+      <a href="#2-architecture">Architecture</a>
+      <ul>
+        <li><a href="#21-crate-map">Crate map</a></li>
+        <li><a href="#22-built-with">Built with</a></li>
+      </ul>
+    </li>
+    <li>
+      <a href="#3-running-formless">Running Formless</a>
+      <ul>
+        <li><a href="#31-requirements">Requirements</a></li>
+        <li><a href="#32-install">Install</a></li>
+        <li><a href="#33-first-run-the-onboarding-wizard">First run: the onboarding wizard</a></li>
+        <li><a href="#34-using-the-tui">Using the TUI</a></li>
+        <li><a href="#35-headless-runs-no-tui">Headless runs (no TUI)</a></li>
+        <li><a href="#36-daemon-diagnostics-and-reset">Daemon, diagnostics and reset</a></li>
+        <li><a href="#37-browser-access-via-the-relay-v2">Browser access via the relay (v2)</a></li>
+        <li><a href="#38-provider-options-v2">Provider options (v2)</a></li>
+        <li><a href="#39-profiles-and-environment-variables">Profiles and environment variables</a></li>
+        <li><a href="#310-troubleshooting">Troubleshooting</a></li>
+        <li><a href="#311-cli-reference">CLI reference</a></li>
+        <li><a href="#312-updating">Updating</a></li>
+      </ul>
+    </li>
+    <li><a href="#4-data-config-and-profiles">Data, config and profiles</a></li>
+    <li>
+      <a href="#5-the-tool-system">The Tool system</a>
+      <ul>
+        <li><a href="#51-create_tool--the-bootstrap-tool"><code>create_tool</code> — the Bootstrap Tool</a></li>
+        <li><a href="#52-lifecycle-and-versioning">Lifecycle and versioning</a></li>
+        <li><a href="#53-capabilities-closed-taxonomy">Capabilities (closed taxonomy)</a></li>
+        <li><a href="#54-the-host-api-inside-a-tool">The host API inside a Tool</a></li>
+        <li><a href="#55-composition-rules">Composition rules</a></li>
+      </ul>
+    </li>
+    <li><a href="#6-invocations-async-by-design">Invocations: async by design</a></li>
+    <li><a href="#7-sessions-runs-and-steer">Sessions, Runs and Steer</a></li>
+    <li><a href="#8-life-of-a-run">Life of a Run</a></li>
+    <li><a href="#9-self-optimisation">Self-Optimisation</a></li>
+    <li><a href="#10-security-and-privacy">Security and privacy</a></li>
+    <li><a href="#11-repository-layout">Repository layout</a></li>
+    <li><a href="#12-development">Development</a></li>
+    <li><a href="#13-non-goals">Non-goals</a></li>
+    <li><a href="#roadmap">Roadmap</a></li>
+    <li><a href="#contributing">Contributing</a></li>
+    <li><a href="#further-reading">Further reading</a></li>
+    <li><a href="#license">License</a></li>
+    <li><a href="#contact">Contact</a></li>
+    <li><a href="#acknowledgments">Acknowledgments</a></li>
+  </ol>
+</details>
 
 ---
 
@@ -113,6 +177,18 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | `formless-protocol` | Shared daemon↔client types: requests, streamed events, errors (versioned) |
 | `formless-tui` | ratatui TUI client |
 | `formless` | Binary entrypoint: CLI commands + default TUI launch |
+
+### 2.2 Built with
+
+| Layer | Choice |
+|---|---|
+| Language | Rust, edition 2021, one workspace |
+| Terminal UI | [ratatui](https://ratatui.rs/) |
+| Tool sandbox | [QuickJS-NG](https://quickjs-ng.github.io/) via [`rquickjs`](https://github.com/DelSkayn/rquickjs) |
+| Async runtime | [Tokio](https://tokio.rs/) |
+| Local storage | SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite) |
+| HTTP and streaming | [`reqwest`](https://docs.rs/reqwest) with rustls |
+| Local session naming | [Candle](https://github.com/huggingface/candle) with [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) |
 
 ---
 
@@ -298,6 +374,7 @@ formless --profile sandbox
 | `formless auth login\|status\|logout` | OAuth sign-in for subscription providers (v2) |
 | `formless prompts list\|generate\|apply\|reject\|rollback` | Measured prompt/memory proposals (v2) |
 | `formless update check` | Compare with the latest GitHub release; never modifies the binary |
+| `formless naming status\|pull\|test "<message>"` | Session-naming model: install state, download now, preview a title |
 | `formless doctor` | Config validity, data dir, keychain reachability, endpoint + tool-calling probe |
 | `formless reset [--force]` | Full wipe of config, keychain entry and data dir |
 
@@ -472,6 +549,7 @@ formless memory rm m1a2b3c4
 * **Session** — a resumable conversation plus Run history; many run concurrently against one Daemon Core. Deleting a Session removes payloads but keeps anonymised tallies.
 * **Run** — one unit of work: user message → final answer. No step, token or time limit; it ends on completion, fault or interruption.
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
+* **Auto-naming** — when an `Untitled` Session finishes its first Run, the daemon gives it a short title (for example "Fixing Rust Error E0502"). A small model, [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) (153 MB, Q4_K_M), runs in-process on the CPU, so naming spends no provider tokens and sends nothing off the machine. It runs in the background, never delays a Run, and never replaces a name you set. The model downloads once into `<data dir>/models/` on first use (pinned revision, SHA-256 verified) or with `formless naming pull`. Until it is installed, or if it fails or exceeds `naming.timeout_secs`, the title is the first few words of your message. Set `naming.enabled = false` to turn naming off, or `naming.auto_download = false` to keep the model off the network. The model is licensed under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE), which limits commercial use above a revenue threshold; building without the default `embedded-llm` cargo feature removes it and leaves only first-words titles.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 
@@ -583,6 +661,33 @@ v2 shipped what v1 left out: the encrypted Relay and Web frontend ([§3.7](#37-b
 
 ---
 
+## Roadmap
+
+- [x] **v1** — bootstrap Tool, measured registry, sandboxed runtime, TUI/CLI and Self-Optimisation.
+- [x] **v2** — encrypted Relay and web frontend, Responses API, prompt-based tool calling, failover and measured routing, OAuth providers, shared modules, sub-agents, prompt/memory self-optimisation, the Tool editor and the multi-pane TUI.
+- [ ] **Next** — tracked in [GitHub Issues](https://github.com/athiwatc/formless/issues). Signed/notarised distribution and package-manager publication remain explicit [non-goals](#13-non-goals).
+
+---
+
+## Contributing
+
+Contributions are welcome, whether it is a bug report, a Tool, a client improvement or a documentation fix.
+
+1. Open an issue for anything larger than a typo so the design can be agreed first.
+2. Fork the repository and create a branch from `main`.
+3. Make the change. If behaviour changes, update `SPEC.md` first; no behaviour may live only in a client.
+4. Run the checks:
+
+   ```bash
+   cargo fmt --all
+   cargo clippy --workspace --all-targets
+   cargo test --workspace
+   ```
+
+5. Open a pull request describing the change, the reasoning and the tests you ran.
+
+---
+
 ## Further reading
 
 1. [GLOSSARY.md](GLOSSARY.md) — the exact words (Tool, Run, Invocation, Candidate, Promotion, Compaction).
@@ -597,3 +702,23 @@ v2 shipped what v1 left out: the encrypted Relay and Web frontend ([§3.7](#37-b
 ## License
 
 Apache-2.0. See `Cargo.toml` and the license text referenced there.
+
+The optional session-naming model, LFM2.5-230M, is not part of this repository or the binary. It is downloaded at runtime and covered by Liquid AI's [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE) ([§7](#7-sessions-runs-and-steer)).
+
+---
+
+## Contact
+
+- **Project:** [formless.athiwat.xyz](https://formless.athiwat.xyz)
+- **Source:** [github.com/athiwatc/formless](https://github.com/athiwatc/formless)
+- **Bugs and features:** [GitHub Issues](https://github.com/athiwatc/formless/issues)
+
+---
+
+## Acknowledgments
+
+- [Best-README-Template](https://github.com/othneildrew/Best-README-Template) for the README structure this page follows.
+- [Liquid AI](https://www.liquid.ai/) for LFM2.5-230M, the optional local session-naming model.
+- The Rust, [ratatui](https://ratatui.rs/), [rquickjs](https://github.com/DelSkayn/rquickjs), [Tokio](https://tokio.rs/) and SQLite communities.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
