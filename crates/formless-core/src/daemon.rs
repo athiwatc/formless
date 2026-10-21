@@ -247,7 +247,9 @@ impl Daemon {
         f(&guard)
     }
 
-    async fn handle(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
+    /// Handle one request as a connected client's would be (in-process
+    /// callers and tests; `Subscribe` needs a connection).
+    pub async fn handle(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
         match req {
             Request::Ping => Ok(json!({"pong": true, "protocol": PROTOCOL_VERSION})),
             Request::Status => {
