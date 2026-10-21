@@ -483,6 +483,46 @@ impl Daemon {
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
             }
+            Request::ListMemories => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_memories())?,
+            )?),
+            Request::UpsertMemory {
+                id,
+                text,
+                scope,
+                enabled,
+            } => {
+                let m = match id {
+                    Some(id) => self
+                        .with_store(|st| {
+                            st.update_memory(&id, text.as_deref(), scope.as_deref(), enabled)
+                        })?
+                        .with_context(|| format!("no memory '{id}'"))?,
+                    None => {
+                        let text = text.context("text required")?;
+                        let scope = scope.as_deref().unwrap_or("global");
+                        let (m, _) =
+                            self.with_store(|st| st.add_memory(&text, scope, "user", None))?;
+                        if enabled == Some(false) {
+                            self.with_store(|st| st.update_memory(&m.id, None, None, Some(false)))?
+                                .unwrap_or(m)
+                        } else {
+                            m
+                        }
+                    }
+                };
+                let _ = self.with_store(|st| st.audit("user", "memory.upsert", &m.id));
+                self.broadcast(Event::MemoryUpdated);
+                Ok(serde_json::to_value(m)?)
+            }
+            Request::DeleteMemory { id } => {
+                if !self.with_store(|st| st.delete_memory(&id))? {
+                    return Err(anyhow!("no memory '{id}'"));
+                }
+                let _ = self.with_store(|st| st.audit("user", "memory.delete", &id));
+                self.broadcast(Event::MemoryUpdated);
+                Ok(json!({"deleted": id}))
+            }
             Request::ExportSkill { name } => {
                 self.with_reader(|st| crate::skills::export(st, &name))
             }
@@ -1706,7 +1746,7 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: remember failed: {e}"),
             },
-            toolreg::FORGET => match self.forget_impl(&args) {
+            toolreg::FORGET => match self.forget_impl(session_id, &args) {
                 Ok(text) => text,
                 Err(e) => format!("error: forget failed: {e}"),
             },
@@ -2674,6 +2714,11 @@ impl Daemon {
             self.with_store(|st| st.add_memory(text, scope, "agent", Some(session_id)))?;
         let _ = self.with_store(|st| st.audit("agent", "memory.remember", &m.id));
         self.broadcast(Event::MemoryUpdated);
+        // Never silent: the user sees every agent write live.
+        self.broadcast(Event::Note {
+            session_id: Some(session_id.to_string()),
+            text: format!("remembered: {} [{}]", m.text, m.id),
+        });
         Ok(json!({
             "id": m.id,
             "saved": if created { "new" } else { "already remembered" },
@@ -2683,13 +2728,18 @@ impl Daemon {
     }
 
     /// `forget` (SPEC §7.11): delete a note by id.
-    fn forget_impl(&self, args: &Value) -> Result<String> {
+    fn forget_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let id = args["id"].as_str().context("id required")?;
-        if !self.with_store(|st| st.delete_memory(id))? {
-            return Err(anyhow!("no memory '{id}'"));
-        }
+        let m = self
+            .with_store(|st| st.get_memory(id))?
+            .with_context(|| format!("no memory '{id}'"))?;
+        self.with_store(|st| st.delete_memory(id))?;
         let _ = self.with_store(|st| st.audit("agent", "memory.forget", id));
         self.broadcast(Event::MemoryUpdated);
+        self.broadcast(Event::Note {
+            session_id: Some(session_id.to_string()),
+            text: format!("forgot: {} [{id}]", m.text),
+        });
         Ok(json!({"forgotten": id}).to_string())
     }
 

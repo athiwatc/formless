@@ -96,3 +96,49 @@ async fn remember_and_forget_built_ins_feed_the_next_session() {
         .await;
     assert!(missing.starts_with("error:"), "{missing}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn users_list_add_edit_and_delete_memories() {
+    use formless_protocol::Request;
+    let paths = temp_paths("memreq");
+    formless_core::Config::default().save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let added = daemon
+        .handle(Request::UpsertMemory {
+            id: None,
+            text: Some("Projects live in ~/code".into()),
+            scope: None,
+            enabled: None,
+        })
+        .await
+        .unwrap();
+    let id = added["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        (added["author"].as_str(), added["scope"].as_str()),
+        (Some("user"), Some("global"))
+    );
+    let edited = daemon
+        .handle(Request::UpsertMemory {
+            id: Some(id.clone()),
+            text: Some("Projects live in ~/src".into()),
+            scope: None,
+            enabled: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (edited["text"].as_str(), edited["enabled"].as_bool()),
+        (Some("Projects live in ~/src"), Some(false))
+    );
+    let list = daemon.handle(Request::ListMemories).await.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    daemon
+        .handle(Request::DeleteMemory { id: id.clone() })
+        .await
+        .unwrap();
+    assert!(daemon.handle(Request::DeleteMemory { id }).await.is_err());
+    assert_eq!(
+        daemon.handle(Request::ListMemories).await.unwrap(),
+        serde_json::json!([])
+    );
+}

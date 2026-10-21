@@ -129,6 +129,7 @@ enum Pending {
     ListMcpPrompts,
     GetMcpPrompt,
     ListSkills,
+    ListMemories,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -765,6 +766,28 @@ impl App {
                                     s.last_error
                                         .map(|e| format!(" · error: {}", truncate_chars(&e, 80)))
                                         .unwrap_or_default()
+                                ));
+                            }
+                        }
+                        Pending::ListMemories => {
+                            let list: Vec<formless_protocol::MemoryInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push(
+                                    "no memories (the agent saves preferences with remember)"
+                                        .into(),
+                                );
+                            }
+                            for m in list {
+                                self.notes.push(format!(
+                                    "memory {} [{}{}] {} · {}",
+                                    m.id,
+                                    m.scope,
+                                    if m.enabled { "" } else { ", off" },
+                                    m.text,
+                                    m.session_id
+                                        .map(|s| format!("from session {}", truncate_chars(&s, 8)))
+                                        .unwrap_or(m.author)
                                 ));
                             }
                         }
@@ -1566,6 +1589,40 @@ impl App {
             "mcp" => self.request(Pending::ListMcpServers, Request::ListMcpServers),
             "prompts" => self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts),
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
+            "memory" => self.request(Pending::ListMemories, Request::ListMemories),
+            cmd if cmd.starts_with("memory ") => {
+                let mut words = cmd.split_whitespace().skip(1);
+                let (verb, id) = (
+                    words.next().unwrap_or_default(),
+                    words.next().unwrap_or_default().to_string(),
+                );
+                let rest = words.collect::<Vec<_>>().join(" ");
+                let req = match verb {
+                    "rm" | "delete" => Some(Request::DeleteMemory { id: id.clone() }),
+                    "on" | "off" => Some(Request::UpsertMemory {
+                        id: Some(id.clone()),
+                        text: None,
+                        scope: None,
+                        enabled: Some(verb == "on"),
+                    }),
+                    "edit" if !rest.is_empty() => Some(Request::UpsertMemory {
+                        id: Some(id.clone()),
+                        text: Some(rest),
+                        scope: None,
+                        enabled: None,
+                    }),
+                    _ => None,
+                };
+                match req {
+                    Some(req) if !id.is_empty() => {
+                        self.fire(req);
+                        self.notes.push(format!("memory {verb} {id}"));
+                    }
+                    _ => self
+                        .notes
+                        .push("usage: /memory [rm|on|off ID | edit ID TEXT]".into()),
+                }
+            }
             cmd if cmd.starts_with("skills enable ") || cmd.starts_with("skills disable ") => {
                 let enabled = cmd.starts_with("skills enable ");
                 let name = cmd.split_whitespace().nth(2).unwrap_or_default().to_string();
@@ -1659,7 +1716,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

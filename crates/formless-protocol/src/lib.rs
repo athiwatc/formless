@@ -359,6 +359,23 @@ pub enum Request {
     GetSkill {
         name: String,
     },
+    /// User-memory notes (SPEC §7.11).
+    ListMemories,
+    /// Add a note (no `id`, author `user`) or edit one: text, scope,
+    /// enabled. Unset fields keep their value.
+    UpsertMemory {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        enabled: Option<bool>,
+    },
+    DeleteMemory {
+        id: String,
+    },
     /// A skill's files as a `formless.skill/1` bundle (no metrics).
     ExportSkill {
         name: String,
