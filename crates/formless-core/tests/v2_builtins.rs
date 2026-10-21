@@ -1031,3 +1031,46 @@ async fn agent_can_find_and_read_modules() {
     let found = call("find_tools", json!({"query": "string helpers"})).await;
     assert_eq!(found["modules"][0]["name"], "strings");
 }
+
+/// The agent reads its own stored outputs without building an fs Tool;
+/// other Sessions' artifacts stay out of reach.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_reads_its_own_artifacts_by_id() {
+    let paths = temp_paths("readart");
+    Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let mine = store.create_session(None).unwrap().id;
+    let theirs = store.create_session(None).unwrap().id;
+    let file = paths.data_dir.join("big.txt");
+    let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&file, &body).unwrap();
+    let id = store
+        .save_artifact(Some(&mine), &file.to_string_lossy(), "", body.len() as i64)
+        .unwrap();
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let call = |session: String, args: Value| {
+        let d = daemon.clone();
+        async move { d.call_tool_direct(&session, "read_artifact", args).await }
+    };
+    let slice: Value = serde_json::from_str(
+        &call(mine.clone(), json!({"id": id, "offset": 7, "length": 7})).await,
+    )
+    .unwrap();
+    assert_eq!(slice["text"], "line 2\n");
+    assert_eq!(slice["total_chars"], body.len());
+    let grep: Value =
+        serde_json::from_str(&call(mine.clone(), json!({"id": id, "grep": "line 49"})).await)
+            .unwrap();
+    let lines: Vec<i64> = grep["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["line"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![49, 490, 491, 492, 493, 494, 495, 496, 497, 498, 499]
+    );
+    let denied = call(theirs, json!({"id": id})).await;
+    assert!(denied.contains("no artifact"), "{denied}");
+}
