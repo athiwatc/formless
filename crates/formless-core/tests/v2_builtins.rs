@@ -754,3 +754,51 @@ async fn sub_agents_cannot_recurse_past_the_depth_limit() {
         2
     );
 }
+
+/// A Session keeps the Tool definition it first listed when a new version
+/// lands elsewhere (prompt-cache prefix), until its pin is refreshed.
+#[test]
+fn listed_tool_definitions_are_pinned_per_session() {
+    let store = Store::open_in_memory().unwrap();
+    let schema = |field: &str| {
+        format!(r#"{{"type":"object","properties":{{"{field}":{{"type":"string"}}}}}}"#)
+    };
+    let make = |field: &str| {
+        store
+            .create_tool_version(
+                "greeter",
+                "greets",
+                &schema(field),
+                "{}",
+                "function run(){ return 1; }",
+                &Capabilities::default(),
+                256,
+                "agent",
+            )
+            .unwrap()
+    };
+    let (info, _) = make("name");
+    let session = store.create_session(None).unwrap().id;
+    let params = |defs: &[Value]| {
+        defs.iter()
+            .find(|d| d["function"]["name"] == "greeter")
+            .unwrap()["function"]["parameters"]["properties"]
+            .clone()
+    };
+    let first = toolreg::tool_definitions(&store, Some(&session), 40).unwrap();
+    assert!(params(&first).get("name").is_some());
+
+    make("who"); // v2 with a different input schema
+    let again = toolreg::tool_definitions(&store, Some(&session), 40).unwrap();
+    assert_eq!(again, first, "the listed definition is pinned");
+    let fresh = store.create_session(None).unwrap().id;
+    let other = toolreg::tool_definitions(&store, Some(&fresh), 40).unwrap();
+    assert!(params(&other).get("who").is_some(), "new Sessions list v2");
+
+    let dropped = store
+        .unpin_definitions(&session, Some(std::slice::from_ref(&info.id)))
+        .unwrap();
+    assert_eq!(dropped, vec![(info.id.clone(), 1)]);
+    let refreshed = toolreg::tool_definitions(&store, Some(&session), 40).unwrap();
+    assert!(params(&refreshed).get("who").is_some());
+}

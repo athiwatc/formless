@@ -202,6 +202,8 @@ CREATE INDEX IF NOT EXISTS idx_run_usage_session ON run_usage(session_id, create
 CREATE INDEX IF NOT EXISTS idx_run_usage_run ON run_usage(run_id);
 ";
 
+/// Tool definitions as a Session last listed them (pinned for the prompt
+/// cache until that Session refreshes them).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -225,7 +227,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -240,7 +242,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 11] = [
+const MIGRATIONS: [(i64, MigrationStep); 12] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -264,6 +266,10 @@ const MIGRATIONS: [(i64, MigrationStep); 11] = [
     (9, |c| Ok(c.execute_batch(SCHEMA_V9)?)),
     (10, |c| Ok(c.execute_batch(SCHEMA_V10)?)),
     (11, |c| Ok(c.execute_batch(SCHEMA_V11)?)),
+    (12, |c| {
+        add_column(c, "session_tools", "pinned_version INTEGER")?;
+        add_column(c, "session_tools", "pinned_def TEXT")
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1517,6 +1523,67 @@ impl Store {
     }
 
     /// Tools a Session has loaded: found or created there, or called there.
+    /// (version, definition JSON) a Session listed for a Tool, if pinned.
+    pub fn pinned_definition(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+    ) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT pinned_version, pinned_def FROM session_tools WHERE session_id=?1 AND tool_id=?2 AND pinned_def IS NOT NULL",
+                params![session_id, tool_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok())
+    }
+
+    pub fn pin_definition(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+        version: i64,
+        def: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, 'called', ?3)",
+            params![session_id, tool_id, now()],
+        )?;
+        self.conn.execute(
+            "UPDATE session_tools SET pinned_version=?3, pinned_def=?4 WHERE session_id=?1 AND tool_id=?2",
+            params![session_id, tool_id, version, def],
+        )?;
+        Ok(())
+    }
+
+    /// Drop pins so the next listing shows current definitions: the given
+    /// Tools, or all of the Session's (`None`). Returns (tool id, version
+    /// that was pinned) for each dropped pin.
+    pub fn unpin_definitions(
+        &self,
+        session_id: &str,
+        tool_ids: Option<&[String]>,
+    ) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_id, pinned_version FROM session_tools WHERE session_id=?1 AND pinned_def IS NOT NULL",
+        )?;
+        let pinned: Vec<(String, i64)> = stmt
+            .query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let dropped: Vec<(String, i64)> = pinned
+            .into_iter()
+            .filter(|(id, _)| tool_ids.is_none_or(|ids| ids.contains(id)))
+            .collect();
+        for (id, _) in &dropped {
+            self.conn.execute(
+                "UPDATE session_tools SET pinned_version=NULL, pinned_def=NULL WHERE session_id=?1 AND tool_id=?2",
+                params![session_id, id],
+            )?;
+        }
+        Ok(dropped)
+    }
+
     pub fn session_tool_ids(&self, session_id: &str) -> Result<std::collections::HashSet<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT tool_id FROM session_tools WHERE session_id=?1
