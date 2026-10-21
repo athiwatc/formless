@@ -268,6 +268,9 @@ INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
 pub const KV_MAX_VALUE: usize = 64 * 1024;
 pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
 
+/// Token use of one model: (model, prompt, completion, cached).
+pub type ModelUsage = (String, i64, i64, i64);
+
 /// Scheduled jobs (SPEC §9.7).
 const SCHEMA_V22: &str = "
 CREATE TABLE IF NOT EXISTS jobs (
@@ -1078,6 +1081,30 @@ impl Store {
             params![tool_id, serde_json::to_string(active_runs)?],
             |r| r.get(0),
         )?)
+    }
+
+    /// Token use for a Run (`run_id`) or a whole Session, per model, and
+    /// the steps: (model, prompt, completion, cached) rows plus steps.
+    pub fn usage_rows(
+        &self,
+        session_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<(Vec<ModelUsage>, i64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage
+             WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR run_id=?2) GROUP BY model",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, run_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let steps: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(steps),0) FROM runs WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR id=?2)",
+            params![session_id, run_id],
+            |r| r.get(0),
+        )?;
+        Ok((rows, steps))
     }
 
     /// One model call made in a Run (a step).

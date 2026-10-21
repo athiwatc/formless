@@ -78,6 +78,24 @@ impl Default for SkillsCfg {
     }
 }
 
+/// USD per million tokens for one model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    /// Cached input; unset charges cached tokens at `input`.
+    pub cached_input: Option<f64>,
+}
+
+impl ModelPrice {
+    pub fn cost(&self, prompt: i64, completion: i64, cached: i64) -> f64 {
+        let fresh = (prompt - cached).max(0) as f64;
+        let cached_rate = self.cached_input.unwrap_or(self.input);
+        (fresh * self.input + cached as f64 * cached_rate + completion as f64 * self.output) / 1e6
+    }
+}
+
 /// Settings clients may change through the daemon (`SetSetting`): exact
 /// keys, or whole sections ending in '.'. Credentials, the endpoint, extra
 /// headers, the relay, MCP servers and hooks stay file-only.
@@ -97,6 +115,7 @@ pub const SETTABLE: &[&str] = &[
     "provider.max_backoff_secs",
     "provider.cache_key",
     "provider.vision",
+    "provider.prices",
     "daemon.idle_grace_secs",
     "daemon.stall_warning_secs",
     "daemon.keep_alive_for_jobs",
@@ -272,6 +291,10 @@ pub struct ProviderCfg {
     /// from the model name (see `provider::is_vision_model`).
     #[serde(default)]
     pub vision: Option<bool>,
+    /// Prices in USD per million tokens, per model, for the cost estimate
+    /// in the status line (SPEC §10.6). Unset models show no cost.
+    #[serde(default)]
+    pub prices: HashMap<String, ModelPrice>,
     /// Seconds without any bytes from an open provider stream before
     /// clients are told it looks stalled (0 = never).
     pub stall_notice_secs: u64,
@@ -351,6 +374,7 @@ impl Default for ProviderCfg {
             routing_complex_chars: default_routing_complex_chars(),
             auth: AuthCfg::default(),
             vision: None,
+            prices: HashMap::new(),
             stall_notice_secs: 120,
             first_byte_timeout_secs: 0,
             max_backoff_secs: 30,

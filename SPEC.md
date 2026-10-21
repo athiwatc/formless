@@ -1215,6 +1215,17 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### 10.6 Live feedback (v2)
 
+- **Usage and cost:**
+  - After every model step the daemon broadcasts `RunUsage`: steps,
+    prompt, completion and cached tokens, and the estimated cost.
+  - The TUI status line and the web status bar show it for the current
+    Session, for example `3 steps · 12.3k in / 1.2k out · 40% cached ·
+    $0.021`.
+  - `SessionUsage` returns the last Run and Session totals: TUI and web
+    `/usage`, and the web status-bar tooltip.
+  - Cost comes from `provider.prices` (USD per million tokens, per model:
+    `input`, `output` and optional `cached_input`). It is shown only when
+    every model used has a price.
 - **Colour:** roles, statuses, list selections, borders, and approval
   prompts are colour-coded; the chat has a friendly empty state and
   `/help` lists the shortcuts. `NO_COLOR` disables all colour.
@@ -1387,6 +1398,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
+| `provider.prices` | {} | USD per million tokens per model (`input`, `output`, `cached_input`) for cost estimates (§10.6) |
 | `tools.pending_threshold_secs` | 300 | Soft async handoff threshold (§6.2) |
 | `tools.default_memory_mb` | 256 | Default per-Invocation heap (§7.4) |
 | `tools.max_memory_mb` | 4096 | Daemon bound on declared memory (§7.4) |
