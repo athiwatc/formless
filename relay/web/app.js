@@ -343,9 +343,18 @@
     $("sidebar").classList.toggle("hidden", S.view !== "chat");
     $("menu-btn").classList.toggle("hidden", S.view !== "chat");
     const conn = $("conn");
-    if (!S.ws || S.ws.readyState !== 1) {
+    conn.title = "";
+    conn.onclick = null;
+    if (S.reconnect) {
+      // Visible backoff with a manual retry (SPEC §12).
+      const secs = Math.max(0, Math.ceil((S.reconnect.at - Date.now()) / 1000));
+      conn.className = "pill off clickable";
+      conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
+      conn.title = "Retry now";
+      conn.onclick = retryNow;
+    } else if (!S.ws || S.ws.readyState !== 1) {
       conn.className = "pill off";
-      conn.textContent = "relay disconnected";
+      conn.textContent = S.ws && S.ws.readyState === 0 ? "connecting…" : "relay disconnected";
     } else if (!S.daemonOnline) {
       conn.className = "pill off";
       conn.textContent = "daemon offline";
@@ -2046,8 +2055,7 @@
       if (!$("app").classList.contains("hidden")) renderAll();
       if (S.userClosed) return;
       // Reconnect with backoff; the relay and daemon are both stateless here.
-      setTimeout(() => { if (!S.userClosed && S.ws === ws) connect(S.secret); }, S.backoff);
-      S.backoff = Math.min(S.backoff * 2, 15000);
+      scheduleReconnect(() => { if (!S.userClosed && S.ws === ws) connect(S.secret); });
     };
   }
 
@@ -2078,6 +2086,8 @@
     S.ws = ws;
     ws.onopen = () => {
       S.backoff = 1000;
+      S.localConnected = true;
+      S.localFails = 0;
       S.channel = { local: true };
       S.daemonOnline = true;
       $("pair").classList.add("hidden");
@@ -2100,16 +2110,38 @@
       for (const p of S.pending.values()) p.reject(new Error("local daemon connection closed"));
       S.pending.clear();
       if (S.userClosed) return;
-      if (!wasOpen) {
+      if (!wasOpen && !S.localConnected) {
         $("pair-error").textContent = "Not signed in to the local daemon: run formless web for a new link.";
         showPair();
         return;
       }
+      // Was connected: keep retrying (the daemon may be restarting).
+      if (!wasOpen && ++S.localFails === 3) {
+        note("Still offline. If the daemon restarted, run formless web for a new link.", true);
+      }
       renderAll();
-      setTimeout(() => { if (!S.userClosed && S.ws === ws) connectLocal(null); }, S.backoff);
-      S.backoff = Math.min(S.backoff * 2, 15000);
+      scheduleReconnect(() => { if (!S.userClosed && S.ws === ws) connectLocal(null); });
     };
   }
+
+  // Reconnect after S.backoff, visibly: the pill counts down and a tap
+  // retries at once.
+  function scheduleReconnect(fn) {
+    clearTimeout(S.reconnect && S.reconnect.timer);
+    const delay = S.backoff;
+    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(() => { S.reconnect = null; fn(); }, delay) };
+    S.backoff = Math.min(S.backoff * 2, 15000);
+    renderChrome();
+  }
+  function retryNow() {
+    if (!S.reconnect) return;
+    const fn = S.reconnect.fn;
+    clearTimeout(S.reconnect.timer);
+    S.reconnect = null;
+    renderChrome();
+    fn();
+  }
+  setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
 
   function showPair() {
     $("app").classList.add("hidden");
@@ -2251,6 +2283,19 @@
   }, 1000);
   // Relative times drift; refresh the sidebar each minute.
   setInterval(renderSessions, 60000);
+
+  // A new `formless web` link pasted into an open tab only changes the
+  // fragment: sign in with it instead of ignoring it.
+  window.addEventListener("hashchange", () => {
+    if (!document.querySelector('meta[name="formless-local"]') || !location.hash.startsWith("#local=")) return;
+    const token = decodeURIComponent(location.hash.slice(7));
+    clearTimeout(S.reconnect && S.reconnect.timer);
+    S.reconnect = null;
+    const old = S.ws;
+    S.ws = null;
+    if (old) old.close();
+    connectLocal(token);
+  });
 
   (function init() {
     if (document.querySelector('meta[name="formless-local"]')) {
