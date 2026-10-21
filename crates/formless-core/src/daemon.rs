@@ -2001,6 +2001,7 @@ impl Daemon {
                 tool_name: tc.name.clone(),
                 version: 0,
                 arguments: tc.arguments.clone(),
+                depth: 0,
             });
         }
         let text = match tc.name.as_str() {
@@ -4375,6 +4376,7 @@ impl Daemon {
                 tool_name: name.clone(),
                 version: ver.version,
                 arguments: input_text.clone(),
+                depth,
             });
             let inv_id = match self.with_store(|st| {
                 st.start_invocation(

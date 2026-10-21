@@ -1235,6 +1235,15 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### 10.6 Live feedback (v2)
 
+- **Live call tree:** `ToolCallStarted.depth` gives a call's `tools.call`
+  nesting (0 for the agent's own calls). The TUI draws running calls as a
+  tree:
+  - nested calls are indented under their caller (└)
+  - sub-agents appear as nodes under the Tool that started them, showing
+    their current step and the Tools they call next
+  - every node has its status (spinner, ✓, ✗) and elapsed time
+  - a subtree that finished successfully folds to one line (`+N nested`);
+    running or failed subtrees stay open.
 - **Usage and cost:**
   - After every model step the daemon broadcasts `RunUsage`: steps,
     prompt, completion and cached tokens, and the estimated cost.

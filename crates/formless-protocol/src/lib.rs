@@ -789,6 +789,10 @@ pub enum Event {
         /// Raw JSON arguments (display only; empty for older daemons).
         #[serde(default)]
         arguments: String,
+        /// `tools.call` nesting: 0 for the agent's own calls, 1 for a call
+        /// made inside that Tool, … (clients draw a tree).
+        #[serde(default)]
+        depth: usize,
     },
     ToolCallFinished {
         session_id: String,
