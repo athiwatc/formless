@@ -472,3 +472,107 @@ async fn dropped_stream_is_retried_and_partial_output_discarded() {
     assert_eq!(out.content, "the whole answer");
     assert_eq!(shown, "the whole answer");
 }
+
+#[tokio::test]
+async fn real_token_usage_is_read_from_both_apis() {
+    use formless_core::provider::Usage;
+    let ev = |v: Value| format!("data: {v}\n\n");
+    // Chat Completions: usage arrives in a final chunk with no choices.
+    let chat = ev(json!({"choices": [{"delta": {"content": "hi"}}]}))
+        + &ev(
+            json!({"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 100},
+            "completion_tokens_details": {"reasoning_tokens": 3}}}),
+        )
+        + "data: [DONE]\n\n";
+    let base = scripted_sse("/chat/completions", vec![chat]).await;
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    let p = Provider::new(c, "k".into()).unwrap();
+    let out = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "x"})],
+            &[],
+            "good",
+            None,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.usage,
+        Some(Usage {
+            prompt_tokens: 120,
+            completion_tokens: 7,
+            reasoning_tokens: 3,
+            cached_tokens: 100
+        })
+    );
+
+    // Responses API: usage on response.completed.
+    let resp = ev(json!({"type": "response.output_text.delta", "delta": "hi"}))
+        + &ev(
+            json!({"type": "response.completed", "response": {"usage": {"input_tokens": 50,
+            "output_tokens": 4, "input_tokens_details": {"cached_tokens": 32}}}}),
+        );
+    let base = scripted_sse("/responses", vec![resp]).await;
+    let mut c = cfg(&base);
+    c.api_style = "responses".into();
+    c.fallback_models.clear();
+    let p = Provider::new(c, "k".into()).unwrap();
+    let out = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "x"})],
+            &[],
+            "good",
+            None,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.usage.unwrap().cached_tokens, 32);
+    assert_eq!(out.usage.unwrap().prompt_tokens, 50);
+}
+
+/// Endpoints that reject `stream_options` still work: it is dropped.
+#[tokio::test]
+async fn stream_options_is_dropped_when_rejected() {
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            if body.get("stream_options").is_some() {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": "Unknown parameter: 'stream_options'"}})),
+                )
+                    .into_response();
+            }
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"delta": {"content": "fine"}}]})
+            )
+            .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    let p = Provider::new(c, "k".into()).unwrap();
+    let out = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "x"})],
+            &[],
+            "good",
+            None,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.content, "fine");
+    assert_eq!(out.usage, None);
+}

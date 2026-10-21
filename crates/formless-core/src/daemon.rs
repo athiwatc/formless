@@ -1113,6 +1113,11 @@ impl Daemon {
             let result = match outcome {
                 Ok(r) => {
                     self.record_model_outcome(&r.model_used, true, started);
+                    if let Some(usage) = &r.usage {
+                        let _ = self.with_store(|st| {
+                            st.record_usage(session_id, run_id, &r.model_used, usage)
+                        });
+                    }
                     r
                 }
                 Err(e) => {
@@ -2769,7 +2774,9 @@ impl Daemon {
             .remove(session_id)
             .unwrap_or_default();
         let built = self.with_store(|st| {
-            cache.build(st, session_id, &prompt, context_tokens, trigger_fraction)
+            let built = cache.build(st, session_id, &prompt, context_tokens, trigger_fraction)?;
+            let known = st.last_prompt_tokens(session_id)?;
+            Ok(cache.with_known_tokens(built, known, context_tokens, trigger_fraction))
         });
         if built.is_ok() {
             self.contexts

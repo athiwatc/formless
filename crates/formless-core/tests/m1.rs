@@ -621,3 +621,36 @@ fn concurrent_appends_get_distinct_ordered_seqs() {
         .collect();
     assert_eq!(seqs, (1..=100).collect::<Vec<i64>>());
 }
+
+#[test]
+fn real_prompt_size_drives_compaction_until_the_next_checkpoint() {
+    use formless_core::provider::Usage;
+    use formless_core::storage::ContextCache;
+    let paths = temp_paths("usage");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap();
+    for i in 0..8 {
+        store
+            .append_message(&s.id, "user", &format!("short {i}"))
+            .unwrap();
+    }
+    let mut cache = ContextCache::default();
+    let built = cache.build(&store, &s.id, "sys", 1000, 0.8).unwrap();
+    assert!(!built.1, "the estimate alone is far under the limit");
+    let usage = Usage {
+        prompt_tokens: 950,
+        completion_tokens: 10,
+        ..Default::default()
+    };
+    store.record_usage(&s.id, "run1", "m", &usage).unwrap();
+    store.record_usage(&s.id, "run1", "m", &usage).unwrap();
+    assert_eq!(store.run_usage("run1").unwrap().prompt_tokens, 1900);
+    let known = store.last_prompt_tokens(&s.id).unwrap();
+    assert_eq!(known, Some(950));
+    let (_, needs, up_to) = cache.with_known_tokens(built, known, 1000, 0.8);
+    assert!(needs, "the provider says the context is nearly full");
+    // After compaction the old count no longer applies.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store.save_checkpoint(&s.id, "summary", up_to).unwrap();
+    assert_eq!(store.last_prompt_tokens(&s.id).unwrap(), None);
+}
