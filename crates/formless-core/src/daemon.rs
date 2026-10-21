@@ -1877,6 +1877,10 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: load_skill failed: {e}"),
             },
+            toolreg::READ_METRICS => match self.read_metrics_impl(&args) {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("error: read_metrics failed: {e}"),
+            },
             toolreg::SCHEDULE_RUN => {
                 match self.schedule_run_impl(session_id, &args, cancel).await {
                     Ok(text) => text,
@@ -3002,6 +3006,62 @@ impl Daemon {
         self.with_store(|st| st.get_skill(name))?
             .filter(|s| s.enabled && !s.retired)
             .with_context(|| format!("no enabled skill named '{name}'"))
+    }
+
+    /// `read_metrics` (SPEC §8.9): registry-wide health for the agent.
+    fn read_metrics_impl(&self, args: &Value) -> Result<Value> {
+        let kind = args["kind"].as_str().context("kind required")?;
+        let filter = args["filter"].as_str().filter(|f| !f.trim().is_empty());
+        let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+        self.with_reader(|st| match kind {
+            "tools" => {
+                let last = st.tool_last_used()?;
+                let month_ago = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+                let mut tools: Vec<_> = st
+                    .list_tools(false)?
+                    .into_iter()
+                    .filter(|t| !t.name.starts_with(crate::mcp::PREFIX))
+                    .filter(|t| match filter {
+                        Some("needs_attention") => t.needs_attention,
+                        Some("failing") => t.success_rate.is_some_and(|r| r < 0.9),
+                        Some("unused") => last.get(&t.id).is_none_or(|l| *l < month_ago),
+                        Some(s) => t.name.contains(s),
+                        None => true,
+                    })
+                    .collect();
+                tools.sort_by_key(|t| std::cmp::Reverse(t.invocations));
+                let total = tools.len();
+                let out: Vec<Value> = tools
+                    .into_iter()
+                    .take(limit)
+                    .map(|t| {
+                        json!({
+                            "name": t.name, "version": t.current_version,
+                            "invocations": t.invocations, "success_rate": t.success_rate,
+                            "needs_attention": t.needs_attention,
+                            "last_used": last.get(&t.id), "capabilities": t.capabilities,
+                        })
+                    })
+                    .collect();
+                Ok(json!({"tools": out, "total": total}))
+            }
+            "audit" => {
+                let rows = st.recent_audit(filter, limit)?;
+                Ok(json!({"audit": rows.into_iter().map(|(actor, action, detail, at)| {
+                    json!({"actor": actor, "action": action, "detail": detail.chars().take(300).collect::<String>(), "at": at})
+                }).collect::<Vec<_>>()}))
+            }
+            "models" => Ok(json!({"models": st.list_model_stats()?.into_iter().map(|m| json!({
+                "model": m.model, "calls": m.samples(), "success_rate": m.success_rate(),
+                "avg_ms": (m.samples() > 0).then(|| m.total_ms / m.samples()),
+            })).collect::<Vec<_>>()})),
+            "runs" => {
+                let runs = st.run_metrics(limit.max(50))?;
+                Ok(json!({"summary": crate::runs::summarize(&runs)}))
+            }
+            "builtins" => Ok(json!({"builtins": st.builtin_stats()?})),
+            other => Err(anyhow!("unknown kind '{other}' (tools, audit, models, runs, builtins)")),
+        })
     }
 
     /// Store an attachment as a Session artifact and hold it for the

@@ -332,7 +332,7 @@ pattern (§4.4).
   `create_tool`, `create_module`, `retire_tool`,
   `find_tools`, `read_tool`, `read_module`, `read_artifact`, `test_tool`,
   `unload_tools`, `remember`, `forget` (§7.11), `ask_user` (§5.5),
-  `schedule_run` (§9.7),
+  `schedule_run` (§9.7), `read_metrics` (§8.9),
   and the Pending Invocation handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
   former built-in; sub-agents are now the `agent` Capability, §7.6), so no
   registry Tool can impersonate one.
@@ -908,6 +908,26 @@ improving the bootstrap prompt and search. The `builtin_calls` table
 
 `ListBuiltinStats` returns calls, failures and kind counts per built-in,
 and the TUI Metrics view shows them in a "Built-ins" table.
+
+### 8.9 The agent reads its own metrics
+
+`read_metrics({kind, filter?, limit?})` lets the agent see registry-wide
+health, so it can clean up duplicates, retire dead Tools and explain
+failures to the user. It is read-only and needs no approval. The kinds
+are:
+
+- `tools`: name, version, invocations, success rate, needs-attention,
+  last use and Capabilities, most used first. `filter` is
+  `needs_attention`, `failing` (below 90%), `unused` (not invoked for 30
+  days) or a name substring.
+- `audit`: recent actions, newest first. `filter` is an action prefix
+  such as `tool.`, `proposal.` or `job.`. Details are clipped to 300
+  characters.
+- `models`: measured reliability and average latency.
+- `runs`: the Run-outcome summary (§8.7).
+- `builtins`: built-in call stats (§8.8).
+
+`limit` defaults to 50, with a maximum of 200.
 
 ## 9. Daemon Core
 
