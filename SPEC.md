@@ -198,6 +198,12 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 - v2: Sessions can be forked (full copy, or a prefix up to a message),
   searched across all Sessions, and a past user message can be edited —
   everything after it is dropped and the Run retries from there.
+  Search uses an FTS5 index over message content (schema v24, with
+  `unicode61` tokens and diacritics folded). Triggers keep the index
+  current through inserts, edits and deletes. Every query word must match
+  as a word prefix, and results are ranked by bm25, then newest. A query
+  with no word characters falls back to a substring scan. Search runs on a
+  reader connection and never takes the store lock.
 
 ### 5.2 Run lifecycle
 

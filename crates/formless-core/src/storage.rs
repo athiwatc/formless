@@ -245,6 +245,25 @@ CREATE TABLE IF NOT EXISTS tool_kv (
   updated_at TEXT NOT NULL, PRIMARY KEY (namespace, key));
 ";
 
+/// Full-text index over message content (SPEC §5.1 search), kept in step
+/// with `messages` by triggers and backfilled once.
+const SCHEMA_V24: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+  content, content='messages', content_rowid='rowid',
+  tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+  INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
+";
+
 /// Largest stored value (JSON bytes) and namespace total.
 pub const KV_MAX_VALUE: usize = 64 * 1024;
 pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
@@ -300,7 +319,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -315,7 +334,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 23] = [
+const MIGRATIONS: [(i64, MigrationStep); 24] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -370,6 +389,7 @@ const MIGRATIONS: [(i64, MigrationStep); 23] = [
     }),
     (22, |c| Ok(c.execute_batch(SCHEMA_V22)?)),
     (23, |c| Ok(c.execute_batch(SCHEMA_V23)?)),
+    (24, |c| Ok(c.execute_batch(SCHEMA_V24)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -708,13 +728,24 @@ impl Store {
             return Ok(Vec::new());
         }
         let limit = limit.clamp(1, 200) as i64;
-        let mut stmt = self.conn.prepare(
+        // FTS5 (bm25, then newest): every word as a prefix term. A query
+        // with no word characters falls back to a substring scan.
+        let fts = fts_query(query);
+        let sql = if fts.is_some() {
+            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
+             JOIN sessions s ON s.id = m.session_id \
+             WHERE messages_fts MATCH ?1 \
+             ORDER BY bm25(messages_fts), m.created_at DESC LIMIT ?2"
+        } else {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages m JOIN sessions s ON s.id = m.session_id \
              WHERE instr(lower(m.content), lower(?1)) > 0 \
-             ORDER BY m.created_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![query, limit], |r| {
+             ORDER BY m.created_at DESC LIMIT ?2"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let arg = fts.unwrap_or_else(|| query.to_string());
+        let rows = stmt.query_map(params![arg, limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -725,7 +756,11 @@ impl Store {
                 r.get::<_, String>(6)?,
             ))
         })?;
-        let needle = query.to_lowercase();
+        let needle = query
+            .split(|c: char| !c.is_alphanumeric())
+            .find(|w| !w.is_empty())
+            .unwrap_or(query)
+            .to_lowercase();
         let mut hits = Vec::new();
         for row in rows {
             let (session_id, session_name, message_id, seq, role, content, created_at) = row?;
@@ -3320,4 +3355,15 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         }
     }
     json!({"role": m.role, "content": m.content})
+}
+
+/// An FTS5 query from free text: each word quoted as a prefix term, all
+/// required. None when the text has no word characters.
+pub fn fts_query(text: &str) -> Option<String> {
+    let terms: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{w}\"*"))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
 }
