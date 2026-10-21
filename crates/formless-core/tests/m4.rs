@@ -1494,3 +1494,65 @@ async fn config_edits_are_picked_up_and_announced() {
     assert_eq!(model.as_deref(), Some("mock-two"));
     server.abort();
 }
+
+/// Separate Runs reach the provider over one pooled connection (one
+/// client in the daemon), not a fresh TCP+TLS handshake each time.
+#[cfg(unix)]
+#[tokio::test]
+async fn provider_connections_are_reused_across_runs() {
+    use axum::{
+        extract::ConnectInfo,
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4pool");
+    let peers = Arc::new(std::sync::Mutex::new(Vec::<u16>::new()));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let peers = peers.clone();
+                move |ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>| {
+                    peers.lock().unwrap().push(addr.port());
+                    async { sse_text("ok") }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    for text in ["one", "two", "three"] {
+        c.send(Request::SendMessage {
+            session_id: sid.clone(),
+            content: text.into(),
+            mode: SendMode::Send,
+        })
+        .await;
+        c.run_to_finish().await;
+    }
+    let peers = peers.lock().unwrap().clone();
+    assert_eq!(peers.len(), 3);
+    assert!(
+        peers.iter().all(|p| *p == peers[0]),
+        "one pooled connection, got client ports {peers:?}"
+    );
+    server.abort();
+}

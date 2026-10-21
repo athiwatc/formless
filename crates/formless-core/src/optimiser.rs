@@ -169,7 +169,7 @@ impl Daemon {
                 signals.push_str(&format!("- [{}] {}\n", a.kind, a.content));
             }
         }
-        let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
+        let provider = self.provider(&cfg).await?;
         let model = cfg
             .optimiser
             .model
@@ -380,7 +380,7 @@ impl Daemon {
                 "\nNOTE: resource (OOM) failures present - use streaming/chunking first.\n",
             );
         }
-        let provider = Provider::for_profile(cfg.provider.clone(), self.paths.clone()).await?;
+        let provider = self.provider(&cfg).await?;
         let model = cfg
             .optimiser
             .model
