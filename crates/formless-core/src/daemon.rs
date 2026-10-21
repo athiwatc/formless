@@ -2313,13 +2313,24 @@ impl Daemon {
         let tools: Vec<Value> = hits
             .iter()
             .map(|t| {
-                json!({
+                let mut v = json!({
                     "name": t.name,
                     "description": t.description,
                     "capabilities": t.capabilities,
                     "invocations": t.invocations,
                     "success_rate": t.success_rate,
-                })
+                });
+                // Measured unreliability is worth saying out loud: the agent
+                // may do better building its own Tool (e.g. for an MCP tool
+                // that keeps failing, which the optimiser cannot rewrite).
+                if let Some(rate) = t.success_rate.filter(|r| *r < 0.5 && t.invocations >= 5) {
+                    v["warning"] = json!(format!(
+                        "unreliable: {:.0}% success over {} calls; consider another Tool or creating one",
+                        rate * 100.0,
+                        t.invocations
+                    ));
+                }
+                v
             })
             .collect();
         // Shared modules match too, so the agent reuses (and reads, with
@@ -3097,22 +3108,28 @@ impl Daemon {
                 let call = self
                     .mcp
                     .call(&self.paths, &cfg.mcp, &server, &tool, input.clone());
-                let outcome = tokio::select! {
-                    _ = cancel.cancelled() => Err("interrupted".to_string()),
-                    r = call => r
-                        .map_err(|e| e.to_string())
-                        .and_then(|v| crate::mcp::call_result(&v))
-                        .map(|v| crate::mcp::untrusted(&server, v)),
+                // Error classes (SPEC §7.9): the server could not be reached
+                // or died (`mcp-transport`) vs the tool reported an error
+                // (`mcp-tool-error`).
+                let outcome: std::result::Result<Value, (&str, String)> = tokio::select! {
+                    _ = cancel.cancelled() => Err(("user-cancelled", "interrupted".to_string())),
+                    r = call => match r {
+                        Err(e) => Err(("mcp-transport", format!("{e:#}"))),
+                        Ok(v) => crate::mcp::call_result(&v)
+                            .map(|v| crate::mcp::untrusted(&server, v))
+                            .map_err(|e| ("mcp-tool-error", e)),
+                    },
                 };
                 let elapsed = dur(&started);
                 let ok = outcome.is_ok();
                 let (status, tag, out, err) = match &outcome {
                     Ok(v) => ("success", "", toolreg::redact(v).to_string(), String::new()),
-                    Err(e) if cancel.is_cancelled() => {
-                        ("cancelled", "user-cancelled", String::new(), e.clone())
+                    Err((tag @ "user-cancelled", e)) => {
+                        ("cancelled", *tag, String::new(), e.clone())
                     }
-                    Err(e) => ("failure", "mcp", String::new(), e.clone()),
+                    Err((tag, e)) => ("failure", *tag, String::new(), e.clone()),
                 };
+                let outcome = outcome.map_err(|(_, e)| e);
                 self.finish_inv(&inv_id, &info, status, tag, &out, &err, elapsed, &cfg);
                 self.broadcast(Event::ToolCallFinished {
                     session_id: session_id.clone(),
