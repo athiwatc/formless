@@ -139,6 +139,7 @@ enum Pending {
     GetArtifact,
     GenerateProposal,
     ListProviders,
+    HarnessChanges,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -893,6 +894,27 @@ impl App {
                                     },
                                     if i.abandoned { " · abandoned" } else { "" },
                                     truncate_chars(&i.handle, 8)
+                                ));
+                            }
+                        }
+                        Pending::HarnessChanges => {
+                            let list = result.as_array().cloned().unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push("no agent changes to the harness".into());
+                            }
+                            for c in list.iter().take(20).rev() {
+                                self.notes.push(format!(
+                                    "{} {} {} · by {} · {}{}",
+                                    c["id"].as_str().unwrap_or_default(),
+                                    c["op"].as_str().unwrap_or_default(),
+                                    c["target"].as_str().unwrap_or_default(),
+                                    c["tool"].as_str().unwrap_or_default(),
+                                    truncate_chars(c["reason"].as_str().unwrap_or_default(), 60),
+                                    if c["undone"] == true {
+                                        " · undone"
+                                    } else {
+                                        ""
+                                    }
                                 ));
                             }
                         }
@@ -1991,6 +2013,17 @@ impl App {
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
             "roles" | "providers" => self.request(Pending::ListProviders, Request::ListProviders),
+            "harness" => self.request(Pending::HarnessChanges, Request::ListHarnessChanges),
+            cmd if cmd.starts_with("harness undo") => {
+                let id = cmd["harness undo".len()..].trim();
+                self.request(
+                    Pending::RunControl,
+                    Request::UndoHarnessChange {
+                        id: (!id.is_empty()).then(|| id.to_string()),
+                    },
+                );
+                self.notes.push("undoing the harness change…".into());
+            }
             cmd if cmd.starts_with("role add ") => {
                 let mut w = cmd["role add ".len()..].split_whitespace();
                 let (name, provider, model) = (w.next(), w.next(), w.next());
@@ -2292,7 +2325,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /roles /role add|rm /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
+                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /roles /role add|rm /harness [undo [ID]] /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),

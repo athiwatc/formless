@@ -859,6 +859,10 @@ impl Daemon {
                 let _ = self.config();
                 Ok(json!({"deleted": name}))
             }
+            Request::ListHarnessChanges => {
+                Ok(json!(self.with_reader(|st| st.harness_changes(100))?))
+            }
+            Request::UndoHarnessChange { id } => self.undo_harness_change(id.as_deref()).await,
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
             )?),
@@ -3623,6 +3627,342 @@ impl Daemon {
         });
     }
 
+    /// The harness API for Tools (SPEC §7.13). `read` returns the harness
+    /// state without secrets; every change asks the user, showing the
+    /// exact before → after and the agent's reason (failing closed with
+    /// nobody connected), is validated by the same code the user's own
+    /// requests use, and is logged with what it replaced so it can be undone.
+    pub(crate) async fn harness_call(
+        &self,
+        session_id: &str,
+        tool: &str,
+        op: &str,
+        args: &Value,
+        reason: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        if op == "read" {
+            return self.harness_read().await;
+        }
+        let before = self.harness_snapshot(op, args)?;
+        let target = harness_target(op, args);
+        let scope = op.split('.').next().unwrap_or_default().to_string();
+        let detail = format!(
+            "The agent (Tool {tool}) wants to change the harness: {op} {target}\nReason: {}\nBefore: {before}\nAfter: {args}",
+            if reason.is_empty() { "(none given)" } else { reason }
+        );
+        let (approved, _) = self
+            .ask_user_approval(
+                session_id,
+                &format!("harness {op}"),
+                vec![format!("harness:{scope}")],
+                detail,
+                cancel,
+            )
+            .await;
+        if !approved {
+            return Err(anyhow!(
+                "the user did not approve this harness change (or nobody is connected to ask)"
+            ));
+        }
+        let result = self.harness_apply(op, args).await?;
+        // An installed skill is undone by its name, not its source.
+        let target = match result["name"].as_str() {
+            Some(n) if op == "skills.add" => n.to_string(),
+            _ => target,
+        };
+        let id = self
+            .with_store(|st| st.record_harness_change(op, &target, &before, args, tool, reason))?;
+        let _ = self.with_store(|st| {
+            st.audit(
+                "agent",
+                &format!("harness.{op}"),
+                &format!("{target} via {tool}: {reason}"),
+            )
+        });
+        Ok(
+            json!({"applied": op, "target": target, "change_id": id, "result": result,
+                  "undo": "the user can revert it with /harness undo"}),
+        )
+    }
+
+    /// Harness state for `harness:read`: never keys or tokens.
+    async fn harness_read(&self) -> Result<Value> {
+        let cfg = self.config()?;
+        let mut providers = vec![json!({
+            "name": crate::config::DEFAULT_PROVIDER, "base_url": cfg.provider.base_url,
+            "model": cfg.provider.model, "fallback_models": cfg.provider.fallback_models,
+            "routing_models": cfg.provider.routing_models,
+        })];
+        for (name, p) in &cfg.providers {
+            providers.push(
+                json!({"name": name, "base_url": p.base_url, "model": p.model,
+                "has_key": crate::config::provider_key(&self.paths, name).is_some()}),
+            );
+        }
+        let mcp: Vec<Value> = self
+            .mcp_servers()
+            .await?
+            .into_iter()
+            .map(|m| {
+                json!({"name": m.name, "transport": m.transport, "disabled": m.disabled,
+                "running": m.running, "tools": m.tool_count})
+            })
+            .collect();
+        let skills: Vec<Value> = self
+            .with_reader(|st| st.list_skills())?
+            .into_iter()
+            .map(|s| json!({"name": s.name, "enabled": s.enabled, "description": s.description}))
+            .collect();
+        Ok(
+            json!({"providers": providers, "roles": cfg.roles, "mcp_servers": mcp,
+                  "skills": skills, "settings": cfg.settings_summary(&self.paths)}),
+        )
+    }
+
+    /// The current value a change would replace (null when absent).
+    fn harness_snapshot(&self, op: &str, args: &Value) -> Result<Value> {
+        let cfg = Config::load_file_only(&self.paths)?;
+        let name = args["name"].as_str().unwrap_or_default();
+        Ok(match op {
+            "mcp.add" | "mcp.remove" => json!(cfg.mcp.servers.get(name)),
+            "skills.enable" => json!(self
+                .with_reader(|st| st.get_skill(name))?
+                .map(|s| s.enabled)),
+            "skills.add" | "skills.remove" => Value::Null,
+            "models.set" | "config.set" => {
+                let key = args["key"].as_str().context("key required")?;
+                let mut v = toml::Value::try_from(&cfg)?;
+                for p in key.split('.') {
+                    match v.get(p) {
+                        Some(x) => v = x.clone(),
+                        None => return Ok(Value::Null),
+                    }
+                }
+                serde_json::to_value(v)?
+            }
+            "providers.upsert" | "providers.remove" => json!(cfg
+                .providers
+                .get(name)
+                .map(|p| json!({"name": name, "base_url": p.base_url, "model": p.model}))),
+            "roles.upsert" | "roles.delete" => json!(cfg.roles.get(name)),
+            other => return Err(anyhow!("unknown harness operation '{other}'")),
+        })
+    }
+
+    /// Apply one harness change (shared with undo). Keys never pass here.
+    async fn harness_apply(&self, op: &str, args: &Value) -> Result<Value> {
+        let name = args["name"].as_str().unwrap_or_default().to_string();
+        let edit_config = |f: &dyn Fn(&mut Config) -> Result<()>| -> Result<()> {
+            let mut cfg = Config::load_file_only(&self.paths)?;
+            f(&mut cfg)?;
+            cfg.save(&self.paths)?;
+            let _ = self.config();
+            Ok(())
+        };
+        match op {
+            "mcp.add" => {
+                let server: crate::config::McpServerCfg =
+                    serde_json::from_value(args["server"].clone())
+                        .context("invalid MCP server config")?;
+                self.add_mcp_server(&name, server, "agent").await
+            }
+            "mcp.remove" => self.remove_mcp_server(&name, "agent").await,
+            "skills.add" => {
+                let (paths, source) = (
+                    self.paths.clone(),
+                    args["source"]
+                        .as_str()
+                        .context("source required")?
+                        .to_string(),
+                );
+                let subdir = args["subdir"].as_str().map(str::to_string);
+                let staged = tokio::task::spawn_blocking(move || {
+                    crate::skills::prepare(&paths, &source, subdir.as_deref(), None)
+                })
+                .await??;
+                // The approval was the review: install enabled.
+                let info = self.with_store(|st| {
+                    let info = crate::skills::commit(&self.paths, st, &staged, "agent")?;
+                    st.set_skill_enabled(&info.name, true)?;
+                    Ok(info)
+                })?;
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"name": info.name, "version": info.version}))
+            }
+            "skills.remove" => {
+                if self.with_store(|st| st.remove_skill(&name))?.is_empty() {
+                    return Err(anyhow!("no skill named '{name}'"));
+                }
+                let _ = std::fs::remove_dir_all(self.paths.data_dir.join("skills").join(&name));
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"removed": name}))
+            }
+            "skills.enable" => {
+                let enabled = args["enabled"].as_bool().context("enabled required")?;
+                if !self.with_store(|st| st.set_skill_enabled(&name, enabled))? {
+                    return Err(anyhow!("no skill named '{name}'"));
+                }
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"name": name, "enabled": enabled}))
+            }
+            "models.set" | "config.set" => {
+                let key = args["key"].as_str().context("key required")?.to_string();
+                let models_key = crate::config::HARNESS_MODEL_KEYS
+                    .iter()
+                    .any(|k| key == *k || key.starts_with(&format!("{k}.")));
+                if (op == "models.set") != models_key {
+                    return Err(anyhow!(
+                        "'{key}' is {}",
+                        if models_key {
+                            "a models.set key"
+                        } else {
+                            "not a model setting; use config.set"
+                        }
+                    ));
+                }
+                let value = args["value"].clone();
+                edit_config(&|cfg| cfg.set_key(&key, value.clone()))?;
+                Ok(json!({"key": key}))
+            }
+            "providers.upsert" => {
+                if args.get("api_key").is_some() {
+                    return Err(anyhow!("API keys are never set by the agent: ask the user to run `formless providers add {name}`"));
+                }
+                if name.is_empty()
+                    || name == crate::config::DEFAULT_PROVIDER
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!(
+                        "provider names use letters, digits, '-' and '_' (and not 'default')"
+                    ));
+                }
+                let base_url = args["base_url"]
+                    .as_str()
+                    .context("base_url required")?
+                    .trim_end_matches('/')
+                    .to_string();
+                // Validate before applying: the endpoint must answer at all.
+                self.http
+                    .get(format!("{base_url}/models"))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                    .with_context(|| format!("{base_url} is not reachable; nothing changed"))?;
+                let model = args["model"].as_str().map(str::to_string);
+                edit_config(&|cfg| {
+                    let p = cfg.providers.entry(name.clone()).or_default();
+                    p.base_url = base_url.clone();
+                    if let Some(m) = &model {
+                        p.model = m.clone();
+                    }
+                    Ok(())
+                })?;
+                let has_key = crate::config::provider_key(&self.paths, &name).is_some();
+                Ok(json!({"provider": name, "has_key": has_key,
+                    "note": if has_key { "" } else { "no API key stored: the user adds one with `formless providers add` (keys never pass through the agent)" }}))
+            }
+            "providers.remove" => {
+                edit_config(&|cfg| {
+                    if cfg
+                        .roles
+                        .values()
+                        .any(|r| r.provider.as_deref() == Some(name.as_str()))
+                    {
+                        return Err(anyhow!("provider '{name}' is used by a role"));
+                    }
+                    cfg.providers
+                        .remove(&name)
+                        .map(|_| ())
+                        .with_context(|| format!("no provider '{name}'"))
+                })?;
+                // The key stays, so undo restores the provider whole.
+                Ok(json!({"removed": name}))
+            }
+            "roles.upsert" => {
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!("role names use letters, digits, '-' and '_'"));
+                }
+                let role: crate::config::RoleCfg =
+                    serde_json::from_value(args["role"].clone()).context("invalid role")?;
+                edit_config(&|cfg| {
+                    cfg.provider_cfg(role.provider.as_deref())?;
+                    cfg.roles.insert(name.clone(), role.clone());
+                    Ok(())
+                })?;
+                Ok(json!({"role": name}))
+            }
+            "roles.delete" => {
+                edit_config(&|cfg| {
+                    cfg.roles
+                        .remove(&name)
+                        .map(|_| ())
+                        .with_context(|| format!("no role '{name}'"))
+                })?;
+                Ok(json!({"deleted": name}))
+            }
+            other => Err(anyhow!("unknown harness operation '{other}'")),
+        }
+    }
+
+    /// Revert a harness change by applying its inverse (the user's call;
+    /// no approval).
+    async fn undo_harness_change(&self, id: Option<&str>) -> Result<Value> {
+        let changes = self.with_reader(|st| st.harness_changes(500))?;
+        let change = changes
+            .into_iter()
+            .find(|c| {
+                c["undone"] == false
+                    && id.is_none_or(|id| c["id"].as_str().is_some_and(|c| c.starts_with(id)))
+            })
+            .context("no harness change to undo")?;
+        let (op, before, after) = (
+            change["op"].as_str().unwrap_or_default(),
+            &change["before"],
+            &change["after"],
+        );
+        let name = after["name"].clone();
+        let (inv_op, inv_args): (&str, Value) = match op {
+            "mcp.add" => ("mcp.remove", json!({"name": name})),
+            "mcp.remove" => ("mcp.add", json!({"name": name, "server": before})),
+            "skills.add" => ("skills.remove", json!({"name": change["target"]})),
+            "skills.enable" => ("skills.enable", json!({"name": name, "enabled": before})),
+            "models.set" | "config.set" => (op, json!({"key": after["key"], "value": before})),
+            "providers.upsert" if before.is_null() => ("providers.remove", json!({"name": name})),
+            "providers.upsert" | "providers.remove" => ("providers.upsert", before.clone()),
+            "roles.upsert" if before.is_null() => ("roles.delete", json!({"name": name})),
+            "roles.upsert" | "roles.delete" => {
+                ("roles.upsert", json!({"name": name, "role": before}))
+            }
+            other => return Err(anyhow!("{other} cannot be undone")),
+        };
+        if inv_op == "providers.upsert" {
+            // Re-adding a provider the agent removed: no reachability check.
+            let n = inv_args["name"].as_str().unwrap_or_default().to_string();
+            let mut cfg = Config::load_file_only(&self.paths)?;
+            let p = cfg.providers.entry(n).or_default();
+            p.base_url = inv_args["base_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            p.model = inv_args["model"].as_str().unwrap_or_default().to_string();
+            cfg.save(&self.paths)?;
+            let _ = self.config();
+        } else {
+            self.harness_apply(inv_op, &inv_args).await?;
+        }
+        let cid = change["id"].as_str().unwrap_or_default().to_string();
+        self.with_store(|st| st.mark_harness_undone(&cid))?;
+        let _ = self.with_store(|st| st.audit("user", "harness.undo", &format!("{cid} ({op})")));
+        Ok(json!({"undone": cid, "op": op}))
+    }
+
     /// Usage of a Run or Session, priced with `provider.prices` when every
     /// model used has a price (SPEC §10.6).
     pub fn usage_info(
@@ -6086,6 +6426,28 @@ impl NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn harness(&self, op: &str, args: &Value, reason: &str) -> std::result::Result<Value, String> {
+        let tool = self
+            .kv_scope
+            .strip_prefix("tool:")
+            .and_then(|id| {
+                self.daemon
+                    .with_reader(|st| st.get_tool_current(id))
+                    .ok()
+                    .flatten()
+            })
+            .map(|(t, _)| t.name)
+            .unwrap_or_else(|| self.kv_scope.clone());
+        self.block_cancellable(self.daemon.harness_call(
+            &self.session_id,
+            &tool,
+            op,
+            args,
+            reason,
+            &self.cancel,
+        ))
+    }
+
     fn kv(
         &self,
         op: &str,
@@ -6397,4 +6759,13 @@ pub(crate) struct Target {
     pub system: Option<String>,
     /// The role, when one was chosen.
     pub role: Option<String>,
+}
+
+/// What a harness change is about, for the log and the approval.
+fn harness_target(op: &str, args: &Value) -> String {
+    match op {
+        "models.set" | "config.set" => args["key"].as_str().unwrap_or_default().to_string(),
+        "skills.add" => args["source"].as_str().unwrap_or_default().to_string(),
+        _ => args["name"].as_str().unwrap_or_default().to_string(),
+    }
 }

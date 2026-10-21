@@ -187,6 +187,19 @@ impl ModelPrice {
     }
 }
 
+/// Keys `harness:models` may change (SPEC §7.13); other settable keys are
+/// `harness:config`.
+pub const HARNESS_MODEL_KEYS: &[&str] = &[
+    "provider.model",
+    "provider.reasoning_effort",
+    "provider.context_tokens",
+    "provider.model_context_tokens",
+    "provider.fallback_models",
+    "provider.routing_models",
+    "provider.routing_fast_models",
+    "provider.routing_strong_models",
+];
+
 /// Settings clients may change through the daemon (`SetSetting`): exact
 /// keys, or whole sections ending in '.'. Credentials, the endpoint, extra
 /// headers, the relay, MCP servers and hooks stay file-only.

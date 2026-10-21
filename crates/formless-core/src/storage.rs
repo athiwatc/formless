@@ -333,7 +333,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 30;
+pub const SCHEMA_VERSION: i64 = 31;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -348,7 +348,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 30] = [
+const MIGRATIONS: [(i64, MigrationStep); 31] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -429,6 +429,15 @@ const MIGRATIONS: [(i64, MigrationStep); 30] = [
                ms INTEGER NOT NULL, tokens INTEGER NOT NULL, turns INTEGER NOT NULL,
                outcome TEXT NOT NULL, created_at TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS idx_task_stats ON task_stats(role, model);",
+        )?)
+    }),
+    // Agent changes to the harness, with what they replaced (SPEC §7.13).
+    (31, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS harness_changes (
+               id TEXT PRIMARY KEY, op TEXT NOT NULL, target TEXT NOT NULL,
+               before TEXT NOT NULL, after TEXT NOT NULL, tool TEXT NOT NULL,
+               reason TEXT NOT NULL, undone INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);",
         )?)
     }),
 ];
@@ -1338,6 +1347,53 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Log an agent change to the harness (SPEC §7.13).
+    pub fn record_harness_change(
+        &self,
+        op: &str,
+        target: &str,
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        tool: &str,
+        reason: &str,
+    ) -> Result<String> {
+        let id = format!("h{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        self.conn.execute(
+            "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, op, target, before.to_string(), after.to_string(), tool, reason, now()],
+        )?;
+        Ok(id)
+    }
+
+    /// Harness changes, newest first.
+    pub fn harness_changes(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, op, target, before, after, tool, reason, undone, created_at FROM harness_changes
+             ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                let parse = |s: String| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?, "op": r.get::<_, String>(1)?,
+                    "target": r.get::<_, String>(2)?, "before": parse(r.get(3)?),
+                    "after": parse(r.get(4)?), "tool": r.get::<_, String>(5)?,
+                    "reason": r.get::<_, String>(6)?, "undone": r.get::<_, i64>(7)? != 0,
+                    "created_at": r.get::<_, String>(8)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_harness_undone(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE harness_changes SET undone=1 WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     /// One model call made in a Run (a step).

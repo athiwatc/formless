@@ -573,6 +573,13 @@ pub enum Request {
     DeleteRole {
         name: String,
     },
+    /// Changes the agent made to the harness, newest first (SPEC §7.13).
+    ListHarnessChanges,
+    /// Revert one (or, without `id`, the latest not yet undone).
+    UndoHarnessChange {
+        #[serde(default)]
+        id: Option<String>,
+    },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
     /// Add a job as the user (approved): `cron` for recurring, else `at`.

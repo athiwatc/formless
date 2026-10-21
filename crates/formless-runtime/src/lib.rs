@@ -56,6 +56,11 @@ pub trait HostOps: Send + Sync {
     ) -> Result<String, String> {
         Err("agents.run is not available in this context".into())
     }
+    /// The harness API (SPEC §7.13): `op` such as `read` or `roles.upsert`,
+    /// with its JSON `args` and the agent's `reason` (shown to the user).
+    fn harness(&self, _op: &str, _args: &Value, _reason: &str) -> Result<Value, String> {
+        Err("the harness is not available in this context".into())
+    }
     /// Key-value store (SPEC §7.4): `op` is get, set, delete or list.
     /// `namespace` is "" for the Tool's own, else a shared namespace.
     fn kv(
@@ -283,6 +288,10 @@ globalThis.clipboard = {
 };
 globalThis.notify = (title, body) => __call("notify", { title: String(title || ""), body: String(body || "") });
 globalThis.notifications = { send: globalThis.notify };
+globalThis.harness = {
+  read: () => __call("harness", { op: "read", args: {}, reason: "" }),
+  call: (op, args, reason) => __call("harness", { op: String(op), args: args || {}, reason: String(reason || "") }),
+};
 globalThis.store = {
   get: (k, o) => __call("kv", { op: "get", key: String(k), ns: (o && o.ns) || "" }),
   set: (k, v, o) => __call("kv", { op: "set", key: String(k), value: v === undefined ? null : v, ns: (o && o.ns) || "" }),
@@ -691,6 +700,21 @@ impl State {
                             a["body"].as_str().unwrap_or_default(),
                         )?;
                         Ok(Value::Null)
+                    }
+                }
+            }
+            "harness" => {
+                let op = a["op"].as_str().unwrap_or_default();
+                let scope = op.split('.').next().unwrap_or_default();
+                if !self.caps.harness.iter().any(|h| h == scope) {
+                    return Err(denied(format!("harness:{scope} not declared")));
+                }
+                match self.mode {
+                    HostMode::Smoke => Ok(self.stub(json!({"stubbed": true}))),
+                    HostMode::Replay => Err(denied("harness denied in replay")),
+                    HostMode::Live => {
+                        self.ops
+                            .harness(op, &a["args"], a["reason"].as_str().unwrap_or_default())
                     }
                 }
             }

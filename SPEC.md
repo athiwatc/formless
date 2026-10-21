@@ -563,6 +563,7 @@ pattern (§4.4).
 | `llm` | optionally per-model | v2; LLM completions from inside Tools (§7.5) |
 | `agent` | optionally per-model | v2; sub-agents from inside Tools (§7.6) |
 | `store` / `store:<ns>` | own / named shared namespace | Key-value state between Invocations; not sensitive (no approval) |
+| `harness:<scope>` | `read`, `mcp`, `skills`, `models`, `providers`, `roles`, `config` | Read or change the harness itself (§7.13); every change is approved with a diff |
 
 - **Input-bound scopes (v2.1).** `fs:read`, `fs:write` and `net` may be
   scoped to an input field instead of a fixed value: `fs:read:$input.path`,
@@ -1000,6 +1001,49 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
   three rules: use it to connect existing Tools; anything that reads or
   changes the world is a Tool, not script code; save with `save_as` any
   script you would run twice.
+
+### 7.13 The agent manages its own harness
+
+Tools declaring a `harness:<scope>` Capability can read and change the
+harness, so the agent can set itself up (add a skill, connect an MCP
+server, create a role) instead of asking the user to do it by hand. JS
+API: `harness.read()` and `harness.call(op, args, reason)`.
+
+- **Scopes and operations:**
+  - `read`: providers, roles, MCP servers, skills and settings. Never API
+    keys or tokens; named providers show only `has_key`. It is not
+    sensitive.
+  - `mcp`: `mcp.add` / `mcp.remove`.
+  - `skills`: `skills.add` (a folder, git URL or zip, validated before
+    install and enabled because the approval was the review),
+    `skills.remove` and `skills.enable`.
+  - `models`: `models.set` for the model keys (`provider.model`,
+    effort, context tokens, fallback and routing lists).
+  - `providers`: `providers.upsert` (the endpoint must answer before
+    anything changes) and `providers.remove`.
+  - `roles`: `roles.upsert` / `roles.delete`.
+  - `config`: `config.set` for the other `SetSetting` keys (§13).
+- **Every change is approved.** The prompt shows the operation, its
+  target, the agent's reason, and the exact before and after. With
+  nobody connected it fails closed. The Capability-level first-run
+  approval applies as well.
+- **No secrets and no self-escalation.** API keys never pass through the
+  agent: `providers.upsert` refuses `api_key`, and the user adds the key
+  with `formless providers add`. Settings go through `SetSetting`'s
+  allow-list, so the endpoint, extra headers, auth, relay, MCP command
+  trust, hooks, approvals and Capability grants stay user-only. The
+  harness cannot widen any Tool's Capabilities.
+- **Logged and undoable.** Each change is audit-logged with actor
+  `agent`, the Tool and the reason. It is also kept in `harness_changes`
+  (schema v31) with the value it replaced.
+  - `ListHarnessChanges` lists them; TUI `/harness`.
+  - `UndoHarnessChange {id?}` (TUI `/harness undo [ID]`) applies the
+    inverse: a removed MCP server or provider comes back as it was, and a
+    setting or role returns to its previous value. Removing a skill
+    deletes its files, so that cannot be undone.
+- Changes reach new Sessions, or a Session after compaction, like any
+  configuration change. They never rewrite a running Session's cached
+  prompt prefix.
 
 ## 8. Metrics and Self-Optimisation
 
