@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, ProviderCfg};
@@ -73,7 +73,6 @@ pub struct Daemon {
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
-    queued: Arc<Mutex<HashMap<String, Vec<String>>>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
@@ -96,7 +95,6 @@ impl Daemon {
             paths,
             store: Arc::new(StdMutex::new(store)),
             runs: Arc::new(StdMutex::new(HashMap::new())),
-            queued: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
@@ -176,12 +174,13 @@ impl Daemon {
                 Ok(json!({"deleted": existed}))
             }
             Request::GetSession { id } => {
-                let (session, messages) = self.with_store(|st| {
+                let (session, messages, queued) = self.with_store(|st| {
                     let s = st.get_session(&id)?.context("session not found")?;
                     let m = st.list_messages(&id)?;
-                    Ok((s, m))
+                    let q = st.list_queued_messages(&id)?;
+                    Ok((s, m, q))
                 })?;
-                Ok(json!({"session": session, "messages": messages}))
+                Ok(json!({"session": session, "messages": messages, "queued": queued}))
             }
             Request::ForkSession {
                 id,
@@ -525,7 +524,7 @@ impl Daemon {
     /// drop its queued messages, interrupt its Run (and wait for it to
     /// finish writing), and abandon its background invocations.
     async fn stop_session_work(&self, session_id: &str) {
-        self.queued.lock().await.remove(session_id);
+        let _ = self.with_store(|st| st.clear_queued_messages(session_id));
         if let Some(ctl) = self.runs.lock().unwrap().get(session_id) {
             ctl.cancel_flag.store(true, Ordering::SeqCst);
             ctl.cancel.cancel();
@@ -578,12 +577,8 @@ impl Daemon {
         let busy = self.runs.lock().unwrap().contains_key(&session_id);
         match (busy, mode) {
             (true, SendMode::Queue) => {
-                self.queued
-                    .lock()
-                    .await
-                    .entry(session_id)
-                    .or_default()
-                    .push(content);
+                // Persisted, so a daemon restart does not lose it.
+                self.with_store(|st| st.enqueue_message(&session_id, &content))?;
                 Ok(json!({"queued": true}))
             }
             (true, _) => {
@@ -689,16 +684,10 @@ impl Daemon {
         });
         self.maybe_name_session(&session_id);
         // Queued messages start fresh Runs, in order (SPEC §5.3).
-        let next = {
-            let mut q = self.queued.lock().await;
-            q.get_mut(&session_id).and_then(|v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.remove(0))
-                }
-            })
-        };
+        let next = self
+            .with_store(|st| st.pop_queued_message(&session_id))
+            .ok()
+            .flatten();
         if let Some(content) = next {
             if let Ok(msg) = self.with_store(|st| st.append_message(&session_id, "user", &content))
             {

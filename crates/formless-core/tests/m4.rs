@@ -1119,3 +1119,82 @@ async fn stalled_stream_is_flagged_and_can_be_resent() {
     assert_eq!(final_text.as_deref(), Some("done"));
     server.abort();
 }
+
+/// A queued message is stored (visible in GetSession) and starts its own
+/// Run when the current one ends.
+#[cfg(unix)]
+#[tokio::test]
+async fn queued_message_is_persisted_and_runs_next() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4queue");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let last = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                sse_text(&format!("re: {last}"))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    c.rpc(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "one".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let r = c
+        .rpc(Request::SendMessage {
+            session_id: sid.clone(),
+            content: "two".into(),
+            mode: SendMode::Queue,
+        })
+        .await;
+    assert_eq!(r["queued"], true);
+    let got = c.rpc(Request::GetSession { id: sid.clone() }).await;
+    assert_eq!(got["queued"], json!(["two"]));
+    // Stored, not in memory: visible to a fresh store handle too.
+    assert_eq!(
+        Store::open(&paths.db_file())
+            .unwrap()
+            .list_queued_messages(&sid)
+            .unwrap(),
+        ["two"]
+    );
+    let mut answers = Vec::new();
+    while answers.len() < 2 {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::MessageComplete { message, .. })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            answers.push(message.content);
+        }
+    }
+    assert_eq!(answers, ["re: one", "re: two"]);
+    let got = c.rpc(Request::GetSession { id: sid.clone() }).await;
+    assert_eq!(got["queued"], json!([]));
+    server.abort();
+}

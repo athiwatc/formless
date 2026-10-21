@@ -612,6 +612,12 @@ impl App {
                                     self.follow_chat_bottom();
                                 }
                             }
+                            let queued = result["queued"].as_array().map_or(0, Vec::len);
+                            if queued > 0 {
+                                self.notes.push(format!(
+                                    "{queued} queued message(s) start after the current run"
+                                ));
+                            }
                         }
                     }
                 }

@@ -158,6 +158,14 @@ CREATE TABLE IF NOT EXISTS session_tools (
   PRIMARY KEY (session_id, tool_id));
 ";
 
+const SCHEMA_V8: &str = "
+CREATE TABLE IF NOT EXISTS queued_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  content TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_queued_session ON queued_messages(session_id, id);
+";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -181,7 +189,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -196,7 +204,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 7] = [
+const MIGRATIONS: [(i64, MigrationStep); 8] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -216,6 +224,7 @@ const MIGRATIONS: [(i64, MigrationStep); 7] = [
     (5, |c| Ok(c.execute_batch(SCHEMA_V5)?)),
     (6, |c| Ok(c.execute_batch(SCHEMA_V6)?)),
     (7, |c| Ok(c.execute_batch(SCHEMA_V7)?)),
+    (8, |c| Ok(c.execute_batch(SCHEMA_V8)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -604,6 +613,50 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Queue a message to start its own Run after the current one (§5.3).
+    pub fn enqueue_message(&self, session_id: &str, content: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO queued_messages(session_id,content,created_at) VALUES(?1,?2,?3)",
+            params![session_id, content, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove and return the Session's oldest queued message.
+    pub fn pop_queued_message(&self, session_id: &str) -> Result<Option<String>> {
+        let next: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id LIMIT 1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((id, _)) = &next {
+            self.conn
+                .execute("DELETE FROM queued_messages WHERE id=?1", params![id])?;
+        }
+        Ok(next.map(|(_, content)| content))
+    }
+
+    pub fn list_queued_messages(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content FROM queued_messages WHERE session_id=?1 ORDER BY id")?;
+        let rows = stmt
+            .query_map(params![session_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    pub fn clear_queued_messages(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM queued_messages WHERE session_id=?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     /// The Session's most recent Run as (run id, status).
     pub fn last_run(&self, session_id: &str) -> Result<Option<(String, String)>> {
         Ok(self

@@ -1324,6 +1324,7 @@
     const r = await act({ type: "get_session", id });
     if (r && S.current === id) {
       S.messages = r.messages || [];
+      if (r.queued && r.queued.length) note(r.queued.length + " queued message(s) start after the current run");
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
     }

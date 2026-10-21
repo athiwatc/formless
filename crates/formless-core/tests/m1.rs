@@ -505,3 +505,28 @@ fn migrating_an_older_database_takes_a_backup_first() {
     let err = Store::open(&db).err().unwrap().to_string();
     assert!(err.contains("newer than this build"), "{err}");
 }
+
+#[test]
+fn queued_messages_survive_reopening_the_store() {
+    let paths = temp_paths("queue");
+    let id = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let s = store.create_session(None).unwrap();
+        store.enqueue_message(&s.id, "first").unwrap();
+        store.enqueue_message(&s.id, "second").unwrap();
+        s.id
+    };
+    // A daemon restart reopens the database.
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(
+        store.list_queued_messages(&id).unwrap(),
+        ["first", "second"]
+    );
+    assert_eq!(
+        store.pop_queued_message(&id).unwrap().as_deref(),
+        Some("first")
+    );
+    assert_eq!(store.list_queued_messages(&id).unwrap(), ["second"]);
+    store.clear_queued_messages(&id).unwrap();
+    assert_eq!(store.pop_queued_message(&id).unwrap(), None);
+}
