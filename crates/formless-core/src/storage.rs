@@ -1874,6 +1874,17 @@ impl Store {
         Ok(())
     }
 
+    /// Summed (prompt, completion, cached) tokens per model.
+    pub fn usage_by_model(&self) -> Result<std::collections::HashMap<String, (i64, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage GROUP BY model",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Summed usage of a Run's provider requests.
     pub fn run_usage(&self, run_id: &str) -> Result<crate::provider::Usage> {
         Ok(self.conn.query_row(

@@ -1206,14 +1206,16 @@
       box.append(h("div", { class: "detail" }, h("h3", null, d.tool.name), metricsBlock(d.metrics)));
     }
     const rt = $("routing-table");
-    rt.replaceChildren(h("thead", null, h("tr", null, ["Model", "Calls", "Success", "Avg latency"].map((c, i) => h("th", { class: i ? "num" : null }, c)))));
+    rt.replaceChildren(h("thead", null, h("tr", null, ["Model", "Calls", "Success", "Avg latency", "Prompt tokens", "Cached"].map((c, i) => h("th", { class: i ? "num" : null }, c)))));
     const body = h("tbody");
-    if (!S.modelStats.length) body.append(h("tr", null, h("td", { class: "empty", colspan: 4 }, "No provider calls measured yet.")));
+    if (!S.modelStats.length) body.append(h("tr", null, h("td", { class: "empty", colspan: 6 }, "No provider calls measured yet.")));
     for (const st of S.modelStats) {
       const n = st.successes + st.failures;
       const r = n ? st.successes / n : null;
       body.append(h("tr", null, h("td", null, st.model), h("td", { class: "num" }, n), h("td", { class: "num" }, rateCell(r)),
-        h("td", { class: "num" }, n ? Math.round(st.total_ms / n) + "ms" : "-")));
+        h("td", { class: "num" }, n ? Math.round(st.total_ms / n) + "ms" : "-"),
+        h("td", { class: "num" }, st.prompt_tokens ? st.prompt_tokens.toLocaleString() : "-"),
+        h("td", { class: "num" }, st.prompt_tokens ? Math.round(100 * st.cached_tokens / st.prompt_tokens) + "%" : "-")));
     }
     rt.append(body);
   }

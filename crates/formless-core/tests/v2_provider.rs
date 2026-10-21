@@ -576,3 +576,23 @@ async fn stream_options_is_dropped_when_rejected() {
     assert_eq!(out.content, "fine");
     assert_eq!(out.usage, None);
 }
+
+#[tokio::test]
+async fn cache_probe_reports_cached_tokens_on_the_repeat() {
+    let body = |cached: u64| {
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"delta": {"content": "ok"}}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 1500, "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": cached}}})
+        )
+    };
+    let base = scripted_sse("/chat/completions", vec![body(0), body(1408)]).await;
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    let u = formless_core::provider::cache_probe(&c, "k", "good")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((u.prompt_tokens, u.cached_tokens), (1500, 1408));
+}

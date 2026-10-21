@@ -1715,3 +1715,63 @@ async fn sessions_keep_their_system_prompt_when_guidance_changes() {
     );
     server.abort();
 }
+
+/// Model stats carry provider-reported token and cache totals.
+#[cfg(unix)]
+#[tokio::test]
+async fn model_stats_include_token_and_cache_totals() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4cachestats");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|| async {
+                format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices": [{"delta": {"content": "ok"}}]}),
+                    json!({"choices": [], "usage": {"prompt_tokens": 200, "completion_tokens": 5,
+                        "prompt_tokens_details": {"cached_tokens": 150}}})
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let sid = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for _ in 0..2 {
+        c.send(Request::SendMessage {
+            session_id: sid.clone(),
+            content: "hi".into(),
+            mode: SendMode::Send,
+        })
+        .await;
+        c.run_to_finish().await;
+    }
+    let stats = c.rpc(Request::ListModelStats).await;
+    let m = &stats[0];
+    assert_eq!(m["model"], "mock-1");
+    assert_eq!(
+        (
+            m["prompt_tokens"].as_i64(),
+            m["cached_tokens"].as_i64(),
+            m["completion_tokens"].as_i64()
+        ),
+        (Some(400), Some(300), Some(10))
+    );
+    server.abort();
+}
