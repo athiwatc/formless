@@ -302,6 +302,54 @@ fn subagent_line(m: &serde_json::Value) -> String {
     format!("  [{role}] {}", truncate_chars(&text, 120))
 }
 
+/// Identifies a rendered streaming prefix without hashing all of it: the
+/// stream only grows (or restarts from empty), so its length plus both
+/// ends tell one prefix from another.
+#[derive(PartialEq)]
+struct StreamKey {
+    len: usize,
+    head: u64,
+    tail: u64,
+    width: usize,
+}
+
+impl StreamKey {
+    fn new(prefix: &str, width: usize) -> Self {
+        use std::hash::{Hash, Hasher};
+        let hash = |bytes: &[u8]| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            h.finish()
+        };
+        let b = prefix.as_bytes();
+        Self {
+            len: b.len(),
+            head: hash(&b[..b.len().min(256)]),
+            tail: hash(&b[b.len().saturating_sub(256)..]),
+            width,
+        }
+    }
+}
+
+/// Byte length of the part of a streaming Markdown answer that is complete:
+/// up to and including its last blank line outside a code fence. Blocks
+/// before it render the same however much more text arrives.
+fn stable_prefix_len(text: &str) -> usize {
+    let mut in_fence = false;
+    let mut stable = 0;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if trimmed.is_empty() && !in_fence && line.ends_with('\n') {
+            stable = offset;
+        }
+    }
+    stable
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     if flat.chars().count() <= max {
@@ -382,17 +430,18 @@ struct App {
     editing_id: Option<String>,
     should_quit: bool,
     /// Rendered Markdown of settled messages, keyed by content and width.
-    md_cache: std::cell::RefCell<HashMap<(u64, usize), Vec<Line<'static>>>>,
+    /// Rendered settled messages by (id, content length, width).
+    md_cache: std::cell::RefCell<HashMap<(String, usize, usize), Vec<Line<'static>>>>,
+    /// The streaming answer's settled prefix: (key, rendered lines).
+    stream_cache: std::cell::RefCell<Option<(StreamKey, Vec<Line<'static>>)>>,
 }
 
 impl App {
-    /// Markdown for a settled message, rendered once per content and width.
-    fn markdown_cached(&self, content: &str, width: usize) -> Vec<Line<'static>> {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        content.hash(&mut h);
-        self.color.hash(&mut h);
-        let key = (h.finish(), width);
+    /// Markdown for a settled message, rendered once per message and width
+    /// (assistant messages never change; reloads clear the cache).
+    fn markdown_cached(&self, m: &MessageInfo, width: usize) -> Vec<Line<'static>> {
+        let content = &m.content;
+        let key = (m.id.clone(), content.len(), width);
         let mut cache = self.md_cache.borrow_mut();
         if let Some(lines) = cache.get(&key) {
             return lines.clone();
@@ -402,6 +451,31 @@ impl App {
         }
         let lines = markdown::render(content, self.color, "  ", width);
         cache.insert(key, lines.clone());
+        lines
+    }
+
+    /// The live answer, rendered incrementally: everything up to its last
+    /// block boundary is rendered once and reused while tokens arrive, so
+    /// each frame only renders the unfinished tail block.
+    fn streaming_markdown(&self, width: usize) -> Vec<Line<'static>> {
+        let text = &self.streaming;
+        let split = stable_prefix_len(text);
+        let (prefix, tail) = text.split_at(split);
+        let key = StreamKey::new(prefix, width);
+        let mut cache = self.stream_cache.borrow_mut();
+        let mut lines = match cache.as_ref() {
+            Some((k, lines)) if *k == key => lines.clone(),
+            _ => {
+                let lines = markdown::render(prefix, self.color, "  ", width);
+                *cache = Some((key, lines.clone()));
+                lines
+            }
+        };
+        if !lines.is_empty() && !tail.is_empty() {
+            // The block gap a single render would put between them.
+            lines.push(Line::default());
+        }
+        lines.extend(markdown::render(tail, self.color, "  ", width));
         lines
     }
 
@@ -465,6 +539,7 @@ impl App {
             editing_id: None,
             should_quit: false,
             md_cache: Default::default(),
+            stream_cache: Default::default(),
         };
         if oauth_login_required {
             app.notes
@@ -668,6 +743,8 @@ impl App {
                             if let Some(msgs) = result.get("messages").cloned() {
                                 if let Ok(v) = serde_json::from_value::<Vec<MessageInfo>>(msgs) {
                                     self.messages = v;
+                                    // Edits arrive as reloads: drop renders of old content.
+                                    self.md_cache.borrow_mut().clear();
                                     self.live_tools.clear();
                                     self.follow_chat_bottom();
                                 }
@@ -2202,7 +2279,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
             }
             _ => {
                 open_group(&mut lines, &mut group, "assistant", when);
-                lines.extend(app.markdown_cached(&m.content, width));
+                lines.extend(app.markdown_cached(m, width));
                 if let Some(meta) = &m.meta {
                     for call in tool_call_lines(meta) {
                         lines.push(Line::styled(
@@ -2276,7 +2353,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     }
     if !app.streaming.is_empty() || app.running() {
         open_group(&mut lines, &mut group, "assistant", None);
-        lines.extend(markdown::render(&app.streaming, app.color, "  ", width));
+        lines.extend(app.streaming_markdown(width));
         if app.streaming.is_empty() {
             lines.push(Line::styled(
                 format!("  {}", app.activity_text().unwrap_or_else(|| "…".into())),
@@ -3453,6 +3530,7 @@ mod tests {
             editing_id: None,
             should_quit: false,
             md_cache: Default::default(),
+            stream_cache: Default::default(),
         }
     }
 
@@ -3759,8 +3837,12 @@ mod tests {
     }
 
     fn msg(role: &str, content: &str) -> MessageInfo {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         MessageInfo {
-            id: "m".into(),
+            id: format!(
+                "m{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ),
             session_id: "s1".into(),
             seq: 1,
             role: role.into(),
@@ -3788,6 +3870,30 @@ mod tests {
         assert!(app.streaming.is_empty() && app.thinking.is_empty());
         delta(&mut app, "step two");
         assert_eq!(app.streaming, "step two");
+    }
+
+    #[test]
+    fn stable_prefix_stops_at_blank_lines_outside_fences() {
+        assert_eq!(stable_prefix_len("one line, no end"), 0);
+        assert_eq!(stable_prefix_len("para\n\nnext"), 6);
+        // A blank line inside an open fence is not a boundary.
+        let fenced = "intro\n\n```rust\nfn a() {}\n\nfn b() {}\n";
+        assert_eq!(stable_prefix_len(fenced), 7);
+        let closed = "```\ncode\n```\n\nafter";
+        assert_eq!(stable_prefix_len(closed), closed.len() - "after".len());
+    }
+
+    #[test]
+    fn incremental_streaming_render_matches_a_full_render() {
+        let doc = "# Title\n\nSome **bold** text and `code`.\n\n- one\n- two\n\n\
+                   1. first\n2. second\n\n```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n\
+                   > quoted\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nThe end.";
+        let mut app = test_app();
+        for cut in (0..=doc.len()).filter(|i| doc.is_char_boundary(*i)) {
+            app.streaming = doc[..cut].to_string();
+            let full = markdown::render(&app.streaming, app.color, "  ", 60);
+            assert_eq!(app.streaming_markdown(60), full, "cut at {cut}");
+        }
     }
 
     #[test]
