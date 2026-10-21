@@ -479,8 +479,11 @@ pattern (§4.4).
 - The daemon carries a **versioned bootstrap system prompt** (frozen in
   v1; v2.1 is a deliberate version bump adding generic-Tool guidance and
   input-bound scopes, §7.4). v2 adds prompt/memory **self-optimisation**: the optimiser
-  proposes one short learned-guidance (kind `prompt`) or memory-note
-  (kind `memory`) addendum from Tool metrics/failure patterns, measures
+  proposes one short learned-guidance addendum (kind `prompt`) from Tool
+  metrics/failure patterns (user preferences belong to user memory,
+  §7.11; memory-kind proposals from older builds, when applied, become
+  memory notes with author `optimiser` and are deleted again on
+  rollback), measures
   it against the current prompt on a fixed eval suite (baseline vs
   candidate scores are stored), and only a measured proposal that beats
   the baseline by the promotion margin can be applied — always by the
@@ -678,6 +681,9 @@ suite cannot measure preferences.
   Memory is never part of Tool or skill bundles, and `formless reset`
   wipes it with the rest of the data.
 - Every change is audit-logged and broadcasts `MemoryUpdated`.
+- Optimiser notes (author `optimiser`, up to 800 characters) come from
+  applied memory-kind proposals (§8). Schema v18 migrated the applied
+  ones, and rolling such a proposal back deletes its note.
 
 ## 8. Metrics and Self-Optimisation
 

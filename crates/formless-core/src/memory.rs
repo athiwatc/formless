@@ -7,6 +7,8 @@ use formless_protocol::MemoryInfo;
 
 /// Longest note, in characters.
 pub const MAX_CHARS: usize = 300;
+/// Longest optimiser note (a migrated proposal, up to 800 characters).
+pub const MAX_OPTIMISER_CHARS: usize = 800;
 
 /// Trimmed text with whitespace collapsed (what is stored).
 pub fn clean(text: &str) -> String {
@@ -20,13 +22,22 @@ pub fn dedup_key(text: &str) -> String {
 
 /// Validate a note and its scope: `global` or `project:<absolute path>`.
 pub fn validate(text: &str, scope: &str) -> Result<()> {
+    validate_len(text, MAX_CHARS)?;
+    validate_scope(scope)
+}
+
+pub(crate) fn validate_len(text: &str, max: usize) -> Result<()> {
     let text = clean(text);
     if text.is_empty() {
         bail!("memory text is empty");
     }
-    if text.chars().count() > MAX_CHARS {
-        bail!("memory text is longer than {MAX_CHARS} characters; keep notes short");
+    if text.chars().count() > max {
+        bail!("memory text is longer than {max} characters; keep notes short");
     }
+    Ok(())
+}
+
+pub(crate) fn validate_scope(scope: &str) -> Result<()> {
     match scope.strip_prefix("project:") {
         _ if scope == "global" => Ok(()),
         Some(path) if path.starts_with('/') || path.contains(":\\") => Ok(()),

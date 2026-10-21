@@ -15,8 +15,8 @@ use crate::storage::{CandidateData, ReplayItem};
 use crate::tools as toolreg;
 
 const PROPOSAL_PROMPT: &str = "You improve the Formless agent's learned guidance. \
-Reply with ONLY a JSON object: {\"kind\": \"prompt\" or \"memory\", \"content\": one short imperative guidance or memory note (max 400 chars), \"rationale\": why the signals justify it}. \
-Propose exactly one concrete, generalisable lesson from the failure signals. \
+Reply with ONLY a JSON object: {\"kind\": \"prompt\", \"content\": one short imperative guidance line (max 400 chars), \"rationale\": why the signals justify it}. \
+Propose exactly one concrete, generalisable lesson from the failure signals. User preferences are not guidance: the agent keeps those in its user memory. \
 No secrets, no user data, no instructions to ignore safety or approvals.";
 
 const OPTIMISER_PROMPT: &str = concat!(
@@ -200,13 +200,8 @@ impl Daemon {
         });
         // Measure: fixed eval suite, baseline vs candidate prompt.
         let baseline_prompt = self.effective_system_prompt();
-        let label = if kind == "memory" {
-            "Learned memory"
-        } else {
-            "Learned guidance"
-        };
         let candidate_prompt = format!(
-            "{baseline_prompt}\n\n{label} (candidate): {}",
+            "{baseline_prompt}\n\nLearned guidance (candidate): {}",
             content.trim()
         );
         let (base_score, total) =
@@ -1056,10 +1051,8 @@ fn parse_proposal(raw: &str) -> Result<(String, String, String)> {
         .rfind('}')
         .ok_or_else(|| anyhow!("proposal is not JSON"))?;
     let v: Value = serde_json::from_str(&raw[start..=end])?;
-    let kind = v["kind"].as_str().unwrap_or("prompt").trim().to_string();
-    if kind != "prompt" && kind != "memory" {
-        return Err(anyhow!("proposal kind must be prompt|memory"));
-    }
+    // Only guidance is generated now; memory lives in the memory store.
+    let kind = "prompt".to_string();
     let content = v["content"]
         .as_str()
         .ok_or_else(|| anyhow!("proposal missing content"))?

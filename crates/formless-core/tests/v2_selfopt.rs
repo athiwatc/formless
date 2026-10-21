@@ -58,8 +58,20 @@ fn proposal_lifecycle_is_measured_and_versioned() {
         .unwrap();
     store.update_proposal_eval(&m.id, 0.83, 1.0, 6).unwrap();
     store.set_proposal_status(&m.id, "applied").unwrap();
+    // Memory proposals become memories (author optimiser), not prompt text.
     let prompt2 = store.effective_system_prompt("BASE").unwrap();
-    assert!(prompt2.contains("Learned memory (v2)"), "{prompt2}");
+    assert!(!prompt2.contains("concise"), "{prompt2}");
+    let mems = store.list_memories().unwrap();
+    assert_eq!(mems.len(), 1);
+    assert_eq!(
+        (mems[0].text.as_str(), mems[0].author.as_str()),
+        ("User prefers concise answers.", "optimiser")
+    );
+    store.set_proposal_status(&m.id, "rolled_back").unwrap();
+    assert!(
+        store.list_memories().unwrap().is_empty(),
+        "rollback removes it"
+    );
 
     // Rollback removes it from the effective prompt; reject measured ones.
     store.set_proposal_status(&p.id, "rolled_back").unwrap();
@@ -105,4 +117,32 @@ fn proposal_apply_requires_margin_win() {
     // The margin is configurable.
     assert!(proposal_beats_baseline(0.5, 0.55, 5));
     assert!(!proposal_beats_baseline(0.5, 0.55, 20));
+}
+
+#[test]
+fn applied_memory_proposals_migrate_into_the_memory_store() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let db = std::path::PathBuf::from(format!("/tmp/fl-memmig-{short}/f.db"));
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    drop(Store::open(&db).unwrap());
+    {
+        // As an older build left it: an applied memory proposal, schema v17.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "INSERT INTO prompt_proposals(id,kind,content,rationale,status,est_tokens,created_at,applied_at)
+               VALUES('p1','memory','Prefers tabs.','x','applied',1,'2026-01-01','2026-01-02');
+             PRAGMA user_version=17;",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db).unwrap();
+    let mems = store.list_memories().unwrap();
+    assert_eq!(mems.len(), 1);
+    assert_eq!(
+        (mems[0].text.as_str(), mems[0].author.as_str()),
+        ("Prefers tabs.", "optimiser")
+    );
+    // Rollback still removes it.
+    store.set_proposal_status("p1", "rolled_back").unwrap();
+    assert!(store.list_memories().unwrap().is_empty());
 }

@@ -856,6 +856,9 @@ impl Daemon {
                 .context("proposal not found or not in an actionable state")?;
                 let _ = self
                     .with_store(|st| st.audit("user", &format!("proposal.{status}"), &p.content));
+                if p.kind == "memory" {
+                    self.broadcast(Event::MemoryUpdated);
+                }
                 self.broadcast(Event::ProposalUpdated {
                     proposal: p.clone(),
                 });
@@ -866,6 +869,9 @@ impl Daemon {
                     .with_store(|st| st.set_proposal_status(&id, "rolled_back"))?
                     .context("proposal not found or not applied")?;
                 let _ = self.with_store(|st| st.audit("user", "proposal.rolled_back", &p.content));
+                if p.kind == "memory" {
+                    self.broadcast(Event::MemoryUpdated);
+                }
                 self.broadcast(Event::ProposalUpdated {
                     proposal: p.clone(),
                 });
