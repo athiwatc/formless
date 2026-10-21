@@ -227,7 +227,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -242,7 +242,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 12] = [
+const MIGRATIONS: [(i64, MigrationStep); 13] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -270,6 +270,7 @@ const MIGRATIONS: [(i64, MigrationStep); 12] = [
         add_column(c, "session_tools", "pinned_version INTEGER")?;
         add_column(c, "session_tools", "pinned_def TEXT")
     }),
+    (13, |c| add_column(c, "sessions", "system_prompt TEXT")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1523,6 +1524,27 @@ impl Store {
     }
 
     /// Tools a Session has loaded: found or created there, or called there.
+    /// The system prompt a Session runs with (snapshot), if taken yet.
+    pub fn session_system_prompt(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT system_prompt FROM sessions WHERE id=?1",
+                params![session_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten())
+    }
+
+    pub fn set_session_system_prompt(&self, session_id: &str, prompt: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET system_prompt=?2 WHERE id=?1",
+            params![session_id, prompt],
+        )?;
+        Ok(())
+    }
+
     /// (version, definition JSON) a Session listed for a Tool, if pinned.
     pub fn pinned_definition(
         &self,

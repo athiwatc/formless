@@ -1831,6 +1831,19 @@ impl Daemon {
         let _ = self.with_store(|st| st.record_model_outcome(model, ok, ms));
     }
 
+    /// The system prompt a Session runs with: snapshotted on its first
+    /// step, so applying or rolling back learned guidance never rewrites a
+    /// running Session's cached prefix (new Sessions, or this one after
+    /// compaction, pick it up).
+    fn session_prompt(&self, session_id: &str) -> Result<String> {
+        if let Some(p) = self.with_store(|st| st.session_system_prompt(session_id))? {
+            return Ok(p);
+        }
+        let p = self.effective_system_prompt();
+        self.with_store(|st| st.set_session_system_prompt(session_id, &p))?;
+        Ok(p)
+    }
+
     pub(crate) fn effective_system_prompt(&self) -> String {
         self.with_store(|st| st.effective_system_prompt(SYSTEM_PROMPT))
             .unwrap_or_else(|_| SYSTEM_PROMPT.to_string())
@@ -2788,7 +2801,7 @@ impl Daemon {
         context_tokens: u32,
         trigger_fraction: f64,
     ) -> Result<crate::storage::BuiltContext> {
-        let prompt = self.effective_system_prompt();
+        let prompt = self.session_prompt(session_id)?;
         let mut cache = self
             .contexts
             .lock()
@@ -2863,8 +2876,19 @@ impl Daemon {
             provider.summarize(&input, &cmodel).await?
         };
         self.with_store(|st| st.save_checkpoint(session_id, &summary, compact_up_to))?;
-        // The cached prefix is rebuilt anyway: list current Tool definitions.
+        // The cached prefix is rebuilt anyway: list current Tool definitions
+        // and adopt the current guidance.
         self.with_store(|st| st.unpin_definitions(session_id, None))?;
+        let current = self.effective_system_prompt();
+        if self.session_prompt(session_id)? != current {
+            self.with_store(|st| st.set_session_system_prompt(session_id, &current))?;
+            let note = "The harness guidance in the system prompt was updated (applied or rolled-back proposals).";
+            let msg = self.with_store(|st| st.append_message(session_id, "system-note", note))?;
+            self.broadcast(Event::MessageAppended {
+                session_id: session_id.to_string(),
+                message: msg,
+            });
+        }
         let preview: String = summary.chars().take(200).collect();
         self.broadcast(Event::CompactionNotice {
             session_id: session_id.to_string(),
