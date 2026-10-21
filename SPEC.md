@@ -778,6 +778,13 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   the system prompt, recent turns, pending handles, and artifact references
   are preserved verbatim. Large outputs are already artifacts (§9.6);
   compaction summarises previews + references, never the only copy.
+- Cache-friendly: the cut is always at a turn boundary (just before a user
+  message, near the middle of the live transcript), so a tool call is never
+  separated from its result; and each compaction summarises only the newly
+  compacted span and **appends** that block to the previous summary, which
+  stays byte-identical at the front of the system message. Only when the
+  accumulated summary exceeds a quarter of the context is it condensed as
+  a whole.
 - Compaction is **visible** (notice in chat; checkpoint shown in Session
   detail) — never silent — and persisted in SQLite so resumed Sessions
   continue exactly.

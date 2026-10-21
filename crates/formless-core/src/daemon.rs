@@ -2867,7 +2867,12 @@ impl Daemon {
                 .map(|(s, _)| s)
                 .unwrap_or_default())
         })?;
-        let input = if previous.is_empty() {
+        // Append, don't rewrite (§11): the earlier summary stays
+        // byte-identical at the front of the system message, so the cached
+        // prefix survives the compaction. Only when the accumulated summary
+        // grows past a quarter of the context is it condensed as a whole.
+        let condense = crate::storage::estimate_tokens(&previous) > context_tokens as usize / 4;
+        let input = if previous.is_empty() || !condense {
             text
         } else {
             format!("Previous summary:\n{previous}\n\n{text}")
@@ -2885,6 +2890,11 @@ impl Daemon {
             }
         } else {
             provider.summarize(&input, &cmodel).await?
+        };
+        let summary = if previous.is_empty() || condense {
+            summary
+        } else {
+            format!("{previous}\n\n{}", summary.trim())
         };
         self.with_store(|st| st.save_checkpoint(session_id, &summary, compact_up_to))?;
         // The cached prefix is rebuilt anyway: list current Tool definitions

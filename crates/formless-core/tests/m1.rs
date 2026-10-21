@@ -654,3 +654,44 @@ fn real_prompt_size_drives_compaction_until_the_next_checkpoint() {
     store.save_checkpoint(&s.id, "summary", up_to).unwrap();
     assert_eq!(store.last_prompt_tokens(&s.id).unwrap(), None);
 }
+
+#[test]
+fn compaction_cuts_only_at_turn_boundaries() {
+    use formless_core::storage::ContextCache;
+    let paths = temp_paths("turncut");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap();
+    let big = "x".repeat(400);
+    let mut user_seqs = Vec::new();
+    for turn in 0..4 {
+        user_seqs.push(
+            store
+                .append_message(&s.id, "user", &format!("q{turn} {big}"))
+                .unwrap()
+                .seq,
+        );
+        let calls = serde_json::json!({"tool_calls": [{"id": format!("c{turn}"), "type": "function",
+            "function": {"name": "t", "arguments": "{}"}}]});
+        store
+            .append_message_meta(&s.id, "assistant", "", Some(calls.to_string()))
+            .unwrap();
+        store
+            .append_message_meta(
+                &s.id,
+                "tool",
+                &big,
+                Some(serde_json::json!({"tool_call_id": format!("c{turn}")}).to_string()),
+            )
+            .unwrap();
+        store.append_message(&s.id, "assistant", &big).unwrap();
+    }
+    let (_, needs, cut) = ContextCache::default()
+        .build(&store, &s.id, "sys", 500, 0.8)
+        .unwrap();
+    assert!(needs);
+    // The cut is the last message of a turn: the next one is a user turn.
+    assert!(
+        user_seqs.contains(&(cut + 1)),
+        "cut at {cut}, turns start at {user_seqs:?}"
+    );
+}

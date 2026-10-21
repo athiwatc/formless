@@ -2201,6 +2201,8 @@ pub struct ContextCache {
     tokens: Vec<usize>,
     /// Seqs of the post-checkpoint messages, in order.
     live_seqs: Vec<i64>,
+    /// Indexes into `live_seqs` where a user message starts a turn.
+    turn_starts: Vec<usize>,
 }
 
 impl ContextCache {
@@ -2215,13 +2217,12 @@ impl ContextCache {
         trigger_fraction: f64,
     ) -> BuiltContext {
         let (ctx, needs, up_to) = built;
-        let live = &self.live_seqs;
         let over = known_prompt_tokens
             .is_some_and(|n| n as f64 > context_tokens as f64 * trigger_fraction);
-        if needs || !over || live.len() <= 4 {
-            return (ctx, needs, up_to);
+        match self.turn_cut() {
+            Some(cut) if over && !needs => (ctx, true, cut),
+            _ => (ctx, needs, up_to),
         }
-        (ctx, true, live[live.len() / 2])
     }
 
     pub fn build(
@@ -2255,6 +2256,9 @@ impl ContextCache {
         }
         let after = self.live_seqs.last().copied().unwrap_or(up_to);
         for m in store.list_messages_after(session_id, after)? {
+            if m.role == "user" {
+                self.turn_starts.push(self.live_seqs.len());
+            }
             self.live_seqs.push(m.seq);
             let msg = provider_message(&m);
             // A harness note right after a user message joins it, so strictly
@@ -2274,10 +2278,31 @@ impl ContextCache {
             self.push(msg);
         }
         let tokens: usize = self.tokens.iter().sum();
-        let live = &self.live_seqs;
-        let needs = (tokens as f64) > (context_tokens as f64 * trigger_fraction) && live.len() > 4;
-        let compact_up_to = if needs { live[live.len() / 2] } else { up_to };
+        let over = (tokens as f64) > (context_tokens as f64 * trigger_fraction);
+        let (needs, compact_up_to) = match self.turn_cut() {
+            Some(cut) if over => (true, cut),
+            _ => (false, up_to),
+        };
         Ok((self.ctx.clone(), needs, compact_up_to))
+    }
+
+    /// Where to compact: the end of a whole turn (just before a user
+    /// message), near the middle of the live messages. Cutting at turn
+    /// boundaries never splits a tool call from its result and keeps the
+    /// cut points stable between compactions. None while too short.
+    fn turn_cut(&self) -> Option<i64> {
+        let live = &self.live_seqs;
+        if live.len() <= 4 {
+            return None;
+        }
+        let mid = live.len() / 2;
+        let start = self
+            .turn_starts
+            .iter()
+            .rev()
+            .find(|&&i| i > 0 && i <= mid)
+            .or_else(|| self.turn_starts.iter().find(|&&i| i > mid))?;
+        Some(live[start - 1])
     }
 
     fn push(&mut self, msg: Value) {

@@ -1775,3 +1775,70 @@ async fn model_stats_include_token_and_cache_totals() {
     );
     server.abort();
 }
+
+/// Compaction appends to the earlier summary instead of rewriting it, so
+/// the cached prefix through the old summary stays byte-identical.
+#[cfg(unix)]
+#[tokio::test]
+async fn compaction_appends_to_the_previous_summary() {
+    use axum::{
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4append");
+    let sid = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let s = store.create_session(None).unwrap();
+        let first = store.append_message(&s.id, "user", "early").unwrap();
+        store
+            .save_checkpoint(&s.id, "OLD-SUMMARY", first.seq)
+            .unwrap();
+        for i in 0..6 {
+            store
+                .append_message(&s.id, "user", &format!("q{i} {}", "x".repeat(600)))
+                .unwrap();
+            store
+                .append_message(&s.id, "assistant", &"y".repeat(600))
+                .unwrap();
+        }
+        s.id
+    };
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                if body["stream"] == json!(false) {
+                    // The summariser sees only the new span, not the old summary.
+                    let input = body["messages"][1]["content"].as_str().unwrap_or_default();
+                    assert!(!input.contains("OLD-SUMMARY"), "{input}");
+                    return Json(json!({"choices": [{"message": {"content": "NEW-BLOCK"}}]}))
+                        .into_response();
+                }
+                sse_text("ok").into_response()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 2000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    c.run_to_finish().await;
+    let store = Store::open(&paths.db_file()).unwrap();
+    let (summary, _) = store.latest_checkpoint(&sid).unwrap().unwrap();
+    assert_eq!(summary, "OLD-SUMMARY\n\nNEW-BLOCK");
+    server.abort();
+}
