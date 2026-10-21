@@ -614,6 +614,11 @@ Tools fill capability gaps; skills say how to use them well.
   built-in `load_skill(name)` (recorded as a load, for metrics), extra
   files with `read_skill_file(name, path)` (confined to the skill's
   folder); `find_tools` also lists matching skills.
+- **Scripts never run on the host.** Bundled scripts are flagged at
+  install and review, and `load_skill` lists them with a note: to use one,
+  the agent reads it and ports it to a Tool with `create_tool` (sandboxed,
+  approval applies), or creates a Tool that runs it via `process.run` with
+  a `process:` capability the user approves.
 - **Management** goes through the daemon: `ListSkills`, `AddSkill`,
   `RemoveSkill`, `SetSkillEnabled`, `GetSkill`, the `SkillsChanged` event;
   CLI `formless skills add|remove|list|enable|disable|show`; TUI `/skills`

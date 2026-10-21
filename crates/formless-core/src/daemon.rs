@@ -476,7 +476,9 @@ impl Daemon {
                 let dir = self.with_reader(|st| crate::skills::current_dir(st, &name))?;
                 let text = std::fs::read_to_string(dir.join("SKILL.md"))?;
                 let body = crate::skills::parse_skill_md(&text)?.body;
-                Ok(json!({"skill": info, "body": body, "files": crate::skills::files(&dir)?}))
+                let files = crate::skills::files(&dir)?;
+                let scripts = crate::skills::scripts(&files);
+                Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
             }
             Request::ListMcpPrompts => {
                 let cfg = self.config()?;
@@ -2488,13 +2490,18 @@ impl Daemon {
             .filter(|f| f != "SKILL.md")
             .collect();
         let _ = self.with_store(|st| st.record_skill_load(name, session_id, run_id));
-        Ok(json!({
+        let mut out = json!({
             "name": skill.name,
             "version": skill.version,
             "instructions": body,
             "files": files,
-        })
-        .to_string())
+        });
+        let scripts = crate::skills::scripts(&files);
+        if !scripts.is_empty() {
+            out["scripts"] = json!(scripts);
+            out["scripts_note"] = json!(crate::skills::SCRIPTS_NOTE);
+        }
+        Ok(out.to_string())
     }
 
     fn read_skill_file_impl(&self, args: &Value) -> Result<String> {
