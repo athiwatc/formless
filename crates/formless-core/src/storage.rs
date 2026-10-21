@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use formless_protocol::{
-    MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, ToolInfo, ToolMetricsInfo,
-    ToolVersionInfo,
+    MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo, ToolInfo,
+    ToolMetricsInfo, ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection};
@@ -174,6 +174,20 @@ CREATE TABLE IF NOT EXISTS pending_handles (
   created_at TEXT NOT NULL);
 ";
 
+const SCHEMA_V10: &str = "
+CREATE TABLE IF NOT EXISTS subagents (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL, task TEXT NOT NULL, depth INTEGER NOT NULL,
+  status TEXT NOT NULL, steps INTEGER NOT NULL DEFAULT 0, result TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_subagents_session ON subagents(session_id, created_at);
+CREATE TABLE IF NOT EXISTS subagent_messages (
+  subagent_id TEXT NOT NULL REFERENCES subagents(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL, message TEXT NOT NULL,
+  PRIMARY KEY (subagent_id, seq));
+";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -197,7 +211,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -212,7 +226,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 9] = [
+const MIGRATIONS: [(i64, MigrationStep); 10] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -234,6 +248,7 @@ const MIGRATIONS: [(i64, MigrationStep); 9] = [
     (7, |c| Ok(c.execute_batch(SCHEMA_V7)?)),
     (8, |c| Ok(c.execute_batch(SCHEMA_V8)?)),
     (9, |c| Ok(c.execute_batch(SCHEMA_V9)?)),
+    (10, |c| Ok(c.execute_batch(SCHEMA_V10)?)),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -622,6 +637,96 @@ impl Store {
         )?;
         Ok(())
     }
+    pub fn create_subagent(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        task: &str,
+        depth: u32,
+    ) -> Result<SubagentInfo> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let t = now();
+        self.conn.execute(
+            "INSERT INTO subagents(id,session_id,run_id,task,depth,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'running',?6,?6)",
+            params![id, session_id, run_id, task, depth, t],
+        )?;
+        self.get_subagent(&id)?.context("sub-agent vanished")
+    }
+
+    fn row_subagent(r: &rusqlite::Row) -> rusqlite::Result<SubagentInfo> {
+        Ok(SubagentInfo {
+            id: r.get("id")?,
+            session_id: r.get("session_id")?,
+            run_id: r.get("run_id")?,
+            task: r.get("task")?,
+            depth: r.get("depth")?,
+            status: r.get("status")?,
+            steps: r.get("steps")?,
+            result: r.get("result")?,
+            created_at: r.get("created_at")?,
+            updated_at: r.get("updated_at")?,
+        })
+    }
+
+    pub fn get_subagent(&self, id: &str) -> Result<Option<SubagentInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM subagents WHERE id=?1",
+                params![id],
+                Self::row_subagent,
+            )
+            .ok())
+    }
+
+    pub fn list_subagents(&self, session_id: &str) -> Result<Vec<SubagentInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM subagents WHERE session_id=?1 ORDER BY created_at, rowid")?;
+        let rows = stmt
+            .query_map(params![session_id], Self::row_subagent)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Append one provider-shaped message to a sub-agent's transcript.
+    pub fn append_subagent_message(&self, subagent_id: &str, message: &Value) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO subagent_messages(subagent_id,seq,message) VALUES(?1,(SELECT COALESCE(MAX(seq),0)+1 FROM subagent_messages WHERE subagent_id=?1),?2)",
+            params![subagent_id, message.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn subagent_messages(&self, subagent_id: &str) -> Result<Vec<Value>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT message FROM subagent_messages WHERE subagent_id=?1 ORDER BY seq")?;
+        let rows = stmt
+            .query_map(params![subagent_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .iter()
+            .filter_map(|m| serde_json::from_str(m).ok())
+            .collect())
+    }
+
+    pub fn set_subagent_steps(&self, id: &str, steps: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE subagents SET steps=?2, updated_at=?3 WHERE id=?1",
+            params![id, steps, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_subagent(&self, id: &str, status: &str, result: &str) -> Result<SubagentInfo> {
+        self.conn.execute(
+            "UPDATE subagents SET status=?2, result=?3, updated_at=?4 WHERE id=?1",
+            params![id, status, result, now()],
+        )?;
+        self.get_subagent(id)?.context("sub-agent vanished")
+    }
+
     /// Record a Pending Invocation handle the agent was given (§6.2), so it
     /// can still be answered after a daemon restart.
     pub fn add_pending_handle(&self, handle: &str, session_id: &str, tool: &str) -> Result<()> {
@@ -771,6 +876,10 @@ impl Store {
         let _ = self.conn.execute(
             "UPDATE invocations SET status='interrupted', tag='interrupted' WHERE status='running'",
             [],
+        );
+        let _ = self.conn.execute(
+            "UPDATE subagents SET status='interrupted', updated_at=?1 WHERE status='running'",
+            params![now()],
         );
         Ok(self.conn.execute(
             "UPDATE runs SET status='interrupted', updated_at=?1 WHERE status='running'",

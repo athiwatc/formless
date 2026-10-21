@@ -1342,3 +1342,120 @@ async fn stalled_invocation_is_flagged_and_can_be_cancelled_alone() {
     assert!(answer.contains("interrupted"), "{answer}");
     server.abort();
 }
+
+/// agents.run is visible: lifecycle events while it works, and its
+/// transcript is stored and can be fetched afterwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn subagents_emit_events_and_keep_a_transcript() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4sub");
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        store
+            .create_tool_version(
+                "delegator",
+                "hands work to a sub-agent",
+                r#"{"type":"object","properties":{}}"#,
+                r#"{"type":"string"}"#,
+                "function run(i){ return agents.run('count the files'); }",
+                &Capabilities::parse(&["agent".to_string()]).unwrap(),
+                256,
+                "agent",
+            )
+            .unwrap();
+    }
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                if msgs[0]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Formless sub-agent")
+                {
+                    return sse_text("there are 3 files");
+                }
+                match msgs.iter().find(|m| m["role"] == "tool") {
+                    None => sse_tool("c1", "delegator", json!({})),
+                    Some(_) => sse_text("delegated"),
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut seen = Vec::new();
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(20), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) else {
+            continue;
+        };
+        match ev {
+            Event::ApprovalRequested { approval_id, .. } => {
+                c.send(Request::ApprovalDecision {
+                    approval_id,
+                    approved: true,
+                    scope: formless_protocol::ApprovalScope::Once,
+                })
+                .await;
+            }
+            Event::SubagentStarted { subagent, .. } => {
+                assert_eq!(subagent.task, "count the files");
+                assert_eq!(subagent.depth, 1);
+                seen.push("started".to_string());
+            }
+            Event::SubagentStep {
+                step, tool_calls, ..
+            } => seen.push(format!("step {step} {tool_calls:?}")),
+            Event::SubagentFinished { subagent, .. } => {
+                assert_eq!(subagent.result.as_deref(), Some("there are 3 files"));
+                seen.push(subagent.status);
+            }
+            Event::RunFinished { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(seen, ["started", "step 1 []", "completed"]);
+    let list = c
+        .rpc(Request::ListSubagents {
+            session_id: sid.clone(),
+        })
+        .await;
+    let id = list[0]["id"].as_str().unwrap().to_string();
+    let got = c.rpc(Request::GetSubagent { id }).await;
+    let roles: Vec<&str> = got["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["system", "user", "assistant"]);
+    assert_eq!(got["subagent"]["steps"], 1);
+    server.abort();
+}

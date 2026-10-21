@@ -456,6 +456,11 @@ pattern (§4.4).
   main agent's. Nesting is bounded by `tools.max_agent_depth` (default 1):
   `agents.run` is refused inside a sub-agent at that depth, however its
   Tools are composed.
+- Sub-agents are visible: each gets an id, `SubagentStarted`,
+  `SubagentStep {step, tool_calls}` and `SubagentFinished` events stream to
+  clients while it works, and its transcript is stored apart from the
+  Session's (`ListSubagents`, `GetSubagent`; `/agents` in the clients). A
+  daemon restart marks a running sub-agent `interrupted`.
 
 ### 7.7 Bootstrap system prompt
 

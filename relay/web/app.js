@@ -89,6 +89,7 @@
     editMessageId: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
     pending: new Map(),
+    subagents: [], // last /agents listing
   };
 
   // --------------------------------------------------------------- crypto
@@ -1424,7 +1425,7 @@
     if (S.view === "settings") renderSettings();
   }
 
-  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /cancel /resend /resume /abandon /help";
+  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /cancel /resend /resume /abandon /agents /help";
   async function slash(cmd) {
     const [name, ...rest] = cmd.split(/\s+/);
     const arg = rest.join(" ");
@@ -1441,6 +1442,23 @@
       case "propose": act({ type: "generate_proposal" }); return note("generating a measured proposal…");
       case "thinking": setThinking(!S.showThinking); return note("thinking display " + (S.showThinking ? "on" : "off"));
       case "stop": return stop();
+      case "agents": {
+        if (!S.current) return;
+        if (!arg) {
+          S.subagents = (await act({ type: "list_subagents", session_id: S.current })) || [];
+          if (!S.subagents.length) return note("no sub-agents in this session");
+          S.subagents.forEach((a, i) => note("#" + (i + 1) + " " + a.status + " · " + a.steps + " step(s) · " + truncate(a.task, 70)));
+          return note("/agents <n> shows that sub-agent's transcript");
+        }
+        const a = (S.subagents || [])[Number(arg) - 1];
+        if (!a) return note("usage: /agents to list, then /agents <n>", true);
+        const r = await act({ type: "get_subagent", id: a.id });
+        for (const m of (r && r.messages) || []) {
+          const text = m.tool_calls ? "calls " + m.tool_calls.map((c) => c.function.name).join(", ") : String(m.content || "");
+          note("[" + m.role + "] " + truncate(text.replace(/\n/g, " "), 120));
+        }
+        return;
+      }
       case "cancel": {
         const t = [...S.liveTools].reverse().find((x) => x.status === "running" && x.handle);
         return cancelTool(t && t.handle);
@@ -1646,6 +1664,15 @@
         }
         break;
       }
+      case "subagent_started":
+        if (here) note("sub-agent started: " + truncate(ev.subagent.task, 80));
+        break;
+      case "subagent_step":
+        if (here && isRunning()) setActivity("sub-agent step " + ev.step + ": " + (ev.tool_calls.length ? ev.tool_calls.join(", ") : "answering"));
+        break;
+      case "subagent_finished":
+        if (here) note("sub-agent " + ev.subagent.status + " after " + ev.subagent.steps + " step(s) · /agents to inspect", ev.subagent.status !== "completed");
+        break;
       case "invocation_activity":
         for (const t of S.liveTools) if (t.handle === ev.handle) t.stalledSecs = null;
         if (here) renderLive();

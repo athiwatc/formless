@@ -110,6 +110,23 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// A sub-agent started by `agents.run` (its transcript is stored apart
+/// from the Session's). Status: running | completed | failed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubagentInfo {
+    pub id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub task: String,
+    /// Sub-agent nesting (1 = started by the main agent).
+    pub depth: u32,
+    pub status: String,
+    pub steps: i64,
+    pub result: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// A versioned prompt/memory self-optimisation proposal (v2). Status:
 /// proposed -> measured -> applied | rejected | rolled_back.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -217,6 +234,13 @@ pub enum Request {
     /// Give up on a Session's interrupted or paused Run.
     AbandonRun {
         session_id: String,
+    },
+    ListSubagents {
+        session_id: String,
+    },
+    /// A sub-agent and its transcript (provider-shaped messages).
+    GetSubagent {
+        id: String,
     },
     /// Stop one running Tool Invocation without interrupting its Run (it is
     /// recorded as user-cancelled, and the agent gets the error result).
@@ -447,6 +471,22 @@ pub enum Event {
         tool_name: String,
         silent_secs: u64,
     },
+    SubagentStarted {
+        session_id: String,
+        subagent: SubagentInfo,
+    },
+    /// A sub-agent finished a model step; `tool_calls` names the Tools it
+    /// is calling next (empty on its final answer).
+    SubagentStep {
+        session_id: String,
+        subagent_id: String,
+        step: i64,
+        tool_calls: Vec<String>,
+    },
+    SubagentFinished {
+        session_id: String,
+        subagent: SubagentInfo,
+    },
     /// A stalled Invocation is active again (clears the stall flag).
     InvocationActivity {
         session_id: String,
@@ -486,7 +526,10 @@ impl Event {
             | Event::InvocationPending { session_id, .. }
             | Event::InvocationCompleted { session_id, .. }
             | Event::InvocationStalled { session_id, .. }
-            | Event::InvocationActivity { session_id, .. } => Some(session_id),
+            | Event::InvocationActivity { session_id, .. }
+            | Event::SubagentStarted { session_id, .. }
+            | Event::SubagentStep { session_id, .. }
+            | Event::SubagentFinished { session_id, .. } => Some(session_id),
             Event::Note { session_id, .. } => session_id.as_deref(),
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
