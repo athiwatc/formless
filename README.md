@@ -510,7 +510,7 @@ The loop:
 
 Only the primary metric triggers; the rest inform the optimiser's context.
 
-**Prompt and memory (v2).** The optimiser can also propose one short guidance or memory addendum to the system prompt. Each proposal is scored against the current prompt on a fixed eval suite and can be applied only if it wins by the same promotion margin, and only by the user (`formless prompts`, TUI `/proposals`). Applied addenda are versioned and roll back individually; the bootstrap prompt itself is never edited.
+**Prompt and memory (v2).** The optimiser can also propose one short guidance or memory addendum to the system prompt. Each proposal is scored against the current prompt on scenario evals that check the agent's actual tool calls (search before create, least-privilege caps, streaming, …), run several times. It can be applied only if it wins by the same promotion margin with statistical significance, and only by the user (`formless prompts`, TUI `/proposals`). Applied addenda are versioned and roll back individually; the bootstrap prompt itself is never edited.
 
 ---
 

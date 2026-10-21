@@ -342,6 +342,8 @@ pub struct OptimiserCfg {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub token_budget: Option<u64>,
+    /// Times each prompt-eval scenario runs per arm (SPEC §8.6).
+    pub eval_repeats: u32,
 }
 impl Default for OptimiserCfg {
     fn default() -> Self {
@@ -353,6 +355,7 @@ impl Default for OptimiserCfg {
             model: None,
             reasoning_effort: None,
             token_budget: None,
+            eval_repeats: 3,
         }
     }
 }

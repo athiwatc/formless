@@ -3,7 +3,7 @@
 //! session spread flags Tools that look project-specific.
 
 use formless_core::daemon::Daemon;
-use formless_core::optimiser::{is_narrow, prompt_eval_cases};
+use formless_core::optimiser::{is_narrow, scenario_cases};
 use formless_core::provider::SYSTEM_PROMPT;
 use formless_core::storage::Store;
 use formless_core::{Config, Paths};
@@ -140,7 +140,5 @@ async fn unbindable_input_is_a_validation_failure() {
 fn prompt_and_evals_push_generic_tools() {
     assert!(SYSTEM_PROMPT.contains("Make Tools generic"));
     assert!(SYSTEM_PROMPT.contains("fs:read:$input.path"));
-    assert!(prompt_eval_cases()
-        .iter()
-        .any(|c| c.name == "generic_tools"));
+    assert!(scenario_cases().iter().any(|c| c.name == "generic_tools"));
 }
