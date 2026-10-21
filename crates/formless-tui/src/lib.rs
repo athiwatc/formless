@@ -3113,6 +3113,31 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                         ]));
                     }
                 }
+                let current = d
+                    .versions
+                    .iter()
+                    .position(|v| v.version == d.tool.current_version);
+                if let Some(i) = current.filter(|i| *i > 0) {
+                    // What the current version changed (optimiser or agent edit).
+                    let (prev, cur) = (&d.versions[i - 1], &d.versions[i]);
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(
+                        format!("Changes v{} → v{}", prev.version, cur.version),
+                        bold_fg(app.color, Color::Cyan),
+                    ));
+                    for l in formless_core::diff::version_diff(prev, cur)
+                        .lines()
+                        .take(40)
+                    {
+                        let style = match l.chars().next() {
+                            Some('+') => fg(app.color, Color::Green),
+                            Some('-') => fg(app.color, Color::Red),
+                            Some('@') => ui::dim(app.color),
+                            _ => Style::default(),
+                        };
+                        lines.push(Line::styled(format!("  {l}"), style));
+                    }
+                }
                 if let Some(cur) = d
                     .versions
                     .iter()

@@ -1074,3 +1074,36 @@ async fn agent_reads_its_own_artifacts_by_id() {
     let denied = call(theirs, json!({"id": id})).await;
     assert!(denied.contains("no artifact"), "{denied}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_tool_and_protocol_return_version_diffs() {
+    let paths = temp_paths("tooldiff");
+    Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    seed(&store, "adder", "adds", "function run(i){ return 1; }", &[]);
+    seed(&store, "adder", "adds", "function run(i){ return 2; }", &[]);
+    let id = store.get_tool_by_name("adder").unwrap().unwrap().0.id;
+    let session = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let read: Value = serde_json::from_str(
+        &daemon
+            .call_tool_direct(
+                &session,
+                "read_tool",
+                json!({"name": "adder", "diff_from": 1}),
+            )
+            .await,
+    )
+    .unwrap();
+    let diff = read["diff"].as_str().unwrap();
+    assert!(
+        diff.contains("- function run(i){ return 1; }")
+            && diff.contains("+ function run(i){ return 2; }"),
+        "{diff}"
+    );
+    let r = daemon
+        .handle(formless_protocol::Request::DiffToolVersions { id, from: 1, to: 2 })
+        .await
+        .unwrap();
+    assert_eq!(r["diff"], diff);
+}

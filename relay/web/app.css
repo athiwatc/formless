@@ -363,3 +363,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* Tool version diffs */
+.diff { margin: 0; padding: 8px; overflow-x: auto; font: 12px/1.4 var(--mono); background: var(--code-bg); }
+.diff .add { color: var(--accent); }
+.diff .del { color: var(--err); }

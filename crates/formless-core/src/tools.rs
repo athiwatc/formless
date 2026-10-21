@@ -301,7 +301,8 @@ fn read_tool_definition() -> Value {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "version": {"type": "integer", "description": "Optional; defaults to the current version"}
+                    "version": {"type": "integer", "description": "Optional; defaults to the current version"},
+                    "diff_from": {"type": "integer", "description": "Optional: also return what changed from this version to the one read"}
                 },
                 "required": ["name"]
             }

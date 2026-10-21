@@ -402,6 +402,17 @@ impl Daemon {
             }
             // Only meaningful per connection (see `handle_conn`).
             Request::Subscribe { .. } => Err(anyhow!("subscribe applies to a client connection")),
+            Request::DiffToolVersions { id, from, to } => {
+                let d = self
+                    .with_reader(|st| st.tool_detail(&id))?
+                    .context("tool not found")?;
+                let find = |v: i64| d.versions.iter().find(|x| x.version == v);
+                let (a, b) = (
+                    find(from).with_context(|| format!("no version {from}"))?,
+                    find(to).with_context(|| format!("no version {to}"))?,
+                );
+                Ok(json!({"diff": crate::diff::version_diff(a, b)}))
+            }
             Request::ListSubagents { session_id } => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_subagents(&session_id))?,
             )?),
@@ -2338,6 +2349,13 @@ impl Daemon {
             "version": ver.version,
             "current_version": info.current_version,
             "upgraded": upgraded,
+            "diff": args["diff_from"].as_i64().and_then(|from| {
+                detail
+                    .versions
+                    .iter()
+                    .find(|v| v.version == from)
+                    .map(|old| crate::diff::version_diff(old, ver))
+            }),
             "versions": detail.versions.iter().map(|v| json!({"version": v.version, "author": v.author, "created_at": v.created_at})).collect::<Vec<_>>(),
             "input_schema": parse(&ver.input_schema),
             "output_schema": parse(&ver.output_schema),
