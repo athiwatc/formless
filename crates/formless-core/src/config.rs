@@ -377,6 +377,8 @@ pub struct OptimiserCfg {
     pub token_budget: Option<u64>,
     /// Times each prompt-eval scenario runs per arm (SPEC §8.6).
     pub eval_repeats: u32,
+    /// How often the optimiser checks triggers and its queue.
+    pub scan_interval_secs: u64,
 }
 impl Default for OptimiserCfg {
     fn default() -> Self {
@@ -389,6 +391,7 @@ impl Default for OptimiserCfg {
             reasoning_effort: None,
             token_budget: None,
             eval_repeats: 3,
+            scan_interval_secs: 10,
         }
     }
 }
@@ -440,6 +443,30 @@ pub struct ToolsCfg {
     /// One optimiser replay Invocation is stopped after this long.
     #[serde(default = "default_replay_timeout_secs")]
     pub replay_timeout_secs: u64,
+    /// How deep `tools.call` composition may nest (a cycle guard).
+    #[serde(default = "default_max_tool_depth")]
+    pub max_tool_depth: usize,
+    /// Longest single `sleep(ms)` inside a Tool, in seconds.
+    #[serde(default = "default_max_sleep_secs")]
+    pub max_sleep_secs: u64,
+    /// Largest `randomBytes(n)` a Tool may ask for.
+    #[serde(default = "default_max_random_bytes")]
+    pub max_random_bytes: usize,
+    /// Most results one `find_tools` call may return.
+    #[serde(default = "default_find_tools_max")]
+    pub find_tools_max: usize,
+}
+fn default_max_tool_depth() -> usize {
+    8
+}
+fn default_max_sleep_secs() -> u64 {
+    60
+}
+fn default_max_random_bytes() -> usize {
+    1 << 20
+}
+fn default_find_tools_max() -> usize {
+    25
 }
 fn default_smoke_timeout_secs() -> u64 {
     10
@@ -468,6 +495,10 @@ impl Default for ToolsCfg {
             max_agent_depth: 1,
             smoke_timeout_secs: default_smoke_timeout_secs(),
             replay_timeout_secs: default_replay_timeout_secs(),
+            max_tool_depth: default_max_tool_depth(),
+            max_sleep_secs: default_max_sleep_secs(),
+            max_random_bytes: default_max_random_bytes(),
+            find_tools_max: default_find_tools_max(),
         }
     }
 }

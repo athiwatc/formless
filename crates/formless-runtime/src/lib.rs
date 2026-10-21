@@ -78,6 +78,16 @@ pub trait HostOps: Send + Sync {
     }
 }
 
+/// Process-wide sandbox limits the daemon sets from its config.
+static MAX_SLEEP_MS: AtomicU64 = AtomicU64::new(60_000);
+static MAX_RANDOM_BYTES: AtomicU64 = AtomicU64::new(1 << 20);
+
+/// Set the longest `sleep` and the largest `randomBytes` a Tool may use.
+pub fn set_limits(max_sleep_ms: u64, max_random_bytes: u64) {
+    MAX_SLEEP_MS.store(max_sleep_ms, Ordering::Relaxed);
+    MAX_RANDOM_BYTES.store(max_random_bytes, Ordering::Relaxed);
+}
+
 pub struct NoHostOps;
 impl HostOps for NoHostOps {}
 
@@ -573,7 +583,10 @@ impl State {
                 Ok(Value::Null)
             }
             "sleep" => {
-                let ms = a["ms"].as_u64().unwrap_or(0).min(60_000);
+                let ms = a["ms"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(MAX_SLEEP_MS.load(Ordering::Relaxed));
                 if self.sleep_cancellable(std::time::Duration::from_millis(ms)) {
                     Ok(Value::Null)
                 } else {
@@ -582,7 +595,10 @@ impl State {
             }
             "crypto_random" => Ok(json!(uuid::Uuid::new_v4().to_string())),
             "random_bytes" => {
-                let n = a["n"].as_u64().unwrap_or(0).min(1 << 20) as usize;
+                let n = a["n"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(MAX_RANDOM_BYTES.load(Ordering::Relaxed)) as usize;
                 Ok(encode(&random_bytes(n), Enc::Base64))
             }
             "emit" => {

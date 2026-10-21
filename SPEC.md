@@ -1325,6 +1325,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `daemon.stall_warning_secs` | 300 | Silence before `possibly stalled` flag (§6.1) |
 | `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
 | `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
+| `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
 | `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |
@@ -1344,6 +1345,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `provider.routing_models` | [] | Candidates for `model="auto"` measured routing |
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |
+| `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
 | `tools.pending_threshold_secs` | 300 | Soft async handoff threshold (§6.2) |
 | `tools.default_memory_mb` | 256 | Default per-Invocation heap (§7.4) |
 | `tools.max_memory_mb` | 4096 | Daemon bound on declared memory (§7.4) |
@@ -1352,6 +1354,12 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tools.search` | `bm25` | `find_tools` ranking: BM25 over names, descriptions and input fields with stemming and synonyms, or `keyword` |
 | `tools.inline_limit` | 40 | Tools listed in a Session's frozen first-step listing; others load via `find_tools` (§7.1) |
 | `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |
+| `tools.max_tool_depth` | 8 | How deep `tools.call` composition may nest (cycle guard, §7.6) |
+| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
+| `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
+| `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
+| `tools.smoke_timeout_secs` | 10 | Creation smoke-test bound (§7.1) |
+| `tools.replay_timeout_secs` | 60 | Optimiser replay bound per Invocation (§8.4) |
 | `metrics.success_window` | 100 | Rolling window for success rate (§8.3) |
 | `metrics.trigger_min_invocations` | 20 | Minimum sample before trigger (§8.3) |
 | `metrics.trigger_success_below` | 0.90 | Trigger threshold (§8.3) |
@@ -1362,6 +1370,11 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `optimiser.promotion_margin_points` | 10 | Replay win required (§8.5) |
 | `optimiser.model` / `reasoning_effort` | (session) | Optional separate optimiser model (§8.3) |
 | `optimiser.token_budget` | (none) | Optional daemon optimisation budget (§8.3) |
+| `optimiser.eval_repeats` | 3 | Runs per prompt-eval scenario per arm (§8.6) |
+| `optimiser.scan_interval_secs` | 10 | How often triggers and the queue are checked (§8.3) |
+| `skills.auto_create` / `min_tool_calls` / `model` | true / 5 / (session) | Automatic skills (§7.10) |
+| `skills.auto_retire_days` / `min_success_rate` / `min_runs_for_rate` | 30 / 0.5 / 5 | Auto-skill retirement (§7.10) |
+| `[[hooks]]` | (none) | pre_tool / post_tool / run_end hooks (§9.8) |
 | `compaction.model` | (session) | Optional separate compaction model (§11) |
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
 | `tui.queue_key` | Ctrl+Enter | Queue-vs-steer binding (§10.5) |

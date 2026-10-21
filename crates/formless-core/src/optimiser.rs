@@ -41,7 +41,9 @@ impl Daemon {
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    self.config().map(|c| c.optimiser.scan_interval_secs).unwrap_or(10).max(1),
+                )) => {}
             }
             let Ok(cfg) = self.config() else {
                 continue;
@@ -802,8 +804,9 @@ impl Daemon {
         let caps = caps.clone();
         let override_cand = override_cand.cloned();
         Box::pin(async move {
-            if depth > 8 {
-                return Err("tool nesting too deep (possible cycle)".to_string());
+            let max_depth = this.config().map(|c| c.tools.max_tool_depth).unwrap_or(8);
+            if depth > max_depth {
+                return Err(format!("tool nesting deeper than {max_depth}: a cycle?"));
             }
             let caps = caps.bind(&input)?;
             let ops_daemon = this.clone();

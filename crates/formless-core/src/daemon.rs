@@ -237,6 +237,10 @@ impl Daemon {
             }
         }
         let cfg = Config::load(&self.paths)?;
+        formless_runtime::set_limits(
+            cfg.tools.max_sleep_secs.saturating_mul(1000),
+            cfg.tools.max_random_bytes as u64,
+        );
         let changed = slot.is_some();
         *slot = Some((stamp, cfg.clone()));
         drop(slot);
@@ -2934,8 +2938,12 @@ impl Daemon {
 
     fn find_tools_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let query = args["query"].as_str().unwrap_or_default();
-        let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
-        let method = self.config()?.tools.search;
+        let tools_cfg = self.config()?.tools;
+        let limit = args["limit"]
+            .as_u64()
+            .unwrap_or(8)
+            .clamp(1, tools_cfg.find_tools_max.max(1) as u64) as usize;
+        let method = tools_cfg.search;
         let hits = self.with_store(|st| toolreg::search_tools_with(st, query, limit, &method))?;
         let ids: Vec<String> = hits.iter().map(|t| t.id.clone()).collect();
         self.with_store(|st| st.load_session_tools(session_id, &ids, "found"))?;
@@ -4101,8 +4109,11 @@ impl Daemon {
         agent_depth: usize,
     ) -> ExecFuture {
         Box::pin(async move {
-            if depth > 8 {
-                return Err("tool nesting too deep (possible cycle)".to_string());
+            if depth > cfg.tools.max_tool_depth {
+                return Err(format!(
+                    "tool nesting deeper than tools.max_tool_depth ({}): a cycle?",
+                    cfg.tools.max_tool_depth
+                ));
             }
             let (info, ver) = match self.with_store(|st| st.get_tool_by_name(&name)) {
                 Ok(Some(pair)) => pair,
