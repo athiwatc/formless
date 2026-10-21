@@ -218,7 +218,9 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 
 - **Enter during a Run = Steer** (the default): the message is injected at
   the next step boundary without killing in-flight work. **Ctrl+Enter =
-  queue** for after the Run ends (binding configurable). When idle, Enter
+  queue** for after the Run ends (binding configurable); queued messages
+  are stored in the database, so a daemon restart does not lose them, and
+  `GetSession` lists them. When idle, Enter
   simply starts a new Run.
 - `Esc` interrupts the current Run (in-flight Invocations are cancelled and
   recorded as user-cancelled, §8.2). `Ctrl+C` detaches the TUI client only.

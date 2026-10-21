@@ -1086,8 +1086,10 @@ mod tests {
 
     #[test]
     fn backoff_has_jitter_a_cap_and_honours_the_server() {
-        let mut cfg = ProviderCfg::default();
-        cfg.max_backoff_secs = 4;
+        let cfg = ProviderCfg {
+            max_backoff_secs: 4,
+            ..Default::default()
+        };
         let p = Provider::new(cfg, "k".into()).unwrap();
         let waits: Vec<Duration> = (0..50).map(|_| p.backoff(10, None)).collect();
         assert!(waits.iter().all(|w| *w <= Duration::from_secs(4)));
