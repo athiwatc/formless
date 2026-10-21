@@ -39,6 +39,13 @@ enum Cmd {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
+    Runs {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// User memory: notes the agent keeps about your preferences (SPEC §7.11)
     Memory {
         #[command(subcommand)]
@@ -311,6 +318,7 @@ fn main() -> Result<()> {
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
+        Some(Cmd::Runs { limit, json }) => runs_cmd(paths, limit, json),
         Some(Cmd::Gc) => {
             let cfg = Config::load(&paths)?;
             let store = formless_core::Store::open(&paths.db_file())?;
@@ -1186,6 +1194,33 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
                 println!("enable it with `formless skills enable {name}`\n");
             }
         }
+    }
+    Ok(())
+}
+
+fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
+    formless_core::daemon::ensure_daemon(&paths)?;
+    let v = formless_tui::client::request_once(&paths, Request::RunMetrics { limit: Some(limit) })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    let summary: formless_protocol::RunSummary = serde_json::from_value(v["summary"].clone())?;
+    println!("{}", formless_core::runs::summary_line(&summary));
+    for r in v["runs"].as_array().into_iter().flatten() {
+        println!(
+            "{}  {:<11} {:>3} steps {:>3} tools {:>8} tokens {:>6.1}s",
+            r["created_at"]
+                .as_str()
+                .unwrap_or_default()
+                .get(..19)
+                .unwrap_or_default(),
+            r["outcome"].as_str().unwrap_or_default(),
+            r["steps"],
+            r["tool_calls"],
+            r["prompt_tokens"].as_i64().unwrap_or(0) + r["completion_tokens"].as_i64().unwrap_or(0),
+            r["duration_ms"].as_i64().unwrap_or(0) as f64 / 1000.0
+        );
     }
     Ok(())
 }

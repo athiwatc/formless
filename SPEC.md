@@ -806,6 +806,32 @@ it says.
   two-proportion z-test, p < 0.05). The one exception is when both arms
   are perfect.
 
+### 8.7 Run outcomes
+
+Tool Success Rate alone cannot say whether a Run achieved what the user
+wanted. Each Run therefore records:
+
+- **steps** (model calls)
+- **registry Tool calls**
+- **tokens** (from `run_usage`)
+- **duration**
+- its **status**: completed, interrupted, paused or resumed
+- a **follow-up**:
+  - `edited`: the user edited a message and re-ran.
+  - `corrected`: the next message opens like "that's wrong", "not what I
+    asked" or "it didn't work".
+  The first follow-up wins.
+
+A Run's **outcome** is its follow-up when it has one, otherwise its
+status. The outcomes are used in three places:
+
+- `RunMetrics` returns the recent Runs and a summary: outcome shares and
+  averages. `formless runs [--json]` prints them, and the TUI Metrics
+  title shows them.
+- The prompt-proposal signals get the summary line.
+- Skill measurement (§7.10) counts a completed Run that was later edited
+  or corrected as unsuccessful.
+
 ## 9. Daemon Core
 
 ### 9.1 Lifecycle

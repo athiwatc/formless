@@ -162,6 +162,13 @@ impl Daemon {
         if signals.lines().count() <= 1 {
             signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
         }
+        // Run outcomes (§8.7): whether Runs reach the user's goal.
+        if let Ok(runs) = self.with_store(|st| st.run_metrics(200)) {
+            let summary = crate::runs::summarize(&runs);
+            if summary.runs > 0 {
+                signals.push_str(&format!("\n{}\n", crate::runs::summary_line(&summary)));
+            }
+        }
         let applied = self.with_store(|st| st.applied_proposals())?;
         if !applied.is_empty() {
             signals.push_str("\nAlready applied (do not repeat):\n");

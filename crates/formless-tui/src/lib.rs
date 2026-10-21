@@ -130,6 +130,7 @@ enum Pending {
     GetMcpPrompt,
     ListSkills,
     ListMemories,
+    RunMetrics,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -450,6 +451,8 @@ struct App {
     renaming: bool,
     modules: Vec<ModuleInfo>,
     model_stats: Vec<ModelStatInfo>,
+    /// Run outcomes for the Metrics title (SPEC §8.7).
+    run_summary: Option<formless_protocol::RunSummary>,
     proposals: Vec<PromptProposalInfo>,
     proposal_idx: usize,
     editor: Option<EditorState>,
@@ -560,6 +563,7 @@ impl App {
             renaming: false,
             modules: Vec::new(),
             model_stats: Vec::new(),
+            run_summary: None,
             proposals: Vec::new(),
             proposal_idx: 0,
             editor: None,
@@ -672,6 +676,10 @@ impl App {
                                 self.search_idx = 0;
                                 self.view = View::Search;
                             }
+                        }
+                        Pending::RunMetrics => {
+                            self.run_summary =
+                                serde_json::from_value(result["summary"].clone()).ok();
                         }
                         Pending::ListModelStats => {
                             if let Ok(v) = serde_json::from_value::<Vec<ModelStatInfo>>(result) {
@@ -1485,6 +1493,10 @@ impl App {
             View::Metrics => {
                 self.request(Pending::ListTools, Request::ListTools);
                 self.request(Pending::ListModelStats, Request::ListModelStats);
+                self.request(
+                    Pending::RunMetrics,
+                    Request::RunMetrics { limit: Some(200) },
+                );
             }
             View::Proposals => self.request(Pending::ListProposals, Request::ListProposals),
             View::Chat | View::Settings | View::Search => {}
@@ -2999,7 +3011,17 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             Row::new(row_cells)
         })
         .collect();
-    let title = format!(" Metrics · {} ", metrics_summary(&app.tools));
+    let title = match app.run_summary.as_ref().filter(|s| s.runs > 0) {
+        Some(s) => format!(
+            " Metrics · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
+            metrics_summary(&app.tools),
+            s.runs,
+            s.completed * 100.0,
+            (s.edited + s.corrected) * 100.0,
+            s.avg_steps
+        ),
+        None => format!(" Metrics · {} ", metrics_summary(&app.tools)),
+    };
     let block = ui::panel(title, app.color, Color::Green);
     if rows.is_empty() {
         f.render_widget(
@@ -3943,6 +3965,7 @@ mod tests {
             renaming: false,
             modules: Vec::new(),
             model_stats: Vec::new(),
+            run_summary: None,
             proposals: Vec::new(),
             proposal_idx: 0,
             editor: None,
