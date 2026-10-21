@@ -4480,6 +4480,24 @@ impl Daemon {
                 }
             }
         });
+        // Requests run in order on one worker per connection, so a slow one
+        // (a smoke test, a big export) never holds up reading: control
+        // requests (Esc, approvals, answers, Ping) skip the queue (SPEC §9.3).
+        let (work_tx, mut work_rx) = mpsc::unbounded_channel::<RequestEnvelope>();
+        let worker = {
+            let (this, tx) = (self.clone(), tx.clone());
+            tokio::spawn(async move {
+                while let Some(env) = work_rx.recv().await {
+                    let resp = match this.handle(env.request).await {
+                        Ok(v) => ServerMessage::ok(env.id, v),
+                        Err(e) => ServerMessage::err(env.id, e.to_string()),
+                    };
+                    if tx.send(resp).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
         let mut lines = BufReader::new(read_half).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
@@ -4502,11 +4520,21 @@ impl Daemon {
                             deltas,
                         };
                         ServerMessage::ok(env.id, json!({"subscribed": true}))
+                    } else if is_control(&env.request) {
+                        let (this, tx) = (self.clone(), tx.clone());
+                        tokio::spawn(async move {
+                            let resp = match this.handle(env.request).await {
+                                Ok(v) => ServerMessage::ok(env.id, v),
+                                Err(e) => ServerMessage::err(env.id, e.to_string()),
+                            };
+                            let _ = tx.send(resp);
+                        });
+                        continue;
                     } else {
-                        match self.handle(env.request).await {
-                            Ok(v) => ServerMessage::ok(env.id, v),
-                            Err(e) => ServerMessage::err(env.id, e.to_string()),
+                        if work_tx.send(env).is_err() {
+                            break;
                         }
+                        continue;
                     }
                 }
                 Err(e) => ServerMessage::err(0, format!("bad request: {e}")),
@@ -4515,6 +4543,10 @@ impl Daemon {
                 break;
             }
         }
+        drop(work_tx);
+        // Let queued requests finish (their replies are dropped if the
+        // client is gone), then stop writing.
+        let _ = worker.await;
         writer.abort();
     }
 
@@ -5474,4 +5506,18 @@ pub(crate) async fn execute_bounded(
             }
         }
     }
+}
+
+/// Requests that must never wait behind a slow one on the same connection.
+fn is_control(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Ping
+            | Request::Status
+            | Request::InterruptRun { .. }
+            | Request::CancelInvocation { .. }
+            | Request::ApprovalDecision { .. }
+            | Request::PromotionDecision { .. }
+            | Request::AnswerQuestion { .. }
+    )
 }
