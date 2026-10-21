@@ -1677,19 +1677,15 @@ impl App {
             "approve" => self.notes.push("Approvals arrive with Tools in M2.".into()),
             "panes" => {
                 self.multi_pane = !self.multi_pane;
-                match Config::load(&self.paths) {
-                    Ok(mut cfg) => {
-                        cfg.tui.multi_pane = self.multi_pane;
-                        match cfg.save(&self.paths) {
-                            Ok(()) => self.notes.push(format!(
-                                "multi-pane layout {} (remembered)",
-                                if self.multi_pane { "on" } else { "off" }
-                            )),
-                            Err(e) => self.notes.push(format!("could not save layout: {e}")),
-                        }
-                    }
-                    Err(e) => self.notes.push(format!("could not load config: {e}")),
-                }
+                // Settings go through the daemon (principle 6).
+                self.fire(Request::SetSetting {
+                    key: "tui.multi_pane".into(),
+                    value: serde_json::json!(self.multi_pane),
+                });
+                self.notes.push(format!(
+                    "multi-pane layout {} (remembered)",
+                    if self.multi_pane { "on" } else { "off" }
+                ));
             }
             "thinking" => {
                 self.show_thinking = !self.show_thinking;

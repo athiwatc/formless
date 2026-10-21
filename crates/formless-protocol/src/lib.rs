@@ -477,6 +477,12 @@ pub enum Request {
         #[serde(default)]
         before: Option<String>,
     },
+    /// Change one setting (SPEC §13), validated by the daemon against an
+    /// allow-list; credentials and endpoints are never settable.
+    SetSetting {
+        key: String,
+        value: serde_json::Value,
+    },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
     /// Add a job as the user (approved): `cron` for recurring, else `at`.

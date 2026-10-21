@@ -1275,17 +1275,23 @@
   function renderSettings() {
     const box = $("settings");
     box.replaceChildren();
+    // A row is [label, value] or [label, value, settingKey, kind]: the
+    // latter gets an Edit control (SetSetting, validated by the daemon).
     const section = (title, rows) => h("section", null, h("h3", null, title), h("dl", { class: "kv" },
-      rows.map(([k, v]) => [h("dt", null, k), h("dd", null, v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : String(v))])));
+      rows.map(([k, v, key, kind]) => [h("dt", null, k), h("dd", null,
+        v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : String(v),
+        key ? h("button", { class: "btn ghost small", type: "button", onclick: () => editSetting(key, v, kind) }, "Edit") : null)])));
     const on = (b) => (b ? "on" : "off");
     const grid = h("div", { class: "settings-grid" });
     const c = S.settings;
     if (c && !c.error) {
       grid.append(
-        section("Provider", [["base_url", c.provider.base_url], ["model", c.provider.model], ["reasoning_effort", c.provider.reasoning_effort || "default"],
+        section("Provider", [["base_url", c.provider.base_url], ["model", c.provider.model, "provider.model", "text"],
+          ["reasoning_effort", c.provider.reasoning_effort || "default", "provider.reasoning_effort", "optional"],
           ["api_style", c.provider.api_style], ["tool_mode", c.provider.tool_mode], ["auth", c.provider.auth_mode],
-          ["context_tokens", c.provider.context_tokens], ["fallback_models", (c.provider.fallback_models || []).join(", ")]]),
-        section("Interface (TUI)", [["multi_pane", on(c.tui.multi_pane)], ["queue_key", c.tui.queue_key]]),
+          ["context_tokens", c.provider.context_tokens, "provider.context_tokens", "number"],
+          ["fallback_models", (c.provider.fallback_models || []).join(", "), "provider.fallback_models", "list"]]),
+        section("Interface (TUI)", [["multi_pane", on(c.tui.multi_pane), "tui.multi_pane", "bool"], ["queue_key", c.tui.queue_key]]),
         section("Relay", [["enabled", on(c.relay.enabled)], ["url", c.relay.url]]),
         section("Paths", [["config", c.paths.config], ["data", c.paths.data]]));
     } else if (c && c.error) {
@@ -1383,7 +1389,7 @@
         h("dt", null, "encryption"), h("dd", null, "AES-256-GCM, key held only in this tab")),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
-    box.append(grid, h("p", { class: "muted" }, "Settings are read-only here: edit config.toml on the daemon's machine. Changes apply on the next Run."));
+    box.append(grid, h("p", { class: "muted" }, "Edit applies through the daemon (next Run). Credentials, the endpoint, the relay and MCP servers are changed in config.toml on the daemon's machine."));
   }
 
   // ============================================================ actions
@@ -1418,6 +1424,20 @@
     const r = await act({ type: "get_skill", name });
     if (!r) return;
     await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), ok: "Close" });
+  }
+  async function editSetting(key, current, kind) {
+    let value;
+    if (kind === "bool") value = !(current === "on" || current === true);
+    else {
+      const text = await ask({ title: "Set " + key, input: true, value: current == null || current === "default" ? "" : String(current), ok: "Save",
+        text: kind === "list" ? "Comma-separated." : kind === "optional" ? "Leave empty for the default." : "" });
+      if (text == null) return;
+      if (kind === "number") { value = Number(text); if (!Number.isFinite(value)) { toast("not a number", true); return; } }
+      else if (kind === "list") value = text.split(",").map((s) => s.trim()).filter(Boolean);
+      else if (kind === "optional") value = text.trim() ? text.trim() : null;
+      else value = text.trim();
+    }
+    if (await act({ type: "set_setting", key, value }, "Saved " + key)) refreshSettings();
   }
   async function loadAudit(older) {
     const before = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1].created_at : null;

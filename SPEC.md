@@ -1337,6 +1337,18 @@ run_tool = "network_policy"     # a registry Tool, or…
   [optimiser] [metrics] [tools]`. Env vars `FORMLESS_*` override file values.
   Per-Session model/effort live in SQLite, not the file. Nothing configurable
   is a hidden constant: this table is exhaustive for v1.
+- **Changing settings from a client:** clients never write the file.
+  `SetSetting {key, value}` asks the daemon to set one dotted key. The
+  daemon checks the key against an allow-list: provider model, effort,
+  routing and timing, a few `daemon.*` keys, and the whole `tui`, `tools`,
+  `metrics`, `optimiser`, `compaction`, `naming`, `skills` and `artifacts`
+  sections. It validates the value through the config types, so a wrong
+  type or a mistyped key is refused. It writes the file without
+  environment overrides, audit-logs the change and broadcasts
+  `SettingsChanged`. Changes are hot and apply from the next read.
+  Credentials, `base_url`, `extra_headers`, auth, the relay, MCP servers and
+  hooks are never settable this way, locally or over the relay. The TUI
+  (`/panes`) and the web Settings view (Edit) use `SetSetting`.
 
 | Key | Default | Meaning |
 |---|---|---|

@@ -78,6 +78,38 @@ impl Default for SkillsCfg {
     }
 }
 
+/// Settings clients may change through the daemon (`SetSetting`): exact
+/// keys, or whole sections ending in '.'. Credentials, the endpoint, extra
+/// headers, the relay, MCP servers and hooks stay file-only.
+pub const SETTABLE: &[&str] = &[
+    "provider.model",
+    "provider.reasoning_effort",
+    "provider.context_tokens",
+    "provider.model_context_tokens",
+    "provider.max_retries",
+    "provider.fallback_models",
+    "provider.routing_models",
+    "provider.routing_fast_models",
+    "provider.routing_strong_models",
+    "provider.routing_complex_chars",
+    "provider.stall_notice_secs",
+    "provider.first_byte_timeout_secs",
+    "provider.max_backoff_secs",
+    "provider.cache_key",
+    "provider.vision",
+    "daemon.idle_grace_secs",
+    "daemon.stall_warning_secs",
+    "daemon.keep_alive_for_jobs",
+    "tui.",
+    "tools.",
+    "metrics.",
+    "optimiser.",
+    "compaction.",
+    "naming.",
+    "skills.",
+    "artifacts.",
+];
+
 /// External MCP servers ((SPEC §7.9)). None ship by default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -615,6 +647,65 @@ impl Config {
         cfg.apply_env();
         Ok(cfg)
     }
+    /// The config file alone, without `FORMLESS_*` environment overrides
+    /// (what an edit should write back).
+    pub fn load_file_only(paths: &Paths) -> Result<Self> {
+        let file = paths.config_file();
+        if !file.exists() {
+            return Ok(Self::default());
+        }
+        let text =
+            std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse {}", file.display()))
+    }
+
+    /// Set one dotted key (`tools.inline_limit`) from JSON, validated by
+    /// the config types (SPEC §13). Only [`SETTABLE`] keys: never
+    /// credentials, endpoints, the relay, MCP servers or hooks. `null`
+    /// clears an optional key back to its default.
+    pub fn set_key(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
+        if !SETTABLE
+            .iter()
+            .any(|p| key == *p || (p.ends_with('.') && key.starts_with(p)))
+        {
+            anyhow::bail!(
+                "'{key}' cannot be changed this way; edit config.toml on the daemon's machine"
+            );
+        }
+        let mut doc = toml::Value::try_from(&*self)?;
+        let parts: Vec<&str> = key.split('.').collect();
+        let (leaf, path) = parts.split_last().context("empty key")?;
+        let mut table = doc.as_table_mut().context("config is not a table")?;
+        for p in path {
+            table = table
+                .entry(p.to_string())
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .with_context(|| format!("'{p}' is not a section"))?;
+        }
+        if value.is_null() {
+            table.remove(*leaf);
+        } else {
+            let v = toml::Value::try_from(&value).context("unsupported value")?;
+            table.insert(leaf.to_string(), v.clone());
+        }
+        let next: Config = doc
+            .try_into()
+            .with_context(|| format!("invalid value for '{key}'"))?;
+        // A typo'd key would be dropped silently: make sure it took.
+        if !value.is_null() {
+            let mut check = toml::Value::try_from(&next)?;
+            for p in &parts {
+                check = check
+                    .get(p)
+                    .cloned()
+                    .with_context(|| format!("unknown setting '{key}'"))?;
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
     pub fn save(&self, paths: &Paths) -> Result<()> {
         let file = paths.config_file();
         if let Some(parent) = file.parent() {

@@ -547,6 +547,17 @@ impl Daemon {
                     limit.unwrap_or(100),
                 )
             })?)?),
+            Request::SetSetting { key, value } => {
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                cfg.set_key(&key, value.clone())?;
+                cfg.save(&self.paths)?;
+                let _ = self
+                    .with_store(|st| st.audit("user", "setting.set", &format!("{key} = {value}")));
+                // Hot: the next config() read sees the new file and
+                // broadcasts SettingsChanged.
+                let _ = self.config();
+                Ok(json!({"key": key, "value": value, "restart_required": false}))
+            }
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
             )?),
