@@ -62,7 +62,11 @@ without redesign.
 
 - macOS/Linux: Unix domain socket in the data dir (mode `0700` dir, socket
   accessible only to the owning user).
-- Windows: named pipe with an ACL restricted to the owning user.
+- Windows: a named pipe with an ACL restricted to the owning user. It has
+  a protected DACL granting access only to the current user's SID and
+  SYSTEM, and remote clients are rejected. The auto-started daemon is
+  detached (`DETACHED_PROCESS`, its own process group, no console
+  window), so closing the launching terminal never stops it.
 - Identical framed protocol over both transports. No localhost-TCP fallback
   in v1. Local access control = OS filesystem/pipe permissions only (single-
   user trust boundary; see Security, §14).
