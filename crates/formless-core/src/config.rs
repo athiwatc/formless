@@ -53,6 +53,9 @@ pub struct RoleCfg {
     pub max_turns: Option<u32>,
 }
 
+/// The role an old global `provider.model = "auto"` migrates to.
+pub const PRIMARY_ROLE: &str = "primary";
+
 /// The name of the built-in provider (`[provider]`).
 pub const DEFAULT_PROVIDER: &str = "default";
 
@@ -71,6 +74,31 @@ impl Config {
                 )
             }),
         }
+    }
+
+    /// Migrate the deprecated global `provider.model = "auto"` (SPEC §4.6)
+    /// to a `primary` role with `model = "auto"` whose candidates are the
+    /// former routing pool, and point the default model at it. Returns the
+    /// warning to show, or None when there was nothing to migrate.
+    pub fn migrate_global_auto(&mut self) -> Option<String> {
+        if !ProviderCfg::is_auto_model(&self.provider.model) {
+            return None;
+        }
+        let candidates = self.provider.routing_candidates();
+        self.roles
+            .entry(PRIMARY_ROLE.to_string())
+            .or_insert_with(|| RoleCfg {
+                description: "The primary conversation (migrated from provider.model = \"auto\")."
+                    .into(),
+                model: "auto".into(),
+                candidates: candidates.clone(),
+                ..Default::default()
+            });
+        self.provider.model = format!("role:{PRIMARY_ROLE}");
+        Some(format!(
+            "provider.model = \"auto\" is deprecated: migrated to role '{PRIMARY_ROLE}' (model auto, candidates: {}). Routing is now per role and per task.",
+            if candidates.is_empty() { "the global pool".to_string() } else { candidates.join(", ") }
+        ))
     }
 
     /// A Role by name, with an error listing the configured ones.
