@@ -571,3 +571,18 @@ fn context_cache_matches_a_full_build_through_every_change() {
         .unwrap();
     check(&mut cache, "new prompt", "appending after the edit");
 }
+
+#[test]
+fn reader_connections_see_writes_and_cannot_write() {
+    let paths = temp_paths("reader");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let reader = Store::open_reader(&paths.db_file()).unwrap();
+    let s = store.create_session(Some("seen".into())).unwrap();
+    store.append_message(&s.id, "user", "hi").unwrap();
+    assert_eq!(reader.list_sessions().unwrap()[0].name, "seen");
+    assert_eq!(reader.list_messages(&s.id).unwrap().len(), 1);
+    assert!(
+        reader.create_session(None).is_err(),
+        "query_only connections refuse writes"
+    );
+}
