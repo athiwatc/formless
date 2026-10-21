@@ -9,6 +9,11 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
   AES-256-GCM ciphertext; the pairing secret (32 random bytes) is the
   key and never reaches the relay. The room id is a truncated SHA-256
   of the key.
+- Each browser gets its own logical daemon connection: the daemon
+  connects with `?mux=1`, the room tags every client socket with an id,
+  tells the daemon `{"relay":"client_open"|"client_close","cid":…}`, and
+  routes `{"cid","f"}` frames between them. Daemons without `mux=1` still
+  get raw frames broadcast to every client.
 - The web frontend in `web/` (`index.html`, `app.css`, `app.js`) is
   served by the same Worker as static assets, with a strict CSP
   (`script-src 'self'`, no inline script or style) and `no-referrer`.
