@@ -283,6 +283,13 @@ fn decode(s: &str, enc: Enc) -> Result<Vec<u8>, String> {
 
 /// Length of the longest prefix of `b` that does not end inside a UTF-8
 /// sequence, so text chunks never split a character.
+/// `n` bytes from the OS CSPRNG (uniform; usable for keys and nonces).
+fn random_bytes(n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out);
+    out
+}
+
 fn utf8_cut(b: &[u8]) -> usize {
     let n = b.len();
     for back in 1..=n.min(4) {
@@ -420,12 +427,7 @@ impl State {
             "crypto_random" => Ok(json!(uuid::Uuid::new_v4().to_string())),
             "random_bytes" => {
                 let n = a["n"].as_u64().unwrap_or(0).min(1 << 20) as usize;
-                let mut out = Vec::with_capacity(n + 16);
-                while out.len() < n {
-                    out.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-                }
-                out.truncate(n);
-                Ok(encode(&out, Enc::Base64))
+                Ok(encode(&random_bytes(n), Enc::Base64))
             }
             "emit" => {
                 self.ops.emit(a["chunk"].as_str().unwrap_or_default())?;
@@ -1375,6 +1377,22 @@ mod tests {
             assert!(std::str::from_utf8(&s[..cut]).is_ok(), "n={n}");
             assert!(n - cut < 4);
         }
+    }
+
+    #[test]
+    fn random_bytes_vary_in_every_bit_position() {
+        // UUIDv4 bytes fix 6 bits per 16-byte block; a CSPRNG fixes none.
+        let (mut seen_one, mut seen_zero) = ([0u8; 16], [0u8; 16]);
+        for block in random_bytes(16 * 256).chunks(16) {
+            for (i, b) in block.iter().enumerate() {
+                seen_one[i] |= b;
+                seen_zero[i] |= !b;
+            }
+        }
+        assert_eq!(seen_one, [0xff; 16]);
+        assert_eq!(seen_zero, [0xff; 16]);
+        assert_eq!(random_bytes(5).len(), 5);
+        assert!(random_bytes(0).is_empty());
     }
 
     #[test]
