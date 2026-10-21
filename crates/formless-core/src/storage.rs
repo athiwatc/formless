@@ -333,7 +333,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 28;
+pub const SCHEMA_VERSION: i64 = 29;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -348,7 +348,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 28] = [
+const MIGRATIONS: [(i64, MigrationStep); 29] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -416,6 +416,10 @@ const MIGRATIONS: [(i64, MigrationStep); 28] = [
     // Session delete with an undo window (SPEC §5.1).
     (27, |c| add_column(c, "sessions", "deleted_at TEXT")),
     (28, |c| Ok(c.execute_batch(SCHEMA_V28)?)),
+    // Which role/model a sub-agent ran on (SPEC §4.5).
+    (29, |c| {
+        add_column(c, "subagents", "model TEXT NOT NULL DEFAULT ''")
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1349,18 +1353,20 @@ impl Store {
         run_id: &str,
         task: &str,
         depth: u32,
+        model: &str,
     ) -> Result<SubagentInfo> {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
         self.conn.execute(
-            "INSERT INTO subagents(id,session_id,run_id,task,depth,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'running',?6,?6)",
-            params![id, session_id, run_id, task, depth, t],
+            "INSERT INTO subagents(id,session_id,run_id,task,depth,status,created_at,updated_at,model) VALUES(?1,?2,?3,?4,?5,'running',?6,?6,?7)",
+            params![id, session_id, run_id, task, depth, t, model],
         )?;
         self.get_subagent(&id)?.context("sub-agent vanished")
     }
 
     fn row_subagent(r: &rusqlite::Row) -> rusqlite::Result<SubagentInfo> {
         Ok(SubagentInfo {
+            model: r.get("model")?,
             id: r.get("id")?,
             session_id: r.get("session_id")?,
             run_id: r.get("run_id")?,

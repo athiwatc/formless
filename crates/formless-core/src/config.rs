@@ -24,6 +24,62 @@ pub struct Config {
     /// `[[hooks]]` (SPEC §9.8): user policy and automation around Tool
     /// calls and Runs.
     pub hooks: Vec<HookCfg>,
+    /// More providers beside `[provider]` (which is `default`), by name
+    /// (SPEC §4.5). Their API keys live in the keychain, never here.
+    pub providers: BTreeMap<String, ProviderCfg>,
+    /// Roles: a purpose mapped to a provider + model, described for the
+    /// agent so it can pick one for sub-agents (SPEC §4.5).
+    pub roles: BTreeMap<String, RoleCfg>,
+}
+
+/// One Role (SPEC §4.5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RoleCfg {
+    /// When to use it, written for the agent ("fast; broad read-only search").
+    pub description: String,
+    /// A provider name from `[providers]`; unset or "default" = `[provider]`.
+    pub provider: Option<String>,
+    /// The model; empty = that provider's default model.
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    /// Extra system prompt for sub-agents in this role.
+    pub system: Option<String>,
+}
+
+/// The name of the built-in provider (`[provider]`).
+pub const DEFAULT_PROVIDER: &str = "default";
+
+impl Config {
+    /// A provider's settings by name (`default` or unset = `[provider]`).
+    pub fn provider_cfg(&self, name: Option<&str>) -> Result<ProviderCfg> {
+        match name.filter(|n| !n.is_empty() && *n != DEFAULT_PROVIDER) {
+            None => Ok(self.provider.clone()),
+            Some(n) => self.providers.get(n).cloned().with_context(|| {
+                format!(
+                    "unknown provider '{n}' (configured: default{})",
+                    self.providers
+                        .keys()
+                        .map(|k| format!(", {k}"))
+                        .collect::<String>()
+                )
+            }),
+        }
+    }
+
+    /// A Role by name, with an error listing the configured ones.
+    pub fn role(&self, name: &str) -> Result<&RoleCfg> {
+        self.roles.get(name).with_context(|| {
+            if self.roles.is_empty() {
+                format!("unknown role '{name}': no roles are configured")
+            } else {
+                format!(
+                    "unknown role '{name}' (roles: {})",
+                    self.roles.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            }
+        })
+    }
 }
 
 /// One hook: on `event`, for matching calls, run a registry Tool or a
@@ -847,6 +903,40 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
         }
     }
     None
+}
+
+/// The API key of a named provider (SPEC §4.5): `FORMLESS_API_KEY_<NAME>`
+/// (upper-case, non-alphanumerics as `_`), else the keychain/0600 secret.
+pub fn provider_key(paths: &Paths, name: &str) -> Option<String> {
+    let env = format!(
+        "FORMLESS_API_KEY_{}",
+        name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    );
+    if let Ok(v) = std::env::var(env) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    crate::auth::load_named_secret(paths, &format!("provider-key-{name}"))
+        .and_then(|v| v.as_str().map(str::to_string))
+}
+
+pub fn save_provider_key(paths: &Paths, name: &str, key: &str) -> Result<()> {
+    crate::auth::save_named_secret(
+        paths,
+        &format!("provider-key-{name}"),
+        &serde_json::json!(key),
+    )
+}
+
+pub fn delete_provider_key(paths: &Paths, name: &str) {
+    crate::auth::delete_named_secret(paths, &format!("provider-key-{name}"));
 }
 
 /// Full reset (SPEC §15): keychain entry, config, and the entire data dir.
