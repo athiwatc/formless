@@ -744,6 +744,16 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   `memory_mb` may never be widened by a Candidate** — widening always
   requires user approval (§10.3). Given `resource`-tagged failures, the
   optimiser must attempt streaming/chunking fixes before other changes.
+- **Strategy by failure tag:** the generation prompt gets the failure
+  counts per tag, most frequent first, and a strategy for each:
+  - `validation`: fix the description and input schema before the code.
+  - `resource`: stream.
+  - `js`: fix the failing paths.
+  - `denied-capability`: never widen; throw a clear error instead.
+  When **every** failure is a denied Capability, no Candidate is
+  generated. The Tool is surfaced as "needs a capability" (an activity
+  line, a note and an audit entry) for the user to decide, and the
+  cooldown applies.
 - Candidate inputs: current Tool version, redacted recorded Invocations
   (§8.4, §15). The optimiser LLM call goes only to the user's configured
   endpoint.
