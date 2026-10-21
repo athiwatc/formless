@@ -2018,6 +2018,18 @@ impl Store {
         Ok(rows)
     }
 
+    /// (session id, path, bytes) of one artifact.
+    pub fn get_artifact(&self, id: &str) -> Result<Option<(Option<String>, String, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT session_id, path, bytes FROM artifacts WHERE id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok())
+    }
+
     /// Paths of a Session's artifacts (to delete with it).
     pub fn session_artifact_paths(&self, session_id: &str) -> Result<Vec<String>> {
         let mut stmt = self

@@ -20,7 +20,8 @@ pub const READ_TOOL: &str = "read_tool";
 pub const TEST_TOOL: &str = "test_tool";
 pub const UNLOAD_TOOLS: &str = "unload_tools";
 pub const READ_MODULE: &str = "read_module";
-pub const RESERVED: [&str; 12] = [
+pub const READ_ARTIFACT: &str = "read_artifact";
+pub const RESERVED: [&str; 13] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -33,6 +34,7 @@ pub const RESERVED: [&str; 12] = [
     TEST_TOOL,
     UNLOAD_TOOLS,
     READ_MODULE,
+    READ_ARTIFACT,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -247,6 +249,26 @@ fn read_module_definition() -> Value {
                     "version": {"type": "integer", "description": "Optional; defaults to the current version"}
                 },
                 "required": ["name"]
+            }
+        }
+    })
+}
+
+fn read_artifact_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": READ_ARTIFACT,
+            "description": "Read a large output this session stored as an artifact (the id from \"[full output ... stored as artifact <id> ...]\"). Returns a slice of the text, or with grep the matching lines with line numbers. No approval needed; only this session's artifacts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "offset": {"type": "integer", "description": "Character offset to start at (default 0)"},
+                    "length": {"type": "integer", "description": "Characters to return (default 20000, max 100000)"},
+                    "grep": {"type": "string", "description": "Return only lines containing this text (case-insensitive), up to 200"}
+                },
+                "required": ["id"]
             }
         }
     })
@@ -550,6 +572,7 @@ pub fn tool_definitions(
         read_tool_definition(),
         unload_tools_definition(),
         read_module_definition(),
+        read_artifact_definition(),
         test_tool_definition(),
         pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
         pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),

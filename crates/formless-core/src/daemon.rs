@@ -1389,6 +1389,10 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: find_tools failed: {e}"),
             },
+            toolreg::READ_ARTIFACT => match self.read_artifact_impl(session_id, &args) {
+                Ok(text) => text,
+                Err(e) => format!("error: read_artifact failed: {e}"),
+            },
             toolreg::READ_MODULE => match self.read_module_impl(&args) {
                 Ok(text) => text,
                 Err(e) => format!("error: read_module failed: {e}"),
@@ -2250,6 +2254,36 @@ impl Daemon {
             }
         }
         Ok(notes)
+    }
+
+    /// A slice (or grep) of one of this Session's artifacts (SPEC §9.6).
+    fn read_artifact_impl(&self, session_id: &str, args: &Value) -> Result<String> {
+        let id = args["id"].as_str().context("id required")?;
+        let (_, path, _) = self
+            .with_store(|st| st.get_artifact(id))?
+            .filter(|(owner, ..)| owner.as_deref() == Some(session_id))
+            .with_context(|| format!("no artifact '{id}' in this session"))?;
+        let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
+        if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
+            let needle = needle.to_lowercase();
+            let hits: Vec<Value> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                .take(200)
+                .map(|(i, l)| json!({"line": i + 1, "text": l.chars().take(500).collect::<String>()}))
+                .collect();
+            return Ok(json!({"id": id, "matches": hits}).to_string());
+        }
+        let total = text.chars().count();
+        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+        let length = args["length"].as_u64().unwrap_or(20_000).min(100_000) as usize;
+        let slice: String = text.chars().skip(offset).take(length).collect();
+        let end = (offset + slice.chars().count()).min(total);
+        Ok(
+            json!({"id": id, "offset": offset, "end": end, "total_chars": total, "text": slice})
+                .to_string(),
+        )
     }
 
     fn read_module_impl(&self, args: &Value) -> Result<String> {
