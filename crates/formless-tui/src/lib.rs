@@ -482,6 +482,8 @@ struct App {
     chat_view_height: usize,
     chat_line_count: usize,
     input: String,
+    /// When Ctrl+C was last pressed: a second press soon after detaches.
+    ctrl_c_at: Option<Instant>,
     /// Sessions with a Run in flight; run state is per session, not global.
     running_sessions: std::collections::HashSet<String>,
     notes: Vec<String>,
@@ -613,6 +615,7 @@ impl App {
             chat_view_height: 10,
             chat_line_count: 0,
             input: String::new(),
+            ctrl_c_at: None,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -2403,7 +2406,7 @@ impl App {
 
     fn key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+            self.ctrl_c();
             return;
         }
         if let Some(p) = &mut self.pager {
@@ -3027,7 +3030,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let note = truncate_chars(&note, room.saturating_sub(1));
     let mut spans = left;
     if note.is_empty() && used + 40 < width {
-        let tip = "Tab views · /help · Ctrl+C detach ";
+        let tip = "Tab views · /help · Ctrl+C ×2 detach ";
         spans.push(Span::raw(" ".repeat(width - used - tip.chars().count())));
         spans.push(Span::styled(tip, ui::dim(app.color)));
     } else if !note.is_empty() {
@@ -3063,7 +3066,34 @@ fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// How soon a second Ctrl+C must follow the first to detach.
+const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl App {
+    /// Ctrl+C: clear a typed message first; pressed again within
+    /// [`CTRL_C_WINDOW`] it detaches (Runs keep going in the daemon). The
+    /// setup wizard still quits at once.
+    fn ctrl_c(&mut self) {
+        if self.wizard.is_some() {
+            self.should_quit = true;
+            return;
+        }
+        let armed = self.ctrl_c_at.is_some_and(|t| t.elapsed() < CTRL_C_WINDOW);
+        if armed && self.input.is_empty() {
+            self.should_quit = true;
+            return;
+        }
+        if !self.input.is_empty() {
+            self.input.clear();
+            self.editing_id = None;
+            self.notes
+                .push("message cleared · Ctrl+C again to detach".into());
+        } else {
+            self.notes.push("press Ctrl+C again to detach".into());
+        }
+        self.ctrl_c_at = Some(Instant::now());
+    }
+
     /// `/open [id-prefix]`: view a stored output in the pager. Without an
     /// id, the newest one referenced in this Session.
     fn open_artifact(&mut self, prefix: &str) {
@@ -3146,7 +3176,7 @@ fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
     lines.push(Line::raw(""));
     lines.push(
         Line::styled(
-            "Tab switches views · /help lists commands · Ctrl+C detaches",
+            "Tab switches views · /help lists commands · Ctrl+C clears, twice detaches",
             ui::dim(color),
         )
         .centered(),
@@ -4633,6 +4663,7 @@ mod tests {
             chat_view_height: 10,
             chat_line_count: 100,
             input: String::new(),
+            ctrl_c_at: None,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -5273,5 +5304,29 @@ mod tests {
             ],
             "finished top-level calls hide; ok subtrees fold; failed ones stay open"
         );
+    }
+
+    #[test]
+    fn ctrl_c_clears_then_detaches_on_a_second_press() {
+        let mut app = test_app();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.input = "half-typed".into();
+        app.key(ctrl_c);
+        assert!(
+            app.input.is_empty() && !app.should_quit,
+            "first press clears"
+        );
+        app.key(ctrl_c);
+        assert!(app.should_quit, "second press within the window detaches");
+
+        let mut app = test_app();
+        app.key(ctrl_c);
+        assert!(!app.should_quit);
+        assert!(app.notes.last().unwrap().contains("again to detach"));
+        app.ctrl_c_at = Some(Instant::now() - CTRL_C_WINDOW);
+        app.key(ctrl_c);
+        assert!(!app.should_quit, "an expired first press only re-arms");
+        app.key(ctrl_c);
+        assert!(app.should_quit);
     }
 }
