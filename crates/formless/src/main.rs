@@ -743,6 +743,10 @@ fn run_headless(
     loop {
         match rx.recv() {
             Ok(ServerMessage::Event(ev)) => {
+                // The daemon broadcasts every Session's events; only act on ours.
+                if ev.session_id() != Some(session_id.as_str()) {
+                    continue;
+                }
                 if json_out {
                     println!("{}", serde_json::to_string(&ev).unwrap_or_default());
                 }
@@ -789,11 +793,7 @@ fn run_headless(
                         code = 1;
                         break;
                     }
-                    Event::RunFinished {
-                        status,
-                        session_id: sid,
-                        ..
-                    } if sid == session_id => {
+                    Event::RunFinished { status, .. } => {
                         code = if status == "completed" { 0 } else { 1 };
                         break;
                     }

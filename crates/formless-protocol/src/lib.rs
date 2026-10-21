@@ -406,6 +406,37 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// The Session this event belongs to, or `None` for global events.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Event::RunStarted { session_id, .. }
+            | Event::MessageAppended { session_id, .. }
+            | Event::MessageDelta { session_id, .. }
+            | Event::ReasoningDelta { session_id, .. }
+            | Event::MessageComplete { session_id, .. }
+            | Event::RunFinished { session_id, .. }
+            | Event::RunPaused { session_id, .. }
+            | Event::CompactionNotice { session_id, .. }
+            | Event::MessagesEdited { session_id, .. }
+            | Event::ToolCallStarted { session_id, .. }
+            | Event::ToolCallFinished { session_id, .. }
+            | Event::ApprovalRequested { session_id, .. }
+            | Event::InvocationPending { session_id, .. }
+            | Event::InvocationCompleted { session_id, .. } => Some(session_id),
+            Event::Note { session_id, .. } => session_id.as_deref(),
+            Event::SessionUpdated { session } => Some(&session.id),
+            Event::SessionDeleted { id } => Some(id),
+            Event::ToolUpdated { .. }
+            | Event::ModuleUpdated { .. }
+            | Event::ProposalUpdated { .. }
+            | Event::ToolDeleted { .. }
+            | Event::OptimiserActivity { .. }
+            | Event::PromotionApprovalRequested { .. } => None,
+        }
+    }
+}
+
 impl ServerMessage {
     pub fn ok(id: u64, result: serde_json::Value) -> Self {
         ServerMessage::Response {
@@ -422,5 +453,30 @@ impl ServerMessage {
             result: None,
             error: Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_session_id_scopes_session_events() {
+        let ev = Event::ApprovalRequested {
+            approval_id: "a".into(),
+            session_id: "s1".into(),
+            tool_name: "t".into(),
+            version: 1,
+            capabilities: vec![],
+            memory_mb: 0,
+        };
+        assert_eq!(ev.session_id(), Some("s1"));
+        let note = Event::Note {
+            session_id: None,
+            text: "x".into(),
+        };
+        assert_eq!(note.session_id(), None);
+        let global = Event::ToolDeleted { id: "t".into() };
+        assert_eq!(global.session_id(), None);
     }
 }
