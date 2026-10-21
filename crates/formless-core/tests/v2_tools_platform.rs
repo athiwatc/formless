@@ -35,7 +35,7 @@ fn run(
         mode: HostMode::Live,
         overlay: None,
         activity: None,
-        modules,
+        modules: modules.into(),
         cancel: Arc::new(AtomicBool::new(false)),
     };
     execute(&req, ops).map(|o| o.output)
@@ -115,4 +115,31 @@ fn agents_run_is_gated_scoped_and_stubbed() {
     let caps = Capabilities::parse(&["agent:m1".into()]).unwrap();
     assert!(caps.is_sensitive());
     assert!(caps.to_specs().contains(&"agent:m1".to_string()));
+}
+
+/// The daemon caches module code by this fingerprint, so every change to a
+/// module (a new one, a new version) must change it.
+#[test]
+fn module_fingerprint_changes_with_every_module_write() {
+    let store = Store::open_in_memory().unwrap();
+    let empty = store.modules_fingerprint().unwrap();
+    store
+        .create_module_version("a", "", "module.exports = 1;", "agent")
+        .unwrap();
+    let one = store.modules_fingerprint().unwrap();
+    assert_ne!(empty, one);
+    store
+        .create_module_version("a", "", "module.exports = 2;", "agent")
+        .unwrap();
+    let two = store.modules_fingerprint().unwrap();
+    assert_ne!(one, two, "a new version of the same module");
+    assert_eq!(
+        two,
+        store.modules_fingerprint().unwrap(),
+        "stable otherwise"
+    );
+    assert_eq!(
+        store.list_module_code().unwrap()[0].1,
+        "module.exports = 2;"
+    );
 }

@@ -22,7 +22,7 @@ fn exec(code: &str, input: Value, caps: &[&str], mode: HostMode) -> Result<Value
         mode,
         overlay: None,
         activity: None,
-        modules: Vec::new(),
+        modules: Default::default(),
         cancel: Arc::new(AtomicBool::new(false)),
     };
     execute(&req, Arc::new(NoHostOps)).map(|o| o.output)
@@ -346,7 +346,7 @@ async fn fetch_redirect_hops_follow_browser_rules() {
     use axum::{
         http::{HeaderMap, Method},
         response::Redirect,
-        routing::{any, get},
+        routing::any,
         Router,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

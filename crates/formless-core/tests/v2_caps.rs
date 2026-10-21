@@ -39,7 +39,7 @@ fn run_with(
         mode,
         overlay: None,
         activity: None,
-        modules: Vec::new(),
+        modules: Default::default(),
         cancel: Arc::new(AtomicBool::new(false)),
     };
     execute(&req, ops).map(|o| o.output)

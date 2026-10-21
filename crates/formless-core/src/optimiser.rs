@@ -169,7 +169,7 @@ impl Daemon {
                 signals.push_str(&format!("- [{}] {}\n", a.kind, a.content));
             }
         }
-        let provider = self.provider(&cfg).await?;
+        let provider = self.provider(cfg).await?;
         let model = cfg
             .optimiser
             .model
@@ -380,7 +380,7 @@ impl Daemon {
                 "\nNOTE: resource (OOM) failures present - use streaming/chunking first.\n",
             );
         }
-        let provider = self.provider(&cfg).await?;
+        let provider = self.provider(cfg).await?;
         let model = cfg
             .optimiser
             .model
@@ -764,9 +764,7 @@ impl Daemon {
                 mode: HostMode::Replay,
                 overlay: Some(overlay),
                 activity: None,
-                modules: ops_daemon
-                    .with_store(|st| st.list_module_code())
-                    .unwrap_or_default(),
+                modules: ops_daemon.module_code(),
                 cancel: Arc::new(AtomicBool::new(false)),
             };
             let ops_dyn: Arc<dyn HostOps> = ops;
