@@ -158,6 +158,17 @@ pub struct BuiltinStatInfo {
     pub total_ms: f64,
 }
 
+/// Token use (and, with prices configured, cost) of a Run or Session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UsageInfo {
+    pub steps: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cached_tokens: i64,
+    /// Estimated USD, when every model used has a configured price.
+    pub cost: Option<f64>,
+}
+
 /// One Run's metrics (SPEC §8.7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunMetricsInfo {
@@ -499,6 +510,10 @@ pub enum Request {
         tool_id: String,
         #[serde(default)]
         capability: Option<String>,
+    },
+    /// A Session's usage: `{"last_run": UsageInfo?, "total": UsageInfo, "runs": n}`.
+    SessionUsage {
+        session_id: String,
     },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
@@ -848,6 +863,12 @@ pub enum Event {
     McpServersChanged,
     /// Skills were installed, removed, enabled or disabled.
     SkillsChanged,
+    /// A Run's usage so far, after each model step (SPEC §10.6).
+    RunUsage {
+        session_id: String,
+        run_id: String,
+        usage: UsageInfo,
+    },
     /// User memory changed (SPEC §7.11).
     MemoryUpdated,
     /// Scheduled jobs changed (SPEC §9.7).
@@ -889,6 +910,7 @@ impl Event {
             | Event::ToolCallFinished { session_id, .. }
             | Event::ApprovalRequested { session_id, .. }
             | Event::UserQuestion { session_id, .. }
+            | Event::RunUsage { session_id, .. }
             | Event::InvocationPending { session_id, .. }
             | Event::InvocationCompleted { session_id, .. }
             | Event::InvocationStalled { session_id, .. }

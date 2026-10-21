@@ -572,6 +572,23 @@ impl Daemon {
                 }
                 Ok(json!({"revoked": true}))
             }
+            Request::SessionUsage { session_id } => {
+                let cfg = self.config()?;
+                let total = self.usage_info(Some(&session_id), None, &cfg)?;
+                let last = self.with_reader(|st| st.last_run(&session_id))?;
+                let last_run = match last {
+                    Some((run_id, _)) => Some(self.usage_info(None, Some(&run_id), &cfg)?),
+                    None => None,
+                };
+                let runs = self.with_reader(|st| {
+                    Ok(st
+                        .run_metrics(100_000)?
+                        .into_iter()
+                        .filter(|r| r.session_id == session_id)
+                        .count())
+                })?;
+                Ok(json!({"last_run": last_run, "total": total, "runs": runs}))
+            }
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
             )?),
@@ -1657,6 +1674,13 @@ impl Daemon {
                     if let Some(usage) = &r.usage {
                         let _ = self.with_store(|st| {
                             st.record_usage(session_id, run_id, &r.model_used, usage)
+                        });
+                    }
+                    if let Ok(usage) = self.usage_info(None, Some(run_id), &cfg) {
+                        self.broadcast(Event::RunUsage {
+                            session_id: session_id.to_string(),
+                            run_id: run_id.to_string(),
+                            usage,
                         });
                     }
                     r
@@ -3135,6 +3159,33 @@ impl Daemon {
             .and_then(|s| s.reasoning_effort)
             .or_else(|| cfg.provider.reasoning_effort.clone());
         (model, effort)
+    }
+
+    /// Usage of a Run or Session, priced with `provider.prices` when every
+    /// model used has a price (SPEC §10.6).
+    pub fn usage_info(
+        &self,
+        session_id: Option<&str>,
+        run_id: Option<&str>,
+        cfg: &Config,
+    ) -> Result<formless_protocol::UsageInfo> {
+        let (rows, steps) = self.with_reader(|st| st.usage_rows(session_id, run_id))?;
+        let mut u = formless_protocol::UsageInfo {
+            steps,
+            ..Default::default()
+        };
+        let mut cost = Some(0.0);
+        for (model, p, c, cached) in rows {
+            u.prompt_tokens += p;
+            u.completion_tokens += c;
+            u.cached_tokens += cached;
+            cost = match (cost, cfg.provider.prices.get(&model)) {
+                (Some(sum), Some(price)) => Some(sum + price.cost(p, c, cached)),
+                _ => None,
+            };
+        }
+        u.cost = cost.filter(|_| u.prompt_tokens + u.completion_tokens > 0);
+        Ok(u)
     }
 
     /// `read_metrics` (SPEC §8.9): registry-wide health for the agent.

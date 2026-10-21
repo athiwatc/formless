@@ -134,6 +134,7 @@ enum Pending {
     ListBuiltinStats,
     ListJobs,
     ListAudit,
+    SessionUsage,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -450,6 +451,8 @@ struct App {
     /// Open `ask_user` questions: (id, session, options). The next typed
     /// line answers the current Session's oldest one.
     questions: Vec<(String, String, Vec<String>)>,
+    /// Latest Run usage per Session, for the status line (SPEC §10.6).
+    run_usage: HashMap<String, formless_protocol::UsageInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
     purge_arm: Option<String>,
     /// Session id armed for deletion by a first `d` press.
@@ -567,6 +570,7 @@ impl App {
             rollback_pick: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
+            run_usage: HashMap::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,
@@ -790,6 +794,24 @@ impl App {
                                     s.last_error
                                         .map(|e| format!(" · error: {}", truncate_chars(&e, 80)))
                                         .unwrap_or_default()
+                                ));
+                            }
+                        }
+                        Pending::SessionUsage => {
+                            let get = |k: &str| {
+                                serde_json::from_value::<formless_protocol::UsageInfo>(
+                                    result[k].clone(),
+                                )
+                                .ok()
+                            };
+                            if let Some(last) = get("last_run") {
+                                self.notes.push(format!("last Run: {}", usage_text(&last)));
+                            }
+                            if let Some(total) = get("total") {
+                                self.notes.push(format!(
+                                    "session ({} Runs): {}",
+                                    result["runs"],
+                                    usage_text(&total)
                                 ));
                             }
                         }
@@ -1314,6 +1336,11 @@ impl App {
                 }
                 self.questions.push((question_id, session_id, options));
             }
+            Event::RunUsage {
+                session_id, usage, ..
+            } => {
+                self.run_usage.insert(session_id, usage);
+            }
             Event::UserQuestionClosed { question_id } => {
                 self.questions.retain(|(id, _, _)| *id != question_id);
             }
@@ -1708,6 +1735,12 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            "usage" => match self.current.clone() {
+                Some(session_id) => {
+                    self.request(Pending::SessionUsage, Request::SessionUsage { session_id })
+                }
+                None => self.notes.push("open a session first".into()),
+            },
             "audit" => self.request(
                 Pending::ListAudit,
                 Request::ListAudit {
@@ -1923,7 +1956,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /quit".into(),
+                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /quit".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -2694,6 +2727,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     if !app.model_label.is_empty() {
         left.push(sep());
         left.push(Span::styled(app.model_label.clone(), ui::dim(app.color)));
+    }
+    if let Some(u) = app
+        .current
+        .as_ref()
+        .and_then(|s| app.run_usage.get(s))
+        .filter(|u| u.steps > 0)
+    {
+        left.push(sep());
+        left.push(Span::styled(usage_text(u), ui::dim(app.color)));
     }
     let waiting = app.approvals.len() + app.promotions.len();
     if waiting > 0 {
@@ -4181,6 +4223,34 @@ pub fn run(paths: Paths) -> Result<()> {
     result
 }
 
+/// "3 steps · 12.3k in / 1.2k out · 40% cached · $0.021" (SPEC §10.6).
+fn usage_text(u: &formless_protocol::UsageInfo) -> String {
+    fn k(n: i64) -> String {
+        if n >= 1000 {
+            format!("{:.1}k", n as f64 / 1000.0)
+        } else {
+            n.to_string()
+        }
+    }
+    let mut s = format!(
+        "{} step{} · {} in / {} out",
+        u.steps,
+        if u.steps == 1 { "" } else { "s" },
+        k(u.prompt_tokens),
+        k(u.completion_tokens)
+    );
+    if u.prompt_tokens > 0 && u.cached_tokens > 0 {
+        s.push_str(&format!(
+            " · {:.0}% cached",
+            100.0 * u.cached_tokens as f64 / u.prompt_tokens as f64
+        ));
+    }
+    if let Some(c) = u.cost {
+        s.push_str(&format!(" · ${c:.3}"));
+    }
+    s
+}
+
 /// Cost per Success (SPEC §8.1): "1.2s, 3400 tok", or "-".
 fn cost_per_success(m: &formless_protocol::ToolMetricsInfo) -> String {
     match (m.ms_per_success, m.tokens_per_success) {
@@ -4244,6 +4314,7 @@ mod tests {
             rollback_pick: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
+            run_usage: HashMap::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
             delete_arm: None,

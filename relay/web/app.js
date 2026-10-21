@@ -1011,6 +1011,9 @@
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
     $("status-model").textContent = (s && s.model) || (S.settings && S.settings.provider.model) || "";
+    const u = S.usage && S.usage[S.current];
+    $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
+    $("status-usage").title = S.sessionUsage && S.sessionUsage.id === S.current ? "Session (" + S.sessionUsage.runs + " Runs): " + usageText(S.sessionUsage.total) : "";
     const waiting = S.approvals.length;
     $("status-approvals").classList.toggle("hidden", !waiting);
     $("status-approvals").textContent = "⚠ " + waiting + " awaiting approval";
@@ -1470,6 +1473,14 @@
     renderView();
     renderStatus();
   }
+  // "3 steps · 12.3k in / 1.2k out · 40% cached · $0.021" (SPEC §10.6).
+  function usageText(u) {
+    const k = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
+    let s = u.steps + " step" + (u.steps === 1 ? "" : "s") + " · " + k(u.prompt_tokens) + " in / " + k(u.completion_tokens) + " out";
+    if (u.prompt_tokens > 0 && u.cached_tokens > 0) s += " · " + Math.round((100 * u.cached_tokens) / u.prompt_tokens) + "% cached";
+    if (u.cost != null) s += " · $" + u.cost.toFixed(3);
+    return s;
+  }
   async function revokeApproval(t, capability) {
     if (!(await ask({ title: "Revoke " + (capability || "every approval") + " for " + t.name + "?", text: "The next call that needs it asks again.", ok: "Revoke", danger: true }))) return;
     if (await act({ type: "revoke_approval", tool_id: t.id, capability }, "Revoked")) selectTool(t.id, true);
@@ -1487,6 +1498,11 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    request({ type: "session_usage", session_id: id }).then((r) => {
+      S.sessionUsage = { id, runs: r.runs, total: r.total };
+      if (r.last_run && r.last_run.steps) (S.usage = S.usage || {})[id] = r.last_run;
+      renderStatus();
+    }).catch(() => {});
     rendered.clear(); // a reload may carry edited messages
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
@@ -1606,6 +1622,13 @@
       case "tools": case "metrics": case "proposals": case "settings": return setView(name);
       case "propose": act({ type: "generate_proposal" }); return note("generating a measured proposal…");
       case "thinking": setThinking(!S.showThinking); return note("thinking display " + (S.showThinking ? "on" : "off"));
+      case "usage": {
+        if (!S.current) return note("open a session first", true);
+        const r = await act({ type: "session_usage", session_id: S.current });
+        if (!r) return;
+        if (r.last_run) note("last Run: " + usageText(r.last_run));
+        return note("session (" + r.runs + " Runs): " + usageText(r.total));
+      }
       case "stop": return stop();
       case "prompts": {
         const list = (await act({ type: "list_mcp_prompts" })) || [];
@@ -1777,6 +1800,10 @@
         });
         break;
       }
+      case "run_usage":
+        (S.usage = S.usage || {})[ev.session_id] = ev.usage;
+        if (here) renderStatus();
+        break;
       case "user_question_closed":
         // Answered elsewhere (or the Run stopped): close our prompt.
         if (S.questionId === ev.question_id) { S.questionId = null; closeAsk(null); }

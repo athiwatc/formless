@@ -212,3 +212,73 @@ fn cost_per_success_counts_attributed_tokens_and_time() {
         "960 tokens over 2 successes"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_usage_totals_and_priced_cost() {
+    use formless_core::config::ModelPrice;
+    use formless_protocol::Request;
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-usage-{short}"));
+    let paths = formless_core::Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-usage-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut cfg = formless_core::Config::default();
+    cfg.provider.prices.insert(
+        "m".into(),
+        ModelPrice {
+            input: 2.0,
+            output: 8.0,
+            cached_input: Some(0.5),
+        },
+    );
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap().id;
+    let usage = |p, c, cached| formless_core::provider::Usage {
+        prompt_tokens: p,
+        completion_tokens: c,
+        cached_tokens: cached,
+        ..Default::default()
+    };
+    let r1 = store.create_run(&s).unwrap();
+    store.bump_run_steps(&r1).unwrap();
+    store
+        .record_usage(&s, &r1, "m", &usage(1_000_000, 0, 0))
+        .unwrap();
+    store.set_run_status(&r1, "completed").unwrap();
+    let r2 = store.create_run(&s).unwrap();
+    store.bump_run_steps(&r2).unwrap();
+    store.bump_run_steps(&r2).unwrap();
+    store
+        .record_usage(&s, &r2, "m", &usage(1_000_000, 500_000, 600_000))
+        .unwrap();
+    let daemon = std::sync::Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let r = daemon
+        .handle(Request::SessionUsage {
+            session_id: s.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(r["runs"], 2);
+    assert_eq!(r["last_run"]["steps"], 2);
+    // r2: 0.4M fresh × $2 + 0.6M cached × $0.5 + 0.5M out × $8 = 0.8 + 0.3 + 4.0
+    assert!(
+        (r["last_run"]["cost"].as_f64().unwrap() - 5.1).abs() < 1e-9,
+        "{r}"
+    );
+    assert_eq!(r["total"]["prompt_tokens"], 2_000_000);
+    assert!((r["total"]["cost"].as_f64().unwrap() - 7.1).abs() < 1e-9);
+    // A model without a price: no cost guess.
+    store
+        .record_usage(&s, &r2, "unpriced", &usage(10, 10, 0))
+        .unwrap();
+    let r = daemon
+        .handle(Request::SessionUsage { session_id: s })
+        .await
+        .unwrap();
+    assert!(r["total"]["cost"].is_null());
+}
