@@ -578,3 +578,48 @@ fn cancel_stops_a_fetch_that_never_answers() {
     assert_eq!(err.kind, ExecErrorKind::Cancelled, "{}", err.message);
     assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
 }
+
+#[test]
+fn timers_are_asynchronous_ordered_and_clearable() {
+    let code = r#"
+      async function run(i) {
+        const order = [];
+        setTimeout(() => order.push("late"), 60);
+        const cancelled = setTimeout(() => order.push("cleared"), 10);
+        setTimeout((x) => order.push(x), 20, "early");
+        clearTimeout(cancelled);
+        order.push("sync");
+        let ticks = 0;
+        await new Promise((done) => {
+          const id = setInterval(() => { if (++ticks === 3) { clearInterval(id); done(); } }, 5);
+        });
+        const raced = await Promise.race([
+          new Promise((r) => setTimeout(() => r("timeout"), 30)),
+          new Promise((r) => setTimeout(() => r("fast"), 1)),
+        ]);
+        await new Promise((r) => setTimeout(r, 80));
+        return { order, ticks, raced };
+      }"#;
+    let out = run_mode(code, json!({}), &[], HostMode::Live).unwrap();
+    assert_eq!(out["order"], json!(["sync", "early", "late"]));
+    assert_eq!(out["ticks"], 3);
+    assert_eq!(out["raced"], "fast");
+}
+
+#[test]
+fn cancel_interrupts_sleep_promptly() {
+    let (err, took) = run_cancelled(
+        "function run(i){ for (;;) sleep(60000); }",
+        &[],
+        std::time::Duration::from_millis(200),
+    );
+    assert_eq!(err.kind, ExecErrorKind::Cancelled, "{}", err.message);
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+    let (err, took) = run_cancelled(
+        "async function run(i){ await new Promise((r) => setTimeout(r, 60000)); }",
+        &[],
+        std::time::Duration::from_millis(200),
+    );
+    assert_eq!(err.kind, ExecErrorKind::Cancelled, "{}", err.message);
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+}

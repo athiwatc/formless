@@ -388,7 +388,7 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | `agents.run(task, {system, model})` | `agent` | v2; sub-agent over the same Tools (depth-limited, no step limit), returns its final text |
 | `requireModule(name)` | — | v2; load a shared module created with `create_module` |
 | `emit(chunk)` | — | Stream large output to an artifact file |
-| `console.log`, `sleep`, `setTimeout`, `JSON`, `cryptoRandom()`, `randomBytes(n)` | — | Logging, timing and entropy |
+| `console.log`, `sleep`, `setTimeout`/`setInterval`/`clearTimeout`, `JSON`, `cryptoRandom()`, `randomBytes(n)` | — | Logging, timing and entropy |
 
 A complete Tool:
 
