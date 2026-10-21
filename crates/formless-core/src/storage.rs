@@ -3061,6 +3061,37 @@ impl Store {
         Ok(())
     }
 
+    /// Recent audit entries, newest first: (actor, action, detail, at).
+    /// `action_prefix` narrows them ("tool.", "proposal.").
+    pub fn recent_audit(
+        &self,
+        action_prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT actor, action, detail, created_at FROM audit
+             WHERE ?1 IS NULL OR substr(action,1,length(?1))=?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![action_prefix, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// When each Tool was last invoked (tool id -> RFC 3339).
+    pub fn tool_last_used(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tool_id, MAX(created_at) FROM invocations GROUP BY tool_id")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn audit(&self, actor: &str, action: &str, detail: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO audit(id,actor,action,detail,created_at) VALUES(?1,?2,?3,?4,?5)",

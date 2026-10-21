@@ -31,7 +31,8 @@ pub const REMEMBER: &str = "remember";
 pub const FORGET: &str = "forget";
 pub const ASK_USER: &str = "ask_user";
 pub const SCHEDULE_RUN: &str = "schedule_run";
-pub const RESERVED: [&str; 23] = [
+pub const READ_METRICS: &str = "read_metrics";
+pub const RESERVED: [&str; 24] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -55,6 +56,7 @@ pub const RESERVED: [&str; 23] = [
     FORGET,
     ASK_USER,
     SCHEDULE_RUN,
+    READ_METRICS,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -404,6 +406,25 @@ fn schedule_run_definition() -> Value {
                     "session_id": {"type": "string"}
                 },
                 "required": ["prompt"]
+            }
+        }
+    })
+}
+
+fn read_metrics_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": READ_METRICS,
+            "description": "Registry-wide health, to clean up and explain: kind \"tools\" (filter: needs_attention | failing | unused | a name substring), \"audit\" (recent actions; filter: an action prefix such as tool., proposal., job.), \"models\" (measured model reliability and latency), \"runs\" (Run outcomes), \"builtins\" (built-in call stats).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["tools", "audit", "models", "runs", "builtins"]},
+                    "filter": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Default 50, max 200"}
+                },
+                "required": ["kind"]
             }
         }
     })
@@ -779,6 +800,7 @@ pub fn tool_definitions(
         forget_definition(),
         ask_user_definition(),
         schedule_run_definition(),
+        read_metrics_definition(),
         list_mcp_resources_definition(),
         read_mcp_resource_definition(),
         test_tool_definition(),
