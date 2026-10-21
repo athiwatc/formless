@@ -53,6 +53,9 @@ fn truncated_call_message(tool: &str) -> String {
     )
 }
 
+/// Shared module (name, code) snapshot handed to Invocations.
+type ModuleCode = Arc<Vec<(String, String)>>;
+
 /// Read-only database connections for client queries (see `with_reader`).
 const READER_CONNECTIONS: usize = 4;
 
@@ -97,6 +100,8 @@ pub struct Daemon {
     /// One HTTP client (connection pool + TLS sessions) for every provider
     /// call the daemon makes.
     http: reqwest::Client,
+    /// Module code snapshot keyed by its fingerprint (see `module_code`).
+    modules: StdMutex<Option<(String, ModuleCode)>>,
     /// Parsed config.toml, re-read only when the file changes.
     config: StdMutex<Option<(ConfigStamp, Config)>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
@@ -137,6 +142,7 @@ impl Daemon {
             subs: Arc::new(StdMutex::new(Vec::new())),
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
+            modules: StdMutex::new(None),
             http: reqwest::Client::builder().build()?,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
@@ -1778,9 +1784,24 @@ impl Daemon {
             .unwrap_or_else(|_| SYSTEM_PROMPT.to_string())
     }
 
-    fn module_code(&self) -> Vec<(String, String)> {
-        self.with_store(|st| st.list_module_code())
-            .unwrap_or_default()
+    /// Current module code for Invocations: one shared snapshot, re-read
+    /// only when a module changed (a cheap fingerprint query otherwise).
+    pub(crate) fn module_code(&self) -> ModuleCode {
+        let Ok(stamp) = self.with_store(|st| st.modules_fingerprint()) else {
+            return Arc::default();
+        };
+        let mut cache = self.modules.lock().unwrap();
+        if let Some((cached, code)) = cache.as_ref() {
+            if *cached == stamp {
+                return code.clone();
+            }
+        }
+        let code = Arc::new(
+            self.with_store(|st| st.list_module_code())
+                .unwrap_or_default(),
+        );
+        *cache = Some((stamp, code.clone()));
+        code
     }
 
     async fn create_module_impl(self: &Arc<Self>, args: &Value, cfg: &Config) -> Result<String> {
@@ -1796,9 +1817,10 @@ impl Daemon {
         formless_runtime::check_syntax(&format!("const module = {{exports:{{}}}};\n{code}"))
             .map_err(|e| anyhow!("syntax check failed: {e}"))?;
         // Smoke: actually load the candidate through requireModule.
-        let mut modules = self.module_code();
+        let mut modules = (*self.module_code()).clone();
         modules.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
         modules.push((name.to_string(), code.clone()));
+        let modules = Arc::new(modules);
         let probe = format!(
             "function run() {{ const m = requireModule({}); return {{ ok: typeof m }}; }}",
             serde_json::to_string(name)?
@@ -1852,7 +1874,7 @@ impl Daemon {
             if task.trim().is_empty() {
                 return Err(anyhow!("sub-agent task is empty"));
             }
-            let provider = self.provider(&cfg).await?;
+            let provider = self.provider(cfg).await?;
             let requested = model
                 .map(str::to_string)
                 .unwrap_or_else(|| cfg.provider.model.clone());

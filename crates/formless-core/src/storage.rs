@@ -1256,6 +1256,16 @@ impl Store {
     }
 
     /// Current code of every live module, for the runtime's `requireModule`.
+    /// Changes whenever any module is created, versioned, rolled back or
+    /// retired: lets callers cache [`Store::list_module_code`].
+    pub fn modules_fingerprint(&self) -> Result<String> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) || ':' || COALESCE(SUM(current_version),0) || ':' || COALESCE(SUM(retired),0) || ':' || COALESCE(MAX(updated_at),'') || ':' || (SELECT COUNT(*) FROM module_versions) FROM modules",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn list_module_code(&self) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         for info in self.list_modules()? {

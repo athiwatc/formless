@@ -82,8 +82,9 @@ pub struct ExecRequest {
     pub overlay: Option<Overlay>,
     /// Last-activity heartbeat (epoch millis), updated per host call (§6.1).
     pub activity: Option<Arc<AtomicU64>>,
-    /// Shared JS modules available via `requireModule(name)` (v2).
-    pub modules: Vec<(String, String)>,
+    /// Shared JS modules available via `requireModule(name)` (v2), as
+    /// (name, code). Shared, not copied, between Invocations.
+    pub modules: Arc<Vec<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -132,7 +133,7 @@ struct State {
     /// Smoke/Replay write overlay: discarded writes stay readable within
     /// the same run so write-then-read tools work (§8.4).
     overlay: Overlay,
-    modules: Vec<(String, String)>,
+    modules: Arc<Vec<(String, String)>>,
     streams: Mutex<HashMap<u64, Stream>>,
     next_stream: AtomicU64,
     stubbed: AtomicBool,
