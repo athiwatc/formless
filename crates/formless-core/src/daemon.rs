@@ -41,6 +41,16 @@ fn send_all(subs: &Subs, ev: Event) {
         .retain(|tx| tx.send(ServerMessage::Event(ev.clone())).is_ok());
 }
 
+/// Tool result for a call whose arguments hit the output token limit.
+fn truncated_call_message(tool: &str) -> String {
+    format!(
+        "error: your {tool} call was cut off at the output token limit, so its arguments are \
+         incomplete and it was not run. Do not resend it unchanged: make it smaller (for \
+         create_tool, move helpers into a module or shorten implementation_js; otherwise \
+         send less data per call)."
+    )
+}
+
 pub(crate) fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -895,6 +905,12 @@ impl Daemon {
                     run_id: run_id.to_string(),
                     message: msg,
                 });
+                if result.truncated {
+                    self.broadcast(Event::Note {
+                        session_id: Some(session_id.to_string()),
+                        text: "The answer was cut off at the model's output token limit.".into(),
+                    });
+                }
                 return Ok(());
             }
             // Persist the assistant tool-call turn, execute calls, persist results.
@@ -925,6 +941,25 @@ impl Daemon {
                 session_id: session_id.to_string(),
                 message: call_msg,
             });
+            if result.truncated {
+                // The arguments are cut off: running them (or treating them as
+                // a malformed call) would only repeat the failure. Say why.
+                for tc in &result.tool_calls {
+                    let msg = self.with_store(|st| {
+                        st.append_message_meta(
+                            session_id,
+                            "tool",
+                            &truncated_call_message(&tc.name),
+                            Some(json!({"tool_call_id": tc.id, "name": tc.name}).to_string()),
+                        )
+                    })?;
+                    self.broadcast(Event::MessageAppended {
+                        session_id: session_id.to_string(),
+                        message: msg,
+                    });
+                }
+                continue;
+            }
             let denied = self
                 .approve_calls(&cfg, session_id, run_id, &result.tool_calls, cancel)
                 .await?;

@@ -743,3 +743,82 @@ async fn deleting_a_session_interrupts_its_run_first() {
     assert!(!list.to_string().contains(&sid));
     server.abort();
 }
+
+/// A tool call cut off at the output token limit is not run; the model is
+/// told why. A cut-off answer is flagged to the user.
+#[cfg(unix)]
+#[tokio::test]
+async fn length_truncated_tool_call_is_explained_not_run() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4len");
+    seed_sleeper(&paths);
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                let tool = msgs.iter().find(|m| m["role"] == "tool");
+                let d = match tool {
+                    None => json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1",
+                        "function": {"name": "echo_fast", "arguments": "{\"x\": 12"}}]},
+                        "finish_reason": "length"}]}),
+                    Some(t) => json!({"choices": [{"delta": {"content":
+                        format!("saw: {}", t["content"].as_str().unwrap_or_default())},
+                        "finish_reason": "length"}]}),
+                };
+                format!("data: {d}\n\ndata: [DONE]\n\n")
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let s = c.rpc(Request::CreateSession { name: None }).await;
+    let sid = s["id"].as_str().unwrap().to_string();
+    c.send(Request::SendMessage {
+        session_id: sid.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let (mut started, mut noted) = (false, false);
+    let mut answer = String::new();
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(20), c.lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) else {
+            continue;
+        };
+        match ev {
+            Event::ToolCallStarted { .. } => started = true,
+            Event::MessageDelta { delta, .. } => answer.push_str(&delta),
+            Event::Note { text, .. } if text.contains("cut off") => noted = true,
+            Event::RunFinished { status, .. } => {
+                assert_eq!(status, "completed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(!started, "a truncated call must not run");
+    assert!(
+        answer.contains("cut off at the output token limit"),
+        "{answer}"
+    );
+    assert!(noted, "a truncated answer is flagged");
+    server.abort();
+}
