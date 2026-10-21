@@ -861,6 +861,7 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
+| `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
 | `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
 | `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this long (`ProviderStalled`; `/resend` re-sends); 0 = never |
 | `provider.first_byte_timeout_secs` | 0 | Auto re-send when no first byte arrives in time (up to `max_retries`); 0 = off |

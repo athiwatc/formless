@@ -55,7 +55,14 @@ pub struct Provider {
     /// an OAuth token expiring during a long Run is refreshed in place.
     credential_paths: Option<Paths>,
     http: reqwest::Client,
+    /// Sent as `prompt_cache_key` so the endpoint routes one Session's
+    /// requests to the same cache (see `provider.cache_key`).
+    cache_key: Option<String>,
 }
+
+/// Optional request parameters an endpoint may not know: dropped (once)
+/// when a 400 names them, so they never cost a working setup anything.
+const OPTIONAL_PARAMS: [&str; 2] = ["stream_options", "prompt_cache_key"];
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolCall {
@@ -333,6 +340,7 @@ impl Provider {
             cfg,
             api_key,
             credential_paths: None,
+            cache_key: None,
             http,
         })
     }
@@ -357,6 +365,7 @@ impl Provider {
             cfg,
             api_key,
             credential_paths: Some(paths),
+            cache_key: None,
             http,
         })
     }
@@ -366,6 +375,15 @@ impl Provider {
             Some(paths) => crate::auth::resolve_provider_token(paths, &self.cfg).await,
             None => Ok(self.api_key.clone()),
         }
+    }
+
+    /// Route this provider's requests to a stable prompt cache (e.g. one
+    /// per Session); off when `provider.cache_key = "off"`.
+    pub fn with_cache_key(mut self, key: &str) -> Self {
+        if !self.cfg.cache_key.eq_ignore_ascii_case("off") {
+            self.cache_key = Some(key.to_string());
+        }
+        self
     }
 
     pub fn model(&self) -> &str {
@@ -482,12 +500,16 @@ impl Provider {
                         }
                         server_wait = retry_after(resp.headers());
                         let text = resp.text().await.unwrap_or_default();
-                        if status.as_u16() == 400
-                            && body.get("stream_options").is_some()
-                            && text.to_lowercase().contains("stream_options")
-                        {
+                        let lower = text.to_lowercase();
+                        let rejected = OPTIONAL_PARAMS
+                            .iter()
+                            .find(|p| body.get(**p).is_some() && lower.contains(**p));
+                        if let (400, Some(param)) = (status.as_u16(), rejected) {
+                            tracing::info!(
+                                "provider rejected optional {param}; sending without it"
+                            );
                             if let Some(o) = body.as_object_mut() {
-                                o.remove("stream_options");
+                                o.remove(*param);
                             }
                             continue;
                         }
@@ -574,6 +596,9 @@ impl Provider {
         let effective_tools: &[Value] = if prompt_mode { &[] } else { tools };
         let mut body = if self.cfg.responses() {
             let mut b = json!({"model": model, "input": responses_input(messages), "stream": true});
+            if let Some(key) = &self.cache_key {
+                b["prompt_cache_key"] = json!(key);
+            }
             if !effective_tools.is_empty() {
                 b["tools"] = json!(responses_tools(effective_tools));
             }
@@ -583,6 +608,9 @@ impl Provider {
             // the endpoint rejects the option).
             let mut b = json!({"model": model, "messages": messages, "stream": true,
                 "stream_options": {"include_usage": true}});
+            if let Some(key) = &self.cache_key {
+                b["prompt_cache_key"] = json!(key);
+            }
             if !effective_tools.is_empty() {
                 b["tools"] = json!(effective_tools);
             }

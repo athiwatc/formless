@@ -135,6 +135,9 @@ pub struct ProviderCfg {
     /// Re-send the request automatically when no first byte arrives within
     /// this many seconds (0 = off; the user can always `/resend`).
     pub first_byte_timeout_secs: u64,
+    /// "session" (default): send a per-Session `prompt_cache_key` so the
+    /// endpoint keeps one Session on one prompt cache; "off": never send it.
+    pub cache_key: String,
     /// Longest wait between retries when the server gives no hint (full
     /// jitter below it). A server's `Retry-After` is honoured up to 5 min.
     pub max_backoff_secs: u64,
@@ -207,6 +210,7 @@ impl Default for ProviderCfg {
             stall_notice_secs: 120,
             first_byte_timeout_secs: 0,
             max_backoff_secs: 30,
+            cache_key: "session".into(),
         }
     }
 }

@@ -966,7 +966,10 @@ impl Daemon {
                 "provider not configured; run the onboarding wizard"
             ));
         }
-        let provider = self.provider(&cfg).await?;
+        let provider = self
+            .provider(&cfg)
+            .await?
+            .with_cache_key(&format!("formless-{session_id}"));
         let session = self
             .with_store(|st| st.get_session(session_id))?
             .context("session not found")?;

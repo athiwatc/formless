@@ -596,3 +596,74 @@ async fn cache_probe_reports_cached_tokens_on_the_repeat() {
         .unwrap();
     assert_eq!((u.prompt_tokens, u.cached_tokens), (1500, 1408));
 }
+
+/// prompt_cache_key is sent when set, and dropped if an endpoint rejects it.
+#[tokio::test]
+async fn prompt_cache_key_is_sent_and_dropped_when_rejected() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route(
+        "/chat/completions",
+        post({
+            let seen = seen.clone();
+            move |Json(body): Json<Value>| {
+                let reject = seen.lock().unwrap().is_empty();
+                seen.lock().unwrap().push(body["prompt_cache_key"].clone());
+                async move {
+                    if reject {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(json!({"error": {"message": "Unrecognized request argument: prompt_cache_key"}})),
+                        )
+                            .into_response();
+                    }
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices": [{"delta": {"content": "fine"}}]})
+                    )
+                    .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    let p = Provider::new(c.clone(), "k".into())
+        .unwrap()
+        .with_cache_key("formless-s1");
+    let out = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "x"})],
+            &[],
+            "good",
+            None,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.content, "fine");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![json!("formless-s1"), Value::Null]
+    );
+
+    // cache_key = "off" never sends it.
+    c.cache_key = "off".into();
+    let p = Provider::new(c, "k".into())
+        .unwrap()
+        .with_cache_key("formless-s1");
+    p.chat_stream(
+        &[json!({"role": "user", "content": "x"})],
+        &[],
+        "good",
+        None,
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(seen.lock().unwrap().last().unwrap(), &Value::Null);
+}
