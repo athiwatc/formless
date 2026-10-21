@@ -339,6 +339,69 @@ async fn fetch_headers_binary_streaming_and_scoped_redirects() {
     assert_eq!(e.kind, ExecErrorKind::Denied, "{}", e.message);
 }
 
+/// Redirects are followed by hand on one shared client: methods change
+/// like a browser's, credentials stay on their host, loops are cut off.
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_redirect_hops_follow_browser_rules() {
+    use axum::{
+        http::{HeaderMap, Method},
+        response::Redirect,
+        routing::{any, get},
+        Router,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    let app =
+        Router::new()
+            .route(
+                "/echo",
+                any(
+                    |method: Method, headers: HeaderMap, body: String| async move {
+                        format!(
+                            "{method} auth={} body={}",
+                            headers.contains_key("authorization"),
+                            body.len()
+                        )
+                    },
+                ),
+            )
+            .route("/see-other", any(|| async { Redirect::to("/echo") }))
+            .route("/keep", any(|| async { Redirect::temporary("/echo") }))
+            .route(
+                "/elsewhere",
+                any(move || async move {
+                    Redirect::temporary(&format!("http://localhost:{port}/echo"))
+                }),
+            )
+            .route("/loop", any(|| async { Redirect::temporary("/loop") }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let fetch = |path: &str| {
+        let code = format!(
+            "function run(){{ return fetch('{base}{path}', {{method: 'POST', body: 'abc', headers: {{authorization: 'secret'}}}}).body; }}"
+        );
+        tokio::task::spawn_blocking(move || live(&code, json!({}), &["net"]))
+    };
+    assert_eq!(
+        fetch("/see-other").await.unwrap().unwrap(),
+        "GET auth=true body=0",
+        "303 turns into a bodiless GET"
+    );
+    assert_eq!(
+        fetch("/keep").await.unwrap().unwrap(),
+        "POST auth=true body=3",
+        "307 keeps the method and body"
+    );
+    assert_eq!(
+        fetch("/elsewhere").await.unwrap().unwrap(),
+        "POST auth=false body=3",
+        "credentials are not sent on to another host"
+    );
+    let e = fetch("/loop").await.unwrap().unwrap_err();
+    assert!(e.message.contains("too many redirects"), "{}", e.message);
+}
+
 fn temp_paths(tag: &str) -> Paths {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-{tag}-{short}"));
