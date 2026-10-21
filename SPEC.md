@@ -292,7 +292,7 @@ pattern (§4.4).
 - **Built-ins (v2.2).** The minimal set the harness needs to grow itself:
   `create_tool`, `create_module`, `retire_tool`,
   `find_tools`, `read_tool`, `read_module`, `read_artifact`, `test_tool`,
-  `unload_tools`,
+  `unload_tools`, `remember`, `forget` (§7.11),
   and the Pending Invocation handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
   former built-in; sub-agents are now the `agent` Capability, §7.6), so no
   registry Tool can impersonate one.
@@ -645,6 +645,30 @@ Tools fill capability gaps; skills say how to use them well.
   CLI `formless skills add|remove|list|enable|disable|show`; TUI `/skills`
   (`/skills enable|disable NAME`); the web Settings view (review, enable,
   remove). Changes are audit-logged.
+
+### 7.11 User memory
+
+Short notes about stable user preferences and facts ("uses pnpm",
+"answer in Thai", "projects live in ~/code"). The agent writes them and
+the user can see them. They are not eval-gated, because the prompt eval
+suite cannot measure preferences.
+
+- **Built-ins:** `remember({text, scope?})` saves a note of at most 300
+  characters. `scope` is `global` (the default) or
+  `project:<absolute path>`. A duplicate (same scope, same text ignoring
+  case and spacing) refreshes the existing note. `forget({id})` deletes one.
+  The bootstrap prompt says to remember lasting preferences and facts,
+  never secrets or one-off details, and to forget on request.
+- **Store:** the `memories` table (schema v17) holds the text, scope,
+  author (`agent`, `user`, `optimiser`), the source Session, an enabled
+  flag, the created and updated times, and `last_used`.
+- **Injection:** a "User memory" block with the global notes, then the
+  project notes grouped as "When working in <path>:", each tagged with its
+  `[id]`. The block is part of the per-Session system prompt snapshot, so
+  it keeps the cache stable. A new note applies from the next Session, or
+  from this one after compaction, which adds a note to the chat that the
+  prompt changed. Disabled notes are left out.
+- Every change is audit-logged and broadcasts `MemoryUpdated`.
 
 ## 8. Metrics and Self-Optimisation
 

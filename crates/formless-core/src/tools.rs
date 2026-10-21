@@ -27,7 +27,9 @@ pub const LIST_MCP_RESOURCES: &str = "list_mcp_resources";
 pub const READ_MCP_RESOURCE: &str = "read_mcp_resource";
 pub const LOAD_SKILL: &str = "load_skill";
 pub const READ_SKILL_FILE: &str = "read_skill_file";
-pub const RESERVED: [&str; 19] = [
+pub const REMEMBER: &str = "remember";
+pub const FORGET: &str = "forget";
+pub const RESERVED: [&str; 21] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -47,6 +49,8 @@ pub const RESERVED: [&str; 19] = [
     READ_MCP_RESOURCE,
     LOAD_SKILL,
     READ_SKILL_FILE,
+    REMEMBER,
+    FORGET,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -340,6 +344,39 @@ fn read_skill_file_definition() -> Value {
                 "type": "object",
                 "properties": {"name": {"type": "string"}, "path": {"type": "string"}},
                 "required": ["name", "path"]
+            }
+        }
+    })
+}
+
+fn remember_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": REMEMBER,
+            "description": "Save a short note (max 300 chars) about a stable user preference or fact, e.g. \"Uses pnpm, not npm\" or \"Answer in Thai\", when the user states one or asks you to remember. Never secrets, credentials or one-off task details. The user sees every note; it applies from the next Session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "scope": {"type": "string", "description": "\"global\" (default) or \"project:<absolute path>\" for one project"}
+                },
+                "required": ["text"]
+            }
+        }
+    })
+}
+
+fn forget_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": FORGET,
+            "description": "Delete a memory note by its id (shown in [brackets] in the User memory list) when the user asks or it is no longer true.",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
             }
         }
     })
@@ -696,6 +733,8 @@ pub fn tool_definitions(
         remove_mcp_server_definition(),
         load_skill_definition(),
         read_skill_file_definition(),
+        remember_definition(),
+        forget_definition(),
         list_mcp_resources_definition(),
         read_mcp_resource_definition(),
         test_tool_definition(),
