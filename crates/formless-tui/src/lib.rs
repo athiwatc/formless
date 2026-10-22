@@ -316,6 +316,8 @@ enum WizardJob {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum WizardStep {
+    /// Choose a provider preset (or Custom URL).
+    PickPreset,
     BaseUrl,
     ApiKey,
     FetchModels,
@@ -327,6 +329,12 @@ enum WizardStep {
 
 struct Wizard {
     step: WizardStep,
+    /// Highlighted row in `PickPreset`: a preset, or `PRESETS.len()` for
+    /// a custom URL.
+    preset_idx: usize,
+    preset: Option<&'static formless_core::presets::Preset>,
+    /// A failed model fetch from a local server: Enter retries it.
+    retry_fetch: bool,
     base_url: String,
     api_key: String,
     picker: picker::ModelPicker,
@@ -347,17 +355,25 @@ impl Wizard {
         // Remember previous startup options: a saved config starts at the
         // API-key step (Esc returns to the URL), with model/effort restored.
         let has_saved = !cfg.provider.base_url.trim().is_empty();
+        let preset = formless_core::presets::for_url(&cfg.provider.base_url);
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
-                "Saved setup found. Re-enter your API key to restore it (Esc to edit the base URL).".into(),
+                "Saved setup found. Re-enter your API key to restore it (Esc to choose another provider).".into(),
             )
         } else {
             (
-                WizardStep::BaseUrl,
-                "Welcome to Formless. Enter your provider base URL.".into(),
+                WizardStep::PickPreset,
+                "Welcome to Formless. Choose your model provider.".into(),
             )
         };
+        let preset_idx = preset
+            .and_then(|p| {
+                formless_core::presets::PRESETS
+                    .iter()
+                    .position(|x| x.id == p.id)
+            })
+            .unwrap_or(0);
         let effort_idx = cfg
             .provider
             .reasoning_effort
@@ -366,6 +382,9 @@ impl Wizard {
             .unwrap_or(0);
         Self {
             step,
+            preset_idx,
+            preset,
+            retry_fetch: false,
             base_url: cfg.provider.base_url.clone(),
             api_key: String::new(),
             picker: picker::ModelPicker::loading(),
@@ -379,6 +398,59 @@ impl Wizard {
     }
     fn model(&self) -> String {
         self.picker.choice().unwrap_or_default()
+    }
+
+    /// The API-key step, with the preset's key page and any key found in
+    /// the environment.
+    fn enter_api_key_step(&mut self) {
+        self.step = WizardStep::ApiKey;
+        let mut status = String::from("Enter your API key (stored in the OS keychain).");
+        if let Some(p) = self.preset {
+            if let Some(url) = p.key_url {
+                status.push_str(&format!(" Get one at {url}"));
+            }
+            if let Some((var, _)) = formless_core::presets::env_key(p) {
+                status = format!("Found ${var}: press Enter to use it, or type a different key.");
+            }
+        }
+        self.status = status;
+    }
+
+    /// List the endpoint's models in the background (`FetchModels`).
+    fn fetch_models(&mut self) {
+        self.step = WizardStep::FetchModels;
+        self.status = format!("Fetching models from {}…", self.base_url.trim());
+        let (tx, mut cfg) = (self.job_tx.clone(), Config::default());
+        cfg.provider.base_url = self.base_url.trim().to_string();
+        let (pcfg, key) = (cfg.provider.clone(), self.api_key.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(WizardJob::Models(
+                list_models_blocking(&pcfg, &key).map_err(|e| e.to_string()),
+            ));
+        });
+    }
+
+    /// Apply the highlighted preset (or go to the custom URL step).
+    fn choose_preset(&mut self) {
+        let Some(p) = formless_core::presets::PRESETS.get(self.preset_idx) else {
+            self.preset = None;
+            self.step = WizardStep::BaseUrl;
+            self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
+            return;
+        };
+        self.preset = Some(p);
+        self.base_url = p.base_url.to_string();
+        if self.saved_model.is_empty() {
+            self.saved_model = p.default_model.to_string();
+        }
+        if p.local {
+            // No key; listing models doubles as the reachability check.
+            self.api_key.clear();
+            self.retry_fetch = true;
+            self.fetch_models();
+        } else {
+            self.enter_api_key_step();
+        }
     }
 }
 
@@ -3078,6 +3150,13 @@ impl App {
                         w.step = WizardStep::PickModel;
                         w.status = "Pick a model: type to filter, Up/Down, Enter.".into();
                     }
+                    WizardJob::Models(Err(e)) if w.retry_fetch => {
+                        w.step = WizardStep::Failed;
+                        w.status = format!(
+                            "Can't reach {} ({e}). Start the server, then press Enter to retry (Esc for another provider).",
+                            w.base_url.trim()
+                        );
+                    }
                     WizardJob::Models(_) => {
                         w.picker = picker::ModelPicker::new(Vec::new());
                         w.picker.query = w.saved_model.clone();
@@ -3113,6 +3192,9 @@ impl App {
         let w = self.wizard.take().expect("wizard");
         let mut cfg = Config::load(&self.paths)?;
         cfg.provider.base_url = w.base_url.trim().to_string();
+        if let Some(p) = w.preset {
+            cfg.provider.api_style = p.api_style.to_string();
+        }
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
         if w.prompt_fallback {
@@ -3125,12 +3207,27 @@ impl App {
 
     fn wizard_key(&mut self, key: KeyEvent) {
         let Some(w) = &mut self.wizard else { return };
+        let presets = formless_core::presets::PRESETS.len();
         match w.step {
-            WizardStep::BaseUrl => match key.code {
-                KeyCode::Enter if !w.base_url.trim().is_empty() => {
-                    w.step = WizardStep::ApiKey;
-                    w.status = "Enter your API key (stored in the OS keychain).".into();
+            WizardStep::PickPreset => match key.code {
+                KeyCode::Up => w.preset_idx = w.preset_idx.saturating_sub(1),
+                KeyCode::Down => w.preset_idx = (w.preset_idx + 1).min(presets),
+                KeyCode::Char(d @ '1'..='9') => {
+                    let n = d as usize - '1' as usize;
+                    if n <= presets {
+                        w.preset_idx = n;
+                        w.choose_preset();
+                    }
                 }
+                KeyCode::Enter => w.choose_preset(),
+                _ => {}
+            },
+            WizardStep::BaseUrl => match key.code {
+                KeyCode::Esc => {
+                    w.step = WizardStep::PickPreset;
+                    w.status = "Choose your model provider.".into();
+                }
+                KeyCode::Enter if !w.base_url.trim().is_empty() => w.enter_api_key_step(),
                 KeyCode::Char(c) => w.base_url.push(c),
                 KeyCode::Backspace => {
                     w.base_url.pop();
@@ -3139,20 +3236,17 @@ impl App {
             },
             WizardStep::ApiKey => match key.code {
                 KeyCode::Esc => {
-                    w.step = WizardStep::BaseUrl;
-                    w.status = "Enter your provider base URL.".into();
+                    w.step = WizardStep::PickPreset;
+                    w.status = "Choose your model provider.".into();
                 }
                 KeyCode::Enter => {
-                    w.step = WizardStep::FetchModels;
-                    w.status = "Fetching models…".into();
-                    let (tx, mut cfg) = (w.job_tx.clone(), Config::default());
-                    cfg.provider.base_url = w.base_url.trim().to_string();
-                    let (pcfg, key2) = (cfg.provider.clone(), w.api_key.clone());
-                    std::thread::spawn(move || {
-                        let _ = tx.send(WizardJob::Models(
-                            list_models_blocking(&pcfg, &key2).map_err(|e| e.to_string()),
-                        ));
-                    });
+                    if w.api_key.is_empty() {
+                        if let Some((_, k)) = w.preset.and_then(formless_core::presets::env_key) {
+                            w.api_key = k;
+                        }
+                    }
+                    w.retry_fetch = false;
+                    w.fetch_models();
                 }
                 KeyCode::Char(c) => w.api_key.push(c),
                 KeyCode::Backspace => {
@@ -3191,6 +3285,12 @@ impl App {
                 }
                 _ => {}
             },
+            WizardStep::Failed if w.retry_fetch && key.code == KeyCode::Esc => {
+                w.retry_fetch = false;
+                w.step = WizardStep::PickPreset;
+                w.status = "Choose your model provider.".into();
+            }
+            WizardStep::Failed if w.retry_fetch && key.code == KeyCode::Enter => w.fetch_models(),
             WizardStep::Failed if key.code == KeyCode::Enter => {
                 w.step = WizardStep::PickModel;
                 w.status = "Pick a model.".into();
@@ -6187,7 +6287,7 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     let (step_no, step_name) = match w.step {
-        WizardStep::BaseUrl => (1, "Provider"),
+        WizardStep::PickPreset | WizardStep::BaseUrl => (1, "Provider"),
         WizardStep::ApiKey | WizardStep::FetchModels => (2, "API key"),
         WizardStep::PickModel => (3, "Model"),
         WizardStep::PickEffort => (4, "Reasoning effort"),
@@ -6250,6 +6350,20 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         out
     };
     match w.step {
+        WizardStep::PickPreset => {
+            let mut rows: Vec<String> = formless_core::presets::PRESETS
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let env = formless_core::presets::env_key(p)
+                        .map(|(var, _)| format!("  (${var} found)"))
+                        .unwrap_or_default();
+                    format!("{}. {}{env}", i + 1, p.name)
+                })
+                .collect();
+            rows.push(format!("{}. Custom URL…", rows.len() + 1));
+            text.extend(pick(rows, w.preset_idx));
+        }
         WizardStep::BaseUrl => text.push(field("Base URL", format!("{}▏", w.base_url))),
         WizardStep::ApiKey | WizardStep::FetchModels => {
             text.push(field("Base URL", w.base_url.clone()));
@@ -6669,6 +6783,36 @@ mod tests {
     }
 
     #[test]
+    fn wizard_starts_with_provider_presets() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.wizard = Some(Wizard::new(&Config::default()));
+        assert!(render(&mut app, 90, 30).contains("2. Anthropic"));
+        // Groq: fills the endpoint and links to its keys page.
+        app.key(key(KeyCode::Char('5')));
+        let w = app.wizard.as_ref().unwrap();
+        assert_eq!(w.step, WizardStep::ApiKey);
+        assert_eq!(w.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(w.saved_model, "llama-3.3-70b-versatile");
+        assert!(w.status.contains("console.groq.com") || w.status.contains("$GROQ_API_KEY"));
+        // Esc returns to the presets; the last row is a custom URL.
+        app.key(key(KeyCode::Esc));
+        for _ in 0..20 {
+            app.key(key(KeyCode::Down));
+        }
+        app.key(key(KeyCode::Enter));
+        let w = app.wizard.as_ref().unwrap();
+        assert_eq!(w.step, WizardStep::BaseUrl);
+        assert!(w.preset.is_none());
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickPreset);
+        // A saved setup recognises its preset.
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "https://openrouter.ai/api/v1".into();
+        assert_eq!(Wizard::new(&cfg).preset.unwrap().id, "openrouter");
+    }
+
+    #[test]
     fn wizard_remembers_saved_startup_options() {
         let mut cfg = Config::default();
         cfg.provider.base_url = "https://api.deepseek.com".into();
@@ -6681,7 +6825,7 @@ mod tests {
         assert_eq!(EFFORTS[w.effort_idx], Some("high"));
 
         let fresh = Wizard::new(&Config::default());
-        assert_eq!(fresh.step, WizardStep::BaseUrl);
+        assert_eq!(fresh.step, WizardStep::PickPreset);
     }
 
     #[test]

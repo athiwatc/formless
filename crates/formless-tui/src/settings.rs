@@ -348,7 +348,7 @@ impl Form {
                     "base_url",
                     &get("base_url"),
                     false,
-                    "e.g. http://localhost:11434/v1",
+                    "a URL, or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio",
                 ),
                 field("model", &get("model"), false, "optional: its default model"),
                 field(
@@ -417,10 +417,12 @@ impl Form {
         }
         match self.kind {
             FormKind::Provider => {
-                let base_url = self.value(1);
-                if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-                    return Err("base_url must start with http:// or https://".into());
-                }
+                let Some(base_url) = formless_core::presets::resolve_base_url(&self.value(1))
+                else {
+                    return Err(
+                        "base_url must start with http:// or https://, or name a preset".into(),
+                    );
+                };
                 Ok(Request::UpsertProvider {
                     name,
                     base_url,
@@ -492,7 +494,7 @@ mod tests {
         f.fields[0].input.set("local");
         f.fields[1].input.set("localhost:11434");
         assert!(f.request().unwrap_err().contains("http://"));
-        f.fields[1].input.set("http://localhost:11434/v1");
+        f.fields[1].input.set("ollama");
         f.fields[3].input.set("sk-1");
         match f.request().unwrap() {
             Request::UpsertProvider {

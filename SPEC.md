@@ -134,6 +134,23 @@ without redesign.
 
 ### 4.2 Configuration and selection
 
+- **Provider presets** (`presets.rs`): OpenAI, Anthropic
+  (OpenAI-compatible endpoint), OpenRouter, Google Gemini
+  (OpenAI-compatible), Groq, Ollama (local) and LM Studio (local). Each
+  preset gives the base URL and `api_style`, where to get a key, the
+  environment variable that often holds one, and a default model that is
+  pre-selected when the endpoint lists it. The wizard starts by choosing
+  a preset or "Custom URL…" (↑/↓ or a digit). A saved config whose
+  endpoint matches a preset is recognised as that preset.
+  - Local presets skip the key step. Listing their models doubles as the
+    reachability check; on failure the wizard asks you to start the
+    server and press Enter to retry.
+  - When the preset's variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+    `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`) is set, Enter
+    on an empty key uses it.
+  - Presets also work later: `formless providers add NAME --preset ID`,
+    a preset id in Settings → Providers' base_url field, and
+    `providers.upsert` with `preset` (or a preset id as `base_url`).
 - Onboarding collects `base_url` + API key, then fetches `/models`; the user
   picks a **model** and a **reasoning effort**. If `/models` fails, manual
   model-name entry is offered. Model + effort are a daemon default,

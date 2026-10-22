@@ -3951,11 +3951,18 @@ impl Daemon {
                         "provider names use letters, digits, '-' and '_' (and not 'default')"
                     ));
                 }
-                let base_url = args["base_url"]
+                // A URL, or a preset id (SPEC §4.2) in `preset` or `base_url`.
+                let base_url = args["preset"]
                     .as_str()
-                    .context("base_url required")?
-                    .trim_end_matches('/')
-                    .to_string();
+                    .or(args["base_url"].as_str())
+                    .context("base_url or preset required")?;
+                let base_url = crate::presets::resolve_base_url(base_url).with_context(|| {
+                    let ids: Vec<_> = crate::presets::PRESETS.iter().map(|p| p.id).collect();
+                    format!(
+                        "'{base_url}' is neither a URL nor a preset ({})",
+                        ids.join(", ")
+                    )
+                })?;
                 // Validate before applying: the endpoint must answer at all.
                 self.http
                     .get(format!("{base_url}/models"))
