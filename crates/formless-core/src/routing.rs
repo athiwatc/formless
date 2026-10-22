@@ -81,3 +81,79 @@ pub fn select_model(cfg: &ProviderCfg, stats: &[ModelStat], complex: bool) -> Op
     }
     best.map(|(m, _)| m)
 }
+
+/// One (role, model) pair's finished sub-agent tasks (SPEC §4.6).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskStat {
+    pub model: String,
+    pub samples: i64,
+    /// Tasks that completed and were not immediately re-run.
+    pub good: i64,
+    pub avg_ms: f64,
+    pub avg_tokens: f64,
+}
+
+impl TaskStat {
+    pub fn good_rate(&self) -> f64 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            self.good as f64 / self.samples as f64
+        }
+    }
+}
+
+/// Per-task model choice for a role with `model = "auto"` (SPEC §4.6):
+/// quality is a gate, cost decides among those that pass.
+///
+/// - A candidate qualifies with at least `min_samples` tasks and a good
+///   rate of at least `quality_bar`.
+/// - Among qualifiers the cheapest per task wins: time and tokens per
+///   finished task, each relative to the best qualifier, weighted equally
+///   (never per call).
+/// - With no qualifier, the first listed candidate; `explore` (the
+///   caller's coin flip) instead tries the least-sampled under-sampled
+///   one, so the others can earn samples.
+pub fn select_task_model(
+    candidates: &[String],
+    stats: &[TaskStat],
+    min_samples: i64,
+    quality_bar: f64,
+    explore: bool,
+) -> Option<String> {
+    let stat = |m: &str| stats.iter().find(|s| s.model == m);
+    if explore {
+        if let Some(m) = candidates
+            .iter()
+            .filter(|m| stat(m).map_or(0, |s| s.samples) < min_samples)
+            .min_by_key(|m| stat(m).map_or(0, |s| s.samples))
+        {
+            return Some(m.clone());
+        }
+    }
+    let qualified: Vec<&TaskStat> = candidates
+        .iter()
+        .filter_map(|m| stat(m))
+        .filter(|s| s.samples >= min_samples && s.good_rate() >= quality_bar)
+        .collect();
+    if qualified.is_empty() {
+        return candidates.first().cloned();
+    }
+    let best_ms = qualified
+        .iter()
+        .map(|s| s.avg_ms)
+        .fold(f64::MAX, f64::min)
+        .max(1.0);
+    let best_tok = qualified
+        .iter()
+        .map(|s| s.avg_tokens)
+        .fold(f64::MAX, f64::min)
+        .max(1.0);
+    qualified
+        .into_iter()
+        .min_by(|a, b| {
+            let cost = |s: &TaskStat| s.avg_ms / best_ms + s.avg_tokens / best_tok;
+            cost(a).total_cmp(&cost(b))
+        })
+        .map(|s| s.model.clone())
+}

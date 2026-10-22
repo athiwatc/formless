@@ -333,7 +333,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 28;
+pub const SCHEMA_VERSION: i64 = 31;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -348,7 +348,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 28] = [
+const MIGRATIONS: [(i64, MigrationStep); 31] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -416,6 +416,30 @@ const MIGRATIONS: [(i64, MigrationStep); 28] = [
     // Session delete with an undo window (SPEC §5.1).
     (27, |c| add_column(c, "sessions", "deleted_at TEXT")),
     (28, |c| Ok(c.execute_batch(SCHEMA_V28)?)),
+    // Which role/model a sub-agent ran on (SPEC §4.5).
+    (29, |c| {
+        add_column(c, "subagents", "model TEXT NOT NULL DEFAULT ''")
+    }),
+    // Per-task routing stats for roles (SPEC §4.6).
+    (30, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_stats (
+               id TEXT PRIMARY KEY, role TEXT NOT NULL, model TEXT NOT NULL,
+               session_id TEXT, run_id TEXT, task_hash TEXT NOT NULL,
+               ms INTEGER NOT NULL, tokens INTEGER NOT NULL, turns INTEGER NOT NULL,
+               outcome TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS idx_task_stats ON task_stats(role, model);",
+        )?)
+    }),
+    // Agent changes to the harness, with what they replaced (SPEC §7.13).
+    (31, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS harness_changes (
+               id TEXT PRIMARY KEY, op TEXT NOT NULL, target TEXT NOT NULL,
+               before TEXT NOT NULL, after TEXT NOT NULL, tool TEXT NOT NULL,
+               reason TEXT NOT NULL, undone INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);",
+        )?)
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1274,6 +1298,104 @@ impl Store {
             .filter(|(_, s, _): &(String, String, String)| s == "interrupted" || s == "paused"))
     }
 
+    /// Record one finished sub-agent task for routing (SPEC §4.6).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_task(
+        &self,
+        role: &str,
+        model: &str,
+        session_id: &str,
+        run_id: &str,
+        task_hash: &str,
+        ms: i64,
+        tokens: i64,
+        turns: i64,
+        outcome: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO task_stats(id,role,model,session_id,run_id,task_hash,ms,tokens,turns,outcome,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![uuid::Uuid::new_v4().to_string(), role, model, session_id, run_id, task_hash, ms, tokens, turns, outcome, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The same task started again in the same Run: the earlier result was
+    /// not good enough, so it no longer counts as good.
+    pub fn mark_task_respawned(&self, role: &str, run_id: &str, task_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE task_stats SET outcome='respawned' WHERE role=?1 AND run_id=?2 AND task_hash=?3 AND outcome='completed'",
+            params![role, run_id, task_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Per-model task stats of a role.
+    pub fn task_stats(&self, role: &str) -> Result<Vec<crate::routing::TaskStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, COUNT(*), SUM(outcome='completed'), AVG(ms), AVG(tokens) FROM task_stats WHERE role=?1 GROUP BY model",
+        )?;
+        let rows = stmt
+            .query_map(params![role], |r| {
+                Ok(crate::routing::TaskStat {
+                    model: r.get(0)?,
+                    samples: r.get(1)?,
+                    good: r.get(2)?,
+                    avg_ms: r.get(3)?,
+                    avg_tokens: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Log an agent change to the harness (SPEC §7.13).
+    pub fn record_harness_change(
+        &self,
+        op: &str,
+        target: &str,
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        tool: &str,
+        reason: &str,
+    ) -> Result<String> {
+        let id = format!("h{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        self.conn.execute(
+            "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, op, target, before.to_string(), after.to_string(), tool, reason, now()],
+        )?;
+        Ok(id)
+    }
+
+    /// Harness changes, newest first.
+    pub fn harness_changes(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, op, target, before, after, tool, reason, undone, created_at FROM harness_changes
+             ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                let parse = |s: String| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?, "op": r.get::<_, String>(1)?,
+                    "target": r.get::<_, String>(2)?, "before": parse(r.get(3)?),
+                    "after": parse(r.get(4)?), "tool": r.get::<_, String>(5)?,
+                    "reason": r.get::<_, String>(6)?, "undone": r.get::<_, i64>(7)? != 0,
+                    "created_at": r.get::<_, String>(8)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_harness_undone(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE harness_changes SET undone=1 WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// One model call made in a Run (a step).
     pub fn bump_run_steps(&self, run_id: &str) -> Result<()> {
         self.conn
@@ -1288,6 +1410,13 @@ impl Store {
         self.conn.execute(
             "UPDATE runs SET followup=?2 WHERE id=(SELECT id FROM runs WHERE session_id=?1
                ORDER BY created_at DESC, rowid DESC LIMIT 1) AND followup=''",
+            params![session_id, followup],
+        )?;
+        // A primary role's task that the user corrected was not good
+        // (SPEC §4.6).
+        self.conn.execute(
+            "UPDATE task_stats SET outcome=?2 WHERE run_id=(SELECT id FROM runs WHERE session_id=?1
+               ORDER BY created_at DESC, rowid DESC LIMIT 1) AND outcome='completed'",
             params![session_id, followup],
         )?;
         Ok(())
@@ -1349,18 +1478,20 @@ impl Store {
         run_id: &str,
         task: &str,
         depth: u32,
+        model: &str,
     ) -> Result<SubagentInfo> {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
         self.conn.execute(
-            "INSERT INTO subagents(id,session_id,run_id,task,depth,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'running',?6,?6)",
-            params![id, session_id, run_id, task, depth, t],
+            "INSERT INTO subagents(id,session_id,run_id,task,depth,status,created_at,updated_at,model) VALUES(?1,?2,?3,?4,?5,'running',?6,?6,?7)",
+            params![id, session_id, run_id, task, depth, t, model],
         )?;
         self.get_subagent(&id)?.context("sub-agent vanished")
     }
 
     fn row_subagent(r: &rusqlite::Row) -> rusqlite::Result<SubagentInfo> {
         Ok(SubagentInfo {
+            model: r.get("model")?,
             id: r.get("id")?,
             session_id: r.get("session_id")?,
             run_id: r.get("run_id")?,

@@ -119,6 +119,13 @@ without redesign.
   `routing_fast_models` / `routing_strong_models` subsets constrain
   simple vs complex tasks (`routing_complex_chars`). No vendor ranking
   is hard-coded. Stats are visible in the Metrics view and `doctor`.
+  **Deprecated (§4.6):** a global `provider.model = "auto"` is migrated on
+  daemon start. A `primary` role is created with `model = "auto"` and the
+  former routing pool as `candidates`, `provider.model` becomes
+  `role:primary`, the file is rewritten, and every client gets the warning
+  as a note when it connects. A Session set to `auto` uses `role:primary`
+  when that role exists. The global per-call pool remains only for an
+  `auto` role without `candidates`.
 - v2 subscription/OAuth providers use the same OpenAI-compatible HTTP
   surface with a Bearer access token obtained by OAuth2
   authorization-code + PKCE (`provider.auth.mode = "oauth"`). This is a
@@ -191,6 +198,88 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   correction prompt and counted in a **separate** malformed-call counter —
   they never pollute Tool Success Rate.
 
+### 4.5 Providers and Roles
+
+The user talks to one **primary** model; work can go to others.
+
+- **Providers.** `[provider]` is the provider named `default`, unchanged
+  for existing setups. `[providers.<name>]` adds more, with the same
+  fields (`base_url`, `model`, headers, per-model `context_tokens`, …).
+  - Keys: a named provider's API key lives in the keychain or 0600 secret
+    `provider-key-<name>` (or the env var `FORMLESS_API_KEY_<NAME>`), and
+    is never in the config file or a listing. Named providers use API
+    keys; OAuth stays with `default`.
+  - Requests: `ListProviders` (with `has_key`), `UpsertProvider` (the key
+    goes straight to the keychain), `TestProvider` (lists `/models`) and
+    `RemoveProvider` (refused while a role uses it).
+- **Roles.** `[roles.<name>]` holds a `description` (when to use it,
+  written for the agent), a `provider` (default `default`), a `model`
+  (empty = that provider's default), an optional `reasoning_effort`, and
+  an optional `system` addendum for sub-agents in the role. Roles change
+  through `UpsertRole` and `DeleteRole`.
+  - CLI: `formless providers list|add|remove|test` and `formless roles
+    list|add|rm`. The CLI reads the key from stdin, never argv.
+  - TUI: `/roles`, `/role add NAME PROVIDER MODEL description…` and
+    `/role rm NAME`.
+- **Choosing a role.** The system prompt lists the roles with their
+  descriptions, so the agent picks by intent:
+  - inside a Tool, `agents.run(task, {role})` and `llm.complete(prompt,
+    {role})`; an explicit `model` still works
+  - for the primary Session, `/model role:<name>`, which runs the Session
+    on that role's provider and model.
+  No role means the Session's own model and effort. An unknown role is
+  an error naming the configured ones. Capability scopes apply as for
+  models (`agent:role:<name>` / `llm:role:<name>`). A sub-agent records
+  its role and model (`subagents.model`, schema v29), and the TUI shows
+  it on the sub-agent's node.
+- **Fallback.** A role's model may be `auto` and goes through the
+  existing routing and failover of `default`. If a role's provider is
+  unreachable, the call fails like any provider error (§4.4) rather than
+  silently using another provider.
+- **Design answers (#195).**
+  - Who decides: the user defines the roles; the primary model chooses
+    among them at call time.
+  - Nesting: sub-agents may spawn others only within
+    `tools.max_agent_depth`, as before.
+  - Not yet: per-role budgets, and making the optimiser and namer
+    built-in roles.
+  - Per-role `auto` with per-task scoring follows in #201 and #202.
+
+### 4.6 Per-task routing for roles
+
+Per-call success and latency (§4.1 routing) cannot tell whether a
+sub-agent's answer was good, and per-call latency is the wrong unit. A
+role with `model = "auto"` and `candidates` is therefore routed **per
+task, with quality as a gate**.
+
+- **Recorded per task,** for each finished sub-agent in a role
+  (`task_stats`, schema v30): role, model, wall-clock, tokens and turns
+  for the whole task, and an outcome:
+  - `completed`
+  - `failed`
+  - `limit`: it hit `max_turns`, set by the role or by
+    `tools.subagent_max_turns` (40); every sub-agent now stops there.
+  - `respawned`: the primary agent started the same task again in the
+    same Run, so the first result wasn't good enough.
+  Interrupted tasks are not recorded.
+- **Selection** (`routing::select_task_model`):
+  - A candidate qualifies once it has `tools.task_min_samples` (5) tasks
+    and at least `tools.task_quality_bar` (0.8) of them completed and not
+    re-run.
+  - Among qualifiers the cheapest per task wins: time plus tokens, each
+    relative to the best qualifier.
+  - With no qualifier, the role's first candidate. With probability
+    `tools.task_explore_rate` (0.1), the least-sampled under-sampled
+    candidate instead, so the others earn samples.
+- **The primary Session counts too.** A Run on a role (for example the
+  migrated `primary`) is recorded as one task with the model it resolved
+  to. When the user edits and re-runs it, or corrects it ("that's
+  wrong", §8.7), the task becomes bad, so per-role `auto` has a quality
+  signal for the primary role as well.
+- Per-call outcomes stay as they were, for failover and the Models
+  metrics view.
+- Pinned roles (a concrete `model`) are unaffected.
+
 ## 5. Agent loop, Sessions, and Runs
 
 ### 5.1 Session
@@ -240,7 +329,7 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 
 - **Enter during a Run = Steer** (the default): the message is injected at
   the next step boundary without killing in-flight work. **Ctrl+Enter =
-  queue** for after the Run ends (binding configurable); queued messages
+  queue** for after the Run ends (Ctrl+J or Alt+Enter in any terminal, §10.5); queued messages
   are stored in the database, so a daemon restart does not lose them, and
   `GetSession` lists them. When idle, Enter
   simply starts a new Run.
@@ -488,6 +577,7 @@ pattern (§4.4).
 | `llm` | optionally per-model | v2; LLM completions from inside Tools (§7.5) |
 | `agent` | optionally per-model | v2; sub-agents from inside Tools (§7.6) |
 | `store` / `store:<ns>` | own / named shared namespace | Key-value state between Invocations; not sensitive (no approval) |
+| `harness:<scope>` | `read`, `mcp`, `skills`, `models`, `providers`, `roles`, `config` | Read or change the harness itself (§7.13); every change is approved with a diff |
 
 - **Input-bound scopes (v2.1).** `fs:read`, `fs:write` and `net` may be
   scoped to an input field instead of a fixed value: `fs:read:$input.path`,
@@ -613,7 +703,14 @@ pattern (§4.4).
   it against the current prompt on the scenario eval suite (§8.6; baseline vs
   candidate scores are stored), and only a measured proposal that beats
   the baseline by the promotion margin can be applied — always by the
-  user's decision (`formless prompts`, TUI `/proposals`). Applied
+  user's decision (`formless prompts`, TUI `/proposals`). The generator
+  sees every earlier proposal (proposed, measured, applied, rejected and
+  rolled back) and must not repeat them. A near-duplicate (≥ 80% of words
+  shared) gets one retry that names the repeat; a second repeat, or the
+  model saying it has nothing new, stores nothing and reports "no new
+  proposal". Only one generation runs at a time, so a second request
+  answers `started: false`. The TUI Proposals view states what `g` costs
+  and shows "generating…". Applied
   proposals append to the bootstrap prompt in version order and can be
   rolled back individually; the bootstrap text itself is never edited. It states: you have only `create_tool`; build small,
   single-purpose, minimally-Capabilitied Tools on demand; validate/test each
@@ -918,6 +1015,49 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
   three rules: use it to connect existing Tools; anything that reads or
   changes the world is a Tool, not script code; save with `save_as` any
   script you would run twice.
+
+### 7.13 The agent manages its own harness
+
+Tools declaring a `harness:<scope>` Capability can read and change the
+harness, so the agent can set itself up (add a skill, connect an MCP
+server, create a role) instead of asking the user to do it by hand. JS
+API: `harness.read()` and `harness.call(op, args, reason)`.
+
+- **Scopes and operations:**
+  - `read`: providers, roles, MCP servers, skills and settings. Never API
+    keys or tokens; named providers show only `has_key`. It is not
+    sensitive.
+  - `mcp`: `mcp.add` / `mcp.remove`.
+  - `skills`: `skills.add` (a folder, git URL or zip, validated before
+    install and enabled because the approval was the review),
+    `skills.remove` and `skills.enable`.
+  - `models`: `models.set` for the model keys (`provider.model`,
+    effort, context tokens, fallback and routing lists).
+  - `providers`: `providers.upsert` (the endpoint must answer before
+    anything changes) and `providers.remove`.
+  - `roles`: `roles.upsert` / `roles.delete`.
+  - `config`: `config.set` for the other `SetSetting` keys (§13).
+- **Every change is approved.** The prompt shows the operation, its
+  target, the agent's reason, and the exact before and after. With
+  nobody connected it fails closed. The Capability-level first-run
+  approval applies as well.
+- **No secrets and no self-escalation.** API keys never pass through the
+  agent: `providers.upsert` refuses `api_key`, and the user adds the key
+  with `formless providers add`. Settings go through `SetSetting`'s
+  allow-list, so the endpoint, extra headers, auth, relay, MCP command
+  trust, hooks, approvals and Capability grants stay user-only. The
+  harness cannot widen any Tool's Capabilities.
+- **Logged and undoable.** Each change is audit-logged with actor
+  `agent`, the Tool and the reason. It is also kept in `harness_changes`
+  (schema v31) with the value it replaced.
+  - `ListHarnessChanges` lists them; TUI `/harness`.
+  - `UndoHarnessChange {id?}` (TUI `/harness undo [ID]`) applies the
+    inverse: a removed MCP server or provider comes back as it was, and a
+    setting or role returns to its previous value. Removing a skill
+    deletes its files, so that cannot be undone.
+- Changes reach new Sessions, or a Session after compaction, like any
+  configuration change. They never rewrite a running Session's cached
+  prompt prefix.
 
 ## 8. Metrics and Self-Optimisation
 
@@ -1355,7 +1495,18 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### 10.5 Input and keys
 
-- Enter: send / Steer while running (Ctrl+Enter: queue; configurable).
+- Enter: send / Steer while running. Queue: Ctrl+Enter where the
+  terminal supports the kitty keyboard protocol (enabled when available;
+  most terminals otherwise send the same byte for Enter and Ctrl+Enter),
+  and Ctrl+J or Alt+Enter everywhere, tmux and Terminal.app included. The
+  footer shows the binding that works in the current terminal.
+- Copying: `/copy` copies the last answer and `/copy code [n]` its n-th
+  code block (default: the last one). The text goes to the clipboard
+  through OSC 52, which works over SSH and inside tmux with
+  `allow-passthrough`, and also through the OS clipboard when the terminal
+  is local. Mouse capture (for wheel scrolling) stops the terminal's own
+  text selection, so `/mouse` toggles it; holding Shift (Option in
+  iTerm2, Fn in Terminal.app) while dragging also bypasses it.
   `Esc`: interrupt Run. `Ctrl+C`: clear the typed message; twice within 2 s: detach client. `Tab`/`Shift+Tab` (and slash commands)
   switch views. Mouse supported; **every** action is keyboard-reachable.
   Slash commands (mirror the views): `/new`, `/sessions`, `/tools`,
@@ -1410,7 +1561,12 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **Real-time thinking:** when the endpoint streams reasoning deltas
   (`reasoning_content`, or `reasoning` on some endpoints) the daemon
   forwards them as `ReasoningDelta` events and the TUI shows them live in
-  a dimmed, separate "Thinking" block (`/thinking` toggles it). Reasoning
+  a dimmed, separate "Thinking" block (`/thinking` toggles it). The
+  block has a fixed height: a header ("Thinking · N lines") plus the
+  latest 4 rendered rows, wrapped by display width and padded while
+  shorter. The assistant header and activity line below it therefore stay
+  put while reasoning streams, and stay put when the answer starts
+  streaming below it. Reasoning
   is never fabricated when the endpoint emits none, never shown as the
   assistant's answer, and never persisted as message content; on
   tool-call turns it is kept only as provider metadata so thinking-mode
@@ -1597,6 +1753,8 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
+| `tools.subagent_max_turns` | 40 | Model turns a sub-agent may take (roles can override) (§4.6) |
+| `tools.task_min_samples` / `task_quality_bar` / `task_explore_rate` | 5 / 0.8 / 0.1 | Per-task routing for `auto` roles (§4.6) |
 | `tools.smoke_timeout_secs` | 10 | Creation smoke-test bound (§7.1) |
 | `tools.replay_timeout_secs` | 60 | Optimiser replay bound per Invocation (§8.4) |
 | `scripts.max_parallel` | 8 | Nested `tools.call` Invocations in flight per sandbox; the rest queue (§7.5, §7.12) |
@@ -1621,7 +1779,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `[[hooks]]` | (none) | pre_tool / post_tool / run_end hooks (§9.8) |
 | `compaction.model` | (session) | Optional separate compaction model (§11) |
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
-| `tui.queue_key` | Ctrl+Enter | Queue-vs-steer binding (§10.5) |
+| `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 
 ## 14. Security

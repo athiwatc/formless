@@ -153,6 +153,12 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
+    /// Shown to each client as it connects (deprecation migrations).
+    startup_warnings: Vec<String>,
+    /// The model each active Run resolved to (per-task routing, §4.6).
+    run_models: StdMutex<HashMap<String, String>>,
+    /// A prompt proposal is being generated (one at a time).
+    pub(crate) proposing: Arc<AtomicBool>,
     /// Hook commands the user approved this daemon lifetime (SPEC §9.8).
     hook_approvals: StdMutex<std::collections::HashSet<String>>,
     /// The opt-in localhost web UI, while running (SPEC §12).
@@ -188,6 +194,20 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(paths: Paths) -> Result<Self> {
         let store = Store::open(&paths.db_file())?;
+        // Deprecated global auto (SPEC §4.6): rewrite the file once and
+        // tell every client that connects this lifetime.
+        let mut startup_warnings = Vec::new();
+        if paths.config_file().exists() {
+            if let Ok(mut cfg) = Config::load_file_only(&paths) {
+                if let Some(w) = cfg.migrate_global_auto() {
+                    if cfg.save(&paths).is_ok() {
+                        tracing::warn!("{w}");
+                        let _ = store.audit("daemon", "config.migrate_auto", &w);
+                        startup_warnings.push(w);
+                    }
+                }
+            }
+        }
         store.mark_orphan_runs_interrupted()?;
         // Pending handles do not survive a restart; tell each Session's
         // agent instead of leaving a handle that later reads "unknown".
@@ -211,6 +231,9 @@ impl Daemon {
             attachments: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
+            proposing: Arc::new(AtomicBool::new(false)),
+            startup_warnings,
+            run_models: StdMutex::new(HashMap::new()),
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
@@ -257,6 +280,79 @@ impl Daemon {
             self.broadcast(Event::SettingsChanged);
         }
         Ok(cfg)
+    }
+
+    /// A named provider (SPEC §4.5); `default`/unset is `[provider]`.
+    pub(crate) async fn provider_named(
+        &self,
+        cfg: &Config,
+        name: Option<&str>,
+    ) -> Result<Provider> {
+        match name.filter(|n| !n.is_empty() && *n != crate::config::DEFAULT_PROVIDER) {
+            None => self.provider(cfg).await,
+            Some(n) => {
+                let pcfg = cfg.provider_cfg(Some(n))?;
+                if pcfg.oauth() {
+                    return Err(anyhow!(
+                        "provider '{n}': OAuth is only supported for the default provider"
+                    ));
+                }
+                let key = crate::config::provider_key(&self.paths, n).unwrap_or_default();
+                Ok(Provider::with_key(pcfg, key, self.http.clone()))
+            }
+        }
+    }
+
+    /// Where a model call goes (SPEC §4.5): `requested` is a model id,
+    /// `role:<name>`, or None for the Session's own model and effort.
+    pub(crate) async fn target(
+        &self,
+        cfg: &Config,
+        session_id: &str,
+        requested: Option<&str>,
+    ) -> Result<Target> {
+        let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
+        let wanted = requested.map(str::to_string).unwrap_or(session_model);
+        if let Some(role_name) = wanted.strip_prefix("role:") {
+            let role = cfg.role(role_name)?;
+            let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
+            let model = if role.model.is_empty() {
+                cfg.provider_cfg(role.provider.as_deref())?.model
+            } else if ProviderCfg::is_auto_model(&role.model) && !role.candidates.is_empty() {
+                // Per-task choice: quality gate, then cost (SPEC §4.6).
+                let stats = self.with_reader(|st| st.task_stats(role_name))?;
+                let explore = rand::random::<f64>() < cfg.tools.task_explore_rate;
+                crate::routing::select_task_model(
+                    &role.candidates,
+                    &stats,
+                    cfg.tools.task_min_samples,
+                    cfg.tools.task_quality_bar,
+                    explore,
+                )
+                .unwrap_or_else(|| role.model.clone())
+            } else {
+                role.model.clone()
+            };
+            let effort = role.reasoning_effort.clone().or_else(|| {
+                cfg.provider_cfg(role.provider.as_deref())
+                    .ok()?
+                    .reasoning_effort
+            });
+            return Ok(Target {
+                provider,
+                model,
+                effort,
+                system: role.system.clone(),
+                role: Some(role_name.to_string()),
+            });
+        }
+        Ok(Target {
+            provider: self.provider(cfg).await?,
+            model: wanted,
+            effort: session_effort,
+            system: None,
+            role: None,
+        })
     }
 
     /// A provider for `cfg` on the daemon's shared HTTP client.
@@ -430,6 +526,23 @@ impl Daemon {
                 model,
                 reasoning_effort,
             } => {
+                // A Session's model "auto" is deprecated too (SPEC §4.6):
+                // with a primary role it means that role.
+                let model = match model {
+                    Some(m) if ProviderCfg::is_auto_model(&m) => {
+                        let cfg = self.config()?;
+                        if cfg.roles.contains_key(crate::config::PRIMARY_ROLE) {
+                            self.broadcast(Event::Note {
+                                session_id: Some(id.clone()),
+                                text: format!("model \"auto\" is deprecated; using role:{} (per-role, per-task routing)", crate::config::PRIMARY_ROLE),
+                            });
+                            Some(format!("role:{}", crate::config::PRIMARY_ROLE))
+                        } else {
+                            Some(m)
+                        }
+                    }
+                    other => other,
+                };
                 let s = self
                     .with_store(|st| st.set_session_model(&id, model, reasoning_effort))?
                     .context("session not found")?;
@@ -644,6 +757,115 @@ impl Daemon {
                 Ok(json!({"id": id, "session_id": session, "bytes": bytes,
                           "total_chars": total, "offset": offset, "end": end, "text": slice}))
             }
+            Request::ListProviders => {
+                let cfg = self.config()?;
+                let mut providers = vec![json!({
+                    "name": crate::config::DEFAULT_PROVIDER,
+                    "base_url": cfg.provider.base_url,
+                    "model": cfg.provider.model,
+                    "has_key": crate::config::load_api_key(&self.paths).is_some() || cfg.provider.oauth(),
+                })];
+                for (name, p) in &cfg.providers {
+                    providers.push(json!({
+                        "name": name, "base_url": p.base_url, "model": p.model,
+                        "has_key": crate::config::provider_key(&self.paths, name).is_some(),
+                    }));
+                }
+                Ok(json!({"providers": providers, "roles": cfg.roles}))
+            }
+            Request::UpsertProvider {
+                name,
+                base_url,
+                model,
+                api_key,
+            } => {
+                if name == crate::config::DEFAULT_PROVIDER
+                    || name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!("provider names use letters, digits, '-' and '_' (and 'default' is [provider])"));
+                }
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                let p = cfg.providers.entry(name.clone()).or_default();
+                p.base_url = base_url.trim_end_matches('/').to_string();
+                if let Some(m) = model {
+                    p.model = m;
+                }
+                cfg.save(&self.paths)?;
+                if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+                    crate::config::save_provider_key(&self.paths, &name, &key)?;
+                }
+                let _ = self.with_store(|st| st.audit("user", "provider.upsert", &name));
+                let _ = self.config();
+                Ok(json!({"provider": name}))
+            }
+            Request::RemoveProvider { name } => {
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                let users: Vec<&String> = cfg
+                    .roles
+                    .iter()
+                    .filter(|(_, r)| r.provider.as_deref() == Some(name.as_str()))
+                    .map(|(n, _)| n)
+                    .collect();
+                if !users.is_empty() {
+                    return Err(anyhow!(
+                        "provider '{name}' is used by role(s) {}; change or delete them first",
+                        users
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if cfg.providers.remove(&name).is_none() {
+                    return Err(anyhow!("no provider '{name}'"));
+                }
+                cfg.save(&self.paths)?;
+                crate::config::delete_provider_key(&self.paths, &name);
+                let _ = self.with_store(|st| st.audit("user", "provider.remove", &name));
+                let _ = self.config();
+                Ok(json!({"removed": name}))
+            }
+            Request::TestProvider { name } => {
+                let cfg = self.config()?;
+                let provider = self.provider_named(&cfg, Some(&name)).await?;
+                let models = provider.list_models().await?;
+                Ok(json!({"provider": name, "models": models}))
+            }
+            Request::UpsertRole { name, role } => {
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!("role names use letters, digits, '-' and '_'"));
+                }
+                let role: crate::config::RoleCfg =
+                    serde_json::from_value(role).context("invalid role")?;
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                cfg.provider_cfg(role.provider.as_deref())?;
+                cfg.roles.insert(name.clone(), role);
+                cfg.save(&self.paths)?;
+                let _ = self.with_store(|st| st.audit("user", "role.upsert", &name));
+                let _ = self.config();
+                Ok(json!({"role": name}))
+            }
+            Request::DeleteRole { name } => {
+                let mut cfg = Config::load_file_only(&self.paths)?;
+                if cfg.roles.remove(&name).is_none() {
+                    return Err(anyhow!("no role '{name}'"));
+                }
+                cfg.save(&self.paths)?;
+                let _ = self.with_store(|st| st.audit("user", "role.delete", &name));
+                let _ = self.config();
+                Ok(json!({"deleted": name}))
+            }
+            Request::ListHarnessChanges => {
+                Ok(json!(self.with_reader(|st| st.harness_changes(100))?))
+            }
+            Request::UndoHarnessChange { id } => self.undo_harness_change(id.as_deref()).await,
             Request::ListJobs => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_jobs())?,
             )?),
@@ -1102,9 +1324,16 @@ impl Daemon {
                 Ok(serde_json::to_value(stats)?)
             }
             Request::GenerateProposal => {
+                // One at a time: each costs model calls and an eval run.
+                if self.proposing.swap(true, Ordering::SeqCst) {
+                    return Ok(
+                        json!({"started": false, "reason": "a proposal is already being generated"}),
+                    );
+                }
                 let this = self.clone();
                 tokio::spawn(async move {
-                    this.generate_and_measure_proposal().await;
+                    this.clone().generate_and_measure_proposal().await;
+                    this.proposing.store(false, Ordering::SeqCst);
                 });
                 Ok(json!({"started": true}))
             }
@@ -1328,6 +1557,7 @@ impl Daemon {
         });
         self.maybe_name_session(&session_id);
         self.maybe_auto_skill(&session_id, &run_id, final_status);
+        self.record_primary_task(&session_id, &run_id, final_status);
         // run_end hooks (SPEC §9.8): automation, results only logged.
         if let Ok(cfg) = self.config() {
             let hooks: Vec<_> = cfg
@@ -1613,17 +1843,14 @@ impl Daemon {
                 "provider not configured; run the onboarding wizard"
             ));
         }
-        let provider = self
-            .provider(&cfg)
-            .await?
-            .with_cache_key(&format!("formless-{session_id}"));
-        let session = self
-            .with_store(|st| st.get_session(session_id))?
+        self.with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
-        let requested_model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| cfg.provider.model.clone());
+        // The Session's model, or its role's provider + model (SPEC §4.5).
+        let target = self.target(&cfg, session_id, None).await?;
+        let provider = target
+            .provider
+            .with_cache_key(&format!("formless-{session_id}"));
+        let requested_model = target.model.clone();
         let (context_chars, tool_count) = self.with_store(|st| {
             let chars = st.session_content_chars(session_id).unwrap_or(0);
             let tools = toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -1637,17 +1864,18 @@ impl Daemon {
             cfg.provider.routing_complex_chars,
         );
         let model = self.resolve_model(&requested_model, &cfg, complex)?;
+        self.run_models
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), model.clone());
         if ProviderCfg::is_auto_model(&requested_model) {
             self.broadcast(Event::Note {
                 session_id: Some(session_id.to_string()),
                 text: format!("Routed to model {model} (measured auto-selection)."),
             });
         }
-        let effort = session
-            .reasoning_effort
-            .clone()
-            .or_else(|| cfg.provider.reasoning_effort.clone());
-        let context_tokens = cfg.provider.context_for(&model);
+        let effort = target.effort.clone();
+        let context_tokens = provider.settings().context_for(&model);
 
         self.maybe_compact(&provider, &cfg, session_id, &model, context_tokens)
             .await?;
@@ -2823,6 +3051,31 @@ impl Daemon {
             prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
             prompt.push_str(&skills.join("\n"));
         }
+        // Roles (SPEC §4.5): described so the agent picks one for
+        // sub-agents and llm calls by intent.
+        if let Ok(cfg) = self.config() {
+            if !cfg.roles.is_empty() {
+                prompt.push_str("\n\nRoles (pass {role: name} to agents.run or llm.complete from a Tool with the agent/llm Capability):");
+                for (name, r) in &cfg.roles {
+                    let model = if r.model.is_empty() {
+                        "provider default"
+                    } else {
+                        r.model.as_str()
+                    };
+                    prompt.push_str(&format!(
+                        "\n- {name}: {} [{} · {model}]",
+                        if r.description.is_empty() {
+                            "(no description)"
+                        } else {
+                            r.description.as_str()
+                        },
+                        r.provider
+                            .as_deref()
+                            .unwrap_or(crate::config::DEFAULT_PROVIDER)
+                    ));
+                }
+            }
+        }
         // User memory (SPEC §7.11), also part of the snapshot.
         let memories = self.with_store(|st| st.list_memories()).unwrap_or_default();
         prompt.push_str(&crate::memory::prompt_block(&memories));
@@ -2929,10 +3182,30 @@ impl Daemon {
             if task.trim().is_empty() {
                 return Err(anyhow!("sub-agent task is empty"));
             }
-            let provider = self.provider(cfg).await?;
-            // The Session's model/effort, not the daemon default (SPEC §7.6).
-            let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
-            let requested = model.map(str::to_string).unwrap_or(session_model);
+            // The Session's model/effort, or a role's provider + model
+            // (`role:<name>`), never the daemon default (SPEC §4.5, §7.6).
+            let target = self.target(cfg, session_id, model).await?;
+            let provider = target.provider;
+            let session_effort = target.effort;
+            let requested = target.model;
+            let role = target.role;
+            let max_turns = role
+                .as_deref()
+                .and_then(|r| cfg.roles.get(r))
+                .and_then(|r| r.max_turns)
+                .unwrap_or(cfg.tools.subagent_max_turns)
+                .max(1) as i64;
+            let task_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                task.trim().to_lowercase().hash(&mut h);
+                format!("{:016x}", h.finish())
+            };
+            if let Some(r) = &role {
+                let _ = self.with_store(|st| st.mark_task_respawned(r, run_id, &task_hash));
+            }
+            let task_started = std::time::Instant::now();
+            let mut task_tokens = 0i64;
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -2954,14 +3227,21 @@ impl Daemon {
                 "role": "system",
                 "content": "You are a Formless sub-agent. Complete the single task you are given, building and using Tools as needed, then return a concise final result."
             })];
+            if let Some(sys) = target.system.as_deref() {
+                messages.push(json!({"role": "system", "content": sys}));
+            }
             if let Some(sys) = system {
                 messages.push(json!({"role": "system", "content": sys}));
             }
             messages.push(json!({"role": "user", "content": task}));
+            let label = match &role {
+                Some(r) => format!("{r} · {model}"),
+                None => model.clone(),
+            };
             // Visible and stored (not just a local Vec): clients see each
             // step, and the transcript outlives the call.
             let sub = self.with_store(|st| {
-                st.create_subagent(session_id, run_id, task, agent_depth as u32)
+                st.create_subagent(session_id, run_id, task, agent_depth as u32, &label)
             })?;
             let sub_id = sub.id.clone();
             for m in &messages {
@@ -2982,6 +3262,9 @@ impl Daemon {
                     if cancel.is_cancelled() {
                         return Err(anyhow!("interrupted"));
                     }
+                    if step >= max_turns {
+                        return Err(anyhow!("sub-agent hit its turn limit ({max_turns})"));
+                    }
                     // Rebuilt each step: find_tools/create_tool load new Tools.
                     let defs = sub_defs()?;
                     let result = provider
@@ -2995,6 +3278,9 @@ impl Daemon {
                         )
                         .await?;
                     step += 1;
+                    if let Some(u) = &result.usage {
+                        task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
+                    }
                     let _ = self.with_store(|st| st.set_subagent_steps(&sub_id, step));
                     self.broadcast(Event::SubagentStep {
                         session_id: session_id.to_string(),
@@ -3047,6 +3333,35 @@ impl Daemon {
                 Ok(text) => ("completed", text.clone()),
                 Err(e) => ("failed", e.to_string()),
             };
+            // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
+            // turns of the whole task, and whether it ended well.
+            // An interrupt says nothing about the model: not recorded.
+            let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
+            if let Some(r) = role.as_ref().filter(|_| !interrupted) {
+                let kind = match &outcome {
+                    Ok(_) => "completed",
+                    Err(e) if e.to_string().contains("turn limit") => "limit",
+                    Err(_) => "failed",
+                };
+                let turns = self
+                    .with_reader(|st| st.get_subagent(&sub_id))
+                    .ok()
+                    .flatten()
+                    .map_or(0, |s| s.steps);
+                let _ = self.with_store(|st| {
+                    st.record_task(
+                        r,
+                        &model,
+                        session_id,
+                        run_id,
+                        &task_hash,
+                        task_started.elapsed().as_millis() as i64,
+                        task_tokens,
+                        turns,
+                        kind,
+                    )
+                });
+            }
             if let Ok(sub) = self.with_store(|st| st.finish_subagent(&sub_id, status, &result)) {
                 self.broadcast(Event::SubagentFinished {
                     session_id: session_id.to_string(),
@@ -3277,6 +3592,379 @@ impl Daemon {
             .and_then(|s| s.reasoning_effort)
             .or_else(|| cfg.provider.reasoning_effort.clone());
         (model, effort)
+    }
+
+    /// A primary Run on a role counts as one task for that role's per-task
+    /// routing (SPEC §4.6); a later edit or correction marks it bad.
+    fn record_primary_task(&self, session_id: &str, run_id: &str, status: &str) {
+        let model = self.run_models.lock().unwrap().remove(run_id);
+        if status == "interrupted" {
+            return;
+        }
+        let Some(model) = model else { return };
+        let Ok(cfg) = self.config() else { return };
+        let (session_model, _) = self.session_model_effort(session_id, &cfg);
+        let Some(role) = session_model.strip_prefix("role:") else {
+            return;
+        };
+        let Ok(Some(m)) =
+            self.with_reader(|st| Ok(st.run_metrics(50)?.into_iter().find(|m| m.run_id == run_id)))
+        else {
+            return;
+        };
+        let _ = self.with_store(|st| {
+            st.record_task(
+                role,
+                &model,
+                session_id,
+                run_id,
+                "",
+                m.duration_ms,
+                m.prompt_tokens + m.completion_tokens,
+                m.steps,
+                if status == "completed" {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            )
+        });
+    }
+
+    /// The harness API for Tools (SPEC §7.13). `read` returns the harness
+    /// state without secrets; every change asks the user, showing the
+    /// exact before → after and the agent's reason (failing closed with
+    /// nobody connected), is validated by the same code the user's own
+    /// requests use, and is logged with what it replaced so it can be undone.
+    pub(crate) async fn harness_call(
+        &self,
+        session_id: &str,
+        tool: &str,
+        op: &str,
+        args: &Value,
+        reason: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        if op == "read" {
+            return self.harness_read().await;
+        }
+        let before = self.harness_snapshot(op, args)?;
+        let target = harness_target(op, args);
+        let scope = op.split('.').next().unwrap_or_default().to_string();
+        let detail = format!(
+            "The agent (Tool {tool}) wants to change the harness: {op} {target}\nReason: {}\nBefore: {before}\nAfter: {args}",
+            if reason.is_empty() { "(none given)" } else { reason }
+        );
+        let (approved, _) = self
+            .ask_user_approval(
+                session_id,
+                &format!("harness {op}"),
+                vec![format!("harness:{scope}")],
+                detail,
+                cancel,
+            )
+            .await;
+        if !approved {
+            return Err(anyhow!(
+                "the user did not approve this harness change (or nobody is connected to ask)"
+            ));
+        }
+        let result = self.harness_apply(op, args).await?;
+        // An installed skill is undone by its name, not its source.
+        let target = match result["name"].as_str() {
+            Some(n) if op == "skills.add" => n.to_string(),
+            _ => target,
+        };
+        let id = self
+            .with_store(|st| st.record_harness_change(op, &target, &before, args, tool, reason))?;
+        let _ = self.with_store(|st| {
+            st.audit(
+                "agent",
+                &format!("harness.{op}"),
+                &format!("{target} via {tool}: {reason}"),
+            )
+        });
+        Ok(
+            json!({"applied": op, "target": target, "change_id": id, "result": result,
+                  "undo": "the user can revert it with /harness undo"}),
+        )
+    }
+
+    /// Harness state for `harness:read`: never keys or tokens.
+    async fn harness_read(&self) -> Result<Value> {
+        let cfg = self.config()?;
+        let mut providers = vec![json!({
+            "name": crate::config::DEFAULT_PROVIDER, "base_url": cfg.provider.base_url,
+            "model": cfg.provider.model, "fallback_models": cfg.provider.fallback_models,
+            "routing_models": cfg.provider.routing_models,
+        })];
+        for (name, p) in &cfg.providers {
+            providers.push(
+                json!({"name": name, "base_url": p.base_url, "model": p.model,
+                "has_key": crate::config::provider_key(&self.paths, name).is_some()}),
+            );
+        }
+        let mcp: Vec<Value> = self
+            .mcp_servers()
+            .await?
+            .into_iter()
+            .map(|m| {
+                json!({"name": m.name, "transport": m.transport, "disabled": m.disabled,
+                "running": m.running, "tools": m.tool_count})
+            })
+            .collect();
+        let skills: Vec<Value> = self
+            .with_reader(|st| st.list_skills())?
+            .into_iter()
+            .map(|s| json!({"name": s.name, "enabled": s.enabled, "description": s.description}))
+            .collect();
+        Ok(
+            json!({"providers": providers, "roles": cfg.roles, "mcp_servers": mcp,
+                  "skills": skills, "settings": cfg.settings_summary(&self.paths)}),
+        )
+    }
+
+    /// The current value a change would replace (null when absent).
+    fn harness_snapshot(&self, op: &str, args: &Value) -> Result<Value> {
+        let cfg = Config::load_file_only(&self.paths)?;
+        let name = args["name"].as_str().unwrap_or_default();
+        Ok(match op {
+            "mcp.add" | "mcp.remove" => json!(cfg.mcp.servers.get(name)),
+            "skills.enable" => json!(self
+                .with_reader(|st| st.get_skill(name))?
+                .map(|s| s.enabled)),
+            "skills.add" | "skills.remove" => Value::Null,
+            "models.set" | "config.set" => {
+                let key = args["key"].as_str().context("key required")?;
+                let mut v = toml::Value::try_from(&cfg)?;
+                for p in key.split('.') {
+                    match v.get(p) {
+                        Some(x) => v = x.clone(),
+                        None => return Ok(Value::Null),
+                    }
+                }
+                serde_json::to_value(v)?
+            }
+            "providers.upsert" | "providers.remove" => json!(cfg
+                .providers
+                .get(name)
+                .map(|p| json!({"name": name, "base_url": p.base_url, "model": p.model}))),
+            "roles.upsert" | "roles.delete" => json!(cfg.roles.get(name)),
+            other => return Err(anyhow!("unknown harness operation '{other}'")),
+        })
+    }
+
+    /// Apply one harness change (shared with undo). Keys never pass here.
+    async fn harness_apply(&self, op: &str, args: &Value) -> Result<Value> {
+        let name = args["name"].as_str().unwrap_or_default().to_string();
+        let edit_config = |f: &dyn Fn(&mut Config) -> Result<()>| -> Result<()> {
+            let mut cfg = Config::load_file_only(&self.paths)?;
+            f(&mut cfg)?;
+            cfg.save(&self.paths)?;
+            let _ = self.config();
+            Ok(())
+        };
+        match op {
+            "mcp.add" => {
+                let server: crate::config::McpServerCfg =
+                    serde_json::from_value(args["server"].clone())
+                        .context("invalid MCP server config")?;
+                self.add_mcp_server(&name, server, "agent").await
+            }
+            "mcp.remove" => self.remove_mcp_server(&name, "agent").await,
+            "skills.add" => {
+                let (paths, source) = (
+                    self.paths.clone(),
+                    args["source"]
+                        .as_str()
+                        .context("source required")?
+                        .to_string(),
+                );
+                let subdir = args["subdir"].as_str().map(str::to_string);
+                let staged = tokio::task::spawn_blocking(move || {
+                    crate::skills::prepare(&paths, &source, subdir.as_deref(), None)
+                })
+                .await??;
+                // The approval was the review: install enabled.
+                let info = self.with_store(|st| {
+                    let info = crate::skills::commit(&self.paths, st, &staged, "agent")?;
+                    st.set_skill_enabled(&info.name, true)?;
+                    Ok(info)
+                })?;
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"name": info.name, "version": info.version}))
+            }
+            "skills.remove" => {
+                if self.with_store(|st| st.remove_skill(&name))?.is_empty() {
+                    return Err(anyhow!("no skill named '{name}'"));
+                }
+                let _ = std::fs::remove_dir_all(self.paths.data_dir.join("skills").join(&name));
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"removed": name}))
+            }
+            "skills.enable" => {
+                let enabled = args["enabled"].as_bool().context("enabled required")?;
+                if !self.with_store(|st| st.set_skill_enabled(&name, enabled))? {
+                    return Err(anyhow!("no skill named '{name}'"));
+                }
+                self.broadcast(Event::SkillsChanged);
+                Ok(json!({"name": name, "enabled": enabled}))
+            }
+            "models.set" | "config.set" => {
+                let key = args["key"].as_str().context("key required")?.to_string();
+                let models_key = crate::config::HARNESS_MODEL_KEYS
+                    .iter()
+                    .any(|k| key == *k || key.starts_with(&format!("{k}.")));
+                if (op == "models.set") != models_key {
+                    return Err(anyhow!(
+                        "'{key}' is {}",
+                        if models_key {
+                            "a models.set key"
+                        } else {
+                            "not a model setting; use config.set"
+                        }
+                    ));
+                }
+                let value = args["value"].clone();
+                edit_config(&|cfg| cfg.set_key(&key, value.clone()))?;
+                Ok(json!({"key": key}))
+            }
+            "providers.upsert" => {
+                if args.get("api_key").is_some() {
+                    return Err(anyhow!("API keys are never set by the agent: ask the user to run `formless providers add {name}`"));
+                }
+                if name.is_empty()
+                    || name == crate::config::DEFAULT_PROVIDER
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!(
+                        "provider names use letters, digits, '-' and '_' (and not 'default')"
+                    ));
+                }
+                let base_url = args["base_url"]
+                    .as_str()
+                    .context("base_url required")?
+                    .trim_end_matches('/')
+                    .to_string();
+                // Validate before applying: the endpoint must answer at all.
+                self.http
+                    .get(format!("{base_url}/models"))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                    .with_context(|| format!("{base_url} is not reachable; nothing changed"))?;
+                let model = args["model"].as_str().map(str::to_string);
+                edit_config(&|cfg| {
+                    let p = cfg.providers.entry(name.clone()).or_default();
+                    p.base_url = base_url.clone();
+                    if let Some(m) = &model {
+                        p.model = m.clone();
+                    }
+                    Ok(())
+                })?;
+                let has_key = crate::config::provider_key(&self.paths, &name).is_some();
+                Ok(json!({"provider": name, "has_key": has_key,
+                    "note": if has_key { "" } else { "no API key stored: the user adds one with `formless providers add` (keys never pass through the agent)" }}))
+            }
+            "providers.remove" => {
+                edit_config(&|cfg| {
+                    if cfg
+                        .roles
+                        .values()
+                        .any(|r| r.provider.as_deref() == Some(name.as_str()))
+                    {
+                        return Err(anyhow!("provider '{name}' is used by a role"));
+                    }
+                    cfg.providers
+                        .remove(&name)
+                        .map(|_| ())
+                        .with_context(|| format!("no provider '{name}'"))
+                })?;
+                // The key stays, so undo restores the provider whole.
+                Ok(json!({"removed": name}))
+            }
+            "roles.upsert" => {
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!("role names use letters, digits, '-' and '_'"));
+                }
+                let role: crate::config::RoleCfg =
+                    serde_json::from_value(args["role"].clone()).context("invalid role")?;
+                edit_config(&|cfg| {
+                    cfg.provider_cfg(role.provider.as_deref())?;
+                    cfg.roles.insert(name.clone(), role.clone());
+                    Ok(())
+                })?;
+                Ok(json!({"role": name}))
+            }
+            "roles.delete" => {
+                edit_config(&|cfg| {
+                    cfg.roles
+                        .remove(&name)
+                        .map(|_| ())
+                        .with_context(|| format!("no role '{name}'"))
+                })?;
+                Ok(json!({"deleted": name}))
+            }
+            other => Err(anyhow!("unknown harness operation '{other}'")),
+        }
+    }
+
+    /// Revert a harness change by applying its inverse (the user's call;
+    /// no approval).
+    async fn undo_harness_change(&self, id: Option<&str>) -> Result<Value> {
+        let changes = self.with_reader(|st| st.harness_changes(500))?;
+        let change = changes
+            .into_iter()
+            .find(|c| {
+                c["undone"] == false
+                    && id.is_none_or(|id| c["id"].as_str().is_some_and(|c| c.starts_with(id)))
+            })
+            .context("no harness change to undo")?;
+        let (op, before, after) = (
+            change["op"].as_str().unwrap_or_default(),
+            &change["before"],
+            &change["after"],
+        );
+        let name = after["name"].clone();
+        let (inv_op, inv_args): (&str, Value) = match op {
+            "mcp.add" => ("mcp.remove", json!({"name": name})),
+            "mcp.remove" => ("mcp.add", json!({"name": name, "server": before})),
+            "skills.add" => ("skills.remove", json!({"name": change["target"]})),
+            "skills.enable" => ("skills.enable", json!({"name": name, "enabled": before})),
+            "models.set" | "config.set" => (op, json!({"key": after["key"], "value": before})),
+            "providers.upsert" if before.is_null() => ("providers.remove", json!({"name": name})),
+            "providers.upsert" | "providers.remove" => ("providers.upsert", before.clone()),
+            "roles.upsert" if before.is_null() => ("roles.delete", json!({"name": name})),
+            "roles.upsert" | "roles.delete" => {
+                ("roles.upsert", json!({"name": name, "role": before}))
+            }
+            other => return Err(anyhow!("{other} cannot be undone")),
+        };
+        if inv_op == "providers.upsert" {
+            // Re-adding a provider the agent removed: no reachability check.
+            let n = inv_args["name"].as_str().unwrap_or_default().to_string();
+            let mut cfg = Config::load_file_only(&self.paths)?;
+            let p = cfg.providers.entry(n).or_default();
+            p.base_url = inv_args["base_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            p.model = inv_args["model"].as_str().unwrap_or_default().to_string();
+            cfg.save(&self.paths)?;
+            let _ = self.config();
+        } else {
+            self.harness_apply(inv_op, &inv_args).await?;
+        }
+        let cid = change["id"].as_str().unwrap_or_default().to_string();
+        self.with_store(|st| st.mark_harness_undone(&cid))?;
+        let _ = self.with_store(|st| st.audit("user", "harness.undo", &format!("{cid} ({op})")));
+        Ok(json!({"undone": cid, "op": op}))
     }
 
     /// Usage of a Run or Session, priced with `provider.prices` when every
@@ -4964,6 +5652,12 @@ impl Daemon {
             tx: tx.clone(),
             filter: filter.clone(),
         });
+        for w in &self.startup_warnings {
+            let _ = tx.send(ServerMessage::Event(Event::Note {
+                session_id: None,
+                text: w.clone(),
+            }));
+        }
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let Ok(line) = serde_json::to_string(&msg) {
@@ -5770,6 +6464,28 @@ impl NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn harness(&self, op: &str, args: &Value, reason: &str) -> std::result::Result<Value, String> {
+        let tool = self
+            .kv_scope
+            .strip_prefix("tool:")
+            .and_then(|id| {
+                self.daemon
+                    .with_reader(|st| st.get_tool_current(id))
+                    .ok()
+                    .flatten()
+            })
+            .map(|(t, _)| t.name)
+            .unwrap_or_else(|| self.kv_scope.clone());
+        self.block_cancellable(self.daemon.harness_call(
+            &self.session_id,
+            &tool,
+            op,
+            args,
+            reason,
+            &self.cancel,
+        ))
+    }
+
     fn kv(
         &self,
         op: &str,
@@ -5852,14 +6568,13 @@ impl HostOps for NestedOps {
         if self.cancel.is_cancelled() {
             return Err("interrupted".into());
         }
-        let provider = self
+        let target = self
             .handle
-            .block_on(self.daemon.provider(&self.cfg))
+            .block_on(self.daemon.target(&self.cfg, &self.session_id, model))
             .map_err(|e| e.to_string())?;
-        let (session_model, effort) = self
-            .daemon
-            .session_model_effort(&self.session_id, &self.cfg);
-        let requested = model.map(str::to_string).unwrap_or(session_model);
+        let provider = target.provider;
+        let effort = target.effort;
+        let requested = target.model;
         let model = self
             .daemon
             .resolve_model(
@@ -6115,5 +6830,26 @@ fn parse_questions(args: &Value) -> Result<Vec<Question>> {
         }
         Some(_) => bail!("questions must be an array"),
         None => Ok(vec![one(args)?]),
+    }
+}
+
+/// Where a model call goes (SPEC §4.5).
+pub(crate) struct Target {
+    pub provider: Provider,
+    /// The model to request (may still be `auto`, resolved by routing).
+    pub model: String,
+    pub effort: Option<String>,
+    /// A role's system prompt addendum.
+    pub system: Option<String>,
+    /// The role, when one was chosen.
+    pub role: Option<String>,
+}
+
+/// What a harness change is about, for the log and the approval.
+fn harness_target(op: &str, args: &Value) -> String {
+    match op {
+        "models.set" | "config.set" => args["key"].as_str().unwrap_or_default().to_string(),
+        "skills.add" => args["source"].as_str().unwrap_or_default().to_string(),
+        _ => args["name"].as_str().unwrap_or_default().to_string(),
     }
 }

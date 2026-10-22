@@ -139,9 +139,20 @@ impl Daemon {
         if !cfg.provider.is_configured() {
             return;
         }
-        self.activity("prompt", "generating prompt/memory proposal...".into());
+        self.activity(
+            "prompt",
+            "generating a proposal (runs the eval suite)...".into(),
+        );
         if let Err(e) = self.generate_proposal_inner(&cfg).await {
-            self.activity("prompt", format!("proposal generation failed: {e}"));
+            let text = e.to_string();
+            self.activity(
+                "prompt",
+                if text.starts_with("no new proposal") {
+                    text
+                } else {
+                    format!("proposal generation failed: {text}")
+                },
+            );
         }
     }
 
@@ -208,11 +219,15 @@ impl Daemon {
                 signals.push_str(&format!("\n{}\n", crate::runs::summary_line(&summary)));
             }
         }
-        let applied = self.with_store(|st| st.applied_proposals())?;
-        if !applied.is_empty() {
-            signals.push_str("\nAlready applied (do not repeat):\n");
-            for a in &applied {
-                signals.push_str(&format!("- [{}] {}\n", a.kind, a.content));
+        // Every earlier proposal, not only applied ones: with unchanged
+        // signals the model would otherwise suggest the same thing again.
+        let earlier = self.with_store(|st| st.list_proposals())?;
+        if !earlier.is_empty() {
+            signals.push_str(
+                "\nEarlier proposals (do not repeat or rephrase them; rejected and rolled-back ones were judged unhelpful):\n",
+            );
+            for p in earlier.iter().take(40) {
+                signals.push_str(&format!("- [{}] {}\n", p.status, p.content));
             }
         }
         let provider = self.provider(cfg).await?;
@@ -227,18 +242,42 @@ impl Daemon {
             .reasoning_effort
             .as_deref()
             .or(cfg.provider.reasoning_effort.as_deref());
-        let raw = provider
-            .complete(
-                &[
-                    json!({"role": "system", "content": PROPOSAL_PROMPT}),
-                    json!({"role": "user", "content": signals}),
-                ],
-                &model,
-                effort,
-            )
-            .await?;
-        let est_tokens = ((signals.len() + raw.len()) / 4) as i64;
-        let (kind, content, rationale) = parse_proposal(&raw)?;
+        let mut messages = vec![
+            json!({"role": "system", "content": PROPOSAL_PROMPT}),
+            json!({"role": "user", "content": signals}),
+        ];
+        let mut est_tokens = 0i64;
+        let mut attempt = 0;
+        let (kind, content, rationale) = loop {
+            let raw = provider.complete(&messages, &model, effort).await?;
+            est_tokens += ((signals.len() + raw.len()) / 4) as i64;
+            let parsed = parse_proposal(&raw)?;
+            match earlier
+                .iter()
+                .find(|p| near_duplicate(&p.content, &parsed.1))
+            {
+                None => break parsed,
+                Some(dup) if attempt == 0 => {
+                    // One more try, naming the repeat.
+                    attempt += 1;
+                    messages.push(json!({"role": "assistant", "content": raw}));
+                    messages.push(json!({"role": "user", "content": format!(
+                        "That repeats an earlier proposal ({}): \"{}\". Propose a different lesson, or reply with {{\"kind\":\"none\"}} if the signals hold nothing new.",
+                        dup.status, dup.content
+                    )}));
+                }
+                Some(dup) => {
+                    self.activity(
+                        "prompt",
+                        format!(
+                            "no new proposal: nothing new to learn from the current signals (it repeated an earlier {} one)",
+                            dup.status
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
+        };
         let proposal =
             self.with_store(|st| st.create_proposal(&kind, &content, &rationale, est_tokens))?;
         self.broadcast(Event::ProposalUpdated {
@@ -1266,6 +1305,22 @@ pub fn fix_plan(replay: &[ReplayItem]) -> FixPlan {
     FixPlan::Rewrite(out)
 }
 
+/// Whether two proposals say the same thing: equal, or ≥ 80% of their
+/// words shared (case, punctuation and plural 's' ignored).
+pub fn near_duplicate(a: &str, b: &str) -> bool {
+    let words = |s: &str| -> std::collections::BTreeSet<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2)
+            .map(|w| w.to_lowercase().trim_end_matches('s').to_string())
+            .collect()
+    };
+    let (x, y) = (words(a), words(b));
+    if x.is_empty() || y.is_empty() {
+        return a.trim().eq_ignore_ascii_case(b.trim());
+    }
+    x.intersection(&y).count() as f64 / x.union(&y).count() as f64 >= 0.8
+}
+
 /// A Tool called repeatedly but only ever from one Session: a hint that it
 /// hardcodes task-specific values instead of taking them as input.
 pub fn is_narrow(m: &ToolMetricsInfo) -> bool {
@@ -1319,6 +1374,11 @@ fn parse_proposal(raw: &str) -> Result<(String, String, String)> {
         .rfind('}')
         .ok_or_else(|| anyhow!("proposal is not JSON"))?;
     let v: Value = serde_json::from_str(&raw[start..=end])?;
+    if v["kind"].as_str() == Some("none") {
+        return Err(anyhow!(
+            "no new proposal: the model found nothing new to learn"
+        ));
+    }
     // Only guidance is generated now; memory lives in the memory store.
     let kind = "prompt".to_string();
     let content = v["content"]

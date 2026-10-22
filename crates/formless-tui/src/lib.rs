@@ -137,6 +137,9 @@ enum Pending {
     SessionUsage,
     ListInvocations,
     GetArtifact,
+    GenerateProposal,
+    ListProviders,
+    HarnessChanges,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -523,6 +526,13 @@ struct App {
     input: String,
     /// When Ctrl+C was last pressed: a second press soon after detaches.
     ctrl_c_at: Option<Instant>,
+    /// The terminal reports Ctrl+Enter apart from Enter (kitty keyboard
+    /// protocol); otherwise queueing uses Ctrl+J / Alt+Enter.
+    enhanced_keys: bool,
+    /// Mouse capture (wheel scrolling); off lets the terminal select text.
+    mouse_capture: bool,
+    /// A prompt proposal is being generated (Proposals view shows it).
+    proposal_generating: bool,
     /// Sessions with a Run in flight; run state is per session, not global.
     running_sessions: std::collections::HashSet<String>,
     notes: Vec<String>,
@@ -655,6 +665,9 @@ impl App {
             chat_line_count: 0,
             input: String::new(),
             ctrl_c_at: None,
+            enhanced_keys: false,
+            mouse_capture: true,
+            proposal_generating: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -921,6 +934,75 @@ impl App {
                                     if i.abandoned { " · abandoned" } else { "" },
                                     truncate_chars(&i.handle, 8)
                                 ));
+                            }
+                        }
+                        Pending::HarnessChanges => {
+                            let list = result.as_array().cloned().unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push("no agent changes to the harness".into());
+                            }
+                            for c in list.iter().take(20).rev() {
+                                self.notes.push(format!(
+                                    "{} {} {} · by {} · {}{}",
+                                    c["id"].as_str().unwrap_or_default(),
+                                    c["op"].as_str().unwrap_or_default(),
+                                    c["target"].as_str().unwrap_or_default(),
+                                    c["tool"].as_str().unwrap_or_default(),
+                                    truncate_chars(c["reason"].as_str().unwrap_or_default(), 60),
+                                    if c["undone"] == true {
+                                        " · undone"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                            }
+                        }
+                        Pending::ListProviders => {
+                            for p in result["providers"].as_array().into_iter().flatten() {
+                                self.notes.push(format!(
+                                    "provider {} · {} · model {}{}",
+                                    p["name"].as_str().unwrap_or_default(),
+                                    p["base_url"].as_str().unwrap_or_default(),
+                                    p["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("-"),
+                                    if p["has_key"] == true {
+                                        ""
+                                    } else {
+                                        " · no key"
+                                    }
+                                ));
+                            }
+                            let roles = result["roles"].as_object().cloned().unwrap_or_default();
+                            if roles.is_empty() {
+                                self.notes.push(
+                                    "no roles · /role add NAME PROVIDER MODEL description…".into(),
+                                );
+                            }
+                            for (name, r) in roles {
+                                self.notes.push(format!(
+                                    "role {name} · {} · {} · {}",
+                                    r["provider"].as_str().unwrap_or("default"),
+                                    r["model"]
+                                        .as_str()
+                                        .filter(|m| !m.is_empty())
+                                        .unwrap_or("provider default"),
+                                    r["description"].as_str().unwrap_or_default()
+                                ));
+                            }
+                        }
+                        Pending::GenerateProposal => {
+                            if result["started"] == true {
+                                self.proposal_generating = true;
+                                self.notes.push(
+                                    "generating a proposal: one model call plus the eval suite (costs tokens)"
+                                        .into(),
+                                );
+                            } else {
+                                self.notes.push(
+                                    result["reason"]
+                                        .as_str()
+                                        .unwrap_or("not started")
+                                        .to_string(),
+                                );
                             }
                         }
                         Pending::GetArtifact => {
@@ -1561,6 +1643,13 @@ impl App {
             }
             Event::ToolDeleted { id } => self.tools.retain(|x| x.id != id),
             Event::OptimiserActivity { tool_name, text } => {
+                if tool_name == "prompt"
+                    && ["measured", "no new proposal", "failed"]
+                        .iter()
+                        .any(|w| text.contains(w))
+                {
+                    self.proposal_generating = false;
+                }
                 self.notes.push(format!("optimiser {tool_name}: {text}"));
                 self.request(Pending::ListTools, Request::ListTools);
             }
@@ -1627,7 +1716,15 @@ impl App {
                         .find(|c| c.status == "running")
                         .map_or(0, |c| c.depth + 1);
                     self.live_tools.push(LiveToolCall {
-                        name: format!("sub-agent: {}", truncate_chars(&subagent.task, 60)),
+                        name: format!(
+                            "sub-agent{}: {}",
+                            if subagent.model.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", subagent.model)
+                            },
+                            truncate_chars(&subagent.task, 60)
+                        ),
                         depth,
                         subagent: Some(subagent.id.clone()),
                         version: 0,
@@ -1896,10 +1993,7 @@ impl App {
             },
             "metrics" => self.open_view(View::Metrics),
             "proposals" => self.open_view(View::Proposals),
-            "propose" => {
-                self.fire(Request::GenerateProposal);
-                self.notes.push("generating a measured proposal...".into());
-            }
+            "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             "settings" => self.open_view(View::Settings),
             "model" => {
@@ -1970,6 +2064,61 @@ impl App {
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
+            "roles" | "providers" => self.request(Pending::ListProviders, Request::ListProviders),
+            "harness" => self.request(Pending::HarnessChanges, Request::ListHarnessChanges),
+            cmd if cmd.starts_with("harness undo") => {
+                let id = cmd["harness undo".len()..].trim();
+                self.request(
+                    Pending::RunControl,
+                    Request::UndoHarnessChange {
+                        id: (!id.is_empty()).then(|| id.to_string()),
+                    },
+                );
+                self.notes.push("undoing the harness change…".into());
+            }
+            cmd if cmd.starts_with("role add ") => {
+                let mut w = cmd["role add ".len()..].split_whitespace();
+                let (name, provider, model) = (w.next(), w.next(), w.next());
+                let description = w.collect::<Vec<_>>().join(" ");
+                match (name, provider, model) {
+                    (Some(name), Some(provider), Some(model)) if !description.is_empty() => {
+                        self.fire(Request::UpsertRole {
+                            name: name.to_string(),
+                            role: serde_json::json!({
+                                "provider": provider,
+                                "model": if model == "-" { "" } else { model },
+                                "description": description,
+                            }),
+                        });
+                        self.notes.push(format!("role {name} saved (new Sessions see it)"));
+                    }
+                    _ => self.notes.push(
+                        "usage: /role add NAME PROVIDER MODEL description… (MODEL - = provider default)"
+                            .into(),
+                    ),
+                }
+            }
+            cmd if cmd.starts_with("role rm ") => {
+                let name = cmd["role rm ".len()..].trim().to_string();
+                self.fire(Request::DeleteRole { name: name.clone() });
+                self.notes.push(format!("deleted role {name}"));
+            }
+            "copy" => self.copy_cmd(""),
+            cmd if cmd.starts_with("copy ") => self.copy_cmd(cmd[5..].trim()),
+            "mouse" => {
+                self.mouse_capture = !self.mouse_capture;
+                let mut out = stdout();
+                if self.mouse_capture {
+                    let _ = out.execute(crossterm::event::EnableMouseCapture);
+                } else {
+                    let _ = out.execute(crossterm::event::DisableMouseCapture);
+                }
+                self.notes.push(if self.mouse_capture {
+                    "mouse on: the wheel scrolls the chat (/mouse to select text instead)".into()
+                } else {
+                    "mouse off: drag to select and copy text with your terminal (/mouse for wheel scrolling)".into()
+                });
+            }
             "open" => self.open_artifact(""),
             cmd if cmd.starts_with("open ") => self.open_artifact(cmd[5..].trim()),
             "undo" => match self.last_deleted.take() {
@@ -2228,7 +2377,7 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+Enter queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /quit".into(),
+                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /roles /role add|rm /harness [undo [ID]] /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
@@ -2559,10 +2708,7 @@ impl App {
                     self.proposal_idx =
                         (self.proposal_idx + 1).min(self.proposals.len().saturating_sub(1))
                 }
-                KeyCode::Char('g') => {
-                    self.fire(Request::GenerateProposal);
-                    self.notes.push("generating a measured proposal...".into());
-                }
+                KeyCode::Char('g') => self.generate_proposal(),
                 KeyCode::Char('a') | KeyCode::Enter => {
                     if let Some(p) = self.proposals.get(self.proposal_idx).cloned() {
                         self.fire(Request::ProposalDecision {
@@ -2779,9 +2925,7 @@ impl App {
                 KeyCode::Up => self.scroll_chat_up(3),
                 KeyCode::Down => self.scroll_chat_down(3),
                 KeyCode::End => self.follow_chat_bottom(),
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.submit_chat(true)
-                }
+                _ if is_queue_key(&key) => self.submit_chat(true),
                 KeyCode::Enter => self.submit_chat(false),
                 KeyCode::Esc => {
                     if self.running() {
@@ -3004,10 +3148,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     let mut block = ui::panel(" Message ", app.color, color);
     if area.width > 64 {
         block = block.title(ui::hint(
-            if app.running() {
-                "Enter steer · Ctrl+Enter queue · Esc stop"
+            &if app.running() {
+                format!("Enter steer · {} queue · Esc stop", app.queue_label())
             } else {
-                "Enter send · Ctrl+Enter queue · /help"
+                format!("Enter send · {} queue · /help", app.queue_label())
             },
             app.color,
         ));
@@ -3118,10 +3262,145 @@ fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Keys that queue a message (SPEC §10.5): Ctrl+Enter where the terminal
+/// can tell it from Enter, and everywhere Ctrl+J (a raw line feed) or
+/// Alt+Enter.
+fn is_queue_key(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+        KeyCode::Char('j') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+/// Rows the live thinking block always takes (SPEC §10.6).
+const THINKING_ROWS: usize = 4;
+
+/// The last `rows` display rows of `text` wrapped at `width` columns
+/// (wide characters count double), padded with empty rows: always exactly
+/// `rows` rows, each fitting the width.
+fn thinking_rows(text: &str, width: usize, rows: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut wrapped: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut row = String::new();
+        let mut used = 0;
+        for c in line.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width {
+                wrapped.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += w;
+        }
+        wrapped.push(row);
+    }
+    let mut out: Vec<String> = wrapped[wrapped.len().saturating_sub(rows)..].to_vec();
+    while out.len() < rows {
+        out.push(String::new());
+    }
+    out
+}
+
 /// How soon a second Ctrl+C must follow the first to detach.
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Fenced code blocks in Markdown text, in order (fence lines dropped).
+fn code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            match current.take() {
+                Some(lines) => blocks.push(lines.join("\n")),
+                None => current = Some(Vec::new()),
+            }
+        } else if let Some(lines) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    blocks
+}
+
+/// OSC 52: the terminal puts `text` on the clipboard (works over SSH;
+/// inside tmux it needs passthrough, `set -g allow-passthrough on`).
+fn osc52(text: &str) -> String {
+    use base64::Engine;
+    let seq = format!(
+        "\x1b]52;c;{}\x07",
+        base64::engine::general_purpose::STANDARD.encode(text)
+    );
+    if std::env::var_os("TMUX").is_some() {
+        format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
+    } else {
+        seq
+    }
+}
+
 impl App {
+    /// `g` / `/propose`: ask for one new measured proposal.
+    fn generate_proposal(&mut self) {
+        if self.proposal_generating {
+            self.notes
+                .push("a proposal is already being generated".into());
+            return;
+        }
+        self.request(Pending::GenerateProposal, Request::GenerateProposal);
+    }
+
+    /// `/copy` (last answer) or `/copy code [n]` (its n-th code block,
+    /// default the last): to the clipboard via OSC 52, and the OS
+    /// clipboard too when this is a local terminal.
+    fn copy_cmd(&mut self, arg: &str) {
+        let Some(last) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+        else {
+            self.notes.push("nothing to copy yet".into());
+            return;
+        };
+        let (text, what) = if let Some(rest) = arg.strip_prefix("code") {
+            let blocks = code_blocks(&last.content);
+            let n = rest.trim().parse::<usize>().unwrap_or(blocks.len());
+            match blocks.get(n.wrapping_sub(1)) {
+                Some(b) => (b.clone(), format!("code block {n} of {}", blocks.len())),
+                None => {
+                    self.notes.push(format!(
+                        "the last answer has {} code block(s)",
+                        blocks.len()
+                    ));
+                    return;
+                }
+            }
+        } else {
+            (last.content.clone(), "the last answer".to_string())
+        };
+        use std::io::Write;
+        let mut out = stdout();
+        let _ = out.write_all(osc52(&text).as_bytes());
+        let _ = out.flush();
+        if std::env::var_os("SSH_CONNECTION").is_none() {
+            let _ = formless_runtime::clipboard_write(&text);
+        }
+        self.notes
+            .push(format!("copied {what} ({} chars)", text.chars().count()));
+    }
+
+    /// The queue binding to advertise: one that works in this terminal.
+    fn queue_label(&self) -> &'static str {
+        if self.enhanced_keys {
+            "Ctrl+Enter"
+        } else {
+            "Ctrl+J"
+        }
+    }
+
     /// Ctrl+C: clear a typed message first; pressed again within
     /// [`CTRL_C_WINDOW`] it detaches (Runs keep going in the daemon). The
     /// setup wizard still quits at once.
@@ -3347,17 +3626,16 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
         if group.is_some() {
             lines.push(Line::raw(""));
         }
-        lines.push(Line::styled("▍Thinking", thinking_style(app.color)));
-        let all: Vec<&str> = app.thinking.lines().collect();
-        const KEEP: usize = 6;
-        if all.len() > KEEP {
-            lines.push(Line::styled(
-                format!("  … {} earlier lines", all.len() - KEEP),
-                thinking_style(app.color),
-            ));
-        }
-        for l in &all[all.len().saturating_sub(KEEP)..] {
-            lines.push(Line::styled(format!("  {l}"), thinking_style(app.color)));
+        // A fixed-height block (header + THINKING_ROWS rendered rows,
+        // pre-wrapped so the paragraph never re-wraps them): nothing below
+        // it moves while reasoning streams.
+        let n = app.thinking.lines().count();
+        lines.push(Line::styled(
+            format!("▍Thinking · {n} line{}", if n == 1 { "" } else { "s" }),
+            thinking_style(app.color),
+        ));
+        for row in thinking_rows(&app.thinking, width.saturating_sub(2), THINKING_ROWS) {
+            lines.push(Line::styled(format!("  {row}"), thinking_style(app.color)));
         }
         group = None;
     }
@@ -3858,8 +4136,13 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 }
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
-    let block = ui::panel(" Prompt proposals ", app.color, Color::Blue).title_bottom(ui::hint(
-        "g generate · a apply measured · r reject · b roll back",
+    let title = if app.proposal_generating {
+        format!(" Prompt proposals · {} generating… ", app.spinner())
+    } else {
+        " Prompt proposals ".to_string()
+    };
+    let block = ui::panel(title, app.color, Color::Blue).title_bottom(ui::hint(
+        "g generate a new one (model call + evals, costs tokens) · a apply measured · r reject · b roll back",
         app.color,
     ));
     if app.proposals.is_empty() {
@@ -4610,6 +4893,13 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
     out.execute(crossterm::event::EnableMouseCapture)?;
+    // Ctrl+Enter is only distinguishable with the kitty keyboard protocol.
+    app.enhanced_keys = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && out
+            .execute(crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ))
+            .is_ok();
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     let result = (|| -> Result<()> {
         while !app.should_quit {
@@ -4627,6 +4917,9 @@ pub fn run(paths: Paths) -> Result<()> {
         }
         Ok(())
     })();
+    if app.enhanced_keys {
+        let _ = stdout().execute(crossterm::event::PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
@@ -4716,6 +5009,9 @@ mod tests {
             chat_line_count: 100,
             input: String::new(),
             ctrl_c_at: None,
+            enhanced_keys: false,
+            mouse_capture: true,
+            proposal_generating: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
             pending: HashMap::new(),
@@ -5380,5 +5676,55 @@ mod tests {
         assert!(!app.should_quit, "an expired first press only re-arms");
         app.key(ctrl_c);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn queue_keys_work_without_the_kitty_protocol() {
+        let k = |code, m| KeyEvent::new(code, m);
+        assert!(is_queue_key(&k(KeyCode::Enter, KeyModifiers::CONTROL)));
+        assert!(is_queue_key(&k(KeyCode::Enter, KeyModifiers::ALT)));
+        assert!(is_queue_key(&k(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+        assert!(!is_queue_key(&k(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!is_queue_key(&k(KeyCode::Char('j'), KeyModifiers::NONE)));
+        let mut app = test_app();
+        assert_eq!(app.queue_label(), "Ctrl+J", "advertise what works");
+        app.enhanced_keys = true;
+        assert_eq!(app.queue_label(), "Ctrl+Enter");
+    }
+
+    #[test]
+    fn code_blocks_and_osc52() {
+        let md = "Intro\n```rust\nfn a() {}\n```\ntext\n```\nls -la\necho hi\n```\n";
+        assert_eq!(
+            code_blocks(md),
+            vec!["fn a() {}".to_string(), "ls -la\necho hi".to_string()]
+        );
+        assert!(code_blocks("no code").is_empty());
+        let seq = osc52("hi");
+        assert!(seq.contains("]52;c;aGk="), "{seq:?}");
+    }
+
+    #[test]
+    fn thinking_block_has_a_fixed_height_at_any_width() {
+        for text in [
+            "",
+            "one",
+            "a\nb\nc\nd\ne\nf\ng",
+            &"x".repeat(500),
+            "漢字漢字漢字漢字",
+        ] {
+            for width in [1, 5, 20, 80] {
+                let rows = thinking_rows(text, width, THINKING_ROWS);
+                assert_eq!(rows.len(), THINKING_ROWS, "{text:?} at {width}");
+                assert!(rows
+                    .iter()
+                    .all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= width.max(2)));
+            }
+        }
+        assert_eq!(
+            thinking_rows("a\nb\nc\nd\ne", 10, 4),
+            vec!["b", "c", "d", "e"],
+            "keeps the latest rows"
+        );
     }
 }

@@ -34,7 +34,22 @@ pub struct Capabilities {
     /// `store:<ns>`: shared key-value namespaces.
     #[serde(default)]
     pub store_shared: Vec<String>,
+    /// `harness:<scope>`: read or change the harness itself (SPEC §7.13).
+    #[serde(default)]
+    pub harness: Vec<String>,
 }
+
+/// Harness scopes (SPEC §7.13). `read` needs no approval; every other one
+/// changes the harness behind a per-change approval.
+pub const HARNESS_SCOPES: &[&str] = &[
+    "read",
+    "mcp",
+    "skills",
+    "models",
+    "providers",
+    "roles",
+    "config",
+];
 
 impl Capabilities {
     pub fn parse(specs: &[String]) -> Result<Self, String> {
@@ -89,6 +104,16 @@ impl Capabilities {
                 c.clipboard_write = true;
             } else if s == "notify" {
                 c.notify = true;
+            } else if let Some(scope) = s.strip_prefix("harness:") {
+                if !HARNESS_SCOPES.contains(&scope) {
+                    return Err(format!(
+                        "unknown harness scope '{scope}' (one of {})",
+                        HARNESS_SCOPES.join(", ")
+                    ));
+                }
+                if !c.harness.iter().any(|h| h == scope) {
+                    c.harness.push(scope.to_string());
+                }
             } else if s == "store" {
                 c.store = true;
             } else if let Some(ns) = s.strip_prefix("store:") {
@@ -160,6 +185,7 @@ impl Capabilities {
             out.push("store".into());
         }
         out.extend(self.store_shared.iter().map(|n| format!("store:{n}")));
+        out.extend(self.harness.iter().map(|h| format!("harness:{h}")));
         match &self.llm {
             Some(v) if v.is_empty() => out.push("llm".into()),
             Some(v) => out.extend(v.iter().map(|m| format!("llm:{m}"))),
@@ -274,6 +300,7 @@ impl Capabilities {
             mcp: merge(&self.mcp, &other.mcp),
             store: self.store || other.store,
             store_shared: merge(&self.store_shared, &other.store_shared),
+            harness: merge(&self.harness, &other.harness),
         }
     }
 
@@ -289,6 +316,7 @@ impl Capabilities {
             || self.llm.is_some()
             || self.agent.is_some()
             || !self.mcp.is_empty()
+            || self.harness.iter().any(|h| h != "read")
     }
 
     /// Does `self` (approved) fully cover `other` (requested)?
@@ -310,6 +338,7 @@ impl Capabilities {
                 .store_shared
                 .iter()
                 .all(|n| self.store_shared.contains(n))
+            && other.harness.iter().all(|h| self.harness.contains(h))
     }
 }
 

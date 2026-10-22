@@ -24,6 +24,96 @@ pub struct Config {
     /// `[[hooks]]` (SPEC §9.8): user policy and automation around Tool
     /// calls and Runs.
     pub hooks: Vec<HookCfg>,
+    /// More providers beside `[provider]` (which is `default`), by name
+    /// (SPEC §4.5). Their API keys live in the keychain, never here.
+    pub providers: BTreeMap<String, ProviderCfg>,
+    /// Roles: a purpose mapped to a provider + model, described for the
+    /// agent so it can pick one for sub-agents (SPEC §4.5).
+    pub roles: BTreeMap<String, RoleCfg>,
+}
+
+/// One Role (SPEC §4.5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RoleCfg {
+    /// When to use it, written for the agent ("fast; broad read-only search").
+    pub description: String,
+    /// A provider name from `[providers]`; unset or "default" = `[provider]`.
+    pub provider: Option<String>,
+    /// The model; empty = that provider's default model.
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    /// Extra system prompt for sub-agents in this role.
+    pub system: Option<String>,
+    /// With `model = "auto"`: the models to choose from, per task, by
+    /// measured quality then cost (SPEC §4.6). Empty: the global pool.
+    pub candidates: Vec<String>,
+    /// Most model turns a sub-agent in this role may take; unset uses
+    /// `tools.subagent_max_turns`.
+    pub max_turns: Option<u32>,
+}
+
+/// The role an old global `provider.model = "auto"` migrates to.
+pub const PRIMARY_ROLE: &str = "primary";
+
+/// The name of the built-in provider (`[provider]`).
+pub const DEFAULT_PROVIDER: &str = "default";
+
+impl Config {
+    /// A provider's settings by name (`default` or unset = `[provider]`).
+    pub fn provider_cfg(&self, name: Option<&str>) -> Result<ProviderCfg> {
+        match name.filter(|n| !n.is_empty() && *n != DEFAULT_PROVIDER) {
+            None => Ok(self.provider.clone()),
+            Some(n) => self.providers.get(n).cloned().with_context(|| {
+                format!(
+                    "unknown provider '{n}' (configured: default{})",
+                    self.providers
+                        .keys()
+                        .map(|k| format!(", {k}"))
+                        .collect::<String>()
+                )
+            }),
+        }
+    }
+
+    /// Migrate the deprecated global `provider.model = "auto"` (SPEC §4.6)
+    /// to a `primary` role with `model = "auto"` whose candidates are the
+    /// former routing pool, and point the default model at it. Returns the
+    /// warning to show, or None when there was nothing to migrate.
+    pub fn migrate_global_auto(&mut self) -> Option<String> {
+        if !ProviderCfg::is_auto_model(&self.provider.model) {
+            return None;
+        }
+        let candidates = self.provider.routing_candidates();
+        self.roles
+            .entry(PRIMARY_ROLE.to_string())
+            .or_insert_with(|| RoleCfg {
+                description: "The primary conversation (migrated from provider.model = \"auto\")."
+                    .into(),
+                model: "auto".into(),
+                candidates: candidates.clone(),
+                ..Default::default()
+            });
+        self.provider.model = format!("role:{PRIMARY_ROLE}");
+        Some(format!(
+            "provider.model = \"auto\" is deprecated: migrated to role '{PRIMARY_ROLE}' (model auto, candidates: {}). Routing is now per role and per task.",
+            if candidates.is_empty() { "the global pool".to_string() } else { candidates.join(", ") }
+        ))
+    }
+
+    /// A Role by name, with an error listing the configured ones.
+    pub fn role(&self, name: &str) -> Result<&RoleCfg> {
+        self.roles.get(name).with_context(|| {
+            if self.roles.is_empty() {
+                format!("unknown role '{name}': no roles are configured")
+            } else {
+                format!(
+                    "unknown role '{name}' (roles: {})",
+                    self.roles.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            }
+        })
+    }
 }
 
 /// One hook: on `event`, for matching calls, run a registry Tool or a
@@ -96,6 +186,19 @@ impl ModelPrice {
         (fresh * self.input + cached as f64 * cached_rate + completion as f64 * self.output) / 1e6
     }
 }
+
+/// Keys `harness:models` may change (SPEC §7.13); other settable keys are
+/// `harness:config`.
+pub const HARNESS_MODEL_KEYS: &[&str] = &[
+    "provider.model",
+    "provider.reasoning_effort",
+    "provider.context_tokens",
+    "provider.model_context_tokens",
+    "provider.fallback_models",
+    "provider.routing_models",
+    "provider.routing_fast_models",
+    "provider.routing_strong_models",
+];
 
 /// Settings clients may change through the daemon (`SetSetting`): exact
 /// keys, or whole sections ending in '.'. Credentials, the endpoint, extra
@@ -517,6 +620,32 @@ pub struct ToolsCfg {
     /// Most results one `find_tools` call may return.
     #[serde(default = "default_find_tools_max")]
     pub find_tools_max: usize,
+    /// Most model turns a sub-agent may take before it stops (a quality
+    /// signal for routing, SPEC §4.6).
+    #[serde(default = "default_subagent_max_turns")]
+    pub subagent_max_turns: u32,
+    /// Per-task routing for `auto` roles (SPEC §4.6): samples a model
+    /// needs before its score counts …
+    #[serde(default = "default_task_min_samples")]
+    pub task_min_samples: i64,
+    /// … the share of good tasks it must reach …
+    #[serde(default = "default_task_quality_bar")]
+    pub task_quality_bar: f64,
+    /// … and how often an under-sampled candidate is tried instead.
+    #[serde(default = "default_task_explore_rate")]
+    pub task_explore_rate: f64,
+}
+fn default_subagent_max_turns() -> u32 {
+    40
+}
+fn default_task_min_samples() -> i64 {
+    5
+}
+fn default_task_quality_bar() -> f64 {
+    0.8
+}
+fn default_task_explore_rate() -> f64 {
+    0.1
 }
 fn default_max_tool_depth() -> usize {
     8
@@ -561,6 +690,10 @@ impl Default for ToolsCfg {
             max_sleep_secs: default_max_sleep_secs(),
             max_random_bytes: default_max_random_bytes(),
             find_tools_max: default_find_tools_max(),
+            subagent_max_turns: default_subagent_max_turns(),
+            task_min_samples: default_task_min_samples(),
+            task_quality_bar: default_task_quality_bar(),
+            task_explore_rate: default_task_explore_rate(),
         }
     }
 }
@@ -847,6 +980,40 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
         }
     }
     None
+}
+
+/// The API key of a named provider (SPEC §4.5): `FORMLESS_API_KEY_<NAME>`
+/// (upper-case, non-alphanumerics as `_`), else the keychain/0600 secret.
+pub fn provider_key(paths: &Paths, name: &str) -> Option<String> {
+    let env = format!(
+        "FORMLESS_API_KEY_{}",
+        name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    );
+    if let Ok(v) = std::env::var(env) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    crate::auth::load_named_secret(paths, &format!("provider-key-{name}"))
+        .and_then(|v| v.as_str().map(str::to_string))
+}
+
+pub fn save_provider_key(paths: &Paths, name: &str, key: &str) -> Result<()> {
+    crate::auth::save_named_secret(
+        paths,
+        &format!("provider-key-{name}"),
+        &serde_json::json!(key),
+    )
+}
+
+pub fn delete_provider_key(paths: &Paths, name: &str) {
+    crate::auth::delete_named_secret(paths, &format!("provider-key-{name}"));
 }
 
 /// Full reset (SPEC §15): keychain entry, config, and the entire data dir.
