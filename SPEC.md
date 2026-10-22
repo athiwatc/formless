@@ -1582,6 +1582,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   lines longer than the pane end in `…`. `/pager code [N]` opens the last
   answer's Nth code block (default the last) unwrapped in the pager, with
   line numbers and ←/→ to scroll sideways.
+  Each block's top border names its language and its index in the
+  message (`╭─ rust [2]`), which is the number `/copy code 2` and
+  `/pager code 2` use. `tui.code_line_numbers` adds dim line numbers.
 - **Tables in narrow terminals (TUI).** Markdown tables wider than the
   pane shrink: columns narrower than an equal share keep their width, and
   the rest share the room in proportion. Cell text wraps inside its
@@ -2038,6 +2041,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tui.hyperlinks` | auto | Clickable OSC 8 links for URLs in the TUI chat: `on`, `off`, or `auto` (on except Terminal.app and the Linux console) (§10.2) |
 | `tui.theme` | auto | `dark`, `light` (deeper hues for white backgrounds), `high-contrast` (bright variants), or `auto` (light when `COLORFGBG` reports a light background) (§10.6) |
 | `tui.colors` | {} | Per-role colour overrides: `user`, `assistant`, `tool`, `note`, `error`, `accent` → a name (`light-cyan`) or `#rrggbb` (§10.6) |
+| `tui.code_line_numbers` | false | Dim line numbers in the chat's code blocks (§10.2) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 

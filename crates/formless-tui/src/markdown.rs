@@ -17,6 +17,15 @@ use super::highlight::{diff_line, Highlighter};
 use super::ui::dim;
 use super::{bold_fg, fg, mermaid};
 
+thread_local! {
+    /// `tui.code_line_numbers`: dim line numbers in code blocks.
+    static LINE_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_line_numbers(on: bool) {
+    LINE_NUMBERS.with(|l| l.set(on));
+}
+
 pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -66,6 +75,8 @@ struct Renderer {
     table: Option<Table>,
     link: Option<(String, usize)>,
     need_gap: bool,
+    /// Code blocks so far, so each is labelled `[n]` like `/copy code n`.
+    code_index: usize,
 }
 
 impl Renderer {
@@ -418,6 +429,8 @@ impl Renderer {
         let color = self.color;
         let avail = self.width.saturating_sub(self.prefix_width());
         let body = body.strip_suffix('\n').unwrap_or(body);
+        self.code_index += 1;
+        let index = self.code_index;
         if lang.eq_ignore_ascii_case("mermaid") {
             if let Some(d) = mermaid::render(body, color, avail) {
                 self.emit(vec![Span::styled(
@@ -431,17 +444,21 @@ impl Renderer {
             }
         }
         let label = if lang.eq_ignore_ascii_case("mermaid") {
-            "╭─ mermaid (source — diagram too wide or not drawable here)".to_string()
+            format!("╭─ mermaid [{index}] (source — diagram too wide or not drawable here)")
         } else if lang.is_empty() {
-            "╭─".to_string()
+            format!("╭─ [{index}]")
         } else {
-            format!("╭─ {lang}")
+            format!("╭─ {lang} [{index}]")
         };
         self.emit(vec![Span::styled(label, dim(color))]);
         let diff = matches!(lang, "diff" | "patch");
         let mut hl = Highlighter::new(lang, color);
-        let code_w = avail.saturating_sub(2).max(8);
-        for raw in body.split('\n') {
+        let numbers = LINE_NUMBERS.with(|l| l.get());
+        let num_w = body.split('\n').count().to_string().len();
+        let code_w = avail
+            .saturating_sub(2 + if numbers { num_w + 1 } else { 0 })
+            .max(8);
+        for (n, raw) in body.split('\n').enumerate() {
             let raw = raw.replace('\t', "    ");
             let spans = if diff {
                 vec![diff_line(&raw, color)]
@@ -453,6 +470,9 @@ impl Renderer {
             // Code never wraps (it would break indentation): long lines
             // end in `…`, and `/pager code N` shows them in full.
             let mut line = vec![Span::styled("│ ", dim(color))];
+            if numbers {
+                line.push(Span::styled(format!("{:>num_w$} ", n + 1), dim(color)));
+            }
             line.extend(truncate_spans(spans, code_w));
             self.emit(line);
         }
@@ -832,6 +852,24 @@ mod tests {
     }
 
     #[test]
+    fn code_blocks_are_numbered_and_can_show_line_numbers() {
+        let md = "```\na\n```\n\ntext\n\n```py\nx = 1\ny = 2\n```";
+        let out = lines(md, 40);
+        assert!(out.contains(&"  ╭─ [1]".to_string()), "{out:#?}");
+        assert!(
+            out.contains(&"  ╭─ py [2]".to_string()),
+            "matches /copy code 2"
+        );
+        set_line_numbers(true);
+        let out = lines(md, 40);
+        set_line_numbers(false);
+        assert!(
+            out.iter().any(|l| l.trim_end() == "  │ 2 y = 2"),
+            "{out:#?}"
+        );
+    }
+
+    #[test]
     fn long_code_lines_are_cut_not_wrapped() {
         let md = format!("```\n    indented {}\nshort\n```", "x".repeat(80));
         let out = lines(&md, 30);
@@ -844,14 +882,14 @@ mod tests {
     #[test]
     fn code_blocks_highlight_and_mermaid_draws() {
         let out = render("```rust\nfn main() {}\n```", true, "", 60);
-        assert_eq!(out[0].spans[0].content, "╭─ rust");
+        assert_eq!(out[0].spans[0].content, "╭─ rust [1]");
         let kw = out[1].spans.iter().find(|s| s.content == "fn").unwrap();
         assert_eq!(kw.style.fg, Some(Color::Magenta));
         let out = lines("```mermaid\ngraph LR\nA --> B\n```", 60);
         assert_eq!(out[0], "  ◇ mermaid · flowchart");
         assert!(out.iter().any(|l| l.contains("│ A ├───▶│ B │")), "{out:?}");
         let out = lines("```mermaid\ngantt\ntitle x\n```", 60);
-        assert!(out[0].contains("mermaid (source"), "{out:?}");
+        assert!(out[0].contains("mermaid [1] (source"), "{out:?}");
         assert!(out.iter().any(|l| l.contains("gantt")));
     }
 }

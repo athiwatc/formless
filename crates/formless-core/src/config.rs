@@ -786,6 +786,8 @@ pub struct TuiCfg {
     /// Per-role colour overrides: user, assistant, tool, note, error,
     /// accent → a colour name or `#rrggbb`.
     pub colors: HashMap<String, String>,
+    /// Dim line numbers in the chat's code blocks.
+    pub code_line_numbers: bool,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -798,6 +800,7 @@ impl Default for TuiCfg {
             hyperlinks: "auto".into(),
             theme: "auto".into(),
             colors: HashMap::new(),
+            code_line_numbers: false,
         }
     }
 }
