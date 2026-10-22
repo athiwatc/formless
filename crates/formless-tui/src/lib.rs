@@ -809,6 +809,9 @@ struct App {
     /// Inline images (SPEC §10.2): the terminal's protocol, the
     /// thumbnails this frame places and those last sent.
     image_proto: Option<images::Protocol>,
+    /// While an approval is open: whether keys go to the input (Tab
+    /// toggles) instead of the approval (SPEC §10.3).
+    input_focus: bool,
     image_placed: Vec<images::Placed>,
     painted_images: Vec<images::Placed>,
     /// Chat rows when the user scrolled away from the bottom, to count
@@ -985,6 +988,7 @@ impl App {
             painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
+            input_focus: false,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
             unseen_from: None,
@@ -3720,8 +3724,30 @@ impl App {
             self.model_key(key);
             return;
         }
+        let modal_open = !self.approvals.is_empty() || !self.promotions.is_empty();
+        if !modal_open {
+            self.input_focus = false;
+        }
+        // Tab moves focus between an open approval and the input; the
+        // approval stays on screen either way.
+        if modal_open && key.code == KeyCode::Tab && self.view == View::Chat {
+            self.input_focus = !self.input_focus;
+            return;
+        }
+        let modal_keys = modal_open && !self.input_focus;
         if let KeyCode::Char(c) = key.code {
-            if c == 'o' && self.input.is_empty() && !self.approvals.is_empty() {
+            // Typing anything else while the approval has focus moves
+            // focus to the input (and types it).
+            if modal_keys
+                && !matches!(c, 'y' | 'n' | 'o')
+                && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+            {
+                self.input_focus = true;
+            }
+        }
+        let modal_keys = modal_keys && !self.input_focus;
+        if let (true, KeyCode::Char(c)) = (modal_keys, key.code) {
+            if c == 'o' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.fire(Request::ApprovalDecision {
                     approval_id: req.approval_id,
@@ -3731,7 +3757,7 @@ impl App {
                 self.notes.push(format!("approved {} once", req.tool_name));
                 return;
             }
-            if (c == 'y' || c == 'n') && self.input.is_empty() {
+            if c == 'y' || c == 'n' {
                 if !self.approvals.is_empty() {
                     let req = self.approvals.pop_front().unwrap();
                     self.fire(Request::ApprovalDecision {
@@ -4784,7 +4810,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         .map(|r| (r, false))
         .or(app.promotions.front().map(|r| (r, true)));
     let typing = app.view == View::Chat;
-    draw_input(f, chunks[2], app, typing && modal.is_none());
+    draw_input(
+        f,
+        chunks[2],
+        app,
+        typing && (modal.is_none() || app.input_focus),
+    );
     draw_status(f, chunks[3], app);
     if app.view == View::Chat {
         let palette = app.palette_items();
@@ -4799,7 +4830,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some((req, promotion)) = modal {
         let more = app.approvals.len() + app.promotions.len() - 1;
-        draw_approval(f, req, promotion, more, app.color);
+        draw_approval(f, req, promotion, more, app.color, !app.input_focus);
     } else if let Some(pick) = &app.rollback_pick {
         draw_rollback_picker(f, app, pick);
     } else if let Some(o) = &app.model_overlay {
@@ -7465,7 +7496,14 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize, color: bool) {
+fn draw_approval(
+    f: &mut Frame,
+    req: &ApprovalReq,
+    promotion: bool,
+    more: usize,
+    color: bool,
+    focused: bool,
+) {
     let mut lines = match &req.detail {
         // A non-Tool approval (e.g. the agent adding an MCP server).
         Some(detail) => {
@@ -7569,6 +7607,14 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
         ));
     }
     lines.push(Line::from(keys));
+    lines.push(Line::styled(
+        if focused {
+            "Tab: keep typing your message (this stays open)"
+        } else {
+            "You're typing · Tab: back to this approval"
+        },
+        ui::dim(color),
+    ));
 
     let area = f.area();
     let content_w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 4;
@@ -7585,15 +7631,20 @@ fn draw_approval(f: &mut Frame, req: &ApprovalReq, promotion: bool, more: usize,
         Paragraph::new(lines)
             .block(
                 ui::panel(
-                    if promotion {
-                        " Promotion approval "
-                    } else {
-                        " Approval required "
+                    match (promotion, focused) {
+                        (true, true) => " Promotion approval ",
+                        (false, true) => " Approval required ",
+                        (true, false) => " Promotion approval · Tab to answer ",
+                        (false, false) => " Approval required · Tab to answer ",
                     },
                     color,
                     Color::Red,
                 )
-                .border_style(bold_fg(color, Color::Red)),
+                .border_style(if focused {
+                    bold_fg(color, Color::Red)
+                } else {
+                    ui::dim(color)
+                }),
             )
             .wrap(Wrap { trim: false }),
         rect,
@@ -8152,6 +8203,7 @@ mod tests {
             painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
+            input_focus: false,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
             hyperlinks: false,
@@ -9693,6 +9745,41 @@ mod tests {
         // Too short to show the whole box: not placed.
         render(&mut app, 100, 12);
         assert!(app.image_placed.is_empty());
+    }
+
+    #[test]
+    fn typing_continues_while_an_approval_is_open() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.approvals.push_back(ApprovalReq {
+            approval_id: "a".into(),
+            tool_name: "fetch_page".into(),
+            version: 1,
+            capabilities: vec!["net:example.com".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: Vec::new(),
+            code_preview: None,
+        });
+        assert!(render(&mut app, 100, 30).contains("Tab: keep typing"));
+        // Typing moves focus to the input; y and n then type normally.
+        for c in "hey no".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input, "hey no");
+        assert_eq!(app.approvals.len(), 1, "still waiting");
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("Approval required · Tab to answer"),
+            "{screen}"
+        );
+        assert_eq!(app.view, View::Chat);
+        // Tab back to the approval: n denies it, the draft is kept.
+        app.key(key(KeyCode::Tab));
+        app.key(key(KeyCode::Char('n')));
+        assert!(app.approvals.is_empty());
+        assert_eq!(app.input, "hey no");
+        assert!(app.notes.last().unwrap().contains("denied fetch_page"));
     }
 
     #[test]
