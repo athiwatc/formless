@@ -1388,8 +1388,16 @@
     const u = S.unfinished;
     box.classList.toggle("hidden", !u || isRunning());
     if (!u) return box.replaceChildren();
+    // An explained provider error (SPEC §4.4): what happened, what to do,
+    // and the raw error behind "details".
+    const x = u.explained;
+    const text = x
+      ? h("span", { class: "banner-text" }, "⏸ " + x.message,
+        x.action ? h("span", { class: "muted" }, " " + x.action + ".") : null,
+        h("details", null, h("summary", null, "details"), h("code", null, u.error || x.details)))
+      : h("span", null, "⏸ The last Run was " + u.status + (u.error ? ": " + truncate(u.error, 200) : ""));
     box.replaceChildren(
-      h("span", null, "⏸ The last Run was " + u.status + (u.error ? ": " + truncate(u.error, 200) : "")),
+      text,
       h("button", { class: "btn small primary", type: "button", onclick: async () => {
         if (await act({ type: "resume_run", session_id: S.current })) { S.unfinished = null; renderRunBanner(); }
       } }, "Resume"),
@@ -2302,7 +2310,7 @@
         if (took >= min && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + Math.round(took) + "s");
         return;
       }
-      case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate(ev.error || "", 120));
+      case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120));
       case "provider_stalled": return alertUser("Run stalled", sessionName(ev.session_id) + ": no reply for " + ev.idle_secs + "s");
       case "approval_requested": return alertUser("Approval needed", sessionName(ev.session_id) + ": " + (ev.tool_name || ""));
       case "user_question": {
@@ -2343,13 +2351,20 @@
       case "run_finished":
       case "run_paused":
         S.running.delete(ev.session_id);
-        if (here) { S.unfinished = { status: "paused", error: ev.error }; renderRunBanner(); }
+        if (here) {
+          // run_paused carries the error (and its explanation); the
+          // run_finished that follows must not wipe it.
+          if (ev.type === "run_paused") S.unfinished = { status: "paused", error: ev.error, explained: ev.explained };
+          else if (ev.status === "completed") S.unfinished = null;
+          else if (!S.unfinished) S.unfinished = { status: ev.status };
+          renderRunBanner();
+        }
         if (here) {
           S.streaming = "";
           S.thinking = "";
           S.liveTools = [];
           setActivity(null);
-          if (ev.type === "run_paused") note("run paused: " + ev.error, true);
+          if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
           else if (ev.status !== "completed") note("run " + ev.status, ev.status !== "interrupted");
           renderHistory();
         }

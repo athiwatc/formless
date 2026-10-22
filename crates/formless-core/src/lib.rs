@@ -4,6 +4,7 @@ pub mod config;
 pub mod daemon;
 pub mod diff;
 pub mod dupes;
+pub mod errors;
 pub mod files;
 pub mod fuzzy;
 pub mod hooks;

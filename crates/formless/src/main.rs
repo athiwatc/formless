@@ -982,7 +982,17 @@ fn doctor(paths: Paths) -> Result<()> {
                             Err(e) => println!("cache:      probe failed: {e}"),
                         }
                     }
-                    Err(e) => println!("probe:      FAILED: {e}"),
+                    Err(e) => {
+                        let x = formless_core::errors::explain(
+                            &format!("{e:#}"),
+                            &formless_core::errors::ErrorContext::from_config(&cfg, &probe_model),
+                        );
+                        println!("probe:      FAILED ({}): {}", x.category, x.message);
+                        if let Some(action) = x.action {
+                            println!("            next: {action}");
+                        }
+                        println!("            details: {e:#}");
+                    }
                 }
             }
         }
@@ -1150,8 +1160,19 @@ fn run_headless(
                             scope: ApprovalScope::Once,
                         });
                     }
-                    Event::RunPaused { error, .. } => {
-                        eprintln!("run paused: {error}");
+                    Event::RunPaused {
+                        error, explained, ..
+                    } => {
+                        match explained {
+                            Some(x) => {
+                                eprintln!("run paused: {}", x.message);
+                                if let Some(action) = x.action {
+                                    eprintln!("  next: {action}");
+                                }
+                                eprintln!("  details: {error}");
+                            }
+                            None => eprintln!("run paused: {error}"),
+                        }
                         code = 1;
                         break;
                     }

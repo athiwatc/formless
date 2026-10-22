@@ -228,6 +228,23 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   correction prompt and counted in a **separate** malformed-call counter —
   they never pollute Tool Success Rate.
 
+- **Explained errors.** When a Run pauses on a provider failure,
+  `RunPaused.explained` sorts it into a category with a short message and
+  the next step (`errors.rs`):
+  - `auth` (401/403, "invalid API key"): re-enter the key.
+  - `model` (404, "model … does not exist"): pick another with `/model`.
+  - `rate_limit` (429, "quota"): the wait from `Retry-After`, which the
+    provider client now includes in the error, plus any fallback models
+    or Roles to switch to.
+  - `context` (context length exceeded): compact or `/fork`.
+  - `unreachable` (connection refused, DNS, timeouts): for local
+    endpoints, "is Ollama/LM Studio running?".
+  - `tool_calling` (tools unsupported): set `provider.tool_mode = prompt`.
+  - `server` (5xx) and `other`.
+  The raw error stays available: the TUI's `/details` pager, the web
+  banner's "details", and `formless run`'s output. `formless doctor`
+  reports a failed probe the same way.
+
 ### 4.5 Providers and Roles
 
 The user talks to one **primary** model; work can go to others.

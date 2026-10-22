@@ -1594,10 +1594,18 @@ impl Daemon {
                     final_status = "paused";
                     let _ = self.with_store(|st| st.set_run_status(&run_id, "paused"));
                     let _ = self.with_store(|st| st.set_run_error(&run_id, &e.to_string()));
+                    let explained = self.config().ok().map(|cfg| {
+                        let (model, _) = self.session_model_effort(&session_id, &cfg);
+                        crate::errors::explain(
+                            &format!("{e:#}"),
+                            &crate::errors::ErrorContext::from_config(&cfg, &model),
+                        )
+                    });
                     self.broadcast(Event::RunPaused {
                         session_id: session_id.clone(),
                         run_id: run_id.clone(),
                         error: e.to_string(),
+                        explained,
                     });
                     break;
                 }

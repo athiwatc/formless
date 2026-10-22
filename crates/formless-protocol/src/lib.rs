@@ -55,6 +55,20 @@ pub struct ToolInfo {
     pub updated_at: String,
 }
 
+/// A provider failure explained for people (SPEC §4.4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ErrorExplained {
+    /// auth, model, rate_limit, context, unreachable, tool_calling,
+    /// server or other.
+    pub category: String,
+    pub message: String,
+    /// The next step to take, if any.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// The raw error.
+    pub details: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolVersionInfo {
     pub version: i64,
@@ -947,6 +961,9 @@ pub enum Event {
         session_id: String,
         run_id: String,
         error: String,
+        /// The error sorted into a category with a next step (SPEC §4.4).
+        #[serde(default)]
+        explained: Option<ErrorExplained>,
     },
     CompactionNotice {
         session_id: String,
