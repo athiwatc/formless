@@ -337,6 +337,17 @@ task, with quality as a gate**.
   in its own isolated sandbox instance; results are returned together.
   Approval gates (§10.3) are evaluated per call before the batch starts:
   approved calls run, held calls wait on one combined prompt.
+- **Building Tools instead of refusing** (`provider.tool_use_nudge`, on by
+  default). The system prompt tells the agent that it has no abilities
+  beyond its Tools and can always build one, and that it should never say
+  it can't access something or hand a step back to the user. GPT-family
+  models (ids starting `gpt-`, `chatgpt`, `o1`, `o3`, `o4`, with any
+  `vendor/` prefix) also get a stronger addendum. The addendum is chosen
+  when the Session's prompt is snapshotted, so it stays stable for the
+  Session and its cached prefix. If a final answer reads as an access
+  refusal ("I can't access…", "please paste…") before any Tool was used in
+  that step, the answer is dropped and a system note asks the agent to
+  find_tools / create_tool instead. This happens at most once per step.
 
 ### 5.3 Talking to a busy agent
 
@@ -1760,6 +1771,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
 | `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
+| `provider.tool_use_nudge` | true | Push models to build Tools: a GPT-family system-prompt addendum, and one nudge per step when an answer refuses for lack of access before using any Tool (§5.2) |
 | `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this long (`ProviderStalled`; `/resend` re-sends); 0 = never |
 | `provider.first_byte_timeout_secs` | 0 | Auto re-send when no first byte arrives in time (up to `max_retries`); 0 = off |
 | `provider.api_style` | `chat` | `chat` or `responses` (§4.1) |

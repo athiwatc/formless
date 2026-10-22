@@ -218,6 +218,7 @@ pub const SETTABLE: &[&str] = &[
     "provider.first_byte_timeout_secs",
     "provider.max_backoff_secs",
     "provider.cache_key",
+    "provider.tool_use_nudge",
     "provider.vision",
     "provider.prices",
     "daemon.idle_grace_secs",
@@ -413,6 +414,10 @@ pub struct ProviderCfg {
     /// "session" (default): send a per-Session `prompt_cache_key` so the
     /// endpoint keeps one Session on one prompt cache; "off": never send it.
     pub cache_key: String,
+    /// Push models to build Tools (#237): a per-family system-prompt
+    /// addendum (GPT models) and one nudge per step when an answer refuses
+    /// for lack of access before using any Tool.
+    pub tool_use_nudge: bool,
     /// Longest wait between retries when the server gives no hint (full
     /// jitter below it). A server's `Retry-After` is honoured up to 5 min.
     pub max_backoff_secs: u64,
@@ -488,6 +493,7 @@ impl Default for ProviderCfg {
             first_byte_timeout_secs: 0,
             max_backoff_secs: 30,
             cache_key: "session".into(),
+            tool_use_nudge: true,
         }
     }
 }

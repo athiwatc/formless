@@ -24,10 +24,66 @@ pub const SYSTEM_PROMPT: &str = concat!("You are Formless, a general-purpose age
 You start with only built-ins: `create_tool`, `create_module`, `retire_tool`, `find_tools`, `read_tool`, `test_tool` and `run_script`. Everything else you build yourself: small, minimally-capabled Tools created with create_tool, persisted and reused across tasks and projects. Never expect a Tool to exist - find it or build it.\n\
 The registry can hold far more Tools than are listed to you as functions. Before creating a Tool, find_tools for it; matches become callable. To change a Tool, read_tool it first and create a new version (same name) from its real code. Test a draft with test_tool on real input before saving it, then call the saved Tool. Shared JS helpers (parsers, encoders, hashing, URL handling) belong in modules via create_module, loaded inside Tools with requireModule(name). To delegate a focused task to a sub-agent with the same Tools, build a Tool with the \"agent\" Capability, e.g. `function run(i){ return agents.run(i.task, {model: i.model}); }`; several such calls in one turn run in parallel.\n\
 To call existing Tools many times, or chain them with loops, filters and branches, use run_script instead of one call per step: it runs a short script that calls only the Tools in its uses list, in parallel with Promise.all, and returns just the final value. Scripts only connect Tools: anything that reads or changes the world is a Tool, never script code. Save a script you would run twice as a Tool with save_as.\n\
+You have no abilities beyond your Tools, but you can always build one: when a task needs files, the web, processes, the clipboard or anything else outside this conversation, find_tools and, if nothing fits, create_tool and do it. Never say you can't access something, and never ask the user to do a step a Tool could do.\n\
 Make Tools generic: a Tool does one kind of thing (read_text_file, http_get_json, csv_column_sum), and everything task- or project-specific - paths, URLs, hosts, queries, names, column/field names - comes in through its input. Never hardcode such values in implementation_js, the Tool name, or its description. If an existing Tool nearly fits, create a more general new version of it (existing input fields keep working, new ones optional) rather than a new narrow Tool. Specialise only when the logic itself is inherently specific to one project.\n\
 ", host_api_doc!(), "\n\
 Stream anything large (fs.readChunks / fetchChunks / fs.append / emit); never load it whole. Declare only the Capabilities a Tool needs, as strings like \"net\", \"net:example.com\", \"fs:read:/abs/path\", \"fs:write:/abs/path\", input-bound scopes \"fs:read:$input.path\", \"fs:write:$input.out\", \"net:$input.url\" (granted per call for exactly the path(s)/host named by that input field - string or array of strings - so a generic Tool stays least-privilege; prefer these over fixed project paths), \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"clipboard:write\", \"notify\", \"store\", \"store:<ns>\", \"harness:read\", \"harness:<mcp|skills|models|providers|roles|config>\", \"llm\", \"agent\" (or \"llm:model\"/\"agent:model\"). Prefer retiring a broken Tool and creating a new version over silent workarounds.\n\
 When the user states a lasting preference or fact about themselves or their setup (tools they use, language, where projects live), save it with remember; never remember secrets or one-off details, and forget a note when asked or when it stops being true.");
+
+/// Extra guidance for model families that under-use Tools (#237): GPT
+/// models tend to answer from memory or refuse instead of building one.
+const OPENAI_ADDENDUM: &str = "Tool use rule: you have no built-in access to files, the web, processes or the clipboard, but you can build it. If a task needs anything outside this conversation, do not answer from memory, do not say you can't access it, and do not ask the user to run or paste anything: call find_tools, and if nothing fits, create_tool (test it with test_tool), then call it. Act first; ask the user only for decisions or facts no Tool could find.";
+
+/// The system-prompt addendum for `model`'s family, if any. Chosen when a
+/// Session's prompt is snapshotted, so it is stable for the Session.
+pub fn model_family_addendum(model: &str) -> Option<&'static str> {
+    let m = model.to_ascii_lowercase();
+    let id = m.rsplit('/').next().unwrap_or(&m);
+    let openai = ["gpt-", "gpt5", "chatgpt", "o1", "o3", "o4"]
+        .iter()
+        .any(|p| id.starts_with(p));
+    openai.then_some(OPENAI_ADDENDUM)
+}
+
+/// Sent back once per step when a final answer refuses for lack of
+/// access before any Tool was used.
+pub const REFUSAL_NUDGE: &str = "You answered that you can't access or do something, or asked the user to do a step themselves, without trying a Tool. You can build that access: call find_tools for it and, if nothing fits, create_tool, test it, and call it. Only if that truly cannot work, explain why.";
+
+/// Whether a final answer refuses for lack of access or hands a step back
+/// to the user ("I can't access files", "please paste the output").
+pub fn looks_like_access_refusal(text: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "can't access",
+        "cannot access",
+        "don't have access",
+        "do not have access",
+        "unable to access",
+        "not able to access",
+        "can't browse",
+        "cannot browse",
+        "unable to browse",
+        "don't have the ability",
+        "do not have the ability",
+        "don't have direct access",
+        "can't read files",
+        "can't run commands",
+        "cannot run commands",
+        "can't execute",
+        "cannot execute",
+        "no access to your",
+        "please paste",
+        "you can paste",
+        "could you paste",
+        "can you paste",
+        "you'll need to run",
+        "you will need to run",
+        "you can run the following",
+        "run the following command",
+    ];
+    // Curly apostrophes count too.
+    let t = text.to_lowercase().replace('\u{2019}', "'");
+    PATTERNS.iter().any(|p| t.contains(p))
+}
 
 const SUMMARIZE_PROMPT: &str = "Summarise the following conversation excerpt \
 faithfully and compactly, preserving facts, decisions, names, and open \
@@ -1287,6 +1343,48 @@ pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpt_family_gets_the_tool_use_addendum() {
+        for m in [
+            "gpt-4.1",
+            "openai/gpt-5-mini",
+            "o3",
+            "o4-mini",
+            "chatgpt-4o-latest",
+            "GPT-4o",
+        ] {
+            assert!(model_family_addendum(m).is_some(), "{m}");
+        }
+        for m in [
+            "claude-sonnet-4",
+            "anthropic/claude-opus-4",
+            "deepseek-chat",
+            "llama3",
+            "",
+        ] {
+            assert!(model_family_addendum(m).is_none(), "{m}");
+        }
+    }
+
+    #[test]
+    fn detects_access_refusals() {
+        for t in [
+            "I can't access files on your computer.",
+            "I don\u{2019}t have access to the internet, but here is what I know.",
+            "As a language model I do not have the ability to browse.",
+            "You can run the following command and paste the output:",
+            "Could you paste the contents of the file?",
+        ] {
+            assert!(looks_like_access_refusal(t), "{t}");
+        }
+        for t in [
+            "Here are the 12 TODOs I found.",
+            "The page title is \"Example Domain\".",
+        ] {
+            assert!(!looks_like_access_refusal(t), "{t}");
+        }
+    }
 
     #[test]
     fn retry_hints_are_parsed_from_headers() {
