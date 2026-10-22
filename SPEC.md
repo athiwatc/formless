@@ -354,20 +354,34 @@ task, with quality as a gate**.
 
 ### 5.5 Asking the user mid-Run
 
-`ask_user({question, options?})` lets the agent ask a clarifying
-question without ending its Run, so pending Invocations and other
-in-flight state carry on.
+`ask_user` lets the agent ask without ending its Run, so pending
+Invocations and other in-flight state carry on. It takes either one
+`question` (with optional `options` and `multi_select`) or `questions`:
+1–4 related questions asked together, each `{question, header?, options?,
+multi_select?}`. An option is `{label, description?}`; a plain string is
+accepted as a label. The user may always answer in their own words.
 
 - The daemon broadcasts `UserQuestion` (global, like approvals) and waits
-  for the first `AnswerQuestion`. The answer comes back as the tool result
-  (`{"answer": …}`), and `UserQuestionClosed` tells the other clients to
-  close their prompt. Interrupting the Run abandons the question.
+  for the first `AnswerQuestion`. `UserQuestionClosed` tells the other
+  clients to close their prompt. Interrupting the Run abandons the
+  question.
+- **Compatibility:** `UserQuestion` carries the structured `questions` and
+  also `question`/`options` (one question: its text and labels; several: a
+  numbered list and no options) for older clients. `AnswerQuestion` takes
+  `answers` (one `{selected[], text?}` per question, in order) and/or the
+  free-text `answer`.
+- **Result:** with structured answers, `{"answers": [{question, selected,
+  text?}]}`, plus `answer` (the first answer as one line) when the call
+  used the single-question form. With free text only, `{"answer": …}`.
 - **Clients:**
-  - TUI: the question appears in the chat, and the next typed line
-    answers it (an option number picks that option).
-  - web: a modal prompt.
-  - `formless run`: `--answer TEXT`, else a terminal prompt, else a
-    reply telling the agent that nobody can answer.
+  - TUI: each question appears in the chat in turn; the next typed line
+    answers it (an option number picks that option, `1,3` picks several
+    on a `multi_select` question, anything else is the user's own text).
+  - web: a modal with radios or checkboxes per question and an "Other"
+    box.
+  - `formless run`: `--answer TEXT` (free text for the whole call), else a
+    terminal prompt per question, else a reply telling the agent that
+    nobody can answer.
 - With no client connected, `ask_user` fails at once with an error
   telling the agent to proceed on a stated assumption.
 

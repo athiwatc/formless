@@ -387,6 +387,15 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 /* Multi-line dialog text (shortcut help, questions) */
 #ask-text { white-space: pre-wrap; font-variant-numeric: tabular-nums; }
 
+/* ask_user questions */
+.question { border: 0; padding: 0; margin: 0 0 14px; }
+.question legend { padding: 0; margin-bottom: 6px; font-weight: 600; }
+.q-option { display: flex; gap: 8px; align-items: flex-start; padding: 5px 0; cursor: pointer; }
+.q-option input { width: auto; margin: 3px 0 0; }
+.q-option > span { display: flex; flex-direction: column; }
+.q-option .muted { font-size: 13px; }
+.modal input.q-other { margin-top: 4px; }
+
 /* Connection pill: retry while offline */
 .pill.clickable { cursor: pointer; }
 .pill.clickable:hover { text-decoration: underline; }

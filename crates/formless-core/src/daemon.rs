@@ -140,6 +140,9 @@ pub(crate) struct RunCtl {
     retry: Arc<tokio::sync::Notify>,
 }
 
+/// A client's reply to an `ask_user` call: free text, structured answers.
+type QuestionReply = (String, Vec<QuestionAnswer>);
+
 pub struct Daemon {
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
@@ -149,7 +152,7 @@ pub struct Daemon {
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Open `ask_user` questions, by id.
-    questions: Arc<StdMutex<HashMap<String, oneshot::Sender<String>>>>,
+    questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
     /// Shown to each client as it connects (deprecation migrations).
     startup_warnings: Vec<String>,
     /// The model each active Run resolved to (per-task routing, §4.6).
@@ -908,10 +911,11 @@ impl Daemon {
             Request::AnswerQuestion {
                 question_id,
                 answer,
+                answers,
             } => {
                 // First answer wins; the others find it gone.
                 let tx = self.questions.lock().unwrap().remove(&question_id);
-                let answered = tx.is_some_and(|tx| tx.send(answer).is_ok());
+                let answered = tx.is_some_and(|tx| tx.send((answer, answers)).is_ok());
                 Ok(json!({"answered": answered}))
             }
             Request::ListBuiltinStats => Ok(serde_json::to_value(
@@ -4279,44 +4283,78 @@ impl Daemon {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<String> {
-        let question = args["question"]
-            .as_str()
-            .filter(|q| !q.trim().is_empty())
-            .context("question required")?
-            .to_string();
-        let options: Vec<String> = args["options"]
-            .as_array()
-            .map(|o| {
-                o.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let questions = parse_questions(args)?;
+        // A single top-level question is the original form: its result
+        // keeps the plain `answer` field.
+        let legacy = args.get("questions").is_none();
         if self.subscriber_count() == 0 {
             return Err(anyhow!(
                 "no user is connected to answer (headless run); continue with your best assumption and state it"
             ));
         }
         let question_id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel::<String>();
+        let (tx, rx) = oneshot::channel();
         self.questions
             .lock()
             .unwrap()
             .insert(question_id.clone(), tx);
+        // Summary fields for clients that predate `questions`.
+        let (question, options) = match questions.as_slice() {
+            [q] => (
+                q.question.clone(),
+                q.options.iter().map(|o| o.label.clone()).collect(),
+            ),
+            qs => (
+                qs.iter()
+                    .enumerate()
+                    .map(|(i, q)| format!("{}. {}", i + 1, q.question))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Vec::new(),
+            ),
+        };
         self.broadcast(Event::UserQuestion {
             question_id: question_id.clone(),
             session_id: session_id.to_string(),
             question,
             options,
+            questions: questions.clone(),
         });
-        let answer = tokio::select! {
+        let reply = tokio::select! {
             _ = cancel.cancelled() => None,
             r = rx => r.ok(),
         };
         self.questions.lock().unwrap().remove(&question_id);
         self.broadcast(Event::UserQuestionClosed { question_id });
-        let answer = answer.context("interrupted before the user answered")?;
-        Ok(json!({"answer": answer}).to_string())
+        let (answer, answers) = reply.context("interrupted before the user answered")?;
+        if answers.is_empty() {
+            // Free text from a client that answers in one line.
+            return Ok(json!({"answer": answer}).to_string());
+        }
+        // One answer per question; blank text counts as none.
+        let answers: Vec<QuestionAnswer> = answers
+            .into_iter()
+            .map(|mut a| {
+                a.text = a.text.filter(|t| !t.trim().is_empty());
+                a
+            })
+            .chain(std::iter::repeat_with(QuestionAnswer::default))
+            .take(questions.len())
+            .collect();
+        let structured = questions
+            .iter()
+            .zip(&answers)
+            .map(|(q, a)| {
+                let mut v = serde_json::to_value(a)?;
+                v["question"] = json!(q.question);
+                Ok(v)
+            })
+            .collect::<Result<Vec<Value>>>()?;
+        let mut out = json!({"answers": structured});
+        if legacy {
+            out["answer"] = json!(answers[0].summary());
+        }
+        Ok(out.to_string())
     }
 
     /// `remember` (SPEC §7.11): save (or refresh) a user-memory note.
@@ -6747,6 +6785,52 @@ fn is_control(req: &Request) -> bool {
             | Request::PromotionDecision { .. }
             | Request::AnswerQuestion { .. }
     )
+}
+
+/// The questions of an `ask_user` call: `questions` (1–4), or the single
+/// top-level `question`. Options may be labels or `{label, description}`.
+fn parse_questions(args: &Value) -> Result<Vec<Question>> {
+    fn one(v: &Value) -> Result<Question> {
+        let question = v["question"]
+            .as_str()
+            .filter(|q| !q.trim().is_empty())
+            .context("question required")?
+            .to_string();
+        let options = v["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| {
+                Some(QuestionOption {
+                    label: o.as_str().or(o["label"].as_str())?.to_string(),
+                    description: o["description"]
+                        .as_str()
+                        .filter(|d| !d.trim().is_empty())
+                        .map(str::to_string),
+                })
+            })
+            .filter(|o| !o.label.trim().is_empty())
+            .collect();
+        Ok(Question {
+            question,
+            header: v["header"]
+                .as_str()
+                .filter(|h| !h.trim().is_empty())
+                .map(str::to_string),
+            options,
+            multi_select: v["multi_select"].as_bool().unwrap_or(false),
+        })
+    }
+    match args.get("questions") {
+        Some(Value::Array(qs)) => {
+            if qs.is_empty() || qs.len() > toolreg::MAX_QUESTIONS {
+                bail!("questions takes 1 to {} questions", toolreg::MAX_QUESTIONS);
+            }
+            qs.iter().map(one).collect()
+        }
+        Some(_) => bail!("questions must be an array"),
+        None => Ok(vec![one(args)?]),
+    }
 }
 
 /// Where a model call goes (SPEC §4.5).
