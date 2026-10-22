@@ -139,6 +139,19 @@ without redesign.
   model-name entry is offered. Model + effort are a daemon default,
   overridable per Session, changeable mid-Session, effective on the **next
   Run** (never mid-Run).
+- **Model picker.** The wizard, `/model` and the web client share one
+  picker. Typing filters the list by fuzzy (subsequence) match on the id:
+  word starts and runs of consecutive matches rank higher, matched
+  characters are highlighted, and recently used models come first. Roles
+  show up as `role:<name>` rows with the provider and model they map to.
+  `ListModels` returns `{models, roles, recent, current, error}`: `models`
+  comes from the default provider's `/models`, `recent` from the Sessions'
+  models, newest first. When the list can't be fetched, the typed text is
+  used as a free-form model id. In `/model`, Enter sets the **current
+  Session**'s model and effort (`SetSessionModel`). Ctrl+Enter, Alt+Enter
+  or Ctrl+D (Ctrl/⌘+Enter on the web) sets the global default instead
+  (`SetSetting provider.model` / `provider.reasoning_effort`). Tab picks
+  the effort. `/model <id>` sets the Session's model directly.
 - `reasoning_effort` is sent verbatim when set. If the endpoint rejects an
   unknown parameter (HTTP 400), the daemon retries **once** without the
   offending parameter and posts a visible note in the Session (never silent).

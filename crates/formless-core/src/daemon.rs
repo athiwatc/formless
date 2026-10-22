@@ -773,6 +773,45 @@ impl Daemon {
                 }
                 Ok(json!({"providers": providers, "roles": cfg.roles}))
             }
+            Request::ListModels => {
+                let cfg = self.config()?;
+                let listed = async {
+                    let provider = self.provider(&cfg).await?;
+                    tokio::time::timeout(std::time::Duration::from_secs(15), provider.list_models())
+                        .await
+                        .map_err(|_| anyhow!("GET /models timed out"))?
+                };
+                let (models, error) = match listed.await {
+                    Ok(m) => (m, None),
+                    Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+                };
+                let roles: Vec<_> = cfg
+                    .roles
+                    .iter()
+                    .map(|(name, r)| {
+                        json!({"name": name,
+                               "provider": r.provider.as_deref().unwrap_or(crate::config::DEFAULT_PROVIDER),
+                               "model": r.model})
+                    })
+                    .collect();
+                // Sessions come newest first; keep each model once.
+                let mut recent: Vec<String> = Vec::new();
+                for s in self.with_reader(|st| st.list_sessions())? {
+                    if let Some(m) = s.model.filter(|m| !m.is_empty()) {
+                        if !recent.contains(&m) {
+                            recent.push(m);
+                        }
+                    }
+                }
+                Ok(json!({
+                    "models": models,
+                    "roles": roles,
+                    "recent": recent,
+                    "current": {"model": cfg.provider.model,
+                                "reasoning_effort": cfg.provider.reasoning_effort},
+                    "error": error,
+                }))
+            }
             Request::UpsertProvider {
                 name,
                 base_url,

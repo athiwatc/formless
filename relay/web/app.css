@@ -396,6 +396,18 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .q-option .muted { font-size: 13px; }
 .modal input.q-other { margin-top: 4px; }
 
+/* /model picker */
+.modal.picker { max-width: 640px; }
+.picker-list { max-height: min(50vh, 420px); overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.modal .picker-list li { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; }
+.picker-list li.sel { background: var(--accent-soft); }
+.picker-id { font-family: var(--mono, monospace); overflow-wrap: anywhere; flex: 1; min-width: 0; }
+.picker-id mark { background: none; color: var(--accent); font-weight: 600; text-decoration: underline; }
+.picker-tag { font-size: 12px; border: 1px solid var(--line); border-radius: 6px; padding: 0 6px; }
+.picker-list .muted { font-size: 12px; }
+.picker-effort { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+#status-model.clickable { cursor: pointer; }
+
 /* Connection pill: retry while offline */
 .pill.clickable { cursor: pointer; }
 .pill.clickable:hover { text-decoration: underline; }
