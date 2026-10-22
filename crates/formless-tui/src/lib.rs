@@ -786,6 +786,9 @@ struct App {
     /// Unsent input and attachments per Session (SPEC §10.2), kept when
     /// switching away; text drafts persist across restarts.
     drafts: HashMap<String, Draft>,
+    /// Until when the input border flashes after the target Session
+    /// changed (SPEC §10.2).
+    target_flash: Option<Instant>,
     /// Chat rows when the user scrolled away from the bottom, to count
     /// what arrived since; and where the "new lines" badge was drawn
     /// (row, first and last column) so a click can follow again.
@@ -951,6 +954,7 @@ impl App {
             edit_armed: false,
             fork_prefill: None,
             drafts: HashMap::new(),
+            target_flash: None,
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -1770,6 +1774,7 @@ impl App {
             let draft = self.drafts.remove(&id).unwrap_or_default();
             self.input = draft.input;
             self.attachments = draft.attachments;
+            self.target_flash = Some(Instant::now() + Duration::from_millis(700));
         }
         self.current = Some(id);
         self.streaming.clear();
@@ -5275,7 +5280,16 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         }
         cursor = Some((cur.0 - top, cur.1));
     }
-    let mut title = String::from(" Message ");
+    // Which Session gets this message (SPEC §10.2).
+    let target = app
+        .current
+        .as_ref()
+        .and_then(|id| app.sessions.iter().find(|s| &s.id == id))
+        .map(|s| truncate_chars(&s.name, 32));
+    let mut title = match &target {
+        Some(name) => format!(" Message › to: {name} "),
+        None => String::from(" Message "),
+    };
     for (n, (name, bytes)) in app.attachments.iter().enumerate() {
         let label = if name.starts_with("pasted-image") {
             format!("image {}", n + 1)
@@ -5284,7 +5298,15 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         };
         title.push_str(&format!("[{label} · {}] ", size_text(bytes.len())));
     }
-    let mut block = ui::panel(title, app.color, color);
+    let flashing = app.target_flash.is_some_and(|t| Instant::now() < t);
+    let mut block = ui::panel(
+        title,
+        app.color,
+        if flashing { Color::Yellow } else { color },
+    );
+    if flashing {
+        block = block.border_style(bold_fg(app.color, Color::Yellow));
+    }
     if area.width > 64 {
         block = block.title(ui::hint(
             &if app.running() {
@@ -7739,6 +7761,7 @@ mod tests {
             edit_armed: false,
             fork_prefill: None,
             drafts: HashMap::new(),
+            target_flash: None,
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -9061,6 +9084,27 @@ mod tests {
         assert_eq!(again.input, "for s2");
         again.switch_session("s1".into());
         assert_eq!(again.input, "half-typed for s1");
+    }
+
+    #[test]
+    fn input_border_names_the_target_session() {
+        let mut app = test_app();
+        app.sessions = ["refactor-auth", "docs"]
+            .iter()
+            .map(|n| SessionInfo {
+                id: n.to_string(),
+                name: n.to_string(),
+                model: None,
+                reasoning_effort: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
+        app.switch_session("refactor-auth".into());
+        assert!(render(&mut app, 100, 20).contains("Message › to: refactor-auth"));
+        assert!(app.target_flash.is_some_and(|t| t > Instant::now()));
+        app.switch_session("docs".into());
+        assert!(render(&mut app, 100, 20).contains("to: docs"));
     }
 
     #[test]

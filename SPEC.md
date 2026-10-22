@@ -1533,6 +1533,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   with live elapsed + `possibly stalled` flags, §6), compaction notices,
   optimiser activity notes. Full scrollback is preserved across modal
   overlays and view switches.
+- **Which Session gets the input (TUI).** The input box's border names
+  the target Session (`Message › to: refactor-auth`) and briefly flashes
+  when it changes.
 - **Drafts per Session (TUI).** Unsent input and pending attachments
   belong to their Session. Switching away keeps them and coming back
   restores them, so a half-typed message never goes to the wrong Session.
