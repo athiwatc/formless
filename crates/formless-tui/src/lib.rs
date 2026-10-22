@@ -4294,6 +4294,13 @@ impl App {
         if self.find_key(&key) || self.call_focus_key(&key) {
             return;
         }
+        // On the empty-Session screen, 1–4 put an example in the input.
+        if let KeyCode::Char(d @ '1'..='4') = key.code {
+            if self.input.is_empty() && self.messages.is_empty() && !self.running() {
+                self.input.set(EXAMPLES[d as usize - '1' as usize]);
+                return;
+            }
+        }
         let page = self.chat_view_height.saturating_sub(1).max(1);
         let empty = self.input.is_empty();
         match key.code {
@@ -5439,30 +5446,42 @@ fn tool_result_line(content: &str, color: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Example tasks on an empty Session (SPEC §10.2); 1–4 put one in the
+/// input.
+const EXAMPLES: [&str; 4] = [
+    "Find every TODO in this repo and group them by file",
+    "Summarise https://example.com in three bullet points",
+    "Every weekday at 9:00, list the top 5 stories on news.ycombinator.com",
+    "What can you do, and which Tools have you built so far?",
+];
+
 fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = (0..height.saturating_sub(10) / 2)
+    let mut lines: Vec<Line> = (0..height.saturating_sub(14) / 2)
         .map(|_| Line::raw(""))
         .collect();
     lines.push(Line::styled("◇ Formless", bold_fg(color, Color::Cyan)).centered());
     lines.push(
         Line::styled(
-            "an agent that builds, measures, and improves its own Tools",
+            "It builds the Tools a task needs and keeps them, so it gets more capable the more you use it.",
             ui::dim(color),
         )
         .centered(),
     );
     lines.push(Line::raw(""));
-    for example in [
-        "“Fetch the title of https://example.com”",
-        "“Summarise the largest files in ~/Downloads”",
-        "“Watch a log file and flag new errors”",
-    ] {
-        lines.push(Line::styled(example, fg(color, Color::Gray)).centered());
+    lines.push(Line::styled("Try one — press its number:", fg(color, Color::Gray)).centered());
+    for (i, example) in EXAMPLES.iter().enumerate() {
+        lines.push(
+            Line::from(vec![
+                Span::styled(format!("{} ", i + 1), bold_fg(color, Color::Cyan)),
+                Span::styled(example.to_string(), fg(color, Color::Gray)),
+            ])
+            .centered(),
+        );
     }
     lines.push(Line::raw(""));
     lines.push(
         Line::styled(
-            "Tab switches views · /help lists commands · Ctrl+C clears, twice detaches",
+            "/help commands · /model switch model · @ reference a file · Tab views",
             ui::dim(color),
         )
         .centered(),
@@ -8630,6 +8649,23 @@ mod tests {
         let total = app.chat_line_count;
         assert!(screen.contains(&format!("/{total} · ")), "{screen}");
         assert!(screen.contains("% · End to follow"));
+    }
+
+    #[test]
+    fn empty_session_offers_examples_by_number() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("Try one") && screen.contains("keeps them"),
+            "{screen}"
+        );
+        assert!(screen.contains("@ reference a file"));
+        app.key(key(KeyCode::Char('2')));
+        assert_eq!(app.input, EXAMPLES[1]);
+        // Once there's text, digits type normally.
+        app.key(key(KeyCode::Char('3')));
+        assert!(app.input.ends_with('3'));
     }
 
     #[test]

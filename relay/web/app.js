@@ -1318,16 +1318,18 @@
   }
 
   function welcome() {
+    // The same examples as the TUI's empty Session (1–4 there).
     const examples = [
-      "Fetch the title of https://example.com",
-      "Summarise the largest files in ~/Downloads",
-      "Watch a log file and flag new errors",
+      "Find every TODO in this repo and group them by file",
+      "Summarise https://example.com in three bullet points",
+      "Every weekday at 9:00, list the top 5 stories on news.ycombinator.com",
+      "What can you do, and which Tools have you built so far?",
     ];
     return h("div", { class: "welcome" },
       h("h2", null, h("span", { class: "mark" }, "◇ "), "Formless"),
-      h("p", { class: "muted" }, "An agent that builds, measures, and improves its own Tools."),
+      h("p", { class: "muted" }, "It builds the Tools a task needs and keeps them, so it gets more capable the more you use it."),
       h("div", { class: "examples" }, examples.map((ex) => h("button", { type: "button", onclick: () => { $("input").value = ex; $("input").focus(); autosize(); } }, ex))),
-      h("p", { class: "muted" }, "Enter sends · Ctrl/⌘+Enter queues · /help lists commands"));
+      h("p", { class: "muted" }, "Enter sends · /help commands · /model switch model · @ reference a file"));
   }
 
   function runningTool(name) {
