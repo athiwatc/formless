@@ -892,6 +892,7 @@ impl App {
     fn new(paths: Paths) -> Result<Self> {
         let cfg = Config::load(&paths)?;
         theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
+        markdown::set_line_numbers(cfg.tui.code_line_numbers);
         let has_credential = has_provider_credential(&paths, &cfg.provider);
         // OAuth onboarding is CLI-led. Do not send an OAuth-configured user
         // through the API-key field; daemon auth errors point to `auth login`.
@@ -1950,6 +1951,9 @@ impl App {
             Event::SettingsChanged => {
                 if let Ok(cfg) = Config::load(&self.paths) {
                     theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
+                    markdown::set_line_numbers(cfg.tui.code_line_numbers);
+                    // Rendered answers carry the old colours and options.
+                    self.md_cache.borrow_mut().clear();
                     self.model_label = cfg.provider.model;
                 }
             }

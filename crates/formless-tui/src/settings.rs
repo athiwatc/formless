@@ -169,6 +169,13 @@ pub fn rows(
         ),
         Row::new(
             "Interface",
+            "tui.code_line_numbers",
+            "code_line_numbers",
+            on(cfg.tui.code_line_numbers),
+            Bool,
+        ),
+        Row::new(
+            "Interface",
             "tui.timestamps",
             "timestamps",
             on(cfg.tui.timestamps),
