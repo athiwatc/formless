@@ -1667,6 +1667,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   audit-logged. Clients: TUI `/revoke NAME [CAPABILITY]` and the Tool
   detail's "Approved" list; web Tool detail × per item and "Revoke all".
 
+- **Typing while an approval is open (TUI).** The approval stays on
+  screen, but its keys (y/o/n) only apply while it has focus. Tab moves
+  focus between the approval and the input, and typing anything else
+  moves focus to the input, so a steer message can be written while
+  deciding. The focused side is highlighted, and the approval's title
+  says "Tab to answer" when the input has focus.
+
 ### 10.4 Sessions, Tools, and Settings views
 
 - **Sessions view:** list/create/rename/resume/delete/export/import. Two
