@@ -466,26 +466,20 @@ impl Renderer {
             return;
         }
         let cell_w = |c: &Vec<Span>| c.iter().map(|s| s.content.width()).sum::<usize>();
-        let mut widths = vec![1usize; cols];
+        let mut natural = vec![1usize; cols];
         for row in &t.rows {
             for (i, c) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cell_w(c));
+                natural[i] = natural[i].max(cell_w(c));
             }
         }
-        // Shrink the widest columns until the table fits the pane.
         let avail = self.width.saturating_sub(self.prefix_width());
         let frame = 3 * cols + 1;
-        while widths.iter().sum::<usize>() + frame > avail {
-            let (i, &w) = widths
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, w)| **w)
-                .unwrap_or((0, &0));
-            if w <= 3 {
-                break;
-            }
-            widths[i] = w - 1;
+        // Too narrow to keep every column legible: one record per row.
+        if avail < frame + cols * MIN_COL {
+            self.table_records(t);
+            return;
         }
+        let widths = fit_widths(&natural, avail - frame);
         let border = |l: &str, m: &str, r: &str| {
             let mut s = l.to_string();
             for (i, w) in widths.iter().enumerate() {
@@ -499,25 +493,106 @@ impl Renderer {
             if ri == t.header_rows && t.header_rows > 0 {
                 self.emit(vec![border("├", "┼", "┤")]);
             }
-            let mut line = vec![Span::styled("│", dim(color))];
-            for (i, w) in widths.iter().enumerate() {
-                let cell = row.get(i).cloned().unwrap_or_default();
-                let cell = truncate_spans(cell, *w);
-                let pad = w - cell_w(&cell);
-                let (l, r) = match t.aligns.get(i) {
-                    Some(Alignment::Right) => (pad, 0),
-                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
-                    _ => (0, pad),
-                };
-                line.push(Span::raw(" ".repeat(l + 1)));
-                line.extend(cell);
-                line.push(Span::raw(" ".repeat(r + 1)));
-                line.push(Span::styled("│", dim(color)));
+            // Each cell wraps within its column; the row is as tall as
+            // its tallest cell.
+            let cells: Vec<Vec<Vec<Span<'static>>>> = widths
+                .iter()
+                .enumerate()
+                .map(|(i, w)| wrap(row.get(i).cloned().unwrap_or_default(), *w))
+                .collect();
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+            for k in 0..height {
+                let mut line = vec![Span::styled("│", dim(color))];
+                for (i, w) in widths.iter().enumerate() {
+                    let cell = truncate_spans(cells[i].get(k).cloned().unwrap_or_default(), *w);
+                    let pad = w - cell_w(&cell);
+                    let (l, r) = match t.aligns.get(i) {
+                        Some(Alignment::Right) => (pad, 0),
+                        Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                        _ => (0, pad),
+                    };
+                    line.push(Span::raw(" ".repeat(l + 1)));
+                    line.extend(cell);
+                    line.push(Span::raw(" ".repeat(r + 1)));
+                    line.push(Span::styled("│", dim(color)));
+                }
+                self.emit(line);
             }
-            self.emit(line);
         }
         self.emit(vec![border("└", "┴", "┘")]);
     }
+
+    /// A table too wide for the pane, as `key: value` records.
+    fn table_records(&mut self, t: Table) {
+        let color = self.color;
+        let headers: Vec<Vec<Span<'static>>> = if t.header_rows > 0 {
+            t.rows[0].clone()
+        } else {
+            Vec::new()
+        };
+        for (n, row) in t.rows.iter().skip(t.header_rows).enumerate() {
+            self.emit(vec![Span::styled(
+                format!("▸ row {}", n + 1),
+                dim(color).add_modifier(Modifier::BOLD),
+            )]);
+            for (i, cell) in row.iter().enumerate() {
+                let mut line = vec![Span::raw("  ")];
+                match headers.get(i).filter(|h| !h.is_empty()) {
+                    Some(h) => line.extend(h.iter().map(|s| {
+                        Span::styled(s.content.clone(), s.style.add_modifier(Modifier::BOLD))
+                    })),
+                    None => line.push(Span::styled(
+                        format!("col {}", i + 1),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                }
+                line.push(Span::raw(": "));
+                line.extend(cell.iter().cloned());
+                self.emit(line);
+            }
+        }
+    }
+}
+
+/// The narrowest a table column gets before the table becomes records.
+const MIN_COL: usize = 4;
+
+/// Column widths for `room` characters: columns narrower than an equal
+/// share keep their natural width, and the rest share what's left in
+/// proportion to their natural widths (never below `MIN_COL`).
+fn fit_widths(natural: &[usize], room: usize) -> Vec<usize> {
+    if natural.iter().sum::<usize>() <= room {
+        return natural.to_vec();
+    }
+    let mut widths = natural.to_vec();
+    let mut flex: Vec<usize> = (0..natural.len()).collect();
+    let mut left = room;
+    loop {
+        let share = left / flex.len().max(1);
+        let (small, big): (Vec<usize>, Vec<usize>) =
+            flex.iter().partition(|&&i| natural[i] <= share);
+        if small.is_empty() {
+            let total: usize = big.iter().map(|&i| natural[i]).sum();
+            for &i in &big {
+                widths[i] = (natural[i] * left / total.max(1)).max(MIN_COL);
+            }
+            break;
+        }
+        left -= small.iter().map(|&i| natural[i]).sum::<usize>();
+        flex = big;
+        if flex.is_empty() {
+            break;
+        }
+    }
+    // The minimum can overshoot: take back from the widest.
+    while widths.iter().sum::<usize>() > room {
+        let i = (0..widths.len()).max_by_key(|&i| widths[i]).unwrap_or(0);
+        if widths[i] <= MIN_COL {
+            break;
+        }
+        widths[i] -= 1;
+    }
+    widths
 }
 
 /// Greedy word wrap of styled spans; `\n` inside a span forces a break.
@@ -726,6 +801,34 @@ mod tests {
         assert!(out.iter().any(|l| l == "  │ ⚠ Warning"), "{out:?}");
         let last = out.last().unwrap();
         assert_eq!(last, "  See docs (https://x.dev) or https://y.dev.");
+    }
+
+    #[test]
+    fn narrow_tables_wrap_cells_then_become_records() {
+        let md = "| Name | Notes |\n|---|---|\n| apple | a crisp red fruit that keeps well in a cool place |\n| kiwi | small and green |";
+        // Narrower than the table: the long cell wraps, nothing is cut.
+        let out = lines(md, 36);
+        assert!(out.iter().all(|l| l.chars().count() <= 36), "{out:#?}");
+        let text = out.join(" ");
+        for word in ["crisp", "keeps", "place", "green"] {
+            assert!(text.contains(word), "{word} lost: {out:#?}");
+        }
+        assert!(out.iter().any(|l| l.contains("│ apple │")), "{out:#?}");
+        // Too narrow for every column: one record per row.
+        let wide = "| a | b | c | d | e |\n|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 |";
+        let out = lines(wide, 20);
+        assert!(out.iter().any(|l| l.trim() == "▸ row 1"), "{out:#?}");
+        assert!(out.iter().any(|l| l.trim() == "c: 3"), "{out:#?}");
+    }
+
+    #[test]
+    fn column_widths_shrink_proportionally() {
+        assert_eq!(fit_widths(&[5, 10], 20), vec![5, 10], "fits as is");
+        let w = fit_widths(&[5, 40, 20], 35);
+        assert_eq!(w[0], 5, "a small column keeps its width");
+        assert!(w[1] > w[2] && w.iter().sum::<usize>() <= 35, "{w:?}");
+        let tiny = fit_widths(&[30, 30], 8);
+        assert!(tiny.iter().all(|&x| x >= MIN_COL), "{tiny:?}");
     }
 
     #[test]
