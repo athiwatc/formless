@@ -162,6 +162,13 @@ pub fn rows(
         ),
         Row::new(
             "Interface",
+            "tui.timestamps",
+            "timestamps",
+            on(cfg.tui.timestamps),
+            Bool,
+        ),
+        Row::new(
+            "Interface",
             "tui.notify",
             "notify",
             cfg.tui.notify.clone(),

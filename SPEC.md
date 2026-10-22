@@ -1970,6 +1970,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
+| `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 

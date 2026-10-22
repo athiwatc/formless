@@ -76,6 +76,28 @@ pub(crate) fn relative_time(ts: &str, now: DateTime<Utc>) -> String {
     }
 }
 
+/// A message's time (SPEC §10.2): `now`, `2m`, `3h` for today's recent
+/// ones, else the local `Tue 14:02` within a week or `3 Mar 14:02`.
+pub(crate) fn message_stamp(ts: &str, now: DateTime<Utc>) -> Option<String> {
+    let t = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+    let secs = (now - t).num_seconds().max(0);
+    let local = t.with_timezone(&Local);
+    Some(match secs {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=43_199 => format!("{}h", secs / 3600),
+        43_200..=518_399 => local.format("%a %H:%M").to_string(),
+        _ => local.format("%-d %b %H:%M").to_string(),
+    })
+}
+
+/// The local calendar day of an RFC 3339 timestamp, for day separators.
+pub(crate) fn local_day(ts: &str) -> Option<chrono::NaiveDate> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|t| t.with_timezone(&Local).date_naive())
+}
+
 /// Local `HH:MM` for an RFC 3339 timestamp.
 pub(crate) fn clock_time(ts: &str) -> Option<String> {
     DateTime::parse_from_rfc3339(ts)

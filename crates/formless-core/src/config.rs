@@ -774,6 +774,8 @@ pub struct TuiCfg {
     pub notify: String,
     /// Runs shorter than this many seconds finish quietly.
     pub notify_min_secs: u64,
+    /// Message times and day separators in the TUI chat (`/timestamps`).
+    pub timestamps: bool,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -782,6 +784,7 @@ impl Default for TuiCfg {
             multi_pane: false,
             notify: "desktop".into(),
             notify_min_secs: 20,
+            timestamps: true,
         }
     }
 }
