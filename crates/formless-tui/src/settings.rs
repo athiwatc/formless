@@ -162,6 +162,13 @@ pub fn rows(
         ),
         Row::new(
             "Interface",
+            "tui.theme",
+            "theme",
+            cfg.tui.theme.clone(),
+            Choice(&["auto", "dark", "light", "high-contrast"]),
+        ),
+        Row::new(
+            "Interface",
             "tui.timestamps",
             "timestamps",
             on(cfg.tui.timestamps),

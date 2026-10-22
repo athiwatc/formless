@@ -10,6 +10,7 @@ mod mermaid;
 mod notify;
 mod picker;
 mod settings;
+mod theme;
 mod ui;
 
 use anyhow::Result;
@@ -46,7 +47,7 @@ fn colors_enabled() -> bool {
 
 fn fg(enabled: bool, color: Color) -> Style {
     if enabled {
-        Style::default().fg(color)
+        Style::default().fg(theme::remap(color))
     } else {
         Style::default()
     }
@@ -57,13 +58,17 @@ fn bold_fg(enabled: bool, color: Color) -> Style {
 }
 
 fn role_style(enabled: bool, role: &str) -> Style {
-    let color = match role {
-        "user" => Color::Cyan,
-        "tool" => Color::Yellow,
-        "system-note" => Color::Blue,
-        _ => Color::Green,
+    let (name, color) = match role {
+        "user" => ("user", Color::Cyan),
+        "tool" => ("tool", Color::Yellow),
+        "system-note" => ("note", Color::Blue),
+        _ => ("assistant", Color::Green),
     };
-    bold_fg(enabled, color)
+    match theme::role(name).filter(|_| enabled) {
+        // An override is used as given, not remapped.
+        Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
+        None => bold_fg(enabled, color),
+    }
 }
 
 fn thinking_style(enabled: bool) -> Style {
@@ -886,6 +891,7 @@ impl App {
 
     fn new(paths: Paths) -> Result<Self> {
         let cfg = Config::load(&paths)?;
+        theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
         let has_credential = has_provider_credential(&paths, &cfg.provider);
         // OAuth onboarding is CLI-led. Do not send an OAuth-configured user
         // through the API-key field; daemon auth errors point to `auth login`.
@@ -1943,6 +1949,7 @@ impl App {
             | Event::JobsChanged => {}
             Event::SettingsChanged => {
                 if let Ok(cfg) = Config::load(&self.paths) {
+                    theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
                     self.model_label = cfg.provider.model;
                 }
             }
@@ -9400,6 +9407,21 @@ mod tests {
         assert!(found[0].url.starts_with("file://") && found[0].url.ends_with("src/lib.rs"));
         assert_eq!((found[0].x0, found[0].x1), (4, 16));
         assert!(editor_takes_goto("/usr/local/bin/code") && !editor_takes_goto("vim"));
+    }
+
+    #[test]
+    fn theme_follows_settings() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.config_dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.tui.theme = "light".into();
+        cfg.tui.colors.insert("user".into(), "#ff0000".into());
+        cfg.save(&app.paths).unwrap();
+        app.on_event(Event::SettingsChanged);
+        assert_eq!(fg(true, Color::Yellow).fg, Some(Color::Rgb(150, 100, 0)));
+        assert_eq!(role_style(true, "user").fg, Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(fg(false, Color::Yellow).fg, None, "NO_COLOR still wins");
+        theme::reset();
     }
 
     #[test]

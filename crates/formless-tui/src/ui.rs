@@ -24,7 +24,7 @@ pub(crate) fn hint(text: &str, color: bool) -> Line<'static> {
 /// Secondary text: grey with colour, terminal-dim without.
 pub(crate) fn dim(color: bool) -> Style {
     if color {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(super::theme::remap(Color::DarkGray))
     } else {
         Style::default().add_modifier(Modifier::DIM)
     }
