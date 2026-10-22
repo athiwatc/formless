@@ -210,6 +210,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("provider.tool_mode", &["native", "prompt"]),
     ("provider.cache_key", &["session", "off"]),
     ("tui.notify", &["off", "bell", "desktop"]),
+    ("tui.hyperlinks", &["auto", "on", "off"]),
 ];
 
 pub const SETTABLE: &[&str] = &[
@@ -776,6 +777,8 @@ pub struct TuiCfg {
     pub notify_min_secs: u64,
     /// Message times and day separators in the TUI chat (`/timestamps`).
     pub timestamps: bool,
+    /// Clickable OSC 8 links in the TUI chat: "auto", "on" or "off".
+    pub hyperlinks: String,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -785,6 +788,7 @@ impl Default for TuiCfg {
             notify: "desktop".into(),
             notify_min_secs: 20,
             timestamps: true,
+            hyperlinks: "auto".into(),
         }
     }
 }

@@ -3,6 +3,7 @@ mod clipimg;
 mod commands;
 mod highlight;
 mod input;
+mod links;
 mod lists;
 mod markdown;
 mod mermaid;
@@ -791,6 +792,11 @@ struct App {
     /// Until when the input border flashes after the target Session
     /// changed (SPEC §10.2).
     target_flash: Option<Instant>,
+    /// The chat's inner area in the last frame, and the OSC 8 links
+    /// painted over it (SPEC §10.2).
+    chat_area: Option<Rect>,
+    painted_links: Vec<links::Painted>,
+    hyperlinks: bool,
     /// Chat rows when the user scrolled away from the bottom, to count
     /// what arrived since; and where the "new lines" badge was drawn
     /// (row, first and last column) so a click can follow again.
@@ -905,6 +911,7 @@ impl App {
             color: colors_enabled(),
             multi_pane: cfg.tui.multi_pane,
             show_timestamps: cfg.tui.timestamps,
+            hyperlinks: links::enabled(&cfg.tui.hyperlinks),
             model_label: cfg.provider.model.clone(),
             tick: 0,
             activity: None,
@@ -957,6 +964,8 @@ impl App {
             fork_prefill: None,
             drafts: HashMap::new(),
             target_flash: None,
+            chat_area: None,
+            painted_links: Vec::new(),
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -2998,6 +3007,10 @@ impl App {
                 });
             }
             "open" => self.open_artifact(""),
+            "open link" => self.open_link(""),
+            cmd if cmd.starts_with("open link ") => {
+                self.open_link(cmd["open link ".len()..].trim())
+            }
             cmd if cmd.starts_with("open ") => self.open_artifact(cmd[5..].trim()),
             "undo" => match self.last_deleted.take() {
                 Some((id, name)) => {
@@ -5638,6 +5651,40 @@ impl App {
         self.copy_text(&text, &what);
     }
 
+    /// `/open link [N]`: the Nth link in the last answer (default the
+    /// first) with the system opener.
+    fn open_link(&mut self, arg: &str) {
+        let urls: Vec<String> = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+            .map(|m| {
+                links::find_urls(&m.content)
+                    .into_iter()
+                    .map(|(_, _, u)| u)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let n = arg.parse::<usize>().unwrap_or(1);
+        match n.checked_sub(1).and_then(|i| urls.get(i)) {
+            Some(url) => {
+                let url = url.clone();
+                if cfg!(test) {
+                    self.notes.push(format!("opening {url}"));
+                    return;
+                }
+                match links::open_external(&url) {
+                    Ok(()) => self.notes.push(format!("opening {url}")),
+                    Err(e) => self.notes.push(format!("couldn't open {url}: {e}")),
+                }
+            }
+            None => self
+                .notes
+                .push(format!("the last answer has {} link(s)", urls.len())),
+        }
+    }
+
     /// `/table [N]`: the last answer's Nth table at full width in the
     /// pager, scrolled sideways with ←/→ (SPEC §10.2).
     fn open_table(&mut self, arg: &str) {
@@ -6181,6 +6228,10 @@ fn chat_lines(
 }
 
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
+    app.chat_area = Some(area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    }));
     let height = (area.height.saturating_sub(2) as usize).max(1);
     let width = area.width.saturating_sub(2);
     let (mut lines, focus_line, user_lines) = chat_lines(app, width as usize, height);
@@ -7657,6 +7708,7 @@ pub fn run(paths: Paths) -> Result<()> {
             app.wizard_poll();
             if std::mem::take(&mut app.force_redraw) {
                 terminal.clear()?;
+                app.painted_links.clear();
             }
             if !app.notifications.is_empty() {
                 let mode = Config::load(&app.paths)
@@ -7670,7 +7722,19 @@ pub fn run(paths: Paths) -> Result<()> {
                 }
                 let _ = out.flush();
             }
-            terminal.draw(|f| draw(f, &mut app))?;
+            app.chat_area = None;
+            let frame = terminal.draw(|f| draw(f, &mut app))?;
+            // Clickable links: repaint them with OSC 8 when they change.
+            if app.hyperlinks {
+                let found = app
+                    .chat_area
+                    .map(|a| links::scan(frame.buffer, a))
+                    .unwrap_or_default();
+                if found != app.painted_links {
+                    let _ = links::paint(&mut stdout(), frame.buffer, &found);
+                    app.painted_links = found;
+                }
+            }
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     CtEvent::Key(k) => app.key(k),
@@ -7824,6 +7888,9 @@ mod tests {
             fork_prefill: None,
             drafts: HashMap::new(),
             target_flash: None,
+            chat_area: None,
+            painted_links: Vec::new(),
+            hyperlinks: false,
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -9197,6 +9264,32 @@ mod tests {
         app.key(key(KeyCode::Esc));
         app.slash("table 3");
         assert!(app.notes.last().unwrap().contains("2 table(s)"));
+    }
+
+    #[test]
+    fn open_links_from_the_last_answer() {
+        let mut app = test_app();
+        app.messages = vec![MessageInfo {
+            id: "a".into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: "See [the docs](https://docs.rs/x) and https://example.com/page.".into(),
+            created_at: String::new(),
+            meta: None,
+        }];
+        app.slash("open link");
+        assert_eq!(app.notes.last().unwrap(), "opening https://docs.rs/x");
+        app.slash("open link 2");
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "opening https://example.com/page"
+        );
+        app.slash("open link 3");
+        assert_eq!(app.notes.last().unwrap(), "the last answer has 2 link(s)");
+        // The chat area is recorded for the OSC 8 pass.
+        render(&mut app, 80, 20);
+        assert!(app.chat_area.is_some());
     }
 
     #[test]
