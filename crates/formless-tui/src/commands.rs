@@ -95,6 +95,12 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("usage", "", "tokens and cost of this Session", Session),
     cmd(
+        "table",
+        "[N]",
+        "open the last answer's Nth table full-width (←/→ scroll)",
+        Session,
+    ),
+    cmd(
         "compact",
         "[FOCUS]",
         "summarise the Session now, keeping what FOCUS asks",

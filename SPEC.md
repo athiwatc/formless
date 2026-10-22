@@ -1566,6 +1566,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   to the next/previous match and scroll to it; a new query starts at the
   match nearest the bottom. Esc closes the bar and follows the bottom.
   `/search` still searches every Session.
+- **Tables in narrow terminals (TUI).** Markdown tables wider than the
+  pane shrink: columns narrower than an equal share keep their width, and
+  the rest share the room in proportion. Cell text wraps inside its
+  column instead of being cut. When the pane can't give every column 4
+  characters, the table is shown as one `key: value` record per row.
+  `/table [N]` opens the last answer's Nth table at full width in the
+  pager, where ←/→ scroll sideways.
 - **Tool calls in the TUI chat.** Persisted calls start collapsed to one
   line: `▸ ⚙ name ✓`, an input summary, and the first line of the result
   (✗ on failure, … while there is none). Their separate result lines are

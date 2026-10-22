@@ -540,6 +540,8 @@ struct Pager {
     title: String,
     lines: Vec<String>,
     top: usize,
+    /// Columns scrolled to the right (←/→), for wide content.
+    left: usize,
 }
 
 struct LiveToolCall {
@@ -1411,6 +1413,7 @@ impl App {
                                 ),
                                 lines,
                                 top: 0,
+                                left: 0,
                             });
                         }
                         Pending::SessionUsage => {
@@ -3086,6 +3089,8 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "table" => self.open_table(""),
+            cmd if cmd.starts_with("table ") => self.open_table(cmd["table ".len()..].trim()),
             "compact" => self.compact_now(None),
             cmd if cmd.starts_with("compact ") => {
                 let focus = cmd["compact ".len()..].trim().to_string();
@@ -3114,6 +3119,7 @@ impl App {
                         title: "Last error".into(),
                         lines: raw.lines().map(str::to_string).collect(),
                         top: 0,
+                        left: 0,
                     })
                 }
                 None => self.notes.push("no error to show".into()),
@@ -3286,6 +3292,7 @@ impl App {
                     title: "Help".into(),
                     lines: commands::help_lines(),
                     top: 0,
+                    left: 0,
                 })
             }
             "quit" => self.should_quit = true,
@@ -3645,6 +3652,8 @@ impl App {
                 KeyCode::PageUp => p.top = p.top.saturating_sub(page),
                 KeyCode::Home | KeyCode::Char('g') => p.top = 0,
                 KeyCode::End | KeyCode::Char('G') => p.top = last,
+                KeyCode::Right | KeyCode::Char('l') => p.left += 8,
+                KeyCode::Left | KeyCode::Char('h') => p.left = p.left.saturating_sub(8),
                 _ => {}
             }
             return;
@@ -4714,10 +4723,10 @@ fn draw(f: &mut Frame, app: &mut App) {
             .iter()
             .skip(p.top)
             .take(height)
-            .map(|l| Line::raw(l.clone()))
+            .map(|l| Line::raw(l.chars().skip(p.left).collect::<String>()))
             .collect();
         let title = format!(
-            " {} · line {}/{} · ↑↓ PgUp PgDn g G · Esc close ",
+            " {} · line {}/{} · ↑↓ ←→ PgUp PgDn g G · Esc close ",
             p.title,
             (p.top + 1).min(p.lines.len().max(1)),
             p.lines.len()
@@ -5519,6 +5528,23 @@ fn thinking_rows(text: &str, width: usize, rows: usize) -> Vec<String> {
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Fenced code blocks in Markdown text, in order (fence lines dropped).
+/// The Markdown tables in `text`: runs of lines that start with `|`.
+fn markdown_tables(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.trim_start().starts_with('|') {
+            cur.push(line);
+        } else if !cur.is_empty() {
+            if cur.len() >= 2 {
+                out.push(cur.join("\n"));
+            }
+            cur.clear();
+        }
+    }
+    out
+}
+
 fn code_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current: Option<Vec<&str>> = None;
@@ -5610,6 +5636,42 @@ impl App {
             (last.content.clone(), "the last answer".to_string())
         };
         self.copy_text(&text, &what);
+    }
+
+    /// `/table [N]`: the last answer's Nth table at full width in the
+    /// pager, scrolled sideways with ←/→ (SPEC §10.2).
+    fn open_table(&mut self, arg: &str) {
+        let Some(last) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+        else {
+            self.notes.push("no answer with a table yet".into());
+            return;
+        };
+        let tables = markdown_tables(&last.content);
+        let n = arg.parse::<usize>().unwrap_or(1);
+        let Some(table) = n.checked_sub(1).and_then(|i| tables.get(i)) else {
+            self.notes
+                .push(format!("the last answer has {} table(s)", tables.len()));
+            return;
+        };
+        let lines = markdown::render(table, false, "", 100_000)
+            .into_iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        self.pager = Some(Pager {
+            title: format!("table {n} of {}", tables.len()),
+            lines,
+            top: 0,
+            left: 0,
+        });
     }
 
     /// Copy to the clipboard: OSC 52 (works over SSH) and, locally, the
@@ -9105,6 +9167,36 @@ mod tests {
         assert!(app.target_flash.is_some_and(|t| t > Instant::now()));
         app.switch_session("docs".into());
         assert!(render(&mut app, 100, 20).contains("to: docs"));
+    }
+
+    #[test]
+    fn tables_open_full_width_in_the_pager() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let wide = format!(
+            "Results:\n\n| id | description |\n|---|---|\n| 1 | {} |\n\nand\n\n| a | b |\n|---|---|\n| x | y |",
+            "word ".repeat(40)
+        );
+        app.messages = vec![MessageInfo {
+            id: "a".into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: wide,
+            created_at: String::new(),
+            meta: None,
+        }];
+        assert_eq!(markdown_tables(&app.messages[0].content).len(), 2);
+        app.slash("table");
+        let p = app.pager.as_ref().unwrap();
+        assert_eq!(p.title, "table 1 of 2");
+        assert!(p.lines.iter().any(|l| l.chars().count() > 200), "unshrunk");
+        app.key(key(KeyCode::Right));
+        assert_eq!(app.pager.as_ref().unwrap().left, 8);
+        assert!(render(&mut app, 60, 20).contains("←→"));
+        app.key(key(KeyCode::Esc));
+        app.slash("table 3");
+        assert!(app.notes.last().unwrap().contains("2 table(s)"));
     }
 
     #[test]
