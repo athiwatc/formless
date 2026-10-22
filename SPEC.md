@@ -1578,6 +1578,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
   editors (which get the terminal until they exit), `FILE:LINE` for
   Helix, and `-g` for VS Code and its forks.
+- **Inline images (TUI).** Image attachments the TUI can read get an
+  8-row thumbnail under their message. After each draw, thumbnails whose
+  rows are all on screen are sent with the terminal's own protocol, which
+  scales the image into the box: iTerm2's inline images (iTerm2,
+  WezTerm) or the kitty graphics protocol (kitty, Ghostty; PNG only).
+  When thumbnails move, the screen is redrawn first so none linger. Other
+  terminals, tmux, and `tui.inline_images = "off"` keep just the
+  reference line.
 - **Diffs (TUI).** Unified diffs show coloured: added lines green, removed
   red, hunk headers cyan, file headers bold. Runs of more than 7
   unchanged context lines collapse to their first and last 3
@@ -2048,6 +2056,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tui.theme` | auto | `dark`, `light` (deeper hues for white backgrounds), `high-contrast` (bright variants), or `auto` (light when `COLORFGBG` reports a light background) (§10.6) |
 | `tui.colors` | {} | Per-role colour overrides: `user`, `assistant`, `tool`, `note`, `error`, `accent` → a name (`light-cyan`) or `#rrggbb` (§10.6) |
 | `tui.code_line_numbers` | false | Dim line numbers in the chat's code blocks (§10.2) |
+| `tui.inline_images` | auto | Image thumbnails in the chat on iTerm2, WezTerm, kitty and Ghostty; `off` keeps only the reference (§10.2) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 

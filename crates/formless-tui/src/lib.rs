@@ -2,6 +2,7 @@ pub mod client;
 mod clipimg;
 mod commands;
 mod highlight;
+mod images;
 mod input;
 mod links;
 mod lists;
@@ -805,6 +806,11 @@ struct App {
     /// Path words already checked against the filesystem: their
     /// `file://` target when the file exists.
     path_cache: HashMap<String, Option<String>>,
+    /// Inline images (SPEC §10.2): the terminal's protocol, the
+    /// thumbnails this frame places and those last sent.
+    image_proto: Option<images::Protocol>,
+    image_placed: Vec<images::Placed>,
+    painted_images: Vec<images::Placed>,
     /// Chat rows when the user scrolled away from the bottom, to count
     /// what arrived since; and where the "new lines" badge was drawn
     /// (row, first and last column) so a click can follow again.
@@ -893,6 +899,7 @@ impl App {
         let cfg = Config::load(&paths)?;
         theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
         markdown::set_line_numbers(cfg.tui.code_line_numbers);
+        let image_proto = images::detect(&cfg.tui.inline_images);
         let has_credential = has_provider_credential(&paths, &cfg.provider);
         // OAuth onboarding is CLI-led. Do not send an OAuth-configured user
         // through the API-key field; daemon auth errors point to `auth login`.
@@ -977,6 +984,9 @@ impl App {
             chat_area: None,
             painted_links: Vec::new(),
             path_cache: HashMap::new(),
+            image_proto,
+            image_placed: Vec::new(),
+            painted_images: Vec::new(),
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -1952,6 +1962,7 @@ impl App {
                 if let Ok(cfg) = Config::load(&self.paths) {
                     theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
                     markdown::set_line_numbers(cfg.tui.code_line_numbers);
+                    self.image_proto = images::detect(&cfg.tui.inline_images);
                     // Rendered answers carry the old colours and options.
                     self.md_cache.borrow_mut().clear();
                     self.model_label = cfg.provider.model;
@@ -5607,6 +5618,33 @@ fn thinking_rows(text: &str, width: usize, rows: usize) -> Vec<String> {
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Fenced code blocks in Markdown text, in order (fence lines dropped).
+/// Image attachments of a message that this machine can read: (name,
+/// path).
+fn image_attachments(m: &MessageInfo) -> Vec<(String, String)> {
+    let Some(meta) = m
+        .meta
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    else {
+        return Vec::new();
+    };
+    meta["attachments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["mime"].as_str().is_some_and(|t| t.starts_with("image/")))
+        .filter_map(|a| {
+            let path = a["path"].as_str()?;
+            std::path::Path::new(path).is_file().then(|| {
+                (
+                    a["name"].as_str().unwrap_or("image").to_string(),
+                    path.to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
 /// A file a chat mentions, resolved against the TUI's working directory
 /// (or absolute, or under `~/`), when it exists.
 fn resolve_path(path: &str) -> Option<std::path::PathBuf> {
@@ -6170,16 +6208,23 @@ fn tool_call_block(
     out
 }
 
-/// The chat's lines, the focused tool call's line, and where each user
-/// message starts (for jumping between them).
-fn chat_lines(
-    app: &App,
-    width: usize,
-    height: usize,
-) -> (Vec<Line<'static>>, Option<usize>, Vec<usize>) {
+/// The chat as drawn: its lines, the focused item's line, where each
+/// user message starts (for jumping between them), and the rows reserved
+/// for image thumbnails (first line, file).
+#[derive(Default)]
+struct ChatRender {
+    lines: Vec<Line<'static>>,
+    focus_line: Option<usize>,
+    user_lines: Vec<usize>,
+    image_lines: Vec<(usize, String)>,
+}
+
+fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let mut lines: Vec<Line> = Vec::new();
     let mut focus_line = None;
     let mut user_lines = Vec::new();
+    // Rows reserved for image thumbnails: (first line, file).
+    let mut image_lines: Vec<(usize, String)> = Vec::new();
     // Results by call id, so each call renders with its result and the
     // separate `tool` line is skipped.
     let results: HashMap<String, &str> = app
@@ -6237,6 +6282,13 @@ fn chat_lines(
                 }
                 for l in m.content.lines() {
                     lines.push(mention_line(&truncate_chars(l, 2000), app.color));
+                }
+                if app.image_proto.is_some() {
+                    for (name, path) in image_attachments(m) {
+                        lines.push(Line::styled(format!("  🖼 {name}"), ui::dim(app.color)));
+                        image_lines.push((lines.len(), path));
+                        lines.extend((0..images::ROWS).map(|_| Line::raw("")));
+                    }
                 }
                 if focused {
                     lines.push(focus_hint(app.color, true));
@@ -6330,7 +6382,10 @@ fn chat_lines(
         }
     }
     if app.messages.is_empty() && !app.running() {
-        return (welcome_lines(app.color, height), None, Vec::new());
+        return ChatRender {
+            lines: welcome_lines(app.color, height),
+            ..Default::default()
+        };
     }
     // Live reasoning: dimmed, separate from the answer, and capped to the
     // latest lines so it never floods the transcript (/thinking hides it).
@@ -6379,7 +6434,12 @@ fn chat_lines(
             ));
         }
     }
-    (lines, focus_line, user_lines)
+    ChatRender {
+        lines,
+        focus_line,
+        user_lines,
+        image_lines,
+    }
 }
 
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
@@ -6389,7 +6449,12 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     }));
     let height = (area.height.saturating_sub(2) as usize).max(1);
     let width = area.width.saturating_sub(2);
-    let (mut lines, focus_line, user_lines) = chat_lines(app, width as usize, height);
+    let ChatRender {
+        mut lines,
+        focus_line,
+        user_lines,
+        image_lines,
+    } = chat_lines(app, width as usize, height);
     // Find (Ctrl+F): highlight matches; the current one stands out.
     let mut match_lines = Vec::new();
     if let Some(find) = app.find.as_ref().filter(|f| !f.query.is_empty()) {
@@ -6422,6 +6487,10 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             .max(1);
     }
     app.user_rows = user_lines.iter().map(|&i| line_rows[i]).collect();
+    let image_rows: Vec<(usize, String)> = image_lines
+        .into_iter()
+        .map(|(i, p)| (line_rows[i], p))
+        .collect();
     if let Some(find) = &mut app.find {
         find.rows = match_lines.iter().map(|&i| line_rows[i]).collect();
     }
@@ -6524,6 +6593,17 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             .scroll((scroll_top.min(u16::MAX as usize) as u16, 0)),
         area,
     );
+    // Thumbnails whose rows are all on screen (drawn after the frame).
+    app.image_placed = image_rows
+        .into_iter()
+        .filter(|(row, _)| *row >= scroll_top && row + images::ROWS as usize <= scroll_top + height)
+        .map(|(row, path)| images::Placed {
+            x: area.x + 3,
+            y: area.y + 1 + (row - scroll_top) as u16,
+            cols: images::MAX_COLS.min(width.saturating_sub(4)),
+            path,
+        })
+        .collect();
     // A scrollbar on the right border when there's more than a screen.
     if max_top > 0 {
         let mut state = ScrollbarState::new(max_top + 1).position(scroll_top);
@@ -7880,6 +7960,19 @@ pub fn run(paths: Paths) -> Result<()> {
             app.chat_area = None;
             let frame = terminal.draw(|f| draw(f, &mut app))?;
             // Clickable links: repaint them with OSC 8 when they change.
+            if let Some(proto) = app.image_proto {
+                if app.image_placed != app.painted_images {
+                    if app.painted_images.is_empty() {
+                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
+                        app.painted_images = app.image_placed.clone();
+                    } else {
+                        // Old thumbnails stay on screen until cleared:
+                        // redraw from scratch, then paint the new ones.
+                        app.painted_images.clear();
+                        app.force_redraw = true;
+                    }
+                }
+            }
             if app.hyperlinks {
                 let cache = &mut app.path_cache;
                 let mut resolve = |p: &str| {
@@ -8058,6 +8151,9 @@ mod tests {
             chat_area: None,
             painted_links: Vec::new(),
             path_cache: HashMap::new(),
+            image_proto: None,
+            image_placed: Vec::new(),
+            painted_images: Vec::new(),
             hyperlinks: false,
             unseen_from: None,
             new_badge: None,
@@ -9562,6 +9658,41 @@ mod tests {
             !screen.contains("\\n"),
             "the diff isn't shown as escaped JSON"
         );
+    }
+
+    #[test]
+    fn image_attachments_get_thumbnail_rows() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let png = app.paths.data_dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        app.messages = vec![MessageInfo {
+            id: "u".into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: "user".into(),
+            content: "what's this?".into(),
+            created_at: String::new(),
+            meta: Some(
+                serde_json::json!({"attachments": [
+                    {"name": "shot.png", "mime": "image/png", "path": png.to_string_lossy()},
+                    {"name": "notes.txt", "mime": "text/plain", "path": png.to_string_lossy()}
+                ]})
+                .to_string(),
+            ),
+        }];
+        // Without a protocol nothing is reserved.
+        render(&mut app, 100, 40);
+        assert!(app.image_placed.is_empty());
+        app.image_proto = Some(images::Protocol::ITerm);
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("🖼 shot.png") && !screen.contains("notes.txt"));
+        assert_eq!(app.image_placed.len(), 1);
+        let p = &app.image_placed[0];
+        assert_eq!((p.cols, p.path.as_str()), (40, png.to_str().unwrap()));
+        // Too short to show the whole box: not placed.
+        render(&mut app, 100, 12);
+        assert!(app.image_placed.is_empty());
     }
 
     #[test]

@@ -212,6 +212,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("tui.notify", &["off", "bell", "desktop"]),
     ("tui.hyperlinks", &["auto", "on", "off"]),
     ("tui.theme", &["auto", "dark", "light", "high-contrast"]),
+    ("tui.inline_images", &["auto", "off"]),
 ];
 
 pub const SETTABLE: &[&str] = &[
@@ -788,6 +789,9 @@ pub struct TuiCfg {
     pub colors: HashMap<String, String>,
     /// Dim line numbers in the chat's code blocks.
     pub code_line_numbers: bool,
+    /// Image thumbnails in the chat on terminals that can show them:
+    /// "auto" or "off".
+    pub inline_images: String,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -801,6 +805,7 @@ impl Default for TuiCfg {
             theme: "auto".into(),
             colors: HashMap::new(),
             code_line_numbers: false,
+            inline_images: "auto".into(),
         }
     }
 }
