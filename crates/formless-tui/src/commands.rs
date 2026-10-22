@@ -89,8 +89,8 @@ pub const COMMANDS: &[Command] = &[
     cmd("open", "[ID]", "show a stored output full-screen", Session),
     cmd(
         "copy",
-        "[code [N]]",
-        "copy the last answer or a code block",
+        "[N | code [N]]",
+        "copy the last answer, the Nth message from the bottom, or a code block",
         Session,
     ),
     cmd("usage", "", "tokens and cost of this Session", Session),
