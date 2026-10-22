@@ -767,6 +767,11 @@ struct App {
     user_rows: Vec<usize>,
     /// Ctrl+F find in this Session (SPEC §10.2).
     find: Option<FindBar>,
+    /// Chat rows when the user scrolled away from the bottom, to count
+    /// what arrived since; and where the "new lines" badge was drawn
+    /// (row, first and last column) so a click can follow again.
+    unseen_from: Option<usize>,
+    new_badge: Option<(u16, u16, u16)>,
     /// Last listed running Invocations (for /kill and /drop by prefix).
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
@@ -924,6 +929,8 @@ impl App {
             scroll_to_focus: false,
             user_rows: Vec::new(),
             find: None,
+            unseen_from: None,
+            new_badge: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -3493,14 +3500,22 @@ impl App {
         }
     }
 
-    fn mouse(&mut self, kind: crossterm::event::MouseEventKind) {
-        use crossterm::event::MouseEventKind;
+    fn mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
         if self.wizard.is_some() || self.view != View::Chat {
             return;
         }
-        match kind {
+        match m.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(3),
             MouseEventKind::ScrollDown => self.scroll_chat_down(3),
+            // The "↓ N new lines" badge follows the bottom again.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((row, x0, x1)) = self.new_badge {
+                    if m.row == row && (x0..=x1).contains(&m.column) {
+                        self.follow_chat_bottom();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -5863,7 +5878,35 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     if app.chat_scroll_top == Some(scroll_top) && scroll_top >= max_top {
         app.chat_scroll_top = None;
     }
+    // Output that arrived while scrolled up (SPEC §10.2).
+    match app.chat_scroll_top {
+        None => app.unseen_from = None,
+        Some(_) if app.unseen_from.is_none() => app.unseen_from = Some(rows),
+        Some(_) => {}
+    }
+    let unseen = app.unseen_from.map_or(0, |from| rows.saturating_sub(from));
     let mut block = ui::panel(" Chat ", app.color, Color::DarkGray);
+    app.new_badge = None;
+    if unseen > 0 {
+        let label = format!(
+            " ↓ {unseen} new line{} · End ",
+            if unseen == 1 { "" } else { "s" }
+        );
+        let w = Span::raw(label.as_str()).width() as u16;
+        let x1 = area.right().saturating_sub(2);
+        app.new_badge = Some((area.bottom().saturating_sub(1), x1.saturating_sub(w), x1));
+        block = block.title_bottom(
+            Line::styled(
+                label,
+                bold_fg(app.color, Color::Black).bg(if app.color {
+                    Color::Yellow
+                } else {
+                    Color::Reset
+                }),
+            )
+            .right_aligned(),
+        );
+    }
     if app.chat_scroll_top.is_some() {
         block = block.title(
             Line::styled(
@@ -7234,7 +7277,7 @@ pub fn run(paths: Paths) -> Result<()> {
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     CtEvent::Key(k) => app.key(k),
-                    CtEvent::Mouse(m) => app.mouse(m.kind),
+                    CtEvent::Mouse(m) => app.mouse(m),
                     CtEvent::Paste(text) => app.paste(&text),
                     CtEvent::FocusGained => app.focused = true,
                     CtEvent::FocusLost => app.focused = false,
@@ -7379,6 +7422,8 @@ mod tests {
             scroll_to_focus: false,
             user_rows: Vec::new(),
             find: None,
+            unseen_from: None,
+            new_badge: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -8509,6 +8554,37 @@ mod tests {
         assert!(app.find.is_none() && app.chat_scroll_top.is_none());
         let (line, n) = highlight_matches(Line::raw("Aa aA"), "aa", |_| Style::default());
         assert_eq!((n, line.spans.len()), (2, 3));
+    }
+
+    #[test]
+    fn new_lines_badge_while_scrolled_up() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        let msg = |i: i64| MessageInfo {
+            id: format!("m{i}"),
+            session_id: "s".into(),
+            seq: i,
+            role: "assistant".into(),
+            content: format!("para {i}\n\n").repeat(10),
+            created_at: String::new(),
+            meta: None,
+        };
+        app.messages = (0..4).map(msg).collect();
+        render(&mut app, 80, 20);
+        app.scroll_chat_up(10);
+        assert!(!render(&mut app, 80, 20).contains("new line"));
+        app.messages.push(msg(4));
+        let screen = render(&mut app, 80, 20);
+        assert!(screen.contains("new lines · End"), "{screen}");
+        let (row, x0, _) = app.new_badge.unwrap();
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x0 + 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.chat_scroll_top.is_none());
+        assert!(!render(&mut app, 80, 20).contains("new line"));
     }
 
     #[test]
