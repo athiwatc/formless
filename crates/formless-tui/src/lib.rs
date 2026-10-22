@@ -4218,6 +4218,74 @@ impl App {
             .collect()
     }
 
+    /// What `[`/`]` move through, in order: messages with text
+    /// (`msg:<id>`) and persisted tool calls (their call id).
+    fn focus_items(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for m in &self.messages {
+            let text = m.role == "user" || (m.role == "assistant" && !m.content.trim().is_empty());
+            if text {
+                out.push(format!("msg:{}", m.id));
+            }
+            if let Some(meta) = &m.meta {
+                out.extend(
+                    persisted_calls(meta)
+                        .into_iter()
+                        .map(|(id, _, _)| id)
+                        .filter(|id| !id.is_empty()),
+                );
+            }
+        }
+        out
+    }
+
+    /// The focused item's text: plain, or as Markdown (SPEC §10.2).
+    fn focused_text(&self, markdown: bool) -> Option<(String, String)> {
+        let focus = self.call_focus.as_deref()?;
+        if let Some(id) = focus.strip_prefix("msg:") {
+            let m = self.messages.iter().find(|m| m.id == id)?;
+            let text = match (markdown, m.role.as_str()) {
+                (true, "user") => format!("**You:**\n\n{}", m.content),
+                _ => m.content.clone(),
+            };
+            let what = if m.role == "user" {
+                "your message"
+            } else {
+                "the answer"
+            };
+            return Some((text, what.into()));
+        }
+        let (call, result) = self.messages.iter().find_map(|m| {
+            let call = persisted_calls(m.meta.as_deref()?)
+                .into_iter()
+                .find(|(id, _, _)| id == focus)?;
+            let result = self
+                .messages
+                .iter()
+                .find(|r| r.role == "tool" && result_call_id(r).as_deref() == Some(focus))
+                .map(|r| r.content.clone())
+                .unwrap_or_default();
+            Some((call, result))
+        })?;
+        let (_, name, args) = call;
+        let pretty = |t: &str| {
+            serde_json::from_str::<serde_json::Value>(t)
+                .ok()
+                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                .unwrap_or_else(|| t.to_string())
+        };
+        let text = if markdown {
+            format!(
+                "**⚙ {name}**\n\n```json\n{}\n```\n\n```\n{}\n```",
+                pretty(&args),
+                pretty(&result)
+            )
+        } else {
+            format!("{name} {args}\n{result}")
+        };
+        Some((text, format!("the {name} call")))
+    }
+
     /// Tool-call focus (SPEC §10.2): `[`/`]` on an empty input move it;
     /// while a call is focused Enter toggles it, `z`/`Z` expand or
     /// collapse all, and Esc or any other key leaves the focus.
@@ -4225,7 +4293,7 @@ impl App {
         if !self.input.is_empty() || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
             return false;
         }
-        let ids = self.call_ids();
+        let ids = self.focus_items();
         let at = self
             .call_focus
             .as_ref()
@@ -4243,12 +4311,22 @@ impl App {
             _ if self.call_focus.is_none() => return false,
             KeyCode::Enter => {
                 let id = self.call_focus.clone().unwrap();
-                if !self.expanded_calls.remove(&id) {
+                if !id.starts_with("msg:") && !self.expanded_calls.remove(&id) {
                     self.expanded_calls.insert(id);
                 }
                 self.scroll_to_focus = true;
             }
-            KeyCode::Char('z') => self.expanded_calls.extend(ids),
+            KeyCode::Char(c @ ('c' | 'C')) => {
+                if let Some((text, what)) = self.focused_text(c == 'C') {
+                    let what = if c == 'C' {
+                        format!("{what} as Markdown")
+                    } else {
+                        what
+                    };
+                    self.copy_text(&text, &what);
+                }
+            }
+            KeyCode::Char('z') => self.expanded_calls.extend(self.call_ids()),
             KeyCode::Char('Z') => self.expanded_calls.clear(),
             KeyCode::Esc => self.call_focus = None,
             _ => {
@@ -5319,6 +5397,25 @@ impl App {
     /// default the last): to the clipboard via OSC 52, and the OS
     /// clipboard too when this is a local terminal.
     fn copy_cmd(&mut self, arg: &str) {
+        // `/copy N`: the Nth message from the bottom.
+        if let Ok(n) = arg.trim().parse::<usize>() {
+            let texts: Vec<&MessageInfo> = self
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
+                .filter(|m| !m.content.trim().is_empty())
+                .collect();
+            match n.checked_sub(1).and_then(|i| texts.iter().rev().nth(i)) {
+                Some(m) => {
+                    let text = m.content.clone();
+                    self.copy_text(&text, &format!("message {n} from the bottom"));
+                }
+                None => self
+                    .notes
+                    .push(format!("there are {} messages to copy", texts.len())),
+            }
+            return;
+        }
         let Some(last) = self
             .messages
             .iter()
@@ -5344,11 +5441,17 @@ impl App {
         } else {
             (last.content.clone(), "the last answer".to_string())
         };
+        self.copy_text(&text, &what);
+    }
+
+    /// Copy to the clipboard: OSC 52 (works over SSH) and, locally, the
+    /// system clipboard too.
+    fn copy_text(&mut self, text: &str, what: &str) {
         let mut out = stdout();
-        let _ = out.write_all(osc52(&text).as_bytes());
+        let _ = out.write_all(osc52(text).as_bytes());
         let _ = out.flush();
-        if std::env::var_os("SSH_CONNECTION").is_none() {
-            let _ = formless_runtime::clipboard_write(&text);
+        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
+            let _ = formless_runtime::clipboard_write(text);
         }
         self.notes
             .push(format!("copied {what} ({} chars)", text.chars().count()));
@@ -5487,6 +5590,14 @@ fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
         .centered(),
     );
     lines
+}
+
+/// The keys for a focused message, under it.
+fn focus_hint(color: bool, _user: bool) -> Line<'static> {
+    Line::styled(
+        "  ▲ c copy · C copy as Markdown · [ ] move · Esc",
+        bold_fg(color, Color::Yellow),
+    )
 }
 
 /// A persisted tool call: (call id, name, raw arguments).
@@ -5684,8 +5795,15 @@ fn chat_lines(
             "user" => {
                 user_lines.push(lines.len());
                 open_group(&mut lines, &mut group, "user", when);
+                let focused = app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
+                if focused {
+                    focus_line = Some(lines.len());
+                }
                 for l in m.content.lines() {
                     lines.push(mention_line(&truncate_chars(l, 2000), app.color));
+                }
+                if focused {
+                    lines.push(focus_hint(app.color, true));
                 }
             }
             "tool" => {
@@ -5706,7 +5824,14 @@ fn chat_lines(
             }
             _ => {
                 open_group(&mut lines, &mut group, "assistant", when);
+                let focused = app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
+                if focused {
+                    focus_line = Some(lines.len());
+                }
                 lines.extend(app.markdown_cached(m, width));
+                if focused {
+                    lines.push(focus_hint(app.color, false));
+                }
                 if let Some(meta) = &m.meta {
                     for call in persisted_calls(meta) {
                         if app.call_focus.as_deref() == Some(call.0.as_str()) {
@@ -8666,6 +8791,52 @@ mod tests {
         // Once there's text, digits type normally.
         app.key(key(KeyCode::Char('3')));
         assert!(app.input.ends_with('3'));
+    }
+
+    #[test]
+    fn focus_messages_and_copy_them() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let msg = |id: &str, role: &str, content: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 0,
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+            meta: None,
+        };
+        app.messages = vec![
+            msg("u1", "user", "first question"),
+            msg("a1", "assistant", "first answer"),
+            msg("u2", "user", "second question"),
+            msg("a2", "assistant", "**second** answer"),
+        ];
+        app.key(key(KeyCode::Char(']')));
+        assert_eq!(app.call_focus.as_deref(), Some("msg:a2"));
+        assert!(render(&mut app, 100, 30).contains("c copy · C copy as Markdown"));
+        app.key(key(KeyCode::Char('c')));
+        assert_eq!(app.notes.last().unwrap(), "copied the answer (17 chars)");
+        app.key(key(KeyCode::Char('[')));
+        app.key(key(KeyCode::Char('C')));
+        assert_eq!(
+            app.focused_text(true).unwrap().0,
+            "**You:**\n\nsecond question"
+        );
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("your message as Markdown"));
+        app.key(key(KeyCode::Esc));
+        app.slash("copy 3");
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("message 3 from the bottom"));
+        app.slash("copy 9");
+        assert_eq!(app.notes.last().unwrap(), "there are 4 messages to copy");
     }
 
     #[test]
