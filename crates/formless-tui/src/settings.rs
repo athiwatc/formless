@@ -161,6 +161,20 @@ pub fn rows(
             Thinking,
         ),
         Row::new(
+            "Interface",
+            "tui.notify",
+            "notify",
+            cfg.tui.notify.clone(),
+            Choice(&["off", "bell", "desktop"]),
+        ),
+        Row::new(
+            "Interface",
+            "tui.notify_min_secs",
+            "notify_min_secs",
+            cfg.tui.notify_min_secs.to_string(),
+            Number,
+        ),
+        Row::new(
             "Naming",
             "naming.enabled",
             "auto-naming",

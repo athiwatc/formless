@@ -4,6 +4,7 @@ mod highlight;
 mod input;
 mod markdown;
 mod mermaid;
+mod notify;
 mod picker;
 mod settings;
 mod ui;
@@ -23,7 +24,7 @@ use formless_protocol::*;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::collections::HashMap;
-use std::io::stdout;
+use std::io::{stdout, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -660,6 +661,12 @@ struct App {
     providers_info: serde_json::Value,
     /// Redraw from scratch (after handing the terminal to $EDITOR).
     force_redraw: bool,
+    /// Whether the terminal has focus (focus events; assumed until told).
+    focused: bool,
+    /// When each Session's current Run started, for the notify threshold.
+    run_started_at: HashMap<String, Instant>,
+    /// Notifications (title, body) for the run loop to write out.
+    notifications: Vec<(String, String)>,
     approvals: std::collections::VecDeque<ApprovalReq>,
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
@@ -806,6 +813,9 @@ impl App {
             settings_remove_arm: None,
             providers_info: serde_json::Value::Null,
             force_redraw: false,
+            focused: true,
+            run_started_at: HashMap::new(),
+            notifications: Vec::new(),
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -1589,6 +1599,7 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Event) {
+        self.maybe_notify(&ev);
         match ev {
             Event::MessageAppended {
                 session_id,
@@ -2179,6 +2190,99 @@ impl App {
             answer: QuestionAnswer::summary_of(&open.answers),
             answers: open.answers,
         });
+    }
+
+    fn session_name(&self, id: &str) -> String {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Session".into())
+    }
+
+    /// Queue a notification for events worth interrupting the user for,
+    /// while the terminal isn't focused (SPEC §10.6).
+    fn maybe_notify(&mut self, ev: &Event) {
+        if let Event::RunStarted { session_id, .. } = ev {
+            self.run_started_at
+                .insert(session_id.clone(), Instant::now());
+        }
+        let elapsed = |sid: &str| {
+            self.run_started_at
+                .get(sid)
+                .map(|t| t.elapsed())
+                .unwrap_or_default()
+        };
+        let min = Config::load(&self.paths)
+            .map(|c| c.tui.notify_min_secs)
+            .unwrap_or(20);
+        let note = match ev {
+            Event::RunFinished {
+                session_id, status, ..
+            } => {
+                let took = elapsed(session_id);
+                self.run_started_at.remove(session_id);
+                (took.as_secs() >= min && status != "interrupted").then(|| {
+                    (
+                        format!("Run {status}"),
+                        format!(
+                            "{} · {}",
+                            self.session_name(session_id),
+                            format_elapsed(took)
+                        ),
+                    )
+                })
+            }
+            Event::RunPaused {
+                session_id, error, ..
+            } => {
+                self.run_started_at.remove(session_id);
+                Some((
+                    "Run paused".into(),
+                    format!(
+                        "{}: {}",
+                        self.session_name(session_id),
+                        truncate_chars(error, 120)
+                    ),
+                ))
+            }
+            Event::ProviderStalled {
+                session_id,
+                idle_secs,
+                ..
+            } => Some((
+                "Run stalled".into(),
+                format!(
+                    "{}: no reply for {idle_secs}s (/resend)",
+                    self.session_name(session_id)
+                ),
+            )),
+            Event::ApprovalRequested {
+                session_id,
+                tool_name,
+                ..
+            } => Some((
+                "Approval needed".into(),
+                format!("{}: {tool_name}", self.session_name(session_id)),
+            )),
+            Event::UserQuestion {
+                session_id,
+                question,
+                questions,
+                ..
+            } => Some((
+                "Question for you".into(),
+                format!(
+                    "{}: {}",
+                    self.session_name(session_id),
+                    truncate_chars(questions.first().map_or(question, |q| &q.question), 120)
+                ),
+            )),
+            _ => None,
+        };
+        if let Some(n) = note.filter(|_| !self.focused) {
+            self.notifications.push(n);
+        }
     }
 
     /// The open question of the current Session, if any.
@@ -4622,7 +4726,6 @@ impl App {
         } else {
             (last.content.clone(), "the last answer".to_string())
         };
-        use std::io::Write;
         let mut out = stdout();
         let _ = out.write_all(osc52(&text).as_bytes());
         let _ = out.flush();
@@ -6202,6 +6305,8 @@ pub fn run(paths: Paths) -> Result<()> {
     out.execute(crossterm::event::EnableMouseCapture)?;
     // Pastes arrive as one event, so pasted newlines never send.
     let _ = out.execute(crossterm::event::EnableBracketedPaste);
+    // Focus events: notify only while the user is elsewhere.
+    let _ = out.execute(crossterm::event::EnableFocusChange);
     // Ctrl+Enter is only distinguishable with the kitty keyboard protocol.
     app.enhanced_keys = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
         && out
@@ -6218,12 +6323,26 @@ pub fn run(paths: Paths) -> Result<()> {
             if std::mem::take(&mut app.force_redraw) {
                 terminal.clear()?;
             }
+            if !app.notifications.is_empty() {
+                let mode = Config::load(&app.paths)
+                    .map(|c| c.tui.notify)
+                    .unwrap_or_default();
+                let (term, tmux) = (notify::terminal(), std::env::var_os("TMUX").is_some());
+                let mut out = stdout();
+                for (title, body) in app.notifications.drain(..) {
+                    let _ = out
+                        .write_all(notify::sequence(&mode, &term, tmux, &title, &body).as_bytes());
+                }
+                let _ = out.flush();
+            }
             terminal.draw(|f| draw(f, &mut app))?;
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     CtEvent::Key(k) => app.key(k),
                     CtEvent::Mouse(m) => app.mouse(m.kind),
                     CtEvent::Paste(text) => app.paste(&text),
+                    CtEvent::FocusGained => app.focused = true,
+                    CtEvent::FocusLost => app.focused = false,
                     _ => {}
                 }
             }
@@ -6235,6 +6354,7 @@ pub fn run(paths: Paths) -> Result<()> {
     }
     disable_raw_mode()?;
     let _ = stdout().execute(crossterm::event::DisableBracketedPaste);
+    let _ = stdout().execute(crossterm::event::DisableFocusChange);
     let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
     result
@@ -6346,6 +6466,9 @@ mod tests {
             settings_remove_arm: None,
             providers_info: serde_json::Value::Null,
             force_redraw: false,
+            focused: true,
+            run_started_at: HashMap::new(),
+            notifications: Vec::new(),
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -7105,6 +7228,53 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.questions.is_empty(), "all answered and sent");
         assert!(app.notes.iter().any(|n| n == "answered: just auth"));
+    }
+
+    #[test]
+    fn notifies_only_while_unfocused_and_after_long_runs() {
+        let mut app = test_app();
+        let started = |app: &mut App, sid: &str| {
+            app.on_event(Event::RunStarted {
+                session_id: sid.into(),
+                run_id: "r".into(),
+            })
+        };
+        let finished = |app: &mut App, sid: &str| {
+            app.on_event(Event::RunFinished {
+                session_id: sid.into(),
+                run_id: "r".into(),
+                status: "completed".into(),
+            })
+        };
+        // Focused: nothing.
+        app.on_event(Event::ApprovalRequested {
+            session_id: "s".into(),
+            approval_id: "a".into(),
+            tool_name: "fetch".into(),
+            version: 1,
+            capabilities: vec![],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+        });
+        assert!(app.notifications.is_empty());
+        app.focused = false;
+        // A short Run finishes quietly; a long one notifies.
+        started(&mut app, "s");
+        finished(&mut app, "s");
+        assert!(app.notifications.is_empty());
+        started(&mut app, "s");
+        app.run_started_at
+            .insert("s".into(), Instant::now() - Duration::from_secs(60));
+        finished(&mut app, "s");
+        assert_eq!(app.notifications.last().unwrap().0, "Run completed");
+        app.on_event(Event::RunPaused {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            error: "429 rate limited".into(),
+        });
+        assert!(app.notifications.last().unwrap().1.contains("429"));
     }
 
     #[test]

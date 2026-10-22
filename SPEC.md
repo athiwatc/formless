@@ -1679,6 +1679,21 @@ run_tool = "network_policy"     # a registry Tool, or…
   rebuilds of an unsigned dev binary (whose keychain ACL would otherwise
   orphan the entry).
 
+- **Notifications.** While the TUI's terminal isn't focused (focus
+  events) or the web tab is hidden, Formless tells you when a Run
+  finishes (if it took at least `tui.notify_min_secs`, default 20), is
+  paused by a provider error, or stalls, and when an approval or
+  `ask_user` question is waiting. `tui.notify`:
+  - `bell` rings the terminal bell;
+  - `desktop` (the default) also sends the terminal's notification: OSC 9
+    for iTerm2, WezTerm, Ghostty and Windows Terminal, OSC 99 for kitty
+    and OSC 777 otherwise, wrapped for tmux passthrough. The web client
+    uses the browser Notification API, asked for on the first message
+    you send;
+  - `off` does nothing.
+  The web tab title also counts unseen alerts (`(2) Formless`) until you
+  come back. Interrupted Runs never notify.
+
 ## 11. Compaction
 
 - Trigger: Run/Session approaching the model's `context_tokens` (§4.2).
@@ -1871,6 +1886,8 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
+| `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
+| `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 
 ## 14. Security
 
