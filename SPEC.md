@@ -1483,6 +1483,23 @@ run_tool = "network_policy"     # a registry Tool, or…
   with live elapsed + `possibly stalled` flags, §6), compaction notices,
   optimiser activity notes. Full scrollback is preserved across modal
   overlays and view switches.
+- **Input editor (TUI).** The message box is a multi-line editor with
+  readline keys:
+  - ←/→ move by character and Alt or Ctrl+←/→ by word. Home/End and
+    Ctrl+A/E go to the line start and end; End on an empty input jumps
+    the chat to the bottom.
+  - Ctrl+W (Alt or Ctrl+Backspace) deletes a word back and Alt+D a word
+    forward. Ctrl+U and Ctrl+K delete to the start and end of the line.
+  - Shift+Enter, where the terminal reports it, or `\` + Enter inserts a
+    newline. The box grows to 8 rows.
+  - ↑/↓ move between lines. On the first or last line they walk the
+    current Session's earlier messages, and Down past the newest returns
+    the draft. Ctrl+R searches that history.
+  - Bracketed paste is on, so a paste is one block and its newlines
+    never send. Pastes over 8 lines or 1,500 characters show as
+    `[pasted N lines #k]` and are sent in full; Backspace removes one as
+    a unit.
+  - The chat scrolls with PgUp/PgDn and the mouse wheel.
 
 ### 10.3 Approvals (modal)
 
