@@ -1440,6 +1440,12 @@
     const u = S.usage && S.usage[S.current];
     $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
     $("status-usage").title = S.sessionUsage && S.sessionUsage.id === S.current ? "Session (" + S.sessionUsage.runs + " Runs): " + usageText(S.sessionUsage.total) : "";
+    // Context fill (SPEC §10.6): amber above 70%, red above 90%.
+    const fill = S.contextFill && S.contextFill[S.current];
+    const pct = fill && fill.size > 0 && fill.used > 0 ? Math.floor(fill.used * 100 / fill.size) : null;
+    $("status-context").classList.toggle("hidden", pct == null);
+    $("status-context").textContent = pct == null ? "" : " │ ctx " + pct + "%";
+    $("status-context").className = "clickable " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted") + (pct == null ? " hidden" : "");
     const waiting = S.approvals.length;
     $("status-approvals").classList.toggle("hidden", !waiting);
     $("status-approvals").textContent = "⚠ " + waiting + " awaiting approval";
@@ -1504,6 +1510,7 @@
     renderStatus();
   }
   $("status-model").onclick = () => openModelPicker();
+  $("status-context").onclick = () => showContext();
   for (const id of ["tools-filter", "tools-sort", "tools-quick"]) $(id).addEventListener("input", () => renderTools());
   for (const id of ["proposals-filter", "proposals-quick"]) $(id).addEventListener("input", () => renderProposals());
   $("modal-approve").onclick = () => decide(true);
@@ -1960,6 +1967,10 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    request({ type: "context_usage", session_id: id }).then((r) => {
+      (S.contextFill = S.contextFill || {})[id] = { used: r.used_tokens, size: r.context_tokens };
+      renderStatus();
+    }).catch(() => {});
     request({ type: "session_usage", session_id: id }).then((r) => {
       S.sessionUsage = { id, runs: r.runs, total: r.total };
       if (r.last_run && r.last_run.steps) (S.usage = S.usage || {})[id] = r.last_run;
@@ -2094,6 +2105,7 @@
       if (r.last_run) note("last Run: " + usageText(r.last_run));
       return note("session (" + r.runs + " Runs): " + usageText(r.total));
     } },
+    { name: "context", group: "Session", desc: "how full the context window is, and what fills it", run: () => showContext() },
     { name: "stop", group: "Run control", desc: "stop the current Run (Esc)", run: () => stop() },
     { name: "cancel", group: "Run control", desc: "cancel the stalled or pending Tool call", run: () => {
       const t = [...S.liveTools].reverse().find((x) => x.status === "running" && x.handle);
@@ -2199,6 +2211,17 @@
     dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
     document.body.append(dialog);
     close.focus();
+  }
+  async function showContext() {
+    if (!S.current) return note("open a session first", true);
+    const r = await act({ type: "context_usage", session_id: S.current });
+    if (!r) return;
+    (S.contextFill = S.contextFill || {})[S.current] = { used: r.used_tokens, size: r.context_tokens };
+    renderStatus();
+    const b = r.breakdown || {};
+    const pct = r.context_tokens ? Math.floor(r.used_tokens * 100 / r.context_tokens) : 0;
+    note("context: " + r.used_tokens + " of " + r.context_tokens + " tokens (" + pct + "%" + (r.measured ? "" : ", estimated") + ") on " + r.model);
+    note("≈ system prompt " + b.system_prompt + " · Tool schemas " + b.tool_schemas + " · history " + b.history + " tokens · " + b.attachments + " attachment(s)");
   }
   async function slash(cmd) {
     const [first, ...rest] = cmd.split(/\s+/);
@@ -2403,6 +2426,7 @@
       }
       case "run_usage":
         (S.usage = S.usage || {})[ev.session_id] = ev.usage;
+        if (ev.usage.context_tokens > 0) (S.contextFill = S.contextFill || {})[ev.session_id] = { used: ev.usage.context_used, size: ev.usage.context_tokens };
         if (here) renderStatus();
         break;
       case "user_question_closed":

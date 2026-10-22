@@ -340,6 +340,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .statusbar .sep { color: var(--line); }
 .statusbar .note { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .statusbar .note.err { color: var(--err); }
+.statusbar .err { color: var(--err); font-weight: 650; }
+#status-context.clickable { cursor: pointer; }
 .state { color: var(--accent); display: inline-flex; align-items: center; gap: 6px; }
 .state.busy { color: var(--warn); font-weight: 650; }
 

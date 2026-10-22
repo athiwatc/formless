@@ -744,6 +744,46 @@ impl Daemon {
                 }
                 Ok(json!({"revoked": true}))
             }
+            Request::ContextUsage { session_id } => {
+                let cfg = self.config()?;
+                let model = self.session_base_model(&session_id, &cfg);
+                let size = cfg.provider.context_for(&model);
+                let prompt = self.session_prompt(&session_id)?;
+                let (tools, history, attachments, measured) = self.with_reader(|st| {
+                    let defs =
+                        toolreg::tool_definitions(st, Some(&session_id), cfg.tools.inline_limit)?;
+                    let msgs = st.list_messages(&session_id)?;
+                    let history: usize = msgs
+                        .iter()
+                        .map(|m| m.content.len() + m.meta.as_deref().map_or(0, str::len))
+                        .sum();
+                    let attachments: usize = msgs
+                        .iter()
+                        .filter_map(|m| m.meta.as_deref())
+                        .filter_map(|m| serde_json::from_str::<Value>(m).ok())
+                        .map(|m| m["attachments"].as_array().map_or(0, Vec::len))
+                        .sum();
+                    Ok((
+                        serde_json::to_string(&defs)?.len(),
+                        history,
+                        attachments,
+                        st.last_prompt_tokens(&session_id)?,
+                    ))
+                })?;
+                let estimate = (prompt.len() + tools + history) / 4;
+                Ok(json!({
+                    "model": model,
+                    "context_tokens": size,
+                    "used_tokens": measured.unwrap_or(estimate as u64),
+                    "measured": measured.is_some(),
+                    "breakdown": {
+                        "system_prompt": prompt.len() / 4,
+                        "tool_schemas": tools / 4,
+                        "history": history / 4,
+                        "attachments": attachments,
+                    },
+                }))
+            }
             Request::SessionUsage { session_id } => {
                 let cfg = self.config()?;
                 let total = self.usage_info(Some(&session_id), None, &cfg)?;
@@ -2074,7 +2114,9 @@ impl Daemon {
                             st.record_usage(session_id, run_id, &r.model_used, usage)
                         });
                     }
-                    if let Ok(usage) = self.usage_info(None, Some(run_id), &cfg) {
+                    if let Ok(mut usage) = self.usage_info(None, Some(run_id), &cfg) {
+                        usage.context_used = r.usage.as_ref().map_or(0, |u| u.prompt_tokens as i64);
+                        usage.context_tokens = i64::from(context_tokens);
                         self.broadcast(Event::RunUsage {
                             session_id: session_id.to_string(),
                             run_id: run_id.to_string(),
@@ -3130,23 +3172,29 @@ impl Daemon {
         if !cfg.provider.tool_use_nudge {
             return prompt;
         }
-        let (mut model, _) = self.session_model_effort(session_id, &cfg);
-        if let Some(role) = model.strip_prefix("role:") {
-            // A role's own model, else its provider's default.
-            model = match cfg.role(role) {
-                Ok(r) if !r.model.is_empty() => r.model.clone(),
-                Ok(r) => cfg
-                    .provider_cfg(r.provider.as_deref())
-                    .map(|p| p.model)
-                    .unwrap_or_default(),
-                Err(_) => String::new(),
-            };
-        }
+        let model = self.session_base_model(session_id, &cfg);
         if let Some(extra) = crate::provider::model_family_addendum(&model) {
             prompt.push_str("\n\n");
             prompt.push_str(extra);
         }
         prompt
+    }
+
+    /// The model a Session runs on, with `role:<name>` resolved to the
+    /// role's model (or its provider's default).
+    fn session_base_model(&self, session_id: &str, cfg: &Config) -> String {
+        let (model, _) = self.session_model_effort(session_id, cfg);
+        let Some(role) = model.strip_prefix("role:") else {
+            return model;
+        };
+        match cfg.role(role) {
+            Ok(r) if !r.model.is_empty() => r.model.clone(),
+            Ok(r) => cfg
+                .provider_cfg(r.provider.as_deref())
+                .map(|p| p.model)
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
     }
 
     pub fn effective_system_prompt(&self) -> String {
