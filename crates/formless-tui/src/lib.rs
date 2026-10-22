@@ -210,9 +210,61 @@ struct OpenQuestion {
     session_id: String,
     questions: Vec<Question>,
     answers: Vec<QuestionAnswer>,
+    /// The highlighted row of the current question: an option, or
+    /// `options.len()` for "Other…".
+    cursor: usize,
+    /// Ticked options of a multi-select question.
+    checked: Vec<bool>,
 }
 
 impl OpenQuestion {
+    fn new(id: String, session_id: String, questions: Vec<Question>) -> Self {
+        let mut q = OpenQuestion {
+            id,
+            session_id,
+            questions,
+            answers: Vec::new(),
+            cursor: 0,
+            checked: Vec::new(),
+        };
+        q.reset_choice();
+        q
+    }
+
+    fn current(&self) -> &Question {
+        &self.questions[self.answers.len()]
+    }
+
+    /// Fresh cursor and ticks for the current question.
+    fn reset_choice(&mut self) {
+        self.cursor = 0;
+        self.checked = vec![false; self.current().options.len()];
+    }
+
+    fn on_other(&self) -> bool {
+        self.cursor >= self.current().options.len()
+    }
+
+    /// The answer the panel's selection gives: the ticked options (or the
+    /// highlighted one), None on "Other…".
+    fn picked(&self) -> Option<QuestionAnswer> {
+        let q = self.current();
+        let mut selected: Vec<String> = q
+            .options
+            .iter()
+            .zip(&self.checked)
+            .filter(|(_, c)| **c)
+            .map(|(o, _)| o.label.clone())
+            .collect();
+        if selected.is_empty() {
+            selected.push(q.options.get(self.cursor)?.label.clone());
+        }
+        Some(QuestionAnswer {
+            selected,
+            text: None,
+        })
+    }
+
     /// The chat note for the next unanswered question.
     fn prompt(&self) -> String {
         let n = self.answers.len();
@@ -1727,12 +1779,7 @@ impl App {
                 if questions.is_empty() {
                     questions.push(Question::single(question, options));
                 }
-                let open = OpenQuestion {
-                    id: question_id,
-                    session_id,
-                    questions,
-                    answers: Vec::new(),
-                };
+                let open = OpenQuestion::new(question_id, session_id, questions);
                 self.notes.push(open.prompt());
                 if self.is_current(&open.session_id) {
                     self.set_activity("awaiting your answer");
@@ -2052,21 +2099,8 @@ impl App {
             .iter()
             .position(|q| q.session_id == session_id)
         {
-            let open = &mut self.questions[i];
-            let answer = open.questions[open.answers.len()].parse_reply(&text);
-            self.notes.push(format!("answered: {}", answer.summary()));
-            open.answers.push(answer);
-            if open.answers.len() < open.questions.len() {
-                let next = open.prompt();
-                self.notes.push(next);
-                return;
-            }
-            let open = self.questions.remove(i);
-            self.fire(Request::AnswerQuestion {
-                question_id: open.id,
-                answer: QuestionAnswer::summary_of(&open.answers),
-                answers: open.answers,
-            });
+            let answer = self.questions[i].current().parse_reply(&text);
+            self.answer_question(i, answer);
             return;
         }
         let mode = if queued {
@@ -2125,6 +2159,77 @@ impl App {
                 mode: p.mode,
             });
         }
+    }
+
+    /// Record an answer to open question `i`'s current question; send
+    /// them all after the last one.
+    fn answer_question(&mut self, i: usize, answer: QuestionAnswer) {
+        let open = &mut self.questions[i];
+        self.notes.push(format!("answered: {}", answer.summary()));
+        open.answers.push(answer);
+        if open.answers.len() < open.questions.len() {
+            open.reset_choice();
+            let next = open.prompt();
+            self.notes.push(next);
+            return;
+        }
+        let open = self.questions.remove(i);
+        self.fire(Request::AnswerQuestion {
+            question_id: open.id,
+            answer: QuestionAnswer::summary_of(&open.answers),
+            answers: open.answers,
+        });
+    }
+
+    /// The open question of the current Session, if any.
+    fn current_question(&self) -> Option<usize> {
+        let sid = self.current.as_ref()?;
+        self.questions.iter().position(|q| &q.session_id == sid)
+    }
+
+    /// Keys for the question panel (SPEC §5.5): ↑/↓ move, Space ticks,
+    /// Enter answers, 1–9 pick, Shift+Tab goes back. With text typed (or
+    /// on "Other…") keys go to the input and Enter sends it as the answer.
+    fn question_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(i) = self.current_question() else {
+            return false;
+        };
+        let typing = !self.input.is_empty();
+        let open = &mut self.questions[i];
+        let rows = open.current().options.len() + 1;
+        let multi = open.current().multi_select;
+        match key.code {
+            KeyCode::BackTab => {
+                if open.answers.pop().is_some() {
+                    open.reset_choice();
+                    self.notes.push("back to the previous question".into());
+                }
+            }
+            KeyCode::Up if !typing => open.cursor = open.cursor.saturating_sub(1),
+            KeyCode::Down if !typing => open.cursor = (open.cursor + 1).min(rows - 1),
+            KeyCode::Char(' ') if !typing && multi && !open.on_other() => {
+                let c = open.cursor;
+                open.checked[c] = !open.checked[c];
+            }
+            KeyCode::Char(d @ '1'..='9') if !typing && !open.on_other() => {
+                let n = d as usize - '1' as usize;
+                if n >= rows - 1 {
+                    return false;
+                }
+                open.cursor = n;
+                if multi {
+                    open.checked[n] = !open.checked[n];
+                } else if let Some(answer) = open.picked() {
+                    self.answer_question(i, answer);
+                }
+            }
+            KeyCode::Enter if !typing && key.modifiers.is_empty() => match open.picked() {
+                Some(answer) => self.answer_question(i, answer),
+                None => self.notes.push("type your answer, then Enter".into()),
+            },
+            _ => return false,
+        }
+        true
     }
 
     /// The `/` palette rows for the input, empty when it isn't shown.
@@ -3140,7 +3245,9 @@ impl App {
                 }
             }
         }
-        if self.view == View::Chat && (self.palette_key(&key) || self.mention_key(&key)) {
+        if self.view == View::Chat
+            && (self.question_key(&key) || self.palette_key(&key) || self.mention_key(&key))
+        {
             return;
         }
         if self.view == View::Chat
@@ -3737,7 +3844,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, chunks[3], app);
     if app.view == View::Chat {
         let palette = app.palette_items();
-        if !palette.is_empty() {
+        let question = app.current_question().map(|i| &app.questions[i]);
+        if let Some(q) = question.filter(|_| palette.is_empty() && modal.is_none()) {
+            draw_question_panel(f, chunks[1], q, !app.input.is_empty(), app.color);
+        } else if !palette.is_empty() {
             draw_palette(f, chunks[2], &palette, app.palette_sel, app.color);
         } else if let Some(m) = app.mention.as_ref().filter(|m| !m.dismissed) {
             draw_mention_popup(f, chunks[2], m, app.color);
@@ -3935,6 +4045,102 @@ fn mention_line(text: &str, color: bool) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+/// An open `ask_user` question (SPEC §5.5), at the bottom of the chat
+/// area just above the input.
+fn draw_question_panel(f: &mut Frame, chat: Rect, open: &OpenQuestion, typing: bool, color: bool) {
+    let q = open.current();
+    let total = open.questions.len();
+    let mut title = String::from(" Question");
+    if total > 1 {
+        title.push_str(&format!(" {}/{total}", open.answers.len() + 1));
+    }
+    if let Some(h) = &q.header {
+        title.push_str(&format!(" · {h}"));
+    }
+    title.push(' ');
+    let mut lines = vec![Line::styled(
+        q.question.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    for (n, o) in q.options.iter().enumerate() {
+        let here = n == open.cursor && !typing;
+        let mark = match (
+            q.multi_select,
+            open.checked.get(n).copied().unwrap_or(false),
+        ) {
+            (true, true) => "[x]",
+            (true, false) => "[ ]",
+            (false, _) if here => "(•)",
+            (false, _) => "( )",
+        };
+        let style = if here {
+            bold_fg(color, Color::Green)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(
+            format!(
+                "{} {}. {mark} {}",
+                if here { "›" } else { " " },
+                n + 1,
+                o.label
+            ),
+            style,
+        ));
+        if here {
+            if let Some(d) = &o.description {
+                lines.push(Line::styled(format!("        {d}"), ui::dim(color)));
+            }
+        }
+    }
+    let other_here = open.on_other() || typing;
+    lines.push(Line::styled(
+        format!(
+            "{} {}",
+            if other_here { "›" } else { " " },
+            if q.options.is_empty() {
+                "type your answer below"
+            } else {
+                "Other… (type your own answer below)"
+            }
+        ),
+        if other_here {
+            bold_fg(color, Color::Green)
+        } else {
+            ui::dim(color)
+        },
+    ));
+    let mut hint = String::from(if typing {
+        "Enter sends your text as the answer"
+    } else if q.multi_select {
+        "↑↓ move · Space tick · Enter answer · 1–9 tick"
+    } else {
+        "↑↓ move · Enter answer · 1–9 pick"
+    });
+    if !open.answers.is_empty() {
+        hint.push_str(" · Shift+Tab back");
+    }
+    lines.push(Line::styled(hint, ui::dim(color)));
+    let w = chat.width.clamp(1, 100);
+    let h = (lines.len() as u16 + 2).min(chat.height);
+    if h < 3 {
+        return;
+    }
+    let rect = Rect {
+        x: chat.x,
+        y: chat.bottom() - h,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(ui::panel(title, color, Color::Magenta))
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
 }
 
 /// The `/` palette, just above the input box, scrolled to the selection.
@@ -6787,14 +6993,22 @@ mod tests {
         // A toggle saves through the daemon.
         app.settings_sel = at("provider.tool_use_nudge");
         app.key(key(KeyCode::Enter));
-        assert_eq!(app.settings_saving.as_deref(), Some("provider.tool_use_nudge"));
+        assert_eq!(
+            app.settings_saving.as_deref(),
+            Some("provider.tool_use_nudge")
+        );
         // A bad number is caught before saving and shown by the row.
         app.settings_sel = at("provider.max_retries");
         app.key(key(KeyCode::Enter));
         assert!(app.settings_edit.is_some());
         app.key(key(KeyCode::Char('x')));
         app.key(key(KeyCode::Enter));
-        assert!(app.settings_error.as_ref().unwrap().1.contains("whole number"));
+        assert!(app
+            .settings_error
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("whole number"));
         assert!(render(&mut app, 100, 40).contains("whole number"));
         app.key(key(KeyCode::Esc));
         assert!(app.settings_edit.is_none());
@@ -6821,7 +7035,14 @@ mod tests {
         let screen = render(&mut app, 100, 40);
         assert!(!screen.contains("sk-secret") && screen.contains("•••••••••"));
         app.key(key(KeyCode::Enter));
-        assert!(app.settings_form.as_ref().unwrap().error.as_ref().unwrap().contains("http"));
+        assert!(app
+            .settings_form
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("http"));
         app.key(key(KeyCode::Esc));
         assert!(app.settings_form.is_none());
         for (w, h) in [(1, 1), (20, 5), (80, 24)] {
@@ -6829,6 +7050,61 @@ mod tests {
         }
         app.key(key(KeyCode::Esc));
         assert_eq!(app.view, View::Chat);
+    }
+
+    #[test]
+    fn question_panel_answers_with_arrow_keys_and_goes_back() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let opt = |l: &str, d: Option<&str>| QuestionOption {
+            label: l.into(),
+            description: d.map(str::to_string),
+        };
+        let mut app = test_app();
+        app.current = Some("s".into());
+        app.on_event(Event::UserQuestion {
+            question_id: "q".into(),
+            session_id: "s".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![
+                Question {
+                    question: "Which database?".into(),
+                    header: Some("DB".into()),
+                    options: vec![opt("Postgres", Some("relational")), opt("SQLite", None)],
+                    multi_select: false,
+                },
+                Question {
+                    question: "Which features?".into(),
+                    header: None,
+                    options: vec![opt("auth", None), opt("search", None), opt("billing", None)],
+                    multi_select: true,
+                },
+            ],
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Question 1/2 · DB") && screen.contains("relational"));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.questions[0].answers[0].selected, vec!["SQLite"]);
+        // Multi-select: tick with a number and with Space.
+        app.key(key(KeyCode::Char('1')));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Char(' ')));
+        assert!(render(&mut app, 100, 30).contains("[x] billing"));
+        // Shift+Tab: back to change the first answer.
+        app.key(key(KeyCode::BackTab));
+        assert_eq!(app.questions[0].answers.len(), 0);
+        assert_eq!(app.view, View::Chat, "Shift+Tab didn't switch views");
+        app.key(key(KeyCode::Char('1')));
+        assert_eq!(app.questions[0].answers[0].selected, vec!["Postgres"]);
+        // Typed text is the answer ("Other…").
+        for c in "just auth".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert!(app.questions.is_empty(), "all answered and sent");
+        assert!(app.notes.iter().any(|n| n == "answered: just auth"));
     }
 
     #[test]

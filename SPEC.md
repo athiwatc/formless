@@ -398,9 +398,15 @@ accepted as a label. The user may always answer in their own words.
   text?}]}`, plus `answer` (the first answer as one line) when the call
   used the single-question form. With free text only, `{"answer": …}`.
 - **Clients:**
-  - TUI: each question appears in the chat in turn; the next typed line
-    answers it (an option number picks that option, `1,3` picks several
-    on a `multi_select` question, anything else is the user's own text).
+  - TUI: the open question shows in a panel above the input, with
+    progress (`2/4`) and its header. Options are a list: ↑/↓ move, Enter
+    answers, and Space ticks on a `multi_select` question. 1–9 pick, or
+    tick on multi-select. The highlighted option's description shows
+    under it. An "Other…" row means typing your own answer. Once text
+    is typed, Enter sends it (an option number picks that option, `1,3`
+    picks several, anything else is the user's own text). Shift+Tab goes
+    back to change an earlier answer before the last one sends them all.
+    The question is also noted in the chat.
   - web: a modal with radios or checkboxes per question and an "Other"
     box.
   - `formless run`: `--answer TEXT` (free text for the whole call), else a
