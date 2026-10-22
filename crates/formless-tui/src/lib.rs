@@ -25,7 +25,7 @@ use formless_core::Paths;
 use formless_protocol::*;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{stdout, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -651,23 +651,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Render persisted assistant tool-call metadata as display lines.
-fn tool_call_lines(meta: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) else {
-        return Vec::new();
-    };
-    let Some(calls) = v["tool_calls"].as_array() else {
-        return Vec::new();
-    };
-    calls
-        .iter()
-        .map(|c| {
-            let name = c["function"]["name"].as_str().unwrap_or("tool");
-            let args = c["function"]["arguments"].as_str().unwrap_or_default();
-            format!("⚙ {name}  {}", ui::summarize_args(args, 220))
-        })
-        .collect()
-}
-
 struct App {
     paths: Paths,
     view: View,
@@ -756,6 +739,12 @@ struct App {
     run_banner: Option<(String, String)>,
     /// The last provider error in full, for `/details`.
     last_error: Option<String>,
+    /// The persisted tool call `[`/`]` focused (its call id), and the
+    /// calls expanded to show their input and result (SPEC §10.2).
+    call_focus: Option<String>,
+    expanded_calls: HashSet<String>,
+    /// Scroll the chat to the focused call on the next draw.
+    scroll_to_focus: bool,
     /// Last listed running Invocations (for /kill and /drop by prefix).
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
@@ -906,6 +895,9 @@ impl App {
             run_usage: HashMap::new(),
             run_banner: None,
             last_error: None,
+            call_focus: None,
+            expanded_calls: HashSet::new(),
+            scroll_to_focus: false,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -4044,6 +4036,59 @@ impl App {
         });
     }
 
+    /// Persisted tool call ids of the current Session, in order.
+    fn call_ids(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|m| m.meta.as_deref())
+            .flat_map(persisted_calls)
+            .map(|(id, _, _)| id)
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// Tool-call focus (SPEC §10.2): `[`/`]` on an empty input move it;
+    /// while a call is focused Enter toggles it, `z`/`Z` expand or
+    /// collapse all, and Esc or any other key leaves the focus.
+    fn call_focus_key(&mut self, key: &KeyEvent) -> bool {
+        if !self.input.is_empty() || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return false;
+        }
+        let ids = self.call_ids();
+        let at = self
+            .call_focus
+            .as_ref()
+            .and_then(|f| ids.iter().position(|id| id == f));
+        match key.code {
+            KeyCode::Char('[') | KeyCode::Char(']') if !ids.is_empty() => {
+                let next = match (at, key.code == KeyCode::Char(']')) {
+                    (None, _) => ids.len() - 1,
+                    (Some(i), true) => (i + 1).min(ids.len() - 1),
+                    (Some(i), false) => i.saturating_sub(1),
+                };
+                self.call_focus = Some(ids[next].clone());
+                self.scroll_to_focus = true;
+            }
+            _ if self.call_focus.is_none() => return false,
+            KeyCode::Enter => {
+                let id = self.call_focus.clone().unwrap();
+                if !self.expanded_calls.remove(&id) {
+                    self.expanded_calls.insert(id);
+                }
+                self.scroll_to_focus = true;
+            }
+            KeyCode::Char('z') => self.expanded_calls.extend(ids),
+            KeyCode::Char('Z') => self.expanded_calls.clear(),
+            KeyCode::Esc => self.call_focus = None,
+            _ => {
+                // Typing leaves the focus and goes to the input.
+                self.call_focus = None;
+                return false;
+            }
+        }
+        true
+    }
+
     /// The user messages of the current Session, oldest first: the input
     /// history for Up/Down and Ctrl+R.
     fn input_history(&self) -> Vec<String> {
@@ -4073,6 +4118,9 @@ impl App {
                     self.input_key(key);
                 }
             }
+            return;
+        }
+        if self.call_focus_key(&key) {
             return;
         }
         let page = self.chat_view_height.saturating_sub(1).max(1);
@@ -5157,8 +5205,159 @@ fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
+/// A persisted tool call: (call id, name, raw arguments).
+fn persisted_calls(meta: &str) -> Vec<(String, String, String)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) else {
+        return Vec::new();
+    };
+    v["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            (
+                c["id"].as_str().unwrap_or_default().to_string(),
+                c["function"]["name"].as_str().unwrap_or("tool").to_string(),
+                c["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The call id a `tool` message answers.
+fn result_call_id(m: &MessageInfo) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+    meta["tool_call_id"].as_str().map(str::to_string)
+}
+
+/// JSON pretty-printed (or the text as is), highlighted, capped.
+fn code_block_lines(text: &str, indent: &str, color: bool, max: usize) -> Vec<Line<'static>> {
+    let pretty = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok());
+    let (body, lang) = match &pretty {
+        Some(p) => (p.as_str(), Some("json")),
+        None => (text.trim_end(), None),
+    };
+    let mut hl = lang.and_then(|l| highlight::Highlighter::new(l, color));
+    let all: Vec<&str> = body.lines().collect();
+    let mut out: Vec<Line<'static>> = all
+        .iter()
+        .take(max)
+        .map(|l| {
+            let mut spans = vec![Span::raw(indent.to_string())];
+            match &mut hl {
+                Some(h) => spans.extend(h.line(l)),
+                None => spans.push(Span::styled(l.to_string(), ui::dim(color))),
+            }
+            Line::from(spans)
+        })
+        .collect();
+    if all.len() > max {
+        out.push(Line::styled(
+            format!("{indent}… {} more lines", all.len() - max),
+            ui::dim(color),
+        ));
+    }
+    out
+}
+
+/// One persisted call: collapsed to a line (name, input summary and the
+/// result's status), or expanded to its full input and result.
+fn tool_call_block(
+    app: &App,
+    (id, name, args): &(String, String, String),
+    result: Option<&str>,
+) -> Vec<Line<'static>> {
+    let focused = app.call_focus.as_deref() == Some(id.as_str());
+    let expanded = app.expanded_calls.contains(id);
+    let failed = result.is_some_and(|r| {
+        r.contains("\"ok\":false") || r.trim_start().to_lowercase().starts_with("error")
+    });
+    let (mark, mark_style) = match result {
+        None => ("…", ui::dim(app.color)),
+        Some(_) if failed => ("✗", bold_fg(app.color, Color::Red)),
+        Some(_) => ("✓", fg(app.color, Color::Green)),
+    };
+    let head_style = if focused {
+        bold_fg(app.color, Color::Yellow).add_modifier(Modifier::REVERSED)
+    } else {
+        fg(app.color, Color::Yellow)
+    };
+    let mut head = vec![
+        Span::styled(
+            format!("  {} ⚙ {name}", if expanded { "▾" } else { "▸" }),
+            head_style,
+        ),
+        Span::raw(" "),
+        Span::styled(mark, mark_style),
+    ];
+    if !expanded {
+        head.push(Span::styled(
+            format!("  {}", ui::summarize_args(args, 120)),
+            ui::dim(app.color),
+        ));
+        if let Some(r) = result {
+            head.push(Span::styled(
+                format!(
+                    "  → {}",
+                    truncate_chars(r.trim().lines().next().unwrap_or_default(), 80)
+                ),
+                ui::dim(app.color),
+            ));
+            if let Some(a) = formless_protocol::artifact_refs(r).first() {
+                head.push(Span::styled(
+                    format!("  /open {}", &a[..8]),
+                    fg(app.color, Color::Cyan),
+                ));
+            }
+        }
+        return vec![Line::from(head)];
+    }
+    let mut out = vec![
+        Line::from(head),
+        Line::styled("    input", ui::dim(app.color)),
+    ];
+    out.extend(code_block_lines(args, "      ", app.color, 200));
+    match result {
+        Some(r) => {
+            out.push(Line::styled(
+                if failed { "    error" } else { "    result" },
+                if failed {
+                    fg(app.color, Color::Red)
+                } else {
+                    ui::dim(app.color)
+                },
+            ));
+            out.extend(code_block_lines(r, "      ", app.color, 300));
+        }
+        None => out.push(Line::styled("    (no result yet)", ui::dim(app.color))),
+    }
+    out
+}
+
+fn chat_lines(app: &App, width: usize, height: usize) -> (Vec<Line<'static>>, Option<usize>) {
     let mut lines: Vec<Line> = Vec::new();
+    let mut focus_line = None;
+    // Results by call id, so each call renders with its result and the
+    // separate `tool` line is skipped.
+    let results: HashMap<String, &str> = app
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| result_call_id(m).map(|id| (id, m.content.as_str())))
+        .collect();
+    let called: HashSet<String> = app
+        .messages
+        .iter()
+        .filter_map(|m| m.meta.as_deref())
+        .flat_map(persisted_calls)
+        .map(|(id, _, _)| id)
+        .filter(|id| !id.is_empty())
+        .collect();
     let mut group: Option<&'static str> = None;
     // Header only when the speaker changes; a blank line separates turns.
     let open_group = |lines: &mut Vec<Line<'static>>,
@@ -5184,6 +5383,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
                 }
             }
             "tool" => {
+                if result_call_id(m).is_some_and(|id| called.contains(&id)) {
+                    continue;
+                }
                 open_group(&mut lines, &mut group, "assistant", when);
                 lines.push(tool_result_line(&m.content, app.color));
             }
@@ -5200,11 +5402,12 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
                 open_group(&mut lines, &mut group, "assistant", when);
                 lines.extend(app.markdown_cached(m, width));
                 if let Some(meta) = &m.meta {
-                    for call in tool_call_lines(meta) {
-                        lines.push(Line::styled(
-                            format!("  {call}"),
-                            fg(app.color, Color::Yellow),
-                        ));
+                    for call in persisted_calls(meta) {
+                        if app.call_focus.as_deref() == Some(call.0.as_str()) {
+                            focus_line = Some(lines.len());
+                        }
+                        let result = results.get(&call.0).copied();
+                        lines.extend(tool_call_block(app, &call, result));
                     }
                 }
             }
@@ -5260,7 +5463,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
         }
     }
     if app.messages.is_empty() && !app.running() {
-        return welcome_lines(app.color, height);
+        return (welcome_lines(app.color, height), None);
     }
     // Live reasoning: dimmed, separate from the answer, and capped to the
     // latest lines so it never floods the transcript (/thinking hides it).
@@ -5309,19 +5512,33 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
             ));
         }
     }
-    lines
+    (lines, focus_line)
 }
 
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let height = (area.height.saturating_sub(2) as usize).max(1);
     let width = area.width.saturating_sub(2);
-    let paragraph =
-        Paragraph::new(chat_lines(app, width as usize, height)).wrap(Wrap { trim: false });
+    let (lines, focus_line) = chat_lines(app, width as usize, height);
+    // Bring a newly focused tool call into view (rows before it, wrapped).
+    let focus_row = focus_line
+        .filter(|_| std::mem::take(&mut app.scroll_to_focus))
+        .map(|i| {
+            Paragraph::new(lines[..i].to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+        });
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Scroll by rendered (wrapped) rows so the newest output stays visible.
     let rows = paragraph.line_count(width);
     app.chat_view_height = height;
     app.chat_line_count = rows;
     let max_top = rows.saturating_sub(height);
+    if let Some(row) = focus_row {
+        let top = app.chat_scroll_top.unwrap_or(max_top);
+        if row < top || row >= top + height {
+            app.chat_scroll_top = Some(row.saturating_sub(height / 3).min(max_top));
+        }
+    }
     let scroll_top = match app.chat_scroll_top {
         Some(top) => top.min(max_top),
         None => max_top,
@@ -6822,6 +7039,9 @@ mod tests {
             run_usage: HashMap::new(),
             run_banner: None,
             last_error: None,
+            call_focus: None,
+            expanded_calls: HashSet::new(),
+            scroll_to_focus: false,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -7011,11 +7231,81 @@ mod tests {
             {"id": "1", "type": "function", "function": {"name": "create_tool", "arguments": "{\"name\":\"w\"}"}},
             {"id": "2", "type": "function", "function": {"name": "writer", "arguments": "{}"}}
         ]});
-        let lines = tool_call_lines(&meta.to_string());
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("create_tool"), "{lines:?}");
-        assert!(tool_call_lines("not json").is_empty());
-        assert!(tool_call_lines("{}").is_empty());
+        let calls = persisted_calls(&meta.to_string());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            (calls[0].0.as_str(), calls[0].1.as_str()),
+            ("1", "create_tool")
+        );
+        assert!(persisted_calls("not json").is_empty());
+        assert!(persisted_calls("{}").is_empty());
+    }
+
+    #[test]
+    fn tool_calls_collapse_expand_and_take_focus() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let msg =
+            |id: &str, role: &str, content: &str, meta: Option<serde_json::Value>| MessageInfo {
+                id: id.into(),
+                session_id: "s".into(),
+                seq: 0,
+                role: role.into(),
+                content: content.into(),
+                created_at: String::new(),
+                meta: meta.map(|m| m.to_string()),
+            };
+        let mut app = test_app();
+        app.messages = vec![
+            msg("u", "user", "count lines", None),
+            msg(
+                "a",
+                "assistant",
+                "",
+                Some(serde_json::json!({"tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "line_count", "arguments": "{\"path\":\"/tmp/x\"}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "fetch", "arguments": "{}"}}
+                ]})),
+            ),
+            msg(
+                "t1",
+                "tool",
+                "{\"lines\": 42}",
+                Some(serde_json::json!({"tool_call_id": "c1"})),
+            ),
+            msg(
+                "t2",
+                "tool",
+                "Error: denied",
+                Some(serde_json::json!({"tool_call_id": "c2"})),
+            ),
+        ];
+        // Collapsed: one line per call with its result folded in.
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("▸ ⚙ line_count ✓"), "{screen}");
+        assert!(screen.contains("▸ ⚙ fetch ✗"));
+        assert!(!screen.contains("↳"), "results aren't repeated");
+        // ] focuses the last call, [ the one before; Enter expands it.
+        app.key(key(KeyCode::Char(']')));
+        app.key(key(KeyCode::Char('[')));
+        assert_eq!(app.call_focus.as_deref(), Some("c1"));
+        app.key(key(KeyCode::Enter));
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("▾ ⚙ line_count") && screen.contains("\"lines\": 42"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("\"path\": \"/tmp/x\""),
+            "input pretty-printed"
+        );
+        // z expands all, Z collapses all; typing leaves the focus.
+        app.key(key(KeyCode::Char('z')));
+        assert_eq!(app.expanded_calls.len(), 2);
+        app.key(key(KeyCode::Char('Z')));
+        assert!(app.expanded_calls.is_empty());
+        app.key(key(KeyCode::Char('h')));
+        assert!(app.call_focus.is_none());
+        assert_eq!(app.input, "h");
     }
 
     #[test]

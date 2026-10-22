@@ -1533,6 +1533,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   with live elapsed + `possibly stalled` flags, §6), compaction notices,
   optimiser activity notes. Full scrollback is preserved across modal
   overlays and view switches.
+- **Tool calls in the TUI chat.** Persisted calls start collapsed to one
+  line: `▸ ⚙ name ✓`, an input summary, and the first line of the result
+  (✗ on failure, … while there is none). Their separate result lines are
+  folded in. `[`/`]` on an empty input focus the previous/next call and
+  scroll it into view. While a call is focused, Enter expands or collapses
+  it, `z` expands all, `Z` collapses all, and Esc or typing leaves the
+  focus. An expanded call shows its input and its result or error,
+  pretty-printed and highlighted when JSON (capped at a few hundred lines;
+  `/open` shows stored outputs in full).
 - **Input editor (TUI).** The message box is a multi-line editor with
   readline keys:
   - ←/→ move by character and Alt or Ctrl+←/→ by word. Home/End and
