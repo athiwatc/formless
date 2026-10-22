@@ -1747,6 +1747,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   rebuilds of an unsigned dev binary (whose keychain ACL would otherwise
   orphan the entry).
 
+- **Context fill.** The status line shows `ctx N%`: the latest prompt's
+  token count over the model's context size (`model_context_tokens`,
+  else `context_tokens`). It's amber above 70% and red above 90%, so
+  compaction (§11) isn't a surprise. `RunUsage` carries `context_used`
+  and `context_tokens` after each step, and `ContextUsage {session_id}`
+  gives the same for a Session on demand, falling back to an estimate
+  before any prompt is measured. `/context` (or clicking the segment on
+  the web) adds an estimated breakdown: system prompt, Tool schemas,
+  history, and the number of attachments.
 - **Notifications.** While the TUI's terminal isn't focused (focus
   events) or the web tab is hidden, Formless tells you when a Run
   finishes (if it took at least `tui.notify_min_secs`, default 20), is

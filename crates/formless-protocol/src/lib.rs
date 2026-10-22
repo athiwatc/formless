@@ -195,6 +195,12 @@ pub struct UsageInfo {
     pub cached_tokens: i64,
     /// Estimated USD, when every model used has a configured price.
     pub cost: Option<f64>,
+    /// The latest step's prompt tokens and the model's context size
+    /// (SPEC §10.6); 0 when unknown.
+    #[serde(default)]
+    pub context_used: i64,
+    #[serde(default)]
+    pub context_tokens: i64,
 }
 
 /// One Run's metrics (SPEC §8.7).
@@ -665,6 +671,14 @@ pub enum Request {
         tool_id: String,
         #[serde(default)]
         capability: Option<String>,
+    },
+    /// How full a Session's context is (SPEC §10.6): `{model,
+    /// context_tokens, used_tokens, measured, breakdown: {system_prompt,
+    /// tool_schemas, history, attachments}}`. `used_tokens` is the last
+    /// prompt's count when known (`measured`), else an estimate; the
+    /// breakdown is estimated (about 4 characters per token).
+    ContextUsage {
+        session_id: String,
     },
     /// A Session's usage: `{"last_run": UsageInfo?, "total": UsageInfo, "runs": n}`.
     SessionUsage {

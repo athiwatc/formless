@@ -149,6 +149,9 @@ enum Pending {
     ListModels,
     SetModel,
     ListFiles,
+    /// Context fill for the status line (quiet) or `/context` (report).
+    ContextFill,
+    ContextReport,
     MentionAttach,
     /// Providers and Roles for the Settings view.
     SettingsProviders,
@@ -735,6 +738,8 @@ struct App {
     questions: Vec<OpenQuestion>,
     /// Latest Run usage per Session, for the status line (SPEC §10.6).
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
+    /// Context fill per Session: (last prompt tokens, context size).
+    context_fill: HashMap<String, (i64, i64)>,
     /// The current Session's unfinished last Run: (status, reason).
     run_banner: Option<(String, String)>,
     /// The last provider error in full, for `/details`.
@@ -893,6 +898,7 @@ impl App {
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
+            context_fill: HashMap::new(),
             run_banner: None,
             last_error: None,
             call_focus: None,
@@ -1228,6 +1234,30 @@ impl App {
                             self.mention_attached();
                         }
                         Pending::SettingsProviders => self.providers_info = result,
+                        Pending::ContextFill | Pending::ContextReport => {
+                            let used = result["used_tokens"].as_i64().unwrap_or(0);
+                            let size = result["context_tokens"].as_i64().unwrap_or(0);
+                            if let Some(id) = self.current.clone().filter(|_| size > 0) {
+                                self.context_fill.insert(id, (used, size));
+                            }
+                            if matches!(kind, Pending::ContextReport) {
+                                let b = &result["breakdown"];
+                                let pct = (used * 100).checked_div(size).unwrap_or(0);
+                                self.notes.push(format!(
+                                    "context: {used} of {size} tokens ({pct}%{}) on {}",
+                                    if result["measured"] == true {
+                                        ""
+                                    } else {
+                                        ", estimated"
+                                    },
+                                    result["model"].as_str().unwrap_or_default()
+                                ));
+                                self.notes.push(format!(
+                                    "  ≈ system prompt {} · Tool schemas {} · history {} tokens · {} attachment(s)",
+                                    b["system_prompt"], b["tool_schemas"], b["history"], b["attachments"]
+                                ));
+                            }
+                        }
                         Pending::SaveSetting => {
                             if let Some(key) = self.settings_saving.take() {
                                 self.notes.push(format!(
@@ -1665,6 +1695,12 @@ impl App {
             sessions: Some(vec![id.clone()]),
             deltas: true,
         });
+        self.request(
+            Pending::ContextFill,
+            Request::ContextUsage {
+                session_id: id.clone(),
+            },
+        );
         self.current = Some(id);
         self.streaming.clear();
         self.thinking.clear();
@@ -1895,6 +1931,12 @@ impl App {
             Event::RunUsage {
                 session_id, usage, ..
             } => {
+                if usage.context_tokens > 0 {
+                    self.context_fill.insert(
+                        session_id.clone(),
+                        (usage.context_used, usage.context_tokens),
+                    );
+                }
                 self.run_usage.insert(session_id, usage);
             }
             Event::UserQuestionClosed { question_id } => {
@@ -2955,6 +2997,12 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "context" => match self.current.clone() {
+                Some(session_id) => {
+                    self.request(Pending::ContextReport, Request::ContextUsage { session_id })
+                }
+                None => self.notes.push("no current session".into()),
+            },
             "details" => match self.last_error.clone() {
                 Some(raw) => {
                     self.pager = Some(Pager {
@@ -4885,6 +4933,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     {
         left.push(sep());
         left.push(Span::styled(usage_text(u), ui::dim(app.color)));
+    }
+    if let Some(&(used, size)) = app.current.as_ref().and_then(|s| app.context_fill.get(s)) {
+        if size > 0 && used > 0 {
+            let pct = used * 100 / size;
+            let style = match pct {
+                90.. => bold_fg(app.color, Color::Red),
+                70.. => fg(app.color, Color::Yellow),
+                _ => ui::dim(app.color),
+            };
+            left.push(sep());
+            left.push(Span::styled(format!("ctx {pct}%"), style));
+        }
     }
     let waiting = app.approvals.len() + app.promotions.len();
     if waiting > 0 {
@@ -7037,6 +7097,7 @@ mod tests {
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
+            context_fill: HashMap::new(),
             run_banner: None,
             last_error: None,
             call_focus: None,
@@ -8018,6 +8079,24 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.attachments.is_empty());
         assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+    }
+
+    #[test]
+    fn status_line_shows_context_fill() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        app.on_event(Event::RunUsage {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            usage: formless_protocol::UsageInfo {
+                steps: 1,
+                prompt_tokens: 7500,
+                context_used: 7500,
+                context_tokens: 10000,
+                ..Default::default()
+            },
+        });
+        assert!(render(&mut app, 120, 20).contains("ctx 75%"));
     }
 
     #[test]

@@ -94,6 +94,12 @@ pub const COMMANDS: &[Command] = &[
         Session,
     ),
     cmd("usage", "", "tokens and cost of this Session", Session),
+    cmd(
+        "context",
+        "",
+        "how full the context window is, and what fills it",
+        Session,
+    ),
     cmd("undo", "", "undo the last Session delete", Session),
     cmd("stop", "", "stop the current Run (Esc)", Run),
     cmd("cancel", "", "cancel the stalled or pending Tool call", Run),
