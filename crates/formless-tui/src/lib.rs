@@ -752,6 +752,8 @@ struct App {
     expanded_calls: HashSet<String>,
     /// Scroll the chat to the focused call on the next draw.
     scroll_to_focus: bool,
+    /// Wrapped row of each user message, from the last draw.
+    user_rows: Vec<usize>,
     /// Last listed running Invocations (for /kill and /drop by prefix).
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
@@ -907,6 +909,7 @@ impl App {
             call_focus: None,
             expanded_calls: HashSet::new(),
             scroll_to_focus: false,
+            user_rows: Vec::new(),
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -4117,6 +4120,24 @@ impl App {
         });
     }
 
+    /// Scroll to the previous/next user message (SPEC §10.2); past the
+    /// last one, follow the live bottom again.
+    fn jump_user_message(&mut self, forward: bool) {
+        let max_top = self.chat_line_count.saturating_sub(self.chat_view_height);
+        let top = self.chat_scroll_top.unwrap_or(max_top);
+        let target = if forward {
+            self.user_rows.iter().copied().find(|&r| r > top)
+        } else {
+            self.user_rows.iter().copied().rev().find(|&r| r < top)
+        };
+        match target {
+            Some(r) if r < max_top => self.chat_scroll_top = Some(r),
+            Some(_) | None if forward => self.follow_chat_bottom(),
+            Some(r) => self.chat_scroll_top = Some(r.min(max_top)),
+            None => self.chat_scroll_top = Some(0),
+        }
+    }
+
     /// Persisted tool call ids of the current Session, in order.
     fn call_ids(&self) -> Vec<String> {
         self.messages
@@ -4205,7 +4226,13 @@ impl App {
             return;
         }
         let page = self.chat_view_height.saturating_sub(1).max(1);
+        let empty = self.input.is_empty();
         match key.code {
+            KeyCode::Up if ctrl => self.jump_user_message(false),
+            KeyCode::Down if ctrl => self.jump_user_message(true),
+            KeyCode::Char('{') if empty => self.jump_user_message(false),
+            KeyCode::Char('}') if empty => self.jump_user_message(true),
+            KeyCode::Home if empty => self.chat_scroll_top = Some(0),
             KeyCode::PageUp => self.scroll_chat_up(page),
             KeyCode::PageDown => self.scroll_chat_down(page),
             KeyCode::Up if !self.input.on_first_line() => self.input.vertical(false),
@@ -5435,9 +5462,16 @@ fn tool_call_block(
     out
 }
 
-fn chat_lines(app: &App, width: usize, height: usize) -> (Vec<Line<'static>>, Option<usize>) {
+/// The chat's lines, the focused tool call's line, and where each user
+/// message starts (for jumping between them).
+fn chat_lines(
+    app: &App,
+    width: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, Option<usize>, Vec<usize>) {
     let mut lines: Vec<Line> = Vec::new();
     let mut focus_line = None;
+    let mut user_lines = Vec::new();
     // Results by call id, so each call renders with its result and the
     // separate `tool` line is skipped.
     let results: HashMap<String, &str> = app
@@ -5473,10 +5507,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> (Vec<Line<'static>>, Op
     for m in &app.messages {
         let when = Some(m.created_at.as_str());
         // A separator when the local date changes (not before the first).
-        let this_day = ui::local_day(&m.created_at);
-        if app.show_timestamps && this_day.is_some() && this_day != day {
-            if day.is_some() {
-                let label = this_day.unwrap().format("%a, %-d %b %Y").to_string();
+        if let Some(d) = ui::local_day(&m.created_at).filter(|_| app.show_timestamps) {
+            if day.is_some_and(|prev| prev != d) {
+                let label = d.format("%a, %-d %b %Y").to_string();
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     format!("──── {label} ────"),
@@ -5484,10 +5517,11 @@ fn chat_lines(app: &App, width: usize, height: usize) -> (Vec<Line<'static>>, Op
                 ));
                 group = None;
             }
-            day = this_day;
+            day = Some(d);
         }
         match m.role.as_str() {
             "user" => {
+                user_lines.push(lines.len());
                 open_group(&mut lines, &mut group, "user", when);
                 for l in m.content.lines() {
                     lines.push(mention_line(&truncate_chars(l, 2000), app.color));
@@ -5574,7 +5608,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> (Vec<Line<'static>>, Op
         }
     }
     if app.messages.is_empty() && !app.running() {
-        return (welcome_lines(app.color, height), None);
+        return (welcome_lines(app.color, height), None, Vec::new());
     }
     // Live reasoning: dimmed, separate from the answer, and capped to the
     // latest lines so it never floods the transcript (/thinking hides it).
@@ -5623,13 +5657,27 @@ fn chat_lines(app: &App, width: usize, height: usize) -> (Vec<Line<'static>>, Op
             ));
         }
     }
-    (lines, focus_line)
+    (lines, focus_line, user_lines)
 }
 
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let height = (area.height.saturating_sub(2) as usize).max(1);
     let width = area.width.saturating_sub(2);
-    let (lines, focus_line) = chat_lines(app, width as usize, height);
+    let (lines, focus_line, user_lines) = chat_lines(app, width as usize, height);
+    // Wrapped row where each user message starts (`{`/`}`, Ctrl+↑/↓).
+    let mut row = 0;
+    let mut next_user = user_lines.iter().peekable();
+    app.user_rows.clear();
+    for (i, l) in lines.iter().enumerate() {
+        if next_user.peek() == Some(&&i) {
+            app.user_rows.push(row);
+            next_user.next();
+        }
+        row += Paragraph::new(l.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .max(1);
+    }
     // Bring a newly focused tool call into view (rows before it, wrapped).
     let focus_row = focus_line
         .filter(|_| std::mem::take(&mut app.scroll_to_focus))
@@ -5661,7 +5709,23 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     if app.chat_scroll_top.is_some() {
         block = block.title(
             Line::styled(
-                format!(" ↑ {} more below · End to follow ", max_top - scroll_top),
+                {
+                    let here = app
+                        .user_rows
+                        .iter()
+                        .filter(|&&r| r <= scroll_top + height / 3)
+                        .count();
+                    let of = app.user_rows.len();
+                    let msg = if of > 0 {
+                        format!("message {}/{of} · ", here.max(1))
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        " {msg}↑ {} more below · End to follow ",
+                        max_top - scroll_top
+                    )
+                },
                 bold_fg(app.color, Color::Yellow),
             )
             .right_aligned(),
@@ -7155,6 +7219,7 @@ mod tests {
             call_focus: None,
             expanded_calls: HashSet::new(),
             scroll_to_focus: false,
+            user_rows: Vec::new(),
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -8193,9 +8258,55 @@ mod tests {
         ];
         let screen = render(&mut app, 100, 30);
         assert!(screen.contains("──── Tue, 3 Mar 2026 ────"), "{screen}");
-        assert!(!screen.contains("2 Mar 2026"), "no separator before the first day");
+        assert!(
+            !screen.contains("2 Mar 2026"),
+            "no separator before the first day"
+        );
         app.slash("timestamps");
         assert!(!render(&mut app, 100, 30).contains("3 Mar 2026"));
+    }
+
+    #[test]
+    fn jumps_between_user_messages() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let msg = |i: usize, role: &str, content: String| MessageInfo {
+            id: format!("m{i}"),
+            session_id: "s".into(),
+            seq: i as i64,
+            role: role.into(),
+            content,
+            created_at: String::new(),
+            meta: None,
+        };
+        app.messages = (0..6)
+            .map(|i| {
+                if i % 2 == 0 {
+                    msg(i, "user", format!("question {}", i / 2 + 1))
+                } else {
+                    msg(i, "assistant", "para\n\n".repeat(30))
+                }
+            })
+            .collect();
+        render(&mut app, 80, 20);
+        assert_eq!(app.user_rows.len(), 3);
+        // From the live bottom, { goes to the last question, then earlier.
+        app.key(key(KeyCode::Char('{')));
+        assert_eq!(app.chat_scroll_top, Some(app.user_rows[2]));
+        app.key(key(KeyCode::Char('{')));
+        assert_eq!(app.chat_scroll_top, Some(app.user_rows[1]));
+        let screen = render(&mut app, 80, 20);
+        assert!(screen.contains("message 2/3"), "{screen}");
+        assert!(screen.contains("question 2"));
+        // Ctrl+↓ forward; Home to the top; past the last, follow again.
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(app.chat_scroll_top, Some(app.user_rows[2]));
+        app.key(key(KeyCode::Home));
+        assert_eq!(app.chat_scroll_top, Some(0));
+        app.key(key(KeyCode::Char('}')));
+        app.key(key(KeyCode::Char('}')));
+        app.key(key(KeyCode::Char('}')));
+        assert_eq!(app.chat_scroll_top, None);
     }
 
     #[test]

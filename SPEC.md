@@ -1533,6 +1533,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   with live elapsed + `possibly stalled` flags, §6), compaction notices,
   optimiser activity notes. Full scrollback is preserved across modal
   overlays and view switches.
+- **Moving through a long Session (TUI).** Ctrl+↑/Ctrl+↓, or `{`/`}` on
+  an empty input, jump to the previous/next user message. Past the last
+  one, the chat follows the live bottom again. Home on an empty input
+  goes to the top of the Session. While scrolled, the indicator shows
+  where you are: `message 4/17 · ↑ N more below`.
 - **Tool calls in the TUI chat.** Persisted calls start collapsed to one
   line: `▸ ⚙ name ✓`, an input summary, and the first line of the result
   (✗ on failure, … while there is none). Their separate result lines are
