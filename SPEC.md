@@ -1572,6 +1572,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   style, but only when the set of visible links changed
   (`tui.hyperlinks`). `/open link [N]` opens the Nth link in the last
   answer with the system opener (`open`, `xdg-open`, `start`).
+  File paths in the chat (`src/main.rs`, `./a/b.txt:42`, `Cargo.toml`)
+  that exist under the TUI's working directory are linked the same way,
+  to `file://`. Existence checks are cached. `/open path FILE[:LINE]`
+  opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
+  editors (which get the terminal until they exit), `FILE:LINE` for
+  Helix, and `-g` for VS Code and its forks.
 - **Tables in narrow terminals (TUI).** Markdown tables wider than the
   pane shrink: columns narrower than an equal share keep their width, and
   the rest share the room in proportion. Cell text wraps inside its

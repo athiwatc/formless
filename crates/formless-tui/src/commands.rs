@@ -94,6 +94,12 @@ pub const COMMANDS: &[Command] = &[
         Session,
     ),
     cmd(
+        "open path",
+        "FILE[:LINE]",
+        "open a file the chat mentions in $EDITOR",
+        Session,
+    ),
+    cmd(
         "copy",
         "[N | code [N]]",
         "copy the last answer, the Nth message from the bottom, or a code block",

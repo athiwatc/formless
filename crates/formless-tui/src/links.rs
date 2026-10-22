@@ -51,6 +51,49 @@ pub fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
+/// Path-looking words in a line, as (start char, end char exclusive,
+/// path, line): `src/main.rs`, `./a/b.txt:42`, `Cargo.toml`. Whether they
+/// exist is checked by the caller.
+pub fn find_paths(text: &str) -> Vec<(usize, usize, String, Option<u32>)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let boundary = |c: char| c.is_whitespace() || "()[]{}<>\"'`,;│".contains(c);
+        if boundary(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && !boundary(chars[i]) {
+            i += 1;
+        }
+        let mut word: String = chars[start..i].iter().collect();
+        let mut end = i;
+        while word.ends_with(['.', ':', '!', '?']) {
+            word.pop();
+            end -= 1;
+        }
+        if word.contains("://") || word.starts_with('@') {
+            continue;
+        }
+        // `path:line` or `path:line:col`.
+        let mut parts = word.splitn(3, ':');
+        let path = parts.next().unwrap_or_default().to_string();
+        let line = parts.next().and_then(|l| l.parse::<u32>().ok());
+        let ext = path.rsplit_once('.').is_some_and(|(stem, e)| {
+            !stem.is_empty()
+                && (1..=6).contains(&e.len())
+                && e.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+        let looks = (path.contains('/') && path.len() > 1) || ext;
+        if looks && !path.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            out.push((start, end, path, line));
+        }
+    }
+    out
+}
+
 fn byte_of(chars: &[char], idx: usize) -> usize {
     chars[..idx.min(chars.len())]
         .iter()
@@ -58,8 +101,13 @@ fn byte_of(chars: &[char], idx: usize) -> usize {
         .sum()
 }
 
-/// The links visible in `area` of a drawn buffer.
-pub fn scan(buf: &Buffer, area: Rect) -> Vec<Painted> {
+/// The links visible in `area` of a drawn buffer: URLs, and paths that
+/// `resolve` turns into a `file://` target (it says whether one exists).
+pub fn scan(
+    buf: &Buffer,
+    area: Rect,
+    resolve: &mut dyn FnMut(&str) -> Option<String>,
+) -> Vec<Painted> {
     let mut out = Vec::new();
     for y in area.top()..area.bottom() {
         // One char per cell; wide chars leave an empty continuation cell.
@@ -72,13 +120,27 @@ pub fn scan(buf: &Buffer, area: Rect) -> Vec<Painted> {
                 text.push(c);
             }
         }
-        for (a, b, url) in find_urls(&text) {
+        let urls = find_urls(&text);
+        for (a, b, url) in &urls {
             out.push(Painted {
                 y,
-                x0: xs[a],
-                x1: xs[b - 1],
-                url,
+                x0: xs[*a],
+                x1: xs[*b - 1],
+                url: url.clone(),
             });
+        }
+        for (a, b, path, _) in find_paths(&text) {
+            if urls.iter().any(|(ua, ub, _)| a < *ub && b > *ua) {
+                continue;
+            }
+            if let Some(url) = resolve(&path) {
+                out.push(Painted {
+                    y,
+                    x0: xs[a],
+                    x1: xs[b - 1],
+                    url,
+                });
+            }
         }
     }
     out
@@ -204,6 +266,28 @@ mod tests {
     }
 
     #[test]
+    fn finds_path_like_words() {
+        let got = find_paths("edit src/main.rs:42, then Cargo.toml (see ./a/b.txt). v1.2 and 3.14");
+        let paths: Vec<(&str, Option<u32>)> =
+            got.iter().map(|(_, _, p, l)| (p.as_str(), *l)).collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("src/main.rs", Some(42)),
+                ("Cargo.toml", None),
+                ("./a/b.txt", None),
+                ("v1.2", None)
+            ]
+        );
+        assert_eq!(
+            (got[0].0, got[0].1),
+            (5, 19),
+            "the :line is part of the link"
+        );
+        assert!(find_paths("https://x.dev/a.html and @user").is_empty());
+    }
+
+    #[test]
     fn scans_a_buffer_and_paints_osc8() {
         let area = Rect::new(0, 0, 40, 2);
         let mut buf = Buffer::empty(area);
@@ -213,7 +297,7 @@ mod tests {
             "go to https://x.dev now",
             ratatui::style::Style::default(),
         );
-        let links = scan(&buf, area);
+        let links = scan(&buf, area, &mut |_| None);
         assert_eq!(
             links,
             vec![Painted {
