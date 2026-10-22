@@ -792,6 +792,9 @@ pub struct TuiCfg {
     /// Image thumbnails in the chat on terminals that can show them:
     /// "auto" or "off".
     pub inline_images: String,
+    /// The multi-pane layout's side panes as a percentage of the width:
+    /// [left, right]; 0 hides one.
+    pub pane_widths: Vec<u16>,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -806,6 +809,7 @@ impl Default for TuiCfg {
             colors: HashMap::new(),
             code_line_numbers: false,
             inline_images: "auto".into(),
+            pane_widths: vec![22, 26],
         }
     }
 }
