@@ -107,6 +107,12 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("usage", "", "tokens and cost of this Session", Session),
     cmd(
+        "pager code",
+        "[N]",
+        "open a code block unwrapped with line numbers (←/→ scroll)",
+        Session,
+    ),
+    cmd(
         "table",
         "[N]",
         "open the last answer's Nth table full-width (←/→ scroll)",

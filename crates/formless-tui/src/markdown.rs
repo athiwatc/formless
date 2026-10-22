@@ -450,11 +450,11 @@ impl Renderer {
             } else {
                 vec![Span::styled(raw.clone(), fg(color, Color::Yellow))]
             };
-            for row in hard_wrap(spans, code_w) {
-                let mut line = vec![Span::styled("│ ", dim(color))];
-                line.extend(row);
-                self.emit(line);
-            }
+            // Code never wraps (it would break indentation): long lines
+            // end in `…`, and `/pager code N` shows them in full.
+            let mut line = vec![Span::styled("│ ", dim(color))];
+            line.extend(truncate_spans(spans, code_w));
+            self.emit(line);
         }
         self.emit(vec![Span::styled("╰─", dim(color))]);
     }
@@ -829,6 +829,16 @@ mod tests {
         assert!(w[1] > w[2] && w.iter().sum::<usize>() <= 35, "{w:?}");
         let tiny = fit_widths(&[30, 30], 8);
         assert!(tiny.iter().all(|&x| x >= MIN_COL), "{tiny:?}");
+    }
+
+    #[test]
+    fn long_code_lines_are_cut_not_wrapped() {
+        let md = format!("```\n    indented {}\nshort\n```", "x".repeat(80));
+        let out = lines(&md, 30);
+        let body: Vec<&String> = out.iter().filter(|l| l.contains('│')).collect();
+        assert_eq!(body.len(), 2, "one row per source line: {out:#?}");
+        assert!(body[0].ends_with('…') && body[0].contains("│     indented"));
+        assert!(out.iter().all(|l| l.chars().count() <= 30), "{out:#?}");
     }
 
     #[test]

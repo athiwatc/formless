@@ -3116,6 +3116,10 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "pager code" => self.open_code(""),
+            cmd if cmd.starts_with("pager code ") => {
+                self.open_code(cmd["pager code ".len()..].trim())
+            }
             "table" => self.open_table(""),
             cmd if cmd.starts_with("table ") => self.open_table(cmd["table ".len()..].trim()),
             "compact" => self.compact_now(None),
@@ -5763,6 +5767,38 @@ impl App {
                 .notes
                 .push(format!("the last answer has {} link(s)", urls.len())),
         }
+    }
+
+    /// `/pager code [N]`: the last answer's Nth code block (default the
+    /// last) unwrapped in the pager, with line numbers and ←/→ scrolling.
+    fn open_code(&mut self, arg: &str) {
+        let blocks = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+            .map(|m| code_blocks(&m.content))
+            .unwrap_or_default();
+        let n = arg.parse::<usize>().unwrap_or(blocks.len());
+        let Some(block) = n.checked_sub(1).and_then(|i| blocks.get(i)) else {
+            self.notes.push(format!(
+                "the last answer has {} code block(s)",
+                blocks.len()
+            ));
+            return;
+        };
+        let lines: Vec<&str> = block.lines().collect();
+        let w = lines.len().to_string().len();
+        self.pager = Some(Pager {
+            title: format!("code block {n} of {}", blocks.len()),
+            lines: lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| format!("{:>w$} │ {}", i + 1, l.replace('\t', "    ")))
+                .collect(),
+            top: 0,
+            left: 0,
+        });
     }
 
     /// `/table [N]`: the last answer's Nth table at full width in the
@@ -9422,6 +9458,27 @@ mod tests {
         assert_eq!(role_style(true, "user").fg, Some(Color::Rgb(255, 0, 0)));
         assert_eq!(fg(false, Color::Yellow).fg, None, "NO_COLOR still wins");
         theme::reset();
+    }
+
+    #[test]
+    fn code_blocks_open_unwrapped_in_the_pager() {
+        let mut app = test_app();
+        app.messages = vec![MessageInfo {
+            id: "a".into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: "```rust\nfn a() {}\n```\n\n```sh\necho one\necho two\n```".into(),
+            created_at: String::new(),
+            meta: None,
+        }];
+        app.slash("pager code");
+        let p = app.pager.as_ref().unwrap();
+        assert_eq!(p.title, "code block 2 of 2");
+        assert_eq!(p.lines, vec!["1 │ echo one", "2 │ echo two"]);
+        app.pager = None;
+        app.slash("pager code 1");
+        assert_eq!(app.pager.as_ref().unwrap().lines, vec!["1 │ fn a() {}"]);
     }
 
     #[test]
