@@ -1774,6 +1774,13 @@ run_tool = "network_policy"     # a registry Tool, or…
 ## 11. Compaction
 
 - Trigger: Run/Session approaching the model's `context_tokens` (§4.2).
+- **On demand:** `/compact [focus]` (TUI and web) sends
+  `CompactSession {session_id, focus?}`. It summarises everything so far
+  into the checkpoint through the same path as automatic compaction, and
+  passes `focus` to the summariser as what to keep. It runs in the
+  background and ends with the usual compaction notice (or a note if it
+  fails). It's refused while a Run is active and when nothing is new
+  since the last checkpoint.
 - Preference order: **server-side compaction if the endpoint explicitly
   supports it, otherwise daemon-side summarisation** (the common path) using
   the Session model or an optional separate compaction model. Server-side is
