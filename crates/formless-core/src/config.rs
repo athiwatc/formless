@@ -209,6 +209,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("provider.api_style", &["chat", "responses"]),
     ("provider.tool_mode", &["native", "prompt"]),
     ("provider.cache_key", &["session", "off"]),
+    ("tui.notify", &["off", "bell", "desktop"]),
 ];
 
 pub const SETTABLE: &[&str] = &[
@@ -767,12 +768,20 @@ pub struct TuiCfg {
     /// terminals. Toggled with `/panes` and remembered across starts.
     #[serde(default)]
     pub multi_pane: bool,
+    /// Tell the user when a Run finishes, fails or stalls, or needs an
+    /// answer, while they are elsewhere: "off", "bell" or "desktop"
+    /// (a terminal / browser notification plus the bell).
+    pub notify: String,
+    /// Runs shorter than this many seconds finish quietly.
+    pub notify_min_secs: u64,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
         Self {
             queue_key: "ctrl+enter".into(),
             multi_pane: false,
+            notify: "desktop".into(),
+            notify_min_secs: 20,
         }
     }
 }
@@ -828,6 +837,8 @@ impl Config {
             "tui": {
                 "multi_pane": self.tui.multi_pane,
                 "queue_key": self.tui.queue_key,
+                "notify": self.tui.notify,
+                "notify_min_secs": self.tui.notify_min_secs,
             },
             "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
             "naming": {

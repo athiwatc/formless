@@ -1719,10 +1719,12 @@
       grid.append(
         section("Provider", [["base_url", c.provider.base_url], ["model", c.provider.model, "provider.model", "text"],
           ["reasoning_effort", c.provider.reasoning_effort || "default", "provider.reasoning_effort", "optional"],
-          ["api_style", c.provider.api_style], ["tool_mode", c.provider.tool_mode], ["auth", c.provider.auth_mode],
+          ["api_style", c.provider.api_style, "provider.api_style", "text"], ["tool_mode", c.provider.tool_mode, "provider.tool_mode", "text"], ["auth", c.provider.auth_mode],
           ["context_tokens", c.provider.context_tokens, "provider.context_tokens", "number"],
           ["fallback_models", (c.provider.fallback_models || []).join(", "), "provider.fallback_models", "list"]]),
-        section("Interface (TUI)", [["multi_pane", on(c.tui.multi_pane), "tui.multi_pane", "bool"], ["queue_key", c.tui.queue_key]]),
+        section("Interface", [["multi_pane", on(c.tui.multi_pane), "tui.multi_pane", "bool"], ["queue_key", c.tui.queue_key],
+          ["notify (off, bell, desktop)", c.tui.notify, "tui.notify", "text"],
+          ["notify_min_secs", c.tui.notify_min_secs, "tui.notify_min_secs", "number"]]),
         section("Relay", [["enabled", on(c.relay.enabled)], ["url", c.relay.url]]),
         section("Paths", [["config", c.paths.config], ["data", c.paths.data]]));
     } else if (c && c.error) {
@@ -2189,6 +2191,7 @@
       await act({ type: "edit_message", session_id: S.current, message_id: id, content: text });
       return;
     }
+    askNotifyPermission();
     const mode = queued ? "queue" : isRunning() ? "steer" : "send";
     // `@path` mentions are attached first (the daemon resolves them in its
     // working directory); words that aren't files are left as text.
@@ -2225,7 +2228,59 @@
 
   // ============================================================== events
   let toolRefresh = null;
+  // ------------------------------------------------------ notifications
+  // While the tab is hidden, Runs that finish (after notify_min_secs),
+  // fail or stall, and approvals or questions, raise a browser
+  // notification (tui.notify = desktop) and count in the tab title.
+  const runStarts = new Map();
+  let unseen = 0;
+  const baseTitle = document.title;
+  function notifyMode() {
+    return (S.settings && S.settings.tui && S.settings.tui.notify) || "desktop";
+  }
+  function alertUser(title, body) {
+    if (!document.hidden || notifyMode() === "off") return;
+    unseen++;
+    document.title = "(" + unseen + ") " + baseTitle;
+    if (notifyMode() === "desktop" && "Notification" in window && Notification.permission === "granted") {
+      try { new Notification(title, { body, tag: "formless" }); } catch (_) { /* some browsers need a service worker */ }
+    }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) { unseen = 0; document.title = baseTitle; }
+  });
+  /** Ask once, from a user gesture (sending a message). */
+  function askNotifyPermission() {
+    if (notifyMode() === "desktop" && "Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }
+  function sessionName(id) {
+    const s = S.sessions.find((x) => x.id === id);
+    return (s && s.name) || "Session";
+  }
+  function notifyFor(ev) {
+    switch (ev.type) {
+      case "run_started": runStarts.set(ev.session_id, Date.now()); return;
+      case "run_finished": {
+        const took = (Date.now() - (runStarts.get(ev.session_id) || Date.now())) / 1000;
+        runStarts.delete(ev.session_id);
+        const min = (S.settings && S.settings.tui && S.settings.tui.notify_min_secs) || 20;
+        if (took >= min && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + Math.round(took) + "s");
+        return;
+      }
+      case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate(ev.error || "", 120));
+      case "provider_stalled": return alertUser("Run stalled", sessionName(ev.session_id) + ": no reply for " + ev.idle_secs + "s");
+      case "approval_requested": return alertUser("Approval needed", sessionName(ev.session_id) + ": " + (ev.tool_name || ""));
+      case "user_question": {
+        const q = (ev.questions && ev.questions[0] && ev.questions[0].question) || ev.question || "";
+        return alertUser("Question for you", sessionName(ev.session_id) + ": " + truncate(q, 120));
+      }
+    }
+  }
+
   function onEvent(ev) {
+    notifyFor(ev);
     const here = ev.session_id === S.current;
     switch (ev.type) {
       case "run_started":
