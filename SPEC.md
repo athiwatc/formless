@@ -1533,6 +1533,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   with live elapsed + `possibly stalled` flags, §6), compaction notices,
   optimiser activity notes. Full scrollback is preserved across modal
   overlays and view switches.
+- **Empty Session.** A new Session shows one line on what Formless is
+  (it builds the Tools a task needs and keeps them), four example tasks
+  (search a repo, summarise a page, a recurring job, "what can you do?"),
+  and hints for `/help`, `/model` and `@`. In the TUI, 1–4 on an empty
+  input put an example in the input to edit or send; on the web the
+  examples are buttons.
 - **Moving through a long Session (TUI).** Ctrl+↑/Ctrl+↓, or `{`/`}` on
   an empty input, jump to the previous/next user message. Past the last
   one, the chat follows the live bottom again. Home on an empty input
