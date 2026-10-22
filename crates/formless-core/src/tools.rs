@@ -30,6 +30,8 @@ pub const READ_SKILL_FILE: &str = "read_skill_file";
 pub const REMEMBER: &str = "remember";
 pub const FORGET: &str = "forget";
 pub const ASK_USER: &str = "ask_user";
+/// Most questions one `ask_user` call may ask.
+pub const MAX_QUESTIONS: usize = 4;
 pub const SCHEDULE_RUN: &str = "schedule_run";
 pub const READ_METRICS: &str = "read_metrics";
 pub const RUN_SCRIPT: &str = "run_script";
@@ -376,18 +378,41 @@ fn remember_definition() -> Value {
 }
 
 fn ask_user_definition() -> Value {
+    let option = json!({
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "description": "1–5 words"},
+            "description": {"type": "string", "description": "What picking it means"}
+        },
+        "required": ["label"]
+    });
     json!({
         "type": "function",
         "function": {
             "name": ASK_USER,
-            "description": "Ask the user a clarifying question and wait for the answer, without ending your Run (pending work keeps going). Use only when a wrong guess would waste real work; offer options when the choices are known. Fails at once when no user is connected: then proceed on your best assumption and say so.",
+            "description": "Ask the user and wait for the answer, without ending your Run (pending work keeps going). Use only when a wrong guess would waste real work; offer options when the choices are known (put your pick first). Ask related decisions together in `questions` (up to 4). The user may always type their own answer. Returns {\"answers\": [{question, selected, text?}]} (plus {\"answer\"} for a single top-level question). Fails at once when no user is connected: then proceed on your best assumption and say so.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string"},
-                    "options": {"type": "array", "items": {"type": "string"}, "description": "Suggested answers; the user may still type their own"}
-                },
-                "required": ["question"]
+                    "question": {"type": "string", "description": "A single question (or use `questions`)"},
+                    "options": {"type": "array", "items": option, "description": "Suggested answers for `question`"},
+                    "multi_select": {"type": "boolean", "description": "The user may pick several options"},
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_QUESTIONS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string"},
+                                "header": {"type": "string", "description": "Short label, at most 12 characters"},
+                                "options": {"type": "array", "items": option},
+                                "multi_select": {"type": "boolean"}
+                            },
+                            "required": ["question"]
+                        }
+                    }
+                }
             }
         }
     })

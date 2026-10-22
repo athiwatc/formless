@@ -365,6 +365,107 @@ pub enum SendMode {
     Queue,
 }
 
+/// One question of an `ask_user` call (SPEC §5.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Question {
+    pub question: String,
+    /// A short label (a few words) clients may show as a chip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    /// The user may pick several options.
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The answer to one `Question`: the option labels picked, and/or the
+/// user's own text (the answer is never limited to the options).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct QuestionAnswer {
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl Question {
+    /// The one question an older daemon sends as `question`/`options`.
+    pub fn single(question: String, options: Vec<String>) -> Self {
+        Question {
+            question,
+            header: None,
+            options: options
+                .into_iter()
+                .map(|label| QuestionOption {
+                    label,
+                    description: None,
+                })
+                .collect(),
+            multi_select: false,
+        }
+    }
+
+    /// Read a typed reply: option numbers ("2", or "1,3" when
+    /// `multi_select`) pick those options; anything else is free text.
+    pub fn parse_reply(&self, line: &str) -> QuestionAnswer {
+        let line = line.trim();
+        let picks: Option<Vec<usize>> = line
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                t.parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=self.options.len()).contains(n))
+            })
+            .collect();
+        match picks {
+            Some(p) if !p.is_empty() && (self.multi_select || p.len() == 1) => {
+                let mut selected = Vec::new();
+                for n in p {
+                    let label = &self.options[n - 1].label;
+                    if !selected.contains(label) {
+                        selected.push(label.clone());
+                    }
+                }
+                QuestionAnswer {
+                    selected,
+                    text: None,
+                }
+            }
+            _ => QuestionAnswer {
+                selected: Vec::new(),
+                text: (!line.is_empty()).then(|| line.to_string()),
+            },
+        }
+    }
+}
+
+impl QuestionAnswer {
+    /// The answer as one line of text: picked labels, then own text.
+    pub fn summary(&self) -> String {
+        let mut parts = self.selected.clone();
+        parts.extend(self.text.clone());
+        parts.join(", ")
+    }
+
+    /// Several answers as one line, for `AnswerQuestion.answer`.
+    pub fn summary_of(answers: &[QuestionAnswer]) -> String {
+        answers
+            .iter()
+            .map(QuestionAnswer::summary)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -562,10 +663,15 @@ pub enum Request {
     DeleteJob {
         id: String,
     },
-    /// Answer an `ask_user` question (first answer wins).
+    /// Answer an `ask_user` question (first answer wins). `answers` holds
+    /// one entry per `UserQuestion.questions`, in order; clients that only
+    /// know `answer` send free text and leave it empty.
     AnswerQuestion {
         question_id: String,
+        #[serde(default)]
         answer: String,
+        #[serde(default)]
+        answers: Vec<QuestionAnswer>,
     },
     /// User-memory notes (SPEC §7.11).
     ListMemories,
@@ -816,13 +922,17 @@ pub enum Event {
         elapsed_ms: i64,
     },
     /// The agent asks the user something mid-Run (`ask_user`); answer with
-    /// `AnswerQuestion`. Global like approvals.
+    /// `AnswerQuestion`. Global like approvals. `questions` is the full
+    /// structured form (1–4); `question`/`options` summarise it for
+    /// clients that predate it.
     UserQuestion {
         question_id: String,
         session_id: String,
         question: String,
         #[serde(default)]
         options: Vec<String>,
+        #[serde(default)]
+        questions: Vec<Question>,
     },
     /// A question was answered (or abandoned): clients close their prompt.
     UserQuestionClosed {
@@ -1038,5 +1148,41 @@ mod tests {
         assert_eq!(note.session_id(), None);
         let global = Event::ToolDeleted { id: "t".into() };
         assert_eq!(global.session_id(), None);
+    }
+
+    #[test]
+    fn question_reply_picks_numbers_or_keeps_text() {
+        let opt = |l: &str| QuestionOption {
+            label: l.into(),
+            description: None,
+        };
+        let mut q = Question {
+            question: "Which?".into(),
+            header: None,
+            options: vec![opt("csv"), opt("json"), opt("xml")],
+            multi_select: false,
+        };
+        assert_eq!(q.parse_reply(" 2 ").selected, ["json"]);
+        // Several numbers on a single-select question are free text.
+        assert_eq!(q.parse_reply("1,3").text.as_deref(), Some("1,3"));
+        assert_eq!(q.parse_reply("4").text.as_deref(), Some("4"));
+        q.multi_select = true;
+        let a = q.parse_reply("3, 1 3");
+        assert_eq!(a.selected, ["xml", "csv"]);
+        assert_eq!(a.summary(), "xml, csv");
+        assert_eq!(q.parse_reply("parquet").summary(), "parquet");
+    }
+
+    #[test]
+    fn legacy_question_messages_still_parse() {
+        let ev: Event = serde_json::from_str(
+            r#"{"type":"user_question","question_id":"q","session_id":"s","question":"Which?","options":["a"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(ev, Event::UserQuestion { questions, .. } if questions.is_empty()));
+        let req: Request =
+            serde_json::from_str(r#"{"type":"answer_question","question_id":"q","answer":"a"}"#)
+                .unwrap();
+        assert!(matches!(req, Request::AnswerQuestion { answers, .. } if answers.is_empty()));
     }
 }

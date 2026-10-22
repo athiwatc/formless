@@ -290,6 +290,7 @@
   function ask(opts) {
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
+    $("ask-body").replaceChildren(...(opts.body ? [opts.body] : []));
     const input = $("ask-input");
     input.classList.toggle("hidden", !opts.input);
     input.value = opts.value || "";
@@ -298,7 +299,8 @@
     ok.textContent = opts.ok || "OK";
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
     $("ask-backdrop").classList.remove("hidden");
-    setTimeout(() => (opts.input ? input.select() : ok.focus()), 0);
+    const first = opts.body && opts.body.querySelector("input");
+    setTimeout(() => (opts.input ? input.select() : (first || ok).focus()), 0);
     return new Promise((resolve) => (askResolve = resolve));
   }
   function closeAsk(value) {
@@ -311,6 +313,32 @@
     closeAsk($("ask-input").classList.contains("hidden") ? true : $("ask-input").value);
   });
   $("ask-cancel").onclick = () => closeAsk(null);
+
+  // ask_user (SPEC §5.5): one fieldset per question, options as radios or
+  // checkboxes, and an "Other" box for the user's own answer.
+  function questionForm(qs) {
+    return h("div", { class: "questions" }, qs.map((q, i) => {
+      const type = q.multi_select ? "checkbox" : "radio";
+      const other = h("input", { type: "text", class: "q-other", spellcheck: "false",
+        placeholder: (q.options || []).length ? "Other…" : "Your answer",
+        // Typing your own answer replaces a single choice.
+        oninput: (e) => { if (!q.multi_select && e.target.value) e.target.closest("fieldset").querySelectorAll("input[type=radio]").forEach((r) => (r.checked = false)); } });
+      return h("fieldset", { class: "question" },
+        h("legend", {}, q.header ? h("span", { class: "pill on", text: q.header }) : null, " ", q.question),
+        (q.options || []).map((o) => h("label", { class: "q-option" },
+          h("input", { type, name: "q" + i, value: o.label, onchange: () => { if (!q.multi_select) other.value = ""; } }),
+          h("span", {}, h("span", { text: o.label }), o.description ? h("span", { class: "muted", text: o.description }) : null))),
+        other);
+    }));
+  }
+  function readQuestionForm(body, qs) {
+    return qs.map((_, i) => {
+      const fs = body.querySelectorAll("fieldset.question")[i];
+      const selected = [...fs.querySelectorAll("input:checked")].map((x) => x.value);
+      const text = fs.querySelector(".q-other").value.trim();
+      return text ? { selected, text } : { selected };
+    });
+  }
 
   // ------------------------------------------------------------ activity
   function setActivity(label) {
@@ -1904,13 +1932,17 @@
       case "user_question": {
         if (here) setActivity("awaiting your answer");
         S.questionId = ev.question_id;
-        const opts = (ev.options || []).map((o, i) => (i + 1) + ") " + o).join("\n");
-        ask({ title: "The agent asks", text: ev.question + (opts ? "\n\n" + opts : ""), input: true, placeholder: opts ? "Your answer, or an option number" : "Your answer", ok: "Answer" }).then((text) => {
-          if (S.questionId !== ev.question_id || text == null || text === "") return;
+        // An older daemon sends only the single-question form.
+        const qs = ev.questions && ev.questions.length ? ev.questions
+          : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
+        const body = questionForm(qs);
+        ask({ title: "The agent asks", body, ok: "Answer" }).then((done) => {
+          if (S.questionId !== ev.question_id || !done) return;
+          const answers = readQuestionForm(body, qs);
+          if (answers.every((a) => !a.selected.length && !a.text)) return;
           S.questionId = null;
-          const n = parseInt(text, 10);
-          const answer = String(n) === text.trim() && ev.options && ev.options[n - 1] ? ev.options[n - 1] : text;
-          act({ type: "answer_question", question_id: ev.question_id, answer });
+          const answer = answers.map((a) => a.selected.concat(a.text ? [a.text] : []).join(", ")).join("; ");
+          act({ type: "answer_question", question_id: ev.question_id, answer, answers });
         });
         break;
       }

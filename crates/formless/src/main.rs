@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use formless_core::daemon::{daemon_reachable, Daemon};
 use formless_core::provider::probe_blocking;
 use formless_core::{Config, Paths};
-use formless_protocol::{ApprovalScope, Event, Request, SendMode, ServerMessage, SessionInfo};
+use formless_protocol::{
+    ApprovalScope, Event, Question, QuestionAnswer, Request, SendMode, ServerMessage, SessionInfo,
+};
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
@@ -1030,26 +1032,26 @@ fn run_headless(
                         question_id,
                         question,
                         options,
+                        questions,
                         ..
                     } => {
                         use std::io::IsTerminal;
-                        let reply = match &answer {
-                            Some(a) => a.clone(),
+                        let (reply, answers) = match &answer {
+                            // --answer is one free-text reply to the whole call.
+                            Some(a) => (a.clone(), Vec::new()),
                             None if std::io::stdin().is_terminal() && !json_out => {
-                                eprintln!("[question] {question}");
-                                for (i, o) in options.iter().enumerate() {
-                                    eprintln!("  {}) {o}", i + 1);
-                                }
-                                eprint!("> ");
-                                let mut line = String::new();
-                                let _ = std::io::stdin().read_line(&mut line);
-                                let line = line.trim().to_string();
-                                line.parse::<usize>()
-                                    .ok()
-                                    .and_then(|n| options.get(n.wrapping_sub(1)).cloned())
-                                    .unwrap_or(line)
+                                // An older daemon sends only the single-question
+                                // form (and ignores `answers`).
+                                let questions = if questions.is_empty() {
+                                    vec![Question::single(question, options)]
+                                } else {
+                                    questions
+                                };
+                                let answers: Vec<QuestionAnswer> =
+                                    questions.iter().map(ask_on_terminal).collect();
+                                (QuestionAnswer::summary_of(&answers), answers)
                             }
-                            None => "[no answer: this is a non-interactive run; proceed on your best assumption and state it]".to_string(),
+                            None => ("[no answer: this is a non-interactive run; proceed on your best assumption and state it]".to_string(), Vec::new()),
                         };
                         if !json_out {
                             eprintln!("[answer] {reply}");
@@ -1057,6 +1059,7 @@ fn run_headless(
                         client.send(Request::AnswerQuestion {
                             question_id,
                             answer: reply,
+                            answers,
                         });
                     }
                     Event::ApprovalRequested {
@@ -1725,6 +1728,28 @@ fn reset_cmd(paths: Paths, force: bool) -> Result<()> {
     formless_core::config::reset_all(&paths)?;
     println!("reset complete");
     Ok(())
+}
+
+/// Ask one `ask_user` question on the terminal (SPEC §5.5): option
+/// numbers pick options, anything else is the user's own answer.
+fn ask_on_terminal(q: &Question) -> QuestionAnswer {
+    match &q.header {
+        Some(h) => eprintln!("[question] [{h}] {}", q.question),
+        None => eprintln!("[question] {}", q.question),
+    }
+    for (i, o) in q.options.iter().enumerate() {
+        match &o.description {
+            Some(d) => eprintln!("  {}) {} — {d}", i + 1, o.label),
+            None => eprintln!("  {}) {}", i + 1, o.label),
+        }
+    }
+    if q.multi_select && !q.options.is_empty() {
+        eprintln!("  (several allowed, e.g. 1,3)");
+    }
+    eprint!("> ");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    q.parse_reply(&line)
 }
 
 #[cfg(test)]

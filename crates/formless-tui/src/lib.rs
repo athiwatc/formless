@@ -153,6 +153,45 @@ struct RollbackPick {
     armed: bool,
 }
 
+/// An open `ask_user` call (SPEC §5.5); `answers` fills as the user
+/// answers its questions in order.
+struct OpenQuestion {
+    id: String,
+    session_id: String,
+    questions: Vec<Question>,
+    answers: Vec<QuestionAnswer>,
+}
+
+impl OpenQuestion {
+    /// The chat note for the next unanswered question.
+    fn prompt(&self) -> String {
+        let n = self.answers.len();
+        let q = &self.questions[n];
+        let mut text = String::from("question");
+        if self.questions.len() > 1 {
+            text.push_str(&format!(" {}/{}", n + 1, self.questions.len()));
+        }
+        if let Some(h) = &q.header {
+            text.push_str(&format!(" [{h}]"));
+        }
+        text.push_str(&format!(": {}", q.question));
+        for (i, o) in q.options.iter().enumerate() {
+            text.push_str(&format!("\n  {}) {}", i + 1, o.label));
+            if let Some(d) = &o.description {
+                text.push_str(&format!(" — {d}"));
+            }
+        }
+        text.push_str(match (q.options.is_empty(), q.multi_select) {
+            (true, _) => "\n  type your answer and press Enter",
+            (false, false) => "\n  type an option number or your own answer and press Enter",
+            (false, true) => {
+                "\n  type option numbers (e.g. 1,3) or your own answer and press Enter"
+            }
+        });
+        text
+    }
+}
+
 #[derive(Clone)]
 struct ApprovalReq {
     approval_id: String,
@@ -494,9 +533,9 @@ struct App {
     /// Open rollback version picker (Tools view, `b`).
     rollback_pick: Option<RollbackPick>,
     approvals: std::collections::VecDeque<ApprovalReq>,
-    /// Open `ask_user` questions: (id, session, options). The next typed
-    /// line answers the current Session's oldest one.
-    questions: Vec<(String, String, Vec<String>)>,
+    /// Open `ask_user` calls. The next typed line answers the current
+    /// Session's oldest one, one question at a time.
+    questions: Vec<OpenQuestion>,
     /// Latest Run usage per Session, for the status line (SPEC §10.6).
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
     /// The current Session's unfinished last Run: (status, reason).
@@ -1441,17 +1480,23 @@ impl App {
                 session_id,
                 question,
                 options,
+                mut questions,
             } => {
-                let mut text = format!("question: {question}");
-                for (i, o) in options.iter().enumerate() {
-                    text.push_str(&format!("\n  {}) {o}", i + 1));
+                // An older daemon sends only the single-question form.
+                if questions.is_empty() {
+                    questions.push(Question::single(question, options));
                 }
-                text.push_str("\n  type your answer (or an option number) and press Enter");
-                self.notes.push(text);
-                if self.is_current(&session_id) {
+                let open = OpenQuestion {
+                    id: question_id,
+                    session_id,
+                    questions,
+                    answers: Vec::new(),
+                };
+                self.notes.push(open.prompt());
+                if self.is_current(&open.session_id) {
                     self.set_activity("awaiting your answer");
                 }
-                self.questions.push((question_id, session_id, options));
+                self.questions.push(open);
             }
             Event::RunUsage {
                 session_id, usage, ..
@@ -1459,7 +1504,7 @@ impl App {
                 self.run_usage.insert(session_id, usage);
             }
             Event::UserQuestionClosed { question_id } => {
-                self.questions.retain(|(id, _, _)| *id != question_id);
+                self.questions.retain(|q| q.id != question_id);
             }
             Event::ApprovalRequested {
                 session_id,
@@ -1746,18 +1791,25 @@ impl App {
             return;
         };
         // An open ask_user question takes the next line as its answer.
-        if let Some(i) = self.questions.iter().position(|(_, s, _)| *s == session_id) {
-            let (question_id, _, options) = self.questions.remove(i);
-            let answer = text
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| options.get(n.wrapping_sub(1)).cloned())
-                .unwrap_or(text);
-            self.notes.push(format!("answered: {answer}"));
+        if let Some(i) = self
+            .questions
+            .iter()
+            .position(|q| q.session_id == session_id)
+        {
+            let open = &mut self.questions[i];
+            let answer = open.questions[open.answers.len()].parse_reply(&text);
+            self.notes.push(format!("answered: {}", answer.summary()));
+            open.answers.push(answer);
+            if open.answers.len() < open.questions.len() {
+                let next = open.prompt();
+                self.notes.push(next);
+                return;
+            }
+            let open = self.questions.remove(i);
             self.fire(Request::AnswerQuestion {
-                question_id,
-                answer,
+                question_id: open.id,
+                answer: QuestionAnswer::summary_of(&open.answers),
+                answers: open.answers,
             });
             return;
         }

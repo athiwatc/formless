@@ -2,7 +2,9 @@
 #![cfg(unix)]
 
 use formless_core::Paths;
-use formless_protocol::{Event, Request, RequestEnvelope, ServerMessage, PROTOCOL_VERSION};
+use formless_protocol::{
+    Event, QuestionAnswer, Request, RequestEnvelope, ServerMessage, PROTOCOL_VERSION,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -79,11 +81,14 @@ async fn ask_user_fails_fast_headless_and_waits_for_a_client_answer() {
             question_id,
             question,
             options,
+            questions,
             ..
         })) = serde_json::from_str::<ServerMessage>(&line)
         {
             assert_eq!(question, "Which format?");
             assert_eq!(options, ["csv", "json"]);
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].options[1].label, "json");
             break question_id;
         }
     };
@@ -93,6 +98,7 @@ async fn ask_user_fails_fast_headless_and_waits_for_a_client_answer() {
         request: Request::AnswerQuestion {
             question_id,
             answer: "json".into(),
+            answers: vec![],
         },
     };
     w.write_all(format!("{}\n", serde_json::to_string(&env).unwrap()).as_bytes())
@@ -103,4 +109,89 @@ async fn ask_user_fails_fast_headless_and_waits_for_a_client_answer() {
         .expect("answer never arrived")
         .unwrap();
     assert_eq!(out, r#"{"answer":"json"}"#);
+
+    // Several structured questions, answered with structured answers.
+    let asking = tokio::spawn({
+        let (d, sid) = (daemon.clone(), sid.clone());
+        async move {
+            d.call_tool_direct(
+                &sid,
+                "ask_user",
+                serde_json::json!({"questions": [
+                    {"question": "Which formats?", "header": "Format", "multi_select": true,
+                     "options": [{"label": "csv", "description": "Spreadsheets"}, {"label": "json"}]},
+                    {"question": "Where to?"}
+                ]}),
+            )
+            .await
+        }
+    });
+    let question_id = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("no question")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::UserQuestion {
+            question_id,
+            question,
+            options,
+            questions,
+            ..
+        })) = serde_json::from_str::<ServerMessage>(&line)
+        {
+            // Older clients see a numbered summary and no options.
+            assert_eq!(question, "1. Which formats?\n2. Where to?");
+            assert!(options.is_empty());
+            assert_eq!(questions[0].header.as_deref(), Some("Format"));
+            assert!(questions[0].multi_select);
+            assert_eq!(
+                questions[0].options[0].description.as_deref(),
+                Some("Spreadsheets")
+            );
+            break question_id;
+        }
+    };
+    let env = RequestEnvelope {
+        id: 2,
+        protocol: PROTOCOL_VERSION,
+        request: Request::AnswerQuestion {
+            question_id,
+            answer: "csv, json; ./out".into(),
+            answers: vec![
+                QuestionAnswer {
+                    selected: vec!["csv".into(), "json".into()],
+                    text: None,
+                },
+                QuestionAnswer {
+                    selected: vec![],
+                    text: Some("./out".into()),
+                },
+            ],
+        },
+    };
+    w.write_all(format!("{}\n", serde_json::to_string(&env).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), asking)
+        .await
+        .expect("answer never arrived")
+        .unwrap();
+    let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        out,
+        serde_json::json!({"answers": [
+            {"question": "Which formats?", "selected": ["csv", "json"]},
+            {"question": "Where to?", "selected": [], "text": "./out"}
+        ]})
+    );
+
+    // Too many questions is an error the agent can act on.
+    let five: Vec<_> = (0..5)
+        .map(|i| serde_json::json!({"question": format!("q{i}")}))
+        .collect();
+    let err = daemon
+        .call_tool_direct(&sid, "ask_user", serde_json::json!({"questions": five}))
+        .await;
+    assert!(err.contains("1 to 4 questions"), "{err}");
 }
