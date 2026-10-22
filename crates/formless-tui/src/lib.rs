@@ -2,6 +2,7 @@ pub mod client;
 mod commands;
 mod highlight;
 mod input;
+mod lists;
 mod markdown;
 mod mermaid;
 mod notify;
@@ -674,6 +675,7 @@ struct App {
     inbox: Option<mpsc::Receiver<ServerMessage>>,
     sessions: Vec<SessionInfo>,
     session_idx: usize,
+    session_filter: lists::ListFilter,
     current: Option<String>,
     messages: Vec<MessageInfo>,
     streaming: String,
@@ -707,6 +709,7 @@ struct App {
     pending: HashMap<u64, Pending>,
     tools: Vec<ToolInfo>,
     tool_idx: usize,
+    tool_filter: lists::ListFilter,
     tool_detail: Option<ToolDetail>,
     /// Open rollback version picker (Tools view, `b`).
     rollback_pick: Option<RollbackPick>,
@@ -769,6 +772,7 @@ struct App {
     builtin_stats: Vec<formless_protocol::BuiltinStatInfo>,
     proposals: Vec<PromptProposalInfo>,
     proposal_idx: usize,
+    proposal_filter: lists::ListFilter,
     editor: Option<EditorState>,
     search_hits: Vec<SearchHit>,
     search_idx: usize,
@@ -846,6 +850,7 @@ impl App {
             inbox: None,
             sessions: Vec::new(),
             session_idx: 0,
+            session_filter: lists::ListFilter::default(),
             current: None,
             messages: Vec::new(),
             streaming: String::new(),
@@ -870,6 +875,7 @@ impl App {
             pending: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
+            tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             rollback_pick: None,
             model_overlay: None,
@@ -907,6 +913,7 @@ impl App {
             builtin_stats: Vec::new(),
             proposals: Vec::new(),
             proposal_idx: 0,
+            proposal_filter: lists::ListFilter::default(),
             editor: None,
             search_hits: Vec::new(),
             search_idx: 0,
@@ -1067,7 +1074,7 @@ impl App {
                             self.notes.push(format!("saved {name} v{version}"));
                             self.editor = None;
                             self.request(Pending::ListTools, Request::ListTools);
-                            if let Some(t) = self.tools.get(self.tool_idx).cloned() {
+                            if let Some(t) = self.selected_tool().cloned() {
                                 self.request(Pending::GetTool, Request::GetTool { id: t.id });
                             }
                         }
@@ -3466,6 +3473,9 @@ impl App {
             self.cycle_view(key.code == KeyCode::Tab);
             return;
         }
+        if self.list_filter_key(key.code) {
+            return;
+        }
         match self.view {
             View::Settings => self.settings_key(key),
             View::Search => match key.code {
@@ -3490,12 +3500,12 @@ impl App {
             View::Proposals => match key.code {
                 KeyCode::Up => self.proposal_idx = self.proposal_idx.saturating_sub(1),
                 KeyCode::Down => {
-                    self.proposal_idx =
-                        (self.proposal_idx + 1).min(self.proposals.len().saturating_sub(1))
+                    self.proposal_idx = (self.proposal_idx + 1)
+                        .min(self.visible_proposals().len().saturating_sub(1))
                 }
                 KeyCode::Char('g') => self.generate_proposal(),
                 KeyCode::Char('a') | KeyCode::Enter => {
-                    if let Some(p) = self.proposals.get(self.proposal_idx).cloned() {
+                    if let Some(p) = self.selected_proposal().cloned() {
                         self.fire(Request::ProposalDecision {
                             id: p.id,
                             approved: true,
@@ -3503,7 +3513,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('r') => {
-                    if let Some(p) = self.proposals.get(self.proposal_idx).cloned() {
+                    if let Some(p) = self.selected_proposal().cloned() {
                         self.fire(Request::ProposalDecision {
                             id: p.id,
                             approved: false,
@@ -3511,7 +3521,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('b') => {
-                    if let Some(p) = self.proposals.get(self.proposal_idx).cloned() {
+                    if let Some(p) = self.selected_proposal().cloned() {
                         self.fire(Request::RollbackProposal { id: p.id });
                     }
                 }
@@ -3527,10 +3537,10 @@ impl App {
                 KeyCode::Up => self.session_idx = self.session_idx.saturating_sub(1),
                 KeyCode::Down => {
                     self.session_idx =
-                        (self.session_idx + 1).min(self.sessions.len().saturating_sub(1))
+                        (self.session_idx + 1).min(self.visible_sessions().len().saturating_sub(1))
                 }
                 KeyCode::Enter => {
-                    if let Some(s) = self.sessions.get(self.session_idx).cloned() {
+                    if let Some(s) = self.selected_session().cloned() {
                         self.switch_session(s.id.clone());
                         self.request(Pending::GetSession, Request::GetSession { id: s.id });
                         self.view = View::Chat;
@@ -3541,7 +3551,7 @@ impl App {
                     Request::CreateSession { name: None },
                 ),
                 KeyCode::Char('f') => {
-                    if let Some(s) = self.sessions.get(self.session_idx).cloned() {
+                    if let Some(s) = self.selected_session().cloned() {
                         self.request(
                             Pending::ForkSession,
                             Request::ForkSession {
@@ -3553,7 +3563,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('d') => {
-                    if let Some(s) = self.sessions.get(self.session_idx).cloned() {
+                    if let Some(s) = self.selected_session().cloned() {
                         if self.delete_arm.as_deref() == Some(&s.id) {
                             self.delete_arm = None;
                             self.notes.push(format!(
@@ -3573,7 +3583,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('e') => {
-                    if let Some(s) = self.sessions.get(self.session_idx).cloned() {
+                    if let Some(s) = self.selected_session().cloned() {
                         self.request(Pending::ExportSession, Request::ExportSession { id: s.id });
                     }
                 }
@@ -3595,20 +3605,21 @@ impl App {
             View::Tools => match key.code {
                 KeyCode::Up => self.tool_idx = self.tool_idx.saturating_sub(1),
                 KeyCode::Down => {
-                    self.tool_idx = (self.tool_idx + 1).min(self.tools.len().saturating_sub(1))
+                    self.tool_idx =
+                        (self.tool_idx + 1).min(self.visible_tools().len().saturating_sub(1))
                 }
                 KeyCode::Enter => {
-                    if let Some(tool) = self.tools.get(self.tool_idx).cloned() {
+                    if let Some(tool) = self.selected_tool().cloned() {
                         self.request(Pending::GetTool, Request::GetTool { id: tool.id });
                     }
                 }
                 KeyCode::Char('e') => {
-                    if let Some(tool) = self.tools.get(self.tool_idx).cloned() {
+                    if let Some(tool) = self.selected_tool().cloned() {
                         self.request(Pending::ExportTool, Request::ExportTool { id: tool.id });
                     }
                 }
                 KeyCode::Char('E') => {
-                    if let Some(tool) = self.tools.get(self.tool_idx).cloned() {
+                    if let Some(tool) = self.selected_tool().cloned() {
                         match &self.tool_detail {
                             Some(d) if d.tool.id == tool.id => {
                                 let code = d
@@ -3642,12 +3653,12 @@ impl App {
                         .push("Type a tool bundle file path, then Enter.".into());
                 }
                 KeyCode::Char('o') => {
-                    let tool_id = self.tools.get(self.tool_idx).map(|t| t.id.clone());
+                    let tool_id = self.selected_tool().map(|t| t.id.clone());
                     self.fire(Request::RunOptimiser { tool_id });
                     self.notes.push("optimiser started".into());
                 }
                 KeyCode::Char('x') => {
-                    if let Some(tool) = self.tools.get(self.tool_idx).cloned() {
+                    if let Some(tool) = self.selected_tool().cloned() {
                         if tool.retired {
                             self.fire(Request::RestoreTool { id: tool.id });
                         } else {
@@ -3656,7 +3667,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('b') => {
-                    if let Some(tool) = self.tools.get(self.tool_idx).cloned() {
+                    if let Some(tool) = self.selected_tool().cloned() {
                         match &self.tool_detail {
                             Some(d) if d.tool.id == tool.id && d.versions.len() > 1 => {
                                 // Start on the version before the current one.
@@ -3684,7 +3695,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('p') => {
-                    if let Some(tool) = self.tools.get(self.tool_idx).cloned() {
+                    if let Some(tool) = self.selected_tool().cloned() {
                         if self.purge_arm.as_deref() == Some(&tool.id) {
                             self.purge_arm = None;
                             self.fire(Request::PurgeTool { id: tool.id });
@@ -3700,6 +3711,67 @@ impl App {
             },
             _ => self.input_key(key),
         }
+    }
+
+    fn visible_tools(&self) -> Vec<usize> {
+        lists::tools(&self.tools, &self.tool_filter)
+    }
+
+    fn visible_sessions(&self) -> Vec<usize> {
+        lists::sessions(&self.sessions, &self.running_sessions, &self.session_filter)
+    }
+
+    fn visible_proposals(&self) -> Vec<usize> {
+        lists::proposals(&self.proposals, &self.proposal_filter)
+    }
+
+    fn selected_tool(&self) -> Option<&ToolInfo> {
+        let v = self.visible_tools();
+        v.get(self.tool_idx.min(v.len().saturating_sub(1)))
+            .map(|&i| &self.tools[i])
+    }
+
+    fn selected_session(&self) -> Option<&SessionInfo> {
+        let v = self.visible_sessions();
+        v.get(self.session_idx.min(v.len().saturating_sub(1)))
+            .map(|&i| &self.sessions[i])
+    }
+
+    fn selected_proposal(&self) -> Option<&PromptProposalInfo> {
+        let v = self.visible_proposals();
+        v.get(self.proposal_idx.min(v.len().saturating_sub(1)))
+            .map(|&i| &self.proposals[i])
+    }
+
+    /// `/`, `s` and `v` in a list view (SPEC §10.4); true when used.
+    fn list_filter_key(&mut self, code: KeyCode) -> bool {
+        use lists::*;
+        let (filter, idx, sorts, quicks) = match self.view {
+            View::Tools => (
+                &mut self.tool_filter,
+                &mut self.tool_idx,
+                TOOL_SORTS,
+                TOOL_QUICK,
+            ),
+            View::Sessions => (
+                &mut self.session_filter,
+                &mut self.session_idx,
+                SESSION_SORTS,
+                SESSION_QUICK,
+            ),
+            View::Proposals => (
+                &mut self.proposal_filter,
+                &mut self.proposal_idx,
+                PROPOSAL_SORTS,
+                PROPOSAL_QUICK,
+            ),
+            _ => return false,
+        };
+        let used = lists::key(filter, code, sorts.len(), quicks.len());
+        if used {
+            *idx = 0;
+        }
+        used
     }
 
     fn settings_rows(&self) -> Vec<settings::Row> {
@@ -5152,14 +5224,21 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let now = chrono::Utc::now();
     let name_w = (area.width as usize).saturating_sub(20).max(10);
+    let visible = app.visible_sessions();
     let items: Vec<ListItem> = if app.sessions.is_empty() {
         vec![ListItem::new(Line::styled(
             "No sessions yet — press n to start one.",
             ui::dim(app.color),
         ))]
+    } else if visible.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "No match — Esc clears the filter.",
+            ui::dim(app.color),
+        ))]
     } else {
-        app.sessions
+        visible
             .iter()
+            .map(|&i| &app.sessions[i])
             .map(|s| {
                 let current = Some(&s.id) == app.current.as_ref();
                 ListItem::new(Line::from(vec![
@@ -5174,19 +5253,25 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
             .collect()
     };
     let mut state = ListState::default();
-    if !app.sessions.is_empty() {
-        state.select(Some(app.session_idx.min(app.sessions.len() - 1)));
+    if !visible.is_empty() {
+        state.select(Some(app.session_idx.min(visible.len() - 1)));
     }
     f.render_stateful_widget(
         List::new(items)
             .block(
                 ui::panel(
-                    format!(" Sessions ({}) ", app.sessions.len()),
+                    app.session_filter.title(
+                        "Sessions",
+                        visible.len(),
+                        app.sessions.len(),
+                        lists::SESSION_SORTS,
+                        lists::SESSION_QUICK,
+                    ),
                     app.color,
                     Color::Cyan,
                 )
                 .title_bottom(ui::hint(
-                    "Enter open · n new · f fork · r rename · d delete · e export · i import",
+                    "Enter open · n new · f fork · r rename · d delete · e export · i import · / filter · s sort · v running",
                     app.color,
                 )),
             )
@@ -5650,13 +5735,19 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 }
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
-    let title = if app.proposal_generating {
-        format!(" Prompt proposals · {} generating… ", app.spinner())
-    } else {
-        " Prompt proposals ".to_string()
-    };
+    let visible = app.visible_proposals();
+    let mut title = app.proposal_filter.title(
+        "Prompt proposals",
+        visible.len(),
+        app.proposals.len(),
+        lists::PROPOSAL_SORTS,
+        lists::PROPOSAL_QUICK,
+    );
+    if app.proposal_generating {
+        title.push_str(&format!("· {} generating… ", app.spinner()));
+    }
     let block = ui::panel(title, app.color, Color::Blue).title_bottom(ui::hint(
-        "g generate a new one (model call + evals, costs tokens) · a apply measured · r reject · b roll back",
+        "g generate (costs tokens) · a apply measured · r reject · b roll back · / filter · s sort · v status",
         app.color,
     ));
     if app.proposals.is_empty() {
@@ -5670,9 +5761,9 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let rows: Vec<Row> = app
-        .proposals
+    let rows: Vec<Row> = visible
         .iter()
+        .map(|&i| &app.proposals[i])
         .map(|p| {
             let scores = match (p.baseline_score, p.candidate_score) {
                 (Some(b), Some(c)) => Line::from(vec![
@@ -5706,7 +5797,7 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let mut state = TableState::default();
-    state.select(Some(app.proposal_idx.min(app.proposals.len() - 1)));
+    state.select(Some(app.proposal_idx.min(visible.len().saturating_sub(1))));
     f.render_stateful_widget(
         Table::new(
             rows,
@@ -5900,24 +5991,38 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
-    let list_h = (app.tools.len() as u16 + 3).min(area.height / 2).max(4);
+    let visible = app.visible_tools();
+    let list_h = (visible.len().max(1) as u16 + 3)
+        .min(area.height / 2)
+        .max(4);
     let parts = Layout::vertical([Constraint::Length(list_h), Constraint::Min(3)]).split(area);
-    let block = ui::panel(format!(" Tools ({}) ", app.tools.len()), app.color, Color::Yellow)
-        .title_bottom(ui::hint(
-            "Enter detail · E edit · o optimise · x retire · b rollback · e export · i import · p purge",
-            app.color,
-        ));
-    if app.tools.is_empty() {
+    let title = app.tool_filter.title(
+        "Tools",
+        visible.len(),
+        app.tools.len(),
+        lists::TOOL_SORTS,
+        lists::TOOL_QUICK,
+    );
+    let block = ui::panel(title, app.color, Color::Yellow).title_bottom(ui::hint(
+        "Enter detail · E edit · o optimise · x retire · b rollback · e export · i import · p purge · / filter · s sort · v show",
+        app.color,
+    ));
+    if app.tools.is_empty() || visible.is_empty() {
+        let empty = if app.tools.is_empty() {
+            NO_TOOLS
+        } else {
+            "No match — Esc clears the filter."
+        };
         f.render_widget(
-            Paragraph::new(Line::styled(NO_TOOLS, ui::dim(app.color))).block(block),
+            Paragraph::new(Line::styled(empty, ui::dim(app.color))).block(block),
             parts[0],
         );
     } else {
         let mut state = TableState::default();
-        state.select(Some(app.tool_idx.min(app.tools.len() - 1)));
+        state.select(Some(app.tool_idx.min(visible.len() - 1)));
         f.render_stateful_widget(
             Table::new(
-                app.tools.iter().map(|t| {
+                visible.iter().map(|&i| &app.tools[i]).map(|t| {
                     let mut cells = tool_cells(t, app.color);
                     cells.push(Cell::from(tool_status(t, app.color)));
                     cells.push(Cell::from(Span::styled(
@@ -6541,6 +6646,7 @@ mod tests {
             inbox: None,
             sessions: Vec::new(),
             session_idx: 0,
+            session_filter: lists::ListFilter::default(),
             current: Some("s1".into()),
             messages: Vec::new(),
             streaming: String::new(),
@@ -6565,6 +6671,7 @@ mod tests {
             pending: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
+            tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             rollback_pick: None,
             model_overlay: None,
@@ -6602,6 +6709,7 @@ mod tests {
             builtin_stats: Vec::new(),
             proposals: Vec::new(),
             proposal_idx: 0,
+            proposal_filter: lists::ListFilter::default(),
             editor: None,
             search_hits: Vec::new(),
             search_idx: 0,
@@ -7419,6 +7527,52 @@ mod tests {
             error: "429 rate limited".into(),
         });
         assert!(app.notifications.last().unwrap().1.contains("429"));
+    }
+
+    #[test]
+    fn list_views_filter_sort_and_keep_selection_on_visible_rows() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.tools = ["read_file", "http_get", "csv_sum"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ToolInfo {
+                id: n.to_string(),
+                name: n.to_string(),
+                description: String::new(),
+                retired: false,
+                current_version: 1,
+                capabilities: vec![],
+                memory_mb: 64,
+                invocations: i as i64,
+                success_rate: Some(0.9),
+                needs_attention: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
+        app.view = View::Tools;
+        for c in "/http".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.selected_tool().unwrap().name, "http_get");
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Tools · 1/3 · /http"), "{screen}");
+        // Esc clears the filter, then a second Esc leaves the view.
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.visible_tools().len(), 3);
+        assert_eq!(app.view, View::Tools);
+        // Sort by calls: csv_sum (2 calls) first.
+        for _ in 0..3 {
+            app.key(key(KeyCode::Char('s')));
+        }
+        assert_eq!(app.selected_tool().unwrap().name, "csv_sum");
+        app.key(key(KeyCode::Down));
+        assert_eq!(app.selected_tool().unwrap().name, "http_get");
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.view, View::Chat);
     }
 
     #[test]

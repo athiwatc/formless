@@ -1496,6 +1496,8 @@
     renderStatus();
   }
   $("status-model").onclick = () => openModelPicker();
+  for (const id of ["tools-filter", "tools-sort", "tools-quick"]) $(id).addEventListener("input", () => renderTools());
+  for (const id of ["proposals-filter", "proposals-quick"]) $(id).addEventListener("input", () => renderProposals());
   $("modal-approve").onclick = () => decide(true);
   $("modal-once").onclick = () => decide(true, "once");
   $("modal-deny").onclick = () => decide(false);
@@ -1525,9 +1527,30 @@
     table.append(body);
   }
 
+  /** The Tools view's rows after its filter, quick filter and sort (the
+   * same rules as the TUI's `/`, `v` and `s`). */
+  function visibleTools() {
+    const q = $("tools-filter").value.trim();
+    const quick = $("tools-quick").value;
+    const rows = S.tools.filter((t) => {
+      if (quick === "active" && t.retired) return false;
+      if (quick === "retired" && !t.retired) return false;
+      if (quick === "failing" && !(t.success_rate != null && t.success_rate < 0.8)) return false;
+      if (quick === "attention" && !t.needs_attention) return false;
+      return !q || fuzzyMatch(q, t.name) || fuzzyMatch(q, t.description || "");
+    });
+    const by = {
+      name: (a, b) => a.name.localeCompare(b.name),
+      rate: (a, b) => (b.success_rate ?? -1) - (a.success_rate ?? -1),
+      used: (a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""),
+      calls: (a, b) => b.invocations - a.invocations,
+    }[$("tools-sort").value];
+    return by ? rows.sort(by) : rows;
+  }
   function renderTools() {
-    $("tools-count").textContent = "(" + S.tools.length + ")";
-    toolsTable($("tools-table"), S.tools, { selected: S.selectedTool, onselect: selectTool });
+    const rows = visibleTools();
+    $("tools-count").textContent = "(" + (rows.length === S.tools.length ? S.tools.length : rows.length + "/" + S.tools.length) + ")";
+    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool });
     const box = $("tool-detail");
     box.replaceChildren();
     const d = S.toolDetail;
@@ -1672,10 +1695,20 @@
     const box = $("proposals");
     box.replaceChildren();
     if (!S.proposals.length) {
+      $("proposals-count").textContent = "";
       box.append(h("div", { class: "detail placeholder" }, "No proposals yet. Generate one to have the optimiser draft and measure a prompt or memory addendum."));
       return;
     }
-    for (const p of S.proposals) {
+    const q = $("proposals-filter").value.trim();
+    const quick = $("proposals-quick").value;
+    const shown = S.proposals.filter((p) => {
+      if (quick === "pending" && ["applied", "rejected", "rolled_back"].includes(p.status)) return false;
+      if ((quick === "applied" || quick === "rejected") && p.status !== quick) return false;
+      return !q || [p.content, p.rationale, p.kind].some((f) => fuzzyMatch(q, f || ""));
+    });
+    $("proposals-count").textContent = shown.length === S.proposals.length ? "" : "(" + shown.length + "/" + S.proposals.length + ")";
+    if (!shown.length) box.append(h("div", { class: "detail placeholder" }, "No proposal matches the filter."));
+    for (const p of shown) {
       const cls = p.status === "applied" ? "good" : p.status === "measured" ? "mid" : p.status === "proposed" ? "" : "bad";
       const scored = p.baseline_score != null && p.candidate_score != null;
       const actions = [];
@@ -2733,7 +2766,7 @@
   const selectedTool = () => S.tools.find((t) => t.id === S.selectedTool);
   function moveSelection(delta) {
     if (S.view === "tools") {
-      const list = S.tools;
+      const list = visibleTools();
       if (!list.length) return;
       const i = list.findIndex((t) => t.id === S.selectedTool);
       selectTool(list[Math.max(0, Math.min(list.length - 1, (i < 0 ? 0 : i + delta)))].id);

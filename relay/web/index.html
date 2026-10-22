@@ -89,6 +89,11 @@
       <section id="view-tools" class="view hidden" aria-label="Tools">
         <div class="view-head">
           <h2>Tools <span id="tools-count" class="muted"></span></h2>
+          <div class="list-filter">
+            <input id="tools-filter" type="search" placeholder="Filter Tools…" aria-label="Filter Tools" autocomplete="off">
+            <select id="tools-sort" aria-label="Sort Tools"><option value="name">Name</option><option value="rate">Success rate</option><option value="used">Last used</option><option value="calls">Calls</option></select>
+            <select id="tools-quick" aria-label="Show Tools"><option value="all">All</option><option value="active">Active</option><option value="retired">Retired</option><option value="failing">Failing (&lt;80%)</option><option value="attention">Needs attention</option></select>
+          </div>
           <div class="actions">
             <button class="btn ghost small" id="import-tool" type="button">Import</button>
             <button class="btn ghost small" id="export-tools" type="button">Export all</button>
@@ -114,7 +119,11 @@
       <!-- Proposals -->
       <section id="view-proposals" class="view hidden" aria-label="Prompt proposals">
         <div class="view-head">
-          <h2>Prompt proposals</h2>
+          <h2>Prompt proposals <span id="proposals-count" class="muted"></span></h2>
+          <div class="list-filter">
+            <input id="proposals-filter" type="search" placeholder="Filter proposals…" aria-label="Filter proposals" autocomplete="off">
+            <select id="proposals-quick" aria-label="Show proposals"><option value="all">All</option><option value="pending">Pending</option><option value="applied">Applied</option><option value="rejected">Rejected</option></select>
+          </div>
           <div class="actions"><button class="btn primary small" id="generate-proposal" type="button">Generate measured proposal</button></div>
         </div>
         <p class="muted">A proposal can be applied only after it beats the current prompt on the eval suite by the promotion margin. Applied proposals roll back individually.</p>
