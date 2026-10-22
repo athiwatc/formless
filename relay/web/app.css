@@ -412,6 +412,12 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .q-option .muted { font-size: 13px; }
 .modal input.q-other { margin-top: 4px; }
 
+/* List filters (Tools, Proposals) */
+.list-filter { display: flex; gap: 6px; align-items: center; flex: 1; min-width: 0; margin: 0 12px; }
+.list-filter input { flex: 1; min-width: 80px; max-width: 280px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); }
+.list-filter select { padding: 4px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: inherit; }
+@media (max-width: 700px) { .view-head { flex-wrap: wrap; } .list-filter { order: 3; flex-basis: 100%; margin: 6px 0 0; } }
+
 /* /model picker */
 .modal.picker { max-width: 640px; }
 .picker-list { max-height: min(50vh, 420px); overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }

@@ -1568,6 +1568,21 @@ run_tool = "network_policy"     # a registry Tool, or…
   smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
+- **Filtering lists.** In the TUI's Tools, Sessions and Proposals
+  views, `/` types a fuzzy filter: on name and description for Tools,
+  name for Sessions, and content, rationale and kind for Proposals. Enter
+  keeps it and Esc clears it. `s` cycles the sort and `v` the quick
+  filters:
+  - Tools sort by name, success rate, last used or calls; show all,
+    active, retired, failing (<80%) or needing attention.
+  - Sessions sort by last activity, created or name; show all or running.
+  - Proposals sort newest first or by score; show all, pending, applied
+    or rejected.
+  The panel title shows the match count and the active sort, filter and
+  query (`Tools · 12/240 · sort: calls · failing · /csv`), and the
+  selection follows the visible rows. The web Tools and Proposals views
+  have the same filter box, sort and show menus; web Sessions use the
+  sidebar search.
 - **Settings view:** edits file-backed config (§13) and per-Session
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
