@@ -1,4 +1,5 @@
 pub mod client;
+mod clipimg;
 mod commands;
 mod highlight;
 mod input;
@@ -719,6 +720,9 @@ struct App {
     mention: Option<MentionPopup>,
     /// A message waiting for its `@` attachments before it is sent.
     pending_send: Option<PendingSend>,
+    /// Files and pasted images for the next message, shown as chips in
+    /// the input and uploaded when it is sent (SPEC §5.6).
+    attachments: Vec<(String, Vec<u8>)>,
     /// The `/` palette's selected row.
     palette_sel: usize,
     /// The input the palette was dismissed (Esc) for.
@@ -881,6 +885,7 @@ impl App {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
             settings_sel: 0,
@@ -2208,7 +2213,20 @@ impl App {
             .into_iter()
             .filter(|p| root.as_ref().is_some_and(|r| r.join(p).exists()))
             .collect();
-        if found.is_empty() {
+        let held = std::mem::take(&mut self.attachments);
+        for (name, bytes) in &held {
+            use base64::Engine;
+            self.request(
+                Pending::MentionAttach,
+                Request::AttachFile {
+                    session_id: session_id.clone(),
+                    name: name.clone(),
+                    data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    mime: None,
+                },
+            );
+        }
+        if found.is_empty() && held.is_empty() {
             self.fire(Request::SendMessage {
                 session_id,
                 content: text,
@@ -2231,8 +2249,76 @@ impl App {
             session_id,
             content: text,
             mode,
-            waiting: found.len(),
+            waiting: found.len() + held.len(),
         });
+    }
+
+    /// Hold a file for the next message (a chip in the input).
+    fn add_attachment(&mut self, name: String, bytes: Vec<u8>) {
+        if bytes.len() > 20 * 1024 * 1024 {
+            self.notes.push(format!("{name} is larger than 20 MB"));
+            return;
+        }
+        let image = formless_core::daemon::guess_mime(&name).starts_with("image/");
+        self.notes.push(format!(
+            "attached {name} ({}); it goes with your next message · Backspace on an empty input removes it",
+            size_text(bytes.len())
+        ));
+        if image && !self.vision_model() {
+            self.notes.push(
+                "the current model may not read images (set provider.vision = true if it does); it will get a reference instead"
+                    .into(),
+            );
+        }
+        self.attachments.push((name, bytes));
+    }
+
+    fn attach_path_file(&mut self, path: &std::path::Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "attachment".into());
+                self.add_attachment(name, bytes);
+            }
+            Err(e) => self
+                .notes
+                .push(format!("cannot attach {}: {e}", path.display())),
+        }
+    }
+
+    /// `/paste` and Ctrl+V: an image from the system clipboard.
+    fn paste_image(&mut self) {
+        match clipimg::read_png() {
+            Ok(png) => {
+                let n = self
+                    .attachments
+                    .iter()
+                    .filter(|(n, _)| n.starts_with("pasted-image"))
+                    .count()
+                    + 1;
+                self.add_attachment(format!("pasted-image-{n}.png"), png);
+            }
+            Err(e) => self.notes.push(e),
+        }
+    }
+
+    /// Whether the current model takes images (`provider.vision`, else a
+    /// guess from its name).
+    fn vision_model(&self) -> bool {
+        let Ok(cfg) = Config::load(&self.paths) else {
+            return true;
+        };
+        let model = self
+            .current
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .and_then(|s| s.model.clone())
+            .unwrap_or(cfg.provider.model);
+        cfg.provider
+            .vision
+            .unwrap_or_else(|| formless_core::provider::is_vision_model(&model))
     }
 
     /// One `@` attachment answered; send the message once all have.
@@ -2851,31 +2937,9 @@ impl App {
                         .unwrap_or_else(|_| path.to_string()),
                     None => path.to_string(),
                 };
-                let Some(session_id) = self.current.clone() else {
-                    self.notes.push("open a session first".into());
-                    return;
-                };
-                match std::fs::read(&path) {
-                    Ok(bytes) => {
-                        use base64::Engine;
-                        let name = std::path::Path::new(&path)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "attachment".into());
-                        self.notes.push(format!(
-                            "attached {name} ({} KB); it goes with your next message",
-                            bytes.len() / 1024
-                        ));
-                        self.fire(Request::AttachFile {
-                            session_id,
-                            name,
-                            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                            mime: None,
-                        });
-                    }
-                    Err(e) => self.notes.push(format!("cannot attach {path}: {e}")),
-                }
+                self.attach_path_file(std::path::Path::new(&path));
             }
+            "paste" => self.paste_image(),
             cmd if cmd.starts_with("jobs ") => {
                 let mut words = cmd.split_whitespace().skip(1);
                 let (verb, id) = (
@@ -4010,6 +4074,11 @@ impl App {
                     self.view = View::Chat;
                 }
             }
+            KeyCode::Backspace if self.input.is_empty() && !self.attachments.is_empty() => {
+                if let Some((name, _)) = self.attachments.pop() {
+                    self.notes.push(format!("removed {name}"));
+                }
+            }
             KeyCode::Backspace if ctrl || alt => self.input.delete_word_back(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -4034,6 +4103,7 @@ impl App {
                     let history = self.input_history();
                     self.input.search_older(&history);
                 }
+                'v' => self.paste_image(),
                 _ => return,
             },
             KeyCode::Char(c) if alt => match c {
@@ -4073,6 +4143,11 @@ impl App {
             return;
         }
         if self.view == View::Chat {
+            // A file dragged into the terminal arrives as its path.
+            if let Some(path) = clipimg::dropped_file(text) {
+                self.attach_path_file(&path);
+                return;
+            }
             self.input.paste(text);
             self.palette_sel = 0;
             self.update_mention();
@@ -4638,7 +4713,16 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         }
         cursor = Some((cur.0 - top, cur.1));
     }
-    let mut block = ui::panel(" Message ", app.color, color);
+    let mut title = String::from(" Message ");
+    for (n, (name, bytes)) in app.attachments.iter().enumerate() {
+        let label = if name.starts_with("pasted-image") {
+            format!("image {}", n + 1)
+        } else {
+            truncate_chars(name, 24)
+        };
+        title.push_str(&format!("[{label} · {}] ", size_text(bytes.len())));
+    }
+    let mut block = ui::panel(title, app.color, color);
     if area.width > 64 {
         block = block.title(ui::hint(
             &if app.running() {
@@ -4660,6 +4744,15 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
             x.min(area.right().saturating_sub(2)),
             y.min(area.bottom().saturating_sub(2)),
         ));
+    }
+}
+
+/// `240 KB`, `1.2 MB`.
+fn size_text(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
     }
 }
 
@@ -6677,6 +6770,7 @@ mod tests {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
             settings_sel: 0,
@@ -7573,6 +7667,32 @@ mod tests {
         app.key(key(KeyCode::Esc));
         app.key(key(KeyCode::Esc));
         assert_eq!(app.view, View::Chat);
+    }
+
+    #[test]
+    fn dropped_files_become_removable_attachment_chips() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.current = Some("s".into());
+        let file = app.paths.data_dir.join("shot.png");
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        std::fs::write(&file, vec![0u8; 3000]).unwrap();
+        // Dragging the file in pastes its (quoted) path: it's attached.
+        app.paste(&format!("'{}'", file.display()));
+        assert!(app.input.is_empty());
+        assert_eq!(app.attachments.len(), 1);
+        assert!(render(&mut app, 100, 24).contains("[shot.png · 3 KB]"));
+        // Backspace on an empty input removes the chip.
+        app.key(key(KeyCode::Backspace));
+        assert!(app.attachments.is_empty());
+        // Sending waits for the upload before the message.
+        app.slash(&format!("attach {}", file.display()));
+        for c in "what is this?".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert!(app.attachments.is_empty());
+        assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
     }
 
     #[test]
