@@ -797,6 +797,9 @@ struct App {
     chat_area: Option<Rect>,
     painted_links: Vec<links::Painted>,
     hyperlinks: bool,
+    /// Path words already checked against the filesystem: their
+    /// `file://` target when the file exists.
+    path_cache: HashMap<String, Option<String>>,
     /// Chat rows when the user scrolled away from the bottom, to count
     /// what arrived since; and where the "new lines" badge was drawn
     /// (row, first and last column) so a click can follow again.
@@ -966,6 +969,7 @@ impl App {
             target_flash: None,
             chat_area: None,
             painted_links: Vec::new(),
+            path_cache: HashMap::new(),
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -3008,6 +3012,9 @@ impl App {
             }
             "open" => self.open_artifact(""),
             "open link" => self.open_link(""),
+            cmd if cmd.starts_with("open path ") => {
+                self.open_path(cmd["open path ".len()..].trim())
+            }
             cmd if cmd.starts_with("open link ") => {
                 self.open_link(cmd["open link ".len()..].trim())
             }
@@ -4189,20 +4196,66 @@ impl App {
     /// Hand the terminal to `$VISUAL`/`$EDITOR` on config.toml; the daemon
     /// hot-reloads it on the next Run.
     fn open_config_in_editor(&mut self) {
+        let file = self.paths.config_file();
+        if let Some(note) = self.run_editor(&file, None) {
+            self.notes.push(note);
+        } else {
+            self.notes
+                .push("config.toml saved; the daemon reloads it on the next Run".into());
+        }
+    }
+
+    /// `/open path P[:LINE]`: a file the answer mentions, in the editor.
+    fn open_path(&mut self, arg: &str) {
+        let mut parts = arg.splitn(3, ':');
+        let path = parts.next().unwrap_or_default();
+        let line = parts.next().and_then(|l| l.parse::<u32>().ok());
+        match resolve_path(path) {
+            Some(file) if cfg!(test) => self.notes.push(format!(
+                "opening {}{}",
+                file.display(),
+                line.map(|l| format!(" at line {l}")).unwrap_or_default()
+            )),
+            Some(file) => {
+                if let Some(note) = self.run_editor(&file, line) {
+                    self.notes.push(note);
+                }
+            }
+            None => self.notes.push(format!("no file {path}")),
+        }
+    }
+
+    /// Open `file` (at `line`) in `$VISUAL`/`$EDITOR`. Terminal editors
+    /// get the terminal until they exit; GUI editors just start. Returns
+    /// a note when something went wrong.
+    fn run_editor(&mut self, file: &std::path::Path, line: Option<u32>) -> Option<String> {
         let editor = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
             .unwrap_or_else(|_| if cfg!(windows) { "notepad" } else { "vi" }.into());
         let mut words = editor.split_whitespace();
-        let Some(program) = words.next() else { return };
+        let program = words.next()?.to_string();
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(words);
+        let gui = editor_takes_goto(&program);
+        let path = file.display().to_string();
+        match (line, gui) {
+            (Some(l), true) => cmd.args(["-g", &format!("{path}:{l}")]),
+            (Some(l), false) if program.ends_with("hx") => cmd.arg(format!("{path}:{l}")),
+            (Some(l), false) if !program.contains("notepad") => cmd.arg(format!("+{l}")).arg(&path),
+            _ => cmd.arg(&path),
+        };
+        if gui {
+            return cmd
+                .spawn()
+                .err()
+                .map(|e| format!("could not run {editor}: {e}"));
+        }
         let mut out = stdout();
         let _ = disable_raw_mode();
         let _ = out.execute(crossterm::event::DisableBracketedPaste);
         let _ = out.execute(crossterm::event::DisableMouseCapture);
         let _ = out.execute(LeaveAlternateScreen);
-        let status = std::process::Command::new(program)
-            .args(words)
-            .arg(self.paths.config_file())
-            .status();
+        let status = cmd.status();
         let _ = out.execute(EnterAlternateScreen);
         if self.mouse_capture {
             let _ = out.execute(crossterm::event::EnableMouseCapture);
@@ -4210,13 +4263,11 @@ impl App {
         let _ = out.execute(crossterm::event::EnableBracketedPaste);
         let _ = enable_raw_mode();
         self.force_redraw = true;
-        self.notes.push(match status {
-            Ok(s) if s.success() => {
-                "config.toml saved; the daemon reloads it on the next Run".into()
-            }
-            Ok(s) => format!("{editor} exited with {s}"),
-            Err(e) => format!("could not run {editor}: {e} (set $EDITOR)"),
-        });
+        match status {
+            Ok(s) if s.success() => None,
+            Ok(s) => Some(format!("{editor} exited with {s}")),
+            Err(e) => Some(format!("could not run {editor}: {e} (set $EDITOR)")),
+        }
     }
 
     /// Ctrl+F opens the find bar; while it's open keys edit the query,
@@ -5541,6 +5592,28 @@ fn thinking_rows(text: &str, width: usize, rows: usize) -> Vec<String> {
 const CTRL_C_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Fenced code blocks in Markdown text, in order (fence lines dropped).
+/// A file a chat mentions, resolved against the TUI's working directory
+/// (or absolute, or under `~/`), when it exists.
+fn resolve_path(path: &str) -> Option<std::path::PathBuf> {
+    let p = match path.strip_prefix("~/") {
+        Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => std::env::current_dir().ok()?.join(path),
+    };
+    p.is_file().then(|| p.canonicalize().unwrap_or(p))
+}
+
+/// GUI editors that take `-g file:line` (VS Code and its forks).
+fn editor_takes_goto(program: &str) -> bool {
+    let name = std::path::Path::new(program)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    matches!(
+        name.as_str(),
+        "code" | "code-insiders" | "codium" | "cursor" | "windsurf"
+    )
+}
+
 /// The Markdown tables in `text`: runs of lines that start with `|`.
 fn markdown_tables(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -7726,9 +7799,21 @@ pub fn run(paths: Paths) -> Result<()> {
             let frame = terminal.draw(|f| draw(f, &mut app))?;
             // Clickable links: repaint them with OSC 8 when they change.
             if app.hyperlinks {
+                let cache = &mut app.path_cache;
+                let mut resolve = |p: &str| {
+                    if cache.len() > 4096 {
+                        cache.clear();
+                    }
+                    cache
+                        .entry(p.to_string())
+                        .or_insert_with(|| {
+                            resolve_path(p).map(|f| format!("file://{}", f.display()))
+                        })
+                        .clone()
+                };
                 let found = app
                     .chat_area
-                    .map(|a| links::scan(frame.buffer, a))
+                    .map(|a| links::scan(frame.buffer, a, &mut resolve))
                     .unwrap_or_default();
                 if found != app.painted_links {
                     let _ = links::paint(&mut stdout(), frame.buffer, &found);
@@ -7890,6 +7975,7 @@ mod tests {
             target_flash: None,
             chat_area: None,
             painted_links: Vec::new(),
+            path_cache: HashMap::new(),
             hyperlinks: false,
             unseen_from: None,
             new_badge: None,
@@ -9290,6 +9376,30 @@ mod tests {
         // The chat area is recorded for the OSC 8 pass.
         render(&mut app, 80, 20);
         assert!(app.chat_area.is_some());
+    }
+
+    #[test]
+    fn file_paths_in_the_chat_link_and_open() {
+        // Tests run in the crate directory.
+        assert!(resolve_path("src/lib.rs").is_some());
+        assert!(resolve_path("src/nope.rs").is_none());
+        let mut app = test_app();
+        app.slash("open path Cargo.toml:3");
+        let note = app.notes.last().unwrap();
+        assert!(note.contains("Cargo.toml at line 3"), "{note}");
+        app.slash("open path missing.rs");
+        assert_eq!(app.notes.last().unwrap(), "no file missing.rs");
+        // The OSC 8 pass links existing paths to file://.
+        let area = Rect::new(0, 0, 50, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf.set_string(0, 0, "see src/lib.rs:10 and src/nope.rs", Style::default());
+        let found = links::scan(&buf, area, &mut |p| {
+            resolve_path(p).map(|f| format!("file://{}", f.display()))
+        });
+        assert_eq!(found.len(), 1);
+        assert!(found[0].url.starts_with("file://") && found[0].url.ends_with("src/lib.rs"));
+        assert_eq!((found[0].x0, found[0].x1), (4, 16));
+        assert!(editor_takes_goto("/usr/local/bin/code") && !editor_takes_goto("vim"));
     }
 
     #[test]
