@@ -169,6 +169,13 @@ pub fn rows(
         ),
         Row::new(
             "Interface",
+            "tui.inline_images",
+            "inline_images",
+            cfg.tui.inline_images.clone(),
+            Choice(&["auto", "off"]),
+        ),
+        Row::new(
+            "Interface",
             "tui.code_line_numbers",
             "code_line_numbers",
             on(cfg.tui.code_line_numbers),
