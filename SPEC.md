@@ -1549,6 +1549,19 @@ run_tool = "network_policy"     # a registry Tool, or…
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
   action (§15).
+  In the TUI the rows are selectable (↑/↓ or j/k, Enter or Space):
+  - booleans toggle and enums cycle (`reasoning_effort`, `api_style`,
+    `tool_mode`; the last two are settable and validated against their
+    allowed values);
+  - `model` opens the model picker for the global default;
+  - numbers edit inline and are checked before saving, with errors shown
+    under the row;
+  - read-only rows (endpoint, auth, relay, paths) say where they change.
+  Changes go through `SetSetting`, so they are audited and other clients
+  get `SettingsChanged`. A daemon refusal also shows under the row.
+  Providers and Roles sections list them with add/edit forms (the API key
+  is masked and goes to the keychain through `UpsertProvider`) and `d`
+  twice to remove. "config.toml" opens the file in `$VISUAL`/`$EDITOR`.
 
 ### 10.5 Input and keys
 

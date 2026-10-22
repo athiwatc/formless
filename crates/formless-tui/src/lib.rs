@@ -5,6 +5,7 @@ mod input;
 mod markdown;
 mod mermaid;
 mod picker;
+mod settings;
 mod ui;
 
 use anyhow::Result;
@@ -146,6 +147,10 @@ enum Pending {
     SetModel,
     ListFiles,
     MentionAttach,
+    /// Providers and Roles for the Settings view.
+    SettingsProviders,
+    SaveSetting,
+    SaveProviderOrRole,
     HarnessChanges,
 }
 
@@ -168,6 +173,8 @@ struct RollbackPick {
 struct ModelOverlay {
     picker: picker::ModelPicker,
     effort_idx: usize,
+    /// Opened from Settings: Enter sets the global default.
+    default_only: bool,
 }
 
 /// A row of the `/` palette: a command, or an argument for one.
@@ -588,6 +595,19 @@ struct App {
     palette_sel: usize,
     /// The input the palette was dismissed (Esc) for.
     palette_hidden: Option<String>,
+    /// Settings view (SPEC §10.4): selected row, an inline number edit
+    /// (key, text), the key being saved and the last error by key.
+    settings_sel: usize,
+    settings_edit: Option<(String, input::InputLine)>,
+    settings_saving: Option<String>,
+    settings_error: Option<(String, String)>,
+    settings_form: Option<settings::Form>,
+    /// A `d` press waiting for its confirming second one (row key).
+    settings_remove_arm: Option<String>,
+    /// The last `ListProviders` result.
+    providers_info: serde_json::Value,
+    /// Redraw from scratch (after handing the terminal to $EDITOR).
+    force_redraw: bool,
     approvals: std::collections::VecDeque<ApprovalReq>,
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
@@ -726,6 +746,14 @@ impl App {
             pending_send: None,
             palette_sel: 0,
             palette_hidden: None,
+            settings_sel: 0,
+            settings_edit: None,
+            settings_saving: None,
+            settings_error: None,
+            settings_form: None,
+            settings_remove_arm: None,
+            providers_info: serde_json::Value::Null,
+            force_redraw: false,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -807,9 +835,20 @@ impl App {
                     };
                     if !ok {
                         self.notes
-                            .push(format!("daemon: {}", error.unwrap_or_default()));
+                            .push(format!("daemon: {}", error.clone().unwrap_or_default()));
                         if matches!(kind, Pending::MentionAttach) {
                             self.mention_attached();
+                        }
+                        if matches!(kind, Pending::SaveSetting) {
+                            if let Some(key) = self.settings_saving.take() {
+                                self.settings_error =
+                                    Some((key, error.clone().unwrap_or_default()));
+                            }
+                        }
+                        if matches!(kind, Pending::SaveProviderOrRole) {
+                            if let Some(f) = &mut self.settings_form {
+                                f.error = error.clone();
+                            }
                         }
                         continue;
                     }
@@ -1046,6 +1085,24 @@ impl App {
                                 )
                             });
                             self.mention_attached();
+                        }
+                        Pending::SettingsProviders => self.providers_info = result,
+                        Pending::SaveSetting => {
+                            if let Some(key) = self.settings_saving.take() {
+                                self.notes.push(format!(
+                                    "saved {key} = {} (used from the next Run)",
+                                    result["value"]
+                                ));
+                                if self.settings_error.as_ref().is_some_and(|(k, _)| *k == key) {
+                                    self.settings_error = None;
+                                }
+                            }
+                        }
+                        Pending::SaveProviderOrRole => {
+                            if let Some(f) = self.settings_form.take() {
+                                self.notes.push(format!("{} saved", f.title));
+                            }
+                            self.request(Pending::SettingsProviders, Request::ListProviders);
                         }
                         Pending::SetModel => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
@@ -2250,7 +2307,8 @@ impl App {
                 self.request(Pending::ListBuiltinStats, Request::ListBuiltinStats);
             }
             View::Proposals => self.request(Pending::ListProposals, Request::ListProposals),
-            View::Chat | View::Settings | View::Search => {}
+            View::Settings => self.request(Pending::SettingsProviders, Request::ListProviders),
+            View::Chat | View::Search => {}
         }
     }
 
@@ -2709,11 +2767,16 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
-        let effort = self
-            .current
-            .as_ref()
-            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
-            .and_then(|s| s.reasoning_effort.clone());
+        let effort = if self.view == View::Settings {
+            Config::load(&self.paths)
+                .ok()
+                .and_then(|c| c.provider.reasoning_effort)
+        } else {
+            self.current
+                .as_ref()
+                .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+                .and_then(|s| s.reasoning_effort.clone())
+        };
         let effort_idx = EFFORTS
             .iter()
             .position(|e| e.map(str::to_string) == effort)
@@ -2721,6 +2784,7 @@ impl App {
         self.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::loading(),
             effort_idx,
+            default_only: self.view == View::Settings,
         });
         self.request(Pending::ListModels, Request::ListModels);
     }
@@ -2749,6 +2813,7 @@ impl App {
                 && key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let global = global || (o.default_only && key.code == KeyCode::Enter);
         if global || key.code == KeyCode::Enter {
             let Some(model) = o.picker.choice() else {
                 return;
@@ -3091,6 +3156,7 @@ impl App {
             return;
         }
         match self.view {
+            View::Settings => self.settings_key(key),
             View::Search => match key.code {
                 KeyCode::Up => self.search_idx = self.search_idx.saturating_sub(1),
                 KeyCode::Down => {
@@ -3325,6 +3391,179 @@ impl App {
         }
     }
 
+    fn settings_rows(&self) -> Vec<settings::Row> {
+        match Config::load(&self.paths) {
+            Ok(cfg) => settings::rows(&cfg, &self.providers_info, self.show_thinking, &self.paths),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Save one setting through the daemon (audited; other clients get
+    /// `SettingsChanged`).
+    fn save_setting(&mut self, key: &str, value: serde_json::Value) {
+        self.settings_saving = Some(key.to_string());
+        self.request(
+            Pending::SaveSetting,
+            Request::SetSetting {
+                key: key.to_string(),
+                value,
+            },
+        );
+    }
+
+    /// Settings view keys (SPEC §10.4).
+    fn settings_key(&mut self, key: KeyEvent) {
+        if let Some(form) = &mut self.settings_form {
+            let n = form.fields.len();
+            match key.code {
+                KeyCode::Esc => self.settings_form = None,
+                KeyCode::Tab | KeyCode::Down => form.idx = (form.idx + 1) % n,
+                KeyCode::BackTab | KeyCode::Up => form.idx = (form.idx + n - 1) % n,
+                KeyCode::Enter if form.idx + 1 < n => form.idx += 1,
+                KeyCode::Enter => match form.request() {
+                    Ok(req) => {
+                        form.error = None;
+                        self.request(Pending::SaveProviderOrRole, req);
+                    }
+                    Err(e) => form.error = Some(e),
+                },
+                KeyCode::Backspace => form.fields[form.idx].input.backspace(),
+                KeyCode::Left => form.fields[form.idx].input.left(),
+                KeyCode::Right => form.fields[form.idx].input.right(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    form.fields[form.idx].input.insert_char(c)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if let Some((k, edit)) = &mut self.settings_edit {
+            match key.code {
+                KeyCode::Esc => self.settings_edit = None,
+                KeyCode::Enter => match settings::parse_number(edit) {
+                    Ok(v) => {
+                        let k = k.clone();
+                        self.settings_edit = None;
+                        self.save_setting(&k, v);
+                    }
+                    Err(e) => self.settings_error = Some((k.clone(), e)),
+                },
+                KeyCode::Backspace => edit.backspace(),
+                KeyCode::Left => edit.left(),
+                KeyCode::Right => edit.right(),
+                KeyCode::Char(c) => edit.insert_char(c),
+                _ => {}
+            }
+            return;
+        }
+        let rows = self.settings_rows();
+        if rows.is_empty() {
+            if key.code == KeyCode::Esc {
+                self.view = View::Chat;
+            }
+            return;
+        }
+        let sel = self.settings_sel.min(rows.len() - 1);
+        let row = rows[sel].clone();
+        if key.code != KeyCode::Char('d') {
+            self.settings_remove_arm = None;
+        }
+        match key.code {
+            KeyCode::Esc => self.view = View::Chat,
+            KeyCode::Up | KeyCode::Char('k') => self.settings_sel = sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.settings_sel = (sel + 1).min(rows.len() - 1),
+            KeyCode::Home | KeyCode::Char('g') => self.settings_sel = 0,
+            KeyCode::End | KeyCode::Char('G') => self.settings_sel = rows.len() - 1,
+            KeyCode::Char('d') => {
+                let req = match &row.kind {
+                    settings::Kind::Provider(n) => Request::RemoveProvider { name: n.clone() },
+                    settings::Kind::Role(n) => Request::DeleteRole { name: n.clone() },
+                    _ => return,
+                };
+                if self.settings_remove_arm.as_deref() == Some(&row.key) {
+                    self.settings_remove_arm = None;
+                    self.request(Pending::SaveProviderOrRole, req);
+                    self.notes.push(format!("removing {}", row.label));
+                } else {
+                    self.settings_remove_arm = Some(row.key.clone());
+                    self.notes
+                        .push(format!("press d again to remove {}", row.label));
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match &row.kind {
+                settings::Kind::ReadOnly(why) => {
+                    if !why.is_empty() {
+                        self.notes.push(format!("{}: {why}", row.label));
+                    }
+                }
+                settings::Kind::Bool => {
+                    self.save_setting(&row.key, serde_json::json!(row.value != "on"))
+                }
+                settings::Kind::Choice(choices) => {
+                    self.save_setting(&row.key, settings::next_choice(choices, &row.value))
+                }
+                settings::Kind::Number => {
+                    self.settings_edit =
+                        Some((row.key.clone(), input::InputLine::from(row.value.as_str())))
+                }
+                settings::Kind::Model => self.open_model_picker(),
+                settings::Kind::Thinking => self.slash("thinking"),
+                settings::Kind::Provider(name) => {
+                    let existing = self.providers_info["providers"]
+                        .as_array()
+                        .and_then(|a| a.iter().find(|p| p["name"] == name.as_str()))
+                        .cloned();
+                    self.settings_form = Some(settings::Form::provider(existing.as_ref()));
+                }
+                settings::Kind::Role(name) => {
+                    let existing = self.providers_info["roles"][name.as_str()].clone();
+                    self.settings_form = Some(settings::Form::role(Some(name), Some(&existing)));
+                }
+                settings::Kind::AddProvider => {
+                    self.settings_form = Some(settings::Form::provider(None))
+                }
+                settings::Kind::AddRole => {
+                    self.settings_form = Some(settings::Form::role(None, None))
+                }
+                settings::Kind::OpenEditor => self.open_config_in_editor(),
+            },
+            _ => {}
+        }
+    }
+
+    /// Hand the terminal to `$VISUAL`/`$EDITOR` on config.toml; the daemon
+    /// hot-reloads it on the next Run.
+    fn open_config_in_editor(&mut self) {
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| if cfg!(windows) { "notepad" } else { "vi" }.into());
+        let mut words = editor.split_whitespace();
+        let Some(program) = words.next() else { return };
+        let mut out = stdout();
+        let _ = disable_raw_mode();
+        let _ = out.execute(crossterm::event::DisableBracketedPaste);
+        let _ = out.execute(crossterm::event::DisableMouseCapture);
+        let _ = out.execute(LeaveAlternateScreen);
+        let status = std::process::Command::new(program)
+            .args(words)
+            .arg(self.paths.config_file())
+            .status();
+        let _ = out.execute(EnterAlternateScreen);
+        if self.mouse_capture {
+            let _ = out.execute(crossterm::event::EnableMouseCapture);
+        }
+        let _ = out.execute(crossterm::event::EnableBracketedPaste);
+        let _ = enable_raw_mode();
+        self.force_redraw = true;
+        self.notes.push(match status {
+            Ok(s) if s.success() => {
+                "config.toml saved; the daemon reloads it on the next Run".into()
+            }
+            Ok(s) => format!("{editor} exited with {s}"),
+            Err(e) => format!("could not run {editor}: {e} (set $EDITOR)"),
+        });
+    }
+
     /// The user messages of the current Session, oldest first: the input
     /// history for Up/Down and Ctrl+R.
     fn input_history(&self) -> Vec<String> {
@@ -3442,7 +3681,15 @@ impl App {
             ed.cursor += n;
             return;
         }
-        if matches!(self.view, View::Chat | View::Settings) {
+        if let Some(f) = &mut self.settings_form {
+            f.fields[f.idx].input.paste(text.trim());
+            return;
+        }
+        if let Some((_, edit)) = &mut self.settings_edit {
+            edit.paste(text.trim());
+            return;
+        }
+        if self.view == View::Chat {
             self.input.paste(text);
             self.palette_sel = 0;
             self.update_mention();
@@ -3485,7 +3732,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .front()
         .map(|r| (r, false))
         .or(app.promotions.front().map(|r| (r, true)));
-    let typing = matches!(app.view, View::Chat | View::Settings);
+    let typing = app.view == View::Chat;
     draw_input(f, chunks[2], app, typing && modal.is_none());
     draw_status(f, chunks[3], app);
     if app.view == View::Chat {
@@ -4542,63 +4789,133 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
-    let lines: Vec<Line> = match Config::load(&app.paths) {
-        Ok(c) => {
-            let section =
-                |name: &str| Line::styled(name.to_string(), bold_fg(app.color, Color::Cyan));
-            let row = |k: &str, v: String| {
-                Line::from(vec![
-                    Span::styled(format!("  {}", ui::pad(k, 20)), ui::dim(app.color)),
-                    if v.is_empty() {
-                        Span::styled("(not set)", ui::dim(app.color))
-                    } else {
-                        Span::raw(v)
-                    },
-                ])
-            };
-            let on = |b: bool| if b { "on" } else { "off" }.to_string();
-            vec![
-                section("Provider"),
-                row("base_url", c.provider.base_url.clone()),
-                row("model", c.provider.model.clone()),
-                row(
-                    "reasoning_effort",
-                    c.provider
-                        .reasoning_effort
-                        .clone()
-                        .unwrap_or_else(|| "default".into()),
-                ),
-                row("api_style", c.provider.api_style.clone()),
-                row("tool_mode", c.provider.tool_mode.clone()),
-                row("auth", c.provider.auth.mode.clone()),
-                row("context_tokens", c.provider.context_tokens.to_string()),
-                Line::raw(""),
-                section("Interface"),
-                row("multi_pane", on(c.tui.multi_pane)),
-                row("queue_key", c.tui.queue_key.clone()),
-                row("thinking", on(app.show_thinking)),
-                Line::raw(""),
-                section("Relay"),
-                row("enabled", on(c.relay.enabled)),
-                row("url", c.relay.url.clone()),
-                Line::raw(""),
-                section("Paths"),
-                row("config", app.paths.config_file().display().to_string()),
-                row("data", app.paths.data_dir.display().to_string()),
-            ]
+    let rows = app.settings_rows();
+    let sel = app.settings_sel.min(rows.len().saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_line = 0;
+    let mut section = "";
+    for (i, row) in rows.iter().enumerate() {
+        if row.section != section {
+            if !section.is_empty() {
+                lines.push(Line::raw(""));
+            }
+            section = row.section;
+            lines.push(Line::styled(section, bold_fg(app.color, Color::Cyan)));
         }
-        Err(e) => vec![Line::styled(e.to_string(), bold_fg(app.color, Color::Red))],
+        let selected = i == sel;
+        if selected {
+            sel_line = lines.len();
+        }
+        let mark = if selected { "› " } else { "  " };
+        let label_style = if selected {
+            bold_fg(app.color, Color::Green)
+        } else {
+            ui::dim(app.color)
+        };
+        let value = match &app.settings_edit {
+            Some((k, edit)) if *k == row.key => {
+                Span::styled(format!("{}▏", &**edit), bold_fg(app.color, Color::Yellow))
+            }
+            _ if row.value.is_empty() && matches!(row.kind, settings::Kind::Choice(_)) => {
+                Span::styled("default", ui::dim(app.color))
+            }
+            _ if row.value.is_empty() => Span::raw(""),
+            _ => Span::raw(row.value.clone()),
+        };
+        let mut spans = vec![
+            Span::styled(format!("{mark}{}", ui::pad(&row.label, 20)), label_style),
+            value,
+        ];
+        if selected {
+            spans.push(Span::styled(
+                format!("   {}", row.hint()),
+                ui::dim(app.color),
+            ));
+        }
+        lines.push(Line::from(spans));
+        if let Some((k, e)) = &app.settings_error {
+            if *k == row.key {
+                lines.push(Line::styled(
+                    format!("    ✗ {e}"),
+                    fg(app.color, Color::Red),
+                ));
+            }
+        }
+    }
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            "config.toml could not be read",
+            bold_fg(app.color, Color::Red),
+        ));
+    }
+    // Keep the selection on screen.
+    let height = area.height.saturating_sub(2) as usize;
+    let top = sel_line.saturating_sub(height.saturating_sub(2));
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).block(
+            ui::panel(" Settings ", app.color, Color::Cyan).title_bottom(ui::hint(
+                "↑↓ select · Enter change · d remove · Esc back · saved through the daemon",
+                app.color,
+            )),
+        ),
+        area,
+    );
+    if let Some(form) = &app.settings_form {
+        draw_settings_form(f, form, app.color);
+    }
+}
+
+fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
+    let mut lines = vec![Line::raw("")];
+    for (i, field) in form.fields.iter().enumerate() {
+        let active = i == form.idx;
+        let text = if field.masked {
+            "•".repeat(field.input.chars().count())
+        } else {
+            field.input.to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} {:<12}", if active { "›" } else { " " }, field.label),
+                if active {
+                    bold_fg(color, Color::Green)
+                } else {
+                    ui::dim(color)
+                },
+            ),
+            Span::raw(if active { format!("{text}▏") } else { text }),
+        ]));
+        if active {
+            lines.push(Line::styled(
+                format!("               {}", field.hint),
+                ui::dim(color),
+            ));
+        }
+    }
+    if let Some(e) = &form.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(format!("  ✗ {e}"), fg(color, Color::Red)));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  Tab/↑↓ field · Enter next, then save · Esc cancel",
+        ui::dim(color),
+    ));
+    let area = f.area();
+    let w = 72.min(area.width.saturating_sub(2)).max(1);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 3,
+        width: w,
+        height: h,
     };
+    f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines)
-            .block(
-                ui::panel(" Settings ", app.color, Color::Cyan).title_bottom(ui::hint(
-                    "edit config.toml (hot-reloaded per Run) · delete it to re-run setup",
-                    app.color,
-                )),
-            )
+            .block(ui::panel(format!(" {} ", form.title), color, Color::Cyan))
             .wrap(Wrap { trim: false }),
-        area,
+        rect,
     );
 }
 
@@ -5692,6 +6009,9 @@ pub fn run(paths: Paths) -> Result<()> {
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
             app.wizard_poll();
+            if std::mem::take(&mut app.force_redraw) {
+                terminal.clear()?;
+            }
             terminal.draw(|f| draw(f, &mut app))?;
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
@@ -5812,6 +6132,14 @@ mod tests {
             pending_send: None,
             palette_sel: 0,
             palette_hidden: None,
+            settings_sel: 0,
+            settings_edit: None,
+            settings_saving: None,
+            settings_error: None,
+            settings_form: None,
+            settings_remove_arm: None,
+            providers_info: serde_json::Value::Null,
+            force_redraw: false,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -6447,6 +6775,60 @@ mod tests {
         app.paste(&big);
         assert_eq!(app.input, "[pasted 30 lines #1]");
         assert_eq!(app.input.take(), big);
+    }
+
+    #[test]
+    fn settings_rows_toggle_cycle_edit_and_open_forms() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.open_view(View::Settings);
+        let rows = app.settings_rows();
+        let at = |k: &str| rows.iter().position(|r| r.key == k).unwrap();
+        // A toggle saves through the daemon.
+        app.settings_sel = at("provider.tool_use_nudge");
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.settings_saving.as_deref(), Some("provider.tool_use_nudge"));
+        // A bad number is caught before saving and shown by the row.
+        app.settings_sel = at("provider.max_retries");
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_edit.is_some());
+        app.key(key(KeyCode::Char('x')));
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_error.as_ref().unwrap().1.contains("whole number"));
+        assert!(render(&mut app, 100, 40).contains("whole number"));
+        app.key(key(KeyCode::Esc));
+        assert!(app.settings_edit.is_none());
+        // Model opens the picker for the global default.
+        app.settings_sel = at("provider.model");
+        app.key(key(KeyCode::Enter));
+        assert!(app.model_overlay.as_ref().unwrap().default_only);
+        app.key(key(KeyCode::Esc));
+        // Add provider: a masked key, validated before saving.
+        app.settings_sel = at("+provider");
+        app.key(key(KeyCode::Enter));
+        for c in "local".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        for c in "nope".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Enter));
+        for c in "sk-secret".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        let screen = render(&mut app, 100, 40);
+        assert!(!screen.contains("sk-secret") && screen.contains("•••••••••"));
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_form.as_ref().unwrap().error.as_ref().unwrap().contains("http"));
+        app.key(key(KeyCode::Esc));
+        assert!(app.settings_form.is_none());
+        for (w, h) in [(1, 1), (20, 5), (80, 24)] {
+            render(&mut app, w, h);
+        }
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.view, View::Chat);
     }
 
     #[test]
