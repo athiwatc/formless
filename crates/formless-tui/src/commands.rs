@@ -80,6 +80,12 @@ pub const COMMANDS: &[Command] = &[
         "attach a file to your next message",
         Session,
     ),
+    cmd(
+        "paste",
+        "",
+        "attach an image from the clipboard (also Ctrl+V)",
+        Session,
+    ),
     cmd("open", "[ID]", "show a stored output full-screen", Session),
     cmd(
         "copy",

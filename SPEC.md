@@ -437,9 +437,19 @@ accepted as a label. The user may always answer in their own words.
 Users attach files and screenshots to their next message instead of
 pasting paths.
 
-- **Clients:** in the TUI, `/attach PATH` reads the file on the client's
-  machine. The web composer has a 📎 file picker and accepts pasted
-  images.
+- **Clients:** in the TUI, files wait in the input as chips
+  (`[image 1 · 240 KB]`) until the message is sent, then upload before
+  it. Backspace on an empty input removes the last chip.
+  - `/attach PATH` reads a file on the client's machine.
+  - `/paste` or Ctrl+V attaches an image from the system clipboard,
+    read with the platform's tools: `osascript` on macOS, `wl-paste` on
+    Wayland, `xclip` on X11, PowerShell on Windows.
+  - A file dragged into the terminal (pasted as an absolute path, quoted,
+    `\`-escaped or `file://`) is attached instead of typed.
+  - Attaching an image when the current model doesn't look vision-capable
+    (`provider.vision`, else a guess from the name) warns that it will get
+    a reference instead.
+  The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
   fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
