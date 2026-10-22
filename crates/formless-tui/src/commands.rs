@@ -185,7 +185,12 @@ pub const COMMANDS: &[Command] = &[
         Settings,
     ),
     cmd("role rm", "NAME", "remove a Role", Settings),
-    cmd("panes", "", "toggle the multi-pane layout", Settings),
+    cmd(
+        "panes",
+        "[wider|narrower|left|right|reset]",
+        "toggle the multi-pane layout, or resize/hide its side panes",
+        Settings,
+    ),
     cmd("mouse", "", "release the mouse to select text", Settings),
     cmd("harness", "", "list the agent's harness changes", Settings),
     cmd(

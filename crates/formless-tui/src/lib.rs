@@ -815,6 +815,8 @@ struct App {
     /// Inline images (SPEC §10.2): the terminal's protocol, the
     /// thumbnails this frame places and those last sent.
     image_proto: Option<images::Protocol>,
+    /// Side pane widths in the multi-pane layout, percent (left, right).
+    pane_widths: (u16, u16),
     /// While an approval is open: whether keys go to the input (Tab
     /// toggles) instead of the approval (SPEC §10.3).
     input_focus: bool,
@@ -998,6 +1000,7 @@ impl App {
             painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
+            pane_widths: pane_widths(&cfg.tui.pane_widths),
             input_focus: false,
             approval_explain: false,
             approval_code: None,
@@ -2990,6 +2993,7 @@ impl App {
                     ));
                 }
             }
+            cmd if cmd.starts_with("panes ") => self.resize_panes(cmd["panes ".len()..].trim()),
             "panes" => {
                 self.multi_pane = !self.multi_pane;
                 // Settings go through the daemon (principle 6).
@@ -4751,6 +4755,13 @@ impl App {
             KeyCode::Backspace if ctrl || alt => self.input.delete_word_back(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
+            // Ctrl+Shift+←/→: the multi-pane layout's side panes.
+            KeyCode::Left if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.resize_panes("narrower")
+            }
+            KeyCode::Right if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.resize_panes("wider")
+            }
             KeyCode::Left if ctrl || alt => self.input.word_left(),
             KeyCode::Right if ctrl || alt => self.input.word_right(),
             KeyCode::Left => self.input.left(),
@@ -5737,6 +5748,15 @@ fn image_attachments(m: &MessageInfo) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `tui.pane_widths` as (left, right), each 0 (hidden) or 10–40%.
+fn pane_widths(v: &[u16]) -> (u16, u16) {
+    let fix = |w: Option<&u16>, default: u16| match w.copied().unwrap_or(default) {
+        0 => 0,
+        w => w.clamp(10, 40),
+    };
+    (fix(v.first(), 22), fix(v.get(1), 26))
+}
+
 /// A file a chat mentions, resolved against the TUI's working directory
 /// (or absolute, or under `~/`), when it exists.
 fn resolve_path(path: &str) -> Option<std::path::PathBuf> {
@@ -5897,6 +5917,54 @@ impl App {
             (last.content.clone(), "the last answer".to_string())
         };
         self.copy_text(&text, &what);
+    }
+
+    /// `/panes wider|narrower|left|right|reset`: side pane widths (SPEC
+    /// §10.2), saved in `tui.pane_widths`.
+    fn resize_panes(&mut self, how: &str) {
+        let (l, r) = self.pane_widths;
+        let grow = |w: u16, by: i16| -> u16 {
+            if w == 0 {
+                0
+            } else {
+                (w as i16 + by).clamp(10, 40) as u16
+            }
+        };
+        self.pane_widths = match how {
+            "wider" => (grow(l, 3), grow(r, 3)),
+            "narrower" => (grow(l, -3), grow(r, -3)),
+            "left" => (if l == 0 { 22 } else { 0 }, r),
+            "right" => (l, if r == 0 { 26 } else { 0 }),
+            "reset" => (22, 26),
+            _ => {
+                self.notes
+                    .push("usage: /panes [wider|narrower|left|right|reset]".into());
+                return;
+            }
+        };
+        let (l, r) = self.pane_widths;
+        self.fire(Request::SetSetting {
+            key: "tui.pane_widths".into(),
+            value: serde_json::json!([l, r]),
+        });
+        if !self.multi_pane {
+            self.notes
+                .push("(the multi-pane layout is off: /panes turns it on)".into());
+        }
+        self.notes.push(format!(
+            "panes: left {} · chat {}% · right {} (remembered)",
+            if l == 0 {
+                "hidden".to_string()
+            } else {
+                format!("{l}%")
+            },
+            100 - l - r,
+            if r == 0 {
+                "hidden".to_string()
+            } else {
+                format!("{r}%")
+            },
+        ));
     }
 
     /// `/open link [N]`: the Nth link in the last answer (default the
@@ -7806,10 +7874,13 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
 }
 
 fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
+    // Side panes at their set widths (0 hides one; zero-size areas draw
+    // nothing); the chat takes the rest.
+    let (l, r) = app.pane_widths;
     let cols = Layout::horizontal([
-        Constraint::Percentage(22),
-        Constraint::Percentage(52),
-        Constraint::Percentage(26),
+        Constraint::Percentage(l),
+        Constraint::Percentage(100 - l - r),
+        Constraint::Percentage(r),
     ])
     .split(area);
     let left =
@@ -8303,6 +8374,7 @@ mod tests {
             painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
+            pane_widths: (22, 26),
             input_focus: false,
             approval_explain: false,
             approval_code: None,
@@ -9920,6 +9992,30 @@ mod tests {
         );
         assert_eq!(p.lines[1], "2 │   return 1;");
         assert!(p.styled[0].spans.iter().any(|s| s.content == "function"));
+    }
+
+    #[test]
+    fn side_panes_resize_and_hide() {
+        let mut app = test_app();
+        app.multi_pane = true;
+        app.slash("panes wider");
+        assert_eq!(app.pane_widths, (25, 29));
+        app.key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.pane_widths, (22, 26));
+        app.slash("panes left");
+        assert_eq!(app.pane_widths, (0, 26));
+        // A hidden pane draws nothing and the chat takes its room.
+        let screen = render(&mut app, 140, 30);
+        assert!(!screen.contains("╭ Sessions"), "{screen}");
+        app.slash("panes reset");
+        assert!(render(&mut app, 140, 30).contains("╭ Sessions"));
+        assert_eq!(pane_widths(&[0, 99]), (0, 40));
+        assert_eq!(pane_widths(&[]), (22, 26));
+        app.slash("panes sideways");
+        assert!(app.notes.last().unwrap().starts_with("usage: /panes"));
     }
 
     #[test]

@@ -2069,6 +2069,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tui.colors` | {} | Per-role colour overrides: `user`, `assistant`, `tool`, `note`, `error`, `accent` → a name (`light-cyan`) or `#rrggbb` (§10.6) |
 | `tui.code_line_numbers` | false | Dim line numbers in the chat's code blocks (§10.2) |
 | `tui.inline_images` | auto | Image thumbnails in the chat on iTerm2, WezTerm, kitty and Ghostty; `off` keeps only the reference (§10.2) |
+| `tui.pane_widths` | [22, 26] | Multi-pane side panes as a percentage of the width, [left, right]; 0 hides one; `/panes wider\|narrower\|left\|right\|reset` or Ctrl+Shift+←/→ (§10.2) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 
