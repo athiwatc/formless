@@ -211,6 +211,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("provider.cache_key", &["session", "off"]),
     ("tui.notify", &["off", "bell", "desktop"]),
     ("tui.hyperlinks", &["auto", "on", "off"]),
+    ("tui.theme", &["auto", "dark", "light", "high-contrast"]),
 ];
 
 pub const SETTABLE: &[&str] = &[
@@ -779,6 +780,12 @@ pub struct TuiCfg {
     pub timestamps: bool,
     /// Clickable OSC 8 links in the TUI chat: "auto", "on" or "off".
     pub hyperlinks: String,
+    /// "auto" (light or dark from the terminal), "dark", "light" or
+    /// "high-contrast".
+    pub theme: String,
+    /// Per-role colour overrides: user, assistant, tool, note, error,
+    /// accent → a colour name or `#rrggbb`.
+    pub colors: HashMap<String, String>,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -789,6 +796,8 @@ impl Default for TuiCfg {
             notify_min_secs: 20,
             timestamps: true,
             hyperlinks: "auto".into(),
+            theme: "auto".into(),
+            colors: HashMap::new(),
         }
     }
 }
