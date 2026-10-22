@@ -745,6 +745,10 @@ struct App {
     /// Sessions with a Run in flight; run state is per session, not global.
     running_sessions: std::collections::HashSet<String>,
     notes: Vec<String>,
+    /// Toasts for recent notes (SPEC §10.6): how many notes have been
+    /// shown, and the live ones (text, since, error).
+    notes_seen: usize,
+    toasts: Vec<(String, Instant, bool)>,
     pending: HashMap<u64, Pending>,
     tools: Vec<ToolInfo>,
     tool_idx: usize,
@@ -974,6 +978,8 @@ impl App {
             proposal_generating: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
+            notes_seen: 0,
+            toasts: Vec::new(),
             pending: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
@@ -3190,6 +3196,15 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "notes" => {
+                self.pager = Some(Pager {
+                    title: format!("notes ({})", self.notes.len()),
+                    lines: self.notes.clone(),
+                    top: self.notes.len().saturating_sub(20),
+                    left: 0,
+                    styled: Vec::new(),
+                })
+            }
             "pager code" => self.open_code(""),
             cmd if cmd.starts_with("pager code ") => {
                 self.open_code(cmd["pager code ".len()..].trim())
@@ -4766,6 +4781,9 @@ impl App {
                 self.edit_armed = false;
                 self.submit_chat(false);
             }
+            KeyCode::Esc if !self.running() && self.toasts.iter().any(|t| t.2) => {
+                self.toasts.clear();
+            }
             KeyCode::Esc if self.editing_id.is_some() => {
                 self.editing_id = None;
                 self.edit_armed = false;
@@ -4871,6 +4889,7 @@ impl App {
 
 fn draw(f: &mut Frame, app: &mut App) {
     app.click_targets.borrow_mut().clear();
+    app.refresh_toasts();
     if let Some(w) = &app.wizard {
         draw_wizard(f, w, app.color);
         return;
@@ -4890,6 +4909,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .split(f.area());
     draw_tab_bar(f, chunks[0], app);
+    let toast_area = chunks[1];
     match app.view {
         View::Chat if pane_layout(app.multi_pane, chunks[1].width) => draw_panes(f, chunks[1], app),
         View::Chat => draw_chat(f, chunks[1], app),
@@ -4939,6 +4959,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_rollback_picker(f, app, pick);
     } else if let Some(o) = &app.model_overlay {
         draw_model_overlay(f, o, app.color);
+    }
+    if app.view == View::Chat || app.multi_pane {
+        draw_toasts(f, toast_area, app);
     }
     if let Some(p) = &app.pager {
         let area = f.area();
@@ -5695,36 +5718,74 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     }
     let width = area.width as usize;
     let used: usize = left.iter().map(|s| s.width()).sum();
-    let note = app.notes.last().cloned().unwrap_or_default();
+    // Notes show as toasts; the status line keeps a key tip.
+    let mut spans = left;
+    let tip = "Tab views · /help · /notes · Ctrl+C ×2 detach ";
+    if used + tip.chars().count() + 2 < width {
+        spans.push(Span::raw(" ".repeat(width - used - tip.chars().count())));
+        spans.push(Span::styled(tip, ui::dim(app.color)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Whether a note reports a problem (it stays until dismissed).
+fn is_error_note(note: &str) -> bool {
     let lower = note.to_lowercase();
-    let note_style = if [
+    [
         "paused",
         "failed",
         "denied",
         "error",
         "could not",
+        "couldn't",
         "unknown",
+        "cannot",
     ]
     .iter()
     .any(|w| lower.contains(w))
-    {
-        bold_fg(app.color, Color::Red)
-    } else {
-        fg(app.color, Color::Gray)
-    };
-    let room = width.saturating_sub(used + 2);
-    let note = truncate_chars(&note, room.saturating_sub(1));
-    let mut spans = left;
-    if note.is_empty() && used + 40 < width {
-        let tip = "Tab views · /help · Ctrl+C ×2 detach ";
-        spans.push(Span::raw(" ".repeat(width - used - tip.chars().count())));
-        spans.push(Span::styled(tip, ui::dim(app.color)));
-    } else if !note.is_empty() {
-        let pad = width.saturating_sub(used + Span::raw(note.as_str()).width() + 1);
-        spans.push(Span::raw(" ".repeat(pad.max(2))));
-        spans.push(Span::styled(note, note_style));
+}
+
+/// How long an ordinary toast stays.
+const TOAST_SECS: u64 = 6;
+
+/// Recent notes as toasts in the top-right corner of `area`, newest at
+/// the bottom; errors in red until dismissed.
+fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
+    let live: Vec<&(String, Instant, bool)> = app.toasts.iter().rev().take(4).rev().collect();
+    if live.is_empty() || area.width < 20 || area.height < 4 {
+        return;
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let w = (area.width / 2).clamp(20, 64);
+    let lines: Vec<Line> = live
+        .iter()
+        .map(|(text, _, error)| {
+            Line::styled(
+                truncate_chars(text, w as usize - 4),
+                if *error {
+                    bold_fg(app.color, Color::Red)
+                } else {
+                    fg(app.color, Color::Gray)
+                },
+            )
+        })
+        .collect();
+    let any_error = live.iter().any(|t| t.2);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect::new(area.right().saturating_sub(w + 1), area.y + 1, w, h);
+    let mut block = ui::panel(
+        " notes ",
+        app.color,
+        if any_error {
+            Color::Red
+        } else {
+            Color::DarkGray
+        },
+    );
+    if any_error {
+        block = block.title_bottom(ui::hint("Esc dismisses", app.color));
+    }
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// Speaker groups: tool results belong to the assistant turn around them.
@@ -6031,6 +6092,24 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Turn notes added since the last frame into toasts, and drop the
+    /// ordinary ones that have been up long enough.
+    fn refresh_toasts(&mut self) {
+        if self.notes_seen > self.notes.len() {
+            self.notes_seen = self.notes.len();
+        }
+        let now = Instant::now();
+        for n in &self.notes[self.notes_seen..] {
+            self.toasts.push((n.clone(), now, is_error_note(n)));
+        }
+        self.notes_seen = self.notes.len();
+        self.toasts
+            .retain(|(_, t, error)| *error || t.elapsed() < Duration::from_secs(TOAST_SECS));
+        // A burst (e.g. a long list) keeps only its newest lines.
+        let extra = self.toasts.len().saturating_sub(8);
+        self.toasts.drain(..extra);
     }
 
     /// `/panes wider|narrower|left|right|reset`: side pane widths (SPEC
@@ -8468,6 +8547,8 @@ mod tests {
             proposal_generating: false,
             running_sessions: Default::default(),
             notes: Vec::new(),
+            notes_seen: 0,
+            toasts: Vec::new(),
             pending: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
@@ -10220,6 +10301,28 @@ mod tests {
         let (x, y) = target(&app, &Click::Call("c1".into()));
         click_at(&mut app, x + 3, y);
         assert!(app.expanded_calls.contains("c1"));
+    }
+
+    #[test]
+    fn notes_show_as_toasts_and_errors_stay() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.notes.push("saved provider.model".into());
+        app.notes.push("compaction failed: timeout".into());
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("saved provider.model") && screen.contains("Esc dismisses"));
+        // Ordinary toasts expire; errors stay until Esc.
+        for t in &mut app.toasts {
+            t.1 = Instant::now() - Duration::from_secs(60);
+        }
+        let screen = render(&mut app, 100, 24);
+        assert!(!screen.contains("saved provider.model"));
+        assert!(screen.contains("compaction failed"));
+        app.key(key(KeyCode::Esc));
+        assert!(!render(&mut app, 100, 24).contains("compaction failed"));
+        // /notes keeps the whole history.
+        app.slash("notes");
+        assert_eq!(app.pager.as_ref().unwrap().lines.len(), 2);
     }
 
     #[test]
