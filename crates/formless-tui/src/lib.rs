@@ -767,6 +767,10 @@ struct App {
     user_rows: Vec<usize>,
     /// Ctrl+F find in this Session (SPEC §10.2).
     find: Option<FindBar>,
+    /// An edit that would discard later turns waits for a second Enter.
+    edit_armed: bool,
+    /// Text for the input once a fork from a message opens.
+    fork_prefill: Option<String>,
     /// Chat rows when the user scrolled away from the bottom, to count
     /// what arrived since; and where the "new lines" badge was drawn
     /// (row, first and last column) so a click can follow again.
@@ -929,6 +933,8 @@ impl App {
             scroll_to_focus: false,
             user_rows: Vec::new(),
             find: None,
+            edit_armed: false,
+            fork_prefill: None,
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -1062,6 +1068,12 @@ impl App {
                                 self.request(Pending::GetSession, Request::GetSession { id: s.id });
                                 self.view = View::Chat;
                                 self.notes.push("session forked".into());
+                                if let Some(text) = self.fork_prefill.take() {
+                                    self.input.set(&text);
+                                    self.notes.push(
+                                        "the message is in the input: edit it, then Enter".into(),
+                                    );
+                                }
                             }
                         }
                         Pending::SearchSessions => {
@@ -4239,6 +4251,25 @@ impl App {
         out
     }
 
+    fn focused_user_message(&self) -> Option<&MessageInfo> {
+        let id = self.call_focus.as_deref()?.strip_prefix("msg:")?;
+        self.messages
+            .iter()
+            .find(|m| m.id == id && m.role == "user")
+    }
+
+    /// Editing a message with later user turns discards them, so the
+    /// first Enter only asks.
+    fn edit_needs_confirm(&self) -> bool {
+        let Some(id) = &self.editing_id else {
+            return false;
+        };
+        let seq = self.messages.iter().find(|m| &m.id == id).map(|m| m.seq);
+        let later =
+            seq.is_some_and(|s| self.messages.iter().any(|m| m.seq > s && m.role == "user"));
+        later && !self.edit_armed && !self.input.trim().is_empty()
+    }
+
     /// The focused item's text: plain, or as Markdown (SPEC §10.2).
     fn focused_text(&self, markdown: bool) -> Option<(String, String)> {
         let focus = self.call_focus.as_deref()?;
@@ -4315,6 +4346,40 @@ impl App {
                     self.expanded_calls.insert(id);
                 }
                 self.scroll_to_focus = true;
+            }
+            KeyCode::Char(c @ ('e' | 'f')) => {
+                let Some(m) = self.focused_user_message().cloned() else {
+                    self.notes.push("e and f work on your own messages".into());
+                    return true;
+                };
+                self.call_focus = None;
+                if c == 'e' {
+                    // Rewind to this message: Enter re-runs from it.
+                    self.editing_id = Some(m.id.clone());
+                    self.edit_armed = false;
+                    self.input.set(&m.content);
+                    let later = self.messages.iter().filter(|x| x.seq > m.seq).count();
+                    self.notes.push(format!(
+                        "Editing this message — Enter re-runs from here{}",
+                        if later > 0 {
+                            format!(" and discards the {later} later message(s) (asks first)")
+                        } else {
+                            String::new()
+                        }
+                    ));
+                } else if let Some(id) = self.current.clone() {
+                    // A new Session with everything before it; the message
+                    // waits in the input.
+                    self.fork_prefill = Some(m.content.clone());
+                    self.request(
+                        Pending::ForkSession,
+                        Request::ForkSession {
+                            id,
+                            name: None,
+                            up_to_seq: Some(m.seq - 1),
+                        },
+                    );
+                }
             }
             KeyCode::Char(c @ ('c' | 'C')) => {
                 if let Some((text, what)) = self.focused_text(c == 'C') {
@@ -4407,7 +4472,21 @@ impl App {
                 self.input.backspace();
                 self.input.newline();
             }
-            KeyCode::Enter => self.submit_chat(false),
+            KeyCode::Enter if self.edit_needs_confirm() => {
+                self.edit_armed = true;
+                self.notes
+                    .push("Enter again to discard the later turns and re-run (Esc cancels)".into());
+            }
+            KeyCode::Enter => {
+                self.edit_armed = false;
+                self.submit_chat(false);
+            }
+            KeyCode::Esc if self.editing_id.is_some() => {
+                self.editing_id = None;
+                self.edit_armed = false;
+                self.input.clear();
+                self.notes.push("edit cancelled".into());
+            }
             KeyCode::Esc => {
                 if self.running() {
                     if let Some(id) = self.current.clone() {
@@ -5593,9 +5672,13 @@ fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
 }
 
 /// The keys for a focused message, under it.
-fn focus_hint(color: bool, _user: bool) -> Line<'static> {
+fn focus_hint(color: bool, user: bool) -> Line<'static> {
     Line::styled(
-        "  ▲ c copy · C copy as Markdown · [ ] move · Esc",
+        if user {
+            "  ▲ e edit & re-run from here · f fork from here · c copy · C Markdown · [ ] move · Esc"
+        } else {
+            "  ▲ c copy · C copy as Markdown · [ ] move · Esc"
+        },
         bold_fg(color, Color::Yellow),
     )
 }
@@ -7584,6 +7667,8 @@ mod tests {
             scroll_to_focus: false,
             user_rows: Vec::new(),
             find: None,
+            edit_armed: false,
+            fork_prefill: None,
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -8837,6 +8922,51 @@ mod tests {
             .contains("message 3 from the bottom"));
         app.slash("copy 9");
         assert_eq!(app.notes.last().unwrap(), "there are 4 messages to copy");
+    }
+
+    #[test]
+    fn edit_or_fork_from_any_user_message() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.current = Some("s".into());
+        let msg = |id: &str, seq: i64, role: &str, content: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq,
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+            meta: None,
+        };
+        app.messages = vec![
+            msg("u1", 1, "user", "first question"),
+            msg("a1", 2, "assistant", "first answer"),
+            msg("u2", 3, "user", "second question"),
+            msg("a2", 4, "assistant", "second answer"),
+        ];
+        for k in [']', '[', '[', '['] {
+            app.key(key(KeyCode::Char(k)));
+        }
+        assert_eq!(app.call_focus.as_deref(), Some("msg:u1"));
+        assert!(render(&mut app, 120, 30).contains("e edit & re-run from here"));
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.editing_id.as_deref(), Some("u1"));
+        assert_eq!(app.input, "first question");
+        // Later turns would be discarded: the first Enter only asks.
+        app.key(key(KeyCode::Enter));
+        assert!(app.edit_armed && app.editing_id.is_some());
+        app.key(key(KeyCode::Enter));
+        assert!(app.editing_id.is_none() && app.input.is_empty());
+        // f forks from the second question, which waits in the input.
+        app.key(key(KeyCode::Char(']')));
+        app.key(key(KeyCode::Char('[')));
+        assert_eq!(app.call_focus.as_deref(), Some("msg:u2"));
+        app.key(key(KeyCode::Char('f')));
+        assert_eq!(app.fork_prefill.as_deref(), Some("second question"));
+        // e on an answer explains it needs one of your messages.
+        app.key(key(KeyCode::Char(']')));
+        app.key(key(KeyCode::Char('e')));
+        assert!(app.notes.last().unwrap().contains("your own messages"));
     }
 
     #[test]
