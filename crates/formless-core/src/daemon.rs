@@ -1941,6 +1941,10 @@ impl Daemon {
         // until a final text answer (SPEC §5.2). Context is rebuilt from the
         // DB each iteration, so steered messages join at step boundaries.
         let mut reminded_pending = false;
+        // Once per step: an answer that refuses for lack of access, before
+        // any Tool was used, is sent back with a nudge to build the Tool.
+        let mut nudged_refusal = false;
+        let mut used_tools = false;
         loop {
             if cancel.is_cancelled() {
                 return Err(anyhow!("interrupted"));
@@ -2084,6 +2088,23 @@ impl Daemon {
                     text: "Provider rejected reasoning_effort; retried without it.".into(),
                 });
             }
+            if result.tool_calls.is_empty()
+                && cfg.provider.tool_use_nudge
+                && !used_tools
+                && !nudged_refusal
+                && crate::provider::looks_like_access_refusal(&result.content)
+            {
+                nudged_refusal = true;
+                let msg = self.with_store(|st| {
+                    st.append_message(session_id, "system-note", crate::provider::REFUSAL_NUDGE)
+                })?;
+                self.broadcast(Event::MessageAppended {
+                    session_id: session_id.to_string(),
+                    message: msg,
+                });
+                continue;
+            }
+            used_tools |= !result.tool_calls.is_empty();
             if result.tool_calls.is_empty() {
                 // Pending handles still live: remind once, then accept the
                 // next final answer and mark the rest abandoned (§6.3).
@@ -3084,10 +3105,40 @@ impl Daemon {
         if let Some(p) = self.with_store(|st| st.session_system_prompt(session_id))? {
             return Ok(p);
         }
-        let p = self.effective_system_prompt();
+        let p = self.fresh_session_prompt(session_id);
         self.with_store(|st| st.set_session_system_prompt(session_id, &p))?;
         let _ = self.with_store(|st| st.touch_memories());
         Ok(p)
+    }
+
+    /// The prompt a Session would start with now: the effective prompt
+    /// plus its model family's addendum, if any (stable per Session, so
+    /// the cached prefix stays valid).
+    fn fresh_session_prompt(&self, session_id: &str) -> String {
+        let mut prompt = self.effective_system_prompt();
+        let Ok(cfg) = self.config() else {
+            return prompt;
+        };
+        if !cfg.provider.tool_use_nudge {
+            return prompt;
+        }
+        let (mut model, _) = self.session_model_effort(session_id, &cfg);
+        if let Some(role) = model.strip_prefix("role:") {
+            // A role's own model, else its provider's default.
+            model = match cfg.role(role) {
+                Ok(r) if !r.model.is_empty() => r.model.clone(),
+                Ok(r) => cfg
+                    .provider_cfg(r.provider.as_deref())
+                    .map(|p| p.model)
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+        }
+        if let Some(extra) = crate::provider::model_family_addendum(&model) {
+            prompt.push_str("\n\n");
+            prompt.push_str(extra);
+        }
+        prompt
     }
 
     pub fn effective_system_prompt(&self) -> String {
@@ -5748,7 +5799,7 @@ impl Daemon {
         // Re-pick the most-used filler: Tools that became popular since.
         self.with_store(|st| st.reset_filler(session_id))?;
         self.with_store(|st| st.unpin_definitions(session_id, None))?;
-        let current = self.effective_system_prompt();
+        let current = self.fresh_session_prompt(session_id);
         if self.session_prompt(session_id)? != current {
             self.with_store(|st| st.set_session_system_prompt(session_id, &current))?;
             let _ = self.with_store(|st| st.touch_memories());
