@@ -1,6 +1,7 @@
 pub mod client;
 mod commands;
 mod highlight;
+mod input;
 mod markdown;
 mod mermaid;
 mod picker;
@@ -558,7 +559,7 @@ struct App {
     chat_scroll_top: Option<usize>,
     chat_view_height: usize,
     chat_line_count: usize,
-    input: String,
+    input: input::InputLine,
     /// When Ctrl+C was last pressed: a second press soon after detaches.
     ctrl_c_at: Option<Instant>,
     /// The terminal reports Ctrl+Enter apart from Enter (kitty keyboard
@@ -708,7 +709,7 @@ impl App {
             chat_scroll_top: None,
             chat_view_height: 10,
             chat_line_count: 0,
-            input: String::new(),
+            input: input::InputLine::default(),
             ctrl_c_at: None,
             enhanced_keys: false,
             mouse_capture: true,
@@ -1262,7 +1263,7 @@ impl App {
                             }
                         }
                         Pending::GetMcpPrompt => {
-                            self.input = result["text"].as_str().unwrap_or_default().to_string();
+                            self.input.set(result["text"].as_str().unwrap_or_default());
                             self.notes
                                 .push("prompt loaded into the input; edit it, then Enter".into());
                         }
@@ -1927,7 +1928,7 @@ impl App {
     }
 
     fn submit_chat(&mut self, queued: bool) {
-        let text = std::mem::take(&mut self.input);
+        let text = self.input.take();
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
@@ -2074,7 +2075,7 @@ impl App {
         let Some(q) = self.input.strip_prefix('/') else {
             return Vec::new();
         };
-        if self.palette_hidden.as_deref() == Some(self.input.as_str())
+        if self.palette_hidden.as_deref() == Some(&*self.input)
             || self.search_mode
             || self.renaming
             || self.import_mode.is_some()
@@ -2136,20 +2137,20 @@ impl App {
         match key.code {
             KeyCode::Up => self.palette_sel = sel.saturating_sub(1),
             KeyCode::Down => self.palette_sel = (sel + 1).min(items.len() - 1),
-            KeyCode::Esc => self.palette_hidden = Some(self.input.clone()),
+            KeyCode::Esc => self.palette_hidden = Some(self.input.to_string()),
             KeyCode::Tab if key.modifiers.is_empty() => {
-                self.input = items[sel].insert.clone();
+                self.input.set(&items[sel].insert);
                 self.palette_sel = 0;
             }
             KeyCode::Enter if key.modifiers.is_empty() => {
                 let item = &items[sel];
                 if item.runnable {
-                    self.input = item.insert.trim_end().to_string();
+                    self.input.set(item.insert.trim_end());
                     self.palette_sel = 0;
                     self.submit_chat(false);
                 } else {
                     self.notes.push(format!("usage: {}", item.label));
-                    self.input = item.insert.clone();
+                    self.input.set(&item.insert);
                     self.palette_sel = 0;
                 }
             }
@@ -2160,7 +2161,12 @@ impl App {
 
     /// Open, refresh or close the `@` popup for the input's last word.
     fn update_mention(&mut self) {
-        let word = self.input.rsplit(char::is_whitespace).next().unwrap_or("");
+        let word = self
+            .input
+            .before_cursor()
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or("");
         let query = match word.strip_prefix('@') {
             Some(q) if !self.input.starts_with('/') => q.to_string(),
             _ => {
@@ -2205,16 +2211,19 @@ impl App {
             KeyCode::Esc => m.dismissed = true,
             KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
                 let f = m.files[m.sel.min(m.files.len() - 1)].clone();
-                let word_len = self
+                let word_chars = self
                     .input
+                    .before_cursor()
                     .rsplit(char::is_whitespace)
                     .next()
                     .unwrap_or("")
-                    .len();
-                self.input.truncate(self.input.len() - word_len);
-                self.input.push('@');
-                self.input.push_str(&f.path);
-                self.input.push(if f.dir { '/' } else { ' ' });
+                    .chars()
+                    .count();
+                for _ in 0..word_chars {
+                    self.input.backspace();
+                }
+                self.input
+                    .insert_str(&format!("@{}{}", f.path, if f.dir { '/' } else { ' ' }));
                 self.update_mention();
             }
             _ => return false,
@@ -2282,7 +2291,7 @@ impl App {
             "edit" | "retry" => match self.messages.iter().rev().find(|m| m.role == "user") {
                 Some(m) => {
                     self.editing_id = Some(m.id.clone());
-                    self.input = m.content.clone();
+                    self.input.set(&m.content);
                     self.notes
                         .push("Editing your last message — Enter retries from there.".into());
                 }
@@ -3312,41 +3321,131 @@ impl App {
                 KeyCode::Esc => self.view = View::Chat,
                 _ => {}
             },
-            _ => match key.code {
-                KeyCode::PageUp => {
-                    let page = self.chat_view_height.saturating_sub(1).max(1);
-                    self.scroll_chat_up(page);
+            _ => self.input_key(key),
+        }
+    }
+
+    /// The user messages of the current Session, oldest first: the input
+    /// history for Up/Down and Ctrl+R.
+    fn input_history(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    /// Chat-view keys: the line editor, history, sending and scrolling
+    /// (PgUp/PgDn and the wheel; ↑/↓ belong to the input).
+    fn input_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.input.searching().is_some() {
+            let history = self.input_history();
+            match key.code {
+                KeyCode::Char('r') if ctrl => self.input.search_older(&history),
+                KeyCode::Char('g') if ctrl => self.input.search_cancel(),
+                KeyCode::Esc => self.input.search_cancel(),
+                KeyCode::Enter => self.input.search_accept(&history),
+                KeyCode::Backspace => self.input.search_type(None, &history),
+                KeyCode::Char(c) if !ctrl && !alt => self.input.search_type(Some(c), &history),
+                _ => {
+                    self.input.search_accept(&history);
+                    self.input_key(key);
                 }
-                KeyCode::PageDown => {
-                    let page = self.chat_view_height.saturating_sub(1).max(1);
-                    self.scroll_chat_down(page);
-                }
-                KeyCode::Up => self.scroll_chat_up(3),
-                KeyCode::Down => self.scroll_chat_down(3),
-                KeyCode::End => self.follow_chat_bottom(),
-                _ if is_queue_key(&key) => self.submit_chat(true),
-                KeyCode::Enter => self.submit_chat(false),
-                KeyCode::Esc => {
-                    if self.running() {
-                        if let Some(id) = self.current.clone() {
-                            self.fire(Request::InterruptRun { session_id: id });
-                        }
-                    } else {
-                        self.view = View::Chat;
+            }
+            return;
+        }
+        let page = self.chat_view_height.saturating_sub(1).max(1);
+        match key.code {
+            KeyCode::PageUp => self.scroll_chat_up(page),
+            KeyCode::PageDown => self.scroll_chat_down(page),
+            KeyCode::Up if !self.input.on_first_line() => self.input.vertical(false),
+            KeyCode::Down if !self.input.on_last_line() => self.input.vertical(true),
+            KeyCode::Up => {
+                let history = self.input_history();
+                self.input.history_prev(&history);
+            }
+            KeyCode::Down => {
+                let history = self.input_history();
+                self.input.history_next(&history);
+            }
+            KeyCode::End if self.input.is_empty() => self.follow_chat_bottom(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => self.input.newline(),
+            _ if is_queue_key(&key) => self.submit_chat(true),
+            // A trailing `\` + Enter is a newline in any terminal.
+            KeyCode::Enter if self.input.before_cursor().ends_with('\\') => {
+                self.input.backspace();
+                self.input.newline();
+            }
+            KeyCode::Enter => self.submit_chat(false),
+            KeyCode::Esc => {
+                if self.running() {
+                    if let Some(id) = self.current.clone() {
+                        self.fire(Request::InterruptRun { session_id: id });
                     }
+                } else {
+                    self.view = View::Chat;
                 }
-                KeyCode::Backspace => {
-                    self.input.pop();
-                    self.palette_sel = 0;
-                    self.update_mention();
+            }
+            KeyCode::Backspace if ctrl || alt => self.input.delete_word_back(),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete(),
+            KeyCode::Left if ctrl || alt => self.input.word_left(),
+            KeyCode::Right if ctrl || alt => self.input.word_right(),
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
+            KeyCode::Char(c) if ctrl => match c {
+                'a' => self.input.home(),
+                'e' => self.input.end(),
+                'b' => self.input.left(),
+                'f' => self.input.right(),
+                'w' => self.input.delete_word_back(),
+                // Ctrl+H is Backspace in many terminals.
+                'h' => self.input.backspace(),
+                'u' => self.input.kill_to_start(),
+                'k' => self.input.kill_to_end(),
+                'd' => self.input.delete(),
+                'r' => {
+                    let history = self.input_history();
+                    self.input.search_older(&history);
                 }
-                KeyCode::Char(c) => {
-                    self.input.push(c);
-                    self.palette_sel = 0;
-                    self.update_mention();
-                }
-                _ => {}
+                _ => return,
             },
+            KeyCode::Char(c) if alt => match c {
+                'b' => self.input.word_left(),
+                'f' => self.input.word_right(),
+                'd' => self.input.delete_word_forward(),
+                _ => return,
+            },
+            KeyCode::Char(c) => self.input.insert_char(c),
+            _ => return,
+        }
+        self.palette_sel = 0;
+        self.update_mention();
+    }
+
+    /// A bracketed paste: one block, wherever text is being typed.
+    fn paste(&mut self, text: &str) {
+        if self.wizard.is_some() || self.model_overlay.is_some() {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                self.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            return;
+        }
+        if let Some(ed) = &mut self.editor {
+            let chars: Vec<char> = text.replace("\r\n", "\n").chars().collect();
+            let n = chars.len();
+            ed.chars.splice(ed.cursor..ed.cursor, chars);
+            ed.cursor += n;
+            return;
+        }
+        if matches!(self.view, View::Chat | View::Settings) {
+            self.input.paste(text);
+            self.palette_sel = 0;
+            self.update_mention();
         }
     }
 }
@@ -3360,10 +3459,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_editor(f, ed, app);
         return;
     }
+    let input_h = input_height(app, f.area().width)
+        .min(f.area().height / 2)
+        .max(3);
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(input_h),
         Constraint::Length(1),
     ])
     .split(f.area());
@@ -3769,19 +3871,43 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     } else {
         ("› ", Color::Cyan)
     };
-    let inner = area.width.saturating_sub(2) as usize;
-    let avail = inner.saturating_sub(prompt.chars().count() + 1).max(1);
-    // Show the tail of long input so the cursor end stays visible.
-    let chars: Vec<char> = app.input.chars().collect();
-    let shown: String = chars[chars.len().saturating_sub(avail)..].iter().collect();
-    let mut spans = vec![Span::styled(prompt, bold_fg(app.color, color))];
-    if shown.is_empty() && !app.running() && prompt == "› " && show_cursor {
-        spans.push(Span::styled(
-            "Ask Formless to do something…",
-            ui::dim(app.color),
-        ));
+    let prompt_w = Span::raw(prompt).width();
+    let avail = input_text_width(area.width, prompt);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor = Some((0usize, 0usize));
+    if let Some((query, found)) = app.input.searching() {
+        let hit = found
+            .and_then(|i| app.input_history().get(i).cloned())
+            .unwrap_or_default();
+        let label = format!("(history search) {query}▏: ");
+        lines.push(Line::from(vec![
+            Span::styled(label.clone(), bold_fg(app.color, Color::Magenta)),
+            Span::raw(truncate_chars(
+                &hit.replace('\n', " ⏎ "),
+                avail.saturating_sub(label.chars().count()),
+            )),
+        ]));
+        // The ▏ marks the query's end; no terminal cursor.
+        cursor = None;
+    } else if app.input.is_empty() && !app.running() && prompt == "› " && show_cursor {
+        lines.push(Line::from(vec![
+            Span::styled(prompt, bold_fg(app.color, color)),
+            Span::styled("Ask Formless to do something…", ui::dim(app.color)),
+        ]));
     } else {
-        spans.push(Span::raw(shown.clone()));
+        let (rows, cur) = app.input.layout(avail);
+        let height = area.height.saturating_sub(2).max(1) as usize;
+        // Keep the cursor row on screen.
+        let top = cur.0.saturating_sub(height - 1);
+        for (i, row) in rows.into_iter().enumerate().skip(top).take(height) {
+            let lead = if i == 0 {
+                Span::styled(prompt, bold_fg(app.color, color))
+            } else {
+                Span::raw(" ".repeat(prompt_w))
+            };
+            lines.push(Line::from(vec![lead, Span::raw(row)]));
+        }
+        cursor = Some((cur.0 - top, cur.1));
     }
     let mut block = ui::panel(" Message ", app.color, color);
     if area.width > 64 {
@@ -3789,16 +3915,40 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
             &if app.running() {
                 format!("Enter steer · {} queue · Esc stop", app.queue_label())
             } else {
-                format!("Enter send · {} queue · /help", app.queue_label())
+                format!(
+                    "Enter send · Shift+Enter newline · {} queue · /help",
+                    app.queue_label()
+                )
             },
             app.color,
         ));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
-    if show_cursor {
-        let x = area.x + 1 + Span::raw(prompt).width() as u16 + Span::raw(shown).width() as u16;
-        f.set_cursor_position((x.min(area.right().saturating_sub(2)), area.y + 1));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some((row, col)) = cursor.filter(|_| show_cursor) {
+        let x = area.x + 1 + prompt_w as u16 + col as u16;
+        let y = area.y + 1 + row as u16;
+        f.set_cursor_position((
+            x.min(area.right().saturating_sub(2)),
+            y.min(area.bottom().saturating_sub(2)),
+        ));
     }
+}
+
+/// Columns for input text inside the box after the prompt.
+fn input_text_width(box_width: u16, prompt: &str) -> usize {
+    (box_width.saturating_sub(2) as usize)
+        .saturating_sub(Span::raw(prompt).width() + 1)
+        .max(1)
+}
+
+/// The input box's height: its wrapped rows (up to 8) plus borders.
+fn input_height(app: &App, width: u16) -> u16 {
+    let rows = app
+        .input
+        .layout(input_text_width(width, "steer › "))
+        .0
+        .len();
+    rows.clamp(1, 8) as u16 + 2
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
@@ -5527,6 +5677,8 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
     out.execute(crossterm::event::EnableMouseCapture)?;
+    // Pastes arrive as one event, so pasted newlines never send.
+    let _ = out.execute(crossterm::event::EnableBracketedPaste);
     // Ctrl+Enter is only distinguishable with the kitty keyboard protocol.
     app.enhanced_keys = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
         && out
@@ -5545,6 +5697,7 @@ pub fn run(paths: Paths) -> Result<()> {
                 match event::read()? {
                     CtEvent::Key(k) => app.key(k),
                     CtEvent::Mouse(m) => app.mouse(m.kind),
+                    CtEvent::Paste(text) => app.paste(&text),
                     _ => {}
                 }
             }
@@ -5555,6 +5708,7 @@ pub fn run(paths: Paths) -> Result<()> {
         let _ = stdout().execute(crossterm::event::PopKeyboardEnhancementFlags);
     }
     disable_raw_mode()?;
+    let _ = stdout().execute(crossterm::event::DisableBracketedPaste);
     let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
     result
@@ -5641,7 +5795,7 @@ mod tests {
             chat_scroll_top: None,
             chat_view_height: 10,
             chat_line_count: 100,
-            input: String::new(),
+            input: input::InputLine::default(),
             ctrl_c_at: None,
             enhanced_keys: false,
             mouse_capture: true,
@@ -6228,6 +6382,71 @@ mod tests {
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
+    }
+
+    #[test]
+    fn input_edits_recalls_history_and_keeps_pastes_whole() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let with = |code, m| KeyEvent::new(code, m);
+        let mut app = test_app();
+        app.messages = ["first ask", "second ask"]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| MessageInfo {
+                id: format!("m{i}"),
+                session_id: "s".into(),
+                seq: i as i64,
+                role: "user".into(),
+                content: c.to_string(),
+                created_at: String::new(),
+                meta: None,
+            })
+            .collect();
+        for c in "helo".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Char('l')));
+        assert_eq!(app.input, "hello");
+        // Up recalls this Session's messages; Down returns to the draft.
+        app.key(key(KeyCode::Up));
+        assert_eq!(app.input, "second ask");
+        app.key(key(KeyCode::Up));
+        assert_eq!(app.input, "first ask");
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Down));
+        assert_eq!(app.input, "hello");
+        // Shift+Enter and a trailing backslash add newlines.
+        app.key(with(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.key(key(KeyCode::Char('x')));
+        app.key(key(KeyCode::Char('\\')));
+        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Char('y')));
+        assert_eq!(app.input, "hello\nx\ny");
+        // Up on a later line moves within the input, not through history.
+        app.key(key(KeyCode::Up));
+        assert_eq!(app.input, "hello\nx\ny");
+        for (w, h) in [(1, 1), (12, 6), (80, 24)] {
+            render(&mut app, w, h);
+        }
+        // Ctrl+U clears the cursor's line (now "x"); Ctrl+R finds an
+        // earlier message.
+        app.key(with(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "hello\n\ny");
+        app.input.clear();
+        app.key(with(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        for c in "first".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert!(render(&mut app, 80, 24).contains("(history search) first"));
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.input, "first ask");
+        // A big paste stays one block and is sent in full.
+        app.input.clear();
+        let big = vec!["row"; 30].join("\n");
+        app.paste(&big);
+        assert_eq!(app.input, "[pasted 30 lines #1]");
+        assert_eq!(app.input.take(), big);
     }
 
     #[test]
