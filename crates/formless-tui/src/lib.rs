@@ -203,6 +203,18 @@ fn drafts_file(paths: &Paths) -> std::path::PathBuf {
     paths.data_dir.join("tui-drafts.json")
 }
 
+/// What a mouse click can hit.
+#[derive(Debug, Clone, PartialEq)]
+enum Click {
+    View(View),
+    /// A row of the Sessions, Tools or Proposals list (visible index).
+    Session(usize),
+    Tool(usize),
+    Proposal(usize),
+    /// A persisted tool call's header in the chat.
+    Call(String),
+}
+
 /// The Ctrl+F find bar: the query, the current match and, from the last
 /// draw, the wrapped row of every matching line.
 #[derive(Default)]
@@ -863,6 +875,10 @@ struct App {
     /// Rendered Markdown of settled messages, keyed by content and width.
     /// Rendered settled messages by (id, content length, width).
     md_cache: std::cell::RefCell<HashMap<(String, usize, usize), Vec<Line<'static>>>>,
+    /// Clickable regions of the last frame (SPEC §10.5), and the last
+    /// click for double-click detection.
+    click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
+    last_click: Option<(Click, Instant)>,
     /// The streaming answer's settled prefix: (key, rendered lines).
     stream_cache: std::cell::RefCell<Option<(StreamKey, Vec<Line<'static>>)>>,
 }
@@ -1031,6 +1047,8 @@ impl App {
             editing_id: None,
             should_quit: false,
             md_cache: Default::default(),
+            click_targets: Default::default(),
+            last_click: None,
             stream_cache: Default::default(),
         };
         if oauth_login_required {
@@ -3646,18 +3664,34 @@ impl App {
 
     fn mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
-        if self.wizard.is_some() || self.view != View::Chat {
+        if self.wizard.is_some() {
+            return;
+        }
+        if self.view != View::Chat && !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(3),
             MouseEventKind::ScrollDown => self.scroll_chat_down(3),
-            // The "↓ N new lines" badge follows the bottom again.
             MouseEventKind::Down(MouseButton::Left) => {
+                // The "↓ N new lines" badge follows the bottom again.
                 if let Some((row, x0, x1)) = self.new_badge {
                     if m.row == row && (x0..=x1).contains(&m.column) {
                         self.follow_chat_bottom();
+                        return;
                     }
+                }
+                let hit = self
+                    .click_targets
+                    .borrow()
+                    .iter()
+                    .find(|(r, _)| {
+                        (r.x..r.x + r.width).contains(&m.column)
+                            && (r.y..r.y + r.height).contains(&m.row)
+                    })
+                    .map(|(_, c)| c.clone());
+                if let Some(c) = hit {
+                    self.click(c);
                 }
             }
             _ => {}
@@ -4836,6 +4870,7 @@ impl App {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    app.click_targets.borrow_mut().clear();
     if let Some(w) = &app.wizard {
         draw_wizard(f, w, app.color);
         return;
@@ -5374,6 +5409,40 @@ fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     );
 }
 
+fn views_for_click(app: &App) -> Vec<View> {
+    let mut views: Vec<View> = VIEW_ORDER.to_vec();
+    if app.view == View::Search {
+        views.push(View::Search);
+    }
+    views
+}
+
+/// Remember a clickable region for this frame.
+fn clickable(app: &App, rect: Rect, what: Click) {
+    app.click_targets.borrow_mut().push((rect, what));
+}
+
+/// Rows of a list or table drawn in `area` (inside its border, after
+/// `header` rows), from its scroll `offset`, as click targets.
+fn clickable_rows(
+    app: &App,
+    area: Rect,
+    header: u16,
+    offset: usize,
+    count: usize,
+    what: fn(usize) -> Click,
+) {
+    let top = area.y + 1 + header;
+    let rows = area.height.saturating_sub(2 + header) as usize;
+    for (k, i) in (offset..count).take(rows).enumerate() {
+        clickable(
+            app,
+            Rect::new(area.x + 1, top + k as u16, area.width.saturating_sub(2), 1),
+            what(i),
+        );
+    }
+}
+
 fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(
         " ◇ Formless ",
@@ -5398,6 +5467,19 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
     if used > area.width as usize {
         // Narrow terminal: the view names matter more than the brand.
         used -= spans.remove(0).width();
+    }
+    // Each view's tab is clickable.
+    let mut x = area.x;
+    for span in &spans {
+        let w = span.width() as u16;
+        let label = span.content.trim();
+        if let Some(v) = views_for_click(app)
+            .into_iter()
+            .find(|v| v.label() == label)
+        {
+            clickable(app, Rect::new(x, area.y, w, 1), Click::View(v));
+        }
+        x += w;
     }
     let tip = " Tab ⇥ ";
     if used + tip.len() < area.width as usize {
@@ -5919,6 +6001,38 @@ impl App {
         self.copy_text(&text, &what);
     }
 
+    /// A click on `what` (SPEC §10.5): tabs switch views, list rows
+    /// select (a double-click opens), and a tool call toggles.
+    fn click(&mut self, what: Click) {
+        let double = self
+            .last_click
+            .as_ref()
+            .is_some_and(|(c, t)| *c == what && t.elapsed() < Duration::from_millis(400));
+        self.last_click = Some((what.clone(), Instant::now()));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        match what {
+            Click::View(v) => self.open_view(v),
+            Click::Session(i) => {
+                self.session_idx = i;
+                if double {
+                    self.key(enter);
+                }
+            }
+            Click::Tool(i) => {
+                self.tool_idx = i;
+                if double {
+                    self.key(enter);
+                }
+            }
+            Click::Proposal(i) => self.proposal_idx = i,
+            Click::Call(id) => {
+                if !self.expanded_calls.remove(&id) {
+                    self.expanded_calls.insert(id);
+                }
+            }
+        }
+    }
+
     /// `/panes wider|narrower|left|right|reset`: side pane widths (SPEC
     /// §10.2), saved in `tui.pane_widths`.
     fn resize_panes(&mut self, how: &str) {
@@ -6409,6 +6523,8 @@ struct ChatRender {
     focus_line: Option<usize>,
     user_lines: Vec<usize>,
     image_lines: Vec<(usize, String)>,
+    /// Persisted tool calls' header lines, for clicks.
+    call_lines: Vec<(usize, String)>,
 }
 
 fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
@@ -6417,6 +6533,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let mut user_lines = Vec::new();
     // Rows reserved for image thumbnails: (first line, file).
     let mut image_lines: Vec<(usize, String)> = Vec::new();
+    let mut call_lines: Vec<(usize, String)> = Vec::new();
     // Results by call id, so each call renders with its result and the
     // separate `tool` line is skipped.
     let results: HashMap<String, &str> = app
@@ -6517,6 +6634,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                         if app.call_focus.as_deref() == Some(call.0.as_str()) {
                             focus_line = Some(lines.len());
                         }
+                        call_lines.push((lines.len(), call.0.clone()));
                         let result = results.get(&call.0).copied();
                         lines.extend(tool_call_block(app, &call, result));
                     }
@@ -6631,6 +6749,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         focus_line,
         user_lines,
         image_lines,
+        call_lines,
     }
 }
 
@@ -6646,6 +6765,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         focus_line,
         user_lines,
         image_lines,
+        call_lines,
     } = chat_lines(app, width as usize, height);
     // Find (Ctrl+F): highlight matches; the current one stands out.
     let mut match_lines = Vec::new();
@@ -6785,6 +6905,18 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             .scroll((scroll_top.min(u16::MAX as usize) as u16, 0)),
         area,
     );
+    // A click on a call's header toggles it.
+    for (i, id) in &call_lines {
+        let row = line_rows[*i];
+        if row >= scroll_top && row < scroll_top + height {
+            let y = area.y + 1 + (row - scroll_top) as u16;
+            clickable(
+                app,
+                Rect::new(area.x + 1, y, width, 1),
+                Click::Call(id.clone()),
+            );
+        }
+    }
     // Thumbnails whose rows are all on screen (drawn after the frame).
     app.image_placed = image_rows
         .into_iter()
@@ -6849,6 +6981,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     if !visible.is_empty() {
         state.select(Some(app.session_idx.min(visible.len() - 1)));
     }
+    let count = visible.len();
     f.render_stateful_widget(
         List::new(items)
             .block(
@@ -6873,6 +7006,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
         area,
         &mut state,
     );
+    clickable_rows(app, area, 0, state.offset(), count, Click::Session);
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
@@ -7412,6 +7546,7 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
         area,
         &mut state,
     );
+    clickable_rows(app, area, 1, state.offset(), visible.len(), Click::Proposal);
 }
 
 fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
@@ -7648,6 +7783,7 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
             parts[0],
             &mut state,
         );
+        clickable_rows(app, parts[0], 1, state.offset(), visible.len(), Click::Tool);
     }
     f.render_widget(
         Paragraph::new(tool_detail_lines(app))
@@ -8406,6 +8542,8 @@ mod tests {
             editing_id: None,
             should_quit: false,
             md_cache: Default::default(),
+            click_targets: Default::default(),
+            last_click: None,
             stream_cache: Default::default(),
         }
     }
@@ -10016,6 +10154,72 @@ mod tests {
         assert_eq!(pane_widths(&[]), (22, 26));
         app.slash("panes sideways");
         assert!(app.notes.last().unwrap().starts_with("usage: /panes"));
+    }
+
+    #[test]
+    fn mouse_clicks_switch_tabs_select_rows_and_toggle_calls() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let click_at = |app: &mut App, column: u16, row: u16| {
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let target = |app: &App, what: &Click| {
+            app.click_targets
+                .borrow()
+                .iter()
+                .find(|(_, c)| c == what)
+                .map(|(r, _)| (r.x, r.y))
+                .unwrap()
+        };
+        let mut app = test_app();
+        app.tools = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|n| ToolInfo {
+                id: n.to_string(),
+                name: n.to_string(),
+                description: String::new(),
+                retired: false,
+                current_version: 1,
+                capabilities: vec![],
+                memory_mb: 64,
+                invocations: 0,
+                success_rate: None,
+                needs_attention: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
+        render(&mut app, 120, 30);
+        let (x, y) = target(&app, &Click::View(View::Tools));
+        click_at(&mut app, x + 1, y);
+        assert_eq!(app.view, View::Tools);
+        render(&mut app, 120, 30);
+        let (x, y) = target(&app, &Click::Tool(2));
+        click_at(&mut app, x + 2, y);
+        assert_eq!(app.selected_tool().unwrap().name, "gamma");
+        // A tool call in the chat toggles on click.
+        app.view = View::Chat;
+        app.messages = vec![MessageInfo {
+            id: "a".into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: String::new(),
+            created_at: String::new(),
+            meta: Some(
+                serde_json::json!({"tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "fetch", "arguments": "{}"}}]})
+                .to_string(),
+            ),
+        }];
+        render(&mut app, 120, 30);
+        let (x, y) = target(&app, &Click::Call("c1".into()));
+        click_at(&mut app, x + 3, y);
+        assert!(app.expanded_calls.contains("c1"));
     }
 
     #[test]

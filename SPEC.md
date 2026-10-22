@@ -1783,6 +1783,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   Shortcuts never fire while typing or while a dialog is open. Approvals
   keep `y`/`o`/`n`.
 
+- **Mouse (TUI).** While mouse capture is on: clicking a tab switches
+  views, clicking a row in the Sessions, Tools or Proposals list selects
+  it and a double-click opens it (as Enter), and clicking a tool call's
+  header in the chat expands or collapses it. Each frame records its
+  clickable regions, list rows from the widgets' own scroll offsets.
+
 ### 10.6 Live feedback (v2)
 
 - **Live call tree:** `ToolCallStarted.depth` gives a call's `tools.call`
