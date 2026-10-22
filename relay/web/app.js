@@ -968,6 +968,131 @@
     close.focus();
   }
 
+  // ------------------------------------------------------- model picker
+  /** Case-insensitive subsequence match; higher scores are better
+   * (same rules as the TUI's picker). Returns [score, positions] or null. */
+  function fuzzyMatch(query, cand) {
+    const q = [...query.replace(/\s+/g, "").toLowerCase()];
+    if (!q.length) return [0, []];
+    const c = [...cand.toLowerCase()];
+    const pos = [];
+    let score = 0, qi = 0, prev = -1;
+    for (let i = 0; i < c.length && qi < q.length; i++) {
+      if (c[i] !== q[qi]) continue;
+      score += 1;
+      if (prev >= 0 && prev + 1 === i) score += 5;
+      if (i === 0 || !/[\p{L}\p{N}]/u.test(c[i - 1])) score += 8;
+      if (prev >= 0) score -= Math.min(i - prev - 1, 10);
+      pos.push(i);
+      prev = i;
+      qi++;
+    }
+    if (qi < q.length) return null;
+    return [score - Math.floor(c.length / 8), pos];
+  }
+
+  async function setSessionModel(model, effort) {
+    if (!S.current) return toast("No current session.", true);
+    const req = { type: "set_session_model", id: S.current, model };
+    if (effort !== undefined) req.reasoning_effort = effort;
+    const s = await act(req);
+    if (!s) return;
+    const i = S.sessions.findIndex((x) => x.id === s.id);
+    if (i >= 0) S.sessions[i] = s;
+    renderStatus();
+    note("session model: " + (s.model || "default") + " (effort " + (s.reasoning_effort || "default") + ")");
+  }
+
+  /** `/model`: filter models as you type; Enter sets this Session's model,
+   * Ctrl/⌘+Enter the global default. */
+  async function openModelPicker() {
+    const session = S.sessions.find((x) => x.id === S.current);
+    const efforts = ["", "low", "medium", "high"];
+    const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
+    const list = h("ul", { class: "picker-list", role: "listbox" });
+    const effort = h("select", { "aria-label": "Reasoning effort" },
+      efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
+    effort.value = (session && session.reasoning_effort) || "";
+    const status = h("span", { class: "muted" }, "loading models…");
+    const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
+    const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
+    const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, "Use in this Session");
+    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Model" },
+      h("div", { class: "modal picker" },
+        h("h2", null, "Model"),
+        input, list,
+        h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
+        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), cancel, asDefault, apply)));
+    let items = [], matches = [], sel = 0;
+    const close = () => { dialog.remove(); $("input").focus(); };
+    const choice = () => (matches[sel] && matches[sel].item.id) || input.value.trim();
+    const multiSource = () => new Set(items.map((i) => i.source)).size > 1;
+    function draw() {
+      const q = input.value;
+      matches = items.map((item, n) => ({ item, n, m: fuzzyMatch(q, item.id) }))
+        .filter((x) => x.m)
+        .sort((a, b) => (q.trim() ? b.m[0] - a.m[0] : 0) || a.n - b.n)
+        .map((x) => ({ item: x.item, pos: new Set(x.m[1]) }));
+      sel = Math.min(sel, Math.max(0, matches.length - 1));
+      const sources = multiSource();
+      list.replaceChildren(...matches.slice(0, 200).map((x, i) => {
+        const id = [...x.item.id].map((ch, n) => x.pos.has(n) ? h("mark", null, ch) : ch);
+        const li = h("li", { role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null },
+          h("span", { class: "picker-id" }, id),
+          x.item.recent ? h("span", { class: "picker-tag" }, "recent") : null,
+          sources && x.item.source ? h("span", { class: "muted" }, x.item.source) : null);
+        li.onclick = () => { sel = i; draw(); };
+        li.ondblclick = () => { sel = i; finish(false); };
+        return li;
+      }));
+      const selNode = list.children[sel];
+      if (selNode) selNode.scrollIntoView({ block: "nearest" });
+      if (!items.length) return;
+      status.textContent = matches.length
+        ? matches.length + " of " + items.length
+        : q.trim() ? "no match · Enter uses “" + q.trim() + "”" : "";
+    }
+    async function finish(global) {
+      const model = choice();
+      if (!model) return;
+      const e = effort.value || null;
+      close();
+      if (!global) return setSessionModel(model, e);
+      // Settings go through the daemon (principle 6).
+      if (await act({ type: "set_setting", key: "provider.model", value: model })
+        && await act({ type: "set_setting", key: "provider.reasoning_effort", value: e }))
+        note("default model: " + model + " (effort " + (e || "default") + ")");
+    }
+    input.oninput = () => { sel = 0; draw(); };
+    dialog.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, matches.length - 1); draw(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); sel = Math.max(sel - 1, 0); draw(); }
+      else if (e.key === "Enter" && e.target.tagName !== "BUTTON") { e.preventDefault(); finish(e.ctrlKey || e.metaKey); }
+    });
+    cancel.onclick = close;
+    apply.onclick = () => finish(false);
+    asDefault.onclick = () => finish(true);
+    document.body.append(dialog);
+    input.focus();
+    const r = await act({ type: "list_models" }, null, 30000);
+    if (!r || !dialog.isConnected) return;
+    const recent = r.recent || [];
+    const push = (id, source) => {
+      if (!items.some((i) => i.id === id)) items.push({ id, source, recent: recent.includes(id) });
+    };
+    for (const role of r.roles || [])
+      push("role:" + role.name, "role · " + (role.provider || "default") + " · " + (role.model || "its default model"));
+    for (const m of r.models || []) push(m, "default provider");
+    for (const m of recent) push(m, "recent");
+    items.sort((a, b) => b.recent - a.recent);
+    const current = (session && session.model) || (r.current && r.current.model) || "";
+    sel = Math.max(0, items.findIndex((i) => i.id === current));
+    status.textContent = r.error ? "could not list models: " + r.error : "";
+    if (!items.length && r.error) status.classList.add("err");
+    draw();
+  }
+
   // Rendered message bodies by message id: the turn layout is rebuilt on
   // every change, but Markdown, highlighting, Mermaid and tool chips are
   // built once per message (and keep their state, e.g. open <details>).
@@ -1208,6 +1333,7 @@
     renderApproval();
     renderStatus();
   }
+  $("status-model").onclick = () => openModelPicker();
   $("modal-approve").onclick = () => decide(true);
   $("modal-once").onclick = () => decide(true, "once");
   $("modal-deny").onclick = () => decide(false);
@@ -1745,7 +1871,7 @@
     if (S.view === "settings") renderSettings();
   }
 
-  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /thinking /stop /cancel /resend /resume /abandon /agents /prompts /help";
+  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /model [id] /thinking /stop /cancel /resend /resume /abandon /agents /prompts /help";
   async function slash(cmd) {
     const [name, ...rest] = cmd.split(/\s+/);
     const arg = rest.join(" ");
@@ -1817,10 +1943,7 @@
         return;
       }
       case "panes": return note("The web layout always shows Sessions beside the chat.");
-      case "model": {
-        const s = S.sessions.find((x) => x.id === S.current);
-        return note("model: " + ((s && s.model) || (S.settings && S.settings.provider.model) || "default") + " (see Settings)");
-      }
+      case "model": return arg ? setSessionModel(arg, undefined) : openModelPicker();
       case "help": case "": toast(HELP); return note(HELP);
       case "quit": return forget();
       default: return note("unknown command: /" + name, true);

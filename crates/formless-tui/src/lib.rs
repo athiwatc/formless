@@ -2,6 +2,7 @@ pub mod client;
 mod highlight;
 mod markdown;
 mod mermaid;
+mod picker;
 mod ui;
 
 use anyhow::Result;
@@ -139,6 +140,8 @@ enum Pending {
     GetArtifact,
     GenerateProposal,
     ListProviders,
+    ListModels,
+    SetModel,
     HarnessChanges,
 }
 
@@ -154,6 +157,13 @@ struct RollbackPick {
     tool_id: String,
     idx: usize,
     armed: bool,
+}
+
+/// `/model`: pick a model and reasoning effort for the current Session,
+/// or (Ctrl+Enter / Alt+Enter / Ctrl+D) as the global default.
+struct ModelOverlay {
+    picker: picker::ModelPicker,
+    effort_idx: usize,
 }
 
 /// An open `ask_user` call (SPEC §5.5); `answers` fills as the user
@@ -229,9 +239,7 @@ struct Wizard {
     step: WizardStep,
     base_url: String,
     api_key: String,
-    models: Vec<String>,
-    model_idx: usize,
-    manual_model: bool,
+    picker: picker::ModelPicker,
     effort_idx: usize,
     status: String,
     /// Previously saved model, pre-selected when the list arrives (§17).
@@ -270,9 +278,7 @@ impl Wizard {
             step,
             base_url: cfg.provider.base_url.clone(),
             api_key: String::new(),
-            models: Vec::new(),
-            model_idx: 0,
-            manual_model: false,
+            picker: picker::ModelPicker::loading(),
             effort_idx,
             status,
             saved_model: cfg.provider.model.clone(),
@@ -282,7 +288,7 @@ impl Wizard {
         }
     }
     fn model(&self) -> String {
-        self.models.get(self.model_idx).cloned().unwrap_or_default()
+        self.picker.choice().unwrap_or_default()
     }
 }
 
@@ -542,6 +548,8 @@ struct App {
     tool_detail: Option<ToolDetail>,
     /// Open rollback version picker (Tools view, `b`).
     rollback_pick: Option<RollbackPick>,
+    /// The `/model` picker (SPEC §17).
+    model_overlay: Option<ModelOverlay>,
     approvals: std::collections::VecDeque<ApprovalReq>,
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
@@ -675,6 +683,7 @@ impl App {
             tool_idx: 0,
             tool_detail: None,
             rollback_pick: None,
+            model_overlay: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -955,6 +964,34 @@ impl App {
                                         ""
                                     }
                                 ));
+                            }
+                        }
+                        Pending::ListModels => {
+                            if let Some(o) = &mut self.model_overlay {
+                                let current = self
+                                    .current
+                                    .as_ref()
+                                    .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+                                    .and_then(|s| s.model.clone())
+                                    .or_else(|| {
+                                        result["current"]["model"].as_str().map(str::to_string)
+                                    })
+                                    .unwrap_or_default();
+                                let items = picker::items_from_list(&result);
+                                o.picker.set_items(items, &current);
+                                o.picker.error = result["error"].as_str().map(str::to_string);
+                            }
+                        }
+                        Pending::SetModel => {
+                            if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
+                                self.notes.push(format!(
+                                    "session model: {} (effort {})",
+                                    s.model.as_deref().unwrap_or("default"),
+                                    s.reasoning_effort.as_deref().unwrap_or("default")
+                                ));
+                                if let Some(old) = self.sessions.iter_mut().find(|x| x.id == s.id) {
+                                    *old = s;
+                                }
                             }
                         }
                         Pending::ListProviders => {
@@ -1996,20 +2033,10 @@ impl App {
             "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             "settings" => self.open_view(View::Settings),
-            "model" => {
-                let cfg = Config::load(&self.paths).ok();
-                let (m, e) = cfg
-                    .map(|c| {
-                        (
-                            c.provider.model,
-                            c.provider
-                                .reasoning_effort
-                                .unwrap_or_else(|| "default".into()),
-                        )
-                    })
-                    .unwrap_or_default();
-                self.notes
-                    .push(format!("model: {m} (effort {e}); change in Settings view"));
+            "model" => self.open_model_picker(),
+            cmd if cmd.starts_with("model ") => {
+                let model = cmd["model ".len()..].trim().to_string();
+                self.set_session_model(model, None);
             }
             "stop" => {
                 if let Some(id) = self.current.clone() {
@@ -2377,10 +2404,88 @@ impl App {
                 }
             }
             "help" => self.notes.push(
-                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /roles /role add|rm /harness [undo [ID]] /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
+                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /roles /role add|rm /harness [undo [ID]] /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
             ),
             "quit" => self.should_quit = true,
             other => self.notes.push(format!("unknown command: /{other}")),
+        }
+    }
+
+    fn open_model_picker(&mut self) {
+        let effort = self
+            .current
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .and_then(|s| s.reasoning_effort.clone());
+        let effort_idx = EFFORTS
+            .iter()
+            .position(|e| e.map(str::to_string) == effort)
+            .unwrap_or(0);
+        self.model_overlay = Some(ModelOverlay {
+            picker: picker::ModelPicker::loading(),
+            effort_idx,
+        });
+        self.request(Pending::ListModels, Request::ListModels);
+    }
+
+    fn set_session_model(&mut self, model: String, effort: Option<String>) {
+        match self.current.clone() {
+            Some(id) => self.request(
+                Pending::SetModel,
+                Request::SetSessionModel {
+                    id,
+                    model: Some(model),
+                    reasoning_effort: effort,
+                },
+            ),
+            None => self.notes.push("no current session".into()),
+        }
+    }
+
+    fn model_key(&mut self, key: KeyEvent) {
+        let Some(o) = &mut self.model_overlay else {
+            return;
+        };
+        let global = key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.code == KeyCode::Enter
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if global || key.code == KeyCode::Enter {
+            let Some(model) = o.picker.choice() else {
+                return;
+            };
+            let effort = EFFORTS[o.effort_idx].map(str::to_string);
+            self.model_overlay = None;
+            if global {
+                // Settings go through the daemon (principle 6).
+                self.fire(Request::SetSetting {
+                    key: "provider.model".into(),
+                    value: serde_json::json!(model),
+                });
+                self.fire(Request::SetSetting {
+                    key: "provider.reasoning_effort".into(),
+                    value: serde_json::json!(effort),
+                });
+                self.notes.push(format!(
+                    "default model: {model} (effort {})",
+                    effort.as_deref().unwrap_or("default")
+                ));
+            } else {
+                self.set_session_model(model, effort);
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.model_overlay = None,
+            KeyCode::Up => o.picker.up(),
+            KeyCode::Down => o.picker.down(),
+            KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % EFFORTS.len(),
+            KeyCode::BackTab => o.effort_idx = (o.effort_idx + EFFORTS.len() - 1) % EFFORTS.len(),
+            KeyCode::Backspace => o.picker.backspace(),
+            KeyCode::Char(c) => o.picker.type_char(c),
+            _ => {}
         }
     }
 
@@ -2390,14 +2495,21 @@ impl App {
             while let Ok(job) = w.jobs.try_recv() {
                 match job {
                     WizardJob::Models(Ok(models)) if !models.is_empty() => {
-                        w.model_idx = models.iter().position(|m| *m == w.saved_model).unwrap_or(0);
-                        w.models = models;
+                        let items = models
+                            .into_iter()
+                            .map(|id| picker::ModelItem {
+                                recent: id == w.saved_model,
+                                id,
+                                source: None,
+                            })
+                            .collect();
+                        w.picker.set_items(items, &w.saved_model.clone());
                         w.step = WizardStep::PickModel;
-                        w.status = "Pick a model (Up/Down, Enter).".into();
+                        w.status = "Pick a model: type to filter, Up/Down, Enter.".into();
                     }
                     WizardJob::Models(_) => {
-                        w.manual_model = true;
-                        w.models = vec![String::new()];
+                        w.picker = picker::ModelPicker::new(Vec::new());
+                        w.picker.query = w.saved_model.clone();
                         w.step = WizardStep::PickModel;
                         w.status = "Could not list models; type a model name, then Enter.".into();
                     }
@@ -2477,33 +2589,17 @@ impl App {
                 }
                 _ => {}
             },
-            WizardStep::PickModel => {
-                if w.manual_model {
-                    match key.code {
-                        KeyCode::Enter if !w.model().trim().is_empty() => {
-                            w.step = WizardStep::PickEffort;
-                            w.status = "Pick reasoning effort.".into();
-                        }
-                        KeyCode::Char(c) => w.models[0].push(c),
-                        KeyCode::Backspace => {
-                            w.models[0].pop();
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Up => w.model_idx = w.model_idx.saturating_sub(1),
-                        KeyCode::Down => {
-                            w.model_idx = (w.model_idx + 1).min(w.models.len().saturating_sub(1))
-                        }
-                        KeyCode::Enter => {
-                            w.step = WizardStep::PickEffort;
-                            w.status = "Pick reasoning effort.".into();
-                        }
-                        _ => {}
-                    }
+            WizardStep::PickModel => match key.code {
+                KeyCode::Up => w.picker.up(),
+                KeyCode::Down => w.picker.down(),
+                KeyCode::Enter if !w.model().trim().is_empty() => {
+                    w.step = WizardStep::PickEffort;
+                    w.status = "Pick reasoning effort.".into();
                 }
-            }
+                KeyCode::Char(c) => w.picker.type_char(c),
+                KeyCode::Backspace => w.picker.backspace(),
+                _ => {}
+            },
             WizardStep::PickEffort => match key.code {
                 KeyCode::Up => w.effort_idx = w.effort_idx.saturating_sub(1),
                 KeyCode::Down => w.effort_idx = (w.effort_idx + 1).min(EFFORTS.len() - 1),
@@ -2635,6 +2731,10 @@ impl App {
         }
         if self.rollback_pick.is_some() {
             self.rollback_key(key);
+            return;
+        }
+        if self.model_overlay.is_some() {
+            self.model_key(key);
             return;
         }
         if let KeyCode::Char(c) = key.code {
@@ -2986,6 +3086,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_approval(f, req, promotion, more, app.color);
     } else if let Some(pick) = &app.rollback_pick {
         draw_rollback_picker(f, app, pick);
+    } else if let Some(o) = &app.model_overlay {
+        draw_model_overlay(f, o, app.color);
     }
     if let Some(p) = &app.pager {
         let area = f.area();
@@ -3078,6 +3180,108 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
             app.color,
             Color::Yellow,
         )),
+        rect,
+    );
+}
+
+/// The model list with the filter line, matched chars highlighted and
+/// the selection kept on screen.
+fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(vec![
+        Span::styled("Filter   ", ui::dim(color)),
+        Span::raw(format!("{}▏", p.query)),
+    ])];
+    if p.loading {
+        out.push(Line::styled("  loading models…", ui::dim(color)));
+        return out;
+    }
+    if let Some(e) = &p.error {
+        out.push(Line::styled(
+            format!("  could not list models: {}", truncate_chars(e, 70)),
+            fg(color, Color::Red),
+        ));
+    }
+    let matches = p.matches();
+    if matches.is_empty() {
+        let hint = if p.query.trim().is_empty() {
+            "  type a model id".to_string()
+        } else {
+            format!(
+                "  no match · Enter uses \"{}\" as the model id",
+                p.query.trim()
+            )
+        };
+        out.push(Line::styled(hint, ui::dim(color)));
+        return out;
+    }
+    let sel = p.sel.min(matches.len() - 1);
+    let start = sel
+        .saturating_sub(max_items / 2)
+        .min(matches.len().saturating_sub(max_items));
+    let sources = p.multi_source();
+    for (i, (item, pos)) in matches.iter().enumerate().skip(start).take(max_items) {
+        let selected = i == sel;
+        let base = if selected {
+            bold_fg(color, Color::Green)
+        } else {
+            Style::default()
+        };
+        let hit = base.add_modifier(Modifier::UNDERLINED).fg(if color {
+            Color::Yellow
+        } else {
+            Color::Reset
+        });
+        let mut spans = vec![Span::styled(if selected { "› " } else { "  " }, base)];
+        for (n, ch) in item.id.chars().enumerate() {
+            spans.push(Span::styled(
+                ch.to_string(),
+                if pos.contains(&n) { hit } else { base },
+            ));
+        }
+        if item.recent {
+            spans.push(Span::styled("  recent", ui::dim(color)));
+        }
+        if sources {
+            if let Some(src) = &item.source {
+                spans.push(Span::styled(format!("  {src}"), ui::dim(color)));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    if matches.len() > max_items || matches.len() < p.items.len() {
+        out.push(Line::styled(
+            format!("  ({}/{} of {})", sel + 1, matches.len(), p.items.len()),
+            ui::dim(color),
+        ));
+    }
+    out
+}
+
+fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
+    let area = f.area();
+    let max_items = (area.height as usize).saturating_sub(10).clamp(3, 20);
+    let mut lines = picker_lines(&o.picker, max_items, color);
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Effort   ", ui::dim(color)),
+        Span::raw(EFFORTS[o.effort_idx].unwrap_or("default (provider)")),
+        Span::styled("  (Tab to change)", ui::dim(color)),
+    ]));
+    lines.push(Line::styled(
+        "Enter this Session · Ctrl+Enter/Alt+Enter/Ctrl+D global default · Esc cancel",
+        ui::dim(color),
+    ));
+    let w = 84.min(area.width.saturating_sub(2)).max(1);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 3,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(ui::panel(" Model ", color, Color::Cyan)),
         rect,
     );
 }
@@ -4845,11 +5049,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             ));
         }
         WizardStep::PickModel => {
-            if w.manual_model {
-                text.push(field("Model", format!("{}▏", w.model())));
-            } else {
-                text.extend(pick(w.models.clone(), w.model_idx));
-            }
+            text.extend(picker_lines(&w.picker, max_items, color));
         }
         WizardStep::PickEffort => {
             text.push(field("Model", w.model()));
@@ -5019,6 +5219,7 @@ mod tests {
             tool_idx: 0,
             tool_detail: None,
             rollback_pick: None,
+            model_overlay: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -5589,6 +5790,47 @@ mod tests {
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
+    }
+
+    #[test]
+    fn model_overlay_filters_and_closes() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.slash("model");
+        assert!(app.model_overlay.as_ref().unwrap().picker.loading);
+        let items = [
+            "openai/gpt-4o",
+            "anthropic/claude-sonnet-4",
+            "anthropic/claude-opus-4",
+        ]
+        .iter()
+        .map(|id| picker::ModelItem {
+            id: id.to_string(),
+            source: None,
+            recent: false,
+        })
+        .collect();
+        app.model_overlay
+            .as_mut()
+            .unwrap()
+            .picker
+            .set_items(items, "");
+        for c in "son4".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Tab));
+        let o = app.model_overlay.as_ref().unwrap();
+        assert_eq!(
+            o.picker.choice().as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(EFFORTS[o.effort_idx], Some("low"));
+        for (w, h) in [(1, 1), (12, 4), (80, 24)] {
+            render(&mut app, w, h);
+        }
+        assert!(render(&mut app, 80, 24).contains("Effort"));
+        app.key(key(KeyCode::Esc));
+        assert!(app.model_overlay.is_none());
     }
 
     #[test]

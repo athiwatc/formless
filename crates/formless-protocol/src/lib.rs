@@ -649,6 +649,11 @@ pub enum Request {
     /// Providers and Roles (SPEC §4.5): `{"providers": [...], "roles": {...}}`
     /// (never API keys; `has_key` says whether one is stored).
     ListProviders,
+    /// Models to pick from (SPEC §4.5): `{"models": [id], "roles":
+    /// [{"name", "provider", "model"}], "recent": [id], "current": {"model",
+    /// "reasoning_effort"}, "error": str?}`. `models` comes from the default
+    /// provider's `GET /models`; `recent` is the Sessions' models, newest first.
+    ListModels,
     /// Add or replace a named provider; `api_key` goes to the keychain.
     UpsertProvider {
         name: String,
