@@ -20,6 +20,7 @@ base64.workspace = true
 rand.workspace = true
 sha2.workspace = true
 hkdf.workspace = true
+ignore.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
 tokio-tungstenite.workspace = true
 chrono.workspace = true

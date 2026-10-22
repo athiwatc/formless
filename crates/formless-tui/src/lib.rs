@@ -142,6 +142,8 @@ enum Pending {
     ListProviders,
     ListModels,
     SetModel,
+    ListFiles,
+    MentionAttach,
     HarnessChanges,
 }
 
@@ -164,6 +166,22 @@ struct RollbackPick {
 struct ModelOverlay {
     picker: picker::ModelPicker,
     effort_idx: usize,
+}
+
+/// Completions for the `@path` being typed at the end of the input.
+struct MentionPopup {
+    query: String,
+    files: Vec<formless_core::files::FileEntry>,
+    sel: usize,
+    /// Esc hides the popup until the query changes.
+    dismissed: bool,
+}
+
+struct PendingSend {
+    session_id: String,
+    content: String,
+    mode: SendMode,
+    waiting: usize,
 }
 
 /// An open `ask_user` call (SPEC §5.5); `answers` fills as the user
@@ -550,6 +568,10 @@ struct App {
     rollback_pick: Option<RollbackPick>,
     /// The `/model` picker (SPEC §17).
     model_overlay: Option<ModelOverlay>,
+    /// The `@` file-completion popup (SPEC §5.6).
+    mention: Option<MentionPopup>,
+    /// A message waiting for its `@` attachments before it is sent.
+    pending_send: Option<PendingSend>,
     approvals: std::collections::VecDeque<ApprovalReq>,
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
@@ -684,6 +706,8 @@ impl App {
             tool_detail: None,
             rollback_pick: None,
             model_overlay: None,
+            mention: None,
+            pending_send: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -766,6 +790,9 @@ impl App {
                     if !ok {
                         self.notes
                             .push(format!("daemon: {}", error.unwrap_or_default()));
+                        if matches!(kind, Pending::MentionAttach) {
+                            self.mention_attached();
+                        }
                         continue;
                     }
                     let Some(result) = result else { continue };
@@ -981,6 +1008,26 @@ impl App {
                                 o.picker.set_items(items, &current);
                                 o.picker.error = result["error"].as_str().map(str::to_string);
                             }
+                        }
+                        Pending::ListFiles => {
+                            let query = result["query"].as_str().unwrap_or_default();
+                            if let Some(m) = self.mention.as_mut().filter(|m| m.query == query) {
+                                m.files = serde_json::from_value(result["files"].clone())
+                                    .unwrap_or_default();
+                                m.sel = 0;
+                            }
+                        }
+                        Pending::MentionAttach => {
+                            let name = result["name"].as_str().unwrap_or_default();
+                            self.notes.push(if result["reference"] == true {
+                                format!("referenced {name} (the agent reads it with its Tools)")
+                            } else {
+                                format!(
+                                    "attached {name} ({} KB)",
+                                    result["bytes"].as_u64().unwrap_or(0) / 1024
+                                )
+                            });
+                            self.mention_attached();
                         }
                         Pending::SetModel => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
@@ -1955,11 +2002,118 @@ impl App {
             SendMode::Send
         };
         self.follow_chat_bottom();
-        self.fire(Request::SendMessage {
+        // `@path` mentions are attached first: the daemon handles requests
+        // concurrently, so the message waits for them.
+        let root = std::env::current_dir().ok();
+        let found: Vec<String> = formless_core::files::mentions(&text)
+            .into_iter()
+            .filter(|p| root.as_ref().is_some_and(|r| r.join(p).exists()))
+            .collect();
+        if found.is_empty() {
+            self.fire(Request::SendMessage {
+                session_id,
+                content: text,
+                mode,
+            });
+            return;
+        }
+        let root = root.map(|r| r.to_string_lossy().into_owned());
+        for path in &found {
+            self.request(
+                Pending::MentionAttach,
+                Request::AttachPath {
+                    session_id: session_id.clone(),
+                    path: path.clone(),
+                    root: root.clone(),
+                },
+            );
+        }
+        self.pending_send = Some(PendingSend {
             session_id,
             content: text,
             mode,
+            waiting: found.len(),
         });
+    }
+
+    /// One `@` attachment answered; send the message once all have.
+    fn mention_attached(&mut self) {
+        let Some(p) = &mut self.pending_send else {
+            return;
+        };
+        p.waiting = p.waiting.saturating_sub(1);
+        if p.waiting == 0 {
+            let p = self.pending_send.take().unwrap();
+            self.fire(Request::SendMessage {
+                session_id: p.session_id,
+                content: p.content,
+                mode: p.mode,
+            });
+        }
+    }
+
+    /// Open, refresh or close the `@` popup for the input's last word.
+    fn update_mention(&mut self) {
+        let word = self.input.rsplit(char::is_whitespace).next().unwrap_or("");
+        let query = match word.strip_prefix('@') {
+            Some(q) if !self.input.starts_with('/') => q.to_string(),
+            _ => {
+                self.mention = None;
+                return;
+            }
+        };
+        if self.mention.as_ref().is_some_and(|m| m.query == query) {
+            return;
+        }
+        self.mention = Some(MentionPopup {
+            query: query.clone(),
+            files: self.mention.take().map(|m| m.files).unwrap_or_default(),
+            sel: 0,
+            dismissed: false,
+        });
+        let root = std::env::current_dir()
+            .ok()
+            .map(|r| r.to_string_lossy().into_owned());
+        self.request(
+            Pending::ListFiles,
+            Request::ListFiles {
+                root,
+                query,
+                limit: Some(8),
+            },
+        );
+    }
+
+    /// Keys for an open `@` popup; true when the key was used.
+    fn mention_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(m) = self
+            .mention
+            .as_mut()
+            .filter(|m| !m.dismissed && !m.files.is_empty())
+        else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up => m.sel = m.sel.saturating_sub(1),
+            KeyCode::Down => m.sel = (m.sel + 1).min(m.files.len() - 1),
+            KeyCode::Esc => m.dismissed = true,
+            KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
+                let f = m.files[m.sel.min(m.files.len() - 1)].clone();
+                let word_len = self
+                    .input
+                    .rsplit(char::is_whitespace)
+                    .next()
+                    .unwrap_or("")
+                    .len();
+                self.input.truncate(self.input.len() - word_len);
+                self.input.push('@');
+                self.input.push_str(&f.path);
+                self.input.push(if f.dir { '/' } else { ' ' });
+                self.update_mention();
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Switch view and fetch what it shows.
@@ -2778,6 +2932,9 @@ impl App {
                 }
             }
         }
+        if self.view == View::Chat && self.mention_key(&key) {
+            return;
+        }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.cycle_view(key.code == KeyCode::Tab);
             return;
@@ -3038,8 +3195,12 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
+                    self.update_mention();
                 }
-                KeyCode::Char(c) => self.input.push(c),
+                KeyCode::Char(c) => {
+                    self.input.push(c);
+                    self.update_mention();
+                }
                 _ => {}
             },
         }
@@ -3081,6 +3242,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let typing = matches!(app.view, View::Chat | View::Settings);
     draw_input(f, chunks[2], app, typing && modal.is_none());
     draw_status(f, chunks[3], app);
+    if app.view == View::Chat {
+        if let Some(m) = app.mention.as_ref().filter(|m| !m.dismissed) {
+            draw_mention_popup(f, chunks[2], m, app.color);
+        }
+    }
     if let Some((req, promotion)) = modal {
         let more = app.approvals.len() + app.promotions.len() - 1;
         draw_approval(f, req, promotion, more, app.color);
@@ -3255,6 +3421,66 @@ fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<L
         ));
     }
     out
+}
+
+/// A user-message line with `@path` mentions highlighted.
+fn mention_line(text: &str, color: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for word in text.split_inclusive(char::is_whitespace) {
+        let bare = word.trim_end();
+        if bare.len() > 1 && bare.starts_with('@') {
+            spans.push(Span::styled(
+                bare.to_string(),
+                fg(color, Color::Cyan).add_modifier(Modifier::UNDERLINED),
+            ));
+            spans.push(Span::raw(word[bare.len()..].to_string()));
+        } else {
+            spans.push(Span::raw(word.to_string()));
+        }
+    }
+    Line::from(spans)
+}
+
+/// The `@` completions, just above the input box.
+fn draw_mention_popup(f: &mut Frame, input: Rect, m: &MentionPopup, color: bool) {
+    if m.files.is_empty() || input.y < 3 {
+        return;
+    }
+    let lines: Vec<Line> = m
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let text = format!(
+                "{} {}{}",
+                if i == m.sel { "›" } else { " " },
+                file.path,
+                if file.dir { "/" } else { "" }
+            );
+            if i == m.sel {
+                Line::styled(text, bold_fg(color, Color::Green))
+            } else {
+                Line::raw(text)
+            }
+        })
+        .collect();
+    let h = (lines.len() as u16 + 2).min(input.y);
+    let w = 72.min(input.width).max(1);
+    let rect = Rect {
+        x: input.x,
+        y: input.y - h,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(ui::panel(
+            " @ files · Tab/Enter insert · Esc hide ",
+            color,
+            Color::Cyan,
+        )),
+        rect,
+    );
 }
 
 fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
@@ -3742,7 +3968,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
             "user" => {
                 open_group(&mut lines, &mut group, "user", when);
                 for l in m.content.lines() {
-                    lines.push(Line::raw(format!("  {}", truncate_chars(l, 2000))));
+                    lines.push(mention_line(&truncate_chars(l, 2000), app.color));
                 }
             }
             "tool" => {
@@ -5220,6 +5446,8 @@ mod tests {
             tool_detail: None,
             rollback_pick: None,
             model_overlay: None,
+            mention: None,
+            pending_send: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -5790,6 +6018,75 @@ mod tests {
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
+    }
+
+    #[test]
+    fn mention_popup_completes_paths_and_send_waits_for_attachments() {
+        use formless_core::files::FileEntry;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        for c in "explain @sr".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.mention.as_ref().unwrap().query, "sr");
+        app.mention.as_mut().unwrap().files = vec![
+            FileEntry {
+                path: "src".into(),
+                dir: true,
+                bytes: 0,
+            },
+            FileEntry {
+                path: "src/main.rs".into(),
+                dir: false,
+                bytes: 9,
+            },
+        ];
+        render(&mut app, 80, 24);
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.input, "explain @src/");
+        assert_eq!(app.mention.as_ref().unwrap().query, "src/");
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "src/main.rs".into(),
+            dir: false,
+            bytes: 9,
+        }];
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.input, "explain @src/main.rs ");
+        assert!(app.mention.is_none());
+        // Esc hides the popup without touching the input.
+        app.input = "see @x".into();
+        app.update_mention();
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "x.rs".into(),
+            dir: false,
+            bytes: 1,
+        }];
+        app.key(key(KeyCode::Esc));
+        assert!(app.mention.as_ref().unwrap().dismissed);
+        assert_eq!(app.input, "see @x");
+
+        app.pending_send = Some(PendingSend {
+            session_id: "s".into(),
+            content: "explain @a @b".into(),
+            mode: SendMode::Send,
+            waiting: 2,
+        });
+        app.mention_attached();
+        assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+        app.mention_attached();
+        assert!(app.pending_send.is_none());
+    }
+
+    #[test]
+    fn mentions_are_highlighted_in_user_messages() {
+        let line = mention_line("explain @src/main.rs and mail a@b.c", true);
+        let marked: Vec<String> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(marked, vec!["@src/main.rs"]);
     }
 
     #[test]

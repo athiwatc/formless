@@ -406,6 +406,22 @@ pasting paths.
 - **Clients:** in the TUI, `/attach PATH` reads the file on the client's
   machine. The web composer has a 📎 file picker and accepts pasted
   images.
+- **`@` mentions:** typing `@` in the input opens a completion popup of
+  files under the client's working directory (TUI) or the daemon's (web),
+  fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
+  root once and caches it for 30 s. The walk respects `.gitignore`, skips
+  hidden directories and `target`, `node_modules`, `dist`, `build`,
+  `__pycache__` and `venv`, and stops at 200,000 entries. An empty query
+  lists the top level, and `dir/` lists that directory, so paths complete
+  step by step. Tab or Enter inserts `@path`. On send, each `@path`
+  mention that names an existing file or directory goes through
+  `AttachPath {session_id, path, root?}` before the message is sent:
+  - text files up to 256 KB and images up to 8 MB are attached as below;
+  - larger files and directories go as a reference line,
+    `[referenced: PATH (SIZE | directory); not attached, read it with
+    your Tools]`, so the agent reads only what it needs.
+  Other `@words` stay plain text. Mentions are highlighted in the
+  transcript.
 - **`AttachFile {session_id, name, data_b64, mime?}`** stores the file as
   an artifact of that Session (20 MB max; the MIME type is guessed from
   the extension when not given). The file waits for the Session's next
