@@ -1578,6 +1578,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
   editors (which get the terminal until they exit), `FILE:LINE` for
   Helix, and `-g` for VS Code and its forks.
+- **Code blocks (TUI).** Code never wraps, since that breaks indentation;
+  lines longer than the pane end in `…`. `/pager code [N]` opens the last
+  answer's Nth code block (default the last) unwrapped in the pager, with
+  line numbers and ←/→ to scroll sideways.
 - **Tables in narrow terminals (TUI).** Markdown tables wider than the
   pane shrink: columns narrower than an equal share keep their width, and
   the rest share the room in proportion. Cell text wraps inside its
