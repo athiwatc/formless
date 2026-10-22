@@ -203,6 +203,14 @@ pub const HARNESS_MODEL_KEYS: &[&str] = &[
 /// Settings clients may change through the daemon (`SetSetting`): exact
 /// keys, or whole sections ending in '.'. Credentials, the endpoint, extra
 /// headers, the relay, MCP servers and hooks stay file-only.
+/// Settable keys whose value must be one of a few strings (null always
+/// resets to the default).
+pub const CHOICES: &[(&str, &[&str])] = &[
+    ("provider.api_style", &["chat", "responses"]),
+    ("provider.tool_mode", &["native", "prompt"]),
+    ("provider.cache_key", &["session", "off"]),
+];
+
 pub const SETTABLE: &[&str] = &[
     "provider.model",
     "provider.reasoning_effort",
@@ -219,6 +227,8 @@ pub const SETTABLE: &[&str] = &[
     "provider.max_backoff_secs",
     "provider.cache_key",
     "provider.tool_use_nudge",
+    "provider.api_style",
+    "provider.tool_mode",
     "provider.vision",
     "provider.prices",
     "daemon.idle_grace_secs",
@@ -870,6 +880,12 @@ impl Config {
             anyhow::bail!(
                 "'{key}' cannot be changed this way; edit config.toml on the daemon's machine"
             );
+        }
+        if let Some((_, allowed)) = CHOICES.iter().find(|(k, _)| *k == key) {
+            let ok = value.is_null() || value.as_str().is_some_and(|v| allowed.contains(&v));
+            if !ok {
+                anyhow::bail!("'{key}' must be one of: {}", allowed.join(", "));
+            }
         }
         let mut doc = toml::Value::try_from(&*self)?;
         let parts: Vec<&str> = key.split('.').collect();

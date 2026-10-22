@@ -24,6 +24,17 @@ fn set_key_validates_types_keys_and_the_allow_list() {
             .is_err(),
         "type checked"
     );
+    c.set_key("provider.api_style", serde_json::json!("responses"))
+        .unwrap();
+    assert_eq!(c.provider.api_style, "responses");
+    let err = c
+        .set_key("provider.tool_mode", serde_json::json!("magic"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("one of: native, prompt"), "{err}");
+    assert!(c
+        .set_key("provider.api_style", serde_json::json!(1))
+        .is_err());
     assert!(
         c.set_key("tools.inline_limitt", serde_json::json!(3))
             .is_err(),
