@@ -237,7 +237,7 @@ cargo build --release          # binary at ./target/release/formless
 
 With no arguments `formless` launches the **TUI**, which auto-starts the daemon on first use (`formless daemon serve`, detached, logging to `<data dir>/daemon.log`) and then walks the wizard:
 
-1. **Base URL** — e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1`, or any compatible gateway.
+1. **Provider** — pick a preset (OpenAI, Anthropic, OpenRouter, Gemini, Groq, Ollama, LM Studio) or enter any OpenAI-compatible base URL. Local presets skip the key step, and a key in `OPENAI_API_KEY` (etc.) is offered automatically. Add more later with `formless providers add NAME --preset openrouter`.
 2. **API key** — stored in the OS keychain plus a `0600` fallback file (`api_key`) in the config dir, so rebuilding a dev binary never loses it.
 3. **Model** — picked from the endpoint's model list, or typed by hand.
 4. **Reasoning effort** — for models that accept it.

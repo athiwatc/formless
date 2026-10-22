@@ -15,6 +15,7 @@ pub mod memory;
 pub mod namer;
 pub mod optimiser;
 pub mod paths;
+pub mod presets;
 pub mod provider;
 pub mod relay;
 pub mod routing;

@@ -259,8 +259,12 @@ enum ProvidersAction {
     /// Add or update a provider; the API key is read from stdin (not argv)
     Add {
         name: String,
-        #[arg(long)]
-        base_url: String,
+        #[arg(long, required_unless_present = "preset")]
+        base_url: Option<String>,
+        /// A known endpoint instead of --base-url: openai, anthropic,
+        /// openrouter, gemini, groq, ollama, lmstudio
+        #[arg(long, conflicts_with = "base_url")]
+        preset: Option<String>,
         /// Its default model
         #[arg(long)]
         model: Option<String>,
@@ -1401,17 +1405,53 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
         ProvidersAction::Add {
             name,
             base_url,
+            preset,
             model,
             no_key,
         } => {
-            let api_key = if no_key {
-                None
-            } else {
-                eprint!("API key for {name} (empty for none): ");
+            let preset = match preset.as_deref() {
+                Some(id) => Some(formless_core::presets::find(id).with_context(|| {
+                    let ids: Vec<_> = formless_core::presets::PRESETS
+                        .iter()
+                        .map(|p| p.id)
+                        .collect();
+                    format!("unknown preset '{id}' (one of: {})", ids.join(", "))
+                })?),
+                None => None,
+            };
+            let base_url = match (base_url, preset) {
+                (Some(url), _) => url,
+                (None, Some(p)) => p.base_url.to_string(),
+                (None, None) => unreachable!("clap requires one"),
+            };
+            let read_line = || -> Result<String> {
                 let mut line = String::new();
                 std::io::stdin().read_line(&mut line)?;
-                Some(line.trim().to_string()).filter(|k| !k.is_empty())
+                Ok(line.trim().to_string())
             };
+            let env_key = preset.and_then(formless_core::presets::env_key);
+            let api_key = if no_key || preset.is_some_and(|p| p.local) {
+                None
+            } else if let Some((var, key)) = env_key {
+                eprint!("Use ${var} as the API key for {name}? [Y/n] ");
+                if read_line()?.eq_ignore_ascii_case("n") {
+                    eprint!("API key for {name} (empty for none): ");
+                    Some(read_line()?).filter(|k| !k.is_empty())
+                } else {
+                    Some(key)
+                }
+            } else {
+                if let Some(url) = preset.and_then(|p| p.key_url) {
+                    eprintln!("Get a key at {url}");
+                }
+                eprint!("API key for {name} (empty for none): ");
+                Some(read_line()?).filter(|k| !k.is_empty())
+            };
+            let model = model.or_else(|| {
+                preset
+                    .map(|p| p.default_model.to_string())
+                    .filter(|m| !m.is_empty())
+            });
             daemon(Request::UpsertProvider {
                 name: name.clone(),
                 base_url,
