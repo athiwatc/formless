@@ -5370,6 +5370,7 @@ impl Daemon {
                 .map(|(p, _)| p.to_specs())
                 .unwrap_or_default(),
             code_preview: (!preview.is_empty()).then_some(preview),
+            tool_id: Some(info.id.clone()),
         });
         let (approved, scope) = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
@@ -6149,6 +6150,7 @@ impl Daemon {
             detail: Some(detail),
             already_allowed: Vec::new(),
             code_preview: None,
+            tool_id: None,
         });
         let answer = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),

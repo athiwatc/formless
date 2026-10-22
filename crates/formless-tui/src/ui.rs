@@ -155,3 +155,74 @@ mod tests {
         assert_eq!(summarize_args("not json", 200), "not json");
     }
 }
+
+/// What a Capability spec lets a Tool do, in plain words (SPEC §7.2), for
+/// the approval dialog's `?`.
+pub(crate) fn explain_capability(spec: &str) -> String {
+    let (kind, scope) = spec.split_once(':').unwrap_or((spec, ""));
+    let input = |s: &str| s.strip_prefix("$input.").map(str::to_string);
+    match (kind, scope) {
+        ("net", "") => "can reach any host on the network".into(),
+        ("net", s) => match input(s) {
+            Some(f) => format!("can reach the host named in its `{f}` input, per call"),
+            None => format!("can reach {s} over the network"),
+        },
+        ("fs", s) => {
+            let (mode, path) = s.split_once(':').unwrap_or((s, ""));
+            let what = if mode == "write" {
+                "can create, overwrite or delete files"
+            } else {
+                "can read files"
+            };
+            match input(path) {
+                Some(f) => format!("{what} at the path in its `{f}` input, per call"),
+                None if path.is_empty() => format!("{what} anywhere"),
+                None => format!("{what} under {path}"),
+            }
+        }
+        ("env", k) => format!("can read the environment variable {k}"),
+        ("process", "") => "can run any program on this machine".into(),
+        ("process", cmd) => format!("can run the program `{cmd}`"),
+        ("clipboard", "read") => "can read your clipboard".into(),
+        ("clipboard", _) => "can write to your clipboard".into(),
+        ("notify", _) => "can show desktop notifications".into(),
+        ("store", "") => "can keep its own small saved state".into(),
+        ("store", ns) => format!("can read and change the shared store `{ns}`"),
+        ("harness", "read") => {
+            "can see your setup (providers, MCP servers, skills, settings; never keys)".into()
+        }
+        ("harness", area) => {
+            format!("can propose changes to your {area} setup (each one asks you)")
+        }
+        ("llm", "") => "can make model calls (costs tokens)".into(),
+        ("llm", m) => format!("can make model calls to {m} (costs tokens)"),
+        ("agent", "") => "can start sub-agents with the same Tools (costs tokens)".into(),
+        ("agent", m) => format!("can start sub-agents on {m} (costs tokens)"),
+        _ => "a capability this client doesn't know how to describe".into(),
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::explain_capability as e;
+
+    #[test]
+    fn explains_capabilities() {
+        assert_eq!(
+            e("fs:write:/Users/x/out"),
+            "can create, overwrite or delete files under /Users/x/out"
+        );
+        assert_eq!(
+            e("fs:read:$input.path"),
+            "can read files at the path in its `path` input, per call"
+        );
+        assert_eq!(e("net"), "can reach any host on the network");
+        assert_eq!(
+            e("net:example.com"),
+            "can reach example.com over the network"
+        );
+        assert_eq!(e("process:git"), "can run the program `git`");
+        assert!(e("harness:mcp").contains("each one asks you"));
+        assert!(e("weird:thing").contains("doesn't know"));
+    }
+}

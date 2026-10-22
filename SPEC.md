@@ -1667,6 +1667,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   audit-logged. Clients: TUI `/revoke NAME [CAPABILITY]` and the Tool
   detail's "Approved" list; web Tool detail × per item and "Revoke all".
 
+- **Reading before trusting (TUI).** In the approval, `v` opens the
+  Tool's full code for that version in the pager, numbered and
+  highlighted (`ApprovalRequested.tool_id` identifies the Tool). `?`
+  explains each capability in plain words under it, e.g. "fs:write:/x —
+  can create, overwrite or delete files under /x".
 - **Typing while an approval is open (TUI).** The approval stays on
   screen, but its keys (y/o/n) only apply while it has focus. Tab moves
   focus between the approval and the input, and typing anything else

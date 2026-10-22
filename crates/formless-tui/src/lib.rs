@@ -160,6 +160,7 @@ enum Pending {
     ContextFill,
     ContextReport,
     MentionAttach,
+    ApprovalCode,
     /// Providers and Roles for the Settings view.
     SettingsProviders,
     SaveSetting,
@@ -342,6 +343,8 @@ struct ApprovalReq {
     /// Capabilities already granted (the rest are new).
     already_allowed: Vec<String>,
     code_preview: Option<String>,
+    /// The Tool behind it, for `v` (its full code).
+    tool_id: Option<String>,
 }
 
 enum WizardJob {
@@ -549,6 +552,9 @@ struct Pager {
     top: usize,
     /// Columns scrolled to the right (←/→), for wide content.
     left: usize,
+    /// Highlighted lines, shown instead of `lines` while not scrolled
+    /// sideways.
+    styled: Vec<Line<'static>>,
 }
 
 struct LiveToolCall {
@@ -812,6 +818,10 @@ struct App {
     /// While an approval is open: whether keys go to the input (Tab
     /// toggles) instead of the approval (SPEC §10.3).
     input_focus: bool,
+    /// `?` in an approval: explain each capability under it.
+    approval_explain: bool,
+    /// The version whose full code `v` asked for.
+    approval_code: Option<i64>,
     image_placed: Vec<images::Placed>,
     painted_images: Vec<images::Placed>,
     /// Chat rows when the user scrolled away from the bottom, to count
@@ -989,6 +999,8 @@ impl App {
             path_cache: HashMap::new(),
             image_proto,
             input_focus: false,
+            approval_explain: false,
+            approval_code: None,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
             unseen_from: None,
@@ -1329,6 +1341,23 @@ impl App {
                             self.mention_attached();
                         }
                         Pending::SettingsProviders => self.providers_info = result,
+                        Pending::ApprovalCode => {
+                            if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
+                                let want = self.approval_code.take();
+                                let v = d
+                                    .versions
+                                    .iter()
+                                    .find(|v| Some(v.version) == want)
+                                    .or(d.versions.last());
+                                if let Some(v) = v {
+                                    self.pager = Some(code_pager(
+                                        &format!("{} v{} code", d.tool.name, v.version),
+                                        &v.code,
+                                        self.color,
+                                    ));
+                                }
+                            }
+                        }
                         Pending::ContextFill | Pending::ContextReport => {
                             let used = result["used_tokens"].as_i64().unwrap_or(0);
                             let size = result["context_tokens"].as_i64().unwrap_or(0);
@@ -1448,6 +1477,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                styled: Vec::new(),
                             });
                         }
                         Pending::SessionUsage => {
@@ -2069,6 +2099,7 @@ impl App {
                 detail,
                 already_allowed,
                 code_preview,
+                tool_id,
             } => {
                 // Approvals stay global: a backgrounded Run still needs one.
                 if self.is_current(&session_id) {
@@ -2083,6 +2114,7 @@ impl App {
                     detail,
                     already_allowed,
                     code_preview,
+                    tool_id,
                 });
             }
             Event::ToolUpdated { tool } => {
@@ -2141,6 +2173,7 @@ impl App {
                     detail: None,
                     already_allowed: Vec::new(),
                     code_preview: None,
+                    tool_id: None,
                 });
             }
             Event::InvocationPending {
@@ -3170,6 +3203,7 @@ impl App {
                         lines: raw.lines().map(str::to_string).collect(),
                         top: 0,
                         left: 0,
+                        styled: Vec::new(),
                     })
                 }
                 None => self.notes.push("no error to show".into()),
@@ -3343,6 +3377,7 @@ impl App {
                     lines: commands::help_lines(),
                     top: 0,
                     left: 0,
+                    styled: Vec::new(),
                 })
             }
             "quit" => self.should_quit = true,
@@ -3739,7 +3774,7 @@ impl App {
             // Typing anything else while the approval has focus moves
             // focus to the input (and types it).
             if modal_keys
-                && !matches!(c, 'y' | 'n' | 'o')
+                && !matches!(c, 'y' | 'n' | 'o' | 'v' | '?')
                 && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             {
                 self.input_focus = true;
@@ -3747,6 +3782,21 @@ impl App {
         }
         let modal_keys = modal_keys && !self.input_focus;
         if let (true, KeyCode::Char(c)) = (modal_keys, key.code) {
+            if c == '?' {
+                self.approval_explain = !self.approval_explain;
+                return;
+            }
+            if c == 'v' {
+                let req = self.approvals.front().or(self.promotions.front()).cloned();
+                match req.and_then(|r| r.tool_id.map(|id| (id, r.version))) {
+                    Some((id, version)) => {
+                        self.approval_code = Some(version);
+                        self.request(Pending::ApprovalCode, Request::GetTool { id });
+                    }
+                    None => self.notes.push("this approval has no code to show".into()),
+                }
+                return;
+            }
             if c == 'o' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.fire(Request::ApprovalDecision {
@@ -4830,7 +4880,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some((req, promotion)) = modal {
         let more = app.approvals.len() + app.promotions.len() - 1;
-        draw_approval(f, req, promotion, more, app.color, !app.input_focus);
+        draw_approval(
+            f,
+            req,
+            promotion,
+            more,
+            app.color,
+            !app.input_focus,
+            app.approval_explain,
+        );
     } else if let Some(pick) = &app.rollback_pick {
         draw_rollback_picker(f, app, pick);
     } else if let Some(o) = &app.model_overlay {
@@ -4839,13 +4897,16 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some(p) = &app.pager {
         let area = f.area();
         let height = area.height.saturating_sub(2) as usize;
-        let body: Vec<Line> = p
-            .lines
-            .iter()
-            .skip(p.top)
-            .take(height)
-            .map(|l| Line::raw(l.chars().skip(p.left).collect::<String>()))
-            .collect();
+        let body: Vec<Line> = if p.left == 0 && !p.styled.is_empty() {
+            p.styled.iter().skip(p.top).take(height).cloned().collect()
+        } else {
+            p.lines
+                .iter()
+                .skip(p.top)
+                .take(height)
+                .map(|l| Line::raw(l.chars().skip(p.left).collect::<String>()))
+                .collect()
+        };
         let title = format!(
             " {} · line {}/{} · ↑↓ ←→ PgUp PgDn g G · Esc close ",
             p.title,
@@ -5698,6 +5759,36 @@ fn editor_takes_goto(program: &str) -> bool {
     )
 }
 
+/// A pager of numbered, highlighted JavaScript (a Tool's code).
+fn code_pager(title: &str, code: &str, color: bool) -> Pager {
+    let lines: Vec<&str> = code.lines().collect();
+    let w = lines.len().to_string().len();
+    let mut hl = highlight::Highlighter::new("js", color);
+    let styled = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let mut spans = vec![Span::styled(format!("{:>w$} │ ", i + 1), ui::dim(color))];
+            match &mut hl {
+                Some(h) => spans.extend(h.line(l)),
+                None => spans.push(Span::raw(l.to_string())),
+            }
+            Line::from(spans)
+        })
+        .collect();
+    Pager {
+        title: title.to_string(),
+        lines: lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{:>w$} │ {l}", i + 1))
+            .collect(),
+        top: 0,
+        left: 0,
+        styled,
+    }
+}
+
 /// The Markdown tables in `text`: runs of lines that start with `|`.
 fn markdown_tables(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -5871,6 +5962,7 @@ impl App {
                 .collect(),
             top: 0,
             left: 0,
+            styled: Vec::new(),
         });
     }
 
@@ -5907,6 +5999,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            styled: Vec::new(),
         });
     }
 
@@ -7503,6 +7596,7 @@ fn draw_approval(
     more: usize,
     color: bool,
     focused: bool,
+    explain: bool,
 ) {
     let mut lines = match &req.detail {
         // A non-Tool approval (e.g. the agent adding an MCP server).
@@ -7550,6 +7644,12 @@ fn draw_approval(
             ]));
         } else {
             lines.push(Line::raw(format!("  • {cap}")));
+        }
+        if explain {
+            lines.push(Line::styled(
+                format!("      {}", ui::explain_capability(cap)),
+                ui::dim(color),
+            ));
         }
     }
     if req.detail.is_none() {
@@ -7609,7 +7709,7 @@ fn draw_approval(
     lines.push(Line::from(keys));
     lines.push(Line::styled(
         if focused {
-            "Tab: keep typing your message (this stays open)"
+            "v full code · ? explain capabilities · Tab: keep typing your message"
         } else {
             "You're typing · Tab: back to this approval"
         },
@@ -8204,6 +8304,8 @@ mod tests {
             path_cache: HashMap::new(),
             image_proto: None,
             input_focus: false,
+            approval_explain: false,
+            approval_code: None,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
             hyperlinks: false,
@@ -8345,6 +8447,7 @@ mod tests {
             memory_mb: 256,
             already_allowed: vec![],
             code_preview: None,
+            tool_id: None,
         });
         assert!(app
             .activity_text()
@@ -8798,6 +8901,7 @@ mod tests {
             detail: None,
             already_allowed: Vec::new(),
             code_preview: None,
+            tool_id: None,
         });
         let screen = render(&mut app, 100, 24);
         assert!(
@@ -8861,6 +8965,7 @@ mod tests {
             detail: None,
             already_allowed: Vec::new(),
             code_preview: None,
+            tool_id: None,
         });
         app.editor = Some(EditorState {
             tool_id: "t".into(),
@@ -9094,6 +9199,7 @@ mod tests {
             detail: None,
             already_allowed: vec![],
             code_preview: None,
+            tool_id: None,
         });
         assert!(app.notifications.is_empty());
         app.focused = false;
@@ -9760,6 +9866,7 @@ mod tests {
             detail: None,
             already_allowed: Vec::new(),
             code_preview: None,
+            tool_id: None,
         });
         assert!(render(&mut app, 100, 30).contains("Tab: keep typing"));
         // Typing moves focus to the input; y and n then type normally.
@@ -9780,6 +9887,39 @@ mod tests {
         assert!(app.approvals.is_empty());
         assert_eq!(app.input, "hey no");
         assert!(app.notes.last().unwrap().contains("denied fetch_page"));
+    }
+
+    #[test]
+    fn approval_shows_full_code_and_explains_capabilities() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.approvals.push_back(ApprovalReq {
+            approval_id: "a".into(),
+            tool_name: "save_report".into(),
+            version: 3,
+            capabilities: vec!["fs:write:/Users/x/out".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: Vec::new(),
+            code_preview: Some("function run(i) {".into()),
+            tool_id: Some("t1".into()),
+        });
+        app.key(key(KeyCode::Char('?')));
+        let screen = render(&mut app, 110, 30);
+        assert!(
+            screen.contains("can create, overwrite or delete files under /Users/x/out"),
+            "{screen}"
+        );
+        assert_eq!(app.approvals.len(), 1, "? doesn't decide");
+        app.key(key(KeyCode::Char('v')));
+        assert_eq!(app.approval_code, Some(3), "asks for v3's code");
+        let p = code_pager(
+            "save_report v3 code",
+            "function run(i) {\n  return 1;\n}",
+            true,
+        );
+        assert_eq!(p.lines[1], "2 │   return 1;");
+        assert!(p.styled[0].spans.iter().any(|s| s.content == "function"));
     }
 
     #[test]
@@ -9977,6 +10117,7 @@ mod tests {
             detail: None,
             already_allowed: Vec::new(),
             code_preview: None,
+            tool_id: None,
         });
         app.slash("approve");
         let last = app.notes.last().unwrap();

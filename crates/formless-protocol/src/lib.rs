@@ -1061,6 +1061,9 @@ pub enum Event {
         /// The first lines of the Tool's code, to see what is being trusted.
         #[serde(default)]
         code_preview: Option<String>,
+        /// The Tool's id, to fetch its full code (`GetTool`).
+        #[serde(default)]
+        tool_id: Option<String>,
     },
     ToolUpdated {
         tool: ToolInfo,
@@ -1245,6 +1248,7 @@ mod tests {
             detail: None,
             already_allowed: vec![],
             code_preview: None,
+            tool_id: None,
         };
         assert_eq!(ev.session_id(), Some("s1"));
         let note = Event::Note {
