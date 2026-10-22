@@ -1846,6 +1846,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   rebuilds of an unsigned dev binary (whose keychain ACL would otherwise
   orphan the entry).
 
+- **Toasts (TUI).** Status notes ("approved X once", "saved …", errors)
+  appear as toasts in the top-right corner of the chat instead of
+  crowding the status line. They fade after 6 s, up to 4 are shown, and
+  a burst keeps only its newest. Problem notes (failed, denied, error…)
+  are red and stay until Esc. `/notes` opens every note so far in the
+  pager.
 - **Context fill.** The status line shows `ctx N%`: the latest prompt's
   token count over the model's context size (`model_context_tokens`,
   else `context_tokens`). It's amber above 70% and red above 90%, so

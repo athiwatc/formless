@@ -220,6 +220,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("jobs enable", "ID", "enable (approve) a job", Integrations),
     cmd("jobs disable", "ID", "pause a job", Integrations),
     cmd("jobs rm", "ID", "delete a job", Integrations),
+    cmd("notes", "", "every note so far, in the pager", App),
     cmd(
         "help",
         "",
