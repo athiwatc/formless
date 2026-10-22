@@ -1538,6 +1538,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   one, the chat follows the live bottom again. Home on an empty input
   goes to the top of the Session. While scrolled, the indicator shows
   where you are: `message 4/17 · ↑ N more below`.
+- **Find in this Session (TUI).** Ctrl+F turns the input into a find bar.
+  Matches (case-insensitive, within the rendered chat) are highlighted,
+  the current one brighter. The bar shows `3/11`. Enter/Shift+Enter step
+  to the next/previous match and scroll to it; a new query starts at the
+  match nearest the bottom. Esc closes the bar and follows the bottom.
+  `/search` still searches every Session.
 - **Tool calls in the TUI chat.** Persisted calls start collapsed to one
   line: `▸ ⚙ name ✓`, an input summary, and the first line of the result
   (✗ on failure, … while there is none). Their separate result lines are

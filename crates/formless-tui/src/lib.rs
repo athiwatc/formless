@@ -183,6 +183,17 @@ struct ModelOverlay {
     default_only: bool,
 }
 
+/// The Ctrl+F find bar: the query, the current match and, from the last
+/// draw, the wrapped row of every matching line.
+#[derive(Default)]
+struct FindBar {
+    query: String,
+    current: usize,
+    rows: Vec<usize>,
+    /// Scroll to the current match on the next draw.
+    scroll: bool,
+}
+
 /// A row of the `/` palette: a command, or an argument for one.
 struct PaletteItem {
     /// The input after accepting this row.
@@ -754,6 +765,8 @@ struct App {
     scroll_to_focus: bool,
     /// Wrapped row of each user message, from the last draw.
     user_rows: Vec<usize>,
+    /// Ctrl+F find in this Session (SPEC §10.2).
+    find: Option<FindBar>,
     /// Last listed running Invocations (for /kill and /drop by prefix).
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
@@ -910,6 +923,7 @@ impl App {
             expanded_calls: HashSet::new(),
             scroll_to_focus: false,
             user_rows: Vec::new(),
+            find: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -4120,6 +4134,46 @@ impl App {
         });
     }
 
+    /// Ctrl+F opens the find bar; while it's open keys edit the query,
+    /// Enter/Shift+Enter step through matches and Esc closes it.
+    fn find_key(&mut self, key: &KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Char('f') && ctrl {
+            self.find = Some(FindBar::default());
+            return true;
+        }
+        let Some(find) = &mut self.find else {
+            return false;
+        };
+        let n = find.rows.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.find = None;
+                self.follow_chat_bottom();
+                return true;
+            }
+            KeyCode::Enter if n > 0 => {
+                find.current = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    (find.current + n - 1) % n
+                } else {
+                    (find.current + 1) % n
+                };
+            }
+            KeyCode::Enter => {}
+            KeyCode::Backspace => {
+                find.query.pop();
+                find.current = usize::MAX;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                find.query.push(c);
+                find.current = usize::MAX;
+            }
+            _ => return false,
+        }
+        find.scroll = true;
+        true
+    }
+
     /// Scroll to the previous/next user message (SPEC §10.2); past the
     /// last one, follow the live bottom again.
     fn jump_user_message(&mut self, forward: bool) {
@@ -4222,7 +4276,7 @@ impl App {
             }
             return;
         }
-        if self.call_focus_key(&key) {
+        if self.find_key(&key) || self.call_focus_key(&key) {
             return;
         }
         let page = self.chat_view_height.saturating_sub(1).max(1);
@@ -4569,6 +4623,58 @@ fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<L
     out
 }
 
+/// Highlight case-insensitive `query` matches in a line's spans; `style`
+/// gets each match's index in the line. Returns the line and its match
+/// count (matches across span boundaries are not found).
+fn highlight_matches(
+    line: Line<'static>,
+    query: &str,
+    style: impl Fn(usize) -> Style,
+) -> (Line<'static>, usize) {
+    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if q.is_empty() {
+        return (line, 0);
+    }
+    let mut found = 0;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let low: Vec<char> = chars
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
+        let (mut start, mut i) = (0, 0);
+        while i + q.len() <= chars.len() {
+            if low[i..i + q.len()] == q[..] {
+                if i > start {
+                    spans.push(Span::styled(
+                        chars[start..i].iter().collect::<String>(),
+                        span.style,
+                    ));
+                }
+                spans.push(Span::styled(
+                    chars[i..i + q.len()].iter().collect::<String>(),
+                    style(found),
+                ));
+                found += 1;
+                i += q.len();
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        if start == 0 {
+            spans.push(span);
+        } else if start < chars.len() {
+            spans.push(Span::styled(
+                chars[start..].iter().collect::<String>(),
+                span.style,
+            ));
+        }
+    }
+    (Line::from(spans).style(line.style), found)
+}
+
 /// A user-message line with `@path` mentions highlighted.
 fn mention_line(text: &str, color: bool) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
@@ -4851,6 +4957,27 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
+    if let Some(find) = app.find.as_ref().filter(|_| app.view == View::Chat) {
+        let n = find.rows.len();
+        let count = if find.query.is_empty() {
+            String::new()
+        } else if n == 0 {
+            "  no matches".into()
+        } else {
+            format!("  {}/{n}", find.current.min(n - 1) + 1)
+        };
+        let line = Line::from(vec![
+            Span::styled("find › ", bold_fg(app.color, Color::Magenta)),
+            Span::raw(format!("{}▏", find.query)),
+            Span::styled(count, bold_fg(app.color, Color::Yellow)),
+        ]);
+        let block = ui::panel(" Find in this Session ", app.color, Color::Magenta).title(ui::hint(
+            "Enter next · Shift+Enter previous · Esc close",
+            app.color,
+        ));
+        f.render_widget(Paragraph::new(line).block(block), area);
+        return;
+    }
     let (prompt, color) = if app.renaming {
         ("rename › ", Color::Magenta)
     } else if app.search_mode {
@@ -5663,20 +5790,41 @@ fn chat_lines(
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let height = (area.height.saturating_sub(2) as usize).max(1);
     let width = area.width.saturating_sub(2);
-    let (lines, focus_line, user_lines) = chat_lines(app, width as usize, height);
-    // Wrapped row where each user message starts (`{`/`}`, Ctrl+↑/↓).
-    let mut row = 0;
-    let mut next_user = user_lines.iter().peekable();
-    app.user_rows.clear();
-    for (i, l) in lines.iter().enumerate() {
-        if next_user.peek() == Some(&&i) {
-            app.user_rows.push(row);
-            next_user.next();
+    let (mut lines, focus_line, user_lines) = chat_lines(app, width as usize, height);
+    // Find (Ctrl+F): highlight matches; the current one stands out.
+    let mut match_lines = Vec::new();
+    if let Some(find) = app.find.as_ref().filter(|f| !f.query.is_empty()) {
+        let current = find.current;
+        for (i, line) in lines.iter_mut().enumerate() {
+            let here = match_lines.len();
+            let (lit, n) = highlight_matches(std::mem::take(line), &find.query, |k| {
+                if here + k == current {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightYellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                }
+            });
+            *line = lit;
+            match_lines.extend(std::iter::repeat_n(i, n));
         }
+    }
+    // Wrapped row where each line starts: for user messages (`{`/`}`,
+    // Ctrl+↑/↓) and find matches.
+    let mut line_rows = Vec::with_capacity(lines.len());
+    let mut row = 0;
+    for l in &lines {
+        line_rows.push(row);
         row += Paragraph::new(l.clone())
             .wrap(Wrap { trim: false })
             .line_count(width)
             .max(1);
+    }
+    app.user_rows = user_lines.iter().map(|&i| line_rows[i]).collect();
+    if let Some(find) = &mut app.find {
+        find.rows = match_lines.iter().map(|&i| line_rows[i]).collect();
     }
     // Bring a newly focused tool call into view (rows before it, wrapped).
     let focus_row = focus_line
@@ -5692,7 +5840,17 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     app.chat_view_height = height;
     app.chat_line_count = rows;
     let max_top = rows.saturating_sub(height);
-    if let Some(row) = focus_row {
+    let mut find_row = None;
+    if let Some(f) = app.find.as_mut() {
+        if std::mem::take(&mut f.scroll) {
+            // A new query starts at the match nearest the bottom.
+            if f.current >= f.rows.len() {
+                f.current = f.rows.len().saturating_sub(1);
+            }
+            find_row = f.rows.get(f.current).copied();
+        }
+    }
+    if let Some(row) = focus_row.or(find_row) {
         let top = app.chat_scroll_top.unwrap_or(max_top);
         if row < top || row >= top + height {
             app.chat_scroll_top = Some(row.saturating_sub(height / 3).min(max_top));
@@ -7220,6 +7378,7 @@ mod tests {
             expanded_calls: HashSet::new(),
             scroll_to_focus: false,
             user_rows: Vec::new(),
+            find: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -8307,6 +8466,49 @@ mod tests {
         app.key(key(KeyCode::Char('}')));
         app.key(key(KeyCode::Char('}')));
         assert_eq!(app.chat_scroll_top, None);
+    }
+
+    #[test]
+    fn find_in_session_highlights_and_steps_through_matches() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.messages = (0..8)
+            .map(|i| MessageInfo {
+                id: format!("m{i}"),
+                session_id: "s".into(),
+                seq: i,
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: if i == 2 || i == 6 {
+                    "the Postgres decision".into()
+                } else {
+                    "filler\n\n".repeat(10)
+                },
+                created_at: String::new(),
+                meta: None,
+            })
+            .collect();
+        render(&mut app, 80, 16);
+        app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        for c in "postgres".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        // The first draw finds the matches; the next shows the count.
+        render(&mut app, 80, 16);
+        let screen = render(&mut app, 80, 16);
+        assert_eq!(app.find.as_ref().unwrap().rows.len(), 2);
+        assert!(screen.contains("2/2"), "{screen}");
+        // Enter wraps to the first match and scrolls to it.
+        app.key(key(KeyCode::Enter));
+        render(&mut app, 80, 16);
+        assert_eq!(app.find.as_ref().unwrap().current, 0);
+        assert!(app.chat_scroll_top.is_some());
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.find.as_ref().unwrap().current, 1);
+        // Esc closes it and follows the bottom again.
+        app.key(key(KeyCode::Esc));
+        assert!(app.find.is_none() && app.chat_scroll_top.is_none());
+        let (line, n) = highlight_matches(Line::raw("Aa aA"), "aa", |_| Style::default());
+        assert_eq!((n, line.spans.len()), (2, 3));
     }
 
     #[test]
