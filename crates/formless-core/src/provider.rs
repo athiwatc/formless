@@ -647,7 +647,10 @@ impl Provider {
                             dropped = true;
                             continue;
                         }
-                        last_err = format!("{status}: {text}");
+                        last_err = match server_wait {
+                            Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
+                            None => format!("{status}: {text}"),
+                        };
                         if is_model_error(status.as_u16(), &text) && models.len() > 1 {
                             break; // fail over to the next model
                         }
@@ -1060,10 +1063,11 @@ fn parse_models(body: &Value) -> Vec<String> {
 }
 
 fn is_model_error(status: u16, text: &str) -> bool {
-    if status == 404 {
-        return true;
-    }
-    let t = text.to_lowercase();
+    status == 404 || is_model_error_text(&text.to_lowercase())
+}
+
+/// A (lowercased) error body saying the model doesn't exist.
+pub fn is_model_error_text(t: &str) -> bool {
     t.contains("model")
         && (t.contains("not found")
             || t.contains("does not exist")

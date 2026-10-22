@@ -100,6 +100,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("resend", "", "re-send a stalled provider request", Run),
     cmd("resume", "", "continue an interrupted or paused Run", Run),
     cmd("abandon", "", "drop an interrupted or paused Run", Run),
+    cmd("details", "", "show the last provider error in full", Run),
     cmd("approve", "", "list approvals waiting for you", Run),
     cmd("invocations", "", "list pending Invocations", Run),
     cmd("kill", "HANDLE", "cancel a pending Invocation", Run),

@@ -754,6 +754,8 @@ struct App {
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
     /// The current Session's unfinished last Run: (status, reason).
     run_banner: Option<(String, String)>,
+    /// The last provider error in full, for `/details`.
+    last_error: Option<String>,
     /// Last listed running Invocations (for /kill and /drop by prefix).
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
@@ -903,6 +905,7 @@ impl App {
             questions: Vec::new(),
             run_usage: HashMap::new(),
             run_banner: None,
+            last_error: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -1783,15 +1786,31 @@ impl App {
                 }
             }
             Event::RunPaused {
-                session_id, error, ..
+                session_id,
+                error,
+                explained,
+                ..
             } => {
                 self.running_sessions.remove(&session_id);
                 if !self.is_current(&session_id) {
                     return;
                 }
                 self.activity = None;
-                self.notes.push(format!("run paused: {error}"));
-                self.run_banner = Some(("paused".into(), error));
+                self.last_error = Some(error.clone());
+                match explained {
+                    Some(x) => {
+                        self.notes.push(format!("run paused: {}", x.message));
+                        if let Some(action) = &x.action {
+                            self.notes
+                                .push(format!("→ {action} · /details shows the raw error"));
+                        }
+                        self.run_banner = Some(("paused".into(), x.message));
+                    }
+                    None => {
+                        self.notes.push(format!("run paused: {error}"));
+                        self.run_banner = Some(("paused".into(), error));
+                    }
+                }
             }
             Event::CompactionNotice {
                 summary_preview, ..
@@ -2399,15 +2418,19 @@ impl App {
                 })
             }
             Event::RunPaused {
-                session_id, error, ..
+                session_id,
+                error,
+                explained,
+                ..
             } => {
                 self.run_started_at.remove(session_id);
+                let what = explained.as_ref().map_or(error, |x| &x.message);
                 Some((
                     "Run paused".into(),
                     format!(
                         "{}: {}",
                         self.session_name(session_id),
-                        truncate_chars(error, 120)
+                        truncate_chars(what, 120)
                     ),
                 ))
             }
@@ -2940,6 +2963,16 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "details" => match self.last_error.clone() {
+                Some(raw) => {
+                    self.pager = Some(Pager {
+                        title: "Last error".into(),
+                        lines: raw.lines().map(str::to_string).collect(),
+                        top: 0,
+                    })
+                }
+                None => self.notes.push("no error to show".into()),
+            },
             cmd if cmd.starts_with("jobs ") => {
                 let mut words = cmd.split_whitespace().skip(1);
                 let (verb, id) = (
@@ -6788,6 +6821,7 @@ mod tests {
             questions: Vec::new(),
             run_usage: HashMap::new(),
             run_banner: None,
+            last_error: None,
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
@@ -7619,6 +7653,7 @@ mod tests {
             session_id: "s".into(),
             run_id: "r".into(),
             error: "429 rate limited".into(),
+            explained: None,
         });
         assert!(app.notifications.last().unwrap().1.contains("429"));
     }
