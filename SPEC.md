@@ -1554,6 +1554,19 @@ run_tool = "network_policy"     # a registry Tool, or…
   `/thinking`, `/help`
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`). Plain text is always chat.
+- **Command palette.** Typing `/` at the start of the input opens a popup
+  of commands with one-line descriptions, filtered fuzzily (exact prefixes
+  first). ↑/↓ select, Tab completes, Enter runs. A command that still
+  needs an argument completes to `/name ` and shows its syntax instead of
+  running. Esc hides the popup until the input changes. Arguments
+  complete where the client has the data, for now Tool names for
+  `/revoke`. `/help` (or `?` on an empty input) opens a scrollable
+  overlay grouped by area (Session, Run control, Tools, Settings,
+  Integrations, App) followed by the keys. An unknown command suggests
+  the closest one ("did you mean /sessions?"). In each client one command
+  table (name, arguments, description, group) drives the palette, the
+  help and "did you mean". The web client also dispatches from that
+  table, and a TUI test checks that the dispatcher handles every entry.
 - Terminal colours respected, `NO_COLOR` honoured. Narrow terminals remain
   usable (single-column-first design).
 - Multi-pane layout (v2): `/panes` toggles a persistent dashboard —
