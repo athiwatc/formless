@@ -1578,6 +1578,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
   editors (which get the terminal until they exit), `FILE:LINE` for
   Helix, and `-g` for VS Code and its forks.
+- **Diffs (TUI).** Unified diffs show coloured: added lines green, removed
+  red, hunk headers cyan, file headers bold. Runs of more than 7
+  unchanged context lines collapse to their first and last 3
+  (`⋯ N unchanged lines`). This applies to ```` ```diff ```` blocks and to
+  Tool results that are a diff or hold one in a JSON string field. A
+  collapsed call with a diff result shows `+added −removed`.
 - **Code blocks (TUI).** Code never wraps, since that breaks indentation;
   lines longer than the pane end in `…`. `/pager code [N]` opens the last
   answer's Nth code block (default the last) unwrapped in the pager, with

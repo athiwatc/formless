@@ -561,9 +561,98 @@ pub(crate) fn diff_line(line: &str, color: bool) -> Span<'static> {
     Span::styled(line.to_string(), style)
 }
 
+/// Whether `text` is (or contains) a unified diff: a hunk header and
+/// file headers or a `diff --git` line.
+pub(crate) fn is_unified_diff(text: &str) -> bool {
+    let mut hunk = false;
+    let mut header = false;
+    for l in text.lines() {
+        hunk |= l.starts_with("@@ ");
+        header |= l.starts_with("--- ") || l.starts_with("+++ ") || l.starts_with("diff --git");
+        if hunk && header {
+            return true;
+        }
+    }
+    false
+}
+
+/// A diff's lines, coloured, with runs of unchanged context longer than
+/// `2 * CONTEXT` collapsed to their first and last `CONTEXT` lines.
+pub(crate) fn diff_lines(text: &str, color: bool) -> Vec<Vec<Span<'static>>> {
+    const CONTEXT: usize = 3;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let context = |l: &str| l.starts_with(' ') || l.is_empty();
+        if context(lines[i]) {
+            let start = i;
+            while i < lines.len() && context(lines[i]) {
+                i += 1;
+            }
+            let run = &lines[start..i];
+            if run.len() > 2 * CONTEXT + 1 {
+                out.extend(run[..CONTEXT].iter().map(|l| vec![diff_line(l, color)]));
+                out.push(vec![Span::styled(
+                    format!(" ⋯ {} unchanged lines", run.len() - 2 * CONTEXT),
+                    super::ui::dim(color),
+                )]);
+                out.extend(
+                    run[run.len() - CONTEXT..]
+                        .iter()
+                        .map(|l| vec![diff_line(l, color)]),
+                );
+            } else {
+                out.extend(run.iter().map(|l| vec![diff_line(l, color)]));
+            }
+        } else {
+            out.push(vec![diff_line(lines[i], color)]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `+added −removed` for a diff (file headers excluded).
+pub(crate) fn diff_stat(text: &str) -> (usize, usize) {
+    text.lines().fold((0, 0), |(a, r), l| {
+        if l.starts_with('+') && !l.starts_with("+++") {
+            (a + 1, r)
+        } else if l.starts_with('-') && !l.starts_with("---") {
+            (a, r + 1)
+        } else {
+            (a, r)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diffs_are_detected_coloured_and_collapsed() {
+        let mut d = String::from("--- a/x.rs\n+++ b/x.rs\n@@ -1,12 +1,12 @@\n");
+        for n in 0..10 {
+            d.push_str(&format!(" line {n}\n"));
+        }
+        d.push_str("-old\n+new\n");
+        assert!(is_unified_diff(&d));
+        assert!(!is_unified_diff("just\n@@ text"));
+        assert_eq!(diff_stat(&d), (1, 1));
+        let out = diff_lines(&d, true);
+        let text: Vec<String> = out
+            .iter()
+            .map(|l| l.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(
+            text.contains(&" ⋯ 4 unchanged lines".to_string()),
+            "{text:#?}"
+        );
+        assert_eq!(text.len(), 3 + 3 + 1 + 3 + 2);
+        let added = out.iter().find(|l| l[0].content == "+new").unwrap();
+        assert_eq!(added[0].style.fg, Some(Color::Green));
+    }
 
     fn toks(lang: &str, line: &str) -> Vec<(String, Option<Color>)> {
         let mut h = Highlighter::new(lang, true).unwrap();
