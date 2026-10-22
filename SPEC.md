@@ -1538,6 +1538,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   one, the chat follows the live bottom again. Home on an empty input
   goes to the top of the Session. While scrolled, the indicator shows
   where you are: `message 4/17 · ↑ N more below`.
+- **New output while scrolled up (TUI).** While you're not following the
+  bottom, output that arrives is counted in a badge on the chat's bottom
+  border (`↓ 12 new lines · End`). End, or clicking the badge, jumps to
+  the bottom and follows again.
 - **Find in this Session (TUI).** Ctrl+F turns the input into a find bar.
   Matches (case-insensitive, within the rendered chat) are highlighted,
   the current one brighter. The bar shows `3/11`. Enter/Shift+Enter step
