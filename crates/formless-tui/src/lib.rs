@@ -2374,6 +2374,20 @@ impl App {
             .unwrap_or_else(|| formless_core::provider::is_vision_model(&model))
     }
 
+    /// `/compact [focus]`: summarise the Session now (SPEC §11).
+    fn compact_now(&mut self, focus: Option<String>) {
+        let Some(session_id) = self.current.clone() else {
+            self.notes.push("no current session".into());
+            return;
+        };
+        self.request(
+            Pending::RunControl,
+            Request::CompactSession { session_id, focus },
+        );
+        self.notes
+            .push("compacting: a summary will replace the history so far…".into());
+    }
+
     /// One `@` attachment answered; send the message once all have.
     fn mention_attached(&mut self) {
         let Some(p) = &mut self.pending_send else {
@@ -2997,6 +3011,11 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "compact" => self.compact_now(None),
+            cmd if cmd.starts_with("compact ") => {
+                let focus = cmd["compact ".len()..].trim().to_string();
+                self.compact_now(Some(focus));
+            }
             "context" => match self.current.clone() {
                 Some(session_id) => {
                     self.request(Pending::ContextReport, Request::ContextUsage { session_id })

@@ -2105,6 +2105,10 @@
       if (r.last_run) note("last Run: " + usageText(r.last_run));
       return note("session (" + r.runs + " Runs): " + usageText(r.total));
     } },
+    { name: "compact", args: "[FOCUS]", group: "Session", desc: "summarise the Session now, keeping what FOCUS asks", run: async (arg) => {
+      if (!S.current) return note("open a session first", true);
+      if (await act({ type: "compact_session", session_id: S.current, focus: arg || null })) note("compacting: a summary will replace the history so far…");
+    } },
     { name: "context", group: "Session", desc: "how full the context window is, and what fills it", run: () => showContext() },
     { name: "stop", group: "Run control", desc: "stop the current Run (Esc)", run: () => stop() },
     { name: "cancel", group: "Run control", desc: "cancel the stalled or pending Tool call", run: () => {

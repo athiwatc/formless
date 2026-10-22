@@ -744,6 +744,45 @@ impl Daemon {
                 }
                 Ok(json!({"revoked": true}))
             }
+            Request::CompactSession { session_id, focus } => {
+                if self.runs.lock().unwrap().contains_key(&session_id) {
+                    return Err(anyhow!(
+                        "a Run is active in this Session; compact when it ends"
+                    ));
+                }
+                let cfg = self.config()?;
+                let (prev_up_to, last) = self.with_reader(|st| {
+                    let prev = st.latest_checkpoint(&session_id)?.map_or(0, |(_, up)| up);
+                    let last = st.list_messages(&session_id)?.last().map_or(0, |m| m.seq);
+                    Ok((prev, last))
+                })?;
+                if last <= prev_up_to {
+                    return Err(anyhow!("nothing to compact yet"));
+                }
+                let target = self.target(&cfg, &session_id, None).await?;
+                let context_tokens = target.provider.settings().context_for(&target.model);
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let r = this
+                        .compact(
+                            &target.provider,
+                            &cfg,
+                            &session_id,
+                            &target.model,
+                            context_tokens,
+                            last,
+                            focus.as_deref(),
+                        )
+                        .await;
+                    if let Err(e) = r {
+                        this.broadcast(Event::Note {
+                            session_id: Some(session_id.clone()),
+                            text: format!("compaction failed: {e:#}"),
+                        });
+                    }
+                });
+                Ok(json!({"started": true, "up_to": last}))
+            }
             Request::ContextUsage { session_id } => {
                 let cfg = self.config()?;
                 let model = self.session_base_model(&session_id, &cfg);
@@ -5805,6 +5844,32 @@ impl Daemon {
         if !needs {
             return Ok(());
         }
+        self.compact(
+            provider,
+            cfg,
+            session_id,
+            model,
+            context_tokens,
+            compact_up_to,
+            None,
+        )
+        .await
+    }
+
+    /// Summarise a Session's messages up to `compact_up_to` into its
+    /// checkpoint (SPEC §11), with optional instructions from the user on
+    /// what to keep.
+    #[allow(clippy::too_many_arguments)]
+    async fn compact(
+        &self,
+        provider: &Provider,
+        cfg: &Config,
+        session_id: &str,
+        model: &str,
+        context_tokens: u32,
+        compact_up_to: i64,
+        focus: Option<&str>,
+    ) -> Result<()> {
         let text = self.with_store(|st| {
             let (_s, prev_up_to) = st.latest_checkpoint(session_id)?.unwrap_or_default();
             let msgs = st.list_messages(session_id)?;
@@ -5835,6 +5900,10 @@ impl Daemon {
             text
         } else {
             format!("Previous summary:\n{previous}\n\n{text}")
+        };
+        let input = match focus.map(str::trim).filter(|f| !f.is_empty()) {
+            Some(f) => format!("The user asked this summary to focus on: {f}\n\n{input}"),
+            None => input,
         };
         let summary = if cfg.compaction.server_side {
             match provider.compact_server(&input, &cmodel).await {

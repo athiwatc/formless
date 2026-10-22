@@ -95,6 +95,12 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("usage", "", "tokens and cost of this Session", Session),
     cmd(
+        "compact",
+        "[FOCUS]",
+        "summarise the Session now, keeping what FOCUS asks",
+        Session,
+    ),
+    cmd(
         "context",
         "",
         "how full the context window is, and what fills it",

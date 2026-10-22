@@ -680,6 +680,15 @@ pub enum Request {
     ContextUsage {
         session_id: String,
     },
+    /// Compact a Session now (SPEC §11): summarise everything so far into
+    /// its checkpoint, keeping what `focus` asks for. Runs in the
+    /// background and ends with `CompactionNotice` (or a `Note` on
+    /// failure); refused while a Run is active.
+    CompactSession {
+        session_id: String,
+        #[serde(default)]
+        focus: Option<String>,
+    },
     /// A Session's usage: `{"last_run": UsageInfo?, "total": UsageInfo, "runs": n}`.
     SessionUsage {
         session_id: String,
