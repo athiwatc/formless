@@ -1538,6 +1538,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   one, the chat follows the live bottom again. Home on an empty input
   goes to the top of the Session. While scrolled, the indicator shows
   where you are: `message 4/17 · ↑ N more below`.
+- **Scroll position (TUI).** The chat panel draws a scrollbar on its right
+  border when the Session is longer than a screen. While scrolled away
+  from the bottom, the title shows where you are:
+  `message 4/17 · line 120/400 · 30% · End to follow`.
 - **New output while scrolled up (TUI).** While you're not following the
   bottom, output that arrives is counted in a badge on the chat's bottom
   border (`↓ 12 new lines · End`). End, or clicking the badge, jumps to

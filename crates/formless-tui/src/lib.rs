@@ -5922,9 +5922,11 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         String::new()
                     };
+                    // The bottom visible line, of all of them.
+                    let line = (scroll_top + height).min(rows);
                     format!(
-                        " {msg}↑ {} more below · End to follow ",
-                        max_top - scroll_top
+                        " {msg}line {line}/{rows} · {}% · End to follow ",
+                        line * 100 / rows.max(1)
                     )
                 },
                 bold_fg(app.color, Color::Yellow),
@@ -5938,6 +5940,22 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             .scroll((scroll_top.min(u16::MAX as usize) as u16, 0)),
         area,
     );
+    // A scrollbar on the right border when there's more than a screen.
+    if max_top > 0 {
+        let mut state = ScrollbarState::new(max_top + 1).position(scroll_top);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_style(fg(app.color, Color::Gray)),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut state,
+        );
+    }
 }
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
@@ -8585,6 +8603,33 @@ mod tests {
         });
         assert!(app.chat_scroll_top.is_none());
         assert!(!render(&mut app, 80, 20).contains("new line"));
+    }
+
+    #[test]
+    fn chat_scrollbar_and_position_while_scrolled() {
+        let mut app = test_app();
+        app.messages = (0..4)
+            .map(|i| MessageInfo {
+                id: format!("m{i}"),
+                session_id: "s".into(),
+                seq: i,
+                role: "assistant".into(),
+                content: format!("para {i}\n\n").repeat(10),
+                created_at: String::new(),
+                meta: None,
+            })
+            .collect();
+        let bottom = render(&mut app, 80, 20);
+        assert!(bottom.contains('█'), "scrollbar thumb");
+        assert!(
+            !bottom.contains("End to follow"),
+            "no position while following"
+        );
+        app.scroll_chat_up(20);
+        let screen = render(&mut app, 80, 20);
+        let total = app.chat_line_count;
+        assert!(screen.contains(&format!("/{total} · ")), "{screen}");
+        assert!(screen.contains("% · End to follow"));
     }
 
     #[test]
