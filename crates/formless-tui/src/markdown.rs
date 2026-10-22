@@ -13,7 +13,7 @@ use pulldown_cmark::{
 use ratatui::prelude::*;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::highlight::{diff_line, Highlighter};
+use super::highlight::Highlighter;
 use super::ui::dim;
 use super::{bold_fg, fg, mermaid};
 
@@ -452,6 +452,17 @@ impl Renderer {
         };
         self.emit(vec![Span::styled(label, dim(color))]);
         let diff = matches!(lang, "diff" | "patch");
+        if diff {
+            // Coloured, with long unchanged context collapsed.
+            let code_w = avail.saturating_sub(2).max(8);
+            for row in super::highlight::diff_lines(body, color) {
+                let mut line = vec![Span::styled("│ ", dim(color))];
+                line.extend(truncate_spans(row, code_w));
+                self.emit(line);
+            }
+            self.emit(vec![Span::styled("╰─", dim(color))]);
+            return;
+        }
         let mut hl = Highlighter::new(lang, color);
         let numbers = LINE_NUMBERS.with(|l| l.get());
         let num_w = body.split('\n').count().to_string().len();
@@ -460,9 +471,7 @@ impl Renderer {
             .max(8);
         for (n, raw) in body.split('\n').enumerate() {
             let raw = raw.replace('\t', "    ");
-            let spans = if diff {
-                vec![diff_line(&raw, color)]
-            } else if let Some(h) = &mut hl {
+            let spans = if let Some(h) = &mut hl {
                 h.line(&raw)
             } else {
                 vec![Span::styled(raw.clone(), fg(color, Color::Yellow))]

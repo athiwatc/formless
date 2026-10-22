@@ -6061,6 +6061,20 @@ fn code_block_lines(text: &str, indent: &str, color: bool, max: usize) -> Vec<Li
     out
 }
 
+/// The unified diff in a Tool result: the text itself, or the first
+/// string field of a JSON object that holds one.
+fn result_diff(result: &str) -> Option<String> {
+    if highlight::is_unified_diff(result) {
+        return Some(result.to_string());
+    }
+    let v: serde_json::Value = serde_json::from_str(result).ok()?;
+    v.as_object()?
+        .values()
+        .filter_map(|f| f.as_str())
+        .find(|s| highlight::is_unified_diff(s))
+        .map(str::to_string)
+}
+
 /// One persisted call: collapsed to a line (name, input summary and the
 /// result's status), or expanded to its full input and result.
 fn tool_call_block(
@@ -6096,7 +6110,19 @@ fn tool_call_block(
             format!("  {}", ui::summarize_args(args, 120)),
             ui::dim(app.color),
         ));
-        if let Some(r) = result {
+        if let Some((added, removed)) = result
+            .and_then(result_diff)
+            .map(|d| highlight::diff_stat(&d))
+        {
+            head.push(Span::styled(
+                format!("  +{added}"),
+                fg(app.color, Color::Green),
+            ));
+            head.push(Span::styled(
+                format!(" −{removed}"),
+                fg(app.color, Color::Red),
+            ));
+        } else if let Some(r) = result {
             head.push(Span::styled(
                 format!(
                     "  → {}",
@@ -6128,7 +6154,16 @@ fn tool_call_block(
                     ui::dim(app.color)
                 },
             ));
-            out.extend(code_block_lines(r, "      ", app.color, 300));
+            match result_diff(r) {
+                Some(diff) => out.extend(highlight::diff_lines(&diff, app.color).into_iter().map(
+                    |row| {
+                        let mut spans = vec![Span::raw("      ")];
+                        spans.extend(row);
+                        Line::from(spans)
+                    },
+                )),
+                None => out.extend(code_block_lines(r, "      ", app.color, 300)),
+            }
         }
         None => out.push(Line::styled("    (no result yet)", ui::dim(app.color))),
     }
@@ -9483,6 +9518,50 @@ mod tests {
         app.pager = None;
         app.slash("pager code 1");
         assert_eq!(app.pager.as_ref().unwrap().lines, vec!["1 │ fn a() {}"]);
+    }
+
+    #[test]
+    fn tool_results_with_diffs_are_coloured() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1,2 @@\n-old\n+new\n+more";
+        let msg = |id: &str, role: &str, content: String, meta: serde_json::Value| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 0,
+            role: role.into(),
+            content,
+            created_at: String::new(),
+            meta: Some(meta.to_string()),
+        };
+        let mut app = test_app();
+        app.messages = vec![
+            msg(
+                "a",
+                "assistant",
+                String::new(),
+                serde_json::json!({"tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "apply_patch", "arguments": "{}"}}]}),
+            ),
+            msg(
+                "t",
+                "tool",
+                serde_json::json!({"diff": diff, "ok": true}).to_string(),
+                serde_json::json!({"tool_call_id": "c1"}),
+            ),
+        ];
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("+2 −1"), "{screen}");
+        app.key(key(KeyCode::Char(']')));
+        app.key(key(KeyCode::Enter));
+        let screen = render(&mut app, 100, 20);
+        assert!(
+            screen.contains("      +new") && screen.contains("      -old"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("\\n"),
+            "the diff isn't shown as escaped JSON"
+        );
     }
 
     #[test]
