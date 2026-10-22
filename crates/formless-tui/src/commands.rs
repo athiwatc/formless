@@ -88,6 +88,12 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("open", "[ID]", "show a stored output full-screen", Session),
     cmd(
+        "open link",
+        "[N]",
+        "open the Nth link in the last answer in your browser",
+        Session,
+    ),
+    cmd(
         "copy",
         "[N | code [N]]",
         "copy the last answer, the Nth message from the bottom, or a code block",

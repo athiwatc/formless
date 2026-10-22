@@ -1566,6 +1566,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   to the next/previous match and scroll to it; a new query starts at the
   match nearest the bottom. Esc closes the bar and follows the bottom.
   `/search` still searches every Session.
+- **Links (TUI).** URLs in the chat, from Markdown links or bare, are
+  clickable in terminals that support OSC 8 hyperlinks. After each draw,
+  the TUI repaints the visible URL cells wrapped in OSC 8, keeping their
+  style, but only when the set of visible links changed
+  (`tui.hyperlinks`). `/open link [N]` opens the Nth link in the last
+  answer with the system opener (`open`, `xdg-open`, `start`).
 - **Tables in narrow terminals (TUI).** Markdown tables wider than the
   pane shrink: columns narrower than an equal share keep their width, and
   the rest share the room in proportion. Cell text wraps inside its
@@ -2019,6 +2025,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 | `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
+| `tui.hyperlinks` | auto | Clickable OSC 8 links for URLs in the TUI chat: `on`, `off`, or `auto` (on except Terminal.app and the Linux console) (§10.2) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 
