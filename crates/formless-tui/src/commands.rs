@@ -129,6 +129,12 @@ pub const COMMANDS: &[Command] = &[
         Run,
     ),
     cmd("thinking", "", "show or hide model thinking", Run),
+    cmd(
+        "timestamps",
+        "",
+        "show or hide message times and day separators",
+        Settings,
+    ),
     cmd("tools", "", "open the Tools view", Tools),
     cmd("metrics", "", "open the Metrics view", Tools),
     cmd("proposals", "", "open the prompt Proposals view", Tools),

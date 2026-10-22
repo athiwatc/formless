@@ -669,6 +669,8 @@ struct App {
     /// Live reasoning for the current Run (ephemeral; never persisted).
     thinking: String,
     show_thinking: bool,
+    /// Message times and day separators (`tui.timestamps`).
+    show_timestamps: bool,
     color: bool,
     multi_pane: bool,
     /// Configured model, shown in the status bar.
@@ -858,6 +860,7 @@ impl App {
             show_thinking: true,
             color: colors_enabled(),
             multi_pane: cfg.tui.multi_pane,
+            show_timestamps: cfg.tui.timestamps,
             model_label: cfg.provider.model.clone(),
             tick: 0,
             activity: None,
@@ -3016,6 +3019,17 @@ impl App {
                 let focus = cmd["compact ".len()..].trim().to_string();
                 self.compact_now(Some(focus));
             }
+            "timestamps" => {
+                self.show_timestamps = !self.show_timestamps;
+                self.fire(Request::SetSetting {
+                    key: "tui.timestamps".into(),
+                    value: serde_json::json!(self.show_timestamps),
+                });
+                self.notes.push(format!(
+                    "timestamps {} (remembered)",
+                    if self.show_timestamps { "on" } else { "off" }
+                ));
+            }
             "context" => match self.current.clone() {
                 Some(session_id) => {
                     self.request(Pending::ContextReport, Request::ContextUsage { session_id })
@@ -5026,7 +5040,10 @@ fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
         Span::styled("▍", role_style(app.color, role)),
         Span::styled(who.to_string(), role_style(app.color, role)),
     ];
-    if let Some(t) = when.and_then(ui::clock_time) {
+    if let Some(t) = when
+        .filter(|_| app.show_timestamps)
+        .and_then(|w| ui::message_stamp(w, chrono::Utc::now()))
+    {
         spans.push(Span::styled(format!("  {t}"), ui::dim(app.color)));
     }
     Line::from(spans)
@@ -5452,8 +5469,23 @@ fn chat_lines(app: &App, width: usize, height: usize) -> (Vec<Line<'static>>, Op
             *group = Some(g);
         }
     };
+    let mut day = None;
     for m in &app.messages {
         let when = Some(m.created_at.as_str());
+        // A separator when the local date changes (not before the first).
+        let this_day = ui::local_day(&m.created_at);
+        if app.show_timestamps && this_day.is_some() && this_day != day {
+            if day.is_some() {
+                let label = this_day.unwrap().format("%a, %-d %b %Y").to_string();
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("──── {label} ────"),
+                    ui::dim(app.color),
+                ));
+                group = None;
+            }
+            day = this_day;
+        }
         match m.role.as_str() {
             "user" => {
                 open_group(&mut lines, &mut group, "user", when);
@@ -7073,6 +7105,7 @@ mod tests {
             messages: Vec::new(),
             streaming: String::new(),
             thinking: String::new(),
+            show_timestamps: true,
             show_thinking: true,
             color: true,
             multi_pane: false,
@@ -8116,6 +8149,53 @@ mod tests {
             },
         });
         assert!(render(&mut app, 120, 20).contains("ctx 75%"));
+    }
+
+    #[test]
+    fn message_times_and_day_separators() {
+        use chrono::TimeZone;
+        let now = chrono::Utc::now();
+        assert_eq!(
+            ui::message_stamp(&now.to_rfc3339(), now).as_deref(),
+            Some("now")
+        );
+        let ago = |s: i64| (now - chrono::Duration::seconds(s)).to_rfc3339();
+        assert_eq!(ui::message_stamp(&ago(150), now).as_deref(), Some("2m"));
+        assert_eq!(
+            ui::message_stamp(&ago(3 * 3600), now).as_deref(),
+            Some("3h")
+        );
+        assert!(ui::message_stamp(&ago(2 * 86_400), now)
+            .unwrap()
+            .contains(':'));
+        assert!(ui::message_stamp("garbage", now).is_none());
+
+        let mut app = test_app();
+        let at = |d: u32, h: u32| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 3, d, h, 0, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let msg = |id: &str, role: &str, when: String| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 0,
+            role: role.into(),
+            content: format!("hello {id}"),
+            created_at: when,
+            meta: None,
+        };
+        app.messages = vec![
+            msg("a", "user", at(2, 9)),
+            msg("b", "assistant", at(2, 10)),
+            msg("c", "user", at(3, 9)),
+        ];
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("──── Tue, 3 Mar 2026 ────"), "{screen}");
+        assert!(!screen.contains("2 Mar 2026"), "no separator before the first day");
+        app.slash("timestamps");
+        assert!(!render(&mut app, 100, 30).contains("3 Mar 2026"));
     }
 
     #[test]
