@@ -241,9 +241,20 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .composer textarea { flex: 1; min-width: 0; resize: none; max-height: 220px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); line-height: 1.45; }
 .composer textarea:focus { border-color: var(--accent); outline: none; }
 .composer { position: relative; }
-.mention-popup { position: absolute; left: 24px; right: 24px; bottom: calc(100% - 6px); max-width: 560px; margin: 0; padding: 4px 0; list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); z-index: 20; font-family: var(--mono); font-size: 13px; }
-.mention-popup li { padding: 5px 12px; cursor: pointer; overflow-wrap: anywhere; }
-.mention-popup li.sel { background: var(--accent-soft); }
+.compose-popup { position: absolute; left: 24px; right: 24px; bottom: calc(100% - 6px); max-width: 560px; margin: 0; padding: 4px 0; list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); z-index: 20; font-family: var(--mono); font-size: 13px; }
+.compose-popup li { padding: 5px 12px; cursor: pointer; overflow-wrap: anywhere; }
+.compose-popup li.sel { background: var(--accent-soft); }
+.compose-popup { max-height: 320px; overflow-y: auto; }
+.compose-popup li { display: flex; gap: 12px; }
+.compose-popup .cmd-usage { flex: none; }
+.compose-popup .muted { font-family: system-ui, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal.help { max-width: 760px; }
+.help-body { max-height: 65vh; overflow-y: auto; }
+.help-body h3 { margin: 14px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted, inherit); }
+.help-body section:first-child h3 { margin-top: 0; }
+.help-grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 14px; }
+.help-grid code { font-family: var(--mono); font-size: 13px; }
+@media (max-width: 600px) { .help-grid { grid-template-columns: 1fr; gap: 0; } .help-grid span { margin-bottom: 6px; } }
 .bubble .mention { color: var(--accent); font-family: var(--mono); font-size: 0.95em; }
 .composer.running textarea { border-color: var(--warn); }
 .compose-hint { max-width: 860px; margin: 5px auto 0; font-size: 12px; }

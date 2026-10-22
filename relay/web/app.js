@@ -1021,7 +1021,7 @@
   function drawMentions() {
     if (!mention.files.length) { if (mention.box) mention.box.remove(); mention.box = null; return; }
     if (!mention.box) {
-      mention.box = h("ul", { class: "mention-popup", role: "listbox", "aria-label": "Files" });
+      mention.box = h("ul", { class: "compose-popup", role: "listbox", "aria-label": "Files" });
       $("composer").append(mention.box);
     }
     mention.box.replaceChildren(...mention.files.map((f, i) => {
@@ -1044,6 +1044,70 @@
     autosize();
     updateMentions();
   }
+  // ---------------------------------------------------------- / palette
+  const palette = { box: null, items: [], sel: 0, hidden: null };
+  /** Palette rows for the composer text: commands while the name is being
+   * typed, nothing once its arguments start. */
+  function paletteItems() {
+    const v = $("input").value;
+    if (!v.startsWith("/") || v === palette.hidden || S.editMessageId) return [];
+    const q = v.slice(1);
+    if (/\s/.test(q) && !COMMANDS.some((c) => c.name.startsWith(q.trimEnd()))) return [];
+    return matchCommands(q.trimEnd());
+  }
+  function closePalette() {
+    if (palette.box) palette.box.remove();
+    palette.box = null;
+    palette.items = [];
+  }
+  function updatePalette() {
+    palette.items = paletteItems();
+    palette.sel = Math.min(palette.sel, Math.max(0, palette.items.length - 1));
+    if (!palette.items.length) return closePalette();
+    if (!palette.box) {
+      palette.box = h("ul", { class: "compose-popup", role: "listbox", "aria-label": "Commands" });
+      $("composer").append(palette.box);
+    }
+    palette.box.replaceChildren(...palette.items.map((c, i) => {
+      const li = h("li", { role: "option", "aria-selected": String(i === palette.sel), class: i === palette.sel ? "sel" : null },
+        h("span", { class: "cmd-usage" }, usage(c)), h("span", { class: "muted" }, c.desc));
+      li.onmousedown = (e) => { e.preventDefault(); palette.sel = i; acceptCommand(true); };
+      return li;
+    }));
+    const sel = palette.box.children[palette.sel];
+    if (sel) sel.scrollIntoView({ block: "nearest" });
+  }
+  /** Tab completes the selected command; Enter runs it unless it still
+   * needs an argument. */
+  function acceptCommand(run) {
+    const c = palette.items[palette.sel];
+    if (!c) return;
+    const t = $("input");
+    if (run && !needsArgs(c)) {
+      t.value = "/" + c.name;
+      closePalette();
+      return submit(false);
+    }
+    t.value = "/" + c.name + (c.args ? " " : "");
+    if (run) note("usage: " + usage(c));
+    palette.sel = 0;
+    autosize();
+    updatePalette();
+  }
+  function paletteKey(e) {
+    if (!palette.box || !palette.items.length) return false;
+    if (e.key === "ArrowDown") palette.sel = Math.min(palette.sel + 1, palette.items.length - 1);
+    else if (e.key === "ArrowUp") palette.sel = Math.max(palette.sel - 1, 0);
+    else if (e.key === "Tab" && !e.shiftKey) { e.preventDefault(); acceptCommand(false); return true; }
+    else if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) { e.preventDefault(); acceptCommand(true); return true; }
+    else if (e.key === "Escape") { palette.hidden = $("input").value; closePalette(); }
+    else return false;
+    e.preventDefault();
+    e.stopPropagation();
+    if (palette.box) updatePalette();
+    return true;
+  }
+
   /** Keys for the open popup; true when used. */
   function mentionKey(e) {
     if (!mention.box || !mention.files.length) return false;
@@ -1969,83 +2033,139 @@
     if (S.view === "settings") renderSettings();
   }
 
-  const HELP = "Enter send/steer · Ctrl/⌘+Enter queue · Esc stop · /new /sessions /fork /search <q> /edit /tools /metrics /proposals /propose /settings /model [id] /thinking /stop /cancel /resend /resume /abandon /agents /prompts /help";
-  async function slash(cmd) {
-    const [name, ...rest] = cmd.split(/\s+/);
-    const arg = rest.join(" ");
-    switch (name) {
-      case "new": return newSession();
-      case "sessions": setView("chat"); openSidebar(); return $("search").focus();
-      case "fork": return forkSession(S.current);
-      case "search": setView("chat"); openSidebar(); $("search").value = arg; return arg ? search(arg) : $("search").focus();
-      case "edit": case "retry": {
-        const m = [...S.messages].reverse().find((x) => x.role === "user");
-        return m ? beginEdit(m) : toast("No user message to edit.", true);
+  // Slash commands (SPEC §10.2): one table drives the dispatcher, the `/`
+  // palette and /help, so they can't drift apart.
+  const COMMANDS = [
+    { name: "new", group: "Session", desc: "start a new Session", run: () => newSession() },
+    { name: "sessions", group: "Session", desc: "list and switch Sessions", run: () => { setView("chat"); openSidebar(); $("search").focus(); } },
+    { name: "fork", group: "Session", desc: "fork the current Session", run: () => forkSession(S.current) },
+    { name: "search", args: "[QUERY]", group: "Session", desc: "search all Sessions", run: (arg) => { setView("chat"); openSidebar(); $("search").value = arg; return arg ? search(arg) : $("search").focus(); } },
+    { name: "edit", group: "Session", desc: "edit your last message and retry from there", run: () => {
+      const m = [...S.messages].reverse().find((x) => x.role === "user");
+      return m ? beginEdit(m) : toast("No user message to edit.", true);
+    } },
+    { name: "usage", group: "Session", desc: "tokens and cost of this Session", run: async () => {
+      if (!S.current) return note("open a session first", true);
+      const r = await act({ type: "session_usage", session_id: S.current });
+      if (!r) return;
+      if (r.last_run) note("last Run: " + usageText(r.last_run));
+      return note("session (" + r.runs + " Runs): " + usageText(r.total));
+    } },
+    { name: "stop", group: "Run control", desc: "stop the current Run (Esc)", run: () => stop() },
+    { name: "cancel", group: "Run control", desc: "cancel the stalled or pending Tool call", run: () => {
+      const t = [...S.liveTools].reverse().find((x) => x.status === "running" && x.handle);
+      return cancelTool(t && t.handle);
+    } },
+    { name: "resend", group: "Run control", desc: "re-send a stalled provider request", run: async () => {
+      if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
+    } },
+    { name: "resume", group: "Run control", desc: "continue an interrupted or paused Run", run: async () => {
+      if (S.current) await act({ type: "resume_run", session_id: S.current });
+    } },
+    { name: "abandon", group: "Run control", desc: "drop an interrupted or paused Run", run: async () => {
+      if (!S.current) return;
+      const r = await act({ type: "abandon_run", session_id: S.current });
+      if (r) note(r.abandoned ? "abandoned the interrupted run" : "nothing to abandon");
+    } },
+    { name: "agents", args: "[N]", group: "Run control", desc: "list sub-agents, or show one's transcript", run: async (arg) => {
+      if (!S.current) return;
+      if (!arg) {
+        S.subagents = (await act({ type: "list_subagents", session_id: S.current })) || [];
+        if (!S.subagents.length) return note("no sub-agents in this session");
+        S.subagents.forEach((a, i) => note("#" + (i + 1) + " " + a.status + " · " + a.steps + " step(s) · " + truncate(a.task, 70)));
+        return note("/agents <n> shows that sub-agent's transcript");
       }
-      case "tools": case "metrics": case "proposals": case "settings": return setView(name);
-      case "propose": act({ type: "generate_proposal" }); return note("generating a measured proposal…");
-      case "thinking": setThinking(!S.showThinking); return note("thinking display " + (S.showThinking ? "on" : "off"));
-      case "usage": {
-        if (!S.current) return note("open a session first", true);
-        const r = await act({ type: "session_usage", session_id: S.current });
-        if (!r) return;
-        if (r.last_run) note("last Run: " + usageText(r.last_run));
-        return note("session (" + r.runs + " Runs): " + usageText(r.total));
+      const a = (S.subagents || [])[Number(arg) - 1];
+      if (!a) return note("usage: /agents to list, then /agents <n>", true);
+      const r = await act({ type: "get_subagent", id: a.id });
+      for (const m of (r && r.messages) || []) {
+        const text = m.tool_calls ? "calls " + m.tool_calls.map((c) => c.function.name).join(", ") : String(m.content || "");
+        note("[" + m.role + "] " + truncate(text.replace(/\n/g, " "), 120));
       }
-      case "stop": return stop();
-      case "prompts": {
-        const list = (await act({ type: "list_mcp_prompts" })) || [];
-        if (!list.length) return note("no MCP prompts available");
-        for (const p of list) note("/prompt " + p.server + ":" + p.name + " " + (p.arguments || []).map((a) => a.name + "=…").join(" ") + " — " + (p.description || ""));
-        return;
-      }
-      case "prompt": {
-        const [target, ...pairs] = arg.split(/\s+/);
-        const [server, name] = (target || "").split(":");
-        if (!server || !name) return note("usage: /prompt SERVER:NAME [key=value …] (see /prompts)", true);
-        const r = await act({ type: "get_mcp_prompt", server, name, arguments: Object.fromEntries(pairs.filter((p) => p.includes("=")).map((p) => p.split(/=(.*)/s).slice(0, 2))) });
-        if (r) { $("input").value = r.text; autosize(); $("input").focus(); note("prompt loaded into the composer; edit it, then send"); }
-        return;
-      }
-      case "agents": {
-        if (!S.current) return;
-        if (!arg) {
-          S.subagents = (await act({ type: "list_subagents", session_id: S.current })) || [];
-          if (!S.subagents.length) return note("no sub-agents in this session");
-          S.subagents.forEach((a, i) => note("#" + (i + 1) + " " + a.status + " · " + a.steps + " step(s) · " + truncate(a.task, 70)));
-          return note("/agents <n> shows that sub-agent's transcript");
-        }
-        const a = (S.subagents || [])[Number(arg) - 1];
-        if (!a) return note("usage: /agents to list, then /agents <n>", true);
-        const r = await act({ type: "get_subagent", id: a.id });
-        for (const m of (r && r.messages) || []) {
-          const text = m.tool_calls ? "calls " + m.tool_calls.map((c) => c.function.name).join(", ") : String(m.content || "");
-          note("[" + m.role + "] " + truncate(text.replace(/\n/g, " "), 120));
-        }
-        return;
-      }
-      case "cancel": {
-        const t = [...S.liveTools].reverse().find((x) => x.status === "running" && x.handle);
-        return cancelTool(t && t.handle);
-      }
-      case "resend":
-        if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
-        return;
-      case "resume":
-        if (S.current) await act({ type: "resume_run", session_id: S.current });
-        return;
-      case "abandon": {
-        if (!S.current) return;
-        const r = await act({ type: "abandon_run", session_id: S.current });
-        if (r) note(r.abandoned ? "abandoned the interrupted run" : "nothing to abandon");
-        return;
-      }
-      case "panes": return note("The web layout always shows Sessions beside the chat.");
-      case "model": return arg ? setSessionModel(arg, undefined) : openModelPicker();
-      case "help": case "": toast(HELP); return note(HELP);
-      case "quit": return forget();
-      default: return note("unknown command: /" + name, true);
+    } },
+    { name: "thinking", group: "Run control", desc: "show or hide model thinking", run: () => { setThinking(!S.showThinking); note("thinking display " + (S.showThinking ? "on" : "off")); } },
+    { name: "tools", group: "Tools", desc: "open the Tools view", run: () => setView("tools") },
+    { name: "metrics", group: "Tools", desc: "open the Metrics view", run: () => setView("metrics") },
+    { name: "proposals", group: "Tools", desc: "open the prompt Proposals view", run: () => setView("proposals") },
+    { name: "propose", group: "Tools", desc: "generate a measured prompt proposal", run: () => { act({ type: "generate_proposal" }); note("generating a measured proposal…"); } },
+    { name: "settings", group: "Settings", desc: "open the Settings view", run: () => setView("settings") },
+    { name: "model", args: "[ID]", group: "Settings", desc: "pick the model and effort (fuzzy search)", run: (arg) => (arg ? setSessionModel(arg, undefined) : openModelPicker()) },
+    { name: "panes", group: "Settings", desc: "multi-pane layout (always on in the web)", run: () => note("The web layout always shows Sessions beside the chat.") },
+    { name: "prompts", group: "Integrations", desc: "list MCP prompts", run: async () => {
+      const list = (await act({ type: "list_mcp_prompts" })) || [];
+      if (!list.length) return note("no MCP prompts available");
+      for (const p of list) note("/prompt " + p.server + ":" + p.name + " " + (p.arguments || []).map((a) => a.name + "=…").join(" ") + " — " + (p.description || ""));
+    } },
+    { name: "prompt", args: "SERVER:NAME [KEY=VALUE …]", group: "Integrations", desc: "load an MCP prompt into the composer", run: async (arg) => {
+      const [target, ...pairs] = arg.split(/\s+/);
+      const [server, name] = (target || "").split(":");
+      if (!server || !name) return note("usage: /prompt SERVER:NAME [key=value …] (see /prompts)", true);
+      const r = await act({ type: "get_mcp_prompt", server, name, arguments: Object.fromEntries(pairs.filter((p) => p.includes("=")).map((p) => p.split(/=(.*)/s).slice(0, 2))) });
+      if (r) { $("input").value = r.text; autosize(); $("input").focus(); note("prompt loaded into the composer; edit it, then send"); }
+    } },
+    { name: "help", group: "App", desc: "all commands and keys (also ? on an empty input)", run: () => showHelp() },
+    { name: "quit", group: "App", desc: "disconnect from the daemon", run: () => forget() },
+  ];
+  const ALIASES = { retry: "edit", "": "help" };
+  const usage = (c) => "/" + c.name + (c.args ? " " + c.args : "");
+  const needsArgs = (c) => !!c.args && !c.args.startsWith("[");
+  function editDistance(a, b) {
+    let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 0; i < a.length; i++) {
+      const cur = [i + 1];
+      for (let j = 0; j < b.length; j++) cur.push(Math.min(prev[j] + (a[i] === b[j] ? 0 : 1), prev[j + 1] + 1, cur[j] + 1));
+      prev = cur;
     }
+    return prev[b.length];
+  }
+  /** "did you mean": the closest command name, if close enough. */
+  function closestCommand(word) {
+    let best = null;
+    for (const c of COMMANDS) {
+      const d = editDistance(word, c.name);
+      if (d <= Math.max(2, Math.floor(c.name.length / 3)) && (!best || d < best.d)) best = { d, name: c.name };
+    }
+    return best && best.name;
+  }
+  /** Commands matching what follows `/`, exact prefixes first. */
+  function matchCommands(q) {
+    if (!q) return COMMANDS.slice();
+    return COMMANDS.map((c, i) => ({ c, i, m: fuzzyMatch(q, c.name) }))
+      .filter((x) => x.m)
+      .sort((a, b) => (b.c.name.startsWith(q) - a.c.name.startsWith(q)) || (b.m[0] - a.m[0]) || (a.i - b.i))
+      .map((x) => x.c);
+  }
+  function showHelp() {
+    if (document.querySelector(".modal.help")) return;
+    const rows = (pairs) => h("div", { class: "help-grid" }, pairs.map(([k, d]) => [h("code", null, k), h("span", null, d)]));
+    const keyName = (k) => (k === "ArrowDown" ? "↓" : k === "ArrowUp" ? "↑" : k);
+    const sections = [...new Set(COMMANDS.map((c) => c.group))].map((g) =>
+      h("section", null, h("h3", null, g), rows(COMMANDS.filter((c) => c.group === g).map((c) => [usage(c), c.desc]))));
+    sections.push(h("section", null, h("h3", null, "Keys"), rows([
+      ...SHORTCUTS.map((sc) => [sc.keys.map(keyName).join(" "), (sc.view ? "(" + sc.view + ") " : "") + sc.help]),
+      ["Enter", "send, or steer the running Run"], ["Shift+Enter", "new line"], ["Ctrl/⌘+Enter", "queue for after the Run"],
+      ["Esc", "close a dialog, or stop the Run"], ["/ in the composer", "command palette (Tab completes)"],
+      ["@ in the composer", "reference a file"], ["y · o · n", "approvals: always · once · deny"],
+    ])));
+    const close = h("button", { class: "btn small primary", type: "button" }, "Close");
+    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Help" },
+      h("div", { class: "modal help" }, h("h2", null, "Help"), h("div", { class: "help-body" }, sections),
+        h("div", { class: "modal-actions" }, h("span", { class: "spacer" }), close)));
+    const done = () => { dialog.remove(); $("input").focus(); };
+    close.onclick = done;
+    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
+    document.body.append(dialog);
+    close.focus();
+  }
+  async function slash(cmd) {
+    const [first, ...rest] = cmd.split(/\s+/);
+    const name = ALIASES[first] !== undefined ? ALIASES[first] : first;
+    const c = COMMANDS.find((x) => x.name === name);
+    if (!c) {
+      const near = closestCommand(name);
+      return note("unknown command: /" + name + (near ? " — did you mean /" + near + "?" : " (/help lists them)"), true);
+    }
+    return c.run(rest.join(" "));
   }
 
   async function submit(queued) {
@@ -2534,10 +2654,11 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", () => { autosize(); updateMentions(); });
-  $("input").addEventListener("blur", () => setTimeout(closeMentions, 100));
+  $("input").addEventListener("input", () => { palette.sel = 0; autosize(); updatePalette(); updateMentions(); });
+  $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
-    if (mentionKey(e)) return;
+    if (paletteKey(e) || mentionKey(e)) return;
+    if (e.key === "?" && !$("input").value && !e.ctrlKey && !e.metaKey) { e.preventDefault(); return showHelp(); }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(true); }
     else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }
     else if (e.key === "Escape") {
@@ -2570,7 +2691,7 @@
   }
   const SHORTCUTS = [
     { keys: ["/"], help: "focus the message box", run: () => { if (S.view !== "chat") setView("chat"); $("input").focus(); } },
-    { keys: ["?"], help: "this help", run: () => showShortcuts() },
+    { keys: ["?"], help: "commands and keys", run: () => showHelp() },
     { keys: ["1", "2", "3", "4", "5"], help: "Chat · Tools · Metrics · Proposals · Settings", run: (k) => setView(VIEWS[Number(k) - 1]) },
     { keys: ["[", "]"], help: "previous / next view (TUI Shift+Tab / Tab)", run: (k) => setView(VIEWS[(VIEWS.indexOf(S.view) + (k === "]" ? 1 : VIEWS.length - 1)) % VIEWS.length]) },
     { keys: ["j", "ArrowDown"], help: "next Session (Chat) or Tool (Tools)", run: () => moveSelection(1) },
@@ -2582,12 +2703,6 @@
     { keys: ["o"], view: "tools", help: "optimise the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name); } },
     { keys: ["p"], view: "tools", help: "purge the selected Tool (typed confirmation)", run: () => { const t = selectedTool(); if (t) purgeTool(t); } },
   ];
-  function showShortcuts() {
-    const keyName = (k) => (k === "ArrowDown" ? "↓" : k === "ArrowUp" ? "↑" : k);
-    const lines = SHORTCUTS.map((s) => s.keys.map(keyName).join(" ") + "  —  " + (s.view ? "(" + s.view + ") " : "") + s.help);
-    lines.push("", "Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · Esc close or stop", "Approvals: y always · o once · n deny");
-    ask({ title: "Keyboard shortcuts", text: lines.join("\n"), ok: "Close" });
-  }
   const typingIn = (el) => el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
 
   document.addEventListener("keydown", (e) => {

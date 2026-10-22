@@ -1,4 +1,5 @@
 pub mod client;
+mod commands;
 mod highlight;
 mod markdown;
 mod mermaid;
@@ -166,6 +167,16 @@ struct RollbackPick {
 struct ModelOverlay {
     picker: picker::ModelPicker,
     effort_idx: usize,
+}
+
+/// A row of the `/` palette: a command, or an argument for one.
+struct PaletteItem {
+    /// The input after accepting this row.
+    insert: String,
+    label: String,
+    desc: String,
+    /// Enter runs it as is (no required argument still missing).
+    runnable: bool,
 }
 
 /// Completions for the `@path` being typed at the end of the input.
@@ -572,6 +583,10 @@ struct App {
     mention: Option<MentionPopup>,
     /// A message waiting for its `@` attachments before it is sent.
     pending_send: Option<PendingSend>,
+    /// The `/` palette's selected row.
+    palette_sel: usize,
+    /// The input the palette was dismissed (Esc) for.
+    palette_hidden: Option<String>,
     approvals: std::collections::VecDeque<ApprovalReq>,
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
@@ -708,6 +723,8 @@ impl App {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            palette_sel: 0,
+            palette_hidden: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -2052,6 +2069,95 @@ impl App {
         }
     }
 
+    /// The `/` palette rows for the input, empty when it isn't shown.
+    fn palette_items(&self) -> Vec<PaletteItem> {
+        let Some(q) = self.input.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if self.palette_hidden.as_deref() == Some(self.input.as_str())
+            || self.search_mode
+            || self.renaming
+            || self.import_mode.is_some()
+        {
+            return Vec::new();
+        }
+        // An argument being typed: complete Tool names for /revoke.
+        if let Some(arg) = q.strip_prefix("revoke ") {
+            if arg.contains(' ') {
+                return Vec::new();
+            }
+            let mut tools: Vec<_> = self
+                .tools
+                .iter()
+                .filter(|t| !t.retired)
+                .filter_map(|t| {
+                    formless_core::fuzzy::fuzzy_match(arg, &t.name).map(|(s, _)| (s, t))
+                })
+                .collect();
+            tools.sort_by_key(|t| std::cmp::Reverse(t.0));
+            return tools
+                .into_iter()
+                .take(50)
+                .map(|(_, t)| PaletteItem {
+                    insert: format!("/revoke {}", t.name),
+                    label: t.name.clone(),
+                    desc: t.capabilities.join(", "),
+                    runnable: true,
+                })
+                .collect();
+        }
+        // Past a complete command and into its arguments: nothing to show.
+        let typed = q.trim_end();
+        if q.contains(' ') && !commands::COMMANDS.iter().any(|c| c.name.starts_with(typed)) {
+            return Vec::new();
+        }
+        commands::matches(q)
+            .into_iter()
+            .map(|c| PaletteItem {
+                insert: if c.args.is_empty() {
+                    format!("/{}", c.name)
+                } else {
+                    format!("/{} ", c.name)
+                },
+                label: c.usage(),
+                desc: c.desc.to_string(),
+                runnable: !c.needs_args(),
+            })
+            .collect()
+    }
+
+    /// Keys for the `/` palette; true when the key was used.
+    fn palette_key(&mut self, key: &KeyEvent) -> bool {
+        let items = self.palette_items();
+        if items.is_empty() {
+            return false;
+        }
+        let sel = self.palette_sel.min(items.len() - 1);
+        match key.code {
+            KeyCode::Up => self.palette_sel = sel.saturating_sub(1),
+            KeyCode::Down => self.palette_sel = (sel + 1).min(items.len() - 1),
+            KeyCode::Esc => self.palette_hidden = Some(self.input.clone()),
+            KeyCode::Tab if key.modifiers.is_empty() => {
+                self.input = items[sel].insert.clone();
+                self.palette_sel = 0;
+            }
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                let item = &items[sel];
+                if item.runnable {
+                    self.input = item.insert.trim_end().to_string();
+                    self.palette_sel = 0;
+                    self.submit_chat(false);
+                } else {
+                    self.notes.push(format!("usage: {}", item.label));
+                    self.input = item.insert.clone();
+                    self.palette_sel = 0;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Open, refresh or close the `@` popup for the input's last word.
     fn update_mention(&mut self) {
         let word = self.input.rsplit(char::is_whitespace).next().unwrap_or("");
@@ -2217,8 +2323,9 @@ impl App {
                     )
                     .collect();
                 for w in waiting {
-                    self.notes
-                        .push(format!("{w} · answer in the dialog: y always, o once, n deny"));
+                    self.notes.push(format!(
+                        "{w} · answer in the dialog: y always, o once, n deny"
+                    ));
                 }
             }
             "panes" => {
@@ -2327,7 +2434,10 @@ impl App {
                         if cmd.starts_with("kill ") {
                             self.request(Pending::RunControl, Request::CancelInvocation { handle });
                         } else {
-                            self.request(Pending::RunControl, Request::AbandonInvocation { handle });
+                            self.request(
+                                Pending::RunControl,
+                                Request::AbandonInvocation { handle },
+                            );
                         }
                     }
                     [] => self
@@ -2418,8 +2528,14 @@ impl App {
                     words.next().unwrap_or_default().to_string(),
                 );
                 let req = match verb {
-                    "enable" | "approve" => Some(Request::SetJobEnabled { id: id.clone(), enabled: true }),
-                    "disable" => Some(Request::SetJobEnabled { id: id.clone(), enabled: false }),
+                    "enable" | "approve" => Some(Request::SetJobEnabled {
+                        id: id.clone(),
+                        enabled: true,
+                    }),
+                    "disable" => Some(Request::SetJobEnabled {
+                        id: id.clone(),
+                        enabled: false,
+                    }),
                     "rm" | "delete" => Some(Request::DeleteJob { id: id.clone() }),
                     _ => None,
                 };
@@ -2428,7 +2544,9 @@ impl App {
                         self.fire(req);
                         self.notes.push(format!("job {verb} {id}"));
                     }
-                    _ => self.notes.push("usage: /jobs [enable|disable|rm ID]".into()),
+                    _ => self
+                        .notes
+                        .push("usage: /jobs [enable|disable|rm ID]".into()),
                 }
             }
             cmd if cmd.starts_with("memory ") => {
@@ -2466,8 +2584,15 @@ impl App {
             }
             cmd if cmd.starts_with("skills enable ") || cmd.starts_with("skills disable ") => {
                 let enabled = cmd.starts_with("skills enable ");
-                let name = cmd.split_whitespace().nth(2).unwrap_or_default().to_string();
-                self.fire(Request::SetSkillEnabled { name: name.clone(), enabled });
+                let name = cmd
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or_default()
+                    .to_string();
+                self.fire(Request::SetSkillEnabled {
+                    name: name.clone(),
+                    enabled,
+                });
                 self.notes.push(format!(
                     "{} skill {name}",
                     if enabled { "enabling" } else { "disabling" }
@@ -2503,7 +2628,10 @@ impl App {
             }
             "agents" => {
                 if let Some(session_id) = self.current.clone() {
-                    self.request(Pending::ListSubagents, Request::ListSubagents { session_id });
+                    self.request(
+                        Pending::ListSubagents,
+                        Request::ListSubagents { session_id },
+                    );
                 }
             }
             cmd if cmd.starts_with("agents ") => {
@@ -2529,10 +2657,9 @@ impl App {
                     .filter(|c| c.status == "running")
                     .find_map(|c| c.handle.clone());
                 match handle {
-                    Some(handle) => self.request(
-                        Pending::RunControl,
-                        Request::CancelInvocation { handle },
-                    ),
+                    Some(handle) => {
+                        self.request(Pending::RunControl, Request::CancelInvocation { handle })
+                    }
                     None => self.notes.push(
                         "no pending or stalled tool to cancel (Esc stops the whole run)".into(),
                     ),
@@ -2557,11 +2684,18 @@ impl App {
                     self.run_banner = None;
                 }
             }
-            "help" => self.notes.push(
-                "Enter send/steer · Ctrl+J (or Ctrl+Enter / Alt+Enter) queue · Esc stop · Tab/Shift+Tab views · PgUp/PgDn scroll · /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /mcp /prompts /skills /memory /jobs /attach /audit /revoke /usage /invocations /approve /undo /open /copy /mouse /roles /role add|rm /harness [undo [ID]] /quit · select text: /mouse, or hold Shift (Option in iTerm2, Fn in Terminal.app) while dragging".into(),
-            ),
+            "help" => {
+                self.pager = Some(Pager {
+                    title: "Help".into(),
+                    lines: commands::help_lines(),
+                    top: 0,
+                })
+            }
             "quit" => self.should_quit = true,
-            other => self.notes.push(format!("unknown command: /{other}")),
+            other => self.notes.push(match commands::closest(other) {
+                Some(name) => format!("unknown command: /{other} — did you mean /{name}?"),
+                None => format!("unknown command: /{other} (/help lists them)"),
+            }),
         }
     }
 
@@ -2932,7 +3066,15 @@ impl App {
                 }
             }
         }
-        if self.view == View::Chat && self.mention_key(&key) {
+        if self.view == View::Chat && (self.palette_key(&key) || self.mention_key(&key)) {
+            return;
+        }
+        if self.view == View::Chat
+            && key.code == KeyCode::Char('?')
+            && self.input.is_empty()
+            && self.approvals.is_empty()
+        {
+            self.slash("help");
             return;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -3195,10 +3337,12 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
+                    self.palette_sel = 0;
                     self.update_mention();
                 }
                 KeyCode::Char(c) => {
                     self.input.push(c);
+                    self.palette_sel = 0;
                     self.update_mention();
                 }
                 _ => {}
@@ -3243,7 +3387,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_input(f, chunks[2], app, typing && modal.is_none());
     draw_status(f, chunks[3], app);
     if app.view == View::Chat {
-        if let Some(m) = app.mention.as_ref().filter(|m| !m.dismissed) {
+        let palette = app.palette_items();
+        if !palette.is_empty() {
+            draw_palette(f, chunks[2], &palette, app.palette_sel, app.color);
+        } else if let Some(m) = app.mention.as_ref().filter(|m| !m.dismissed) {
             draw_mention_popup(f, chunks[2], m, app.color);
         }
     }
@@ -3439,6 +3586,67 @@ fn mention_line(text: &str, color: bool) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+/// The `/` palette, just above the input box, scrolled to the selection.
+fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, color: bool) {
+    if input.y < 3 {
+        return;
+    }
+    let sel = sel.min(items.len() - 1);
+    let rows = (input.y as usize).saturating_sub(2).clamp(1, 10);
+    let start = sel
+        .saturating_sub(rows - 1)
+        .min(items.len().saturating_sub(rows));
+    let label_w = items
+        .iter()
+        .map(|i| i.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(40);
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(i, item)| {
+            let style = if i == sel {
+                bold_fg(color, Color::Green)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} {}  ",
+                        if i == sel { "›" } else { " " },
+                        ui::pad(&truncate_chars(&item.label, 40), label_w)
+                    ),
+                    style,
+                ),
+                Span::styled(item.desc.clone(), ui::dim(color)),
+            ])
+        })
+        .collect();
+    let h = (lines.len() as u16 + 2).min(input.y);
+    let rect = Rect {
+        x: input.x,
+        y: input.y - h,
+        width: input.width.clamp(1, 100),
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(ui::panel(
+            format!(
+                " / commands · {} · Tab complete · Enter run · Esc hide ",
+                items.len()
+            ),
+            color,
+            Color::Cyan,
+        )),
+        rect,
+    );
 }
 
 /// The `@` completions, just above the input box.
@@ -5448,6 +5656,8 @@ mod tests {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            palette_sel: 0,
+            palette_hidden: None,
             approvals: std::collections::VecDeque::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
@@ -6018,6 +6228,77 @@ mod tests {
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
+    }
+
+    #[test]
+    fn every_listed_command_is_dispatched() {
+        // The table and the dispatcher can't drift: each entry (with a
+        // dummy argument where one is needed) must not be "unknown".
+        for c in commands::COMMANDS {
+            let mut app = test_app();
+            let line = if c.args.is_empty() {
+                c.name.to_string()
+            } else {
+                format!("{} x", c.name)
+            };
+            app.slash(&line);
+            assert!(
+                !app.notes.iter().any(|n| n.contains("unknown command")),
+                "/{line} is listed but not handled"
+            );
+        }
+        let mut app = test_app();
+        app.slash("sesions");
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("did you mean /sessions?"));
+    }
+
+    #[test]
+    fn palette_completes_runs_and_hides() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        // `?` on an empty input opens the grouped help.
+        app.key(key(KeyCode::Char('?')));
+        assert_eq!(app.pager.as_ref().unwrap().title, "Help");
+        app.pager = None;
+
+        for c in "/ses".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.palette_items()[0].label, "/sessions");
+        render(&mut app, 80, 24);
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.view, View::Sessions);
+        assert!(app.input.is_empty());
+        app.view = View::Chat;
+
+        // A command needing an argument completes instead of running.
+        for c in "/atta".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.input, "/attach ");
+        assert!(app.notes.last().unwrap().contains("usage: /attach PATH"));
+        for c in "foo".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert!(
+            app.palette_items().is_empty(),
+            "hidden once arguments start"
+        );
+
+        // Tab completes; Esc hides until the input changes.
+        app.input = "/role a".into();
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/role add ");
+        app.input = "/mo".into();
+        app.key(key(KeyCode::Esc));
+        assert!(app.palette_items().is_empty());
+        app.key(key(KeyCode::Char('d')));
+        assert!(!app.palette_items().is_empty());
     }
 
     #[test]
