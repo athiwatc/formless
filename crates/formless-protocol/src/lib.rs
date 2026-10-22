@@ -599,6 +599,29 @@ pub enum Request {
         #[serde(default)]
         mime: Option<String>,
     },
+    /// Files under `root` (default: the daemon's working directory) for `@`
+    /// mentions (SPEC §5.6): `{root, query, files: [{path, dir, bytes}],
+    /// truncated}`,
+    /// best match first.
+    ListFiles {
+        #[serde(default)]
+        root: Option<String>,
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Attach a file the daemon can read (an `@` mention) to the Session's
+    /// next user message. `path` is absolute or relative to `root`. Small
+    /// files are stored like `AttachFile`; large files and directories go
+    /// as a reference the agent reads with its own Tools. Returns
+    /// `{name, bytes, mime?, id?, reference}`.
+    AttachPath {
+        session_id: String,
+        path: String,
+        #[serde(default)]
+        root: Option<String>,
+    },
     /// Serve the web UI on 127.0.0.1 (SPEC §12); returns a one-time
     /// login `url`. `port` 0 or unset picks a free one.
     StartWebUi {

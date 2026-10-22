@@ -10,51 +10,7 @@ pub struct ModelItem {
     pub recent: bool,
 }
 
-/// Score `candidate` against `query` as a case-insensitive subsequence;
-/// higher is better. Returns the matched char positions for highlighting.
-pub fn fuzzy_match(query: &str, candidate: &str) -> Option<(i64, Vec<usize>)> {
-    let q: Vec<char> = query
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    if q.is_empty() {
-        return Some((0, Vec::new()));
-    }
-    let c: Vec<char> = candidate.chars().flat_map(char::to_lowercase).collect();
-    let mut positions = Vec::with_capacity(q.len());
-    let mut score = 0i64;
-    let mut qi = 0;
-    let mut prev: Option<usize> = None;
-    for (i, ch) in c.iter().enumerate() {
-        if qi == q.len() {
-            break;
-        }
-        if *ch != q[qi] {
-            continue;
-        }
-        score += 1;
-        // Runs of consecutive matches and matches at word starts count most.
-        if prev.is_some_and(|p| p + 1 == i) {
-            score += 5;
-        }
-        if i == 0 || !c[i - 1].is_alphanumeric() {
-            score += 8;
-        }
-        if let Some(p) = prev {
-            score -= (i - p - 1).min(10) as i64;
-        }
-        positions.push(i);
-        prev = Some(i);
-        qi += 1;
-    }
-    if qi < q.len() {
-        return None;
-    }
-    // Prefer shorter ids among equal matches.
-    score -= (c.len() / 8) as i64;
-    Some((score, positions))
-}
+pub use formless_core::fuzzy::fuzzy_match;
 
 /// Picker rows from a `ListModels` result: Roles, then the provider's
 /// models, then recent models it didn't list, each id once.
@@ -199,16 +155,6 @@ mod tests {
                 recent: false,
             })
             .collect()
-    }
-
-    #[test]
-    fn subsequence_matching() {
-        assert!(fuzzy_match("son4", "anthropic/claude-sonnet-4.5").is_some());
-        assert!(fuzzy_match("SON4", "claude-sonnet-4").is_some());
-        assert!(fuzzy_match("4son", "claude-sonnet-4").is_none());
-        assert_eq!(fuzzy_match("", "x").unwrap().0, 0);
-        let (_, pos) = fuzzy_match("gpt", "openai/gpt-4o").unwrap();
-        assert_eq!(pos, vec![7, 8, 9]);
     }
 
     #[test]

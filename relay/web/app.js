@@ -968,6 +968,96 @@
     close.focus();
   }
 
+  // ------------------------------------------------------- @ mentions
+  /** `@path` mentions: an `@` at the start or after whitespace (same rule
+   * as the daemon's `files::mentions`). */
+  function mentionsIn(text) {
+    const out = [];
+    for (const m of text.matchAll(/(^|\s)@(\S+)/g)) {
+      const p = m[2].replace(/[,.;:!?)"']+$/, "");
+      if (p && !out.includes(p)) out.push(p);
+    }
+    return out;
+  }
+  /** Text with `@path` mentions as highlighted spans. */
+  function withMentions(text) {
+    const parts = [];
+    let last = 0;
+    for (const m of text.matchAll(/(^|\s)(@\S+)/g)) {
+      const at = m.index + m[1].length;
+      parts.push(text.slice(last, at), h("span", { class: "mention" }, m[2]));
+      last = at + m[2].length;
+    }
+    parts.push(text.slice(last));
+    return parts;
+  }
+  const mention = { box: null, files: [], sel: 0, query: null, seq: 0 };
+  function closeMentions() {
+    if (mention.box) mention.box.remove();
+    mention.box = null;
+    mention.files = [];
+    mention.query = null;
+  }
+  /** The `@word` ending at the caret, or null. */
+  function mentionAtCaret() {
+    const t = $("input");
+    const before = t.value.slice(0, t.selectionStart);
+    const m = before.match(/(^|\s)@(\S*)$/);
+    return m && !t.value.startsWith("/") ? { query: m[2], start: before.length - m[2].length - 1 } : null;
+  }
+  async function updateMentions() {
+    const at = mentionAtCaret();
+    if (!at) return closeMentions();
+    if (at.query === mention.query) return;
+    mention.query = at.query;
+    const seq = ++mention.seq;
+    let r;
+    try { r = await request({ type: "list_files", query: at.query, limit: 8 }); } catch (_) { return; }
+    if (seq !== mention.seq || !mentionAtCaret()) return;
+    mention.files = r.files || [];
+    mention.sel = 0;
+    drawMentions();
+  }
+  function drawMentions() {
+    if (!mention.files.length) { if (mention.box) mention.box.remove(); mention.box = null; return; }
+    if (!mention.box) {
+      mention.box = h("ul", { class: "mention-popup", role: "listbox", "aria-label": "Files" });
+      $("composer").append(mention.box);
+    }
+    mention.box.replaceChildren(...mention.files.map((f, i) => {
+      const li = h("li", { role: "option", "aria-selected": String(i === mention.sel), class: i === mention.sel ? "sel" : null },
+        f.path + (f.dir ? "/" : ""));
+      li.onmousedown = (e) => { e.preventDefault(); mention.sel = i; acceptMention(); };
+      return li;
+    }));
+  }
+  function acceptMention() {
+    const f = mention.files[mention.sel];
+    const at = mentionAtCaret();
+    if (!f || !at) return;
+    const t = $("input");
+    const insert = "@" + f.path + (f.dir ? "/" : " ");
+    t.value = t.value.slice(0, at.start) + insert + t.value.slice(t.selectionStart);
+    const caret = at.start + insert.length;
+    t.setSelectionRange(caret, caret);
+    mention.query = null;
+    autosize();
+    updateMentions();
+  }
+  /** Keys for the open popup; true when used. */
+  function mentionKey(e) {
+    if (!mention.box || !mention.files.length) return false;
+    if (e.key === "ArrowDown") mention.sel = Math.min(mention.sel + 1, mention.files.length - 1);
+    else if (e.key === "ArrowUp") mention.sel = Math.max(mention.sel - 1, 0);
+    else if ((e.key === "Tab" || e.key === "Enter") && !e.shiftKey && !e.ctrlKey && !e.metaKey) { e.preventDefault(); acceptMention(); return true; }
+    else if (e.key === "Escape") { closeMentions(); }
+    else return false;
+    e.preventDefault();
+    e.stopPropagation();
+    if (mention.box) drawMentions();
+    return true;
+  }
+
   // ------------------------------------------------------- model picker
   /** Case-insensitive subsequence match; higher scores are better
    * (same rules as the TUI's picker). Returns [score, positions] or null. */
@@ -975,20 +1065,25 @@
     const q = [...query.replace(/\s+/g, "").toLowerCase()];
     if (!q.length) return [0, []];
     const c = [...cand.toLowerCase()];
-    const pos = [];
-    let score = 0, qi = 0, prev = -1;
-    for (let i = 0; i < c.length && qi < q.length; i++) {
-      if (c[i] !== q[qi]) continue;
-      score += 1;
-      if (prev >= 0 && prev + 1 === i) score += 5;
-      if (i === 0 || !/[\p{L}\p{N}]/u.test(c[i - 1])) score += 8;
-      if (prev >= 0) score -= Math.min(i - prev - 1, 10);
-      pos.push(i);
-      prev = i;
-      qi++;
+    // Try each start of the first char: a contiguous later match beats a
+    // scattered earlier one.
+    let best = null;
+    for (let start = c.indexOf(q[0]); start >= 0; start = c.indexOf(q[0], start + 1)) {
+      const pos = [];
+      let score = 0, prev = -1;
+      for (let i = start; i < c.length && pos.length < q.length; i++) {
+        if (c[i] !== q[pos.length]) continue;
+        score += 1;
+        if (prev >= 0 && prev + 1 === i) score += 5;
+        if (i === 0 || !/[\p{L}\p{N}]/u.test(c[i - 1])) score += 8;
+        if (prev >= 0) score -= Math.min(i - prev - 1, 10);
+        pos.push(i);
+        prev = i;
+      }
+      if (pos.length < q.length) break;
+      if (!best || score > best[0]) best = [score, pos];
     }
-    if (qi < q.length) return null;
-    return [score - Math.floor(c.length / 8), pos];
+    return best && [best[0] - Math.floor(c.length / 8), best[1]];
   }
 
   async function setSessionModel(model, effort) {
@@ -1035,7 +1130,10 @@
         .map((x) => ({ item: x.item, pos: new Set(x.m[1]) }));
       sel = Math.min(sel, Math.max(0, matches.length - 1));
       const sources = multiSource();
-      list.replaceChildren(...matches.slice(0, 200).map((x, i) => {
+      // At most 200 rows, in a window that keeps the selection.
+      const first = Math.max(0, Math.min(sel - 100, matches.length - 200));
+      list.replaceChildren(...matches.slice(first, first + 200).map((x, n) => {
+        const i = first + n;
         const id = [...x.item.id].map((ch, n) => x.pos.has(n) ? h("mark", null, ch) : ch);
         const li = h("li", { role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null },
           h("span", { class: "picker-id" }, id),
@@ -1045,7 +1143,7 @@
         li.ondblclick = () => { sel = i; finish(false); };
         return li;
       }));
-      const selNode = list.children[sel];
+      const selNode = list.children[sel - first];
       if (selNode) selNode.scrollIntoView({ block: "nearest" });
       if (!items.length) return;
       status.textContent = matches.length
@@ -1136,7 +1234,7 @@
       if (m.role === "user") {
         // Each user message starts a fresh turn so its Edit button is exact.
         group = null;
-        open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
+        open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)))));
       } else if (m.role === "tool") {
         open("assistant", m.created_at).append(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
       } else if (m.role === "system-note") {
@@ -1972,6 +2070,17 @@
       return;
     }
     const mode = queued ? "queue" : isRunning() ? "steer" : "send";
+    // `@path` mentions are attached first (the daemon resolves them in its
+    // working directory); words that aren't files are left as text.
+    closeMentions();
+    for (const path of mentionsIn(text)) {
+      try {
+        const a = await request({ type: "attach_path", session_id: S.current, path });
+        note(a.reference ? "referenced " + a.name + " (the agent reads it with its Tools)" : "attached " + a.name);
+      } catch (e) {
+        if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
+      }
+    }
     const r = await act({ type: "send_message", session_id: S.current, content: text, mode });
     if (r && mode !== "send") note(mode === "queue" ? "queued for after this run" : "steering the current run");
   }
@@ -2425,8 +2534,10 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", autosize);
+  $("input").addEventListener("input", () => { autosize(); updateMentions(); });
+  $("input").addEventListener("blur", () => setTimeout(closeMentions, 100));
   $("input").addEventListener("keydown", (e) => {
+    if (mentionKey(e)) return;
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(true); }
     else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }
     else if (e.key === "Escape") {

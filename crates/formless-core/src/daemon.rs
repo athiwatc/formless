@@ -165,6 +165,8 @@ pub struct Daemon {
     web: tokio::sync::Mutex<Option<Arc<crate::webui::WebUi>>>,
     /// Files attached to each Session's next user message (SPEC §5.6).
     attachments: StdMutex<HashMap<String, Vec<Value>>>,
+    /// `@`-mention file indexes by root, refreshed after `FILE_INDEX_SECS`.
+    file_index: StdMutex<HashMap<std::path::PathBuf, FileIndex>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
     pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
@@ -229,6 +231,7 @@ impl Daemon {
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
+            file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
             proposing: Arc::new(AtomicBool::new(false)),
@@ -666,6 +669,21 @@ impl Daemon {
                 let r = self.attach_file(&session_id, &name, &data_b64, mime)?;
                 Ok(r)
             }
+            Request::ListFiles { root, query, limit } => {
+                let root = mention_root(root.as_deref())?;
+                let index = self.file_index(&root).await?;
+                let files: Vec<_> =
+                    crate::files::search(&index.0, &query, limit.unwrap_or(50).min(500))
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                Ok(json!({"root": root, "query": query, "files": files, "truncated": index.1}))
+            }
+            Request::AttachPath {
+                session_id,
+                path,
+                root,
+            } => self.attach_path(&session_id, &path, root.as_deref()),
             Request::StartWebUi { port } => {
                 let mut web = self.web.lock().await;
                 let running = web
@@ -4149,6 +4167,76 @@ impl Daemon {
         Ok(json!({"id": id, "name": name, "mime": mime, "bytes": bytes.len()}))
     }
 
+    /// The cached `@`-mention index for `root`, walked again when stale.
+    async fn file_index(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<Arc<(Vec<crate::files::FileEntry>, bool)>> {
+        if let Some((at, index)) = self.file_index.lock().unwrap().get(root) {
+            if at.elapsed() < std::time::Duration::from_secs(FILE_INDEX_SECS) {
+                return Ok(index.clone());
+            }
+        }
+        let walk_root = root.to_path_buf();
+        let index =
+            Arc::new(tokio::task::spawn_blocking(move || crate::files::walk(&walk_root)).await?);
+        let mut cache = self.file_index.lock().unwrap();
+        // A few roots at most: clients use their working directory.
+        if cache.len() > 8 {
+            cache.clear();
+        }
+        cache.insert(
+            root.to_path_buf(),
+            (std::time::Instant::now(), index.clone()),
+        );
+        Ok(index)
+    }
+
+    /// An `@` mention (SPEC §5.6): small files are attached, large files and
+    /// directories go as a reference the agent can read with its Tools.
+    fn attach_path(&self, session_id: &str, path: &str, root: Option<&str>) -> Result<Value> {
+        let root = mention_root(root)?;
+        let full = root
+            .join(path.strip_prefix("~/").map_or_else(
+                || std::path::PathBuf::from(path),
+                |rest| {
+                    directories::BaseDirs::new()
+                        .map(|b| b.home_dir().join(rest))
+                        .unwrap_or_else(|| rest.into())
+                },
+            ))
+            .canonicalize()
+            .with_context(|| format!("no file '{path}'"))?;
+        let meta = std::fs::metadata(&full)?;
+        let name = full
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        let inline_limit = if guess_mime(&name).starts_with("image/") {
+            MAX_INLINE_IMAGE_BYTES
+        } else {
+            MAX_MENTION_INLINE_BYTES
+        };
+        if meta.is_file() && meta.len() as usize <= inline_limit {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(std::fs::read(&full)?);
+            let mut r = self.attach_file(session_id, &name, &data, None)?;
+            r["reference"] = json!(false);
+            return Ok(r);
+        }
+        self.with_store(|st| st.get_session(session_id))?
+            .context("session not found")?;
+        let att = json!({"reference": true, "name": name, "path": full,
+                         "dir": meta.is_dir(), "bytes": if meta.is_dir() { 0 } else { meta.len() }});
+        self.attachments
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .push(att.clone());
+        Ok(att)
+    }
+
     /// Append a user message, carrying the Session's pending attachments.
     fn append_user_message(&self, session_id: &str, content: &str) -> Result<MessageInfo> {
         let atts = self
@@ -6743,6 +6831,33 @@ pub fn builtin_outcome(name: &str, text: &str) -> (bool, &'static str) {
 
 /// Largest attachment accepted (SPEC §5.6).
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+/// `@`-mentioned text files up to this size are attached; larger ones and
+/// directories go as a reference (SPEC §5.6).
+const MAX_MENTION_INLINE_BYTES: usize = 256 * 1024;
+/// Images sent inline to vision models (SPEC §5.6).
+const MAX_INLINE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const FILE_INDEX_SECS: u64 = 30;
+
+type FileIndex = (
+    std::time::Instant,
+    Arc<(Vec<crate::files::FileEntry>, bool)>,
+);
+
+/// The directory `@` mentions resolve against: `root`, or the daemon's
+/// working directory.
+fn mention_root(root: Option<&str>) -> Result<std::path::PathBuf> {
+    let root = match root.filter(|r| !r.trim().is_empty()) {
+        Some(r) => std::path::PathBuf::from(r),
+        None => std::env::current_dir()?,
+    };
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("no directory '{}'", root.display()))?;
+    if !root.is_dir() {
+        return Err(anyhow!("'{}' is not a directory", root.display()));
+    }
+    Ok(root)
+}
 
 /// A MIME type from a file name's extension.
 pub fn guess_mime(name: &str) -> &'static str {

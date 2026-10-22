@@ -3766,6 +3766,18 @@ pub fn provider_message(m: &MessageInfo) -> Value {
             let mut content = m.content.clone();
             let mut images = Vec::new();
             for a in atts {
+                if a["reference"] == true {
+                    let size = if a["dir"] == true {
+                        "directory".to_string()
+                    } else {
+                        format!("{} bytes", a["bytes"])
+                    };
+                    content.push_str(&format!(
+                        "\n[referenced: {} ({size}); not attached, read it with your Tools]",
+                        a["path"].as_str().unwrap_or_default()
+                    ));
+                    continue;
+                }
                 content.push_str(&format!(
                     "\n[attached: {} ({}, {} bytes), artifact {}; read it with read_artifact]",
                     a["name"].as_str().unwrap_or("file"),
