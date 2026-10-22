@@ -183,6 +183,18 @@ struct ModelOverlay {
     default_only: bool,
 }
 
+/// A Session's unsent input and attachments.
+#[derive(Default)]
+struct Draft {
+    input: input::InputLine,
+    attachments: Vec<(String, Vec<u8>)>,
+}
+
+/// Where text drafts persist between TUI starts.
+fn drafts_file(paths: &Paths) -> std::path::PathBuf {
+    paths.data_dir.join("tui-drafts.json")
+}
+
 /// The Ctrl+F find bar: the query, the current match and, from the last
 /// draw, the wrapped row of every matching line.
 #[derive(Default)]
@@ -771,6 +783,9 @@ struct App {
     edit_armed: bool,
     /// Text for the input once a fork from a message opens.
     fork_prefill: Option<String>,
+    /// Unsent input and attachments per Session (SPEC §10.2), kept when
+    /// switching away; text drafts persist across restarts.
+    drafts: HashMap<String, Draft>,
     /// Chat rows when the user scrolled away from the bottom, to count
     /// what arrived since; and where the "new lines" badge was drawn
     /// (row, first and last column) so a click can follow again.
@@ -935,6 +950,7 @@ impl App {
             find: None,
             edit_armed: false,
             fork_prefill: None,
+            drafts: HashMap::new(),
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -1740,6 +1756,21 @@ impl App {
                 session_id: id.clone(),
             },
         );
+        // Each Session keeps its own unsent input (SPEC §10.2).
+        if self.current.as_deref() != Some(id.as_str()) {
+            if let Some(old) = self.current.take() {
+                let draft = Draft {
+                    input: std::mem::take(&mut self.input),
+                    attachments: std::mem::take(&mut self.attachments),
+                };
+                if !draft.input.is_empty() || !draft.attachments.is_empty() {
+                    self.drafts.insert(old, draft);
+                }
+            }
+            let draft = self.drafts.remove(&id).unwrap_or_default();
+            self.input = draft.input;
+            self.attachments = draft.attachments;
+        }
         self.current = Some(id);
         self.streaming.clear();
         self.thinking.clear();
@@ -4401,6 +4432,42 @@ impl App {
             }
         }
         true
+    }
+
+    /// Text drafts from the last run (attachments aren't kept).
+    fn load_drafts(&mut self) {
+        let Ok(text) = std::fs::read_to_string(drafts_file(&self.paths)) else {
+            return;
+        };
+        let saved: HashMap<String, String> = serde_json::from_str(&text).unwrap_or_default();
+        for (sid, t) in saved {
+            self.drafts.insert(
+                sid,
+                Draft {
+                    input: input::InputLine::from(t.as_str()),
+                    attachments: Vec::new(),
+                },
+            );
+        }
+    }
+
+    /// Persist every Session's text draft, the current one included.
+    fn save_drafts(&self) {
+        let mut out: HashMap<&str, String> = self
+            .drafts
+            .iter()
+            .filter(|(_, d)| !d.input.is_empty())
+            .map(|(k, d)| (k.as_str(), d.input.expanded()))
+            .collect();
+        if let Some(cur) = self.current.as_deref().filter(|_| !self.input.is_empty()) {
+            out.insert(cur, self.input.expanded());
+        }
+        let file = drafts_file(&self.paths);
+        if out.is_empty() {
+            let _ = std::fs::remove_file(file);
+        } else if let Ok(json) = serde_json::to_string(&out) {
+            let _ = std::fs::write(file, json);
+        }
     }
 
     /// The user messages of the current Session, oldest first: the input
@@ -7482,6 +7549,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
 
 pub fn run(paths: Paths) -> Result<()> {
     let mut app = App::new(paths)?;
+    app.load_drafts();
     enable_raw_mode()?;
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
@@ -7532,6 +7600,7 @@ pub fn run(paths: Paths) -> Result<()> {
         }
         Ok(())
     })();
+    app.save_drafts();
     if app.enhanced_keys {
         let _ = stdout().execute(crossterm::event::PopKeyboardEnhancementFlags);
     }
@@ -7669,6 +7738,7 @@ mod tests {
             find: None,
             edit_armed: false,
             fork_prefill: None,
+            drafts: HashMap::new(),
             unseen_from: None,
             new_badge: None,
             invocations: Vec::new(),
@@ -8967,6 +9037,30 @@ mod tests {
         app.key(key(KeyCode::Char(']')));
         app.key(key(KeyCode::Char('e')));
         assert!(app.notes.last().unwrap().contains("your own messages"));
+    }
+
+    #[test]
+    fn drafts_stay_with_their_session() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        app.switch_session("s1".into());
+        app.input.set("half-typed for s1");
+        app.attachments.push(("a.txt".into(), b"x".to_vec()));
+        app.switch_session("s2".into());
+        assert!(app.input.is_empty() && app.attachments.is_empty());
+        app.input.set("for s2");
+        app.switch_session("s1".into());
+        assert_eq!(app.input, "half-typed for s1");
+        assert_eq!(app.attachments.len(), 1);
+        // Text drafts survive a restart (the current one too).
+        app.save_drafts();
+        let mut again = test_app();
+        again.paths = app.paths.clone();
+        again.load_drafts();
+        again.switch_session("s2".into());
+        assert_eq!(again.input, "for s2");
+        again.switch_session("s1".into());
+        assert_eq!(again.input, "half-typed for s1");
     }
 
     #[test]

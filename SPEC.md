@@ -1533,6 +1533,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   with live elapsed + `possibly stalled` flags, §6), compaction notices,
   optimiser activity notes. Full scrollback is preserved across modal
   overlays and view switches.
+- **Drafts per Session (TUI).** Unsent input and pending attachments
+  belong to their Session. Switching away keeps them and coming back
+  restores them, so a half-typed message never goes to the wrong Session.
+  Text drafts are saved in `<data dir>/tui-drafts.json` when the TUI
+  exits and restored on the next start; attachments are not.
 - **Empty Session.** A new Session shows one line on what Formless is
   (it builds the Tools a task needs and keeps them), four example tasks
   (search a repo, summarise a page, a recurring job, "what can you do?"),
