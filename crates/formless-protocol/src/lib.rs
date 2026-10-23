@@ -420,6 +420,24 @@ pub struct ToolDetail {
     /// The accumulated approval grant, if any (SPEC §10.3).
     #[serde(default)]
     pub approval: Option<ApprovalGrant>,
+    /// The last 20 Invocations, newest first (SPEC §10.4).
+    #[serde(default)]
+    pub recent_calls: Vec<ToolCallInfo>,
+}
+
+/// One past Invocation of a Tool, for its detail view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallInfo {
+    pub id: String,
+    pub version: i64,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub status: String,
+    pub input: String,
+    pub output: String,
+    pub error: String,
+    pub duration_ms: i64,
+    pub created_at: String,
 }
 
 /// What the user has allowed a Tool, accumulated across approvals.

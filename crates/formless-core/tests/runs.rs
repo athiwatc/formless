@@ -455,11 +455,27 @@ fn tools_list_their_recent_outcomes_oldest_first() {
         )
         .unwrap();
     // Denied and cancelled calls say nothing about the Tool itself.
-    for status in ["success", "denied", "failure", "failure", "cancelled", "success"] {
+    for status in [
+        "success",
+        "denied",
+        "failure",
+        "failure",
+        "cancelled",
+        "success",
+    ] {
         store
-            .record_invocation(&t.id, v, None, None, None, status, "", "{}", "", "", 1, 1000)
+            .record_invocation(
+                &t.id, v, None, None, None, status, "", "{}", "", "", 1, 1000,
+            )
             .unwrap();
     }
     let listed = store.list_tools(false).unwrap();
     assert_eq!(listed[0].recent, "sffs");
+    // The detail lists every call, newest first.
+    let d = store.tool_detail(&t.id).unwrap().unwrap();
+    let statuses: Vec<&str> = d.recent_calls.iter().map(|c| c.status.as_str()).collect();
+    assert_eq!(
+        statuses,
+        ["success", "cancelled", "failure", "failure", "denied", "success"]
+    );
 }

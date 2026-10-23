@@ -2498,6 +2498,39 @@ impl Store {
                     capabilities: caps.to_specs(),
                     memory_mb,
                 });
+        // Each field capped: a detail view, not the full record.
+        let cap = |s: String| -> String {
+            if s.len() <= 20_000 {
+                return s;
+            }
+            let mut end = 20_000;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}… (cut)", &s[..end])
+        };
+        let recent_calls = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, version, session_id, status, input, output, error, duration_ms, created_at
+                 FROM invocations WHERE tool_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 20",
+            )?;
+            let rows = stmt
+                .query_map(params![id], |r| {
+                    Ok(formless_protocol::ToolCallInfo {
+                        id: r.get(0)?,
+                        version: r.get(1)?,
+                        session_id: r.get(2)?,
+                        status: r.get(3)?,
+                        input: cap(r.get(4)?),
+                        output: cap(r.get(5)?),
+                        error: cap(r.get(6)?),
+                        duration_ms: r.get(7)?,
+                        created_at: r.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
         Ok(Some(formless_protocol::ToolDetail {
             tool,
             versions,
@@ -2505,6 +2538,7 @@ impl Store {
             optimiser_attempts,
             version_metrics,
             approval,
+            recent_calls,
         }))
     }
 

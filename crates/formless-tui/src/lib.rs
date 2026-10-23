@@ -777,6 +777,11 @@ struct App {
     tool_idx: usize,
     tool_filter: lists::ListFilter,
     tool_detail: Option<ToolDetail>,
+    /// The selected recent call in the Tool detail (`[`/`]`).
+    call_idx: Option<usize>,
+    /// After opening a Session from a Tool call: focus the call made at
+    /// or after this time once the transcript loads.
+    jump_to: Option<String>,
     /// Open rollback version picker (Tools view, `b`).
     rollback_pick: Option<RollbackPick>,
     /// The `/model` picker (SPEC §17).
@@ -1028,6 +1033,8 @@ impl App {
             tool_idx: 0,
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
+            call_idx: None,
+            jump_to: None,
             rollback_pick: None,
             model_overlay: None,
             mention: None,
@@ -1336,6 +1343,10 @@ impl App {
                         }
                         Pending::GetTool => {
                             if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
+                                if self.tool_detail.as_ref().map(|o| &o.tool.id) != Some(&d.tool.id)
+                                {
+                                    self.call_idx = None;
+                                }
                                 self.tool_detail = Some(d);
                             }
                         }
@@ -1877,6 +1888,9 @@ impl App {
                             if let Some(msgs) = result.get("messages").cloned() {
                                 if let Ok(v) = serde_json::from_value::<Vec<MessageInfo>>(msgs) {
                                     self.messages = v;
+                                    if let Some(at) = self.jump_to.take() {
+                                        self.focus_call_at(&at);
+                                    }
                                     // Edits arrive as reloads: drop renders of old content.
                                     self.md_cache.borrow_mut().clear();
                                     self.live_tools.clear();
@@ -4407,8 +4421,37 @@ impl App {
                         (self.tool_idx + 1).min(self.visible_tools().len().saturating_sub(1))
                 }
                 KeyCode::Enter => {
-                    if let Some(tool) = self.selected_tool().cloned() {
+                    if let Some(call) = self.selected_call() {
+                        self.open_call(&call);
+                    } else if let Some(tool) = self.selected_tool().cloned() {
                         self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                    }
+                }
+                KeyCode::Char('[') | KeyCode::Char(']') => {
+                    let n = self
+                        .tool_detail
+                        .as_ref()
+                        .filter(|d| Some(&d.tool.id) == self.selected_tool().map(|t| &t.id))
+                        .map_or(0, |d| d.recent_calls.len());
+                    self.call_idx = match (self.call_idx, key.code == KeyCode::Char(']')) {
+                        _ if n == 0 => None,
+                        (None, true) => Some(0),
+                        (Some(i), true) => Some((i + 1).min(n - 1)),
+                        (Some(0), false) | (None, false) => None,
+                        (Some(i), false) => Some(i - 1),
+                    };
+                }
+                KeyCode::Char('S') => {
+                    if let Some(call) = self.selected_call() {
+                        match call.session_id {
+                            Some(id) if self.sessions.iter().any(|s| s.id == id) => {
+                                self.jump_to = Some(call.created_at);
+                                self.switch_session(id.clone());
+                                self.request(Pending::GetSession, Request::GetSession { id });
+                                self.view = View::Chat;
+                            }
+                            _ => self.notes.push("that call's Session is gone".into()),
+                        }
                     }
                 }
                 KeyCode::Char('e') => {
@@ -7030,6 +7073,79 @@ impl App {
         });
     }
 
+    /// The recent call selected in the open Tool's detail.
+    fn selected_call(&self) -> Option<ToolCallInfo> {
+        let d = self.tool_detail.as_ref()?;
+        if Some(&d.tool.id) != self.selected_tool().map(|t| &t.id) {
+            return None;
+        }
+        d.recent_calls.get(self.call_idx?).cloned()
+    }
+
+    /// A past call's full input, output and error in the pager.
+    fn open_call(&mut self, c: &ToolCallInfo) {
+        let pretty = |s: &str| {
+            serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                .unwrap_or_else(|| s.to_string())
+        };
+        let mut lines = vec![
+            format!(
+                "{} · v{} · {}ms · {}",
+                c.status, c.version, c.duration_ms, c.created_at
+            ),
+            format!(
+                "Session: {}  (S opens it at this call)",
+                c.session_id
+                    .as_deref()
+                    .map(|id| self.session_name(id))
+                    .unwrap_or_else(|| "none".into())
+            ),
+            String::new(),
+            "Input:".into(),
+        ];
+        lines.extend(pretty(&c.input).lines().map(str::to_string));
+        if !c.output.is_empty() {
+            lines.push(String::new());
+            lines.push("Output:".into());
+            lines.extend(pretty(&c.output).lines().map(str::to_string));
+        }
+        if !c.error.is_empty() {
+            lines.push(String::new());
+            lines.push("Error:".into());
+            lines.extend(c.error.lines().map(str::to_string));
+        }
+        let tool = self
+            .tool_detail
+            .as_ref()
+            .map(|d| d.tool.name.clone())
+            .unwrap_or_default();
+        self.pager = Some(Pager {
+            title: format!("{tool} call"),
+            lines,
+            top: 0,
+            left: 0,
+            styled: Vec::new(),
+        });
+    }
+
+    /// Focus the first Tool result at or after `at` (an Invocation's time).
+    fn focus_call_at(&mut self, at: &str) {
+        let call = self
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool" && m.created_at.as_str() >= at)
+            .find_map(|m| {
+                let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+                meta["tool_call_id"].as_str().map(str::to_string)
+            });
+        if let Some(id) = call {
+            self.call_focus = Some(id);
+            self.scroll_to_focus = true;
+        }
+    }
+
     /// Rename Session `id` in the input, starting from `name` (Esc
     /// cancels).
     fn start_rename(&mut self, id: &str, name: &str) {
@@ -8949,6 +9065,55 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             ),
                         ]),
                     ];
+            if !d.recent_calls.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Recent calls", bold_fg(app.color, Color::Cyan)),
+                    Span::styled(
+                        "  [ ] select · Enter full call · S open its Session",
+                        ui::dim(app.color),
+                    ),
+                ]));
+                for (i, c) in d.recent_calls.iter().enumerate() {
+                    let here = app.call_idx == Some(i);
+                    let (mark, style) = match c.status.as_str() {
+                        "success" => ("✓", fg(app.color, Color::Green)),
+                        "failure" => ("✗", bold_fg(app.color, Color::Red)),
+                        _ => ("·", ui::dim(app.color)),
+                    };
+                    let session = c
+                        .session_id
+                        .as_deref()
+                        .map(|id| app.session_name(id))
+                        .unwrap_or_else(|| "-".into());
+                    let mut spans = vec![
+                        Span::raw(if here { "› " } else { "  " }),
+                        Span::styled(format!("{mark} "), style),
+                        Span::styled(
+                            format!(
+                                "{} {:>6}ms  {}  ",
+                                ui::pad(&ui::relative_time(&c.created_at, now), 8),
+                                c.duration_ms,
+                                truncate_chars(&session, 18)
+                            ),
+                            ui::dim(app.color),
+                        ),
+                        Span::raw(truncate_chars(&c.input.replace('\n', " "), 50)),
+                    ];
+                    if !c.error.is_empty() {
+                        spans.push(Span::styled(
+                            format!("  {}", truncate_chars(&c.error.replace('\n', " "), 60)),
+                            fg(app.color, Color::Red),
+                        ));
+                    }
+                    let line = Line::from(spans);
+                    lines.push(if here {
+                        line.style(Style::default().add_modifier(Modifier::REVERSED))
+                    } else {
+                        line
+                    });
+                }
+            }
             if let Some(g) = &d.approval {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
@@ -9130,10 +9295,24 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         );
         clickable_rows(app, parts[0], 1, state.offset(), visible.len(), Click::Tool);
     }
+    let lines = tool_detail_lines(app);
+    // Keep the selected recent call (marked "› ") in view.
+    let inner = parts[1].inner(Margin::new(1, 1));
+    let scroll = lines
+        .iter()
+        .position(|l| l.spans.first().is_some_and(|s| s.content == "› "))
+        .map(|i| {
+            let before = Paragraph::new(lines[..i].to_vec())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width);
+            before.saturating_sub(inner.height.saturating_sub(2) as usize) as u16
+        })
+        .unwrap_or(0);
     f.render_widget(
-        Paragraph::new(tool_detail_lines(app))
+        Paragraph::new(lines)
             .block(ui::panel(" Detail ", app.color, Color::DarkGray))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         parts[1],
     );
 }
@@ -9835,6 +10014,8 @@ mod tests {
             tool_idx: 0,
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
+            call_idx: None,
+            jump_to: None,
             rollback_pick: None,
             model_overlay: None,
             mention: None,
@@ -12283,6 +12464,93 @@ mod tests {
         assert!(screen.contains("LAST 20"), "{screen}");
         assert!(screen.contains("▆▂▂▂▆▂▂▂"), "{screen}");
         assert!(screen.contains("↓"), "{screen}");
+    }
+
+    #[test]
+    fn tool_detail_lists_recent_calls_to_open_and_jump_to() {
+        let mut app = test_app();
+        let tool = ToolInfo {
+            id: "t".into(),
+            name: "fetch_page".into(),
+            description: String::new(),
+            retired: false,
+            current_version: 1,
+            capabilities: vec![],
+            memory_mb: 64,
+            invocations: 2,
+            success_rate: Some(0.5),
+            needs_attention: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            recent: "sf".into(),
+        };
+        app.tools = vec![tool.clone()];
+        app.sessions = vec![SessionInfo {
+            id: "s1".into(),
+            name: "Research".into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: "2026-01-01".into(),
+            updated_at: "2026-01-01".into(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned: false,
+            archived: false,
+            tags: vec![],
+            instructions: None,
+        }];
+        let call = |id: &str, status: &str, error: &str, at: &str| ToolCallInfo {
+            id: id.into(),
+            version: 1,
+            session_id: Some("s1".into()),
+            status: status.into(),
+            input: r#"{"url":"https://example.com"}"#.into(),
+            output: String::new(),
+            error: error.into(),
+            duration_ms: 120,
+            created_at: at.into(),
+        };
+        app.tool_detail = Some(ToolDetail {
+            tool,
+            versions: vec![],
+            metrics: Default::default(),
+            optimiser_attempts: vec![],
+            version_metrics: vec![],
+            approval: None,
+            recent_calls: vec![
+                call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z"),
+                call("i1", "success", "", "2026-01-01T10:00:00Z"),
+            ],
+        });
+        app.view = View::Tools;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let screen = render(&mut app, 140, 40);
+        assert!(screen.contains("Recent calls"), "{screen}");
+        assert!(screen.contains("timeout after 30s"), "{screen}");
+        app.key(key(KeyCode::Char(']')));
+        assert_eq!(app.call_idx, Some(0));
+        app.key(key(KeyCode::Enter));
+        let pager = app.pager.take().expect("pager");
+        assert!(pager.lines.iter().any(|l| l == "Error:"));
+        assert!(pager.lines.iter().any(|l| l.contains("\"url\": \"https://example.com\"")));
+        // S opens the Session, focusing the call made then.
+        app.key(key(KeyCode::Char('S')));
+        assert_eq!(app.view, View::Chat);
+        assert_eq!(app.current.as_deref(), Some("s1"));
+        app.messages = vec![MessageInfo {
+            id: "m1".into(),
+            session_id: "s1".into(),
+            seq: 1,
+            role: "tool".into(),
+            content: "timeout".into(),
+            created_at: "2026-01-01T10:05:01Z".into(),
+            meta: Some(r#"{"tool_call_id":"call_9"}"#.into()),
+        }];
+        let at = app.jump_to.take().unwrap();
+        app.focus_call_at(&at);
+        assert_eq!(app.call_focus.as_deref(), Some("call_9"));
     }
 
     #[test]
