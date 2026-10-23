@@ -1714,6 +1714,11 @@
               h("button", { class: "btn ghost small", type: "button", title: "Revoke " + c, onclick: () => revokeApproval(t, c) }, "×"))),
             h("button", { class: "btn small", type: "button", onclick: () => revokeApproval(t, null) }, "Revoke all"))
         : h("span", { class: "muted" }, "nothing yet (asks on first sensitive call)"))));
+    if (d.attention && d.attention.length) {
+      box.append(h("div", { class: "attention" },
+        h("strong", null, t.needs_attention ? "Why it needs attention" : "Worth a look"),
+        h("ul", null, d.attention.map((r) => h("li", null, r)))));
+    }
     box.append(metricsBlock(d.metrics));
     const idx = d.versions.findIndex((v) => v.version === t.current_version);
     if (idx > 0) {

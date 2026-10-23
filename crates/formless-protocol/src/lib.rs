@@ -423,6 +423,10 @@ pub struct ToolDetail {
     /// The last 20 Invocations, newest first (SPEC §10.4).
     #[serde(default)]
     pub recent_calls: Vec<ToolCallInfo>,
+    /// Why the Tool needs (or may need) attention, in plain words (SPEC
+    /// §10.4); empty when nothing stands out.
+    #[serde(default)]
+    pub attention: Vec<String>,
 }
 
 /// One past Invocation of a Tool, for its detail view.

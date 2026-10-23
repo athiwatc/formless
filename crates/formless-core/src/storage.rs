@@ -2531,6 +2531,8 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
+        let attention =
+            self.attention_reasons(&tool, &metrics, &optimiser_attempts, &recent_calls)?;
         Ok(Some(formless_protocol::ToolDetail {
             tool,
             versions,
@@ -2539,7 +2541,83 @@ impl Store {
             version_metrics,
             approval,
             recent_calls,
+            attention,
         }))
+    }
+
+    /// Why a Tool needs attention: the optimiser giving up (what sets the
+    /// flag), and live signals: a low success rate, a failure streak, a
+    /// spike of invalid inputs, or a recent rollback.
+    fn attention_reasons(
+        &self,
+        tool: &ToolInfo,
+        m: &ToolMetricsInfo,
+        attempts: &[formless_protocol::OptimiserAttemptInfo],
+        calls: &[formless_protocol::ToolCallInfo],
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if tool.needs_attention {
+            let (_, consec) = self.get_opt_state(&tool.id)?;
+            let last = attempts
+                .iter()
+                .find(|a| a.status == "discarded" || a.status == "failed")
+                .map(|a| format!(" (last: {})", a.detail))
+                .unwrap_or_default();
+            out.push(format!(
+                "the optimiser gave up after {consec} failed candidate fixes{last}"
+            ));
+        }
+        if let Some(rate) = m.success_rate.filter(|r| *r < 0.5 && m.total >= 5) {
+            out.push(format!(
+                "only {:.0}% of {} calls succeed",
+                rate * 100.0,
+                m.total
+            ));
+        }
+        let streak = tool.recent.chars().rev().take_while(|c| *c == 'f').count();
+        if streak >= 3 {
+            let error = calls
+                .iter()
+                .find(|c| c.status == "failure" && !c.error.is_empty())
+                .map(|c| {
+                    let e: String = c
+                        .error
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(120)
+                        .collect();
+                    format!(": {e}")
+                })
+                .unwrap_or_default();
+            out.push(format!("the last {streak} calls failed{error}"));
+        }
+        if m.total >= 5 && m.validation_failures * 5 >= m.total {
+            out.push(format!(
+                "{} of {} calls had invalid input (the schema may not match how the agent calls it)",
+                m.validation_failures, m.total
+            ));
+        }
+        let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let rollback: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT detail, created_at FROM audit WHERE action='tool.rollback'
+                 AND detail LIKE ?1 || ' v%' AND created_at >= ?2
+                 ORDER BY created_at DESC LIMIT 1",
+                params![tool.name, week_ago],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((detail, at)) = rollback {
+            let version = detail.rsplit(' ').next().unwrap_or_default();
+            out.push(format!(
+                "rolled back to {version} on {}",
+                at.get(..10).unwrap_or(&at)
+            ));
+        }
+        Ok(out)
     }
 
     /// Mark Tools as loaded into a Session's function list (SPEC §7.1).
