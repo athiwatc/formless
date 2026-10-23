@@ -2239,6 +2239,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   page loads no inline script (`script-src 'self'`), because its URL
   fragment carries the key, and it removes the key from the address bar
   once connected.
+  The page is an installable app: a web manifest and icons, and a service
+  worker (`/sw.js`) that fetches the shell network-first and falls back to
+  the cached copy offline. It caches only the static shell (`/`, `app.js`,
+  `app.css`, the manifest and icons), never `/auth`, `/ws` or `/relay/`,
+  and URL fragments never reach it. Offline, the status pill says "offline
+  · daemon unreachable" and the transcript says the daemon is offline. The
+  CSP allows `manifest-src 'self'` and `worker-src 'self'` for this.
 
 ## 13. Configuration (complete settings table)
 

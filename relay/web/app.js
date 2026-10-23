@@ -384,6 +384,9 @@
       conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
       conn.title = "Retry now";
       conn.onclick = retryNow;
+    } else if (!navigator.onLine) {
+      conn.className = "pill off";
+      conn.textContent = "offline · daemon unreachable";
     } else if (!S.ws || S.ws.readyState !== 1) {
       conn.className = "pill off";
       conn.textContent = S.ws && S.ws.readyState === 0 ? "connecting…" : "relay disconnected";
@@ -395,6 +398,13 @@
       conn.textContent = "● connected";
     }
   }
+
+  // Installable app shell (SPEC §12): the page opens offline and says so.
+  if ("serviceWorker" in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
+  window.addEventListener("offline", () => renderAll());
+  window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); });
 
   function renderView() {
     if (S.view === "tools") renderTools();

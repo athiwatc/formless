@@ -25,10 +25,16 @@ const INDEX: &str = include_str!("../../../relay/web/index.html");
 const APP_JS: &str = include_str!("../../../relay/web/app.js");
 const APP_CSS: &str = include_str!("../../../relay/web/app.css");
 const MERMAID: &str = include_str!("../../../relay/web/vendor/mermaid.min.js");
+// The installable app shell (SPEC §12).
+const SW_JS: &str = include_str!("../../../relay/web/sw.js");
+const MANIFEST: &str = include_str!("../../../relay/web/manifest.webmanifest");
+const ICON_192: &[u8] = include_bytes!("../../../relay/web/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../../../relay/web/icon-512.png");
 
 /// Same policy as the hosted relay frontend (relay/worker.js).
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
-connect-src 'self' ws:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+connect-src 'self' ws:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; \
+frame-ancestors 'none'";
 
 const COOKIE: &str = "formless_session";
 
@@ -128,6 +134,13 @@ pub async fn start(daemon: Arc<Daemon>, port: u16) -> Result<Arc<WebUi>> {
             "/vendor/mermaid.min.js",
             get(|s, h| asset(s, h, "text/javascript", MERMAID)),
         )
+        .route("/sw.js", get(|s, h| asset(s, h, "text/javascript", SW_JS)))
+        .route(
+            "/manifest.webmanifest",
+            get(|s, h| asset(s, h, "application/manifest+json", MANIFEST)),
+        )
+        .route("/icon-192.png", get(|s, h| icon(s, h, ICON_192)))
+        .route("/icon-512.png", get(|s, h| icon(s, h, ICON_512)))
         .route("/auth", post(auth))
         .route("/ws", get(ws))
         .with_state(state);
@@ -182,6 +195,22 @@ async fn asset(
         return forbidden();
     }
     secured(StatusCode::OK, content_type, body.to_string())
+}
+
+async fn icon(State(st): State<AppState>, headers: HeaderMap, body: &'static [u8]) -> Response {
+    if !st.ui.host_ok(&headers) {
+        return forbidden();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// One-time token (from the URL fragment) for a session cookie.
