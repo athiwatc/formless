@@ -1772,7 +1772,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   Invocations, newest first (time, Session, status, duration, input,
   output and error, each capped at 20 KB). The TUI Tool detail shows them
   under "Recent calls": `[`/`]` select one, Enter opens its full input,
-  output and error in the pager, and `S` opens its Session focused on the
+  output and error in the pager, and `J` opens its Session focused on the
   first Tool result at or after the call's time.
 - **Running a Tool by hand.** `RunTool {id, input, session_id}` runs a
   Tool as the agent would (same approval path, recorded as an Invocation
@@ -1790,6 +1790,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   more of calls, or a rollback in the last week. The TUI and web Tool
   detail list them ("Why it needs attention" / "Worth a look") above the
   recent calls, where the failures can be opened.
+- **Editing what the agent sees.** `UpdateToolSpec {id, description?,
+  input_schema?, output_schema?}` saves a new version with the given
+  description and/or schemas and the current code, Capabilities and
+  memory, through the usual gates, author `user`. In the TUI Tools view
+  (with the detail open) `D` edits the description and `S` the schemas
+  (one JSON object holding `input_schema` and `output_schema`); Ctrl+S
+  saves.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,

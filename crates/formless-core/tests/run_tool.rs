@@ -59,5 +59,36 @@ async fn a_tool_runs_by_hand_and_is_recorded() {
         })
         .await
         .is_err());
+    // A new description and input schema: a new version by the user,
+    // with the same code.
+    let r = daemon
+        .handle(Request::UpdateToolSpec {
+            id: tool.id.clone(),
+            description: Some("Shout text back in capitals".into()),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"text": {"type": "string", "description": "what to shout"}},
+                "required": ["text"]
+            })),
+            output_schema: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(r["version"], 2);
+    let d = store.tool_detail(&tool.id).unwrap().unwrap();
+    assert_eq!(d.tool.description, "Shout text back in capitals");
+    let v2 = d.versions.last().unwrap();
+    assert_eq!(v2.author, "user");
+    assert!(v2.input_schema.contains("what to shout"));
+    assert_eq!(v2.code, d.versions[0].code);
+    assert!(daemon
+        .handle(Request::UpdateToolSpec {
+            id: tool.id.clone(),
+            description: Some("  ".into()),
+            input_schema: None,
+            output_schema: None,
+        })
+        .await
+        .is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
