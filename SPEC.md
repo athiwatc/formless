@@ -2246,6 +2246,18 @@ run_tool = "network_policy"     # a registry Tool, or…
   and URL fragments never reach it. Offline, the status pill says "offline
   · daemon unreachable" and the transcript says the daemon is offline. The
   CSP allows `manifest-src 'self'` and `worker-src 'self'` for this.
+  **Notifications (Web Push, opt-in per device):**
+  - Settings → This browser subscribes with the relay's VAPID key
+    (`GET /push/key`) and sends `{"relay":"push_subscribe","sub"}` to the
+    room in the clear; a subscription is not Session data. "Turn off"
+    sends `push_unsubscribe`.
+  - When an approval or `ask_user` question starts waiting, the daemon
+    sends the relay `{"relay":"push"}` (at most every 30 s). The room
+    sends each subscription a payload-free push signed with VAPID and
+    drops subscriptions the push service reports gone (404/410).
+  - The service worker shows "An approval or a question is waiting for
+    you", and clicking it focuses the app. No Session content reaches the
+    relay or the push service.
 
 ## 13. Configuration (complete settings table)
 

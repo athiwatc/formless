@@ -308,3 +308,77 @@ async fn relay_link_is_silent_without_browsers() {
     shutdown.cancel();
     link.await.unwrap().unwrap();
 }
+
+/// A question waiting on the user asks the relay for a Web Push (SPEC §12),
+/// a payload-free control frame.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_questions_ask_the_relay_for_a_push() {
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let paths = temp_paths("relaypush");
+    formless_core::Config::default().save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let sid = formless_core::Store::open(&paths.db_file())
+        .unwrap()
+        .create_session(None)
+        .unwrap()
+        .id;
+    tokio::spawn({
+        let d = daemon.clone();
+        async move { d.serve().await }
+    });
+    for _ in 0..50 {
+        if formless_core::daemon::daemon_reachable(&paths) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Someone who could answer is connected.
+    let _client = tokio::net::UnixStream::connect(paths.socket_path())
+        .await
+        .unwrap();
+    let secret = generate_relay_secret();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    for _ in 0..50 {
+        if daemon.subscriber_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::spawn({
+        let d = daemon.clone();
+        async move {
+            d.call_tool_direct(
+                &sid,
+                "ask_user",
+                serde_json::json!({"question": "Which file?"}),
+            )
+            .await
+        }
+    });
+    let frame = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(t))) => return t.to_string(),
+                Some(Ok(_)) => continue,
+                other => panic!("relay link ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a push request");
+    assert_eq!(frame, r#"{"relay":"push"}"#);
+    shutdown.cancel();
+}

@@ -34,3 +34,22 @@ self.addEventListener("fetch", (e) => {
       .catch(() => caches.match(path).then((hit) => hit || Response.error())),
   );
 });
+
+// Web Push (opt-in, SPEC §12): pushes carry no content, so the notice is
+// generic; opening it brings the app to the front.
+self.addEventListener("push", (e) => {
+  e.waitUntil(self.registration.showNotification("Formless", {
+    body: "An approval or a question is waiting for you.",
+    icon: "icon-192.png",
+    tag: "formless-waiting",
+    renotify: true,
+  }));
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((wins) => {
+    const win = wins.find((w) => new URL(w.url).origin === location.origin);
+    return win ? win.focus() : self.clients.openWindow("/");
+  }));
+});

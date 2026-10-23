@@ -29,6 +29,9 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
 | `worker.js` | Worker entry: `/relay/<room>` → Durable Object room, `/health`, assets + `SECURITY_HEADERS` |
 | `web/` | The browser app (no build step; one vendored file, `web/vendor/mermaid.min.js`) |
 | `dev.mjs` | Local stand-in for the Worker, for frontend work |
+| `push.mjs` | Payload-free Web Push signed with VAPID (shared by the Worker and `dev.mjs`) |
+| `vapid-keys.mjs` | Makes the VAPID key pair for push |
+| `push.test.mjs`, `push.dev-test.mjs` | `node relay/push.test.mjs` (signing), `node relay/push.dev-test.mjs` (end to end through `dev.mjs`) |
 
 ## Use
 
@@ -71,6 +74,24 @@ npx wrangler deploy
 
 Requires `npx wrangler login` once. The custom domain, Durable Object
 binding, and migration are all declared in `wrangler.toml`.
+
+### Notifications (Web Push)
+
+Optional. Without keys, `/push/key` answers 404 and the web app says the
+relay hasn't set up notifications. To turn it on:
+
+```sh
+node relay/vapid-keys.mjs          # prints the two values
+npx wrangler secret put VAPID_PUBLIC_KEY
+npx wrangler secret put VAPID_PRIVATE_JWK
+npx wrangler secret put VAPID_SUBJECT   # optional, e.g. mailto:you@example.com
+```
+
+Browsers opt in from Settings → This browser. The room keeps their
+subscriptions (at most 10). Pushes carry no payload at all, so the relay
+and the push service learn nothing about any Session; the notification
+just says something is waiting. `dev.mjs` reads the same variables from
+its environment.
 
 ## Vendored Mermaid
 

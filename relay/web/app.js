@@ -2149,10 +2149,56 @@
     grid.append(h("section", null, h("h3", null, "This browser"),
       h("dl", { class: "kv" },
         h("dt", null, "thinking"), h("dd", null, h("label", { class: "toggle" }, thinking, "show live reasoning")),
-        h("dt", null, "encryption"), h("dd", null, "AES-256-GCM, key held only in this tab")),
+        h("dt", null, "encryption"), h("dd", null, "AES-256-GCM, key held only in this tab"),
+        S.local ? null : [h("dt", null, "notifications"), h("dd", null, pushControl())]),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
     box.append(grid, h("p", { class: "muted" }, "Edit applies through the daemon (next Run). Credentials, the endpoint, the relay and MCP servers are changed in config.toml on the daemon's machine."));
+  }
+
+  /** Web Push (SPEC §12): opt in per device. The relay keeps this
+   * browser's subscription and, when an approval or question waits, sends
+   * a push with no content; nothing about the Session leaves the daemon. */
+  function pushControl() {
+    const box = h("span");
+    const supported = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+    if (!supported) return h("span", { class: "muted" }, "not supported in this browser");
+    navigator.serviceWorker.getRegistration().then(async (reg) => {
+      const sub = reg && (await reg.pushManager.getSubscription());
+      box.replaceChildren(sub
+        ? h("span", null, "on · ", h("button", { class: "btn ghost small", type: "button", onclick: () => pushOff(sub) }, "Turn off"))
+        : h("button", { class: "btn small", type: "button", onclick: pushOn }, "Notify me about approvals"));
+    });
+    return box;
+  }
+  function b64uToBytes(s) {
+    const b = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
+    return Uint8Array.from(b, (c) => c.charCodeAt(0));
+  }
+  async function pushOn() {
+    try {
+      const r = await fetch("push/key");
+      if (!r.ok) return toast("This relay hasn't set up notifications.", true);
+      const { key } = await r.json();
+      if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
+      S.ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+      note("This device gets a notification when an approval or question waits.");
+    } catch (e) {
+      toast("Couldn't turn on notifications: " + e.message, true);
+    }
+    renderView();
+  }
+  async function pushOff(sub) {
+    try {
+      if (S.ws) S.ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint: sub.endpoint }));
+      await sub.unsubscribe();
+      note("Notifications are off on this device.");
+    } catch (e) {
+      toast(e.message, true);
+    }
+    renderView();
   }
 
   // ============================================================ actions
