@@ -11465,7 +11465,10 @@ mod tests {
         // The selected row says what it means and its default (SPEC §13).
         app.settings_sel = at("provider.max_retries");
         let screen = render(&mut app, 160, 60);
-        assert!(screen.contains("Bounded backoff attempts · default 5"), "{screen}");
+        assert!(
+            screen.contains("Bounded backoff attempts · default 5"),
+            "{screen}"
+        );
         // A toggle saves through the daemon.
         app.settings_sel = at("provider.tool_use_nudge");
         app.key(key(KeyCode::Enter));

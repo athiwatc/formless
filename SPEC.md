@@ -557,6 +557,13 @@ pasting paths.
     are hidden from screen readers);
   - keep Tab inside the dialog, and give focus back to where it was when
     they close.
+- **Reading controls (web).** Settings → This browser:
+  - text size A− / A+ (85–150% in 10% steps) scales the transcript and
+    composer;
+  - density is comfortable or compact (tighter turns, line height and
+    bubbles).
+
+  Both are remembered per device.
 - **Reduced motion (web).** Under `prefers-reduced-motion: reduce` nothing
   animates or transitions: spinners become a still "⋯", the running dot
   stops pulsing, toasts appear without sliding, the mobile sidebar opens
