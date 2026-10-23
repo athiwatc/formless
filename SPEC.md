@@ -1826,6 +1826,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   `/thinking`, `/help`
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`). Plain text is always chat.
+- **Session switcher.** Ctrl+K (⌘/Ctrl+K on the web) opens a fuzzy
+  switcher over Session names, tags and last messages from any view,
+  newest first until you type. Enter opens the Session; Ctrl+N (Ctrl/⌘+
+  Enter on the web) starts a new Session named after the typed text.
 - **Command palette.** Typing `/` at the start of the input opens a popup
   of commands with one-line descriptions, filtered fuzzily (exact prefixes
   first). ↑/↓ select, Tab completes, Enter runs. A command that still

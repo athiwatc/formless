@@ -2064,6 +2064,65 @@
     await openSession(s.id);
     $("input").focus();
   }
+  /** Ctrl/⌘+K: fuzzy-switch Sessions by name, tags or last message;
+   * Enter opens, Ctrl/⌘+Enter starts a Session named after the query. */
+  function openSwitcher() {
+    if (document.querySelector(".switcher")) return;
+    const input = h("input", { type: "text", placeholder: "Switch to a Session…", "aria-label": "Find a Session", autocomplete: "off", spellcheck: "false" });
+    const list = h("ul", { class: "picker-list", role: "listbox" });
+    const status = h("span", { class: "muted" }, "Enter open · Ctrl/⌘+Enter new Session named this");
+    const dialog = h("div", { class: "backdrop switcher", role: "dialog", "aria-modal": "true", "aria-label": "Switch Session" },
+      h("div", { class: "modal picker" }, h("h2", null, "Switch Session"), input, list,
+        h("div", { class: "modal-actions" }, status)));
+    let matches = [], sel = 0;
+    const close = () => { dialog.remove(); $("input").focus(); };
+    function draw() {
+      const q = input.value;
+      matches = S.sessions.filter((s) => !s.archived).map((s) => {
+        // The name counts most, then tags, then the preview.
+        const fields = [s.name, (s.tags || []).map((t) => "#" + t).join(" "), s.preview || ""];
+        const scores = fields.map((f, k) => { const m = fuzzyMatch(q, f || ""); return m && m[0] - 20 * k; }).filter((x) => x !== null);
+        return { s, score: scores.length ? Math.max(...scores) : null, pos: new Set((fuzzyMatch(q, s.name) || [0, []])[1]) };
+      }).filter((x) => x.score !== null)
+        .sort((a, b) => q.trim() ? b.score - a.score : String(b.s.updated_at).localeCompare(String(a.s.updated_at)))
+        .slice(0, 100);
+      sel = Math.min(sel, Math.max(0, matches.length - 1));
+      list.replaceChildren(...matches.map((x, i) => {
+        const name = [...x.s.name].map((ch, n) => x.pos.has(n) ? h("mark", null, ch) : ch);
+        const li = h("li", { role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null },
+          h("span", { class: "picker-id" }, name),
+          h("span", { class: "muted" }, relTime(x.s.updated_at) + (x.s.preview ? " · “" + x.s.preview.slice(0, 50) + "”" : "")));
+        li.onclick = () => { sel = i; finish(false); };
+        return li;
+      }));
+      if (!matches.length && q.trim()) list.replaceChildren(h("li", { class: "muted" }, "no match · Ctrl/⌘+Enter starts “" + q.trim() + "”"));
+      const selNode = list.children[sel];
+      if (selNode) selNode.scrollIntoView({ block: "nearest" });
+    }
+    async function finish(create) {
+      const q = input.value.trim();
+      const hit = matches[sel];
+      close();
+      if (create || !hit) {
+        const s = await act({ type: "create_session", name: q || null });
+        if (!s) return;
+        S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)];
+        return openSession(s.id);
+      }
+      openSession(hit.s.id);
+    }
+    input.oninput = () => { sel = 0; draw(); };
+    dialog.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, matches.length - 1); draw(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); sel = Math.max(sel - 1, 0); draw(); }
+      else if (e.key === "Enter") { e.preventDefault(); finish(e.ctrlKey || e.metaKey); }
+    });
+    dialog.addEventListener("click", (e) => { if (e.target === dialog) close(); });
+    document.body.append(dialog);
+    draw();
+    input.focus();
+  }
   async function tagSession(s) {
     const text = await ask({ title: "Tags for " + s.name, input: true, value: (s.tags || []).join(" "), placeholder: "work client-a", ok: "Save" });
     if (text == null) return;
@@ -2939,6 +2998,11 @@
   const typingIn = (el) => el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
 
   document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "k" && S.channel) {
+      e.preventDefault();
+      openSwitcher();
+      return;
+    }
     const modalOpen = !$("modal-backdrop").classList.contains("hidden");
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
