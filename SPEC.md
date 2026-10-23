@@ -2201,7 +2201,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   Roles: list, add or edit named providers with a write-only key field,
   test a connection, and add, edit or delete Roles; and Harness changes:
   what the agent changed in its own setup, when and why, with before/after
-  and Undo per entry) — over the
+  and Undo per entry; adding MCP servers (a command with environment, or
+  a URL with headers, tested by listing its tools at once) and Skills (a
+  path, zip or git URL on the daemon's machine, or a bundle uploaded from
+  the browser)) — over the
   same daemon protocol, decrypted in the browser. `GetSettings` returns a
   read-only configuration summary for remote clients and never includes
   `provider.extra_headers` or any other credential-bearing field. The
