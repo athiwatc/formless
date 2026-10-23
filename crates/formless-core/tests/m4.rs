@@ -1597,6 +1597,7 @@ async fn subscriptions_scope_live_events_per_client() {
         .rpc(Request::Subscribe {
             sessions: Some(vec![one.clone()]),
             deltas: true,
+            client: Some("test".into()),
         })
         .await;
     all.send(Request::SendMessage {
@@ -1639,6 +1640,95 @@ async fn subscriptions_scope_live_events_per_client() {
             .any(|k| k == "message_delta" || k == "message_appended" || k == "message_complete"),
         "{kinds:?}"
     );
+    server.abort();
+}
+
+/// Clients on the same Session see each other, and user messages say
+/// which client sent them (SPEC §10.4).
+#[cfg(unix)]
+#[tokio::test]
+async fn clients_on_a_session_see_each_other() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4clients");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route("/chat/completions", post(|| async { sse_text("hello") }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut tui = Client::connect(&paths).await;
+    let mut web = Client::connect(&paths).await;
+    let id = tui.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sub = |client: &str| Request::Subscribe {
+        sessions: Some(vec![id.clone()]),
+        deltas: true,
+        client: Some(client.into()),
+    };
+    let me = tui.rpc(sub("TUI")).await;
+    assert!(me["conn"].as_u64().is_some());
+    web.rpc(sub("web")).await;
+    // Read the TUI's events until one matches.
+    async fn until(c: &mut Client, mut f: impl FnMut(&Event) -> bool) -> Event {
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), c.lines.next_line())
+                .await
+                .expect("timed out")
+                .unwrap()
+                .unwrap();
+            if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
+                if f(&ev) {
+                    return ev;
+                }
+            }
+        }
+    }
+    let labels = |ev: Event| match ev {
+        Event::SessionClients { clients, .. } => {
+            let mut l: Vec<String> = clients.into_iter().map(|c| c.label).collect();
+            l.sort();
+            l
+        }
+        _ => unreachable!(),
+    };
+    let ev = until(&mut tui, |e| matches!(e, Event::SessionClients { .. })).await;
+    assert_eq!(labels(ev), ["TUI", "web"]);
+    web.rpc(Request::SendMessage {
+        session_id: id.clone(),
+        content: "from the browser".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let ev = until(
+        &mut tui,
+        |e| matches!(e, Event::MessageAppended { message, .. } if message.role == "user"),
+    )
+    .await;
+    let Event::MessageAppended { message, .. } = ev else {
+        unreachable!()
+    };
+    let meta: Value = serde_json::from_str(message.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["client"]["label"], "web");
+    // The web client leaves.
+    drop(web);
+    let ev = until(
+        &mut tui,
+        |e| matches!(e, Event::SessionClients { clients, .. } if clients.len() == 1),
+    )
+    .await;
+    assert_eq!(labels(ev), ["TUI"]);
     server.abort();
 }
 

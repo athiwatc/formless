@@ -1072,6 +1072,7 @@ fn run_headless(
     client.send(Request::Subscribe {
         sessions: Some(vec![session_id.clone()]),
         deltas: true,
+        client: Some("CLI".into()),
     });
     client.send(Request::SendMessage {
         session_id: session_id.clone(),

@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// A client connection showing a Session (SPEC §10.4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachedClient {
+    pub conn: u64,
+    pub label: String,
+}
+
 /// A saved starting point for new Sessions (SPEC §5.1).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TemplateInfo {
@@ -652,11 +659,16 @@ pub enum Request {
     /// events. `deltas: false` drops streamed answer/reasoning tokens.
     /// Global events (Tools, approvals, Session list and Run start/end)
     /// always arrive. A connection starts subscribed to everything.
+    /// `client` names this connection to the others on the same Session
+    /// ("TUI", "web", "web (relay)"; SPEC §10.4). The reply carries this
+    /// connection's id, `{subscribed, conn}`.
     Subscribe {
         #[serde(default)]
         sessions: Option<Vec<String>>,
         #[serde(default = "default_true")]
         deltas: bool,
+        #[serde(default)]
+        client: Option<String>,
     },
     ListSubagents {
         session_id: String,
@@ -1154,6 +1166,20 @@ pub enum Event {
     UserQuestionClosed {
         question_id: String,
     },
+    /// The clients showing a Session (subscribed to it), sent to them
+    /// whenever that changes (SPEC §10.4).
+    SessionClients {
+        session_id: String,
+        clients: Vec<AttachedClient>,
+    },
+    /// An approval was answered, by the client named `by`; the others
+    /// close their prompt ("answered in web").
+    ApprovalAnswered {
+        approval_id: String,
+        approved: bool,
+        #[serde(default)]
+        by: Option<String>,
+    },
     ApprovalRequested {
         approval_id: String,
         session_id: String,
@@ -1283,7 +1309,8 @@ impl Event {
             | Event::InvocationActivity { session_id, .. }
             | Event::SubagentStarted { session_id, .. }
             | Event::SubagentStep { session_id, .. }
-            | Event::SubagentFinished { session_id, .. } => Some(session_id),
+            | Event::SubagentFinished { session_id, .. }
+            | Event::SessionClients { session_id, .. } => Some(session_id),
             Event::Note { session_id, .. } => session_id.as_deref(),
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
@@ -1298,7 +1325,8 @@ impl Event {
             | Event::ProposalUpdated { .. }
             | Event::ToolDeleted { .. }
             | Event::OptimiserActivity { .. }
-            | Event::PromotionApprovalRequested { .. } => None,
+            | Event::PromotionApprovalRequested { .. }
+            | Event::ApprovalAnswered { .. } => None,
         }
     }
 }

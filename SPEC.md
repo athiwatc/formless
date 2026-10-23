@@ -1746,6 +1746,18 @@ run_tool = "network_policy"     # a registry Tool, or…
   `/rename auto` (web: "Suggest name") re-runs the namer on the last few
   user messages and offers its name for editing before it's applied;
   `/rename NAME` sets it directly.
+- **Attached clients.** `Subscribe` takes a `client` label ("TUI",
+  "TUI (plain)", "web", "web (relay)", "CLI") and replies with the
+  connection's id, `{subscribed, conn}`. Whenever the clients showing a
+  Session change (subscribe, switch away, disconnect), its subscribers get
+  `SessionClients {session_id, clients: [{conn, label}]}`; the TUI status
+  line and web status bar show "also open in web, TUI ×2".
+  - User messages record the sender in their meta (`client: {conn,
+    label}`). A message from another kind of client, or from another
+    connection still attached, shows "sent from web" under it.
+  - An answered approval broadcasts `ApprovalAnswered {approval_id,
+    approved, by}`; other clients close their prompt and note "approval
+    granted in web".
 - **Sessions view:** list/create/rename/resume/delete/export/import. Two
   TUIs may attach to the same Session simultaneously: both are full
   participants (like two terminals on one tmux session); messages are

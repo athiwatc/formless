@@ -176,6 +176,7 @@ pub fn run(paths: Paths) -> Result<()> {
     client.send(Request::Subscribe {
         sessions: Some(vec![session.id.clone()]),
         deltas: true,
+        client: Some("TUI (plain)".into()),
     });
 
     let (line_tx, lines) = mpsc::channel::<String>();
@@ -326,6 +327,7 @@ pub fn run(paths: Paths) -> Result<()> {
                 client.send(Request::Subscribe {
                     sessions: Some(vec![session.id.clone()]),
                     deltas: true,
+                    client: Some("TUI (plain)".into()),
                 });
                 say(&format!("New Session: {}.", session.name));
             }
@@ -346,6 +348,7 @@ pub fn run(paths: Paths) -> Result<()> {
                         client.send(Request::Subscribe {
                             sessions: Some(vec![session.id.clone()]),
                             deltas: true,
+                            client: Some("TUI (plain)".into()),
                         });
                         say(&format!("Switched to {}.", session.name));
                     }

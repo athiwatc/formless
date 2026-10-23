@@ -152,6 +152,7 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .who time { color: var(--muted); font-weight: 400; font-size: 12px; }
 .who .edit { margin-left: auto; font-weight: 500; }
 .bubble { word-wrap: break-word; overflow-wrap: anywhere; }
+.sent-from { font-size: 12px; margin-top: 2px; }
 .turn.user .bubble { background: var(--panel-2); border-radius: 12px; padding: 9px 13px; white-space: pre-wrap; display: inline-block; max-width: 100%; }
 .turn.system-note .bubble { color: var(--muted); font-style: italic; white-space: pre-wrap; }
 .md p { margin: 0 0 8px; }
