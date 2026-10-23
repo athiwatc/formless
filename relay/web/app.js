@@ -1501,6 +1501,41 @@
     else note("no pending or stalled tool to cancel (Esc stops the whole run)", true);
   }
 
+  /** The live calls to draw (the TUI's rule), each with how many
+   * descendants it folds away: a node shows while it or an ancestor runs,
+   * and under a node that finished successfully its descendants fold. */
+  function liveTree(calls) {
+    const out = [];
+    const stack = []; // [depth, running, open] of the current ancestors
+    for (const c of calls) {
+      const d = c.depth || 0;
+      while (stack.length && stack[stack.length - 1][0] >= d) stack.pop();
+      const parentOpen = !stack.length || stack[stack.length - 1][2];
+      const ancestorRunning = stack.some((s) => s[1]);
+      const running = c.status === "running";
+      const visible = parentOpen && (running || ancestorRunning);
+      const open = visible && c.status !== "ok";
+      if (visible) out.push([c, 0]);
+      else if (ancestorRunning && !parentOpen) {
+        for (let i = out.length - 1; i >= 0; i--) {
+          if ((out[i][0].depth || 0) < d && out[i][0].status === "ok") { out[i][1]++; break; }
+        }
+      }
+      stack.push([d, running, open]);
+    }
+    return out;
+  }
+  /** A sub-agent's transcript (GetSubagent) in a dialog. */
+  async function showSubagent(id) {
+    const r = await act({ type: "get_subagent", id });
+    if (!r) return;
+    const a = r.subagent || {};
+    const body = h("div", { class: "subagent-log" }, (r.messages || []).map((m) => {
+      const text = m.tool_calls ? "calls " + m.tool_calls.map((c) => c.function.name + " " + summarizeArgs(c.function.arguments || "")).join(", ") : String(m.content || "");
+      return h("div", { class: "subagent-msg " + m.role }, h("span", { class: "muted" }, m.role), " ", text);
+    }), a.result ? h("p", null, h("strong", null, "Result: "), a.result) : null);
+    await ask({ title: "Sub-agent · " + truncate(a.task || "", 60), text: (a.status || "") + " · " + (a.steps || 0) + " step(s)" + (a.model ? " · " + a.model : ""), body, ok: "Close" });
+  }
   /** A streaming answer split into its finished Markdown blocks and the
    * unfinished tail (the TUI's complete-prefix rule): blocks end at a blank
    * line outside a code fence, so an open fence, table or list stays plain
@@ -1539,16 +1574,23 @@
       const lines = S.thinking.split("\n");
       live.append(h("div", { class: "thinking" }, lines.length > 6 ? "… " + lines.slice(-6).join("\n") : S.thinking));
     }
-    for (const t of tools) {
-      live.append(h("details", { class: "chip live" },
+    for (const [t, folded] of liveTree(S.liveTools)) {
+      const running = t.status === "running";
+      const mark = running ? h("span", { class: "spinner", style: "color:var(--warn)" })
+        : h("span", { class: t.status === "ok" ? "tree-ok" : "tree-fail" }, t.status === "ok" ? "✓" : "✗");
+      const time = t.elapsedMs != null ? (t.elapsedMs / 1000).toFixed(1) + "s" : elapsed(t.started);
+      live.append(h("details", { class: "chip live tree-node" + (running ? "" : " done"), style: "margin-left:" + (t.depth || 0) * 18 + "px" },
         h("summary", null,
-          h("span", { class: "spinner", style: "color:var(--warn)" }),
+          t.depth ? h("span", { class: "muted" }, "└") : null,
+          mark,
           h("span", { class: "tname" }, t.name + (t.version > 0 ? " v" + t.version : "")),
-          h("span", { class: "targs" }, summarizeArgs(t.arguments || "")),
+          h("span", { class: "targs" }, t.subagent ? (t.step || "") : summarizeArgs(t.arguments || "")),
+          folded ? h("span", { class: "tag" }, "+" + folded + " nested") : null,
           t.stalledSecs != null ? h("span", { class: "tag broad" }, "stalled " + t.stalledSecs + "s") : null,
-          t.handle ? h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(t.handle); } }, "Cancel") : null,
-          h("span", { class: "tstat" }, elapsed(t.started))),
-        payload(t.arguments || "")));
+          t.handle && running ? h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(t.handle); } }, "Cancel") : null,
+          t.subagent ? h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(t.subagent); } }, "Transcript") : null,
+          h("span", { class: "tstat" }, time)),
+        t.subagent ? null : payload(t.arguments || "")));
     }
     if (S.streaming) live.append(streamingNode(S.streaming));
     else if (running && S.activity) live.append(h("div", { class: "activity" }, h("span", { class: "spinner" }), S.activity.label + "… " + elapsed(S.activity.since)));
@@ -3172,7 +3214,7 @@
         break;
       case "tool_call_started":
         if (here) {
-          S.liveTools.push({ name: ev.tool_name, version: ev.version, arguments: ev.arguments, status: "running", started: Date.now() });
+          S.liveTools.push({ name: ev.tool_name, version: ev.version, arguments: ev.arguments, status: "running", started: Date.now(), depth: ev.depth || 0 });
           setActivity("running " + ev.tool_name);
         }
         break;
@@ -3180,7 +3222,7 @@
         if (S.invocations && S.invocations.length) refreshRunning();
         if (here) {
           const t = S.liveTools.find((x) => x.name === ev.tool_name && x.status === "running");
-          if (t) t.status = ev.ok ? "ok" : "failed";
+          if (t) { t.status = ev.ok ? "ok" : "failed"; t.elapsedMs = ev.elapsed_ms; }
           if (!ev.ok) note(ev.tool_name + " failed after " + ev.elapsed_ms + "ms", true);
           setActivity(isRunning() ? "waiting for model" : null);
         }
@@ -3311,13 +3353,30 @@
         refreshSettings();
         break;
       case "subagent_started":
-        if (here) note("sub-agent started: " + truncate(ev.subagent.task, 80));
+        if (here) {
+          note("sub-agent started: " + truncate(ev.subagent.task, 80));
+          // A node under the Tool that called agents.run (the latest running one).
+          const parent = [...S.liveTools].reverse().find((t) => t.status === "running");
+          S.liveTools.push({ name: "sub-agent" + (ev.subagent.model ? " (" + ev.subagent.model + ")" : "") + ": " + truncate(ev.subagent.task, 60),
+            subagent: ev.subagent.id, arguments: "", status: "running", started: Date.now(), depth: parent ? (parent.depth || 0) + 1 : 0 });
+          renderLive();
+        }
         break;
       case "subagent_step":
-        if (here && isRunning()) setActivity("sub-agent step " + ev.step + ": " + (ev.tool_calls.length ? ev.tool_calls.join(", ") : "answering"));
+        if (here) {
+          const node = S.liveTools.find((t) => t.subagent === ev.subagent_id);
+          if (node) node.step = "step " + ev.step + ": " + (ev.tool_calls.length ? ev.tool_calls.join(", ") : "answering");
+          if (isRunning()) setActivity("sub-agent " + (node ? node.step : "step " + ev.step));
+          renderLive();
+        }
         break;
       case "subagent_finished":
-        if (here) note("sub-agent " + ev.subagent.status + " after " + ev.subagent.steps + " step(s) · /agents to inspect", ev.subagent.status !== "completed");
+        if (here) {
+          note("sub-agent " + ev.subagent.status + " after " + ev.subagent.steps + " step(s) · click it to read its transcript", ev.subagent.status !== "completed");
+          const node = S.liveTools.find((t) => t.subagent === ev.subagent.id);
+          if (node) { node.status = ev.subagent.status === "completed" ? "ok" : "failed"; node.elapsedMs = Date.now() - node.started; }
+          renderLive();
+        }
         break;
       case "invocation_activity":
         for (const t of S.liveTools) if (t.handle === ev.handle) t.stalledSecs = null;

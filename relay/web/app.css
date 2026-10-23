@@ -532,3 +532,11 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 /* The status bar's pending approval/question badge is a button */
 button.linkish { background: none; border: 0; padding: 0; font: inherit; cursor: pointer; }
 button.linkish:hover { text-decoration: underline; }
+
+/* Live call tree: nested Tool calls and sub-agents */
+.tree-ok { color: var(--accent); }
+.tree-fail { color: var(--err); }
+.chip.tree-node.done { border-color: var(--line); opacity: .85; }
+.subagent-log { max-height: 55vh; overflow-y: auto; display: grid; gap: 6px; font-size: 13px; }
+.subagent-msg { white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--line); padding-left: 8px; }
+.subagent-msg.assistant { border-color: var(--accent); }

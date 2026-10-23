@@ -554,6 +554,12 @@ pasting paths.
   pending: the status bar shows "⚠ N awaiting approval" or "? the agent
   asked you something", and clicking it or pressing `a` brings back the
   oldest approval (Approve focused), else the question.
+- **Web call tree.** The web live area draws running Tool calls as the
+  TUI does: nested `tools.call`s indented by depth, sub-agents as nodes
+  under the Tool that started them (with their current step), status
+  marks and elapsed time. A successful subtree folds into "+N nested",
+  and finished top-level calls disappear. A sub-agent's Transcript button
+  opens its messages and result (`GetSubagent`).
 - **Web streaming.** While an answer streams, the web client renders only
   its finished blocks (up to the last blank line outside a code fence) as
   Markdown, reusing that render, and shows the unfinished tail as plain
