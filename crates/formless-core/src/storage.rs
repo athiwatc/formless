@@ -1424,16 +1424,26 @@ impl Store {
 
     /// Per-Run metrics, newest first.
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
+        self.run_metrics_for(None, limit)
+    }
+
+    /// The newest `limit` Runs, of one Session or all.
+    pub fn run_metrics_for(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.session_id, r.status, r.followup, r.steps,
                (SELECT COUNT(*) FROM invocations i WHERE i.run_id=r.id),
                (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
                (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
                r.created_at, r.updated_at
-             FROM runs r ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?1",
+             FROM runs r WHERE (?2 IS NULL OR r.session_id=?2)
+             ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| {
+            .query_map(params![limit as i64, session_id], |r| {
                 let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
                 let duration_ms = match (
                     chrono::DateTime::parse_from_rfc3339(&created),

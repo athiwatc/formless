@@ -52,6 +52,11 @@ fn run_metrics_record_steps_tokens_and_followups() {
     let _running = store.create_run(&s).unwrap();
 
     let runs = store.run_metrics(10).unwrap();
+    // One Session's Runs only (for the TUI's answer footers).
+    let other = store.create_session(None).unwrap().id;
+    store.create_run(&other).unwrap();
+    assert_eq!(store.run_metrics_for(Some(&s), 10).unwrap().len(), 4);
+    assert_eq!(store.run_metrics_for(Some(&other), 10).unwrap().len(), 1);
     let first = runs.iter().find(|r| r.run_id == r1).unwrap();
     assert_eq!(
         (
