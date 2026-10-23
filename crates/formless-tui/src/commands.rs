@@ -107,6 +107,18 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("usage", "", "tokens and cost of this Session", Session),
     cmd(
+        "pager diagram",
+        "[N]",
+        "a Mermaid diagram at full size (←/→ scroll)",
+        Session,
+    ),
+    cmd(
+        "open diagram",
+        "[N]",
+        "open a Mermaid diagram's source in mermaid.live",
+        Session,
+    ),
+    cmd(
         "pager code",
         "[N]",
         "open a code block unwrapped with line numbers (←/→ scroll)",

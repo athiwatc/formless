@@ -1592,6 +1592,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   When thumbnails move, the screen is redrawn first so none linger. Other
   terminals, tmux, and `tui.inline_images = "off"` keep just the
   reference line.
+- **Wide Mermaid diagrams (TUI).** A diagram wider than the chat shows a
+  cut-down preview of its first 12 rows with the hint `/pager diagram N ·
+  /open diagram N` (N is the block's `[N]` label). `/pager diagram [N]`
+  opens it at full size in the pager, where ←/→ scroll sideways.
+  `/open diagram [N]` opens its source in mermaid.live
+  (`#base64:` state).
 - **Diffs (TUI).** Unified diffs show coloured: added lines green, removed
   red, hunk headers cyan, file headers bold. Runs of more than 7
   unchanged context lines collapse to their first and last 3
