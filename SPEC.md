@@ -1724,6 +1724,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
+- **Sessions list rows.** Each row shows a state icon (⚠ waiting on an
+  approval, ? on a question, ◐ running, ⏸ paused), the name, the last
+  activity, the message count, the model, the working directory, and the
+  first line of the last user message. `ListSessions` returns
+  `message_count`, `preview` and `last_run_status` for this. The web
+  sidebar shows the preview under the name.
 - **Filtering lists.** In the TUI's Tools, Sessions and Proposals
   views, `/` types a fuzzy filter: on name and description for Tools,
   name for Sessions, and content, rationale and kind for Proposals. Enter

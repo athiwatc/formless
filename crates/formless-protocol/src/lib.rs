@@ -17,6 +17,14 @@ pub struct SessionInfo {
     /// `@` mentions (SPEC §5.1).
     #[serde(default)]
     pub cwd: Option<String>,
+    /// For the Sessions list (SPEC §10.4): how many messages, the last
+    /// user message (first line, shortened) and the last Run's status.
+    #[serde(default)]
+    pub message_count: i64,
+    #[serde(default)]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub last_run_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
