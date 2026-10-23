@@ -3117,6 +3117,10 @@ impl App {
                 });
             }
             "open" => self.open_artifact(""),
+            "open diagram" => self.open_diagram("", true),
+            cmd if cmd.starts_with("open diagram ") => {
+                self.open_diagram(cmd["open diagram ".len()..].trim(), true)
+            }
             "open link" => self.open_link(""),
             cmd if cmd.starts_with("open path ") => {
                 self.open_path(cmd["open path ".len()..].trim())
@@ -3227,6 +3231,10 @@ impl App {
             "pager code" => self.open_code(""),
             cmd if cmd.starts_with("pager code ") => {
                 self.open_code(cmd["pager code ".len()..].trim())
+            }
+            "pager diagram" => self.open_diagram("", false),
+            cmd if cmd.starts_with("pager diagram ") => {
+                self.open_diagram(cmd["pager diagram ".len()..].trim(), false)
             }
             "table" => self.open_table(""),
             cmd if cmd.starts_with("table ") => self.open_table(cmd["table ".len()..].trim()),
@@ -5971,6 +5979,40 @@ fn code_pager(title: &str, code: &str, color: bool) -> Pager {
     }
 }
 
+/// Fenced code blocks as (language, body), in order (so index N matches
+/// the `[N]` labels and `/copy code N`).
+fn fenced_blocks(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cur: Option<(String, Vec<&str>)> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("```") {
+            match cur.take() {
+                Some((lang, body)) => out.push((lang, body.join("\n"))),
+                None => cur = Some((rest.trim().to_lowercase(), Vec::new())),
+            }
+        } else if let Some((_, body)) = cur.as_mut() {
+            body.push(line);
+        }
+    }
+    out
+}
+
+/// A mermaid.live link that opens `src` in its editor.
+fn mermaid_live_url(src: &str) -> String {
+    use base64::Engine;
+    let state = serde_json::json!({
+        "code": src,
+        "mermaid": "{\"theme\": \"default\"}",
+        "autoSync": true,
+        "updateDiagram": true,
+    });
+    format!(
+        "https://mermaid.live/edit#base64:{}",
+        base64::engine::general_purpose::URL_SAFE.encode(state.to_string())
+    )
+}
+
 /// The Markdown tables in `text`: runs of lines that start with `|`.
 fn markdown_tables(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -6255,6 +6297,58 @@ impl App {
             left: 0,
             styled: Vec::new(),
         });
+    }
+
+    /// `/pager diagram [N]` (full size, ←/→ scroll) and `/open diagram
+    /// [N]` (mermaid.live): the last answer's Mermaid block numbered N
+    /// like its `[N]` label, or its last one.
+    fn open_diagram(&mut self, arg: &str, browser: bool) {
+        let blocks = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+            .map(|m| fenced_blocks(&m.content))
+            .unwrap_or_default();
+        let pick = match arg.parse::<usize>() {
+            Ok(n) => blocks
+                .get(n.wrapping_sub(1))
+                .filter(|(l, _)| l == "mermaid"),
+            Err(_) => blocks.iter().rev().find(|(l, _)| l == "mermaid"),
+        };
+        let Some((_, src)) = pick.cloned() else {
+            self.notes
+                .push("no Mermaid diagram with that number in the last answer".into());
+            return;
+        };
+        if browser {
+            let url = mermaid_live_url(&src);
+            if cfg!(test) {
+                self.notes.push(format!("opening {url}"));
+            } else if let Err(e) = links::open_external(&url) {
+                self.notes.push(format!("couldn't open mermaid.live: {e}"));
+            }
+            return;
+        }
+        match mermaid::render(&src, self.color, 10_000) {
+            Some(d) => {
+                let plain: Vec<String> = d
+                    .lines
+                    .iter()
+                    .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                    .collect();
+                self.pager = Some(Pager {
+                    title: format!("mermaid · {}", d.kind),
+                    lines: plain,
+                    top: 0,
+                    left: 0,
+                    styled: d.lines,
+                });
+            }
+            None => self.notes.push(
+                "this diagram can't be drawn here; /open diagram shows it in the browser".into(),
+            ),
+        }
     }
 
     /// `/table [N]`: the last answer's Nth table at full width in the
@@ -10458,6 +10552,50 @@ mod tests {
         );
         let screen = render(&mut app, 100, 30);
         assert!(screen.contains("✓ 2m14s · 7 steps · 3 tools"), "{screen}");
+    }
+
+    #[test]
+    fn wide_diagrams_preview_and_open_full_size() {
+        let mut app = test_app();
+        // A label longer than the pane can't be reflowed to fit.
+        let src = format!("graph TD\nA[{}] --> B[done]", "a very long step name ".repeat(5));
+        let content = format!("```py\nx = 1\n```\n\n```mermaid\n{src}\n```");
+        assert_eq!(fenced_blocks(&content)[1].0, "mermaid");
+        app.messages = vec![MessageInfo {
+            id: "a".into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content,
+            created_at: String::new(),
+            meta: None,
+        }];
+        let screen = render(&mut app, 80, 40);
+        assert!(
+            screen.contains("wider than the chat: /pager diagram 2"),
+            "{screen}"
+        );
+        app.slash("pager diagram 2");
+        let p = app.pager.as_ref().unwrap();
+        assert_eq!(p.title, "mermaid · flowchart");
+        assert!(p.lines.iter().any(|l| l.chars().count() > 80), "full width");
+        app.pager = None;
+        app.slash("pager diagram 1");
+        assert!(app.notes.last().unwrap().contains("no Mermaid diagram"));
+        app.slash("open diagram");
+        let url = app
+            .notes
+            .last()
+            .unwrap()
+            .trim_start_matches("opening ")
+            .to_string();
+        assert!(url.starts_with("https://mermaid.live/edit#base64:"));
+        use base64::Engine;
+        let json = base64::engine::general_purpose::URL_SAFE
+            .decode(url.split("base64:").nth(1).unwrap())
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(state["code"], src);
     }
 
     #[test]

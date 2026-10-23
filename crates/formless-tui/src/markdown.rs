@@ -442,6 +442,28 @@ impl Renderer {
                 }
                 return;
             }
+            // Wider than the pane: a cut-down preview, with the full
+            // diagram in the pager.
+            if let Some(d) = mermaid::render(body, color, 10_000) {
+                self.emit(vec![Span::styled(
+                    format!(
+                        "◇ mermaid [{index}] · {} · wider than the chat: /pager diagram {index} · /open diagram {index}",
+                        d.kind
+                    ),
+                    dim(color),
+                )]);
+                let total = d.lines.len();
+                for line in d.lines.into_iter().take(PREVIEW_ROWS) {
+                    self.emit(truncate_spans(line.spans, avail));
+                }
+                if total > PREVIEW_ROWS {
+                    self.emit(vec![Span::styled(
+                        format!("  … {} more rows", total - PREVIEW_ROWS),
+                        dim(color),
+                    )]);
+                }
+                return;
+            }
         }
         let label = if lang.eq_ignore_ascii_case("mermaid") {
             format!("╭─ mermaid [{index}] (source — diagram too wide or not drawable here)")
@@ -582,6 +604,9 @@ impl Renderer {
         }
     }
 }
+
+/// Rows of a too-wide diagram shown in the chat before `/pager diagram`.
+const PREVIEW_ROWS: usize = 12;
 
 /// The narrowest a table column gets before the table becomes records.
 const MIN_COL: usize = 4;
