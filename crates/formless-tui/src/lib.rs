@@ -10,6 +10,7 @@ mod markdown;
 mod mermaid;
 mod notify;
 mod picker;
+pub mod plain;
 mod settings;
 mod theme;
 mod ui;
@@ -8529,6 +8530,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
 }
 
 pub fn run(paths: Paths) -> Result<()> {
+    // Screen readers get the line-oriented mode (SPEC §10.7).
+    if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
+        return plain::run(paths);
+    }
     let mut app = App::new(paths)?;
     app.load_drafts();
     enable_raw_mode()?;
@@ -10558,7 +10563,10 @@ mod tests {
     fn wide_diagrams_preview_and_open_full_size() {
         let mut app = test_app();
         // A label longer than the pane can't be reflowed to fit.
-        let src = format!("graph TD\nA[{}] --> B[done]", "a very long step name ".repeat(5));
+        let src = format!(
+            "graph TD\nA[{}] --> B[done]",
+            "a very long step name ".repeat(5)
+        );
         let content = format!("```py\nx = 1\n```\n\n```mermaid\n{src}\n```");
         assert_eq!(fenced_blocks(&content)[1].0, "mermaid");
         app.messages = vec![MessageInfo {
