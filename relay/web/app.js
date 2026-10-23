@@ -1370,9 +1370,52 @@
     if (!node) {
       node = h("div", { class: "msg" });
       build(node);
+      if (m.role !== "system-note") {
+        node.append(h("button", { class: "msg-menu", type: "button", title: "Message actions", "aria-label": "Message actions", "aria-haspopup": "menu",
+          onclick: (e) => { e.stopPropagation(); messageMenu(e.currentTarget, m, node); } }, "⋯"));
+      }
       rendered.set(m.id, node);
     }
     return node;
+  }
+  function copy(text, what) {
+    navigator.clipboard.writeText(text).then(() => toast("Copied " + what), () => toast("Copy failed", true));
+  }
+  /** Actions on one message (SPEC §10.2): copy it (as text or Markdown),
+   * edit and re-run a user message, fork the Session from it, and copy a
+   * Tool call's input or a result. */
+  function messageMenu(btn, m, node) {
+    closePopover();
+    let calls = [];
+    try { calls = JSON.parse(m.meta || "{}").tool_calls || []; } catch (_) {}
+    const item = (label, run, cls) => h("button", { type: "button", class: cls || null, onclick: () => { closePopover(); run(); } }, label);
+    const items = [];
+    if (m.role === "tool") items.push(item("Copy output", () => copy(m.content || "", "the output")));
+    else if (m.content) {
+      const text = (node.querySelector(".bubble, .md") || node).innerText;
+      items.push(item("Copy", () => copy(text, "the message")));
+      items.push(item("Copy as Markdown", () => copy(m.content, "as Markdown")));
+    }
+    for (const c of calls) {
+      const f = c.function || {};
+      items.push(item("Copy " + (f.name || "tool") + " input", () => copy(f.arguments || "", "the input")));
+    }
+    if (m.role === "user" && !isRunning()) {
+      const last = [...S.messages].reverse().find((x) => x.role === "user") === m;
+      items.push(item(last ? "Edit & re-run" : "Edit & re-run (drops the later turns)", () => beginEdit(m)));
+    }
+    items.push(item("Fork from here", async () => {
+      const s = await act({ type: "fork_session", id: S.current, name: null, up_to_seq: m.seq }, "Forked from this message");
+      if (s && s.id) { S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)]; await openSession(s.id); }
+    }));
+    btn.setAttribute("aria-expanded", "true");
+    btn.classList.add("menu");
+    const r = btn.getBoundingClientRect();
+    popover = h("div", { class: "popover", role: "menu" }, items);
+    document.body.append(popover);
+    popover.style.top = Math.min(r.bottom + 4, innerHeight - popover.offsetHeight - 8) + "px";
+    popover.style.left = Math.max(8, Math.min(r.right - popover.offsetWidth, innerWidth - popover.offsetWidth - 8)) + "px";
+    popover.querySelector("button").focus();
   }
 
   function renderHistory() {
