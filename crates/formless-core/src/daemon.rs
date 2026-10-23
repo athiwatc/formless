@@ -425,6 +425,64 @@ impl Daemon {
                 let s = self.with_store(|st| st.create_session(name))?;
                 Ok(serde_json::to_value(s)?)
             }
+            Request::SaveSessionTemplate {
+                id,
+                name,
+                first_message,
+            } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Err(anyhow!("a template needs a name"));
+                }
+                let s = self
+                    .with_reader(|st| st.get_session(&id))?
+                    .context("session not found")?;
+                let t = formless_protocol::TemplateInfo {
+                    name,
+                    model: s.model,
+                    reasoning_effort: s.reasoning_effort,
+                    instructions: s.instructions,
+                    cwd: s.cwd,
+                    first_message: first_message.filter(|m| !m.trim().is_empty()),
+                };
+                self.with_store(|st| st.save_template(&t))?;
+                Ok(serde_json::to_value(t)?)
+            }
+            Request::ListSessionTemplates => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_templates())?,
+            )?),
+            Request::DeleteSessionTemplate { name } => {
+                if !self.with_store(|st| st.delete_template(&name))? {
+                    return Err(anyhow!("no template '{name}'"));
+                }
+                Ok(json!({ "deleted": name }))
+            }
+            Request::CreateSessionFromTemplate { template, name } => {
+                let t = self
+                    .with_reader(|st| st.list_templates())?
+                    .into_iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(template.trim()))
+                    .with_context(|| format!("no template '{}'", template.trim()))?;
+                let s = self.with_store(|st| {
+                    let s = st.create_session(Some(name.unwrap_or_else(|| t.name.clone())))?;
+                    if t.model.is_some() || t.reasoning_effort.is_some() {
+                        st.set_session_model(&s.id, t.model.clone(), t.reasoning_effort.clone())?;
+                    }
+                    if t.instructions.is_some() {
+                        st.set_session_instructions(&s.id, t.instructions.as_deref())?;
+                    }
+                    // A directory that's gone since is skipped.
+                    if let Some(cwd) = t
+                        .cwd
+                        .as_deref()
+                        .filter(|c| std::path::Path::new(c).is_dir())
+                    {
+                        st.set_session_cwd(&s.id, Some(cwd))?;
+                    }
+                    Ok(st.get_session(&s.id)?.unwrap_or(s))
+                })?;
+                Ok(json!({ "session": s, "first_message": t.first_message }))
+            }
             Request::SetSessionTags { id, tags } => {
                 let s = self
                     .with_store(|st| st.set_session_tags(&id, &tags))?

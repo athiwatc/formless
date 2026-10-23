@@ -5,6 +5,23 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// A saved starting point for new Sessions (SPEC §5.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TemplateInfo {
+    pub name: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Put in the input of a Session made from it, to edit and send.
+    #[serde(default)]
+    pub first_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionInfo {
     pub id: String,
@@ -541,6 +558,27 @@ pub enum Request {
         id: String,
         instructions: Option<String>,
     },
+    /// Save Session `id`'s model, effort, instructions and working
+    /// directory as template `name` (replacing one of that name), with an
+    /// optional first message. Returns the TemplateInfo.
+    SaveSessionTemplate {
+        id: String,
+        name: String,
+        #[serde(default)]
+        first_message: Option<String>,
+    },
+    /// Templates, by name.
+    ListSessionTemplates,
+    DeleteSessionTemplate {
+        name: String,
+    },
+    /// A new Session set up from a template: `{session, first_message}`.
+    /// The first message isn't sent; clients put it in the input.
+    CreateSessionFromTemplate {
+        template: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
     DeleteSession {
         id: String,
     },
@@ -988,6 +1026,8 @@ pub struct RequestEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// Events dominate the traffic, so boxing them would only add allocations.
+#[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
     Response {
         id: u64,

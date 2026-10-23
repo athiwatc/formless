@@ -167,6 +167,9 @@ enum Pending {
     SetTags,
     ContextReport,
     SuggestName,
+    TemplateSession,
+    ListTemplates,
+    SaveTemplate,
     MentionAttach,
     ApprovalCode,
     /// Providers and Roles for the Settings view.
@@ -1195,22 +1198,66 @@ impl App {
                         }
                         Pending::CreateSession => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
-                                // A new Session works where the TUI started.
-                                if s.cwd.is_none() {
-                                    if let Ok(dir) = std::env::current_dir() {
-                                        self.request(
-                                            Pending::SetCwd,
-                                            Request::SetSessionCwd {
-                                                id: s.id.clone(),
-                                                cwd: Some(dir.to_string_lossy().into_owned()),
-                                            },
-                                        );
+                                self.adopt_new_session(s);
+                            }
+                        }
+                        Pending::TemplateSession => {
+                            if let Ok(s) =
+                                serde_json::from_value::<SessionInfo>(result["session"].clone())
+                            {
+                                let name = s.name.clone();
+                                self.adopt_new_session(s);
+                                match result["first_message"].as_str() {
+                                    Some(first) => {
+                                        self.input.set(first);
+                                        self.notes.push(format!(
+                                            "new Session from template {name}: edit the first message, then Enter"
+                                        ));
+                                    }
+                                    None => {
+                                        self.notes.push(format!("new Session from template {name}"))
                                     }
                                 }
-                                self.switch_session(s.id.clone());
-                                self.sessions.insert(0, s);
-                                self.messages.clear();
-                                self.view = View::Chat;
+                            }
+                        }
+                        Pending::SaveTemplate => self.notes.push(format!(
+                            "saved template {} (use it with /new {})",
+                            result["name"].as_str().unwrap_or_default(),
+                            result["name"].as_str().unwrap_or_default()
+                        )),
+                        Pending::ListTemplates => {
+                            let list = result.as_array().cloned().unwrap_or_default();
+                            if list.is_empty() {
+                                self.notes.push(
+                                    "no templates yet: /template save NAME [FIRST MESSAGE]".into(),
+                                );
+                            }
+                            for t in list {
+                                let bits: Vec<String> = [
+                                    t["model"].as_str().map(|m| format!("model {m}")),
+                                    t["reasoning_effort"]
+                                        .as_str()
+                                        .map(|e| format!("effort {e}")),
+                                    t["cwd"].as_str().map(|c| format!("in {c}")),
+                                    t["instructions"]
+                                        .as_str()
+                                        .map(|_| "instructions".to_string()),
+                                    t["first_message"]
+                                        .as_str()
+                                        .map(|m| format!("“{}”", truncate_chars(m, 40))),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect();
+                                self.notes.push(format!(
+                                    "template {}: {}",
+                                    t["name"].as_str().unwrap_or_default(),
+                                    if bits.is_empty() {
+                                        "defaults".into()
+                                    } else {
+                                        bits.join(" · ")
+                                    }
+                                ));
                             }
                         }
                         Pending::ForkSession => {
@@ -3108,6 +3155,17 @@ impl App {
                     );
                 }
             }
+            cmd if cmd.starts_with("new ") => self.request(
+                Pending::TemplateSession,
+                Request::CreateSessionFromTemplate {
+                    template: cmd[4..].trim().to_string(),
+                    name: None,
+                },
+            ),
+            "templates" | "template" | "template list" => {
+                self.request(Pending::ListTemplates, Request::ListSessionTemplates)
+            }
+            cmd if cmd.starts_with("template ") => self.template_cmd(cmd[9..].trim()),
             "search" => {
                 self.search_mode = true;
                 self.notes
@@ -6761,6 +6819,61 @@ impl App {
                 name: name.to_string(),
             }),
         }
+    }
+
+    /// `/template save NAME [FIRST MESSAGE]` or `/template delete NAME`.
+    fn template_cmd(&mut self, args: &str) {
+        let mut parts = args.splitn(3, ' ');
+        let (verb, name, rest) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default().trim().to_string(),
+            parts.next().map(|r| r.trim().to_string()),
+        );
+        if name.is_empty() {
+            self.notes
+                .push("usage: /template save NAME [FIRST MESSAGE] · /template delete NAME".into());
+            return;
+        }
+        match verb {
+            "save" => match self.current.clone() {
+                Some(id) => self.request(
+                    Pending::SaveTemplate,
+                    Request::SaveSessionTemplate {
+                        id,
+                        name,
+                        first_message: rest.filter(|r| !r.is_empty()),
+                    },
+                ),
+                None => self.notes.push("no current session".into()),
+            },
+            "delete" | "rm" => {
+                self.fire(Request::DeleteSessionTemplate { name: name.clone() });
+                self.notes.push(format!("deleted template {name}"));
+            }
+            _ => self
+                .notes
+                .push("usage: /template save NAME [FIRST MESSAGE] · /template delete NAME".into()),
+        }
+    }
+
+    /// Open a Session the daemon just made.
+    fn adopt_new_session(&mut self, s: SessionInfo) {
+        // A new Session works where the TUI started.
+        if s.cwd.is_none() {
+            if let Ok(dir) = std::env::current_dir() {
+                self.request(
+                    Pending::SetCwd,
+                    Request::SetSessionCwd {
+                        id: s.id.clone(),
+                        cwd: Some(dir.to_string_lossy().into_owned()),
+                    },
+                );
+            }
+        }
+        self.switch_session(s.id.clone());
+        self.sessions.insert(0, s);
+        self.messages.clear();
+        self.view = View::Chat;
     }
 
     /// `/instructions` edits this Session's standing instructions in the
@@ -11878,6 +11991,29 @@ mod tests {
         assert!(render(&mut app, 80, 20).contains("instructions ›"));
         app.key(key(KeyCode::Esc));
         assert!(app.instructing.is_none());
+    }
+
+    #[test]
+    fn a_template_session_opens_with_its_first_message_ready() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.pending.insert(9, Pending::TemplateSession);
+        tx.send(ServerMessage::Response {
+            id: 9,
+            ok: true,
+            result: Some(serde_json::json!({
+                "session": {"id": "t1", "name": "triage", "model": null, "reasoning_effort": null,
+                            "created_at": "2026-01-01", "updated_at": "2026-01-01", "cwd": "/tmp"},
+                "first_message": "Triage today's inbox",
+            })),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.current.as_deref(), Some("t1"));
+        assert_eq!(app.view, View::Chat);
+        assert_eq!(&*app.input, "Triage today's inbox");
     }
 
     #[test]

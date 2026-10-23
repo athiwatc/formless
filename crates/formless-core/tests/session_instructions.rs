@@ -34,7 +34,10 @@ async fn instructions_join_the_session_prompt_and_follow_forks() {
         .unwrap();
     assert_eq!(s["instructions"], "Answer in Thai.");
     let prompt = store.session_system_prompt(&sid).unwrap().unwrap();
-    assert!(prompt.ends_with("from the user:\nAnswer in Thai."), "{prompt}");
+    assert!(
+        prompt.ends_with("from the user:\nAnswer in Thai."),
+        "{prompt}"
+    );
     // Other Sessions keep the shared prompt.
     daemon
         .handle(Request::ContextUsage {
@@ -44,7 +47,10 @@ async fn instructions_join_the_session_prompt_and_follow_forks() {
         .unwrap();
     let shared = store.session_system_prompt(&other).unwrap().unwrap();
     assert!(!shared.contains("Answer in Thai"));
-    assert!(prompt.starts_with(&shared), "instructions come after the shared prefix");
+    assert!(
+        prompt.starts_with(&shared),
+        "instructions come after the shared prefix"
+    );
 
     let fork = daemon
         .handle(Request::ForkSession {
