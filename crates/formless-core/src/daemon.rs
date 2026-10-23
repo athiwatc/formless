@@ -1468,6 +1468,25 @@ impl Daemon {
             Request::ListModules => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_modules())?,
             )?),
+            Request::RunTool {
+                id,
+                input,
+                session_id,
+            } => {
+                let tool = self
+                    .with_reader(|st| st.tool_detail(&id))?
+                    .context("tool not found")?
+                    .tool;
+                if tool.retired {
+                    return Err(anyhow!("'{}' is retired", tool.name));
+                }
+                if !input.is_object() {
+                    return Err(anyhow!("the input must be a JSON object"));
+                }
+                let _ = self.with_store(|st| st.audit("user", "tool.run", &tool.name));
+                let result = self.call_tool_direct(&session_id, &tool.name, input).await;
+                Ok(json!({ "result": result }))
+            }
             Request::UpdateToolCode { id, code } => {
                 // In-TUI editor save: a new immutable version with the same
                 // schemas/capabilities/memory as the current version, run

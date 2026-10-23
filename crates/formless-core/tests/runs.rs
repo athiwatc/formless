@@ -476,6 +476,13 @@ fn tools_list_their_recent_outcomes_oldest_first() {
     let statuses: Vec<&str> = d.recent_calls.iter().map(|c| c.status.as_str()).collect();
     assert_eq!(
         statuses,
-        ["success", "cancelled", "failure", "failure", "denied", "success"]
+        [
+            "success",
+            "cancelled",
+            "failure",
+            "failure",
+            "denied",
+            "success"
+        ]
     );
 }

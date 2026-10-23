@@ -167,6 +167,8 @@ enum Pending {
     SetTags,
     ContextReport,
     SuggestName,
+    RunToolInput,
+    RunTool,
     Subscribed,
     TemplateSession,
     ListTemplates,
@@ -537,6 +539,8 @@ struct EditorState {
     name: String,
     chars: Vec<char>,
     cursor: usize,
+    /// Editing a Tool's input to run it by hand, not its code.
+    run: bool,
 }
 
 impl EditorState {
@@ -1340,6 +1344,26 @@ impl App {
                             if let Ok(v) = serde_json::from_value::<Vec<ToolInfo>>(result) {
                                 self.tools = v;
                             }
+                        }
+                        Pending::RunToolInput => {
+                            if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
+                                self.start_run_editor(&d);
+                                self.tool_detail = Some(d);
+                            }
+                        }
+                        Pending::RunTool => {
+                            let text = result["result"].as_str().unwrap_or_default();
+                            let body = serde_json::from_str::<serde_json::Value>(text)
+                                .ok()
+                                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                                .unwrap_or_else(|| text.to_string());
+                            self.pager = Some(Pager {
+                                title: "Tool run result".into(),
+                                lines: body.lines().map(str::to_string).collect(),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
                         }
                         Pending::GetTool => {
                             if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
@@ -4025,6 +4049,36 @@ impl App {
 
     fn editor_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(ed) = self.editor.as_ref().filter(|e| e.run) {
+                let input = match serde_json::from_str::<serde_json::Value>(&ed.text()) {
+                    Ok(v) if v.is_object() => v,
+                    Ok(_) => {
+                        self.notes.push("the input must be a JSON object".into());
+                        return;
+                    }
+                    Err(e) => {
+                        self.notes.push(format!("not valid JSON: {e}"));
+                        return;
+                    }
+                };
+                let Some(session_id) = self.current.clone() else {
+                    self.notes
+                        .push("open a Session first: the run belongs to one".into());
+                    return;
+                };
+                let (id, name) = (ed.tool_id.clone(), ed.name.clone());
+                self.editor = None;
+                self.notes.push(format!("running {name}…"));
+                self.request(
+                    Pending::RunTool,
+                    Request::RunTool {
+                        id,
+                        input,
+                        session_id,
+                    },
+                );
+                return;
+            }
             if let Some(ed) = &self.editor {
                 self.request(
                     Pending::UpdateTool,
@@ -4427,6 +4481,15 @@ impl App {
                         self.request(Pending::GetTool, Request::GetTool { id: tool.id });
                     }
                 }
+                KeyCode::Char('t') => {
+                    if let Some(tool) = self.selected_tool().cloned() {
+                        match self.tool_detail.clone().filter(|d| d.tool.id == tool.id) {
+                            Some(d) => self.start_run_editor(&d),
+                            None => self
+                                .request(Pending::RunToolInput, Request::GetTool { id: tool.id }),
+                        }
+                    }
+                }
                 KeyCode::Char('[') | KeyCode::Char(']') => {
                     let n = self
                         .tool_detail
@@ -4477,6 +4540,7 @@ impl App {
                                     name: tool.name.clone(),
                                     chars,
                                     cursor,
+                                    run: false,
                                 });
                             }
                             _ => {
@@ -7073,6 +7137,33 @@ impl App {
         });
     }
 
+    /// Edit an input for running Tool `d` by hand, starting from a
+    /// skeleton of its input schema (Ctrl+S runs it).
+    fn start_run_editor(&mut self, d: &ToolDetail) {
+        let schema = d
+            .versions
+            .iter()
+            .find(|v| v.version == d.tool.current_version)
+            .or_else(|| d.versions.last())
+            .and_then(|v| serde_json::from_str(&v.input_schema).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let skeleton = match formless_core::tools::input_skeleton(&schema) {
+            v @ serde_json::Value::Object(_) => v,
+            _ => serde_json::json!({}),
+        };
+        let chars: Vec<char> = serde_json::to_string_pretty(&skeleton)
+            .unwrap_or_else(|_| "{}".into())
+            .chars()
+            .collect();
+        self.editor = Some(EditorState {
+            tool_id: d.tool.id.clone(),
+            name: d.tool.name.clone(),
+            cursor: chars.len(),
+            chars,
+            run: true,
+        });
+    }
+
     /// The recent call selected in the open Tool's detail.
     fn selected_call(&self) -> Option<ToolCallInfo> {
         let d = self.tool_detail.as_ref()?;
@@ -9482,7 +9573,12 @@ fn draw_approval(
 fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     let area = f.area();
     let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
-    let block = ui::panel(format!(" Edit {} ", ed.name), app.color, Color::Yellow);
+    let title = if ed.run {
+        format!(" Run {} · input (JSON) ", ed.name)
+    } else {
+        format!(" Edit {} ", ed.name)
+    };
+    let block = ui::panel(title, app.color, Color::Yellow);
     let inner = block.inner(parts[0]);
     f.render_widget(block, parts[0]);
 
@@ -9525,7 +9621,11 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
                 bold_fg(app.color, Color::Yellow),
             ),
             Span::styled(
-                " Ctrl+S save as new version (smoke-tested) · Esc cancel",
+                if ed.run {
+                    " Ctrl+S run (asks for approval as usual) · Esc cancel"
+                } else {
+                    " Ctrl+S save as new version (smoke-tested) · Esc cancel"
+                },
                 ui::dim(app.color),
             ),
         ])),
@@ -10455,6 +10555,7 @@ mod tests {
             name: "writer".into(),
             chars: "line1\nline2".chars().collect(),
             cursor: 11,
+            run: false,
         });
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         app.key(key(KeyCode::Char('!')));
@@ -10746,6 +10847,7 @@ mod tests {
             name: "t".into(),
             chars: "a\nb".chars().collect(),
             cursor: 3,
+            run: false,
         });
         for (w, h) in [(1, 1), (12, 4), (80, 10)] {
             render(&mut app, w, h);
@@ -12467,6 +12569,74 @@ mod tests {
     }
 
     #[test]
+    fn t_runs_a_tool_by_hand_from_a_schema_skeleton() {
+        let mut app = test_app();
+        let tool = ToolInfo {
+            id: "t".into(),
+            name: "fetch_page".into(),
+            description: String::new(),
+            retired: false,
+            current_version: 1,
+            capabilities: vec![],
+            memory_mb: 64,
+            invocations: 0,
+            success_rate: None,
+            needs_attention: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            recent: String::new(),
+        };
+        app.tools = vec![tool.clone()];
+        app.tool_detail = Some(ToolDetail {
+            tool,
+            versions: vec![ToolVersionInfo {
+                version: 1,
+                author: "agent".into(),
+                created_at: String::new(),
+                capabilities: vec![],
+                memory_mb: 64,
+                input_schema: r#"{"type":"object","properties":{"url":{"type":"string"}}}"#.into(),
+                output_schema: "{}".into(),
+                code: String::new(),
+            }],
+            metrics: Default::default(),
+            optimiser_attempts: vec![],
+            version_metrics: vec![],
+            approval: None,
+            recent_calls: vec![],
+        });
+        app.view = View::Tools;
+        app.current = Some("s1".into());
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        let ed = app.editor.as_ref().expect("run editor");
+        assert!(ed.run);
+        assert_eq!(ed.text(), "{\n  \"url\": \"\"\n}");
+        assert!(render(&mut app, 100, 20).contains("Run fetch_page"));
+        // Bad JSON stays in the editor.
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.editor.is_some());
+        assert!(app.notes.last().unwrap().starts_with("not valid JSON"));
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.editor.is_none());
+        // The result comes back in the pager.
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.pending.insert(5, Pending::RunTool);
+        tx.send(ServerMessage::Response {
+            id: 5,
+            ok: true,
+            result: Some(serde_json::json!({"result": "{\"title\":\"Example\"}"})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        let pager = app.pager.as_ref().expect("pager");
+        assert!(pager.lines.iter().any(|l| l.contains("\"title\": \"Example\"")));
+    }
+
+    #[test]
     fn tool_detail_lists_recent_calls_to_open_and_jump_to() {
         let mut app = test_app();
         let tool = ToolInfo {
@@ -12534,7 +12704,10 @@ mod tests {
         app.key(key(KeyCode::Enter));
         let pager = app.pager.take().expect("pager");
         assert!(pager.lines.iter().any(|l| l == "Error:"));
-        assert!(pager.lines.iter().any(|l| l.contains("\"url\": \"https://example.com\"")));
+        assert!(pager
+            .lines
+            .iter()
+            .any(|l| l.contains("\"url\": \"https://example.com\"")));
         // S opens the Session, focusing the call made then.
         app.key(key(KeyCode::Char('S')));
         assert_eq!(app.view, View::Chat);

@@ -477,3 +477,11 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .modal.viewer { max-width: min(1000px, 96vw); }
 .artifact-text { max-height: 65vh; overflow: auto; white-space: pre; }
 .modal-actions .spacer { flex: 1; }
+
+/* Tools: "Try it" form */
+.try-form { display: grid; gap: 10px; max-height: 50vh; overflow-y: auto; }
+.try-field { display: grid; gap: 4px; }
+.try-field input[type=text], .try-field input[type=number], .try-field select, .try-field textarea { width: 100%; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--code-bg); font: inherit; }
+.try-field textarea { font-family: var(--mono, monospace); font-size: 13px; }
+.try-result { max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.try-field input[type=checkbox] { width: auto; margin: 0; justify-self: start; }

@@ -979,6 +979,15 @@ pub enum Request {
     GetTool {
         id: String,
     },
+    /// Run a Tool by hand with `input` (SPEC §10.4), through the usual
+    /// approval path, as part of `session_id` (approvals and the
+    /// Invocation are attributed to it). Returns `{result}`: the text the
+    /// agent would have got.
+    RunTool {
+        id: String,
+        input: serde_json::Value,
+        session_id: String,
+    },
     /// Save edited Tool JS as a new version (in-TUI editor, v2).
     UpdateToolCode {
         id: String,

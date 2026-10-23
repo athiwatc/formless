@@ -1654,6 +1654,48 @@
       h("dt", null, "Cost per success"), h("dd", null, m.ms_per_success == null ? "-" : (m.ms_per_success / 1000).toFixed(1) + "s · " + Math.round(m.tokens_per_success || 0) + " tokens"));
   }
 
+  /** "Try it": a form from the Tool's input schema; runs it through the
+   * usual approval path as part of the current Session (SPEC §10.4). */
+  async function tryTool(t, version) {
+    if (!S.current) return toast("Open a Session first: the run belongs to one.", true);
+    let schema = {};
+    try { schema = JSON.parse((version && version.input_schema) || "{}"); } catch (_) {}
+    const props = (schema && schema.properties) || {};
+    const required = new Set(schema.required || []);
+    const typeOf = (p) => (Array.isArray(p.type) ? p.type.find((x) => x !== "null") : p.type) || (p.properties ? "object" : "string");
+    const fields = Object.entries(props).map(([name, p]) => {
+      const type = typeOf(p);
+      const init = p.default !== undefined ? p.default : p.examples && p.examples.length ? p.examples[0] : undefined;
+      let input;
+      if (p.enum) input = h("select", null, p.enum.map((v) => h("option", { value: JSON.stringify(v) }, String(v))));
+      else if (type === "boolean") input = h("input", { type: "checkbox", checked: init === true });
+      else if (type === "number" || type === "integer") input = h("input", { type: "number", value: init !== undefined ? String(init) : "" });
+      else if (type === "string") input = h("input", { type: "text", value: init !== undefined ? String(init) : "", spellcheck: "false" });
+      else input = h("textarea", { rows: 3, spellcheck: "false" }, JSON.stringify(init !== undefined ? init : type === "array" ? [] : {}, null, 2));
+      return { name, type, p, input, el: h("label", { class: "try-field" },
+        h("span", null, name, required.has(name) ? " *" : "", p.description ? h("span", { class: "muted" }, " — " + p.description) : null), input) };
+    });
+    const body = h("div", { class: "try-form" }, fields.length ? fields.map((f) => f.el) : h("p", { class: "muted" }, "This Tool takes no input."));
+    if (!(await ask({ title: "Try " + t.name, text: "Runs in the current Session, asking for approval as usual.", body, ok: "Run" }))) return;
+    const input = {};
+    for (const f of fields) {
+      const el = f.input;
+      try {
+        if (f.p.enum) input[f.name] = JSON.parse(el.value);
+        else if (f.type === "boolean") input[f.name] = el.checked;
+        else if (f.type === "number" || f.type === "integer") { if (el.value !== "") input[f.name] = Number(el.value); }
+        else if (f.type === "string") { if (el.value !== "" || required.has(f.name)) input[f.name] = el.value; }
+        else input[f.name] = JSON.parse(el.value || "null");
+      } catch (e) { return toast(f.name + ": not valid JSON", true); }
+    }
+    toast("Running " + t.name + "…");
+    const r = await act({ type: "run_tool", id: t.id, input, session_id: S.current }, null, 300000);
+    if (!r) return;
+    let text = String(r.result);
+    try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+    await ask({ title: t.name + " result", body: h("pre", { class: "try-result" }, text), ok: "Close" });
+    selectTool(t.id, true);
+  }
   function renderToolDetail(box, d) {
     const t = d.tool;
     const current = d.versions.find((v) => v.version === t.current_version) || d.versions[d.versions.length - 1];
@@ -1687,6 +1729,7 @@
     const editing = S.editingCode && S.editingCode.toolId === t.id;
     box.append(h("div", { class: "detail-actions" },
       editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "" }; renderTools(); } }, "Edit code"),
+      t.retired ? null : h("button", { class: "btn small", type: "button", onclick: () => tryTool(t, current) }, "Try it"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name) }, "Optimise"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name) }, t.retired ? "Restore" : "Retire"),
       t.current_version > 1 ? h("button", { class: "btn small", type: "button", onclick: () => rollbackTool(t, t.current_version - 1) }, "Roll back") : null,

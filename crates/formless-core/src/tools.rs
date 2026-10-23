@@ -913,3 +913,68 @@ pub fn tool_definitions(
 fn fn_name(def: &Value) -> &str {
     def["function"]["name"].as_str().unwrap_or_default()
 }
+
+/// A starting input for running a Tool by hand (SPEC §10.4): every
+/// property of its input schema, filled with its default, first example or
+/// enum value, else an empty value of its type.
+pub fn input_skeleton(schema: &Value) -> Value {
+    if let Some(v) = schema
+        .get("default")
+        .or_else(|| schema["examples"].get(0))
+        .or_else(|| schema["enum"].get(0))
+    {
+        return v.clone();
+    }
+    let ty = match &schema["type"] {
+        Value::Array(types) => types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|t| *t != "null")
+            .unwrap_or("null"),
+        t => t.as_str().unwrap_or(if schema.get("properties").is_some() {
+            "object"
+        } else {
+            "null"
+        }),
+    };
+    match ty {
+        "object" => Value::Object(
+            schema["properties"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.clone(), input_skeleton(v)))
+                .collect(),
+        ),
+        "array" => json!([]),
+        "string" => json!(""),
+        "integer" | "number" => json!(0),
+        "boolean" => json!(false),
+        _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod skeleton_tests {
+    use super::*;
+
+    #[test]
+    fn skeletons_follow_the_input_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "limit": {"type": "integer", "default": 5},
+                "mode": {"enum": ["fast", "full"]},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "deep": {"type": ["boolean", "null"]},
+                "opts": {"properties": {"retry": {"type": "number"}}},
+            }
+        });
+        assert_eq!(
+            input_skeleton(&schema),
+            json!({"url": "", "limit": 5, "mode": "fast", "tags": [], "deep": false, "opts": {"retry": 0}})
+        );
+        assert_eq!(input_skeleton(&json!({})), Value::Null);
+    }
+}
