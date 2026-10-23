@@ -42,8 +42,10 @@ export class RelayRoom {
     return this.sockets("daemon").find((ws) => this.attachment(ws).mux) || null;
   }
 
-  notifyDaemon(daemon, kind, cid) {
-    try { daemon.send(JSON.stringify({ relay: kind, cid: cid })); } catch (_) {}
+  notifyDaemon(daemon, kind, cid, ua) {
+    const frame = { relay: kind, cid: cid };
+    if (ua) frame.ua = ua;
+    try { daemon.send(JSON.stringify(frame)); } catch (_) {}
   }
 
   notifyClients(kind) {
@@ -70,15 +72,17 @@ export class RelayRoom {
       this.state.acceptWebSocket(server, [role]);
       server.serializeAttachment({ role: role, mux: mux });
       if (mux) {
-        for (const ws of this.sockets("client")) this.notifyDaemon(server, "client_open", this.attachment(ws).cid);
+        for (const ws of this.sockets("client")) { const a = this.attachment(ws); this.notifyDaemon(server, "client_open", a.cid, a.ua); }
       }
       this.notifyClients("daemon_online");
     } else {
       const cid = crypto.randomUUID();
+      // The User-Agent only labels this browser in the daemon's device list.
+      const ua = (request.headers.get("User-Agent") || "").slice(0, 200);
       this.state.acceptWebSocket(server, [role, cid]);
-      server.serializeAttachment({ role: role, cid: cid });
+      server.serializeAttachment({ role: role, cid: cid, ua: ua });
       const daemon = this.muxDaemon();
-      if (daemon) this.notifyDaemon(daemon, "client_open", cid);
+      if (daemon) this.notifyDaemon(daemon, "client_open", cid, ua);
       const online = this.sockets("daemon").length > 0;
       try { server.send(JSON.stringify({ relay: online ? "daemon_online" : "daemon_offline" })); } catch (_) {}
     }
@@ -113,6 +117,13 @@ export class RelayRoom {
     const att = this.attachment(ws);
     const ctl = this.control(message);
     if (ctl && att.role === "daemon" && ctl.relay === "push") return this.pushAll();
+    // The daemon closes one browser (it may reconnect; rotating revokes).
+    if (ctl && att.role === "daemon" && ctl.relay === "disconnect" && typeof ctl.cid === "string") {
+      for (const target of this.state.getWebSockets(ctl.cid)) {
+        try { target.close(4001, "disconnected by the daemon"); } catch (_) {}
+      }
+      return;
+    }
     if (ctl && att.role === "client") {
       if (ctl.relay === "push_subscribe" && validSubscription(ctl.sub)) {
         const subs = await this.state.storage.list({ prefix: "push:" });

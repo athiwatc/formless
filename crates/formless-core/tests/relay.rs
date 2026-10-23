@@ -382,3 +382,78 @@ async fn waiting_questions_ask_the_relay_for_a_push() {
     assert_eq!(frame, r#"{"relay":"push"}"#);
     shutdown.cancel();
 }
+
+/// The relay's browsers are listed with their User-Agent and can be
+/// disconnected one by one (SPEC §12).
+#[tokio::test]
+async fn relay_browsers_are_listed_and_can_be_disconnected() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(temp_paths("relaydevices")).unwrap());
+    let secret = generate_relay_secret();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let link = tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    ws.send(Message::Text(
+        r#"{"relay":"client_open","cid":"c1","ua":"Mozilla/5.0 (iPhone) Safari/604.1"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let list = loop {
+        let v = daemon
+            .handle(formless_protocol::Request::ListRelayClients)
+            .await
+            .unwrap();
+        if !v.as_array().unwrap().is_empty() {
+            break v;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(list[0]["cid"], "c1");
+    assert!(list[0]["user_agent"].as_str().unwrap().contains("iPhone"));
+
+    let r = daemon
+        .handle(formless_protocol::Request::DisconnectRelayClient { cid: "c1".into() })
+        .await
+        .unwrap();
+    assert_eq!(r["disconnected"], true);
+    let frame = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(Ok(Message::Text(t))) = ws.next().await {
+                return t.to_string();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(frame, r#"{"cid":"c1","relay":"disconnect"}"#);
+    let list = daemon
+        .handle(formless_protocol::Request::ListRelayClients)
+        .await
+        .unwrap();
+    assert!(list.as_array().unwrap().is_empty());
+    // An unknown browser: nothing to do.
+    let r = daemon
+        .handle(formless_protocol::Request::DisconnectRelayClient { cid: "nope".into() })
+        .await
+        .unwrap();
+    assert_eq!(r["disconnected"], false);
+    shutdown.cancel();
+    link.await.unwrap().unwrap();
+    assert!(daemon
+        .handle(formless_protocol::Request::ListRelayClients)
+        .await
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+}

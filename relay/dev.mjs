@@ -73,6 +73,12 @@ function sendFrame(conn, op, payload) {
   conn.socket.write(Buffer.concat([head, payload]));
 }
 const sendText = (conn, text) => sendFrame(conn, 0x1, Buffer.from(text, "utf8"));
+/** Close with a status code the browser sees (4001: kicked by the daemon). */
+function closeWith(conn, code, reason) {
+  const body = Buffer.concat([Buffer.from([code >> 8, code & 255]), Buffer.from(reason, "utf8")]);
+  sendFrame(conn, 0x8, body);
+  close(conn);
+}
 function close(conn) {
   if (!conn.open) return;
   conn.open = false;
@@ -82,10 +88,13 @@ function close(conn) {
 
 // ----------------------------------------------------------------- rooms
 const rooms = new Map(); // room -> { daemon, mux, clients:Map<cid, conn> }
-function joinRoom(room, role, conn, reject, mux) {
+function joinRoom(room, role, conn, reject, mux, ua) {
   const r = rooms.get(room) || { daemon: null, mux: false, clients: new Map(), subs: new Map() };
   rooms.set(room, r);
-  const notifyDaemon = (kind, cid) => { if (r.daemon && r.mux) sendText(r.daemon, JSON.stringify({ relay: kind, cid })); };
+  const notifyDaemon = (kind, cid) => {
+    const c = r.clients.get(cid);
+    if (r.daemon && r.mux) sendText(r.daemon, JSON.stringify({ relay: kind, cid, ...(c && c.ua ? { ua: c.ua } : {}) }));
+  };
   if (role === "daemon") {
     if (r.daemon) return reject();
     r.daemon = conn;
@@ -93,6 +102,13 @@ function joinRoom(room, role, conn, reject, mux) {
     for (const cid of r.clients.keys()) notifyDaemon("client_open", cid);
     for (const c of r.clients.values()) sendText(c, JSON.stringify({ relay: "daemon_online" }));
     conn.onText = (t) => {
+      if (t.startsWith('{"relay":"disconnect"')) {
+        let ctl = null;
+        try { ctl = JSON.parse(t); } catch (_) {}
+        const c = ctl && r.clients.get(ctl.cid);
+        if (c) closeWith(c, 4001, "disconnected by the daemon");
+        return;
+      }
       if (t.startsWith('{"relay":"push"')) {
         if (!vapid) return;
         for (const [endpoint, sub] of r.subs) {
@@ -118,6 +134,7 @@ function joinRoom(room, role, conn, reject, mux) {
     };
   } else {
     const cid = randomUUID();
+    conn.ua = (ua || "").slice(0, 200);
     r.clients.set(cid, conn);
     notifyDaemon("client_open", cid);
     sendText(conn, JSON.stringify({ relay: r.daemon ? "daemon_online" : "daemon_offline" }));
@@ -243,7 +260,7 @@ server.on("upgrade", (req, socket) => {
     socket.end("HTTP/1.1 409 Conflict\r\n\r\n");
     return;
   }
-  joinRoom(m[1], role, wsAccept(req, socket), () => socket.destroy(), params.get("mux") === "1");
+  joinRoom(m[1], role, wsAccept(req, socket), () => socket.destroy(), params.get("mux") === "1", req.headers["user-agent"]);
 });
 server.listen(port, "127.0.0.1", () => {
   console.log("formless dev relay on http://127.0.0.1:" + port + (mock ? " (mock provider at /mock/v1)" : ""));

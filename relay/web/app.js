@@ -2173,6 +2173,7 @@
           ["on_start (last, new, picker)", c.tui.on_start, "tui.on_start", "text"],
           ["screen_reader", on(c.tui.screen_reader), "tui.screen_reader", "bool"]]),
         section("Relay", [["enabled", on(c.relay.enabled)], ["url", c.relay.url]]),
+        relayDevicesSection(),
         section("Paths", [["config", c.paths.config], ["data", c.paths.data]]));
     } else if (c && c.error) {
       grid.append(h("section", null, h("h3", null, "Daemon settings"), h("p", { class: "muted" }, c.error)));
@@ -2469,6 +2470,28 @@
         : h("p", { class: "muted" }, "None. A Role maps a purpose (\"fast search\") to a provider and model for sub-agents."),
       h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => editRole("", {}, names) }, "Add role")));
   }
+  /** Settings → Relay devices (SPEC §12): browsers on the relay now, each
+   * with Disconnect. A disconnected browser can rejoin with the link;
+   * rotating the secret is what revokes access. */
+  function relayDevicesSection() {
+    const list = S.relayClients || [];
+    return h("section", null, h("h3", null, "Relay devices"),
+      list.length ? h("table", { class: "table" }, h("tbody", null, list.map((c) => h("tr", null,
+        h("td", null, h("strong", null, browserName(c.user_agent)), h("div", { class: "muted" }, c.user_agent || "unknown browser")),
+        h("td", { class: "muted" }, "since " + relTime(c.first_seen) + " · active " + relTime(c.last_seen)),
+        h("td", null, h("button", { class: "btn small danger", type: "button", onclick: async () => {
+          if (!(await ask({ title: "Disconnect this browser?", text: "It can reconnect with the pairing link. To revoke access for good, run formless relay enable --rotate.", ok: "Disconnect", danger: true }))) return;
+          if (await act({ type: "disconnect_relay_client", cid: c.cid }, "Disconnected")) refreshSettings();
+        } }, "Disconnect"))))))
+        : h("p", { class: "muted" }, "No browsers on the relay right now."));
+  }
+  /** "Safari on iPhone" from a User-Agent, roughly. */
+  function browserName(ua) {
+    ua = ua || "";
+    const app = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
+    const os = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android" : /Mac OS X/.test(ua) ? "macOS" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "";
+    return os ? app + " on " + os : app;
+  }
   /** Settings → Harness changes (SPEC §7.13): what the agent changed in
    * its own setup, when and why, each with Undo. */
   function harnessSection() {
@@ -2659,6 +2682,7 @@
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
     S.providers = (await request({ type: "list_providers" }).catch(() => null)) || { providers: [], roles: {} };
     S.harness = (await request({ type: "list_harness_changes" }).catch(() => null)) || [];
+    S.relayClients = (await request({ type: "list_relay_clients" }).catch(() => null)) || [];
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
@@ -3609,8 +3633,14 @@
       try { msg = JSON.parse(await decrypt(frame)); } catch (_) { return; }
       onMessage(msg);
     }
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (S.ws !== ws) return;
+      // Disconnected from the daemon's device list: stay off until asked.
+      if (ev && ev.code === 4001) {
+        S.userClosed = true;
+        $("pair-error").textContent = "This browser was disconnected by the daemon. Connect again to rejoin.";
+        showPair();
+      }
       S.daemonOnline = false;
       S.channel = null;
       S.running.clear();

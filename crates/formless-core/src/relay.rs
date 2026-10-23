@@ -17,6 +17,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
+use formless_protocol::RelayClientInfo;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -267,6 +268,19 @@ struct MuxFrame {
     cid: String,
     #[serde(default)]
     f: Option<String>,
+    /// The browser's User-Agent, on `client_open`.
+    #[serde(default)]
+    ua: Option<String>,
+}
+
+/// Clears the relay's browser list and kick channel when a link ends.
+struct Forget(Arc<Daemon>);
+
+impl Drop for Forget {
+    fn drop(&mut self) {
+        self.0.relay_clients.lock().unwrap().clear();
+        *self.0.relay_kick.lock().unwrap() = None;
+    }
 }
 
 /// Pushes for waiting approvals and questions are at least this far apart.
@@ -302,9 +316,22 @@ pub async fn connect_once(
     // in, at most one per PUSH_GAP (the relay holds the subscriptions).
     let mut attention = daemon.attention.subscribe();
     let mut last_push: Option<std::time::Instant> = None;
+    // The browsers on this link (`ListRelayClients`) and requests to close
+    // one; both forgotten when the link ends.
+    let (kick_tx, mut kick_rx) = mpsc::unbounded_channel::<String>();
+    *daemon.relay_kick.lock().unwrap() = Some(kick_tx);
+    let _forget = Forget(daemon.clone());
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
+            Some(cid) = kick_rx.recv() => {
+                clients.remove(&cid);
+                daemon.relay_clients.lock().unwrap().remove(&cid);
+                let frame = json!({"relay": "disconnect", "cid": cid}).to_string();
+                if ws_write.send(Message::Text(frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
             Ok(()) = attention.recv() => {
                 if last_push.is_some_and(|t| t.elapsed() < PUSH_GAP) {
                     continue;
@@ -325,13 +352,29 @@ pub async fn connect_once(
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(anyhow!("relay websocket: {e}")),
                 };
-                let Ok(MuxFrame { relay, cid, f }) = serde_json::from_str::<MuxFrame>(&frame) else {
+                let Ok(MuxFrame { relay, cid, f, ua }) = serde_json::from_str::<MuxFrame>(&frame) else {
                     tracing::warn!("relay: dropping frame without a client id (relay too old?)");
                     continue;
                 };
-                if relay.as_deref() == Some("client_close") {
-                    clients.remove(&cid);
-                    continue;
+                let now = chrono::Utc::now().to_rfc3339();
+                match relay.as_deref() {
+                    Some("client_close") => {
+                        clients.remove(&cid);
+                        daemon.relay_clients.lock().unwrap().remove(&cid);
+                        continue;
+                    }
+                    Some("client_open") => {
+                        let user_agent: String = ua.unwrap_or_default().chars().take(200).collect();
+                        daemon.relay_clients.lock().unwrap().insert(
+                            cid.clone(),
+                            RelayClientInfo { cid: cid.clone(), user_agent, first_seen: now.clone(), last_seen: now },
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+                if let Some(c) = daemon.relay_clients.lock().unwrap().get_mut(&cid) {
+                    c.last_seen = now;
                 }
                 let Some(f) = f else { continue };
                 if let Some(browser_hello) = parse_hello(&f) {

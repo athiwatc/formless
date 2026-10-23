@@ -281,12 +281,18 @@ pub fn setting_docs() -> BTreeMap<String, (String, String)> {
     out
 }
 
+/// Keys about credentials: never in client-facing settings data.
+const CREDENTIAL_KEYS: &[&str] = &["provider.extra_headers", "provider.api_key_ref"];
+
 /// `{key: {description, default}}` for clients: the default is the real
 /// one from `Config::default()` when it has a value, else SPEC's text.
 pub fn setting_docs_json() -> serde_json::Value {
     let defaults = serde_json::to_value(Config::default()).unwrap_or_default();
     let docs: serde_json::Map<String, serde_json::Value> = setting_docs()
         .into_iter()
+        // Credential-bearing keys stay out of what clients see, even by
+        // name; no client can change them anyway.
+        .filter(|(key, _)| !CREDENTIAL_KEYS.contains(&key.as_str()))
         .map(|(key, (description, spec_default))| {
             let pointer = format!("/{}", key.replace('.', "/"));
             let default = match defaults.pointer(&pointer) {
