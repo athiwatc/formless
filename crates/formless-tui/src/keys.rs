@@ -30,6 +30,7 @@ const SESSIONS: &[Hint] = &[
     h("f", "fork", 3),
     h("r", "rename", 3),
     h("d", "delete", 2),
+    h("P", "pin", 4),
     h("e", "export", 5),
     h("i", "import", 5),
     h("/", "filter", 4),

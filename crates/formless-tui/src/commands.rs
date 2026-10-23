@@ -66,6 +66,12 @@ use Group::*;
 pub const COMMANDS: &[Command] = &[
     cmd("new", "", "start a new Session", Session),
     cmd(
+        "pin",
+        "",
+        "pin or unpin this Session (P in Sessions)",
+        Session,
+    ),
+    cmd(
         "cd",
         "[PATH]",
         "show or change this Session's working directory",

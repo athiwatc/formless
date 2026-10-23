@@ -115,6 +115,9 @@ pub fn sessions(sessions: &[SessionInfo], running: &HashSet<String>, f: &ListFil
         2 => idx.sort_by_key(|&i| sessions[i].name.to_lowercase()),
         _ => idx.sort_by(|&a, &b| sessions[b].updated_at.cmp(&sessions[a].updated_at)),
     }
+    // Pinned Sessions first, whatever the sort (a stable sort keeps the
+    // order within each group).
+    idx.sort_by_key(|&i| !sessions[i].pinned);
     idx
 }
 

@@ -1724,6 +1724,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
+- **Pinned Sessions.** `SetSessionPinned {id, pinned}` (`sessions.pinned`,
+  migration v33) keeps a Session at the top: the daemon lists pinned ones
+  first, and every TUI sort keeps them first. Toggle it with `P` in the
+  Sessions view or `/pin` (the current Session) in the TUI, or Pin/Unpin
+  in the web Session menu. Pinned rows show ★. Pinning doesn't change
+  the last-activity time.
 - **Sessions list rows.** Each row shows a state icon (⚠ waiting on an
   approval, ? on a question, ◐ running, ⏸ paused), the name, the last
   activity, the message count, the model, the working directory, and the
