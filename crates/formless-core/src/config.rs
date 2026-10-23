@@ -213,6 +213,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("tui.hyperlinks", &["auto", "on", "off"]),
     ("tui.theme", &["auto", "dark", "light", "high-contrast"]),
     ("tui.inline_images", &["auto", "off"]),
+    ("tui.on_start", &["last", "new", "picker"]),
 ];
 
 pub const SETTABLE: &[&str] = &[
@@ -798,6 +799,9 @@ pub struct TuiCfg {
     /// Start the line-oriented plain mode instead of the full-screen TUI
     /// (as `formless --plain` does).
     pub screen_reader: bool,
+    /// What the TUI opens on launch: "last" (the most recently active
+    /// Session), "new" (a fresh one) or "picker" (the Sessions view).
+    pub on_start: String,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -814,6 +818,7 @@ impl Default for TuiCfg {
             inline_images: "auto".into(),
             pane_widths: vec![22, 26],
             screen_reader: false,
+            on_start: "last".into(),
         }
     }
 }

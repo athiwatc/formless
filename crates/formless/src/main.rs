@@ -24,6 +24,12 @@ struct Cli {
     /// spinners or borders); also `tui.screen_reader = true`
     #[arg(long)]
     plain: bool,
+    /// Open the most recently active Session
+    #[arg(short = 'c', long = "continue", conflicts_with = "new")]
+    continue_last: bool,
+    /// Start in a fresh Session
+    #[arg(long)]
+    new: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -434,7 +440,14 @@ fn main() -> Result<()> {
     let paths = Paths::resolve(cli.profile.as_deref())?;
     match cli.cmd {
         None | Some(Cmd::Tui) if cli.plain => formless_tui::plain::run(paths),
-        None | Some(Cmd::Tui) => formless_tui::run(paths),
+        None | Some(Cmd::Tui) => formless_tui::run_with(
+            paths,
+            match (cli.continue_last, cli.new) {
+                (true, _) => Some("last"),
+                (_, true) => Some("new"),
+                _ => None,
+            },
+        ),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Doctor) => doctor(paths),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),

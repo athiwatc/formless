@@ -1541,6 +1541,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   failure blocks Session start with an explanation, (4) optionally type a
   first message (nothing pre-filled, no starter Tools).
 
+- **What opens on launch.** `tui.on_start` is `last` (default: the most
+  recently active, unarchived Session; not the first row, since pinned
+  Sessions list first), `new` (a fresh Session) or `picker` (the Sessions
+  view). `formless -c` / `--continue` and `formless --new` override it for
+  one launch.
+
 ### 10.2 Home (chat) view
 
 - Single-column streaming chat: model deltas, inline **collapsible** tool
@@ -2180,6 +2186,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tui.inline_images` | auto | Image thumbnails in the chat on iTerm2, WezTerm, kitty and Ghostty; `off` keeps only the reference (§10.2) |
 | `tui.pane_widths` | [22, 26] | Multi-pane side panes as a percentage of the width, [left, right]; 0 hides one; `/panes wider\|narrower\|left\|right\|reset` or Ctrl+Shift+←/→ (§10.2) |
 | `tui.screen_reader` | false | Start the line-oriented plain mode instead of the full-screen TUI, as `formless --plain` does (§10.5) |
+| `tui.on_start` | last | What the TUI opens on launch: `last`, `new` or `picker`; `formless -c` / `--new` override it (§10.1) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 
