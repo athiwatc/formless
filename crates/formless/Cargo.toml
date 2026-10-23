@@ -16,6 +16,7 @@ base64.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+clap_mangen = "0.3"
 formless-core = { path = "../formless-core" }
 formless-protocol = { path = "../formless-protocol" }
 formless-tui = { path = "../formless-tui" }

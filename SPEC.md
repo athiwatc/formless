@@ -2215,6 +2215,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   with no daemon or profile needed. `scripts/install.sh` writes bash, zsh
   and fish completions under `$PREFIX/share`, and the Homebrew formula
   installs them with `generate_completions_from_executable`.
+- The man page, `formless.1`, is generated from the same definitions
+  (clap_mangen) by a hidden `formless man`. Releases put it in each Unix
+  tarball. `scripts/install.sh` installs it to `$PREFIX/share/man/man1`, and
+  the Homebrew formula into `man1`.
 - `formless config`:
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);

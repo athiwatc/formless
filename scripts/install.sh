@@ -46,5 +46,9 @@ mkdir -p "$PREFIX/bin"
 tar -xzf "$tmp/$asset" -C "$tmp"
 cp "$tmp/formless-$version-$target/formless" "$PREFIX/bin/formless"
 chmod +x "$PREFIX/bin/formless"
+if [ -f "$tmp/formless-$version-$target/formless.1" ]; then
+  mkdir -p "$PREFIX/share/man/man1"
+  cp "$tmp/formless-$version-$target/formless.1" "$PREFIX/share/man/man1/formless.1"
+fi
 echo "installed: $PREFIX/bin/formless ($version)"
 install_completions

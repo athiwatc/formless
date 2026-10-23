@@ -73,6 +73,9 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Print the man page (roff), for packaging: `formless man > formless.1`
+    #[command(hide = true)]
+    Man,
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
     Completions {
         #[arg(value_enum)]
@@ -498,7 +501,8 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    // Completions need nothing else: no profile, config or daemon.
+    // Completions and the man page need nothing else: no profile, config
+    // or daemon.
     if let Some(Cmd::Completions { shell }) = cli.cmd {
         use clap::CommandFactory;
         clap_complete::generate(
@@ -507,6 +511,11 @@ fn main() -> Result<()> {
             "formless",
             &mut std::io::stdout(),
         );
+        return Ok(());
+    }
+    if let Some(Cmd::Man) = cli.cmd {
+        use clap::CommandFactory;
+        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
         return Ok(());
     }
     let paths = Paths::resolve(cli.profile.as_deref())?;
@@ -530,7 +539,9 @@ fn main() -> Result<()> {
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
-        Some(Cmd::Completions { .. }) => unreachable!("handled before the profile is set up"),
+        Some(Cmd::Completions { .. } | Cmd::Man) => {
+            unreachable!("handled before the profile is set up")
+        }
         Some(Cmd::Roles { action }) => roles_cmd(paths, action),
         Some(Cmd::Web {
             port,
