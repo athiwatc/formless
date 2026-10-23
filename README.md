@@ -303,6 +303,15 @@ formless sessions import bundle.json
 formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
 ```
 
+### Settings from the command line
+
+```bash
+formless config path                       # where config.toml is
+formless config get tools.inline_limit     # effective value (env overrides applied)
+formless config set tui.notify_min_secs 30 # validated, audited, applied at once
+formless config edit                       # $EDITOR; saved only if it still parses
+```
+
 ### 3.6 Daemon, diagnostics and reset
 
 ```bash

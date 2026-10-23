@@ -2210,6 +2210,17 @@ run_tool = "network_policy"     # a registry Tool, or…
 ## 12. CLI
 
 - `formless` (no args) launches the TUI (auto-starting the daemon).
+- `formless config`:
+  - `path` prints the config file.
+  - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
+    an unknown key exits 2.
+  - `set KEY VALUE` goes through `SetSetting`, so it's validated against
+    the allow-list, audited and hot. VALUE is JSON when it parses (`5`,
+    `true`, `["a"]`), else text.
+  - `edit` opens a copy in `$VISUAL`/`$EDITOR` (run through `sh -c`, so
+    arguments and quotes work) and replaces config.toml only when the copy
+    parses. Otherwise it shows the error and, on a terminal, offers to edit
+    again; the file is never left half-written.
 - `formless sessions` manages Sessions with the same protocol requests as
   the TUI and web: `list [--archived] [--json]`, `show ID [--json]`, `rename
   ID NAME`, `rm ID` (restorable for `daemon.delete_undo_secs`; it prints the
