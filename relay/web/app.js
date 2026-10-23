@@ -290,6 +290,7 @@
   let askResolve = null;
   /** Promise-based prompt/confirm: resolves the text (input) or true, or null. */
   function ask(opts) {
+    rememberFocus("ask-backdrop");
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
     $("ask-body").replaceChildren(...(opts.body ? [opts.body] : []));
@@ -307,6 +308,7 @@
   }
   function closeAsk(value) {
     $("ask-backdrop").classList.add("hidden");
+    restoreFocus("ask-backdrop");
     if (askResolve) askResolve(value);
     askResolve = null;
   }
@@ -1711,7 +1713,7 @@
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
     $("modal-backdrop").classList.toggle("hidden", !req || S.approvalLater);
-    if (!req || S.approvalLater) return;
+    if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
     $("modal-title").textContent = promo ? "Promotion approval" : "Approval required";
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
@@ -1722,7 +1724,7 @@
         : h("p", null, "Tool ", h("strong", null, req.tool_name), req.version ? " v" + req.version : "",
           promo ? " is ready to be promoted." : " wants sensitive capabilities:"),
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
-      h("ul", null,
+      h("ul", { "aria-label": promo ? "Capabilities" : "Capabilities requested" },
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           (req.already || []).includes(c)
             ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
@@ -1733,7 +1735,8 @@
         ? "The new version replaces the current one; rollback stays available."
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
     $("modal-once").classList.toggle("hidden", promo);
-    $("modal-approve").replaceChildren(h("kbd", null, "y"), promo ? " Approve" : " Always");
+    $("modal-approve").replaceChildren(h("kbd", { "aria-hidden": "true" }, "y"), promo ? " Approve" : " Always");
+    rememberFocus("modal-backdrop");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
     setTimeout(() => $("modal-approve").focus(), 0);
   }
@@ -1768,6 +1771,30 @@
   }
   $("status-approvals").onclick = focusPending;
   $("modal-later").onclick = () => { S.approvalLater = true; renderApproval(); };
+  /** Dialogs give focus back to where it was when they close. */
+  const focusBefore = {};
+  function rememberFocus(id) {
+    const el = document.activeElement;
+    if (el && !$(id).contains(el) && focusBefore[id] === undefined) focusBefore[id] = el;
+  }
+  function restoreFocus(id) {
+    const el = focusBefore[id];
+    delete focusBefore[id];
+    if (el && el.isConnected && typeof el.focus === "function") el.focus();
+  }
+  // Tab stays inside an open dialog (it is modal).
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    const open = ["ask-backdrop", "modal-backdrop"].map($).find((b) => !b.classList.contains("hidden"));
+    if (!open) return;
+    const items = [...open.querySelectorAll("button, [href], input, select, textarea, summary, [tabindex]:not([tabindex='-1'])")]
+      .filter((el) => !el.disabled && !el.closest(".hidden") && el.offsetParent !== null);
+    if (!items.length) return;
+    const first = items[0], last = items[items.length - 1];
+    if (!open.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+    else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
   function decide(approved, scope) {
     const req = S.approvals.shift();
     if (!req) return;
