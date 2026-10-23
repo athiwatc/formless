@@ -859,6 +859,8 @@ struct App {
     /// What to open once the Session list arrives: "last", "new" or
     /// "picker" (`tui.on_start`, or a launch flag).
     on_start: String,
+    /// The Ctrl+K Session switcher: (query, selected row).
+    switcher: Option<(String, usize)>,
     /// `/quit` while Runs are working asks first (SPEC §10.5).
     quit_confirm: bool,
     /// `?` in an approval: explain each capability under it.
@@ -1056,6 +1058,7 @@ impl App {
             input_focus: false,
             approval_explain: false,
             quit_confirm: false,
+            switcher: None,
             on_start: cfg.tui.on_start.clone(),
             approval_code: None,
             image_placed: Vec::new(),
@@ -3943,6 +3946,17 @@ impl App {
             self.wizard_key(key);
             return;
         }
+        if key.code == KeyCode::Char('k')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.editor.is_none()
+        {
+            self.switcher = Some((String::new(), 0));
+            return;
+        }
+        if self.switcher.is_some() {
+            self.switcher_key(key);
+            return;
+        }
         if self.editor.is_some() {
             self.editor_key(key);
             return;
@@ -5198,6 +5212,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.quit_confirm {
         draw_quit_confirm(f, app);
     }
+    if let Some((query, sel)) = &app.switcher {
+        draw_switcher(f, app, query, *sel);
+    }
     if let Some(p) = &app.pager {
         let area = f.area();
         let height = area.height.saturating_sub(2) as usize;
@@ -6004,6 +6021,73 @@ fn is_error_note(note: &str) -> bool {
 /// How long an ordinary toast stays.
 const TOAST_SECS: u64 = 6;
 
+/// The Ctrl+K Session switcher.
+fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
+    let area = f.area();
+    let matches = app.switcher_matches(query);
+    let rows = (area.height as usize).saturating_sub(8).clamp(1, 12);
+    let sel = sel.min(matches.len().saturating_sub(1));
+    let start = sel.saturating_sub(rows - 1);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Session  ", ui::dim(app.color)),
+        Span::raw(format!("{query}▏")),
+    ])];
+    let now = chrono::Utc::now();
+    for (k, &i) in matches.iter().enumerate().skip(start).take(rows) {
+        let s = &app.sessions[i];
+        let here = k == sel;
+        let style = if here {
+            bold_fg(app.color, Color::Green)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} {}",
+                    if here { "›" } else { " " },
+                    truncate_chars(&s.name, 40)
+                ),
+                style,
+            ),
+            Span::styled(
+                format!(
+                    "  {}{}",
+                    ui::relative_time(&s.updated_at, now),
+                    s.preview
+                        .as_deref()
+                        .map(|p| format!(" · “{}”", truncate_chars(p, 50)))
+                        .unwrap_or_default()
+                ),
+                ui::dim(app.color),
+            ),
+        ]));
+    }
+    if matches.is_empty() {
+        lines.push(Line::styled(
+            "  no match · Ctrl+N starts a Session with this name",
+            ui::dim(app.color),
+        ));
+    }
+    lines.push(Line::styled(
+        "Enter switch · Ctrl+N new Session named this · Esc close",
+        ui::dim(app.color),
+    ));
+    let w = 90.min(area.width.saturating_sub(2)).max(1);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 3,
+        w,
+        h,
+    );
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(ui::panel(" Switch Session ", app.color, Color::Cyan)),
+        rect,
+    );
+}
+
 /// "Runs are still working" before quitting.
 fn draw_quit_confirm(f: &mut Frame, app: &App) {
     let n = app.running_sessions.len();
@@ -6619,6 +6703,86 @@ impl App {
             }
         }
         self.marked.clear();
+    }
+
+    /// Sessions matching the switcher's query, best first (newest first
+    /// with no query): fuzzy on name, tags and the last message.
+    fn switcher_matches(&self, query: &str) -> Vec<usize> {
+        let mut scored: Vec<(i64, usize)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.archived)
+            .filter_map(|(i, s)| {
+                let fields = [
+                    s.name.clone(),
+                    s.tags
+                        .iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    s.preview.clone().unwrap_or_default(),
+                ];
+                fields
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, f)| {
+                        // The name counts most, then tags, then the preview.
+                        formless_core::fuzzy::fuzzy_match(query, f)
+                            .map(|(sc, _)| sc - 20 * k as i64)
+                    })
+                    .max()
+                    .map(|sc| (sc, i))
+            })
+            .collect();
+        if query.trim().is_empty() {
+            scored.sort_by(|a, b| {
+                self.sessions[b.1]
+                    .updated_at
+                    .cmp(&self.sessions[a.1].updated_at)
+            });
+        } else {
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+        }
+        scored.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// Ctrl+K switcher keys: type to filter, ↑/↓, Enter switches, Ctrl+N
+    /// starts a Session named after the query, Esc closes.
+    fn switcher_key(&mut self, key: KeyEvent) {
+        let Some((query, sel)) = self.switcher.clone() else {
+            return;
+        };
+        let matches = self.switcher_matches(&query);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.switcher = None,
+            KeyCode::Char('n') if ctrl => {
+                let name = Some(query.trim().to_string()).filter(|q| !q.is_empty());
+                self.switcher = None;
+                self.request(Pending::CreateSession, Request::CreateSession { name });
+            }
+            KeyCode::Enter => {
+                self.switcher = None;
+                if let Some(&i) = matches.get(sel.min(matches.len().saturating_sub(1))) {
+                    let id = self.sessions[i].id.clone();
+                    self.switch_session(id.clone());
+                    self.request(Pending::GetSession, Request::GetSession { id });
+                    self.view = View::Chat;
+                }
+            }
+            KeyCode::Up => self.switcher = Some((query, sel.saturating_sub(1))),
+            KeyCode::Down => {
+                self.switcher = Some((query, (sel + 1).min(matches.len().saturating_sub(1))))
+            }
+            KeyCode::Backspace => {
+                let mut q = query;
+                q.pop();
+                self.switcher = Some((q, 0));
+            }
+            KeyCode::Char(c) if !ctrl => self.switcher = Some((format!("{query}{c}"), 0)),
+            _ => {}
+        }
     }
 
     /// The Session to open on launch (SPEC §10.1): the most recently
@@ -9324,6 +9488,7 @@ mod tests {
             input_focus: false,
             approval_explain: false,
             quit_confirm: false,
+            switcher: None,
             on_start: "last".into(),
             approval_code: None,
             image_placed: Vec::new(),
@@ -11538,6 +11703,54 @@ mod tests {
         assert_eq!(app.start_session().unwrap().id, "recent");
         app.on_start = "new".into();
         assert!(app.start_session().is_none());
+    }
+
+    #[test]
+    fn ctrl_k_switches_sessions_from_anywhere() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut app = test_app();
+        let session = |id: &str, name: &str, at: &str, preview: &str| SessionInfo {
+            id: id.into(),
+            name: name.into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: at.into(),
+            updated_at: at.into(),
+            cwd: None,
+            message_count: 0,
+            preview: Some(preview.into()),
+            last_run_status: None,
+            pinned: false,
+            archived: false,
+            tags: vec!["client".into()],
+        };
+        app.sessions = vec![
+            session("a", "Refactor auth", "2026-01-01", "split the token code"),
+            session(
+                "b",
+                "Weekly report",
+                "2026-02-01",
+                "summarise the sales csv",
+            ),
+        ];
+        app.view = View::Tools;
+        app.key(ctrl('k'));
+        assert!(render(&mut app, 100, 24).contains("Switch Session"));
+        // No query: newest first.
+        assert_eq!(app.switcher_matches("")[0], 1);
+        for c in "rfauth".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.current.as_deref(), Some("a"));
+        assert_eq!(app.view, View::Chat);
+        // The preview is searchable too.
+        assert_eq!(app.switcher_matches("sales csv")[0], 1);
+        // Ctrl+N starts a new one; Esc closes.
+        app.key(ctrl('k'));
+        app.key(key(KeyCode::Esc));
+        assert!(app.switcher.is_none());
     }
 
     #[test]
