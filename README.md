@@ -303,6 +303,13 @@ formless sessions import bundle.json
 formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
 ```
 
+### Daemon log
+
+```bash
+formless logs --level warn --since 1h      # recent warnings and errors
+formless logs -f                           # follow as it's written
+```
+
 ### Shell completions
 
 The installer and the Homebrew formula install bash, zsh and fish completions. Otherwise:

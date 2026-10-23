@@ -2231,6 +2231,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   (clap_mangen) by a hidden `formless man`. Releases put it in each Unix
   tarball. `scripts/install.sh` installs it to `$PREFIX/share/man/man1`, and
   the Homebrew formula into `man1`.
+- `formless logs [-f] [--level warn] [--since 10m] [-n 200]` shows the
+  daemon log: rotated files oldest first, then `daemon.log`. Entries are
+  grouped (continuation lines stay with their entry), filtered by level
+  (that level and worse) and age, and show the last `-n` (0 = all). `-f`
+  keeps printing appended entries and follows rotation. The daemon logs
+  `info` and above by default (other commands only errors), `RUST_LOG`
+  overrides it, and colour codes are only used on a terminal, never in the
+  file.
 - `formless config`:
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);

@@ -17,6 +17,7 @@ anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_mangen = "0.3"
+chrono.workspace = true
 crossterm = "0.28"
 unicode-width = "0.2"
 formless-core = { path = "../formless-core" }

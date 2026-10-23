@@ -79,6 +79,21 @@ enum Cmd {
     /// Print the man page (roff), for packaging: `formless man > formless.1`
     #[command(hide = true)]
     Man,
+    /// Show the daemon log (daemon.log and its rotated files)
+    Logs {
+        /// Keep printing new lines as they're written
+        #[arg(short, long)]
+        follow: bool,
+        /// Only this level and worse: error, warn, info, debug, trace
+        #[arg(long, value_parser = ["error", "warn", "info", "debug", "trace"])]
+        level: Option<String>,
+        /// Only entries from this long ago on (10m, 2h, 1d)
+        #[arg(long, value_parser = parse_duration)]
+        since: Option<std::time::Duration>,
+        /// How many of the latest entries to show (default 200; 0 = all)
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+    },
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
     Completions {
         #[arg(value_enum)]
@@ -577,11 +592,27 @@ enum DaemonAction {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
+    // The daemon logs warnings and info to daemon.log (`formless logs`);
+    // other commands only errors. RUST_LOG overrides both. Colour codes
+    // only on a terminal, never into the log file.
+    let serving = matches!(
+        cli.cmd,
+        Some(Cmd::Daemon {
+            action: DaemonAction::Serve
+        })
+    );
+    {
+        use std::io::IsTerminal;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(if serving { "info" } else { "error" })
+        });
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init();
+    }
     // Completions and the man page need nothing else: no profile, config
     // or daemon.
     if let Some(Cmd::Completions { shell }) = cli.cmd {
@@ -620,6 +651,12 @@ fn main() -> Result<()> {
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
+        Some(Cmd::Logs {
+            follow,
+            level,
+            since,
+            lines,
+        }) => logs_cmd(&paths, follow, level, since, lines),
         Some(Cmd::Completions { .. } | Cmd::Man) => {
             unreachable!("handled before the profile is set up")
         }
@@ -3035,6 +3072,133 @@ fn set_tool_retired(paths: &Paths, name: &str, retire: bool) -> Result<()> {
     Ok(())
 }
 
+/// One daemon log entry: its first line starts with an RFC 3339 time and
+/// a level; continuation lines (backtraces, wrapped text) belong to it.
+struct LogEntry {
+    at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    level: u8,
+    text: String,
+}
+
+/// Severity: 0 error … 4 trace; lines without a level count as info.
+fn log_level(word: &str) -> Option<u8> {
+    Some(match word {
+        "ERROR" | "error" => 0,
+        "WARN" | "warn" => 1,
+        "INFO" | "info" => 2,
+        "DEBUG" | "debug" => 3,
+        "TRACE" | "trace" => 4,
+        _ => return None,
+    })
+}
+
+/// Group log text into entries.
+fn parse_log(text: &str) -> Vec<LogEntry> {
+    let mut out: Vec<LogEntry> = Vec::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let at = words
+            .next()
+            .and_then(|w| chrono::DateTime::parse_from_rfc3339(w).ok());
+        match at {
+            Some(at) => out.push(LogEntry {
+                at: Some(at),
+                level: words.next().and_then(log_level).unwrap_or(2),
+                text: line.to_string(),
+            }),
+            None => match out.last_mut() {
+                Some(e) => {
+                    e.text.push('\n');
+                    e.text.push_str(line);
+                }
+                None => out.push(LogEntry {
+                    at: None,
+                    level: 2,
+                    text: line.to_string(),
+                }),
+            },
+        }
+    }
+    out
+}
+
+/// `formless logs`: the rotated files oldest first, then daemon.log,
+/// filtered by level and age; `-f` keeps reading (and follows rotation).
+fn logs_cmd(
+    paths: &Paths,
+    follow: bool,
+    level: Option<String>,
+    since: Option<std::time::Duration>,
+    lines: usize,
+) -> Result<()> {
+    let max_level = level.as_deref().and_then(log_level).unwrap_or(4);
+    let cutoff =
+        since.map(|d| chrono::Utc::now() - chrono::Duration::from_std(d).unwrap_or_default());
+    let keep = |e: &LogEntry| {
+        e.level <= max_level
+            && match (cutoff, e.at) {
+                (Some(c), Some(at)) => at >= c,
+                (Some(_), None) => false,
+                _ => true,
+            }
+    };
+    let live = paths.log_file();
+    let mut files: Vec<std::path::PathBuf> = (1..=20)
+        .map(|n| std::path::PathBuf::from(format!("{}.{n}", live.display())))
+        .filter(|p| p.exists())
+        .collect();
+    files.reverse();
+    files.push(live.clone());
+    let text: String = files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let entries: Vec<LogEntry> = parse_log(&text).into_iter().filter(|e| keep(e)).collect();
+    let skip = if lines == 0 {
+        0
+    } else {
+        entries.len().saturating_sub(lines)
+    };
+    for e in &entries[skip..] {
+        println!("{}", e.text);
+    }
+    if entries.is_empty() && !follow {
+        eprintln!(
+            "no log entries{} in {}",
+            if level.is_some() || since.is_some() {
+                " match"
+            } else {
+                ""
+            },
+            live.display()
+        );
+    }
+    if !follow {
+        return Ok(());
+    }
+    // Follow: print what's appended; a smaller file means it was rotated.
+    let mut pos = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let len = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
+        if len < pos {
+            pos = 0;
+        }
+        if len > pos {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&live)?;
+            f.seek(SeekFrom::Start(pos))?;
+            let mut new = String::new();
+            f.read_to_string(&mut new)?;
+            pos = len;
+            for e in parse_log(&new).into_iter().filter(|e| keep(e)) {
+                println!("{}", e.text);
+            }
+        }
+    }
+}
+
 /// The Tool with this name or id.
 fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
     let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(
@@ -3273,6 +3437,19 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn log_lines_group_into_entries_with_levels() {
+        let text = "2026-10-23T10:00:00.1Z  INFO formless_core::daemon: listening\n\
+                    2026-10-23T10:00:01.2Z  WARN formless_core::daemon: MCP server 'x': failed\n\
+                    \x20 caused by: exit 1\n\
+                    2026-10-23T10:00:02.3Z ERROR formless_core::relay: boom";
+        let entries = parse_log(text);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.iter().map(|e| e.level).collect::<Vec<_>>(), [2, 1, 0]);
+        assert!(entries[1].text.ends_with("caused by: exit 1"));
+        assert!(entries[0].at.is_some());
+    }
 
     #[test]
     fn durations_parse_and_print() {
