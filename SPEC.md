@@ -2259,6 +2259,17 @@ run_tool = "network_policy"     # a registry Tool, or…
 
   Then it checks again, re-running the provider probe. A daemon that
   simply isn't running isn't flagged, since it starts on demand.
+- `formless doctor --json` prints the report as one JSON object: version,
+  OS and arch, profile and dirs, provider (base URL, model, API style, tool
+  mode, auth mode, whether a credential is present), relay, naming, whether
+  the daemon is running, and the problems (with next steps and whether
+  they're fixable).
+- `formless bug-report [-o FILE]` writes a Markdown file with versions, OS,
+  that JSON, and the last 200 daemon log lines, for attaching to an issue.
+- Both are redacted: bearer tokens, `key`/`token`/`secret`/`password`
+  values, `#k=`/`#local=` fragments, URL credentials, `sk-`/`ghp_`-style
+  keys, long opaque tokens, and the home path (shown as `~`). The file says
+  to read it before attaching it.
 - `formless logs [-f] [--level warn] [--since 10m] [-n 200]` shows the
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
