@@ -2210,6 +2210,12 @@ run_tool = "network_policy"     # a registry Tool, or…
 ## 12. CLI
 
 - `formless` (no args) launches the TUI (auto-starting the daemon).
+- CLI lists (`tools`, `sessions`, `providers`, `roles`, `jobs`, `mcp`,
+  `skills`, `prompts`) share one table renderer: aligned columns with a
+  dim header, secondary fields dimmed, status in colour, and the widest
+  column cut with "…" to fit the terminal. Colour and fitting happen only
+  when stdout is a terminal, and `NO_COLOR` turns colour off. Piped output
+  is plain aligned text.
 - Every CLI `list`/`status` subcommand takes `--json` and prints one JSON
   value (the daemon's data) instead of a table: `providers`, `roles`,
   `jobs`, `memory`, `mcp`, `skills`, `tools`, `prompts` and `sessions list`,

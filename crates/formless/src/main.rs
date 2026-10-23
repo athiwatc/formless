@@ -1,3 +1,5 @@
+mod table;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use formless_core::daemon::{daemon_reachable, Daemon};
@@ -9,6 +11,7 @@ use formless_protocol::{
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
+use table::{c, t, Table, Tone};
 
 #[derive(Parser)]
 #[command(
@@ -838,16 +841,32 @@ fn prompts_cmd(paths: Paths, action: PromptsAction) -> Result<()> {
             if arr.is_empty() {
                 println!("no proposals yet (formless prompts generate)");
             }
+            let pct = |v: &serde_json::Value| {
+                v.as_f64()
+                    .map(|x| format!("{:.0}%", x * 100.0))
+                    .unwrap_or_else(|| "-".into())
+            };
+            let mut tbl = Table::new(&["ID", "KIND", "STATUS", "CAND", "BASE", "CONTENT"]);
             for p in arr {
-                println!(
-                    "{} [{}] {} cand={} base={} {}",
-                    p["id"].as_str().unwrap_or_default(),
-                    p["kind"].as_str().unwrap_or_default(),
-                    p["status"].as_str().unwrap_or_default(),
-                    p["candidate_score"],
-                    p["baseline_score"],
-                    p["content"].as_str().unwrap_or_default()
-                );
+                let status = p["status"].as_str().unwrap_or_default();
+                tbl.row(vec![
+                    c(p["id"].as_str().unwrap_or_default()),
+                    c(p["kind"].as_str().unwrap_or_default()),
+                    t(
+                        status,
+                        match status {
+                            "applied" => Tone::Good,
+                            "rejected" | "rolled_back" => Tone::Dim,
+                            _ => Tone::Warn,
+                        },
+                    ),
+                    c(pct(&p["candidate_score"])),
+                    c(pct(&p["baseline_score"])),
+                    t(p["content"].as_str().unwrap_or_default(), Tone::Dim),
+                ]);
+            }
+            if !tbl.is_empty() {
+                tbl.print();
             }
             Ok(())
         }
@@ -1854,35 +1873,36 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
             if skills.is_empty() {
                 println!("no skills installed (formless skills add …)");
             }
+            let mut tbl = Table::new(&["SKILL", "VER", "STATE", "LOADS", "RUNS OK", "DESCRIPTION"]);
             for s in skills {
-                println!(
-                    "{:<24} v{:<3} {:<8} {:>4} loads {:>5}  {}{}{}",
-                    s["name"].as_str().unwrap_or_default(),
-                    s["version"],
-                    if s["retired"] == true {
-                        "retired"
-                    } else if s["enabled"] == true {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    s["loads"],
-                    match (s["runs"].as_i64(), s["runs_completed"].as_i64()) {
-                        (Some(r), Some(c)) if r > 0 => format!("{}%", 100 * c / r),
+                let state = if s["retired"] == true {
+                    t("retired", Tone::Dim)
+                } else if s["enabled"] == true {
+                    t("enabled", Tone::Good)
+                } else {
+                    t("disabled", Tone::Warn)
+                };
+                let mut desc = s["description"].as_str().unwrap_or_default().to_string();
+                if s["has_scripts"] == true {
+                    desc.push_str(" [scripts]");
+                }
+                if s["author"] == "auto" {
+                    desc.push_str(" [auto]");
+                }
+                tbl.row(vec![
+                    t(s["name"].as_str().unwrap_or_default(), Tone::Strong),
+                    c(format!("v{}", s["version"])),
+                    state,
+                    c(s["loads"].to_string()),
+                    c(match (s["runs"].as_i64(), s["runs_completed"].as_i64()) {
+                        (Some(r), Some(done)) if r > 0 => format!("{}%", 100 * done / r),
                         _ => "-".into(),
-                    },
-                    s["description"].as_str().unwrap_or_default(),
-                    if s["has_scripts"] == true {
-                        "  [scripts]"
-                    } else {
-                        ""
-                    },
-                    if s["author"] == "auto" {
-                        "  [auto]"
-                    } else {
-                        ""
-                    },
-                );
+                    }),
+                    t(desc, Tone::Dim),
+                ]);
+            }
+            if !tbl.is_empty() {
+                tbl.print();
             }
         }
         SkillsAction::Enable { name } => set(name, true)?,
@@ -2037,15 +2057,20 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&shown)?);
                 return Ok(());
             }
+            let mut tbl = Table::new(&["ID", "UPDATED", "MSGS", "NAME", "LAST MESSAGE"]);
             for s in list.iter().filter(|s| s.archived == archived) {
-                println!(
-                    "{}  {}  {}{}",
-                    &s.id[..8.min(s.id.len())],
-                    s.updated_at.get(..16).unwrap_or(&s.updated_at),
-                    s.name,
-                    if s.pinned { "  (pinned)" } else { "" }
-                );
+                tbl.row(vec![
+                    t(&s.id[..8.min(s.id.len())], Tone::Dim),
+                    c(s.updated_at.get(..16).unwrap_or(&s.updated_at)),
+                    c(s.message_count.to_string()),
+                    t(
+                        format!("{}{}", if s.pinned { "★ " } else { "" }, s.name),
+                        Tone::Strong,
+                    ),
+                    t(s.preview.clone().unwrap_or_default(), Tone::Dim),
+                ]);
             }
+            tbl.print();
         }
         SessionsAction::Show { id, json } => {
             let s = find_session(&paths, &id)?;
@@ -2320,19 +2345,20 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&r["providers"])?);
                 return Ok(());
             }
+            let mut tbl = Table::new(&["NAME", "MODEL", "KEY", "BASE URL"]);
             for p in r["providers"].as_array().into_iter().flatten() {
-                println!(
-                    "{:<14} {:<40} model {:<24} {}",
-                    p["name"].as_str().unwrap_or_default(),
-                    p["base_url"].as_str().unwrap_or_default(),
-                    p["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("-"),
+                tbl.row(vec![
+                    t(p["name"].as_str().unwrap_or_default(), Tone::Strong),
+                    c(p["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("-")),
                     if p["has_key"] == true {
-                        "key stored"
+                        t("stored", Tone::Good)
                     } else {
-                        "no key"
-                    }
-                );
+                        t("none", Tone::Warn)
+                    },
+                    t(p["base_url"].as_str().unwrap_or_default(), Tone::Dim),
+                ]);
             }
+            tbl.print();
         }
         ProvidersAction::Add {
             name,
@@ -2424,17 +2450,20 @@ fn roles_cmd(paths: Paths, action: RolesAction) -> Result<()> {
                     "no roles (formless roles add NAME --description … --provider … --model …)"
                 );
             }
+            let mut tbl = Table::new(&["ROLE", "PROVIDER", "MODEL", "DESCRIPTION"]);
             for (name, role) in roles {
-                println!(
-                    "{:<14} {} · {}\n               {}",
-                    name,
-                    role["provider"].as_str().unwrap_or("default"),
-                    role["model"]
+                tbl.row(vec![
+                    t(name, Tone::Strong),
+                    c(role["provider"].as_str().unwrap_or("default")),
+                    c(role["model"]
                         .as_str()
                         .filter(|m| !m.is_empty())
-                        .unwrap_or("provider default"),
-                    role["description"].as_str().unwrap_or_default()
-                );
+                        .unwrap_or("provider default")),
+                    t(role["description"].as_str().unwrap_or_default(), Tone::Dim),
+                ]);
+            }
+            if !tbl.is_empty() {
+                tbl.print();
             }
         }
         RolesAction::Add {
@@ -2474,25 +2503,42 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             if jobs.is_empty() {
                 println!("no scheduled jobs (formless jobs add …)");
             }
+            let mut tbl = Table::new(&["ID", "STATE", "SCHEDULE", "NEXT RUN", "LAST", "TASK"]);
             for j in jobs {
-                println!(
-                    "{:<10} {:<18} {:<14} next {:<25} last: {}\n           {}",
-                    j["id"].as_str().unwrap_or_default(),
-                    if j["approved"] == false {
-                        "awaiting approval"
-                    } else if j["enabled"] == true {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                    j["cron"].as_str().unwrap_or("once"),
-                    j["next_run"].as_str().unwrap_or("-"),
-                    j["last_status"]
+                let state = if j["approved"] == false {
+                    t("awaiting approval", Tone::Warn)
+                } else if j["enabled"] == true {
+                    t("on", Tone::Good)
+                } else {
+                    t("off", Tone::Dim)
+                };
+                let last = j["last_status"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("-");
+                tbl.row(vec![
+                    c(j["id"].as_str().unwrap_or_default()),
+                    state,
+                    c(j["cron"].as_str().unwrap_or("once")),
+                    c(j["next_run"]
                         .as_str()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("-"),
-                    j["prompt"].as_str().unwrap_or_default()
-                );
+                        .map(|n| n.get(..16).unwrap_or(n))
+                        .unwrap_or("-")),
+                    t(
+                        last,
+                        if last == "completed" {
+                            Tone::Good
+                        } else if last == "-" {
+                            Tone::Dim
+                        } else {
+                            Tone::Warn
+                        },
+                    ),
+                    t(j["prompt"].as_str().unwrap_or_default(), Tone::Dim),
+                ]);
+            }
+            if !tbl.is_empty() {
+                tbl.print();
             }
         }
         JobsAction::Add {
@@ -2683,25 +2729,33 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             if servers.is_empty() {
                 println!("no MCP servers configured (formless mcp add …)");
             }
+            let mut tbl = Table::new(&[
+                "NAME",
+                "TRANSPORT",
+                "STATE",
+                "TOOLS",
+                "TARGET",
+                "LAST ERROR",
+            ]);
             for s in servers {
-                println!(
-                    "{:<16} {:<5} {:<8} {:>3} tools  {}{}",
-                    s["name"].as_str().unwrap_or_default(),
-                    s["transport"].as_str().unwrap_or_default(),
-                    if s["disabled"] == true {
-                        "disabled"
-                    } else if s["running"] == true {
-                        "running"
-                    } else {
-                        "idle"
-                    },
-                    s["tool_count"],
-                    s["target"].as_str().unwrap_or_default(),
-                    s["last_error"]
-                        .as_str()
-                        .map(|e| format!("\n  last error: {e}"))
-                        .unwrap_or_default(),
-                );
+                let state = if s["disabled"] == true {
+                    t("disabled", Tone::Dim)
+                } else if s["running"] == true {
+                    t("running", Tone::Good)
+                } else {
+                    c("idle")
+                };
+                tbl.row(vec![
+                    t(s["name"].as_str().unwrap_or_default(), Tone::Strong),
+                    c(s["transport"].as_str().unwrap_or_default()),
+                    state,
+                    c(s["tool_count"].to_string()),
+                    t(s["target"].as_str().unwrap_or_default(), Tone::Dim),
+                    t(s["last_error"].as_str().unwrap_or_default(), Tone::Bad),
+                ]);
+            }
+            if !tbl.is_empty() {
+                tbl.print();
             }
         }
         McpAction::Test { name } => {
@@ -2807,24 +2861,36 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             if tools.is_empty() {
                 println!("(no tools yet - the agent builds them via create_tool)");
             }
-            for t in tools {
-                println!(
-                    "{} v{} calls={} rate={}{} [{}]",
-                    t.name,
-                    t.current_version,
-                    t.invocations,
-                    t.success_rate
-                        .map(|r| format!("{:.0}%", r * 100.0))
-                        .unwrap_or_else(|| "-".into()),
-                    if t.retired {
-                        " RETIRED"
-                    } else if t.needs_attention {
-                        " NEEDS-ATTENTION"
-                    } else {
-                        ""
-                    },
-                    t.capabilities.join(",")
-                );
+            let mut tbl =
+                Table::new(&["TOOL", "VER", "CALLS", "SUCCESS", "STATUS", "CAPABILITIES"]);
+            for tool in tools {
+                let status = if tool.retired {
+                    t("retired", Tone::Dim)
+                } else if tool.needs_attention {
+                    t("needs attention", Tone::Bad)
+                } else {
+                    t("active", Tone::Good)
+                };
+                let rate = tool.success_rate;
+                tbl.row(vec![
+                    t(tool.name, Tone::Strong),
+                    c(format!("v{}", tool.current_version)),
+                    c(tool.invocations.to_string()),
+                    t(
+                        rate.map(|r| format!("{:.0}%", r * 100.0))
+                            .unwrap_or_else(|| "-".into()),
+                        match rate {
+                            Some(r) if r < 0.8 => Tone::Bad,
+                            Some(_) => Tone::Good,
+                            None => Tone::Dim,
+                        },
+                    ),
+                    status,
+                    t(tool.capabilities.join(", "), Tone::Dim),
+                ]);
+            }
+            if !tbl.is_empty() {
+                tbl.print();
             }
             Ok(())
         }
