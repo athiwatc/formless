@@ -28,6 +28,9 @@ pub struct SessionInfo {
     /// Pinned Sessions sort first (SPEC §10.4).
     #[serde(default)]
     pub pinned: bool,
+    /// Archived: hidden from the default list, still searchable.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -545,6 +548,12 @@ pub enum Request {
     },
     /// Set (or, with `None`, clear) a Session's working directory; it must
     /// exist on the daemon's machine. Returns the Session.
+    /// Archive or unarchive a Session: archived ones are hidden from the
+    /// default list but kept, searchable and restorable. Returns it.
+    SetSessionArchived {
+        id: String,
+        archived: bool,
+    },
     /// Pin or unpin a Session (pinned ones list first). Returns it.
     SetSessionPinned {
         id: String,

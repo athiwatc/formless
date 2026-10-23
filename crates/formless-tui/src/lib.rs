@@ -163,6 +163,7 @@ enum Pending {
     SessionRuns,
     SetCwd,
     SetPin,
+    SetArchive,
     ContextReport,
     MentionAttach,
     ApprovalCode,
@@ -1146,7 +1147,9 @@ impl App {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
                                 self.sessions = v;
                                 if self.current.is_none() {
-                                    if let Some(first) = self.sessions.first().cloned() {
+                                    if let Some(first) =
+                                        self.sessions.iter().find(|s| !s.archived).cloned()
+                                    {
                                         self.switch_session(first.id.clone());
                                         self.request(
                                             Pending::GetSession,
@@ -1393,6 +1396,22 @@ impl App {
                             self.mention_attached();
                         }
                         Pending::SettingsProviders => self.providers_info = result,
+                        Pending::SetArchive => {
+                            if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
+                                self.notes.push(format!(
+                                    "{} {}",
+                                    if s.archived {
+                                        "archived (v shows archived Sessions)"
+                                    } else {
+                                        "restored"
+                                    },
+                                    s.name
+                                ));
+                                if let Some(old) = self.sessions.iter_mut().find(|x| x.id == s.id) {
+                                    *old = s;
+                                }
+                            }
+                        }
                         Pending::SetPin => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
                                 self.notes.push(format!(
@@ -4085,6 +4104,17 @@ impl App {
                 KeyCode::Char('P') => {
                     if let Some(s) = self.selected_session().cloned() {
                         self.toggle_pin(&s);
+                    }
+                }
+                KeyCode::Char('a') => {
+                    if let Some(s) = self.selected_session().cloned() {
+                        self.request(
+                            Pending::SetArchive,
+                            Request::SetSessionArchived {
+                                id: s.id,
+                                archived: !s.archived,
+                            },
+                        );
                     }
                 }
                 KeyCode::Char('f') => {
@@ -8547,6 +8577,7 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
     let session_items: Vec<ListItem> = app
         .sessions
         .iter()
+        .filter(|s| !s.archived)
         .map(|s| {
             let current = Some(&s.id) == app.current.as_ref();
             ListItem::new(Line::from(vec![
@@ -9619,6 +9650,7 @@ mod tests {
             preview: None,
             last_run_status: None,
             pinned: false,
+            archived: false,
         }];
         app.key(key(KeyCode::Char('d')));
         assert_eq!(app.delete_arm.as_deref(), Some("s1"));
@@ -10401,6 +10433,7 @@ mod tests {
                 preview: None,
                 last_run_status: None,
                 pinned: false,
+                archived: false,
             })
             .collect();
         app.switch_session("refactor-auth".into());
@@ -10978,6 +11011,7 @@ mod tests {
             preview: None,
             last_run_status: None,
             pinned: false,
+            archived: false,
         }];
         app.switch_session("s".into());
         assert_eq!(app.work_dir(), here.join("src"));
@@ -11005,6 +11039,7 @@ mod tests {
             preview: Some(format!("fix the {id} build")),
             last_run_status: status.map(str::to_string),
             pinned: false,
+            archived: false,
         };
         app.sessions = vec![session("a", Some("paused")), session("b", None)];
         app.running_sessions.insert("b".into());
@@ -11040,6 +11075,7 @@ mod tests {
             preview: None,
             last_run_status: None,
             pinned,
+            archived: false,
         };
         app.sessions = vec![
             session("new", "2026-02-01", false),
@@ -11057,6 +11093,39 @@ mod tests {
         assert_eq!(names(&app), ["home", "mid", "new"]);
         app.view = View::Sessions;
         assert!(render(&mut app, 120, 20).contains("★ home"));
+    }
+
+    #[test]
+    fn archived_sessions_hide_behind_their_filter() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let session = |id: &str, archived: bool| SessionInfo {
+            id: id.into(),
+            name: id.into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned: false,
+            archived,
+        };
+        app.sessions = vec![session("old", true), session("live", false)];
+        let names = |app: &App| -> Vec<String> {
+            app.visible_sessions()
+                .iter()
+                .map(|&i| app.sessions[i].name.clone())
+                .collect()
+        };
+        assert_eq!(names(&app), ["live"]);
+        app.view = View::Sessions;
+        app.key(key(KeyCode::Char('v')));
+        app.key(key(KeyCode::Char('v')));
+        assert_eq!(names(&app), ["old"]);
+        assert!(render(&mut app, 120, 20).contains("archived"));
     }
 
     #[test]
