@@ -164,6 +164,10 @@ enum Cmd {
         /// Interrupt the Run after this long (90s, 10m, 1h30m) and exit 124
         #[arg(long, value_parser = parse_duration)]
         timeout: Option<std::time::Duration>,
+        /// Working directory for the Run's Session (default: the current
+        /// directory; with --session, this Run only)
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
         /// Model for this Run (with --session: this Run only)
         #[arg(long, conflicts_with = "role")]
         model: Option<String>,
@@ -539,6 +543,7 @@ fn main() -> Result<()> {
             output,
             quiet,
             timeout,
+            cwd,
             model,
             effort,
             role,
@@ -580,8 +585,21 @@ fn main() -> Result<()> {
                 }
             };
             // An existing Session gets its own model back after this Run.
-            let restore = match (&session, &pick) {
-                (Some(id), Some(_)) => {
+            // The folder the Run acts in: --cwd, else where it was started
+            // (a continued Session keeps its own unless --cwd is given).
+            let dir = match &cwd {
+                Some(d) => match d.canonicalize() {
+                    Ok(p) if p.is_dir() => Some(p),
+                    _ => {
+                        eprintln!("--cwd {}: no such directory", d.display());
+                        std::process::exit(2);
+                    }
+                },
+                None if session.is_none() => std::env::current_dir().ok(),
+                None => None,
+            };
+            let restore = match (&session, pick.is_some() || cwd.is_some()) {
+                (Some(id), true) => {
                     formless_core::daemon::ensure_daemon(&paths)?;
                     let list: Vec<SessionInfo> = serde_json::from_value(
                         formless_tui::client::request_once(&paths, Request::ListSessions)?,
@@ -597,12 +615,14 @@ fn main() -> Result<()> {
                     effort,
                 )
             });
+            let pick_was_set = pick.is_some();
             let code = run_headless(
                 paths.clone(),
                 task,
                 files,
                 session,
                 pick,
+                dir,
                 yes,
                 answer,
                 output,
@@ -610,14 +630,25 @@ fn main() -> Result<()> {
                 timeout,
             );
             if let Some(s) = restore {
-                let _ = formless_tui::client::request_once(
-                    &paths,
-                    Request::SetSessionModel {
-                        id: s.id,
-                        model: s.model,
-                        reasoning_effort: s.reasoning_effort,
-                    },
-                );
+                if pick_was_set {
+                    let _ = formless_tui::client::request_once(
+                        &paths,
+                        Request::SetSessionModel {
+                            id: s.id.clone(),
+                            model: s.model,
+                            reasoning_effort: s.reasoning_effort,
+                        },
+                    );
+                }
+                if cwd.is_some() {
+                    let _ = formless_tui::client::request_once(
+                        &paths,
+                        Request::SetSessionCwd {
+                            id: s.id,
+                            cwd: s.cwd,
+                        },
+                    );
+                }
             }
             let code = code?;
             std::process::exit(code);
@@ -1315,6 +1346,7 @@ fn run_headless(
     files: Vec<(String, Vec<u8>)>,
     session: Option<String>,
     pick: Option<ModelPick>,
+    dir: Option<std::path::PathBuf>,
     yes: bool,
     answer: Option<String>,
     output: RunOutput,
@@ -1373,8 +1405,14 @@ fn run_headless(
         deltas: true,
         client: Some("CLI".into()),
     });
-    // Requests on one connection run in order: the model is set and the
-    // attachment stored before the message.
+    // Requests on one connection run in order: the folder and model are
+    // set and the attachments stored before the message.
+    if let Some(d) = dir {
+        client.send(Request::SetSessionCwd {
+            id: session_id.clone(),
+            cwd: Some(d.to_string_lossy().into_owned()),
+        });
+    }
     if let Some((model, effort)) = pick {
         client.send(Request::SetSessionModel {
             id: session_id.clone(),
