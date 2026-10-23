@@ -444,6 +444,7 @@
       h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
       h("button", { type: "button", onclick: () => { closePopover(); archiveSession(s); } }, s.archived ? "Unarchive" : "Archive"),
       h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
+      h("button", { type: "button", onclick: () => { closePopover(); suggestName(s); } }, "Suggest name"),
       h("button", { type: "button", onclick: () => { closePopover(); tagSession(s); } }, "Tags…"),
       h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
       h("button", { type: "button", onclick: () => { closePopover(); exportSession(s.id); } }, "Export"),
@@ -2136,6 +2137,14 @@
     const name = await ask({ title: "Rename session", input: true, value: s.name, ok: "Rename" });
     if (name && name.trim() && name.trim() !== s.name) await act({ type: "rename_session", id: s.id, name: name.trim() });
   }
+  /** Re-run the namer on the recent messages and offer its name to edit. */
+  async function suggestName(s) {
+    const r = await act({ type: "suggest_session_name", id: s.id }, null, 60000);
+    if (!r) return;
+    if (!r.name) return toast("No name to suggest yet.");
+    const name = await ask({ title: "Suggested name", input: true, value: r.name, ok: "Rename" });
+    if (name && name.trim() && name.trim() !== s.name) await act({ type: "rename_session", id: s.id, name: name.trim() });
+  }
   async function forkSession(id) {
     if (!id) return;
     const s = await act({ type: "fork_session", id, name: null, up_to_seq: null }, "Forked session");
@@ -2269,6 +2278,13 @@
       if (i >= 0) S.sessions[i] = r;
       renderStatus();
       note("working directory: " + r.cwd);
+    } },
+    { name: "rename", args: "[NAME|auto]", group: "Session", desc: "rename the Session; auto suggests a name from recent messages", run: (arg) => {
+      const s = S.sessions.find((x) => x.id === S.current);
+      if (!s) return toast("No current session.", true);
+      if (arg === "auto") return suggestName(s);
+      if (arg) return act({ type: "rename_session", id: s.id, name: arg });
+      return renameSession(s);
     } },
     { name: "context", group: "Session", desc: "how full the context window is, and what fills it", run: () => showContext() },
     { name: "stop", group: "Run control", desc: "stop the current Run (Esc)", run: () => stop() },

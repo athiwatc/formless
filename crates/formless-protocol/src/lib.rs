@@ -526,6 +526,12 @@ pub enum Request {
         id: String,
         name: String,
     },
+    /// Suggest a fresh name from a Session's recent messages (SPEC §10.4):
+    /// `{name}`, null with nothing to go on. Doesn't rename; the client
+    /// confirms with `RenameSession`.
+    SuggestSessionName {
+        id: String,
+    },
     DeleteSession {
         id: String,
     },

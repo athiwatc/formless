@@ -166,6 +166,7 @@ enum Pending {
     SetArchive,
     SetTags,
     ContextReport,
+    SuggestName,
     MentionAttach,
     ApprovalCode,
     /// Providers and Roles for the Settings view.
@@ -1494,6 +1495,18 @@ impl App {
                                         self.color,
                                     ));
                                 }
+                            }
+                        }
+                        Pending::SuggestName => {
+                            match (self.current.clone(), result["name"].as_str()) {
+                                (Some(id), Some(name)) => {
+                                    self.start_rename(&id, name);
+                                    self.notes.push(
+                                        "suggested name: Enter to use it, edit it first, or Esc"
+                                            .into(),
+                                    );
+                                }
+                                _ => self.notes.push("no name to suggest yet".into()),
                             }
                         }
                         Pending::ContextFill | Pending::ContextReport => {
@@ -3373,6 +3386,9 @@ impl App {
                     if self.show_timestamps { "on" } else { "off" }
                 ));
             }
+            cmd if cmd == "rename" || cmd.starts_with("rename ") => {
+                self.rename_cmd(cmd[6..].trim())
+            }
             "context" => match self.current.clone() {
                 Some(session_id) => {
                     self.request(Pending::ContextReport, Request::ContextUsage { session_id })
@@ -4239,7 +4255,7 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     if let Some(s) = self.selected_session().cloned() {
-                        self.start_rename(&s);
+                        self.start_rename(&s.id, &s.name);
                     }
                 }
                 KeyCode::Esc => self.view = View::Chat,
@@ -6710,12 +6726,35 @@ impl App {
         self.marked.clear();
     }
 
-    /// Rename `s` in the input, starting from its current name (Esc
+    /// `/rename` edits the current name, `/rename NAME` sets it, and
+    /// `/rename auto` suggests one from the recent messages.
+    fn rename_cmd(&mut self, arg: &str) {
+        let Some(id) = self.current.clone() else {
+            self.notes.push("no current session".into());
+            return;
+        };
+        match arg {
+            "" => {
+                let name = self.session_name(&id);
+                self.start_rename(&id, &name);
+            }
+            "auto" => {
+                self.notes.push("suggesting a name…".into());
+                self.request(Pending::SuggestName, Request::SuggestSessionName { id });
+            }
+            name => self.fire(Request::RenameSession {
+                id,
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    /// Rename Session `id` in the input, starting from `name` (Esc
     /// cancels).
-    fn start_rename(&mut self, s: &SessionInfo) {
-        self.renaming = Some(s.id.clone());
+    fn start_rename(&mut self, id: &str, name: &str) {
+        self.renaming = Some(id.to_string());
         self.view = View::Chat;
-        self.input.set(&s.name);
+        self.input.set(name);
         self.notes
             .push("Edit the name, then Enter (Esc cancels).".into());
     }
@@ -11747,6 +11786,22 @@ mod tests {
         app.key(key(KeyCode::Esc));
         assert!(app.renaming.is_none());
         assert_eq!(&*app.input, "");
+        // `/rename auto` offers the daemon's suggestion for editing.
+        app.current = Some("a".into());
+        app.slash("rename auto");
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.pending.insert(7, Pending::SuggestName);
+        tx.send(ServerMessage::Response {
+            id: 7,
+            ok: true,
+            result: Some(serde_json::json!({"name": "Token code split"})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.renaming.as_deref(), Some("a"));
+        assert_eq!(&*app.input, "Token code split");
     }
 
     #[test]
