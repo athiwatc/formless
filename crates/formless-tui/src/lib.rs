@@ -12,6 +12,7 @@ mod mermaid;
 mod notify;
 mod picker;
 pub mod plain;
+pub mod qr;
 mod settings;
 mod theme;
 mod ui;
@@ -3306,6 +3307,7 @@ impl App {
                     name: None,
                 },
             ),
+            "relay" => self.show_relay_pairing(),
             "templates" | "template" | "template list" => {
                 self.request(Pending::ListTemplates, Request::ListSessionTemplates)
             }
@@ -7293,6 +7295,60 @@ impl App {
             cursor: chars.len(),
             chars,
             mode: EditMode::Run,
+        });
+    }
+
+    /// `/relay`: the relay's state and its pairing link as a QR code, in
+    /// the pager (SPEC §12).
+    fn show_relay_pairing(&mut self) {
+        let Ok(cfg) = Config::load(&self.paths) else {
+            self.notes.push("config.toml could not be read".into());
+            return;
+        };
+        // Off: nothing to pair with (and no keychain lookup for nothing).
+        if !cfg.relay.enabled {
+            self.notes.push(
+                "The relay is off: run `formless relay enable` in a terminal, then /relay.".into(),
+            );
+            return;
+        }
+        let Some(secret) = formless_core::config::load_relay_secret(&self.paths) else {
+            self.notes
+                .push("No pairing secret yet: run `formless relay enable` in a terminal.".into());
+            return;
+        };
+        let url = formless_core::relay::browser_url(&cfg.relay, &secret);
+        let plain = |s: &str| Line::raw(s.to_string());
+        let mut styled = vec![
+            Line::styled(
+                format!("Relay enabled · {}", cfg.relay.url),
+                bold_fg(self.color, Color::Cyan),
+            ),
+            plain("Scan with your phone, or open the link below."),
+            Line::styled(
+                "This code holds the pairing secret: anyone who sees it can use your daemon.",
+                bold_fg(self.color, Color::Red),
+            ),
+            plain(""),
+        ];
+        // White on black whatever the theme, so phones can read it.
+        let code = Style::default().fg(Color::White).bg(Color::Black);
+        for l in qr::lines(&url).unwrap_or_default() {
+            styled.push(Line::from(vec![Span::raw("  "), Span::styled(l, code)]));
+        }
+        styled.push(plain(""));
+        styled.push(plain(&url));
+        styled.push(Line::styled(
+            "Rotate the secret with `formless relay enable --rotate` if it leaks.",
+            ui::dim(self.color),
+        ));
+        let lines = styled.iter().map(|l| l.to_string()).collect();
+        self.pager = Some(Pager {
+            title: "Pair a device".into(),
+            lines,
+            top: 0,
+            left: 0,
+            styled,
         });
     }
 
@@ -13242,6 +13298,36 @@ mod tests {
         app.key(key(KeyCode::Char('r')));
         assert!(app.pager.is_none() && app.reviewing.is_none());
         assert!(app.notes.iter().any(|n| n == "rejected the proposal"));
+    }
+
+    #[test]
+    fn relay_shows_the_pairing_link_as_a_qr_code() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.config_dir).unwrap();
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        app.slash("relay");
+        assert!(app.pager.is_none(), "off: nothing to pair");
+        let mut cfg = Config::default();
+        cfg.relay.enabled = true;
+        cfg.save(&app.paths).unwrap();
+        let secret = formless_core::config::generate_relay_secret();
+        std::fs::write(app.paths.relay_secret_file(), &secret).unwrap();
+        app.slash("relay");
+        let pager = app.pager.as_ref().expect("pager");
+        assert_eq!(pager.title, "Pair a device");
+        assert!(pager
+            .lines
+            .iter()
+            .any(|l| l.contains(&format!("#k={secret}"))));
+        assert!(pager.lines.iter().any(|l| l.contains("pairing secret")));
+        assert!(
+            pager
+                .lines
+                .iter()
+                .filter(|l| l.contains('▀') || l.contains('▄'))
+                .count()
+                > 5
+        );
     }
 
     #[test]
