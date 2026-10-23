@@ -750,6 +750,23 @@
   let mermaidQueue = Promise.resolve();
   let mermaidSeq = 0;
   const darkScheme = window.matchMedia("(prefers-color-scheme: dark)");
+  /** Text size (85–150%) and density for the transcript, per device. */
+  function setReading(scale, density) {
+    if (scale != null) S.readScale = Math.round(Math.min(1.5, Math.max(0.85, scale)) * 100) / 100;
+    if (density) S.density = density;
+    prefs.set("readScale", S.readScale);
+    prefs.set("density", S.density);
+    applyReading();
+    if (S.view === "settings") renderView();
+  }
+  function applyReading() {
+    document.documentElement.style.setProperty("--read-scale", String(S.readScale));
+    if (S.density === "compact") document.documentElement.dataset.density = "compact";
+    else delete document.documentElement.dataset.density;
+  }
+  S.readScale = prefs.get("readScale", 1);
+  S.density = prefs.get("density", "comfortable");
+  applyReading();
   /** Dark unless the user picked light, or picked nothing and the system is light. */
   const isDark = () => {
     const t = document.documentElement.dataset.theme;
@@ -1461,7 +1478,7 @@
         group = null;
         const from = sentElsewhere(m);
         open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)),
-          from ? h("div", { class: "muted sent-from" }, "sent from " + from) : null)));
+          ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []))));
       } else if (m.role === "tool") {
         open("assistant", m.created_at).append(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
       } else if (m.role === "system-note") {
@@ -2231,6 +2248,12 @@
     grid.append(h("section", null, h("h3", null, "This browser"),
       h("dl", { class: "kv" },
         h("dt", null, "thinking"), h("dd", null, h("label", { class: "toggle" }, thinking, "show live reasoning")),
+        h("dt", null, "text size"), h("dd", null, h("span", { class: "read-controls" },
+          h("button", { class: "btn small", type: "button", "aria-label": "Smaller text", onclick: () => setReading(S.readScale - 0.1, null) }, "A−"),
+          h("span", { "aria-live": "polite" }, Math.round(S.readScale * 100) + "%"),
+          h("button", { class: "btn small", type: "button", "aria-label": "Larger text", onclick: () => setReading(S.readScale + 0.1, null) }, "A+"))),
+        h("dt", null, "density"), h("dd", null, h("span", { class: "read-controls" },
+          ["comfortable", "compact"].map((d) => h("button", { class: "btn small" + (S.density === d ? " primary" : ""), type: "button", "aria-pressed": String(S.density === d), onclick: () => setReading(null, d) }, d)))),
         h("dt", null, "encryption"), h("dd", null, "AES-256-GCM, key held only in this tab"),
         S.local ? null : [h("dt", null, "notifications"), h("dd", null, pushControl())]),
       h("div", { class: "detail-actions" },

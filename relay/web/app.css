@@ -176,8 +176,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .turn.user .bubble { background: var(--panel-2); border-radius: 12px; padding: 9px 13px; white-space: pre-wrap; display: inline-block; max-width: 100%; }
 .turn.system-note .bubble { color: var(--muted); font-style: italic; white-space: pre-wrap; }
 .md p { margin: 0 0 8px; }
-/* Per-message wrapper (render cache); takes no part in layout. */
-.msg { display: contents; }
+/* Per-message wrapper (render cache); it anchors the message's ⋯ menu. */
+.msg { display: block; position: relative; }
 .md p:last-child { margin-bottom: 0; }
 .md h1, .md h2, .md h3, .md h4 { font-size: 16px; margin: 12px 0 6px; }
 .md ul, .md ol { margin: 4px 0 8px; padding-left: 22px; }
@@ -530,7 +530,6 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 #transcript { overflow-anchor: auto; }
 
 /* Per-message actions (⋯): on hover, always shown on touch screens */
-.msg { position: relative; }
 .msg-menu { position: absolute; top: 0; right: 0; opacity: 0; border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 6px; padding: 0 6px; line-height: 1.4; cursor: pointer; }
 .msg:hover > .msg-menu, .msg-menu:focus-visible, .msg-menu[aria-expanded] { opacity: 1; }
 @media (hover: none) { .msg-menu { opacity: .7; } }
@@ -551,3 +550,14 @@ button.linkish:hover { text-decoration: underline; }
 .settings-filter { width: 100%; max-width: 520px; padding: 8px 12px; margin: 0 0 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
 mark.find { background: var(--accent-soft); color: inherit; border-radius: 3px; padding: 0 1px; }
 .setting-desc { font-size: 12px; margin-top: 2px; }
+
+/* Reading controls (per device): text size scales the transcript and the
+   composer; compact density tightens the spacing between turns. */
+#transcript, #composer { zoom: var(--read-scale, 1); }
+:root[data-density="compact"] .turn { margin-bottom: 8px; }
+:root[data-density="compact"] .who { margin-bottom: 1px; }
+:root[data-density="compact"] #transcript { line-height: 1.38; }
+:root[data-density="compact"] .turn.user .bubble { padding: 5px 10px; }
+:root[data-density="compact"] .md p { margin-bottom: 4px; }
+:root[data-density="compact"] .chip { margin: 3px 0; }
+.read-controls { display: inline-flex; gap: 4px; align-items: center; }
