@@ -1774,6 +1774,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   under "Recent calls": `[`/`]` select one, Enter opens its full input,
   output and error in the pager, and `S` opens its Session focused on the
   first Tool result at or after the call's time.
+- **Running a Tool by hand.** `RunTool {id, input, session_id}` runs a
+  Tool as the agent would (same approval path, recorded as an Invocation
+  in that Session) and returns `{result}`. TUI: `t` in the Tools view opens
+  an input editor pre-filled from the input schema (defaults, first
+  example or enum value, else empty values); Ctrl+S runs it and the result
+  opens in the pager. Web: "Try it" in the Tool detail opens a form built
+  from the schema (text, number, checkbox, choice, or JSON for nested
+  values) and shows the result.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,
