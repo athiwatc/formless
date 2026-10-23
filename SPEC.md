@@ -2210,6 +2210,12 @@ run_tool = "network_policy"     # a registry Tool, or…
 ## 12. CLI
 
 - `formless` (no args) launches the TUI (auto-starting the daemon).
+- Every CLI `list`/`status` subcommand takes `--json` and prints one JSON
+  value (the daemon's data) instead of a table: `providers`, `roles`,
+  `jobs`, `memory`, `mcp`, `skills`, `tools`, `prompts` and `sessions list`,
+  plus `runs`, `relay status` and `daemon status`. `relay status --json`
+  leaves out the browser link (it holds the secret) and says `paired`.
+  `daemon status --json` prints `{"running": false}` when no daemon runs.
 - `formless completions <bash|zsh|fish|powershell|elvish>` prints a
   completion script, generated from the command definitions (clap_complete),
   with no daemon or profile needed. `scripts/install.sh` writes bash, zsh
