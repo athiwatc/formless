@@ -544,6 +544,11 @@ pasting paths.
   The web client shows pending attachments as chips above the composer,
   each with ×. Files can be picked, pasted, or dropped anywhere on the
   chat, which shows a drop zone while dragging.
+- **Web `@` mentions.** `@` in the web composer completes Tool names
+  (labelled "Tool"; inserted as `@name` for the agent to see) and files
+  from the Session's working directory, through the daemon. A chosen file
+  is attached at once and shown as a chip; it isn't attached again on send,
+  even if its chip was removed.
 - **What the model sees:** each attachment adds a reference line to the
   message, `[attached: name (mime, bytes), artifact ID; read it with
   read_artifact]`. Images also go inline as `image_url` parts (8 MB max)
