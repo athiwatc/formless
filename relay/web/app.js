@@ -470,9 +470,11 @@
         onclick: () => openSession(s.id),
         onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
       },
-      S.running.has(s.id) ? h("span", { class: "running", title: "running" }) : null,
-      h("span", { class: "name", title: s.name }, s.name),
-      h("span", { class: "when" }, relTime(s.updated_at)),
+      S.running.has(s.id) ? h("span", { class: "running", title: "running" })
+        : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
+      h("span", { class: "name", title: s.name }, s.name,
+        s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
+      h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
       menu));
     }
   }

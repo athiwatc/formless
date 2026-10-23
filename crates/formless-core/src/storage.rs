@@ -332,6 +332,11 @@ impl ModelStat {
     }
 }
 
+/// Per-Session summary columns for the Sessions list.
+const SESSION_SUMMARY: &str = "(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id) AS message_count,
+     (SELECT content FROM messages m WHERE m.session_id=s.id AND m.role='user' ORDER BY m.seq DESC LIMIT 1) AS preview,
+     (SELECT status FROM runs r WHERE r.session_id=s.id ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1) AS last_run_status";
+
 /// Schema version this build writes (`PRAGMA user_version`).
 pub const SCHEMA_VERSION: i64 = 32;
 
@@ -531,6 +536,21 @@ impl Store {
             created_at: r.get("created_at")?,
             updated_at: r.get("updated_at")?,
             cwd: r.get("cwd")?,
+            // Only the list query adds these.
+            message_count: r.get("message_count").unwrap_or(0),
+            preview: r
+                .get::<_, Option<String>>("preview")
+                .ok()
+                .flatten()
+                .map(|p| {
+                    let first = p.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
+                    let mut out: String = first.trim().chars().take(80).collect();
+                    if first.trim().chars().count() > 80 {
+                        out.push('…');
+                    }
+                    out
+                }),
+            last_run_status: r.get("last_run_status").ok().flatten(),
         })
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
@@ -561,7 +581,9 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM sessions WHERE deleted_at IS NULL ORDER BY updated_at DESC")?;
+            .prepare(&format!(
+                "SELECT s.*, {SESSION_SUMMARY} FROM sessions s WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+            ))?;
         let rows = stmt
             .query_map([], Self::row_session)?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -57,6 +57,16 @@ fn run_metrics_record_steps_tokens_and_followups() {
     store.create_run(&other).unwrap();
     assert_eq!(store.run_metrics_for(Some(&s), 10).unwrap().len(), 4);
     assert_eq!(store.run_metrics_for(Some(&other), 10).unwrap().len(), 1);
+    // The Sessions list's summary: count, last user message, last Run.
+    store.append_message(&s, "user", "first ask").unwrap();
+    store
+        .append_message(&s, "user", "\n  latest ask, which goes on\nand on")
+        .unwrap();
+    let listed = store.list_sessions().unwrap();
+    let row = listed.iter().find(|x| x.id == s).unwrap();
+    assert_eq!(row.preview.as_deref(), Some("latest ask, which goes on"));
+    assert!(row.message_count >= 2);
+    assert_eq!(row.last_run_status.as_deref(), Some("running"));
     let first = runs.iter().find(|r| r.run_id == r1).unwrap();
     assert_eq!(
         (

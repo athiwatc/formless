@@ -361,6 +361,8 @@ struct ApprovalReq {
     code_preview: Option<String>,
     /// The Tool behind it, for `v` (its full code).
     tool_id: Option<String>,
+    /// The Session whose Run asked.
+    session_id: Option<String>,
 }
 
 enum WizardJob {
@@ -2187,6 +2189,7 @@ impl App {
                     already_allowed,
                     code_preview,
                     tool_id,
+                    session_id: Some(session_id),
                 });
             }
             Event::ToolUpdated { tool } => {
@@ -2246,6 +2249,7 @@ impl App {
                     already_allowed: Vec::new(),
                     code_preview: None,
                     tool_id: None,
+                    session_id: None,
                 });
             }
             Event::InvocationPending {
@@ -6063,6 +6067,26 @@ fn pane_widths(v: &[u16]) -> (u16, u16) {
     (fix(v.first(), 22), fix(v.get(1), 26))
 }
 
+/// A Session's state icon for the list (SPEC §10.4): waiting on an
+/// approval or a question, running, paused, or nothing.
+fn session_state(app: &App, s: &SessionInfo) -> (&'static str, Style) {
+    let waiting = app
+        .approvals
+        .iter()
+        .any(|a| a.session_id.as_deref() == Some(s.id.as_str()));
+    if waiting {
+        ("⚠", bold_fg(app.color, Color::Red))
+    } else if app.questions.iter().any(|q| q.session_id == s.id) {
+        ("?", bold_fg(app.color, Color::Magenta))
+    } else if app.running_sessions.contains(&s.id) {
+        ("◐", fg(app.color, Color::Yellow))
+    } else if s.last_run_status.as_deref() == Some("paused") {
+        ("⏸", fg(app.color, Color::Yellow))
+    } else {
+        (" ", Style::default())
+    }
+}
+
 /// A directory for display: `~` for home, and only the last two parts
 /// of a long path (`…/work/formless`).
 fn short_dir(dir: &str) -> String {
@@ -7398,7 +7422,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let now = chrono::Utc::now();
-    let name_w = (area.width as usize).saturating_sub(20).max(10);
+    let name_w = (area.width as usize / 3).clamp(10, 40);
     let visible = app.visible_sessions();
     let items: Vec<ListItem> = if app.sessions.is_empty() {
         vec![ListItem::new(Line::styled(
@@ -7416,19 +7440,33 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
             .map(|&i| &app.sessions[i])
             .map(|s| {
                 let current = Some(&s.id) == app.current.as_ref();
+                let (icon, style) = session_state(app, s);
+                let mut meta = format!(
+                    "{} · {} msg{}",
+                    ui::relative_time(&s.updated_at, now),
+                    s.message_count,
+                    if s.message_count == 1 { "" } else { "s" }
+                );
+                if let Some(m) = s.model.as_deref().filter(|m| !m.is_empty()) {
+                    meta.push_str(&format!(" · {m}"));
+                }
+                if let Some(d) = &s.cwd {
+                    meta.push_str(&format!(" · {}", short_dir(d)));
+                }
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         if current { "● " } else { "  " },
                         fg(app.color, Color::Cyan),
                     ),
+                    Span::styled(format!("{icon} "), style),
                     Span::raw(ui::pad(&s.name, name_w)),
-                    Span::styled(ui::relative_time(&s.updated_at, now), ui::dim(app.color)),
+                    Span::styled(format!(" {meta}"), ui::dim(app.color)),
                     Span::styled(
-                        s.cwd
+                        s.preview
                             .as_deref()
-                            .map(|d| format!("  {}", short_dir(d)))
+                            .map(|p| format!("  “{p}”"))
                             .unwrap_or_default(),
-                        ui::dim(app.color),
+                        fg(app.color, Color::Gray),
                     ),
                 ]))
             })
@@ -9535,6 +9573,9 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
         }];
         app.key(key(KeyCode::Char('d')));
         assert_eq!(app.delete_arm.as_deref(), Some("s1"));
@@ -9563,6 +9604,7 @@ mod tests {
             already_allowed: Vec::new(),
             code_preview: None,
             tool_id: None,
+            session_id: None,
         });
         let screen = render(&mut app, 100, 24);
         assert!(
@@ -9627,6 +9669,7 @@ mod tests {
             already_allowed: Vec::new(),
             code_preview: None,
             tool_id: None,
+            session_id: None,
         });
         app.editor = Some(EditorState {
             tool_id: "t".into(),
@@ -10311,6 +10354,9 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 cwd: None,
+                message_count: 0,
+                preview: None,
+                last_run_status: None,
             })
             .collect();
         app.switch_session("refactor-auth".into());
@@ -10529,6 +10575,7 @@ mod tests {
             already_allowed: Vec::new(),
             code_preview: None,
             tool_id: None,
+            session_id: None,
         });
         assert!(render(&mut app, 100, 30).contains("Tab: keep typing"));
         // Typing moves focus to the input; y and n then type normally.
@@ -10565,6 +10612,7 @@ mod tests {
             already_allowed: Vec::new(),
             code_preview: Some("function run(i) {".into()),
             tool_id: Some("t1".into()),
+            session_id: None,
         });
         app.key(key(KeyCode::Char('?')));
         let screen = render(&mut app, 110, 30);
@@ -10882,6 +10930,9 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             cwd: Some(here.join("src").to_string_lossy().into_owned()),
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
         }];
         app.switch_session("s".into());
         assert_eq!(app.work_dir(), here.join("src"));
@@ -10892,6 +10943,33 @@ mod tests {
         assert!(app.notes.last().unwrap().starts_with("working directory: "));
         assert_eq!(short_dir("/a/b/c/d/e"), "…/d/e");
         assert_eq!(short_dir("/a/b"), "/a/b");
+    }
+
+    #[test]
+    fn sessions_list_shows_state_count_and_preview() {
+        let mut app = test_app();
+        let session = |id: &str, status: Option<&str>| SessionInfo {
+            id: id.into(),
+            name: format!("{id} work"),
+            model: Some("gpt-x".into()),
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: None,
+            message_count: 12,
+            preview: Some(format!("fix the {id} build")),
+            last_run_status: status.map(str::to_string),
+        };
+        app.sessions = vec![session("a", Some("paused")), session("b", None)];
+        app.running_sessions.insert("b".into());
+        app.view = View::Sessions;
+        let screen = render(&mut app, 140, 20);
+        assert!(screen.contains("12 msgs · gpt-x"), "{screen}");
+        assert!(screen.contains("“fix the a build”"));
+        assert!(
+            screen.contains("⏸ a work") && screen.contains("◐ b work"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -11090,6 +11168,7 @@ mod tests {
             already_allowed: Vec::new(),
             code_preview: None,
             tool_id: None,
+            session_id: None,
         });
         app.slash("approve");
         let last = app.notes.last().unwrap();
