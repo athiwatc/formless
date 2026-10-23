@@ -51,6 +51,15 @@ enum Cmd {
         /// stuck daemon, tighten secret file permissions, then check again
         #[arg(long)]
         fix: bool,
+        /// A machine-readable report, secrets redacted
+        #[arg(long, conflicts_with = "fix")]
+        json: bool,
+    },
+    /// Write a redacted bug report (doctor, versions, OS, recent log) to attach to an issue
+    BugReport {
+        /// Where to write it (default: ./formless-bug-report-<time>.md)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
     /// Apply artifact retention now (artifacts.max_total_mb / max_age_days)
     Gc,
@@ -647,7 +656,12 @@ fn main() -> Result<()> {
             },
         ),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
-        Some(Cmd::Doctor { fix }) => doctor(paths, fix),
+        Some(Cmd::Doctor { json: true, .. }) => {
+            println!("{}", serde_json::to_string_pretty(&doctor_json(&paths)?)?);
+            Ok(())
+        }
+        Some(Cmd::Doctor { fix, .. }) => doctor(paths, fix),
+        Some(Cmd::BugReport { output }) => bug_report(&paths, output),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
@@ -1394,7 +1408,7 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
 }
 
 fn doctor(paths: Paths, fix: bool) -> Result<()> {
-    let problems = doctor_report(&paths)?;
+    let problems = doctor_report(&paths, false)?;
     if problems.is_empty() {
         println!("\nno problems found");
         return Ok(());
@@ -1431,7 +1445,7 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
     }
     // Check again (this re-runs the probe too).
     println!("\nchecking again:");
-    let left = doctor_report(&paths)?;
+    let left = doctor_report(&paths, false)?;
     if left.is_empty() {
         println!("\nno problems left");
     } else {
@@ -1446,14 +1460,129 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
     Ok(())
 }
 
+/// Secrets out of text meant for others: bearer tokens, API keys, pairing
+/// and login fragments, URL credentials, long tokens, and the home path.
+fn redact(text: &str) -> String {
+    use std::sync::OnceLock;
+    static RULES: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        [
+            (r"(?i)(bearer\s+)[^\s\x22',]+", "${1}[redacted]"),
+            (r"(?i)((?:api[_-]?key|token|secret|password|authorization)\x22?\s*[:=]\s*\x22?)[^\s\x22',]+", "${1}[redacted]"),
+            (r"#(k|local)=[^\s&\x22']+", "#${1}=[redacted]"),
+            (r"(://)[^/\s:@]+:[^/\s@]+@", "${1}[redacted]@"),
+            (r"\b(sk|pk|rk|ghp|gho|xox[abp])[-_][A-Za-z0-9_\-]{8,}", "${1}-[redacted]"),
+            (r"[A-Za-z0-9+/_\-]{40,}={0,2}", "[redacted]"),
+        ]
+        .into_iter()
+        .map(|(re, to)| (regex::Regex::new(re).expect("redaction rule"), to))
+        .collect()
+    });
+    let mut out = text.to_string();
+    for (re, to) in rules {
+        out = re.replace_all(&out, *to).into_owned();
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        out = out.replace(&*home.to_string_lossy(), "~");
+    }
+    out
+}
+
+/// `doctor --json`: the facts and problems, redacted.
+fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
+    let cfg = Config::load(paths)?;
+    let problems = doctor_report(paths, true)?;
+    let auth = formless_core::auth::auth_status(paths, &cfg.provider);
+    let report = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "profile": paths.profile,
+        "data_dir": paths.data_dir.display().to_string(),
+        "config_dir": paths.config_dir.display().to_string(),
+        "db_present": paths.db_file().exists(),
+        "log_bytes": formless_core::logs::log_usage(paths),
+        "daemon_running": daemon_reachable(paths),
+        "provider": {
+            "configured": cfg.provider.is_configured(),
+            "base_url": cfg.provider.base_url,
+            "model": cfg.provider.model,
+            "api_style": cfg.provider.api_style,
+            "tool_mode": cfg.provider.tool_mode,
+            "auth_mode": auth.mode,
+            "credential_present": auth.credential_present,
+        },
+        "relay": { "enabled": cfg.relay.enabled, "url": cfg.relay.url },
+        "naming": naming_model_status(paths, &cfg),
+        "problems": problems.iter().map(|p| serde_json::json!({
+            "what": p.what,
+            "next": p.next,
+            "fixable": p.fix.is_some(),
+        })).collect::<Vec<_>>(),
+    });
+    Ok(serde_json::from_str(&redact(&report.to_string()))?)
+}
+
+/// `formless bug-report`: doctor, versions, OS and the last 200 log lines,
+/// all redacted, in one Markdown file to attach to an issue.
+fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
+    let doctor = doctor_json(paths)?;
+    let log = std::fs::read_to_string(paths.log_file()).unwrap_or_default();
+    let tail: Vec<&str> = log
+        .lines()
+        .rev()
+        .take(200)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let text = format!(
+        "# formless bug report\n\n\
+         - formless {} on {} {}\n\
+         - created {}\n\n\
+         Secrets (keys, tokens, pairing links, URL credentials, long tokens) and your home path are \
+         redacted. Read it through before attaching it.\n\n\
+         ## What happened\n\n(describe it here)\n\n\
+         ## Doctor\n\n```json\n{}\n```\n\n\
+         ## Daemon log (last {} lines)\n\n```\n{}\n```\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
+        serde_json::to_string_pretty(&doctor)?,
+        tail.len(),
+        redact(&tail.join("\n")),
+    );
+    let path = output.unwrap_or_else(|| {
+        std::path::PathBuf::from(format!(
+            "formless-bug-report-{}.md",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        ))
+    });
+    std::fs::write(&path, text)?;
+    println!(
+        "wrote {} (secrets redacted; read it before attaching it to an issue)",
+        path.display()
+    );
+    Ok(())
+}
+
 /// Print the doctor report and return the problems found.
-fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
+fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
+    // `quiet`: only the problems (for --json and bug reports).
+    macro_rules! say {
+        ($($t:tt)*) => {
+            if !quiet {
+                println!($($t)*);
+            }
+        };
+    }
     let paths = paths.clone();
     let mut problems = doctor_local_problems(&paths);
     use formless_core::Store;
-    println!("data dir:   {}", paths.data_dir.display());
-    println!("config dir: {}", paths.config_dir.display());
-    println!(
+    say!("data dir:   {}", paths.data_dir.display());
+    say!("config dir: {}", paths.config_dir.display());
+    say!(
         "db:         {} ({})",
         paths.db_file().display(),
         if paths.db_file().exists() {
@@ -1466,20 +1595,20 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
     if let Ok((n, bytes)) =
         Store::open(&paths.db_file()).and_then(|s| formless_core::artifacts::usage(&s))
     {
-        println!(
+        say!(
             "artifacts:  {n} ({:.1} MB; caps {} MB, {} days)",
             bytes as f64 / 1e6,
             cfg.artifacts.max_total_mb,
             cfg.artifacts.max_age_days
         );
     }
-    println!(
+    say!(
         "logs:       {:.1} MB (rotates at {:.1} MB, keeps {})",
         formless_core::logs::log_usage(&paths) as f64 / 1e6,
         cfg.daemon.log_max_bytes as f64 / 1e6,
         cfg.daemon.log_keep
     );
-    println!(
+    say!(
         "base_url:   {}",
         if cfg.provider.base_url.is_empty() {
             "(unset)"
@@ -1487,7 +1616,7 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
             &cfg.provider.base_url
         }
     );
-    println!(
+    say!(
         "model:      {}",
         if cfg.provider.model.is_empty() {
             "(unset)"
@@ -1495,35 +1624,38 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
             &cfg.provider.model
         }
     );
-    println!(
+    say!(
         "api style:  {} (tools: {}, fallbacks: [{}])",
         cfg.provider.api_style,
         cfg.provider.tool_mode,
         cfg.provider.fallback_models.join(", ")
     );
     if formless_core::config::ProviderCfg::is_auto_model(&cfg.provider.model) {
-        println!(
+        say!(
             "routing:    auto over [{}]",
             cfg.provider.routing_candidates().join(", ")
         );
         if let Ok(store) = Store::open(&paths.db_file()) {
             if let Ok(stats) = store.list_model_stats() {
                 let picked = formless_core::routing::select_model(&cfg.provider, &stats, false);
-                println!(
+                say!(
                     "            simple task now routes to: {}",
                     picked.as_deref().unwrap_or("(no candidates)")
                 );
                 for st in &stats {
-                    println!(
+                    say!(
                         "            {}: ok={} fail={} total_ms={}",
-                        st.model, st.successes, st.failures, st.total_ms
+                        st.model,
+                        st.successes,
+                        st.failures,
+                        st.total_ms
                     );
                 }
             }
         }
     }
     let auth_status = formless_core::auth::auth_status(&paths, &cfg.provider);
-    println!(
+    say!(
         "auth:       {} ({})",
         auth_status.mode,
         if auth_status.credential_present {
@@ -1533,7 +1665,7 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
         }
     );
     if cfg.provider.oauth() {
-        println!(
+        say!(
             "oauth:      refresh={} expires_at={}",
             if auth_status.has_refresh_token {
                 "stored"
@@ -1548,7 +1680,7 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
     }
     let credential = formless_core::auth::resolve_provider_token_blocking(&paths, &cfg.provider);
     if let Err(error) = &credential {
-        println!("auth error: {error:#}");
+        say!("auth error: {error:#}");
         if cfg.provider.is_configured() {
             problems.push(Problem {
                 what: format!("no usable credential for the provider ({error})"),
@@ -1561,8 +1693,8 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
             });
         }
     }
-    println!("naming:     {}", naming_model_status(&paths, &cfg));
-    println!(
+    say!("naming:     {}", naming_model_status(&paths, &cfg));
+    say!(
         "daemon:     {}",
         if daemon_reachable(&paths) {
             "running"
@@ -1579,13 +1711,13 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
         };
         match (probe_model, credential.as_ref()) {
             (None, _) => {
-                println!("probe:      skipped (model=auto with no routing candidates)")
+                say!("probe:      skipped (model=auto with no routing candidates)")
             }
-            (_, Err(_)) => println!("probe:      skipped (credential unavailable)"),
+            (_, Err(_)) => say!("probe:      skipped (credential unavailable)"),
             (Some(probe_model), Ok(credential)) => {
                 match probe_blocking(&cfg.provider, credential, &probe_model) {
                     Ok(r) => {
-                        println!(
+                        say!(
                             "probe:      models={} streaming={} tool_calling={} prompt_fallback={}",
                             r.models.len(),
                             r.streaming,
@@ -1593,7 +1725,7 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
                             r.prompt_fallback
                         );
                         if !r.tool_calling {
-                            println!("WARNING: endpoint/model does not support tool-calling; sessions will be refused (SPEC §4.3).");
+                            say!("WARNING: endpoint/model does not support tool-calling; sessions will be refused (SPEC §4.3).");
                             problems.push(Problem {
                                 what: format!("{probe_model} doesn't call tools on this endpoint"),
                                 next: Some("formless config set provider.tool_mode prompt (or pick a model that supports tools: formless config set provider.model …)".into()),
@@ -1605,18 +1737,19 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
                             credential,
                             &probe_model,
                         ) {
-                            Ok(Some(u)) if u.cached_tokens > 0 => println!(
+                            Ok(Some(u)) if u.cached_tokens > 0 => say!(
                                 "cache:      yes ({} of {} prompt tokens cached on a repeat)",
-                                u.cached_tokens, u.prompt_tokens
+                                u.cached_tokens,
+                                u.prompt_tokens
                             ),
-                            Ok(Some(u)) => println!(
+                            Ok(Some(u)) => say!(
                                 "cache:      no cached tokens on a repeated {}-token prompt",
                                 u.prompt_tokens
                             ),
                             Ok(None) => {
-                                println!("cache:      unknown (endpoint reports no token usage)")
+                                say!("cache:      unknown (endpoint reports no token usage)")
                             }
-                            Err(e) => println!("cache:      probe failed: {e}"),
+                            Err(e) => say!("cache:      probe failed: {e}"),
                         }
                     }
                     Err(e) => {
@@ -1624,22 +1757,22 @@ fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
                             &format!("{e:#}"),
                             &formless_core::errors::ErrorContext::from_config(&cfg, &probe_model),
                         );
-                        println!("probe:      FAILED ({}): {}", x.category, x.message);
+                        say!("probe:      FAILED ({}): {}", x.category, x.message);
                         if let Some(action) = &x.action {
-                            println!("            next: {action}");
+                            say!("            next: {action}");
                         }
                         problems.push(Problem {
                             what: format!("the provider probe failed: {}", x.message),
                             next: x.action.clone(),
                             fix: None,
                         });
-                        println!("            details: {e:#}");
+                        say!("            details: {e:#}");
                     }
                 }
             }
         }
     } else {
-        println!("probe:      skipped (not configured; run `formless` for the wizard)");
+        say!("probe:      skipped (not configured; run `formless` for the wizard)");
         problems.push(Problem {
             what: "no provider is configured".into(),
             next: Some("formless (the setup wizard)".into()),
@@ -3676,6 +3809,32 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bug_reports_redact_secrets() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let text = format!(
+            "Authorization: Bearer abc.def.ghi\n\
+             api_key = \"sk-live-1234567890abcdef\"\n\
+             open https://formless.example/#k=c2VjcmV0c2VjcmV0c2VjcmV0\n\
+             http://127.0.0.1:5000/#local=0123abcd&s=x\n\
+             proxy https://user:hunter2@proxy.example:8080/v1\n\
+             token ghp_ABCDEFGHIJKLMNOPQRSTUV\n\
+             blob {}\n\
+             path {home}/projects/app\n\
+             session 79d338f2-4f6c-4116-b2d7-3043bbfd084b ok",
+            "x".repeat(48)
+        );
+        let r = redact(&text);
+        for secret in ["abc.def.ghi", "sk-live", "c2VjcmV0", "0123abcd", "hunter2", "ABCDEFGHIJ", &"x".repeat(48)] {
+            assert!(!r.contains(secret), "{secret} leaked:\n{r}");
+        }
+        if !home.is_empty() {
+            assert!(r.contains("path ~/projects/app"), "{r}");
+        }
+        // Ordinary ids and words survive.
+        assert!(r.contains("79d338f2-4f6c-4116-b2d7-3043bbfd084b ok"), "{r}");
+    }
 
     #[test]
     fn log_lines_group_into_entries_with_levels() {
