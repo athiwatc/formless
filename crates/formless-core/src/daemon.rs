@@ -5500,6 +5500,7 @@ impl Daemon {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            recent: String::new(),
         });
         let ver = ToolVersionInfo {
             version: 0,

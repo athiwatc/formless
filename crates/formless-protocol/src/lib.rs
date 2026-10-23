@@ -101,6 +101,10 @@ pub struct ToolInfo {
     pub needs_attention: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// Outcomes of the last 40 finished Invocations, oldest first: `s`
+    /// success, `f` failure (SPEC §10.4 sparkline and trend).
+    #[serde(default)]
+    pub recent: String,
 }
 
 /// A provider failure explained for people (SPEC §4.4).

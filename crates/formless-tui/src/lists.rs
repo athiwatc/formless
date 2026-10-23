@@ -207,6 +207,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: format!("2026-01-0{calls}"),
+            recent: String::new(),
         }
     }
 
