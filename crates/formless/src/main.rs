@@ -250,6 +250,9 @@ enum RelayAction {
         /// Also print the browser URL as a QR code (it contains the secret)
         #[arg(long)]
         qr: bool,
+        /// One JSON object (the browser URL holds the secret, so it's left out)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -262,7 +265,11 @@ enum UpdateAction {
 #[derive(Subcommand)]
 enum PromptsAction {
     /// List proposals with eval scores
-    List,
+    List {
+        /// One JSON value instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate and measure a new proposal
     Generate,
     /// Apply a measured proposal
@@ -275,7 +282,11 @@ enum PromptsAction {
 
 #[derive(Subcommand)]
 enum ToolsAction {
-    List,
+    List {
+        /// One JSON value instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// A Tool's description, schemas, Capabilities, versions and stats
     Show {
         /// Tool name or id
@@ -350,7 +361,11 @@ enum SkillsAction {
     Remove {
         name: String,
     },
-    List,
+    List {
+        /// One JSON value instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     Enable {
         name: String,
     },
@@ -377,7 +392,11 @@ enum SkillsAction {
 
 #[derive(Subcommand)]
 enum ProvidersAction {
-    List,
+    List {
+        /// One JSON value instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Add or update a provider; the API key is read from stdin (not argv)
     Add {
         name: String,
@@ -405,7 +424,11 @@ enum ProvidersAction {
 
 #[derive(Subcommand)]
 enum RolesAction {
-    List,
+    List {
+        /// One JSON value instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Create or replace a role
     Add {
         name: String,
@@ -430,7 +453,11 @@ enum RolesAction {
 
 #[derive(Subcommand)]
 enum JobsAction {
-    List,
+    List {
+        /// One JSON value instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Schedule a prompt: --cron "0 3 * * *" (recurring) or --at "in 30m"
     Add {
         prompt: String,
@@ -506,7 +533,11 @@ enum McpAction {
     /// Remove a server (its tools are retired, metrics kept)
     Remove { name: String },
     /// Configured servers: state, tool count, last error
-    List,
+    List {
+        /// One JSON value instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Restart a server and list its tools again
     Test { name: String },
     /// Authorize Formless with a remote (http) MCP server via OAuth
@@ -535,7 +566,11 @@ enum DaemonAction {
     /// Start the daemon if not running
     Start,
     Stop,
-    Status,
+    Status {
+        /// JSON even when the daemon isn't running ({"running": false})
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -793,8 +828,12 @@ fn prompts_cmd(paths: Paths, action: PromptsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
-        PromptsAction::List => {
+        PromptsAction::List { json } => {
             let v = request_once(&paths, Request::ListProposals)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
             let arr = v.as_array().cloned().unwrap_or_default();
             if arr.is_empty() {
                 println!("no proposals yet (formless prompts generate)");
@@ -889,7 +928,27 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
             );
             Ok(())
         }
-        RelayAction::Status { qr } => {
+        RelayAction::Status { qr, json } => {
+            if json {
+                let running = daemon_reachable(&paths);
+                let devices = if running {
+                    formless_tui::client::request_once(&paths, Request::ListRelayClients)
+                        .unwrap_or_default()
+                } else {
+                    serde_json::json!([])
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "enabled": cfg.relay.enabled,
+                        "url": cfg.relay.url,
+                        "paired": load_relay_secret(&paths).is_some(),
+                        "daemon_running": running,
+                        "devices": devices,
+                    }))?
+                );
+                return Ok(());
+            }
             println!("enabled:    {}", cfg.relay.enabled);
             println!("url:        {}", cfg.relay.url);
             match load_relay_secret(&paths) {
@@ -964,10 +1023,12 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
             println!("daemon stopping");
             Ok(())
         }
-        DaemonAction::Status => {
+        DaemonAction::Status { json } => {
             if daemon_reachable(&paths) {
                 let v = formless_tui::client::request_once(&paths, Request::Status)?;
                 println!("{}", serde_json::to_string_pretty(&v)?);
+            } else if json {
+                println!("{}", serde_json::json!({ "running": false }));
             } else {
                 println!("daemon not running");
             }
@@ -1783,8 +1844,12 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
             daemon(Request::RemoveSkill { name: name.clone() })?;
             println!("removed {name}");
         }
-        SkillsAction::List => {
+        SkillsAction::List { json } => {
             let list = daemon(Request::ListSkills)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
             let skills = list.as_array().cloned().unwrap_or_default();
             if skills.is_empty() {
                 println!("no skills installed (formless skills add …)");
@@ -2249,8 +2314,12 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
     match action {
-        ProvidersAction::List => {
+        ProvidersAction::List { json } => {
             let r = daemon(Request::ListProviders)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r["providers"])?);
+                return Ok(());
+            }
             for p in r["providers"].as_array().into_iter().flatten() {
                 println!(
                     "{:<14} {:<40} model {:<24} {}",
@@ -2343,8 +2412,12 @@ fn roles_cmd(paths: Paths, action: RolesAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
     match action {
-        RolesAction::List => {
+        RolesAction::List { json } => {
             let r = daemon(Request::ListProviders)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r["roles"])?);
+                return Ok(());
+            }
             let roles = r["roles"].as_object().cloned().unwrap_or_default();
             if roles.is_empty() {
                 println!(
@@ -2391,8 +2464,12 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
     match action {
-        JobsAction::List => {
+        JobsAction::List { json } => {
             let list = daemon(Request::ListJobs)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
             let jobs = list.as_array().cloned().unwrap_or_default();
             if jobs.is_empty() {
                 println!("no scheduled jobs (formless jobs add …)");
@@ -2596,8 +2673,12 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             let r = daemon(Request::RemoveMcpServer { name: name.clone() })?;
             println!("removed: {name} ({} tool(s) retired)", r["retired_tools"]);
         }
-        McpAction::List => {
+        McpAction::List { json } => {
             let list = daemon(Request::ListMcpServers)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
             let servers = list.as_array().cloned().unwrap_or_default();
             if servers.is_empty() {
                 println!("no MCP servers configured (formless mcp add …)");
@@ -2716,8 +2797,12 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
-        ToolsAction::List => {
+        ToolsAction::List { json } => {
             let v = request_once(&paths, Request::ListTools)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
             let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
             if tools.is_empty() {
                 println!("(no tools yet - the agent builds them via create_tool)");
