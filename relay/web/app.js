@@ -1915,7 +1915,8 @@
               const ok = await ask({ title: "Remove MCP server " + m.name + "?", text: "Its tools are retired (metrics kept).", ok: "Remove", danger: true });
               if (ok) { await act({ type: "remove_mcp_server", name: m.name }, "Removed " + m.name); refreshSettings(); }
             } }, "Remove"))))))
-        : h("p", { class: "muted" }, "None. Add one with formless mcp add NAME -- COMMAND, or --url URL.")));
+        : h("p", { class: "muted" }, "None yet."),
+      h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => addMcpServer() }, "Add MCP server"))));
     const skills = S.skills || [];
     grid.append(h("section", null, h("h3", null, "Skills"),
       skills.length ? h("table", { class: "table" },
@@ -1930,7 +1931,10 @@
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               if (await ask({ title: "Remove skill " + sk.name + "?", text: "All its versions are deleted.", ok: "Remove", danger: true })) { await act({ type: "remove_skill", name: sk.name }, "Removed " + sk.name); refreshSettings(); }
             } }, "Remove"))))))
-        : h("p", { class: "muted" }, "None. Install one with formless skills add FOLDER | GIT_URL | FILE.zip")));
+        : h("p", { class: "muted" }, "None yet."),
+      h("div", { class: "detail-actions" },
+        h("button", { class: "btn small", type: "button", onclick: () => addSkill() }, "Add skill"),
+        h("button", { class: "btn small", type: "button", onclick: () => importSkillBundle() }, "Import bundle"))));
     const audit = S.audit || [];
     const auditFilter = h("input", { type: "search", placeholder: "Filter: tool.approve, skill, a Tool name…", value: S.auditFilter || "" });
     auditFilter.addEventListener("change", () => { S.auditFilter = auditFilter.value; loadAudit(false); });
@@ -2096,6 +2100,73 @@
           if (await act({ type: "undo_harness_change", id: c.id }, "Undone")) refreshSettings();
         } }, "Undo"))))))
         : h("p", { class: "muted" }, "The agent hasn't changed its own setup (MCP servers, skills, settings) yet."));
+  }
+  /** Split a command line into words, keeping "quoted parts" together. */
+  function splitArgs(line) {
+    return [...line.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+  }
+  /** `KEY=value` / `Key: value` lines to an object. */
+  function pairs(text, sep) {
+    const out = {};
+    for (const line of text.split("\n")) {
+      const i = line.indexOf(sep);
+      if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    }
+    return out;
+  }
+  /** Settings → Add MCP server: a stdio command or an HTTP URL. Adding
+   * lists its tools at once, which doubles as the connection test. */
+  async function addMcpServer() {
+    const name = h("input", { type: "text", placeholder: "github", spellcheck: "false" });
+    const transport = h("select", null, h("option", { value: "stdio" }, "Command (stdio)"), h("option", { value: "http" }, "URL (HTTP)"));
+    const command = h("input", { type: "text", placeholder: "npx -y @modelcontextprotocol/server-github", spellcheck: "false" });
+    const env = h("textarea", { rows: 2, placeholder: "KEY=value, one per line", spellcheck: "false" });
+    const url = h("input", { type: "text", placeholder: "https://example.com/mcp", spellcheck: "false" });
+    const headers = h("textarea", { rows: 2, placeholder: "Header: value, one per line", spellcheck: "false" });
+    const stdio = [field("Command", command), field("Environment", env)];
+    const http = [field("URL", url), field("Headers", headers)];
+    const sync = () => {
+      stdio.forEach((f) => f.classList.toggle("hidden", transport.value !== "stdio"));
+      http.forEach((f) => f.classList.toggle("hidden", transport.value !== "http"));
+    };
+    transport.onchange = sync;
+    sync();
+    const body = h("div", { class: "try-form" }, field("Name", name), field("Connect with", transport), stdio, http);
+    if (!(await ask({ title: "Add MCP server", text: "It starts now and its tools are listed; they're asked about before first use.", body, ok: "Add and test" }))) return;
+    const server = { transport: transport.value };
+    if (transport.value === "stdio") {
+      const words = splitArgs(command.value.trim());
+      if (!words.length) return toast("A command is needed.", true);
+      Object.assign(server, { command: words[0], args: words.slice(1), env: pairs(env.value, "=") });
+    } else {
+      if (!url.value.trim()) return toast("A URL is needed.", true);
+      Object.assign(server, { url: url.value.trim(), headers: pairs(headers.value, ":") });
+    }
+    toast("Connecting to " + name.value.trim() + "…");
+    const r = await act({ type: "add_mcp_server", name: name.value.trim(), server }, null, 120000);
+    if (!r) return;
+    if (r.error) note("Added " + r.added + ", but it didn't connect: " + r.error + " (Restart retries)", true);
+    else note("Added " + r.added + ": " + (r.tools || []).length + " tools");
+    refreshSettings();
+  }
+  /** Settings → Add skill: a folder or zip on the daemon's machine, or a
+   * git URL (optionally a subfolder and ref). */
+  async function addSkill() {
+    const source = h("input", { type: "text", placeholder: "~/skills/pdf  or  https://github.com/org/skills.git", spellcheck: "false" });
+    const subdir = h("input", { type: "text", placeholder: "subfolder (optional)", spellcheck: "false" });
+    const ref = h("input", { type: "text", placeholder: "branch or tag (optional)", spellcheck: "false" });
+    const body = h("div", { class: "try-form" }, field("Path, zip or git URL", source), field("Subfolder", subdir), field("Git ref", ref));
+    if (!(await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add" }))) return;
+    if (!source.value.trim()) return toast("A source is needed.", true);
+    const r = await act({ type: "add_skill", source: source.value.trim(), subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }, null, 120000);
+    if (r) { note("Added skill " + (r.name || "")); refreshSettings(); }
+  }
+  /** A `formless.skill/1` or `formless.skills/1` bundle from this browser
+   * (installed disabled, for review). */
+  async function importSkillBundle() {
+    const bundle = await pickJson();
+    if (!bundle) return;
+    if (await act({ type: "import_skill", bundle }, "Imported; review and enable it below")) refreshSettings();
   }
   /** A labelled form field for ask() bodies. */
   function field(label, input) {
