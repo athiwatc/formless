@@ -210,6 +210,15 @@ fn drafts_file(paths: &Paths) -> std::path::PathBuf {
     paths.data_dir.join("tui-drafts.json")
 }
 
+/// A bulk action on marked Sessions that needs typed input first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BulkAction {
+    /// The user must type `delete` to confirm.
+    Delete,
+    /// The input is tags to add.
+    Tag,
+}
+
 /// What a mouse click can hit.
 #[derive(Debug, Clone, PartialEq)]
 enum Click {
@@ -874,6 +883,10 @@ struct App {
     subagents: Vec<SubagentInfo>,
     import_mode: Option<ImportKind>,
     renaming: bool,
+    /// Sessions marked with Space for a bulk action (SPEC §10.4), and a
+    /// bulk action waiting for its typed input (tags, or "delete").
+    marked: HashSet<String>,
+    bulk: Option<(BulkAction, Vec<String>)>,
     modules: Vec<ModuleInfo>,
     model_stats: Vec<ModelStatInfo>,
     /// Run outcomes for the Metrics title (SPEC §8.7).
@@ -1054,6 +1067,8 @@ impl App {
             subagents: Vec::new(),
             import_mode: None,
             renaming: false,
+            marked: HashSet::new(),
+            bulk: None,
             modules: Vec::new(),
             model_stats: Vec::new(),
             run_summary: None,
@@ -2473,6 +2488,10 @@ impl App {
                 }
                 Err(e) => self.notes.push(format!("import failed: {e}")),
             }
+            return;
+        }
+        if let Some((action, ids)) = self.bulk.take() {
+            self.finish_bulk(action, ids, &text);
             return;
         }
         if self.renaming {
@@ -4113,6 +4132,23 @@ impl App {
                         self.view = View::Chat;
                     }
                 }
+                KeyCode::Char(' ') => {
+                    if let Some(s) = self.selected_session().cloned() {
+                        if !self.marked.remove(&s.id) {
+                            self.marked.insert(s.id);
+                        }
+                    }
+                }
+                KeyCode::Char('d' | 'a' | 'e' | 't') if !self.marked.is_empty() => {
+                    let ids: Vec<String> = self
+                        .sessions
+                        .iter()
+                        .filter(|s| self.marked.contains(&s.id))
+                        .map(|s| s.id.clone())
+                        .collect();
+                    self.bulk_key(key.code, ids);
+                }
+                KeyCode::Esc if !self.marked.is_empty() => self.marked.clear(),
                 KeyCode::Char('n') => self.request(
                     Pending::CreateSession,
                     Request::CreateSession { name: None },
@@ -4970,6 +5006,11 @@ impl App {
             KeyCode::Esc if !self.running() && self.toasts.iter().any(|t| t.2) => {
                 self.toasts.clear();
             }
+            KeyCode::Esc if self.bulk.is_some() => {
+                self.bulk = None;
+                self.input.clear();
+                self.notes.push("cancelled".into());
+            }
             KeyCode::Esc if self.editing_id.is_some() => {
                 self.editing_id = None;
                 self.edit_armed = false;
@@ -5725,7 +5766,16 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         f.render_widget(Paragraph::new(line).block(block), area);
         return;
     }
-    let (prompt, color) = if app.renaming {
+    let (prompt, color) = if let Some((action, ids)) = &app.bulk {
+        (
+            match action {
+                BulkAction::Delete if ids.len() == 1 => "type delete to delete 1 Session › ",
+                BulkAction::Delete => "type delete to delete these Sessions › ",
+                BulkAction::Tag => "tags to add › ",
+            },
+            Color::Red,
+        )
+    } else if app.renaming {
         ("rename › ", Color::Magenta)
     } else if app.search_mode {
         ("search › ", Color::Magenta)
@@ -6480,6 +6530,90 @@ impl App {
             tags.retain(|t| !given.contains(t));
         }
         self.request(Pending::SetTags, Request::SetSessionTags { id: s.id, tags });
+    }
+
+    /// A bulk key on the marked Sessions: archive and export act at once;
+    /// tag and delete ask for typed input first.
+    fn bulk_key(&mut self, code: KeyCode, ids: Vec<String>) {
+        let n = ids.len();
+        match code {
+            KeyCode::Char('a') => {
+                // Archive them, or restore them if all are archived.
+                let restore = self
+                    .sessions
+                    .iter()
+                    .filter(|s| ids.contains(&s.id))
+                    .all(|s| s.archived);
+                for id in ids {
+                    self.request(
+                        Pending::SetArchive,
+                        Request::SetSessionArchived {
+                            id,
+                            archived: !restore,
+                        },
+                    );
+                }
+                self.marked.clear();
+            }
+            KeyCode::Char('e') => {
+                for id in ids {
+                    self.request(Pending::ExportSession, Request::ExportSession { id });
+                }
+                self.notes.push(format!("exporting {n} Sessions"));
+                self.marked.clear();
+            }
+            KeyCode::Char('t') => {
+                self.bulk = Some((BulkAction::Tag, ids));
+                self.view = View::Chat;
+                self.input.clear();
+                self.notes.push(format!(
+                    "Type tags to add to {n} Sessions, then Enter (Esc cancels)."
+                ));
+            }
+            _ => {
+                self.bulk = Some((BulkAction::Delete, ids));
+                self.view = View::Chat;
+                self.input.clear();
+                self.notes.push(format!(
+                    "Type delete and Enter to delete {n} Sessions (Esc cancels)."
+                ));
+            }
+        }
+    }
+
+    /// The typed half of a bulk action.
+    fn finish_bulk(&mut self, action: BulkAction, ids: Vec<String>, text: &str) {
+        match action {
+            BulkAction::Delete if text.trim() == "delete" => {
+                for id in &ids {
+                    self.fire(Request::DeleteSession { id: id.clone() });
+                }
+                self.notes.push(format!("deleted {} Sessions", ids.len()));
+                self.request(Pending::ListSessions, Request::ListSessions);
+            }
+            BulkAction::Delete => self
+                .notes
+                .push("not deleted (type delete to confirm)".into()),
+            BulkAction::Tag => {
+                let add: Vec<String> = text
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .map(|t| t.trim_start_matches('#').to_lowercase())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                for s in self
+                    .sessions
+                    .iter()
+                    .filter(|s| ids.contains(&s.id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    let mut tags = s.tags.clone();
+                    tags.extend(add.iter().cloned());
+                    self.request(Pending::SetTags, Request::SetSessionTags { id: s.id, tags });
+                }
+            }
+        }
+        self.marked.clear();
     }
 
     /// Pin or unpin a Session (SPEC §10.4).
@@ -7596,8 +7730,14 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                 }
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        if current { "● " } else { "  " },
-                        fg(app.color, Color::Cyan),
+                        if app.marked.contains(&s.id) {
+                            "✓ "
+                        } else if current {
+                            "● "
+                        } else {
+                            "  "
+                        },
+                        bold_fg(app.color, Color::Cyan),
                     ),
                     Span::styled(format!("{icon} "), style),
                     Span::styled(
@@ -7625,13 +7765,22 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(
         List::new(items)
             .block(ui::panel(
-                app.session_filter.title(
-                    "Sessions",
-                    visible.len(),
-                    app.sessions.len(),
-                    lists::SESSION_SORTS,
-                    lists::SESSION_QUICK,
-                ),
+                {
+                    let mut t = app.session_filter.title(
+                        "Sessions",
+                        visible.len(),
+                        app.sessions.len(),
+                        lists::SESSION_SORTS,
+                        lists::SESSION_QUICK,
+                    );
+                    if !app.marked.is_empty() {
+                        t.push_str(&format!(
+                            "· {} selected: a archive · e export · t tag · d delete · Esc clear ",
+                            app.marked.len()
+                        ));
+                    }
+                    t
+                },
                 app.color,
                 Color::Cyan,
             ))
@@ -9162,6 +9311,8 @@ mod tests {
             subagents: Vec::new(),
             import_mode: None,
             renaming: false,
+            marked: HashSet::new(),
+            bulk: None,
             modules: Vec::new(),
             model_stats: Vec::new(),
             run_summary: None,
@@ -11282,6 +11433,54 @@ mod tests {
         assert_eq!(app.notes.last().unwrap(), "restoring session doomed");
         app.key(key(KeyCode::Char('u')));
         assert_eq!(app.notes.last().unwrap(), "nothing to undo");
+    }
+
+    #[test]
+    fn bulk_actions_on_marked_sessions() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let session = |id: &str| SessionInfo {
+            id: id.into(),
+            name: id.into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned: false,
+            archived: false,
+            tags: Vec::new(),
+        };
+        app.sessions = vec![session("a1"), session("b2"), session("c3")];
+        app.view = View::Sessions;
+        app.key(key(KeyCode::Char(' ')));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::Char(' ')));
+        assert_eq!(app.marked.len(), 2);
+        assert!(render(&mut app, 140, 20).contains("2 selected"));
+        // Delete needs "delete" typed; anything else keeps them.
+        app.key(key(KeyCode::Char('d')));
+        assert_eq!(app.bulk.as_ref().unwrap().1.len(), 2);
+        assert_eq!(app.view, View::Chat);
+        for c in "nope".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert!(app.notes.last().unwrap().contains("not deleted"));
+        // Tagging takes the typed tags; Esc clears marks in the list.
+        app.view = View::Sessions;
+        app.key(key(KeyCode::Char(' ')));
+        app.key(key(KeyCode::Char('t')));
+        assert_eq!(app.bulk.as_ref().unwrap().0, BulkAction::Tag);
+        app.key(key(KeyCode::Esc));
+        assert!(app.bulk.is_none());
+        app.view = View::Sessions;
+        app.key(key(KeyCode::Char(' ')));
+        app.key(key(KeyCode::Esc));
+        assert!(app.marked.is_empty());
     }
 
     #[test]

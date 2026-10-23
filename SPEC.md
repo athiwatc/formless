@@ -1724,6 +1724,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
+- **Bulk actions.** In the TUI Sessions view, Space marks rows (✓, with
+  the count in the panel title) and Esc clears the marks. With marks:
+  `a` archives them (or restores them if all are archived), `e` exports
+  each, `t` asks for tags to add, and `d` asks you to type `delete`
+  before deleting them. The web sidebar has a checkbox per row and a bulk
+  bar (Archive, Export, Tag, Delete with the same typed confirmation,
+  Clear).
 - **Undo delete.** Deleting a Session is a soft delete for
   `daemon.delete_undo_secs` (default 30 s), restored with `RestoreSession`.
   The TUI says "deleted session X · u (or /undo) restores it for 30s",
