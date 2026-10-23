@@ -284,6 +284,27 @@ enum ToolsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Retire a Tool: hidden from the agent, kept with its history
+    Retire {
+        name: String,
+    },
+    /// Bring a retired Tool back
+    Restore {
+        name: String,
+    },
+    /// Make an earlier version current again (default: the one before)
+    Rollback {
+        name: String,
+        #[arg(long)]
+        to: Option<i64>,
+    },
+    /// Delete a Tool and all its versions and history for good
+    Purge {
+        name: String,
+        /// Required without a terminal to confirm on
+        #[arg(long)]
+        force: bool,
+    },
     /// Run a Tool directly; sensitive Capabilities are denied unless --yes
     Run {
         /// Tool name or id
@@ -2779,6 +2800,60 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             let code = tool_run(&paths, tool, input, yes, session)?;
             std::process::exit(code);
         }
+        ToolsAction::Retire { name } => set_tool_retired(&paths, &name, true),
+        ToolsAction::Restore { name } => set_tool_retired(&paths, &name, false),
+        ToolsAction::Rollback { name, to } => {
+            let tool = find_tool(&paths, &name)?;
+            let version = to.unwrap_or(tool.current_version - 1);
+            if version < 1 || version == tool.current_version {
+                eprintln!(
+                    "{} is at v{}; give --to with an earlier version",
+                    tool.name, tool.current_version
+                );
+                std::process::exit(2);
+            }
+            request_once(
+                &paths,
+                Request::RollbackTool {
+                    id: tool.id.clone(),
+                    version,
+                },
+            )?;
+            println!("{} now runs v{version}", tool.name);
+            Ok(())
+        }
+        ToolsAction::Purge { name, force } => {
+            use std::io::{BufRead, IsTerminal, Write};
+            let tool = find_tool(&paths, &name)?;
+            if !force {
+                if !std::io::stdin().is_terminal() {
+                    eprintln!(
+                        "purge deletes {} for good; pass --force to confirm without a terminal",
+                        tool.name
+                    );
+                    std::process::exit(2);
+                }
+                eprint!(
+                    "This deletes {} and all its versions and history. Type its name to confirm: ",
+                    tool.name
+                );
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                if line.trim() != tool.name {
+                    eprintln!("aborted");
+                    std::process::exit(2);
+                }
+            }
+            request_once(
+                &paths,
+                Request::PurgeTool {
+                    id: tool.id.clone(),
+                },
+            )?;
+            println!("purged {}", tool.name);
+            Ok(())
+        }
         ToolsAction::Import { file } => {
             let text = std::fs::read_to_string(&file)?;
             let bundle: serde_json::Value = serde_json::from_str(&text)?;
@@ -2787,6 +2862,26 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Retire or restore a Tool by name or id.
+fn set_tool_retired(paths: &Paths, name: &str, retire: bool) -> Result<()> {
+    let tool = find_tool(paths, name)?;
+    let id = tool.id.clone();
+    formless_tui::client::request_once(
+        paths,
+        if retire {
+            Request::RetireTool { id }
+        } else {
+            Request::RestoreTool { id }
+        },
+    )?;
+    println!(
+        "{} {}",
+        if retire { "retired" } else { "restored" },
+        tool.name
+    );
+    Ok(())
 }
 
 /// The Tool with this name or id.

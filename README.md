@@ -417,6 +417,7 @@ formless --profile sandbox
 | `formless daemon start\|stop\|status\|serve` | Daemon lifecycle |
 | `formless relay enable\|disable\|status` | Encrypted browser access (v2) |
 | `formless tools list\|show\|run\|export\|import` | Registry inspection, direct runs, and transfer (no secrets, no metrics) |
+| `formless tools retire\|restore\|rollback [--to N]\|purge [--force]` | Tool lifecycle, as in the Tools view |
 | `formless auth login\|status\|logout` | OAuth sign-in for subscription providers (v2) |
 | `formless prompts list\|generate\|apply\|reject\|rollback` | Measured prompt/memory proposals (v2) |
 | `formless update check` | Compare with the latest GitHub release; never modifies the binary |
