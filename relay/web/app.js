@@ -1448,6 +1448,31 @@
     else note("no pending or stalled tool to cancel (Esc stops the whole run)", true);
   }
 
+  /** A streaming answer split into its finished Markdown blocks and the
+   * unfinished tail (the TUI's complete-prefix rule): blocks end at a blank
+   * line outside a code fence, so an open fence, table or list stays plain
+   * text until it's done and nothing above it reflows. */
+  function splitStreaming(text) {
+    let fence = null, cut = 0, at = 0;
+    for (const line of text.split("\n")) {
+      const next = at + line.length + 1;
+      const m = line.match(/^\s*(`{3,}|~{3,})/);
+      if (m && (!fence || (m[1][0] === fence[0] && m[1].length >= fence.length))) fence = fence ? null : m[1];
+      else if (!fence && !line.trim() && next <= text.length) cut = next;
+      at = next;
+    }
+    return [text.slice(0, cut), text.slice(cut)];
+  }
+  // The rendered finished part, reused while it doesn't change.
+  const liveDone = { src: null, node: null };
+  function streamingNode(text) {
+    const [done, tail] = splitStreaming(text);
+    if (liveDone.src !== done) {
+      liveDone.src = done;
+      liveDone.node = done ? markdown(done) : null;
+    }
+    return h("div", { class: "streaming" }, liveDone.node, tail ? h("div", { class: "stream-tail" }, tail) : null);
+  }
   function renderLive() {
     const live = $("live");
     if (!live) return;
@@ -1472,7 +1497,7 @@
           h("span", { class: "tstat" }, elapsed(t.started))),
         payload(t.arguments || "")));
     }
-    if (S.streaming) live.append(markdown(S.streaming));
+    if (S.streaming) live.append(streamingNode(S.streaming));
     else if (running && S.activity) live.append(h("div", { class: "activity" }, h("span", { class: "spinner" }), S.activity.label + "… " + elapsed(S.activity.since)));
     scrollToBottom();
   }
