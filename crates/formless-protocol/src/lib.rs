@@ -13,6 +13,10 @@ pub struct SessionInfo {
     pub reasoning_effort: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// The Session's working directory: the base for relative paths and
+    /// `@` mentions (SPEC §5.1).
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -528,6 +532,12 @@ pub enum Request {
         message_id: String,
         content: String,
     },
+    /// Set (or, with `None`, clear) a Session's working directory; it must
+    /// exist on the daemon's machine. Returns the Session.
+    SetSessionCwd {
+        id: String,
+        cwd: Option<String>,
+    },
     SetSessionModel {
         id: String,
         model: Option<String>,
@@ -633,6 +643,9 @@ pub enum Request {
         query: String,
         #[serde(default)]
         limit: Option<usize>,
+        /// Without `root`: this Session's working directory.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     /// Attach a file the daemon can read (an `@` mention) to the Session's
     /// next user message. `path` is absolute or relative to `root`. Small

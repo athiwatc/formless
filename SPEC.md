@@ -357,6 +357,21 @@ task, with quality as a gate**.
   with no word characters falls back to a substring scan. Search runs on a
   reader connection and never takes the store lock.
 
+- **Working directory.** Each Session has a `cwd` (SessionInfo,
+  migration v32), set with `SetSessionCwd {id, cwd}`.
+  - The TUI sets it to its own directory when it creates a Session.
+    `/cd [PATH]` (TUI and web) shows or changes it, relative to where the
+    Session is. It must exist; forks keep it.
+  - The agent is told in its prompt ("Working directory: … Paths the user
+    gives without a leading / are relative to it; pass absolute paths to
+    Tools"), and a change also adds a note to the transcript.
+  - Relative paths in a Tool's input-bound `fs:` fields (`$input.path`)
+    are made absolute against it before the grant is bound, so the Tool
+    gets, and is granted, the path the user meant.
+  - `@` mentions and the TUI's file links resolve against it. It shows
+    in the status line and the Sessions list. Sessions without one use
+    the daemon's directory, as before.
+
 ### 5.2 Run lifecycle
 
 - Each user message in a Session starts a **Run**: the agent loops

@@ -524,6 +524,42 @@ impl Daemon {
                 self.start_run(session_id)?;
                 Ok(serde_json::to_value(msg)?)
             }
+            Request::SetSessionCwd { id, cwd } => {
+                let cwd = match cwd.filter(|c| !c.trim().is_empty()) {
+                    Some(c) => {
+                        // Relative to where the Session already is.
+                        let dir = match self.session_cwd(&id) {
+                            Some(base) => std::path::Path::new(&base).join(c.trim()),
+                            None => std::path::PathBuf::from(c.trim()),
+                        };
+                        let dir = dir
+                            .canonicalize()
+                            .with_context(|| format!("no directory '{}'", dir.display()))?;
+                        if !dir.is_dir() {
+                            return Err(anyhow!("'{}' is not a directory", dir.display()));
+                        }
+                        Some(dir.to_string_lossy().into_owned())
+                    }
+                    None => None,
+                };
+                let s = self
+                    .with_store(|st| st.set_session_cwd(&id, cwd.as_deref()))?
+                    .context("session not found")?;
+                // The agent learns it at the next step: a fresh prompt
+                // snapshot, and a note in the transcript.
+                let prompt = self.fresh_session_prompt(&id);
+                self.with_store(|st| st.set_session_system_prompt(&id, &prompt))?;
+                if let Some(c) = &cwd {
+                    let note = format!("The working directory is now {c}.");
+                    let msg = self.with_store(|st| st.append_message(&id, "system-note", &note))?;
+                    self.broadcast(Event::MessageAppended {
+                        session_id: id.clone(),
+                        message: msg,
+                    });
+                }
+                self.broadcast(Event::SessionUpdated { session: s.clone() });
+                Ok(serde_json::to_value(s)?)
+            }
             Request::SetSessionModel {
                 id,
                 model,
@@ -669,8 +705,14 @@ impl Daemon {
                 let r = self.attach_file(&session_id, &name, &data_b64, mime)?;
                 Ok(r)
             }
-            Request::ListFiles { root, query, limit } => {
-                let root = mention_root(root.as_deref())?;
+            Request::ListFiles {
+                root,
+                query,
+                limit,
+                session_id,
+            } => {
+                let session_root = session_id.as_deref().and_then(|s| self.session_cwd(s));
+                let root = mention_root(root.as_deref().or(session_root.as_deref()))?;
                 let index = self.file_index(&root).await?;
                 let files: Vec<_> =
                     crate::files::search(&index.0, &query, limit.unwrap_or(50).min(500))
@@ -2352,9 +2394,10 @@ impl Daemon {
             }
             if let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? {
                 // Unbindable input fails at execution with a clear error.
-                let Ok(input) = serde_json::from_str::<Value>(&tc.arguments) else {
+                let Ok(mut input) = serde_json::from_str::<Value>(&tc.arguments) else {
                     continue;
                 };
+                self.localize_input(session_id, &ver, &mut input);
                 let Ok(caps) = bound_caps(&ver, &input) else {
                     continue;
                 };
@@ -3207,6 +3250,11 @@ impl Daemon {
     /// the cached prefix stays valid).
     fn fresh_session_prompt(&self, session_id: &str) -> String {
         let mut prompt = self.effective_system_prompt();
+        if let Some(cwd) = self.session_cwd(session_id) {
+            prompt.push_str(&format!(
+                "\n\nWorking directory: {cwd}. Paths the user gives without a leading / are relative to it; pass absolute paths to Tools."
+            ));
+        }
         let Ok(cfg) = self.config() else {
             return prompt;
         };
@@ -3219,6 +3267,24 @@ impl Daemon {
             prompt.push_str(extra);
         }
         prompt
+    }
+
+    /// A Session's working directory (SPEC §5.1), if set.
+    fn session_cwd(&self, session_id: &str) -> Option<String> {
+        self.with_reader(|st| st.get_session(session_id))
+            .ok()
+            .flatten()
+            .and_then(|s| s.cwd)
+    }
+
+    /// Relative paths in a Tool's input-bound `fs:` fields, made absolute
+    /// against the Session's working directory before binding.
+    fn localize_input(&self, session_id: &str, ver: &ToolVersionInfo, input: &mut Value) {
+        if let Some(cwd) = self.session_cwd(session_id) {
+            if let Ok(caps) = Capabilities::parse(&ver.capabilities) {
+                caps.absolutize_inputs(input, std::path::Path::new(&cwd));
+            }
+        }
     }
 
     /// The model a Session runs on, with `role:<name>` resolved to the
@@ -4350,7 +4416,8 @@ impl Daemon {
     /// An `@` mention (SPEC §5.6): small files are attached, large files and
     /// directories go as a reference the agent can read with its Tools.
     fn attach_path(&self, session_id: &str, path: &str, root: Option<&str>) -> Result<Value> {
-        let root = mention_root(root)?;
+        let session_root = self.session_cwd(session_id);
+        let root = mention_root(root.or(session_root.as_deref()))?;
         let full = root
             .join(path.strip_prefix("~/").map_or_else(
                 || std::path::PathBuf::from(path),
@@ -5196,6 +5263,11 @@ impl Daemon {
                 memory_mb: ver.memory_mb,
             }
         };
+        let mut input = input;
+        if let Some(cwd) = self.session_cwd(session_id) {
+            d.caps
+                .absolutize_inputs(&mut input, std::path::Path::new(&cwd));
+        }
         if let Err(e) =
             toolreg::validate_against(&toolreg::compile_schema(&d.input_schema)?, &input)
         {
@@ -5556,6 +5628,8 @@ impl Daemon {
             if info.retired {
                 return Err(format!("tool '{name}' is retired"));
             }
+            let mut input = input;
+            self.localize_input(&session_id, &ver, &mut input);
             let input_text = toolreg::redact(&input).to_string();
             let started = std::time::Instant::now();
             let dur = |s: &std::time::Instant| s.elapsed().as_millis() as i64;

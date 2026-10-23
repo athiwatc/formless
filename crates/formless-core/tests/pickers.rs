@@ -144,6 +144,7 @@ async fn mentions_list_attach_and_reference_files() {
             root: root.clone(),
             query: "main".into(),
             limit: Some(5),
+            session_id: None,
         })
         .await
         .unwrap();
