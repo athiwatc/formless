@@ -2278,6 +2278,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   page loads no inline script (`script-src 'self'`), because its URL
   fragment carries the key, and it removes the key from the address bar
   once connected.
+  **Session links:** the fragment may also carry `s=<session-id>`
+  (`#k=…&s=…`, `#local=…&s=…`, or `#s=…` in a tab that's already
+  connected), which opens that Session. The Session menu's "Copy link"
+  builds one. On the relay it includes the pairing key, still only in the
+  fragment, and the menu says so. Locally the login token is single-use,
+  so the link is just `#s=…` and opens in a browser already signed in.
   The page is an installable app: a web manifest and icons, and a service
   worker (`/sw.js`) that fetches the shell network-first and falls back to
   the cached copy offline. It caches only the static shell (`/`, `app.js`,

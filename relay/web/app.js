@@ -433,6 +433,30 @@
     if (popover) { popover.remove(); popover = null; }
     document.querySelectorAll(".menu[aria-expanded]").forEach((m) => m.removeAttribute("aria-expanded"));
   }
+  /** The URL fragment as `#k=…&s=…` pairs. Not URLSearchParams: it turns
+   * "+" (in a base64 key) into a space. */
+  function hashParams() {
+    const out = {};
+    for (const part of location.hash.replace(/^#/, "").split("&")) {
+      const i = part.indexOf("=");
+      if (i > 0) out[part.slice(0, i)] = decodeURIComponent(part.slice(i + 1));
+    }
+    return out;
+  }
+  /** A link that opens Session `s` (SPEC §12). On the relay it carries the
+   * pairing key, in the fragment only (never sent to a server); locally
+   * the login token is single-use, so it opens in a browser already signed
+   * in. */
+  function sessionLink(s) {
+    const base = location.origin + location.pathname;
+    return S.local ? base + "#s=" + encodeURIComponent(s.id)
+      : base + "#k=" + encodeURIComponent(S.secret) + "&s=" + encodeURIComponent(s.id);
+  }
+  function copySessionLink(s) {
+    navigator.clipboard.writeText(sessionLink(s)).then(
+      () => toast(S.local ? "Copied: opens “" + s.name + "” in a browser signed in to this daemon" : "Copied: it holds the pairing key, so share it only with your own devices"),
+      () => toast("Copy failed", true));
+  }
   /** Archived Sessions are hidden but kept (SPEC §10.4). */
   async function archiveSession(s) {
     const r = await act({ type: "set_session_archived", id: s.id, archived: !s.archived }, s.archived ? "Restored " + s.name : "Archived " + s.name);
@@ -462,6 +486,7 @@
       h("button", { type: "button", onclick: () => { closePopover(); tagSession(s); } }, "Tags…"),
       h("button", { type: "button", onclick: () => { closePopover(); editInstructions(s); } }, "Instructions…"),
       h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
+      h("button", { type: "button", title: S.local ? "" : "The link includes the pairing key", onclick: () => { closePopover(); copySessionLink(s); } }, S.local ? "Copy link" : "Copy link (has the key)"),
       h("button", { type: "button", onclick: () => { closePopover(); pickExport(s.id); } }, "Export…"),
       h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
     popover.style.top = Math.min(r.bottom + 4, innerHeight - 170) + "px";
@@ -3510,7 +3535,10 @@
   async function loadAll() {
     await refreshSessions();
     const saved = prefs.get("session", null);
-    const target = S.sessions.find((s) => s.id === S.current) || S.sessions.find((s) => s.id === saved) || S.sessions[0];
+    const linked = S.linkedSession && S.sessions.find((s) => s.id === S.linkedSession);
+    if (S.linkedSession && !linked) note("That Session link points to a Session that no longer exists.", true);
+    S.linkedSession = null;
+    const target = linked || S.sessions.find((s) => s.id === S.current) || S.sessions.find((s) => s.id === saved) || S.sessions[0];
     if (target) await openSession(target.id, true);
     else renderAll();
     if (S.view !== "chat") setView(S.view);
@@ -3863,8 +3891,17 @@
   // A new `formless web` link pasted into an open tab only changes the
   // fragment: sign in with it instead of ignoring it.
   window.addEventListener("hashchange", () => {
-    if (!document.querySelector('meta[name="formless-local"]') || !location.hash.startsWith("#local=")) return;
-    const token = decodeURIComponent(location.hash.slice(7));
+    const frag = hashParams();
+    // A Session link pasted into an open, connected tab: just open it.
+    if (frag.s && !frag.local && (!frag.k || frag.k === S.secret) && S.channel) {
+      history.replaceState(null, "", location.pathname);
+      if (S.sessions.some((s) => s.id === frag.s)) openSession(frag.s);
+      else note("That Session link points to a Session that no longer exists.", true);
+      return;
+    }
+    if (!document.querySelector('meta[name="formless-local"]') || !frag.local) return;
+    S.linkedSession = frag.s || null;
+    const token = frag.local;
     clearTimeout(S.reconnect && S.reconnect.timer);
     S.reconnect = null;
     const old = S.ws;
@@ -3874,12 +3911,14 @@
   });
 
   (function init() {
+    const frag = hashParams();
+    // A Session link (#s=…) opens that Session once connected.
+    S.linkedSession = frag.s || null;
     if (document.querySelector('meta[name="formless-local"]')) {
-      connectLocal(location.hash.startsWith("#local=") ? decodeURIComponent(location.hash.slice(7)) : null);
+      connectLocal(frag.local || null);
       return;
     }
-    let fromHash = "";
-    if (location.hash.startsWith("#k=")) fromHash = decodeURIComponent(location.hash.slice(3));
+    const fromHash = frag.k || "";
     let saved = "";
     try { saved = sessionStorage.getItem("formless_secret") || ""; } catch (_) {}
     const secret = fromHash || saved;
