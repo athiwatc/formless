@@ -1857,7 +1857,7 @@ async fn model_stats_include_token_and_cache_totals() {
         .await;
         c.run_to_finish().await;
     }
-    let stats = c.rpc(Request::ListModelStats).await;
+    let stats = c.rpc(Request::ListModelStats { since: None }).await;
     let m = &stats[0];
     assert_eq!(m["model"], "mock-1");
     assert_eq!(

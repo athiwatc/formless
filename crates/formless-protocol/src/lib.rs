@@ -748,9 +748,26 @@ pub enum Request {
         /// Only this Session's Runs.
         #[serde(default)]
         session_id: Option<String>,
+        /// Only what happened at or after this RFC 3339 time (SPEC §10.4
+        /// Metrics range); None = all history.
+        #[serde(default)]
+        since: Option<String>,
     },
     /// Built-in call stats (SPEC §8.8).
-    ListBuiltinStats,
+    ListBuiltinStats {
+        /// Only what happened at or after this RFC 3339 time (SPEC §10.4
+        /// Metrics range); None = all history.
+        #[serde(default)]
+        since: Option<String>,
+    },
+    /// Per-Tool calls and success rate in a range:
+    /// `[{tool_id, invocations, success_rate}]`.
+    ListToolMetrics {
+        /// Only what happened at or after this RFC 3339 time (SPEC §10.4
+        /// Metrics range); None = all history.
+        #[serde(default)]
+        since: Option<String>,
+    },
     /// Attach a file to the Session's next user message (SPEC §5.6): stored
     /// as an artifact; returns `{id, name, mime, bytes}`.
     AttachFile {
@@ -1040,7 +1057,12 @@ pub enum Request {
         tool_id: Option<String>,
     },
     ListProposals,
-    ListModelStats,
+    ListModelStats {
+        /// Only what happened at or after this RFC 3339 time (SPEC §10.4
+        /// Metrics range); None = all history.
+        #[serde(default)]
+        since: Option<String>,
+    },
     GenerateProposal,
     ProposalDecision {
         id: String,

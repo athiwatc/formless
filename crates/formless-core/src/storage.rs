@@ -338,7 +338,7 @@ const SESSION_SUMMARY: &str = "(SELECT COUNT(*) FROM messages m WHERE m.session_
      (SELECT status FROM runs r WHERE r.session_id=s.id ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1) AS last_run_status";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 37;
+pub const SCHEMA_VERSION: i64 = 38;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -353,7 +353,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 37] = [
+const MIGRATIONS: [(i64, MigrationStep); 38] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -466,6 +466,14 @@ const MIGRATIONS: [(i64, MigrationStep); 37] = [
             "CREATE TABLE IF NOT EXISTS session_templates (
                name TEXT PRIMARY KEY, model TEXT, reasoning_effort TEXT,
                instructions TEXT, cwd TEXT, first_message TEXT, created_at TEXT NOT NULL);",
+        )?)
+    }),
+    // Model outcomes over time, for ranged Metrics (SPEC §10.4).
+    (38, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS model_events (
+               model TEXT NOT NULL, ok INTEGER NOT NULL, ms INTEGER NOT NULL, created_at TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS idx_model_events ON model_events(created_at);",
         )?)
     }),
 ];
@@ -1119,12 +1127,16 @@ impl Store {
     }
 
     /// Per built-in: calls, failures, and counts per kind.
-    pub fn builtin_stats(&self) -> Result<Vec<formless_protocol::BuiltinStatInfo>> {
+    pub fn builtin_stats(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<formless_protocol::BuiltinStatInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, kind, COUNT(*), SUM(ok=0), AVG(duration_ms) FROM builtin_calls GROUP BY name, kind ORDER BY name, kind",
+            "SELECT name, kind, COUNT(*), SUM(ok=0), AVG(duration_ms) FROM builtin_calls
+             WHERE ?1 IS NULL OR created_at >= ?1 GROUP BY name, kind ORDER BY name, kind",
         )?;
         let mut out: Vec<formless_protocol::BuiltinStatInfo> = Vec::new();
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![since], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1586,7 +1598,7 @@ impl Store {
 
     /// Per-Run metrics, newest first.
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
-        self.run_metrics_for(None, limit)
+        self.run_metrics_for(None, limit, None)
     }
 
     /// The newest `limit` Runs, of one Session or all.
@@ -1594,6 +1606,7 @@ impl Store {
         &self,
         session_id: Option<&str>,
         limit: usize,
+        since: Option<&str>,
     ) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, r.session_id, r.status, r.followup, r.steps,
@@ -1601,11 +1614,11 @@ impl Store {
                (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
                (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
                r.created_at, r.updated_at
-             FROM runs r WHERE (?2 IS NULL OR r.session_id=?2)
+             FROM runs r WHERE (?2 IS NULL OR r.session_id=?2) AND (?3 IS NULL OR r.created_at >= ?3)
              ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64, session_id], |r| {
+            .query_map(params![limit as i64, session_id, since], |r| {
                 let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
                 let duration_ms = match (
                     chrono::DateTime::parse_from_rfc3339(&created),
@@ -2449,7 +2462,50 @@ impl Store {
                 now()
             ],
         )?;
+        self.conn.execute(
+            "INSERT INTO model_events(model, ok, ms, created_at) VALUES(?1, ?2, ?3, ?4)",
+            params![model, ok as i64, elapsed_ms.max(0), now()],
+        )?;
         Ok(())
+    }
+
+    /// Model outcomes since `since` (from the event log, kept since v38).
+    pub fn model_stats_since(&self, since: &str) -> Result<Vec<ModelStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model, SUM(ok), SUM(ok=0), SUM(ms) FROM model_events
+             WHERE created_at >= ?1 GROUP BY model ORDER BY model",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                Ok(ModelStat {
+                    model: r.get(0)?,
+                    successes: r.get(1)?,
+                    failures: r.get(2)?,
+                    total_ms: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Each Tool's calls and success rate since `since`: (tool id, calls,
+    /// success rate over successes and failures).
+    pub fn tool_metrics_since(&self, since: &str) -> Result<Vec<(String, i64, Option<f64>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_id, COUNT(*), SUM(status='success'), SUM(status='failure')
+             FROM invocations WHERE created_at >= ?1 GROUP BY tool_id",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                let (s, f): (i64, i64) = (r.get(2)?, r.get(3)?);
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    (s + f > 0).then(|| s as f64 / (s + f) as f64),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn list_model_stats(&self) -> Result<Vec<ModelStat>> {
@@ -3520,12 +3576,18 @@ impl Store {
     }
 
     /// Summed (prompt, completion, cached) tokens per model.
-    pub fn usage_by_model(&self) -> Result<std::collections::HashMap<String, (i64, i64, i64)>> {
+    pub fn usage_by_model(
+        &self,
+        since: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, (i64, i64, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage GROUP BY model",
+            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage
+             WHERE ?1 IS NULL OR created_at >= ?1 GROUP BY model",
         )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
+            .query_map(params![since], |r| {
+                Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
