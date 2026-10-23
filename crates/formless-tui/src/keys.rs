@@ -69,6 +69,7 @@ const METRICS: &[Hint] = &[
 ];
 
 const PROPOSALS: &[Hint] = &[
+    h("Enter", "review", 0),
     h("n", "new (costs tokens)", 1),
     h("a", "apply", 0),
     h("r", "reject", 0),

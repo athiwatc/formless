@@ -1078,6 +1078,12 @@ pub enum Request {
         id: String,
         approved: bool,
     },
+    /// What a Proposal changes (SPEC §10.4): `{target, diff: [[op,
+    /// line]], applied}` with op ' ', '-' or '+'. `target` is "learned
+    /// guidance" (the system prompt's learned part) or "memory".
+    ProposalDiff {
+        id: String,
+    },
     RollbackProposal {
         id: String,
     },

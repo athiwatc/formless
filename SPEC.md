@@ -1825,6 +1825,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   TUI Metrics view charts it for the selected range: a bar per day (or key)
   split into cached, fresh prompt and completion tokens, with totals and
   cost; `b` cycles the breakdown.
+- **Reviewing a Proposal.** `ProposalDiff {id}` returns what it changes:
+  the learned-guidance part of the system prompt, or the memory notes,
+  as diff lines without and with it (an applied one shows what it added).
+  In the TUI Proposals view, Enter opens that diff with the rationale and
+  eval results (candidate vs baseline, runs, extra tokens). `a` applies
+  and `r` rejects from there; in the list, `a`/`r` still decide directly.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,
