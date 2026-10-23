@@ -2201,7 +2201,53 @@
       h("div", { class: "detail-actions" },
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
     box.append(grid, h("p", { class: "muted" }, "Edit applies through the daemon (next Run). Credentials, the endpoint, the relay and MCP servers are changed in config.toml on the daemon's machine."));
+    filterSettings();
   }
+  /** The Settings filter: rows whose label, key, value or description
+   * contain the words stay (matches marked); sections with none left hide,
+   * unless their title matches. */
+  function filterSettings() {
+    const words = $("settings-filter").value.toLowerCase().split(/\s+/).filter(Boolean);
+    const hit = (el) => { const t = el.textContent.toLowerCase(); return words.every((w) => t.includes(w)); };
+    for (const m of $("settings").querySelectorAll("mark.find")) m.replaceWith(m.textContent);
+    for (const sec of $("settings").querySelectorAll("section")) {
+      const titleHit = words.length && hit(sec.querySelector("h3") || sec);
+      let shown = 0;
+      for (const dt of sec.querySelectorAll("dl.kv > dt")) {
+        const dd = dt.nextElementSibling;
+        const ok = !words.length || titleHit || hit(dt) || (dd && hit(dd)) || (dt.title && words.every((w) => dt.title.toLowerCase().includes(w)));
+        dt.classList.toggle("hidden", !ok);
+        if (dd) dd.classList.toggle("hidden", !ok);
+        if (ok) { shown++; if (words.length) markWords(dt, words); }
+      }
+      for (const tr of sec.querySelectorAll("tbody > tr")) {
+        const ok = !words.length || titleHit || hit(tr);
+        tr.classList.toggle("hidden", !ok);
+        if (ok) shown++;
+      }
+      const hasRows = sec.querySelector("dl.kv > dt, tbody > tr");
+      sec.classList.toggle("hidden", !!words.length && !titleHit && (hasRows ? !shown : !hit(sec)));
+    }
+  }
+  /** Wrap the words' first occurrences in an element's own text in <mark>. */
+  function markWords(el, words) {
+    for (const node of [...el.childNodes].filter((n) => n.nodeType === 3)) {
+      const text = node.textContent;
+      const lower = text.toLowerCase();
+      const spans = words.map((w) => [lower.indexOf(w), w.length]).filter(([i]) => i >= 0).sort((a, b) => a[0] - b[0]);
+      if (!spans.length) continue;
+      const parts = [];
+      let at = 0;
+      for (const [i, n] of spans) {
+        if (i < at) continue;
+        parts.push(text.slice(at, i), h("mark", { class: "find" }, text.slice(i, i + n)));
+        at = i + n;
+      }
+      parts.push(text.slice(at));
+      node.replaceWith(...parts);
+    }
+  }
+  $("settings-filter").addEventListener("input", filterSettings);
 
   /** Web Push (SPEC §12): opt in per device. The relay keeps this
    * browser's subscription and, when an approval or question waits, sends
