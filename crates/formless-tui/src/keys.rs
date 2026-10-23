@@ -33,6 +33,7 @@ const SESSIONS: &[Hint] = &[
     h("P", "pin", 4),
     h("a", "archive", 5),
     h("u", "undo delete", 5),
+    h("Space", "select", 5),
     h("e", "export", 5),
     h("i", "import", 5),
     h("/", "filter", 4),

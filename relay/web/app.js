@@ -487,6 +487,20 @@
         h("button", { type: "button", class: "chip-btn" + (S.tagFilter === t ? " on" : ""), "aria-pressed": String(S.tagFilter === t),
           onclick: () => { S.tagFilter = S.tagFilter === t ? null : t; renderSessions(); } }, "#" + t))));
     }
+    // Bulk actions on checked Sessions (SPEC §10.4).
+    S.marked = S.marked || new Set();
+    for (const id of [...S.marked]) if (!S.sessions.some((s) => s.id === id)) S.marked.delete(id);
+    if (S.marked.size) {
+      const ids = [...S.marked];
+      const btn = (label, run, cls) => h("button", { type: "button", class: "btn small" + (cls ? " " + cls : ""), onclick: run }, label);
+      list.append(h("li", { class: "bulk-bar" },
+        h("span", { class: "muted" }, ids.length + " selected"),
+        btn("Archive", () => bulkSessions("archive", ids)),
+        btn("Export", () => bulkSessions("export", ids)),
+        btn("Tag", () => bulkSessions("tag", ids)),
+        btn("Delete", () => bulkSessions("delete", ids), "danger"),
+        btn("Clear", () => { S.marked.clear(); renderSessions(); })));
+    }
     const tagged = (s) => !S.tagFilter || (s.tags || []).includes(S.tagFilter);
     // Archived Sessions sit in their own collapsible group at the end.
     const archived = S.sessions.filter((s) => s.archived && tagged(s));
@@ -502,6 +516,8 @@
         onclick: () => openSession(s.id),
         onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
       },
+      h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
+        onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
       S.running.has(s.id) ? h("span", { class: "running", title: "running" })
         : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
       h("span", { class: "name", title: s.name }, s.pinned ? "★ " : null, s.name,
@@ -2065,6 +2081,29 @@
     if (!id) return;
     const s = await act({ type: "fork_session", id, name: null, up_to_seq: null }, "Forked session");
     if (s && s.id) { S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)]; await openSession(s.id); }
+  }
+  /** Archive, export, tag or delete several Sessions at once; deleting
+   * asks for "delete" to be typed. */
+  async function bulkSessions(action, ids) {
+    const list = S.sessions.filter((s) => ids.includes(s.id));
+    if (action === "delete") {
+      const typed = await ask({ title: "Delete " + list.length + " Sessions?", text: "Type delete to confirm. Their transcripts are deleted.", input: true, placeholder: "delete", ok: "Delete", danger: true });
+      if (typed == null || typed.trim() !== "delete") return;
+      for (const s of list) await act({ type: "delete_session", id: s.id });
+      toast("Deleted " + list.length + " Sessions");
+    } else if (action === "archive") {
+      const restore = list.every((s) => s.archived);
+      for (const s of list) await act({ type: "set_session_archived", id: s.id, archived: !restore });
+    } else if (action === "export") {
+      for (const s of list) await exportSession(s.id);
+    } else if (action === "tag") {
+      const text = await ask({ title: "Tag " + list.length + " Sessions", input: true, placeholder: "work client-a", ok: "Add tags" });
+      if (!text) return;
+      const add = text.split(/[\s,]+/).filter(Boolean);
+      for (const s of list) await act({ type: "set_session_tags", id: s.id, tags: [...(s.tags || []), ...add] });
+    }
+    S.marked.clear();
+    await refreshSessions();
   }
   async function exportSession(id) {
     if (!id) return;
