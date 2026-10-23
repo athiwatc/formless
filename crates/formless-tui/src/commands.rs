@@ -65,6 +65,12 @@ use Group::*;
 
 pub const COMMANDS: &[Command] = &[
     cmd("new", "", "start a new Session", Session),
+    cmd(
+        "cd",
+        "[PATH]",
+        "show or change this Session's working directory",
+        Session,
+    ),
     cmd("sessions", "", "list and switch Sessions", Session),
     cmd("fork", "", "fork the current Session", Session),
     cmd("search", "", "search all Sessions", Session),

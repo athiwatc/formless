@@ -1012,7 +1012,7 @@
     mention.query = at.query;
     const seq = ++mention.seq;
     let r;
-    try { r = await request({ type: "list_files", query: at.query, limit: 8 }); } catch (_) { return; }
+    try { r = await request({ type: "list_files", query: at.query, limit: 8, session_id: S.current }); } catch (_) { return; }
     if (seq !== mention.seq || !mentionAtCaret()) return;
     mention.files = r.files || [];
     mention.sel = 0;
@@ -1438,6 +1438,7 @@
     }
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
+    $("status-session").title = s && s.cwd ? "Working directory: " + s.cwd : "";
     $("status-model").textContent = (s && s.model) || (S.settings && S.settings.provider.model) || "";
     const u = S.usage && S.usage[S.current];
     $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
@@ -2110,6 +2111,17 @@
     { name: "compact", args: "[FOCUS]", group: "Session", desc: "summarise the Session now, keeping what FOCUS asks", run: async (arg) => {
       if (!S.current) return note("open a session first", true);
       if (await act({ type: "compact_session", session_id: S.current, focus: arg || null })) note("compacting: a summary will replace the history so far…");
+    } },
+    { name: "cd", args: "[PATH]", group: "Session", desc: "show or change this Session's working directory", run: async (arg) => {
+      const s = S.sessions.find((x) => x.id === S.current);
+      if (!S.current) return note("open a session first", true);
+      if (!arg) return note("working directory: " + ((s && s.cwd) || "(the daemon's)"));
+      const r = await act({ type: "set_session_cwd", id: S.current, cwd: arg });
+      if (!r) return;
+      const i = S.sessions.findIndex((x) => x.id === r.id);
+      if (i >= 0) S.sessions[i] = r;
+      renderStatus();
+      note("working directory: " + r.cwd);
     } },
     { name: "context", group: "Session", desc: "how full the context window is, and what fills it", run: () => showContext() },
     { name: "stop", group: "Run control", desc: "stop the current Run (Esc)", run: () => stop() },

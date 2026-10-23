@@ -214,6 +214,39 @@ impl Capabilities {
             .filter(|s| s.starts_with(INPUT_PREFIX))
     }
 
+    /// Make relative paths absolute against `base` in the input fields that
+    /// input-bound `fs:` scopes name, before [`Self::bind`]: the Tool then
+    /// gets, and is granted, the path the user meant (SPEC §5.1).
+    pub fn absolutize_inputs(&self, input: &mut serde_json::Value, base: &std::path::Path) {
+        let fields = self
+            .fs_read
+            .iter()
+            .chain(&self.fs_write)
+            .filter_map(|s| s.strip_prefix(INPUT_PREFIX));
+        for field in fields {
+            let Some(v) = field
+                .split('.')
+                .try_fold(&mut *input, |v, part| v.get_mut(part))
+            else {
+                continue;
+            };
+            let fix = |s: &mut serde_json::Value| {
+                if let Some(p) = s.as_str().filter(|p| !p.is_empty()) {
+                    let path = std::path::Path::new(p);
+                    if path.is_relative() && !p.starts_with('~') {
+                        *s = serde_json::Value::String(
+                            base.join(path).to_string_lossy().into_owned(),
+                        );
+                    }
+                }
+            };
+            match v {
+                serde_json::Value::Array(items) => items.iter_mut().for_each(fix),
+                other => fix(other),
+            }
+        }
+    }
+
     /// Resolve `$input.<field>` scopes against one Invocation's input.
     /// A field may hold a string or an array of strings. Paths are made
     /// absolute and canonicalised (like the runtime's containment check);

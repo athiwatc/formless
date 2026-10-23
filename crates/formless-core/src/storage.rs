@@ -333,7 +333,7 @@ impl ModelStat {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 31;
+pub const SCHEMA_VERSION: i64 = 32;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -348,7 +348,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 31] = [
+const MIGRATIONS: [(i64, MigrationStep); 32] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -440,6 +440,8 @@ const MIGRATIONS: [(i64, MigrationStep); 31] = [
                reason TEXT NOT NULL, undone INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);",
         )?)
     }),
+    // A working directory per Session (SPEC §5.1).
+    (32, |c| add_column(c, "sessions", "cwd TEXT")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -528,6 +530,7 @@ impl Store {
             reasoning_effort: r.get("reasoning_effort")?,
             created_at: r.get("created_at")?,
             updated_at: r.get("updated_at")?,
+            cwd: r.get("cwd")?,
         })
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
@@ -594,6 +597,14 @@ impl Store {
         if n == 0 {
             return Ok(None);
         }
+        self.get_session(id)
+    }
+
+    pub fn set_session_cwd(&self, id: &str, cwd: Option<&str>) -> Result<Option<SessionInfo>> {
+        self.conn.execute(
+            "UPDATE sessions SET cwd=?2, updated_at=?3 WHERE id=?1",
+            params![id, cwd, now()],
+        )?;
         self.get_session(id)
     }
 
@@ -805,13 +816,18 @@ impl Store {
         let name = name
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("{} (fork)", orig.name));
-        Ok(Some(self.import_session(
+        let fork = self.import_session(
             &name,
             orig.model,
             orig.reasoning_effort,
             &messages,
             &checkpoints,
-        )?))
+        )?;
+        // The fork works in the same directory.
+        match orig.cwd.as_deref() {
+            Some(cwd) => self.set_session_cwd(&fork.id, Some(cwd)),
+            None => Ok(Some(fork)),
+        }
     }
 
     /// Case-insensitive substring search across all sessions' messages.

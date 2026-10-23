@@ -161,6 +161,7 @@ enum Pending {
     /// Context fill for the status line (quiet) or `/context` (report).
     ContextFill,
     SessionRuns,
+    SetCwd,
     ContextReport,
     MentionAttach,
     ApprovalCode,
@@ -1159,6 +1160,18 @@ impl App {
                         }
                         Pending::CreateSession => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
+                                // A new Session works where the TUI started.
+                                if s.cwd.is_none() {
+                                    if let Ok(dir) = std::env::current_dir() {
+                                        self.request(
+                                            Pending::SetCwd,
+                                            Request::SetSessionCwd {
+                                                id: s.id.clone(),
+                                                cwd: Some(dir.to_string_lossy().into_owned()),
+                                            },
+                                        );
+                                    }
+                                }
                                 self.switch_session(s.id.clone());
                                 self.sessions.insert(0, s);
                                 self.messages.clear();
@@ -1377,6 +1390,17 @@ impl App {
                             self.mention_attached();
                         }
                         Pending::SettingsProviders => self.providers_info = result,
+                        Pending::SetCwd => {
+                            if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
+                                self.notes.push(format!(
+                                    "working directory: {}",
+                                    s.cwd.as_deref().unwrap_or("(the daemon's)")
+                                ));
+                                if let Some(old) = self.sessions.iter_mut().find(|x| x.id == s.id) {
+                                    *old = s;
+                                }
+                            }
+                        }
                         Pending::SessionRuns => {
                             let runs: Vec<RunMetricsInfo> =
                                 serde_json::from_value(result["runs"].clone()).unwrap_or_default();
@@ -2459,7 +2483,7 @@ impl App {
         self.follow_chat_bottom();
         // `@path` mentions are attached first: the daemon handles requests
         // concurrently, so the message waits for them.
-        let root = std::env::current_dir().ok();
+        let root = Some(self.work_dir());
         let found: Vec<String> = formless_core::files::mentions(&text)
             .into_iter()
             .filter(|p| root.as_ref().is_some_and(|r| r.join(p).exists()))
@@ -2883,15 +2907,14 @@ impl App {
             sel: 0,
             dismissed: false,
         });
-        let root = std::env::current_dir()
-            .ok()
-            .map(|r| r.to_string_lossy().into_owned());
+        let root = Some(self.work_dir().to_string_lossy().into_owned());
         self.request(
             Pending::ListFiles,
             Request::ListFiles {
                 root,
                 query,
                 limit: Some(8),
+                session_id: self.current.clone(),
             },
         );
     }
@@ -3224,6 +3247,8 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "cd" => self.change_dir(""),
+            cmd if cmd.starts_with("cd ") => self.change_dir(cmd[3..].trim()),
             "notes" => {
                 self.pager = Some(Pager {
                     title: format!("notes ({})", self.notes.len()),
@@ -4444,7 +4469,7 @@ impl App {
         let mut parts = arg.splitn(3, ':');
         let path = parts.next().unwrap_or_default();
         let line = parts.next().and_then(|l| l.parse::<u32>().ok());
-        match resolve_path(path) {
+        match resolve_path_in(&self.work_dir(), path) {
             Some(file) if cfg!(test) => self.notes.push(format!(
                 "opening {}{}",
                 file.display(),
@@ -5765,6 +5790,17 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             .unwrap_or_else(|| "no session".into()),
         bold_fg(app.color, Color::Cyan),
     ));
+    if let Some(dir) = app
+        .current
+        .as_ref()
+        .and_then(|id| app.sessions.iter().find(|s| &s.id == id))
+        .and_then(|s| s.cwd.as_deref())
+    {
+        left.push(Span::styled(
+            format!(" {}", short_dir(dir)),
+            ui::dim(app.color),
+        ));
+    }
     if !app.model_label.is_empty() {
         left.push(sep());
         left.push(Span::styled(app.model_label.clone(), ui::dim(app.color)));
@@ -6027,14 +6063,36 @@ fn pane_widths(v: &[u16]) -> (u16, u16) {
     (fix(v.first(), 22), fix(v.get(1), 26))
 }
 
-/// A file a chat mentions, resolved against the TUI's working directory
-/// (or absolute, or under `~/`), when it exists.
-fn resolve_path(path: &str) -> Option<std::path::PathBuf> {
+/// A directory for display: `~` for home, and only the last two parts
+/// of a long path (`…/work/formless`).
+fn short_dir(dir: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let d = match dir.strip_prefix(&home).filter(|_| !home.is_empty()) {
+        Some(rest) => format!("~{rest}"),
+        None => dir.to_string(),
+    };
+    let parts: Vec<&str> = d.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() > 3 {
+        format!("…/{}", parts[parts.len() - 2..].join("/"))
+    } else {
+        d
+    }
+}
+
+/// A file a chat mentions, resolved against `base` (the Session's working
+/// directory), or absolute, or under `~/`, when it exists.
+fn resolve_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
     let p = match path.strip_prefix("~/") {
         Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
-        None => std::env::current_dir().ok()?.join(path),
+        None => base.join(path),
     };
     p.is_file().then(|| p.canonicalize().unwrap_or(p))
+}
+
+/// [`resolve_path_in`] the TUI's own directory.
+#[cfg(test)]
+fn resolve_path(path: &str) -> Option<std::path::PathBuf> {
+    resolve_path_in(&std::env::current_dir().ok()?, path)
 }
 
 /// GUI editors that take `-g file:line` (VS Code and its forks).
@@ -6271,6 +6329,45 @@ impl App {
         // A burst (e.g. a long list) keeps only its newest lines.
         let extra = self.toasts.len().saturating_sub(8);
         self.toasts.drain(..extra);
+    }
+
+    /// The current Session's working directory, else the TUI's own
+    /// (SPEC §5.1).
+    fn work_dir(&self) -> std::path::PathBuf {
+        self.current
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .and_then(|s| s.cwd.clone())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+    }
+
+    /// `/cd [PATH]`: show or change the Session's working directory.
+    fn change_dir(&mut self, arg: &str) {
+        let Some(id) = self.current.clone() else {
+            self.notes.push("no current session".into());
+            return;
+        };
+        if arg.is_empty() {
+            self.notes
+                .push(format!("working directory: {}", self.work_dir().display()));
+            return;
+        }
+        let target = match arg.strip_prefix('~') {
+            Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(rest.trim_start_matches('/')),
+            None => self.work_dir().join(arg),
+        };
+        // Cached `file://` links were relative to the old directory.
+        self.path_cache.clear();
+        self.request(
+            Pending::SetCwd,
+            Request::SetSessionCwd {
+                id,
+                cwd: Some(target.to_string_lossy().into_owned()),
+            },
+        );
     }
 
     /// Fetch a Session's Runs for the answer footers.
@@ -7326,6 +7423,13 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                     ),
                     Span::raw(ui::pad(&s.name, name_w)),
                     Span::styled(ui::relative_time(&s.updated_at, now), ui::dim(app.color)),
+                    Span::styled(
+                        s.cwd
+                            .as_deref()
+                            .map(|d| format!("  {}", short_dir(d)))
+                            .unwrap_or_default(),
+                        ui::dim(app.color),
+                    ),
                 ]))
             })
             .collect()
@@ -8673,6 +8777,7 @@ pub fn run(paths: Paths) -> Result<()> {
                 }
             }
             if app.hyperlinks {
+                let base = app.work_dir();
                 let cache = &mut app.path_cache;
                 let mut resolve = |p: &str| {
                     if cache.len() > 4096 {
@@ -8681,7 +8786,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     cache
                         .entry(p.to_string())
                         .or_insert_with(|| {
-                            resolve_path(p).map(|f| format!("file://{}", f.display()))
+                            resolve_path_in(&base, p).map(|f| format!("file://{}", f.display()))
                         })
                         .clone()
                 };
@@ -9429,6 +9534,7 @@ mod tests {
             reasoning_effort: None,
             created_at: String::new(),
             updated_at: String::new(),
+            cwd: None,
         }];
         app.key(key(KeyCode::Char('d')));
         assert_eq!(app.delete_arm.as_deref(), Some("s1"));
@@ -10204,6 +10310,7 @@ mod tests {
                 reasoning_effort: None,
                 created_at: String::new(),
                 updated_at: String::new(),
+                cwd: None,
             })
             .collect();
         app.switch_session("refactor-auth".into());
@@ -10761,6 +10868,30 @@ mod tests {
         app.slash("quit");
         app.key(key(KeyCode::Char('s')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn the_session_working_directory_is_shown_and_used() {
+        let mut app = test_app();
+        let here = std::env::current_dir().unwrap();
+        app.sessions = vec![SessionInfo {
+            id: "s".into(),
+            name: "work".into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: Some(here.join("src").to_string_lossy().into_owned()),
+        }];
+        app.switch_session("s".into());
+        assert_eq!(app.work_dir(), here.join("src"));
+        // Paths resolve against it: `lib.rs` is src/lib.rs here.
+        assert!(resolve_path_in(&app.work_dir(), "lib.rs").is_some());
+        assert!(render(&mut app, 140, 20).contains("formless-tui/src"));
+        app.slash("cd");
+        assert!(app.notes.last().unwrap().starts_with("working directory: "));
+        assert_eq!(short_dir("/a/b/c/d/e"), "…/d/e");
+        assert_eq!(short_dir("/a/b"), "/a/b");
     }
 
     #[test]
