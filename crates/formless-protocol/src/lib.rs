@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// A browser connected through the relay (SPEC §12).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RelayClientInfo {
+    /// The relay's id for this browser connection.
+    pub cid: String,
+    #[serde(default)]
+    pub user_agent: String,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
 /// A client connection showing a Session (SPEC §10.4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AttachedClient {
@@ -777,6 +788,13 @@ pub enum Request {
         /// Metrics range); None = all history.
         #[serde(default)]
         since: Option<String>,
+    },
+    /// Browsers connected through the relay right now (SPEC §12).
+    ListRelayClients,
+    /// Close one browser's relay connection. It can reconnect with the
+    /// pairing link; rotating the secret is what revokes access.
+    DisconnectRelayClient {
+        cid: String,
     },
     /// Take back a pending attachment before the message is sent: `id` is
     /// the attachment's id (or, for a referenced path, the path). Returns

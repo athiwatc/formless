@@ -170,6 +170,10 @@ pub struct Daemon {
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
+    /// Browsers on the relay link, by cid, and a way to close one (set
+    /// while the link is up; SPEC §12).
+    pub(crate) relay_clients: StdMutex<std::collections::BTreeMap<String, RelayClientInfo>>,
+    pub(crate) relay_kick: StdMutex<Option<mpsc::UnboundedSender<String>>>,
     /// Spending warnings already given ("run:<id>:<limit>", "day:<date>"),
     /// and Sessions allowed past the limits for their next Run (Resume
     /// from a budget pause).
@@ -255,6 +259,8 @@ impl Daemon {
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             next_conn: AtomicU64::new(1),
             attention: tokio::sync::broadcast::channel(16).0,
+            relay_clients: StdMutex::new(Default::default()),
+            relay_kick: StdMutex::new(None),
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
@@ -850,6 +856,30 @@ impl Daemon {
                 let files = crate::skills::files(&dir)?;
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
+            }
+            Request::ListRelayClients => {
+                let list: Vec<RelayClientInfo> = self
+                    .relay_clients
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect();
+                Ok(serde_json::to_value(list)?)
+            }
+            Request::DisconnectRelayClient { cid } => {
+                let known = self.relay_clients.lock().unwrap().contains_key(&cid);
+                let sent = known
+                    && self
+                        .relay_kick
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|tx| tx.send(cid.clone()).is_ok());
+                if sent {
+                    let _ = self.with_store(|st| st.audit("user", "relay.disconnect", &cid));
+                }
+                Ok(json!({ "disconnected": sent }))
             }
             Request::DetachFile { session_id, id } => {
                 let mut pending = self.attachments.lock().unwrap();

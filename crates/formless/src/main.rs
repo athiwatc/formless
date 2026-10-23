@@ -687,14 +687,40 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
                 }
                 None => println!("secret:     none yet (run: formless relay enable)"),
             }
+            let running = daemon_reachable(&paths);
             println!(
                 "daemon:     {}",
-                if daemon_reachable(&paths) {
-                    "running"
-                } else {
-                    "not running"
-                }
+                if running { "running" } else { "not running" }
             );
+            // The browsers on the relay now (disconnect one from the web
+            // Settings; `enable --rotate` revokes them all).
+            if running {
+                let list: Vec<formless_protocol::RelayClientInfo> =
+                    formless_tui::client::request_once(&paths, Request::ListRelayClients)
+                        .ok()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                if list.is_empty() {
+                    println!("devices:    none connected");
+                }
+                for (i, c) in list.iter().enumerate() {
+                    println!(
+                        "{}{}  (since {}, last seen {})",
+                        if i == 0 {
+                            "devices:    "
+                        } else {
+                            "            "
+                        },
+                        if c.user_agent.is_empty() {
+                            "unknown browser"
+                        } else {
+                            &c.user_agent
+                        },
+                        c.first_seen.get(..16).unwrap_or(&c.first_seen),
+                        c.last_seen.get(..16).unwrap_or(&c.last_seen)
+                    );
+                }
+            }
             Ok(())
         }
     }

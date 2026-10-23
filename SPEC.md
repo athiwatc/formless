@@ -2284,6 +2284,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   a pipe or log. The TUI's `/relay` shows the same in the pager when the
   relay is on. Each warns that the code holds the pairing secret and
   points to `--rotate` if it leaks.
+  **Devices:** the relay tells the daemon each browser's User-Agent on
+  `client_open`. `ListRelayClients` lists the browsers on the link (cid,
+  User-Agent, first and last seen), and `DisconnectRelayClient {cid}`
+  makes the relay close that one (code 4001). The web Settings → Relay
+  devices and `formless relay status` show the list; the web offers
+  Disconnect. A disconnected tab stops reconnecting and says why. It can
+  rejoin with the pairing link; `formless relay enable --rotate` is what
+  revokes access. Client settings data never includes credential keys,
+  not even by name.
   **Session links:** the fragment may also carry `s=<session-id>`
   (`#k=…&s=…`, `#local=…&s=…`, or `#s=…` in a tab that's already
   connected), which opens that Session. The Session menu's "Copy link"
