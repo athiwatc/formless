@@ -9156,6 +9156,26 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             ),
                         ]),
                     ];
+            if !d.attention.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    if d.tool.needs_attention {
+                        "Why it needs attention"
+                    } else {
+                        "Worth a look"
+                    },
+                    bold_fg(app.color, Color::Red),
+                ));
+                for r in &d.attention {
+                    lines.push(Line::styled(format!("  • {r}"), fg(app.color, Color::Red)));
+                }
+                if !d.recent_calls.is_empty() {
+                    lines.push(Line::styled(
+                        "  (the failing calls are under Recent calls: [ ] to select, Enter to open)",
+                        ui::dim(app.color),
+                    ));
+                }
+            }
             if !d.recent_calls.is_empty() {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
@@ -12604,6 +12624,7 @@ mod tests {
             version_metrics: vec![],
             approval: None,
             recent_calls: vec![],
+            attention: vec![],
         });
         app.view = View::Tools;
         app.current = Some("s1".into());
@@ -12633,7 +12654,10 @@ mod tests {
         .unwrap();
         app.drain_daemon();
         let pager = app.pager.as_ref().expect("pager");
-        assert!(pager.lines.iter().any(|l| l.contains("\"title\": \"Example\"")));
+        assert!(pager
+            .lines
+            .iter()
+            .any(|l| l.contains("\"title\": \"Example\"")));
     }
 
     #[test]
@@ -12693,11 +12717,14 @@ mod tests {
                 call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z"),
                 call("i1", "success", "", "2026-01-01T10:00:00Z"),
             ],
+            attention: vec!["the last 3 calls failed: timeout after 30s".into()],
         });
         app.view = View::Tools;
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let screen = render(&mut app, 140, 40);
         assert!(screen.contains("Recent calls"), "{screen}");
+        assert!(screen.contains("Why it needs attention"), "{screen}");
+        assert!(screen.contains("• the last 3 calls failed"), "{screen}");
         assert!(screen.contains("timeout after 30s"), "{screen}");
         app.key(key(KeyCode::Char(']')));
         assert_eq!(app.call_idx, Some(0));

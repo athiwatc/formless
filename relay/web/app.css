@@ -485,3 +485,5 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .try-field textarea { font-family: var(--mono, monospace); font-size: 13px; }
 .try-result { max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .try-field input[type=checkbox] { width: auto; margin: 0; justify-self: start; }
+.attention { border: 1px solid var(--err); border-radius: 8px; padding: 8px 12px; margin: 10px 0; }
+.attention ul { margin: 4px 0 0; padding-left: 18px; }

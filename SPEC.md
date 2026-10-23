@@ -1782,6 +1782,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   opens in the pager. Web: "Try it" in the Tool detail opens a form built
   from the schema (text, number, checkbox, choice, or JSON for nested
   values) and shows the result.
+- **Why a Tool needs attention.** `ToolDetail.attention` explains it in
+  plain words: the optimiser giving up after N failed candidate fixes
+  (what sets the flag, with the last attempt's reason), and live signals
+  shown even without the flag: under 50% success over 5+ calls, a streak
+  of 3+ failures (with the latest error), invalid input in a fifth or
+  more of calls, or a rollback in the last week. The TUI and web Tool
+  detail list them ("Why it needs attention" / "Worth a look") above the
+  recent calls, where the failures can be opened.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,
