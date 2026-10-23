@@ -839,6 +839,13 @@ impl Daemon {
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
             }
+            Request::DetachFile { session_id, id } => {
+                let mut pending = self.attachments.lock().unwrap();
+                let list = pending.entry(session_id).or_default();
+                let before = list.len();
+                list.retain(|a| a["id"].as_str() != Some(&id) && a["path"].as_str() != Some(&id));
+                Ok(json!({ "removed": list.len() < before }))
+            }
             Request::AttachFile {
                 session_id,
                 name,

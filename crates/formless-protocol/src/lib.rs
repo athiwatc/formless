@@ -778,6 +778,13 @@ pub enum Request {
         #[serde(default)]
         since: Option<String>,
     },
+    /// Take back a pending attachment before the message is sent: `id` is
+    /// the attachment's id (or, for a referenced path, the path). Returns
+    /// `{removed}`.
+    DetachFile {
+        session_id: String,
+        id: String,
+    },
     /// Attach a file to the Session's next user message (SPEC §5.6): stored
     /// as an artifact; returns `{id, name, mime, bytes}`.
     AttachFile {

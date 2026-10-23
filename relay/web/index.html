@@ -67,6 +67,7 @@
     <main class="main">
       <!-- Chat -->
       <section id="view-chat" class="view chat-view" aria-label="Chat">
+        <div id="drop-zone" class="drop-zone hidden" aria-hidden="true">Drop files to attach them to your next message</div>
         <div class="chat-head">
           <h2 id="session-title" class="session-title">No session</h2>
           <div class="chat-head-actions">
@@ -80,6 +81,7 @@
         <form id="composer" class="composer">
           <div id="run-banner" class="run-banner hidden"></div>
           <div id="compose-mode" class="compose-mode hidden"></div>
+          <div id="attach-chips" class="attach-chips hidden" aria-label="Attachments for your next message"></div>
           <div class="compose-row">
             <label class="btn ghost" id="attach-btn" title="Attach a file (or paste an image)">📎<input id="attach-input" type="file" multiple hidden></label>
             <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message"></textarea>

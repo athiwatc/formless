@@ -62,6 +62,8 @@
     userClosed: false,
     backoff: 1000,
     daemonOnline: false,
+    /** Pending attachments by Session (shown as chips until sent). */
+    chips: {},
     view: prefs.get("view", "chat"),
     sessions: [],
     current: null,
@@ -2338,6 +2340,7 @@
       renderStatus();
     }).catch(() => {});
     rendered.clear(); // a reload may carry edited messages
+    renderChips();
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
     S.others = [];
@@ -2851,6 +2854,8 @@
       }
     }
     const r = await act({ type: "send_message", session_id: S.current, content: text, mode });
+    // The attachments went with it.
+    if (r) { delete S.chips[S.current]; renderChips(); }
     if (r && mode !== "send") note(mode === "queue" ? "queued for after this run" : "steering the current run");
   }
   function stop() {
@@ -3371,8 +3376,42 @@
       let bin = "";
       for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
       const r = await act({ type: "attach_file", session_id: S.current, name: file.name || "pasted-image.png", data_b64: btoa(bin), mime: file.type || null });
-      if (r) note("attached " + r.name + " (" + Math.round(r.bytes / 1024) + " KB); it goes with your next message");
+      if (r) {
+        (S.chips[S.current] = S.chips[S.current] || []).push(r);
+        renderChips();
+      }
     }
+  }
+  /** The current Session's pending attachments, each removable (×). */
+  function renderChips() {
+    const box = $("attach-chips");
+    const list = S.chips[S.current] || [];
+    box.classList.toggle("hidden", !list.length);
+    box.replaceChildren(...list.map((a) => h("span", { class: "tag attach-chip", title: (a.mime || "file") + " · " + Math.max(1, Math.round(a.bytes / 1024)) + " KB" },
+      (a.mime || "").startsWith("image/") ? "🖼 " : "📄 ", a.name,
+      h("button", { class: "btn ghost small", type: "button", "aria-label": "Remove " + a.name, onclick: async () => {
+        const sid = S.current;
+        if (await act({ type: "detach_file", session_id: sid, id: a.id })) {
+          S.chips[sid] = (S.chips[sid] || []).filter((x) => x.id !== a.id);
+          renderChips();
+        }
+      } }, "×"))));
+  }
+  // Drop files anywhere on the chat to attach them.
+  {
+    const view = $("view-chat");
+    let depth = 0;
+    const hasFiles = (e) => [...(e.dataTransfer && e.dataTransfer.types || [])].includes("Files");
+    view.addEventListener("dragenter", (e) => { if (!hasFiles(e)) return; depth++; $("drop-zone").classList.remove("hidden"); });
+    view.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+    view.addEventListener("dragleave", () => { if (--depth <= 0) { depth = 0; $("drop-zone").classList.add("hidden"); } });
+    view.addEventListener("drop", (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth = 0;
+      $("drop-zone").classList.add("hidden");
+      attachFiles([...e.dataTransfer.files]);
+    });
   }
   $("attach-input").addEventListener("change", (e) => { attachFiles([...e.target.files]); e.target.value = ""; });
   $("input").addEventListener("paste", (e) => {
