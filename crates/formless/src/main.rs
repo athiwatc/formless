@@ -20,6 +20,10 @@ struct Cli {
     /// Isolated profile (separate daemon + data dir)
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// Plain, line-oriented mode for screen readers (no redraws,
+    /// spinners or borders); also `tui.screen_reader = true`
+    #[arg(long)]
+    plain: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -424,6 +428,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::resolve(cli.profile.as_deref())?;
     match cli.cmd {
+        None | Some(Cmd::Tui) if cli.plain => formless_tui::plain::run(paths),
         None | Some(Cmd::Tui) => formless_tui::run(paths),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Doctor) => doctor(paths),

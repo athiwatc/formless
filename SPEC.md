@@ -1801,6 +1801,20 @@ run_tool = "network_policy"     # a registry Tool, or…
   header in the chat expands or collapses it. Each frame records its
   clickable regions, list rows from the widgets' own scroll offsets.
 
+- **Plain mode for screen readers.** `formless --plain` (or
+  `tui.screen_reader = true`) runs a line-oriented client instead of the
+  full-screen TUI: no alternate screen, redraws, spinners or box drawing.
+  - Each event prints once, as a sentence, in order: the streamed answer
+    after "Formless:", "Tool started: name.", "Run paused: why. Next: what
+    to do.", and notes.
+  - An approval becomes a prompt that lists each capability with its
+    plain-language meaning; the next line answers it (y, o or n).
+    Questions list numbered options and are answered the same way, one at
+    a time.
+  - Commands: `/new`, `/sessions`, `/switch N`, `/stop`, `/help`, `/quit`.
+    Anything else is a message (a steer while a Run is active). It opens
+    the most recent Session.
+
 ### 10.6 Live feedback (v2)
 
 - **Live call tree:** `ToolCallStarted.depth` gives a call's `tools.call`
@@ -2094,6 +2108,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tui.code_line_numbers` | false | Dim line numbers in the chat's code blocks (§10.2) |
 | `tui.inline_images` | auto | Image thumbnails in the chat on iTerm2, WezTerm, kitty and Ghostty; `off` keeps only the reference (§10.2) |
 | `tui.pane_widths` | [22, 26] | Multi-pane side panes as a percentage of the width, [left, right]; 0 hides one; `/panes wider\|narrower\|left\|right\|reset` or Ctrl+Shift+←/→ (§10.2) |
+| `tui.screen_reader` | false | Start the line-oriented plain mode instead of the full-screen TUI, as `formless --plain` does (§10.5) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 

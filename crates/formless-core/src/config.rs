@@ -795,6 +795,9 @@ pub struct TuiCfg {
     /// The multi-pane layout's side panes as a percentage of the width:
     /// [left, right]; 0 hides one.
     pub pane_widths: Vec<u16>,
+    /// Start the line-oriented plain mode instead of the full-screen TUI
+    /// (as `formless --plain` does).
+    pub screen_reader: bool,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -810,6 +813,7 @@ impl Default for TuiCfg {
             code_line_numbers: false,
             inline_images: "auto".into(),
             pane_widths: vec![22, 26],
+            screen_reader: false,
         }
     }
 }
