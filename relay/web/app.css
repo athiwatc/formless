@@ -528,3 +528,7 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .msg-menu { position: absolute; top: 0; right: 0; opacity: 0; border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 6px; padding: 0 6px; line-height: 1.4; cursor: pointer; }
 .msg:hover > .msg-menu, .msg-menu:focus-visible, .msg-menu[aria-expanded] { opacity: 1; }
 @media (hover: none) { .msg-menu { opacity: .7; } }
+
+/* The status bar's pending approval/question badge is a button */
+button.linkish { background: none; border: 0; padding: 0; font: inherit; cursor: pointer; }
+button.linkish:hover { text-decoration: underline; }

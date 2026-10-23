@@ -1629,8 +1629,11 @@
     $("status-context").textContent = pct == null ? "" : " │ ctx " + pct + "%";
     $("status-context").className = "clickable " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted") + (pct == null ? " hidden" : "");
     const waiting = S.approvals.length;
-    $("status-approvals").classList.toggle("hidden", !waiting);
-    $("status-approvals").textContent = "⚠ " + waiting + " awaiting approval";
+    const asking = S.pendingQuestion && !S.questionOpen ? 1 : 0;
+    $("status-approvals").classList.toggle("hidden", !waiting && !asking);
+    $("status-approvals").textContent = waiting
+      ? "⚠ " + waiting + " awaiting approval" + (asking ? " · a question" : "")
+      : "? the agent asked you something";
     const last = S.notes[S.notes.length - 1];
     const n = $("status-note");
     n.textContent = last ? last.text : "";
@@ -1654,8 +1657,9 @@
   // -------------------------------------------------------- approvals
   function renderApproval() {
     const req = S.approvals[0];
-    $("modal-backdrop").classList.toggle("hidden", !req);
-    if (!req) return;
+    if (!req) S.approvalLater = false;
+    $("modal-backdrop").classList.toggle("hidden", !req || S.approvalLater);
+    if (!req || S.approvalLater) return;
     const promo = req.kind === "promotion";
     $("modal-title").textContent = promo ? "Promotion approval" : "Approval required";
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
@@ -1681,6 +1685,37 @@
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
     setTimeout(() => $("modal-approve").focus(), 0);
   }
+  /** The agent's open question in a dialog; Cancel keeps it pending (the
+   * status bar and `a` bring it back). */
+  function showQuestion() {
+    const q = S.pendingQuestion;
+    if (!q || S.questionOpen) return;
+    S.questionOpen = true;
+    renderStatus();
+    const body = questionForm(q.qs);
+    ask({ title: "The agent asks", body, ok: "Answer" }).then((done) => {
+      S.questionOpen = false;
+      if (!S.pendingQuestion || S.pendingQuestion.id !== q.id || !done) return renderStatus();
+      const answers = readQuestionForm(body, q.qs);
+      if (answers.every((a) => !a.selected.length && !a.text)) return renderStatus();
+      S.pendingQuestion = null;
+      S.questionId = null;
+      renderStatus();
+      const answer = answers.map((a) => a.selected.concat(a.text ? [a.text] : []).join(", ")).join("; ");
+      act({ type: "answer_question", question_id: q.id, answer, answers });
+    });
+  }
+  /** `a` or the status bar: the oldest pending approval, else the open
+   * question, brought back into view and focused. */
+  function focusPending() {
+    if (S.approvals.length) {
+      S.approvalLater = false;
+      renderApproval();
+      $("modal-approve").focus();
+    } else if (S.pendingQuestion) showQuestion();
+  }
+  $("status-approvals").onclick = focusPending;
+  $("modal-later").onclick = () => { S.approvalLater = true; renderApproval(); };
   function decide(approved, scope) {
     const req = S.approvals.shift();
     if (!req) return;
@@ -3100,15 +3135,8 @@
         // An older daemon sends only the single-question form.
         const qs = ev.questions && ev.questions.length ? ev.questions
           : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
-        const body = questionForm(qs);
-        ask({ title: "The agent asks", body, ok: "Answer" }).then((done) => {
-          if (S.questionId !== ev.question_id || !done) return;
-          const answers = readQuestionForm(body, qs);
-          if (answers.every((a) => !a.selected.length && !a.text)) return;
-          S.questionId = null;
-          const answer = answers.map((a) => a.selected.concat(a.text ? [a.text] : []).join(", ")).join("; ");
-          act({ type: "answer_question", question_id: ev.question_id, answer, answers });
-        });
+        S.pendingQuestion = { id: ev.question_id, qs };
+        showQuestion();
         break;
       }
       case "run_usage":
@@ -3135,7 +3163,7 @@
       }
       case "user_question_closed":
         // Answered elsewhere (or the Run stopped): close our prompt.
-        if (S.questionId === ev.question_id) { S.questionId = null; closeAsk(null); }
+        if (S.questionId === ev.question_id) { S.questionId = null; S.pendingQuestion = null; if (S.questionOpen) closeAsk(null); renderStatus(); }
         break;
       case "approval_requested":
         S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
@@ -3563,6 +3591,7 @@
     { keys: ["j", "ArrowDown"], help: "next Session (Chat) or Tool (Tools)", run: () => moveSelection(1) },
     { keys: ["k", "ArrowUp"], help: "previous Session or Tool", run: () => moveSelection(-1) },
     { keys: ["n"], help: "new Session", run: () => newSession() },
+    { keys: ["a"], help: "show the pending approval or question", run: () => focusPending() },
     { keys: ["x"], view: "tools", help: "retire / restore the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name); } },
     { keys: ["b"], view: "tools", help: "roll the selected Tool back one version", run: () => { const t = selectedTool(); if (t && t.current_version > 1) rollbackTool(t, t.current_version - 1); } },
     { keys: ["e"], view: "tools", help: "export the selected Tool", run: () => { const t = selectedTool(); if (t) exportTool(t); } },
@@ -3589,7 +3618,8 @@
       if (sc) { e.preventDefault(); sc.run(e.key); return; }
     }
     if (e.key === "Escape") {
-      if (!$("ask-backdrop").classList.contains("hidden")) closeAsk(null);
+      if (modalOpen) { S.approvalLater = true; renderApproval(); }
+      else if (!$("ask-backdrop").classList.contains("hidden")) closeAsk(null);
       else if (popover) closePopover();
       else if (!$("notes-panel").classList.contains("hidden")) $("notes-panel").classList.add("hidden");
       else closeSidebar();
