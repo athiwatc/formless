@@ -1797,6 +1797,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   (with the detail open) `D` edits the description and `S` the schemas
   (one JSON object holding `input_schema` and `output_schema`); Ctrl+S
   saves.
+- **Grouping Tools.** In the TUI Tools view `c` cycles grouping: none,
+  by Capability family (the families a Tool holds, e.g. "fs + net"), by
+  the current version's author (`ToolInfo.author`), or by status (needs
+  attention first, then active, then retired). Groups get headers with
+  counts; `z` folds the selected Tool's group, `Z` unfolds them all.
+  Filter, sort and quick filters apply inside groups.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,

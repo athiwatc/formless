@@ -105,6 +105,9 @@ pub struct ToolInfo {
     /// success, `f` failure (SPEC §10.4 sparkline and trend).
     #[serde(default)]
     pub recent: String,
+    /// Who wrote the current version: agent, user, optimiser, import.
+    #[serde(default)]
+    pub author: String,
 }
 
 /// A provider failure explained for people (SPEC §4.4).

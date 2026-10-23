@@ -13,6 +13,9 @@ pub struct ListFilter {
     pub editing: bool,
     pub sort: usize,
     pub quick: usize,
+    /// Tools only: grouping (`TOOL_GROUPS`) and the collapsed groups.
+    pub group: usize,
+    pub collapsed: HashSet<String>,
 }
 
 impl ListFilter {
@@ -66,6 +69,48 @@ pub const TOOL_QUICK: &[&str] = &[
     "failing (<80%)",
     "needs attention",
 ];
+pub const TOOL_GROUPS: &[&str] = &["none", "capability", "author", "status"];
+
+/// The group a Tool falls in under grouping `g` (SPEC §10.4): its
+/// Capability families ("fs + net"), its current version's author, or
+/// its status. `None` when not grouping.
+pub fn tool_group(t: &ToolInfo, g: usize) -> Option<String> {
+    Some(match g % TOOL_GROUPS.len() {
+        1 => {
+            let mut fams: Vec<&str> = t
+                .capabilities
+                .iter()
+                .map(|c| c.split(':').next().unwrap_or(c))
+                .collect();
+            fams.sort_unstable();
+            fams.dedup();
+            if fams.is_empty() {
+                "no capabilities".into()
+            } else {
+                fams.join(" + ")
+            }
+        }
+        2 if t.author.is_empty() => "unknown".into(),
+        2 => t.author.clone(),
+        3 if t.retired => "retired".into(),
+        3 if t.needs_attention => "needs attention".into(),
+        3 => "active".into(),
+        _ => return None,
+    })
+}
+
+/// Status groups in a useful order: what needs attention first.
+fn group_rank(group: &str, g: usize) -> (u8, String) {
+    let rank = match (g % TOOL_GROUPS.len(), group) {
+        (3, "needs attention") => 0,
+        (3, "active") => 1,
+        (3, _) => 2,
+        (1, "no capabilities") => 1,
+        _ => 0,
+    };
+    (rank, group.to_string())
+}
+
 pub const SESSION_SORTS: &[&str] = &["last activity", "created", "name"];
 pub const SESSION_QUICK: &[&str] = &["all", "running", "archived"];
 pub const PROPOSAL_SORTS: &[&str] = &["newest", "score"];
@@ -95,7 +140,38 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
         3 => idx.sort_by_key(|&i| std::cmp::Reverse(tools[i].invocations)),
         _ => idx.sort_by(|&a, &b| tools[a].name.cmp(&tools[b].name)),
     }
+    // Grouped: by group (stable, so the sort holds inside each), without
+    // the collapsed groups' Tools.
+    if f.group % TOOL_GROUPS.len() != 0 {
+        idx.sort_by_cached_key(|&i| {
+            group_rank(&tool_group(&tools[i], f.group).unwrap_or_default(), f.group)
+        });
+        idx.retain(|&i| {
+            !f.collapsed
+                .contains(&tool_group(&tools[i], f.group).unwrap_or_default())
+        });
+    }
     idx
+}
+
+/// Every group with its Tool count (after the filter, collapsed ones
+/// too), in display order.
+pub fn tool_groups(tools: &[ToolInfo], f: &ListFilter) -> Vec<(String, usize)> {
+    let open = ListFilter {
+        collapsed: HashSet::new(),
+        ..f.clone()
+    };
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for i in self::tools(tools, &open) {
+        let Some(g) = tool_group(&tools[i], f.group) else {
+            return Vec::new();
+        };
+        match out.last_mut() {
+            Some((last, n)) if *last == g => *n += 1,
+            _ => out.push((g, 1)),
+        }
+    }
+    out
 }
 
 /// Indices into `sessions` (newest activity first by default).
@@ -208,6 +284,7 @@ mod tests {
             created_at: String::new(),
             updated_at: format!("2026-01-0{calls}"),
             recent: String::new(),
+            author: "agent".into(),
         }
     }
 
@@ -239,6 +316,54 @@ mod tests {
         assert_eq!(
             f.title("Tools", 1, 3, TOOL_SORTS, TOOL_QUICK),
             " Tools · 1/3 · sort: success rate · retired "
+        );
+    }
+
+    #[test]
+    fn tools_group_by_capability_author_or_status() {
+        let mut ts = vec![
+            tool("read_file", Some(0.99), 5, false),
+            tool("http_get", Some(0.5), 9, false),
+            tool("old_csv", None, 1, true),
+            tool("fetch_json", Some(0.9), 2, false),
+        ];
+        ts[0].capabilities = vec!["fs:read:/tmp".into()];
+        ts[1].capabilities = vec!["net:example.com".into(), "fs:write:/tmp".into()];
+        ts[3].capabilities = vec!["net:api.example.com".into()];
+        ts[1].needs_attention = true;
+        ts[3].author = "user".into();
+        let names = |idx: Vec<usize>| {
+            idx.into_iter()
+                .map(|i| ts[i].name.as_str())
+                .collect::<Vec<_>>()
+        };
+        let mut f = ListFilter {
+            group: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_groups(&ts, &f),
+            [
+                ("fs".into(), 1),
+                ("fs + net".into(), 1),
+                ("net".into(), 1),
+                ("no capabilities".into(), 1)
+            ]
+        );
+        f.group = 3;
+        assert_eq!(
+            names(tools(&ts, &f)),
+            ["http_get", "fetch_json", "read_file", "old_csv"]
+        );
+        // Folding a group hides its Tools but keeps its header.
+        f.collapsed.insert("active".into());
+        assert_eq!(names(tools(&ts, &f)), ["http_get", "old_csv"]);
+        assert_eq!(tool_groups(&ts, &f).len(), 3);
+        f.group = 2;
+        f.collapsed.clear();
+        assert_eq!(
+            tool_groups(&ts, &f),
+            [("agent".into(), 3), ("user".into(), 1)]
         );
     }
 

@@ -1953,17 +1953,24 @@ impl Store {
         ) = row?;
         drop(rows);
         drop(stmt);
-        let (capabilities, memory_mb) = self
+        let (capabilities, memory_mb, author) = self
             .conn
             .query_row(
-                "SELECT capabilities, memory_mb FROM tool_versions WHERE tool_id=?1 AND version=?2",
+                "SELECT capabilities, memory_mb, author FROM tool_versions WHERE tool_id=?1 AND version=?2",
                 params![id, current_version],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )
-            .map(|(c, m)| {
+            .map(|(c, m, a)| {
                 (
                     serde_json::from_str::<Vec<String>>(&c).unwrap_or_default(),
                     m as u32,
+                    a,
                 )
             })
             .unwrap_or_default();
@@ -1994,6 +2001,7 @@ impl Store {
             created_at,
             updated_at,
             recent: recent.into_iter().collect(),
+            author,
         }))
     }
 

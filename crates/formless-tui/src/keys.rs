@@ -57,6 +57,7 @@ const TOOLS: &[Hint] = &[
     h("/", "filter", 1),
     h("s", "sort", 6),
     h("v", "show", 6),
+    h("c", "group", 6),
 ];
 
 const METRICS: &[Hint] = &[
