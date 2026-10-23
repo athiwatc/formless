@@ -760,6 +760,16 @@ pub enum Request {
         #[serde(default)]
         since: Option<String>,
     },
+    /// Provider token use (and cost, when priced) since `since`, per day
+    /// or, with `by` = "model", "role" or "session", per that key over the
+    /// range (SPEC §10.4): `[{key, prompt_tokens, completion_tokens,
+    /// cached_tokens, cost}]`, days oldest first or keys biggest first.
+    UsageByDay {
+        #[serde(default)]
+        since: Option<String>,
+        #[serde(default)]
+        by: Option<String>,
+    },
     /// Per-Tool calls and success rate in a range:
     /// `[{tool_id, invocations, success_rate}]`.
     ListToolMetrics {

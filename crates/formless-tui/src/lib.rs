@@ -168,6 +168,7 @@ enum Pending {
     ContextReport,
     SuggestName,
     ToolMetrics,
+    Usage,
     RunToolInput,
     RunTool,
     Subscribed,
@@ -796,6 +797,9 @@ struct App {
     /// success rate) in it.
     metrics_range: usize,
     range_tools: HashMap<String, (i64, Option<f64>)>,
+    /// Token use in the range: breakdown (`USAGE_BY`) and its rows.
+    usage_by: usize,
+    usage_rows: Vec<UsageRow>,
     /// The selected recent call in the Tool detail (`[`/`]`).
     call_idx: Option<usize>,
     /// After opening a Session from a Tool call: focus the call made at
@@ -1053,6 +1057,8 @@ impl App {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            usage_by: 0,
+            usage_rows: Vec::new(),
             range_tools: HashMap::new(),
             call_idx: None,
             jump_to: None,
@@ -1611,6 +1617,20 @@ impl App {
                             self.conn = result["conn"].as_u64();
                             let me = self.conn;
                             self.others.retain(|c| Some(c.conn) != me);
+                        }
+                        Pending::Usage => {
+                            self.usage_rows = result
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|r| UsageRow {
+                                    key: r["key"].as_str().unwrap_or_default().to_string(),
+                                    prompt_tokens: r["prompt_tokens"].as_i64().unwrap_or(0),
+                                    completion_tokens: r["completion_tokens"].as_i64().unwrap_or(0),
+                                    cached_tokens: r["cached_tokens"].as_i64().unwrap_or(0),
+                                    cost: r["cost"].as_f64(),
+                                })
+                                .collect();
                         }
                         Pending::ToolMetrics => {
                             self.range_tools = result
@@ -4350,6 +4370,9 @@ impl App {
             View::Metrics => {
                 if key.code == KeyCode::Char('r') {
                     self.metrics_range = (self.metrics_range + 1) % METRIC_RANGES.len();
+                    self.load_metrics();
+                } else if key.code == KeyCode::Char('b') {
+                    self.usage_by = (self.usage_by + 1) % USAGE_BY.len();
                     self.load_metrics();
                 }
             }
@@ -7572,6 +7595,14 @@ impl App {
                 since: since.clone(),
             },
         );
+        self.request(
+            Pending::Usage,
+            Request::UsageByDay {
+                since: since.clone(),
+                by: Some(USAGE_BY[self.usage_by % USAGE_BY.len()].to_string())
+                    .filter(|b| b != "day"),
+            },
+        );
         if since.is_some() {
             self.request(Pending::ToolMetrics, Request::ListToolMetrics { since });
         } else {
@@ -8868,6 +8899,79 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
 
 const NO_TOOLS: &str = "No Tools yet — the agent builds them via create_tool.";
 
+/// Token use per day, or per model, Role or Session over the range.
+const USAGE_BY: &[&str] = &["day", "model", "role", "session"];
+
+/// One bar of the Metrics usage chart.
+#[derive(Debug, Clone)]
+struct UsageRow {
+    key: String,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_tokens: i64,
+    cost: Option<f64>,
+}
+
+/// `12.3k`, `4.5M`.
+fn short_count(n: i64) -> String {
+    match n {
+        1_000_000.. => format!("{:.1}M", n as f64 / 1e6),
+        1_000.. => format!("{:.1}k", n as f64 / 1e3),
+        _ => n.to_string(),
+    }
+}
+
+/// The usage chart: a bar per row, cached prompt, fresh prompt and
+/// completion tokens in their own colours, scaled to the largest row.
+fn usage_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let rows = &app.usage_rows;
+    let label_w = rows
+        .iter()
+        .map(|r| r.key.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    let bar_w = (width as usize).saturating_sub(label_w + 32).max(10);
+    let max = rows
+        .iter()
+        .map(|r| r.prompt_tokens + r.completion_tokens)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let mut lines: Vec<Line> = rows
+        .iter()
+        .map(|r| {
+            let cells = |n: i64| ((n as f64 / max as f64) * bar_w as f64).round() as usize;
+            let cached = cells(r.cached_tokens.min(r.prompt_tokens));
+            let fresh = cells(r.prompt_tokens).saturating_sub(cached);
+            let out = cells(r.completion_tokens);
+            let total = r.prompt_tokens + r.completion_tokens;
+            Line::from(vec![
+                Span::raw(format!(
+                    "{} ",
+                    ui::pad(&truncate_chars(&r.key, label_w), label_w)
+                )),
+                Span::styled("█".repeat(cached), ui::dim(app.color)),
+                Span::styled("█".repeat(fresh), fg(app.color, Color::Cyan)),
+                Span::styled("█".repeat(out), fg(app.color, Color::Green)),
+                Span::raw(" ".repeat(bar_w.saturating_sub(cached + fresh + out) + 1)),
+                Span::raw(format!("{:>7} tok", short_count(total))),
+                Span::styled(
+                    r.cost.map(|c| format!("  ${c:.2}")).unwrap_or_default(),
+                    fg(app.color, Color::Yellow),
+                ),
+            ])
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "No provider use in this range.",
+            ui::dim(app.color),
+        ));
+    }
+    lines
+}
+
 /// The Metrics view's ranges: label and days (None = all history).
 const METRIC_RANGES: &[(&str, Option<f64>)] = &[
     ("all time", None),
@@ -8981,13 +9085,39 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.builtin_stats.len().min(8) as u16 + 3
     };
+    let usage_h = app.usage_rows.len().clamp(1, 10) as u16 + 2;
     let parts = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(detail_h),
+        Constraint::Length(usage_h),
         Constraint::Length(routing_h),
         Constraint::Length(builtins_h),
     ])
     .split(area);
+    {
+        let by = USAGE_BY[app.usage_by % USAGE_BY.len()];
+        let total: i64 = app
+            .usage_rows
+            .iter()
+            .map(|r| r.prompt_tokens + r.completion_tokens)
+            .sum();
+        let cost: Option<f64> = app.usage_rows.iter().map(|r| r.cost).sum();
+        let title = format!(
+            " Tokens by {by} (b) · {} tok{} · cached / prompt / completion ",
+            short_count(total),
+            cost.map(|c| format!(" · ${c:.2}")).unwrap_or_default()
+        );
+        // Days: the latest ones that fit; keys: the biggest.
+        let mut lines = usage_lines(app, parts[2].width.saturating_sub(2));
+        let room = parts[2].height.saturating_sub(2) as usize;
+        if by == "day" && lines.len() > room {
+            lines.drain(..lines.len() - room);
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(ui::panel(title, app.color, Color::Cyan)),
+            parts[2],
+        );
+    }
     if !app.builtin_stats.is_empty() {
         let mut stats: Vec<&formless_protocol::BuiltinStatInfo> =
             app.builtin_stats.iter().collect();
@@ -9030,7 +9160,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             ))
             .column_spacing(2)
             .block(ui::panel(" Built-ins ", app.color, Color::Green)),
-            parts[3],
+            parts[4],
         );
     }
     // In a range, each Tool's calls and success rate within it.
@@ -9196,7 +9326,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                 app.color,
                 Color::Green,
             )),
-            parts[2],
+            parts[3],
         );
     }
 }
@@ -10387,6 +10517,8 @@ mod tests {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            usage_by: 0,
+            usage_rows: Vec::new(),
             range_tools: HashMap::new(),
             call_idx: None,
             jump_to: None,
@@ -12968,6 +13100,34 @@ mod tests {
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("4 invocations"), "{screen}");
         assert!(screen.contains("50%"), "{screen}");
+    }
+
+    #[test]
+    fn metrics_chart_tokens_and_cost_by_day_or_key() {
+        let mut app = test_app();
+        app.view = View::Metrics;
+        let row = |key: &str, p, c, cost| UsageRow {
+            key: key.into(),
+            prompt_tokens: p,
+            completion_tokens: c,
+            cached_tokens: p / 2,
+            cost,
+        };
+        app.usage_rows = vec![
+            row("2026-10-21", 1_200_000, 300_000, Some(1.25)),
+            row("2026-10-22", 400_000, 100_000, Some(0.5)),
+        ];
+        let screen = render(&mut app, 120, 40);
+        assert!(
+            screen.contains("Tokens by day (b) · 2.0M tok · $1.75"),
+            "{screen}"
+        );
+        assert!(screen.contains("2026-10-21 ████"), "{screen}");
+        assert!(screen.contains("1.5M tok  $1.25"), "{screen}");
+        app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.usage_rows = vec![row("deepseek-flash", 10, 5, None)];
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Tokens by model (b) · 15 tok "), "{screen}");
     }
 
     #[test]
