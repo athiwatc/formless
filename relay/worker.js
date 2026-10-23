@@ -119,7 +119,8 @@ export class RelayRoom {
 export const SECURITY_HEADERS = {
   "content-security-policy":
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
-    "connect-src 'self' wss: ws:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "connect-src 'self' wss: ws:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; " +
+    "form-action 'none'; frame-ancestors 'none'",
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
   "cache-control": "no-cache",

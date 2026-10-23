@@ -51,6 +51,26 @@ async fn local_web_ui_is_locked_to_this_origin_and_a_one_time_token() {
         .unwrap()
         .contains("default-src 'none'"));
     assert!(page.text().await.unwrap().contains("formless-local"));
+    // The installable shell: manifest, service worker and icons.
+    for (path, kind) in [
+        ("/manifest.webmanifest", "application/manifest+json"),
+        ("/sw.js", "text/javascript"),
+        ("/icon-192.png", "image/png"),
+    ] {
+        let r = http.get(format!("{origin}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        assert_eq!(r.headers()["content-type"], kind, "{path}");
+    }
+    let csp = http
+        .get(format!("{origin}/"))
+        .send()
+        .await
+        .unwrap()
+        .headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("manifest-src 'self'") && csp.contains("worker-src 'self'"));
     // DNS rebinding: another Host name is refused.
     let rebound = http
         .get(format!("{origin}/"))
