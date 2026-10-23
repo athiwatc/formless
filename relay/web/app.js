@@ -1900,6 +1900,7 @@
         ["token expires", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : ""]]));
     }
     grid.append(providersSection());
+    grid.append(harnessSection());
     const mcp = S.mcpServers || [];
     grid.append(h("section", null, h("h3", null, "MCP servers"),
       mcp.length ? h("table", { class: "table" },
@@ -2076,6 +2077,26 @@
         : h("p", { class: "muted" }, "None. A Role maps a purpose (\"fast search\") to a provider and model for sub-agents."),
       h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => editRole("", {}, names) }, "Add role")));
   }
+  /** Settings → Harness changes (SPEC §7.13): what the agent changed in
+   * its own setup, when and why, each with Undo. */
+  function harnessSection() {
+    const changes = S.harness || [];
+    const show = (v) => (v == null ? "(none)" : typeof v === "string" ? v : JSON.stringify(v, null, 2));
+    return h("section", null, h("h3", null, "Harness changes"),
+      changes.length ? h("table", { class: "table" }, h("tbody", null, changes.map((c) => h("tr", { class: c.undone ? "muted" : null },
+        h("td", { class: "muted" }, relTime(c.created_at)),
+        h("td", null,
+          h("strong", null, c.op + " " + c.target), c.undone ? h("span", { class: "tag" }, "undone") : null,
+          h("div", { class: "muted" }, (c.reason || "no reason given") + (c.tool ? " · via " + c.tool : "")),
+          h("details", { class: "chip" }, h("summary", null, "Before / after"),
+            h("div", { class: "muted" }, "Before"), h("pre", null, show(c.before)),
+            h("div", { class: "muted" }, "After"), h("pre", null, show(c.after)))),
+        h("td", null, c.undone ? null : h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (!(await ask({ title: "Undo " + c.op + " " + c.target + "?", text: "Puts back what it replaced.", ok: "Undo" }))) return;
+          if (await act({ type: "undo_harness_change", id: c.id }, "Undone")) refreshSettings();
+        } }, "Undo"))))))
+        : h("p", { class: "muted" }, "The agent hasn't changed its own setup (MCP servers, skills, settings) yet."));
+  }
   /** A labelled form field for ask() bodies. */
   function field(label, input) {
     return h("label", { class: "try-field" }, h("span", null, label), input);
@@ -2111,6 +2132,7 @@
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
     S.providers = (await request({ type: "list_providers" }).catch(() => null)) || { providers: [], roles: {} };
+    S.harness = (await request({ type: "list_harness_changes" }).catch(() => null)) || [];
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
