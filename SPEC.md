@@ -1724,6 +1724,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
+- **Undo delete.** Deleting a Session is a soft delete for
+  `daemon.delete_undo_secs` (default 30 s), restored with `RestoreSession`.
+  The TUI says "deleted session X · u (or /undo) restores it for 30s",
+  and `u` in the Sessions view undoes it. The web delete toast has an
+  Undo button.
 - **Tags.** `SetSessionTags {id, tags}` (`sessions.tags`, a JSON array,
   migration v35) groups Sessions with free-form tags, normalised to
   lowercase without `#`, unique and sorted.
