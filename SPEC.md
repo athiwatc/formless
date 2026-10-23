@@ -2197,7 +2197,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   search, import/export), streaming chat with thinking and Tool calls,
   send/steer/queue/stop and edit-and-rerun, approvals and promotions,
   Tools (detail, code editor, optimise, retire/restore, rollback, purge,
-  import/export), Metrics, Proposals, and read-only Settings — over the
+  import/export), Metrics, Proposals, and Settings (including Providers &
+  Roles: list, add or edit named providers with a write-only key field,
+  test a connection, and add, edit or delete Roles) — over the
   same daemon protocol, decrypted in the browser. `GetSettings` returns a
   read-only configuration summary for remote clients and never includes
   `provider.extra_headers` or any other credential-bearing field. The
