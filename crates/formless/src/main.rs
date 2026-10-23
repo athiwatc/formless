@@ -1839,6 +1839,32 @@ enum SessionsAction {
     List {
         #[arg(long)]
         archived: bool,
+        /// One JSON array of SessionInfo
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a Session's transcript
+    Show {
+        id: String,
+        /// The Session and its messages as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a Session
+    Rename { id: String, name: String },
+    /// Delete a Session (restorable for daemon.delete_undo_secs)
+    Rm { id: String },
+    /// Bring back a Session deleted moments ago (full id)
+    Restore { id: String },
+    /// Import a Session bundle (from `sessions export --format json`)
+    Import { file: std::path::PathBuf },
+    /// Search every Session's messages
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Hide a Session from the default list (kept and searchable)
     Archive { id: String },
@@ -1861,8 +1887,14 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |r| formless_tui::client::request_once(&paths, r);
     match action {
-        SessionsAction::List { archived } => {
+        SessionsAction::List { archived, json } => {
             let list: Vec<SessionInfo> = serde_json::from_value(daemon(Request::ListSessions)?)?;
+            if json {
+                let shown: Vec<&SessionInfo> =
+                    list.iter().filter(|s| s.archived == archived).collect();
+                println!("{}", serde_json::to_string_pretty(&shown)?);
+                return Ok(());
+            }
             for s in list.iter().filter(|s| s.archived == archived) {
                 println!(
                     "{}  {}  {}{}",
@@ -1870,6 +1902,97 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     s.updated_at.get(..16).unwrap_or(&s.updated_at),
                     s.name,
                     if s.pinned { "  (pinned)" } else { "" }
+                );
+            }
+        }
+        SessionsAction::Show { id, json } => {
+            let s = find_session(&paths, &id)?;
+            let r = daemon(Request::GetSession { id: s.id.clone() })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            println!("{}  ({})", s.name, s.id);
+            println!(
+                "{} messages · updated {}{}{}",
+                s.message_count,
+                s.updated_at.get(..16).unwrap_or(&s.updated_at),
+                s.model
+                    .as_deref()
+                    .map(|m| format!(" · {m}"))
+                    .unwrap_or_default(),
+                s.cwd
+                    .as_deref()
+                    .map(|c| format!(" · in {c}"))
+                    .unwrap_or_default()
+            );
+            let messages: Vec<formless_protocol::MessageInfo> =
+                serde_json::from_value(r["messages"].clone()).unwrap_or_default();
+            for m in messages {
+                let who = match m.role.as_str() {
+                    "user" => "You",
+                    "assistant" => "Formless",
+                    "tool" => "  tool result",
+                    _ => "  note",
+                };
+                if m.role == "tool" {
+                    let first = m.content.lines().next().unwrap_or_default();
+                    println!("{who}: {}", first.chars().take(120).collect::<String>());
+                } else if !m.content.trim().is_empty() {
+                    println!("\n{who}:\n{}", m.content.trim_end());
+                }
+            }
+        }
+        SessionsAction::Rename { id, name } => {
+            let s = find_session(&paths, &id)?;
+            daemon(Request::RenameSession {
+                id: s.id,
+                name: name.clone(),
+            })?;
+            println!("renamed {} to {name}", s.name);
+        }
+        SessionsAction::Rm { id } => {
+            let s = find_session(&paths, &id)?;
+            let r = daemon(Request::DeleteSession { id: s.id.clone() })?;
+            match r["undo_secs"].as_u64() {
+                Some(secs) => println!(
+                    "deleted {} (restore within {secs}s: formless sessions restore {})",
+                    s.name, s.id
+                ),
+                None => println!("deleted {}", s.name),
+            }
+        }
+        SessionsAction::Restore { id } => {
+            let s: SessionInfo = serde_json::from_value(daemon(Request::RestoreSession { id })?)?;
+            println!("restored {}", s.name);
+        }
+        SessionsAction::Import { file } => {
+            let bundle: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)
+                .with_context(|| format!("{} is not a JSON bundle", file.display()))?;
+            let s: SessionInfo =
+                serde_json::from_value(daemon(Request::ImportSession { bundle })?)?;
+            println!("imported {}  ({})", s.name, s.id);
+        }
+        SessionsAction::Search { query, limit, json } => {
+            let hits: Vec<formless_protocol::SearchHit> =
+                serde_json::from_value(daemon(Request::SearchSessions {
+                    query: query.clone(),
+                    limit: Some(limit),
+                })?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+                return Ok(());
+            }
+            if hits.is_empty() {
+                println!("no messages match '{query}'");
+            }
+            for h in hits {
+                println!(
+                    "{}  {}  [{}] {}",
+                    &h.session_id[..8.min(h.session_id.len())],
+                    h.session_name,
+                    h.role,
+                    h.snippet.replace('\n', " ")
                 );
             }
         }
