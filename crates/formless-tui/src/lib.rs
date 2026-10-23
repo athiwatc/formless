@@ -167,6 +167,7 @@ enum Pending {
     SetTags,
     ContextReport,
     SuggestName,
+    Subscribed,
     TemplateSession,
     ListTemplates,
     SaveTemplate,
@@ -811,6 +812,10 @@ struct App {
     /// Notifications (title, body) for the run loop to write out.
     notifications: Vec<(String, String)>,
     approvals: std::collections::VecDeque<ApprovalReq>,
+    /// This connection's id from the daemon, and the other clients
+    /// showing the current Session (SPEC §10.4).
+    conn: Option<u64>,
+    others: Vec<AttachedClient>,
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
     questions: Vec<OpenQuestion>,
@@ -1042,6 +1047,8 @@ impl App {
             run_started_at: HashMap::new(),
             notifications: Vec::new(),
             approvals: std::collections::VecDeque::new(),
+            conn: None,
+            others: Vec::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
@@ -1547,6 +1554,12 @@ impl App {
                                 }
                             }
                         }
+                        Pending::Subscribed => {
+                            // The client list can arrive before this reply.
+                            self.conn = result["conn"].as_u64();
+                            let me = self.conn;
+                            self.others.retain(|c| Some(c.conn) != me);
+                        }
                         Pending::SuggestName => {
                             match (self.current.clone(), result["name"].as_str()) {
                                 (Some(id), Some(name)) => {
@@ -2027,10 +2040,15 @@ impl App {
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
         // Live traffic only for the Session on screen (lists stay global).
-        self.fire(Request::Subscribe {
-            sessions: Some(vec![id.clone()]),
-            deltas: true,
-        });
+        self.others.clear();
+        self.request(
+            Pending::Subscribed,
+            Request::Subscribe {
+                sessions: Some(vec![id.clone()]),
+                deltas: true,
+                client: Some("TUI".into()),
+            },
+        );
         self.request(
             Pending::ContextFill,
             Request::ContextUsage {
@@ -2303,6 +2321,33 @@ impl App {
             }
             Event::UserQuestionClosed { question_id } => {
                 self.questions.retain(|q| q.id != question_id);
+            }
+            Event::SessionClients {
+                session_id,
+                clients,
+            } => {
+                if self.current.as_deref() == Some(&session_id) {
+                    self.others = clients
+                        .into_iter()
+                        .filter(|c| Some(c.conn) != self.conn)
+                        .collect();
+                }
+            }
+            Event::ApprovalAnswered {
+                approval_id,
+                approved,
+                by,
+            } => {
+                // Answered by another client: close ours and say where.
+                let before = self.approvals.len();
+                self.approvals.retain(|a| a.approval_id != approval_id);
+                if self.approvals.len() < before {
+                    self.notes.push(format!(
+                        "approval {} in {}",
+                        if approved { "granted" } else { "denied" },
+                        by.as_deref().unwrap_or("another client")
+                    ));
+                }
             }
             Event::ApprovalRequested {
                 session_id,
@@ -6073,6 +6118,12 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ui::dim(app.color),
         ));
     }
+    if !app.others.is_empty() {
+        left.push(Span::styled(
+            format!(" · also open in {}", others_text(&app.others)),
+            fg(app.color, Color::Magenta),
+        ));
+    }
     if !app.model_label.is_empty() {
         left.push(sep());
         left.push(Span::styled(app.model_label.clone(), ui::dim(app.color)));
@@ -6297,6 +6348,40 @@ fn speaker(role: &str) -> &'static str {
         "system-note" => "system-note",
         _ => "assistant",
     }
+}
+
+/// The client a user message came from, when it wasn't this one: another
+/// kind of client, or another TUI still attached. (Earlier runs of this
+/// TUI had other connection ids, so those alone don't count.)
+fn sent_elsewhere(app: &App, m: &MessageInfo) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+    let label = meta["client"]["label"].as_str()?;
+    let conn = meta["client"]["conn"].as_u64();
+    let other_kind = !label.starts_with("TUI");
+    let other_tui = conn != app.conn && app.others.iter().any(|o| Some(o.conn) == conn);
+    (other_kind || other_tui).then(|| label.to_string())
+}
+
+/// "web, TUI ×2" for the other clients on this Session.
+fn others_text(others: &[AttachedClient]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for o in others {
+        match counts.iter_mut().find(|(l, _)| *l == o.label) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((&o.label, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(l, n)| {
+            if n > 1 {
+                format!("{l} ×{n}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
@@ -7761,6 +7846,12 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             "user" => {
                 user_lines.push(lines.len());
                 open_group(&mut lines, &mut group, "user", when);
+                if let Some(from) = sent_elsewhere(app, m) {
+                    lines.push(Line::styled(
+                        format!("  sent from {from}"),
+                        ui::dim(app.color),
+                    ));
+                }
                 let focused = app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
                 if focused {
                     focus_line = Some(lines.len());
@@ -9715,6 +9806,8 @@ mod tests {
             run_started_at: HashMap::new(),
             notifications: Vec::new(),
             approvals: std::collections::VecDeque::new(),
+            conn: None,
+            others: Vec::new(),
             questions: Vec::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
@@ -12042,6 +12135,71 @@ mod tests {
         assert_eq!(app.current.as_deref(), Some("t1"));
         assert_eq!(app.view, View::Chat);
         assert_eq!(&*app.input, "Triage today's inbox");
+    }
+
+    #[test]
+    fn shows_other_clients_and_what_they_did() {
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.conn = Some(1);
+        let client = |conn, label: &str| AttachedClient {
+            conn,
+            label: label.into(),
+        };
+        app.on_event(Event::SessionClients {
+            session_id: "s1".into(),
+            clients: vec![
+                client(1, "TUI"),
+                client(2, "web"),
+                client(3, "TUI"),
+                client(4, "TUI"),
+            ],
+        });
+        assert_eq!(app.others.len(), 3);
+        assert!(render(&mut app, 140, 20).contains("also open in web, TUI ×2"));
+        // Messages from the web, or from another attached TUI, say so;
+        // this TUI's own (even from an earlier run) don't.
+        let msg = |seq, conn, label: &str| MessageInfo {
+            id: format!("m{seq}"),
+            session_id: "s1".into(),
+            seq,
+            role: "user".into(),
+            content: format!("hello {seq}"),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            meta: Some(serde_json::json!({"client": {"conn": conn, "label": label}}).to_string()),
+        };
+        assert_eq!(
+            sent_elsewhere(&app, &msg(1, 2, "web")).as_deref(),
+            Some("web")
+        );
+        assert_eq!(
+            sent_elsewhere(&app, &msg(2, 3, "TUI")).as_deref(),
+            Some("TUI")
+        );
+        assert_eq!(sent_elsewhere(&app, &msg(3, 1, "TUI")), None);
+        assert_eq!(sent_elsewhere(&app, &msg(4, 99, "TUI")), None);
+        app.messages = vec![msg(1, 2, "web")];
+        assert!(render(&mut app, 100, 20).contains("sent from web"));
+        // An approval answered in the web closes here.
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "a1".into(),
+            session_id: "s1".into(),
+            tool_name: "create_tool".into(),
+            version: 1,
+            capabilities: vec![],
+            detail: None,
+            memory_mb: 256,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+        });
+        app.on_event(Event::ApprovalAnswered {
+            approval_id: "a1".into(),
+            approved: true,
+            by: Some("web".into()),
+        });
+        assert!(app.approvals.is_empty());
+        assert!(app.notes.iter().any(|n| n == "approval granted in web"));
     }
 
     #[test]

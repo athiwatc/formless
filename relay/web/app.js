@@ -1356,7 +1356,9 @@
       if (m.role === "user") {
         // Each user message starts a fresh turn so its Edit button is exact.
         group = null;
-        open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)))));
+        const from = sentElsewhere(m);
+        open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)),
+          from ? h("div", { class: "muted sent-from" }, "sent from " + from) : null)));
       } else if (m.role === "tool") {
         open("assistant", m.created_at).append(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
       } else if (m.role === "system-note") {
@@ -1497,6 +1499,9 @@
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
     $("status-session").title = s && s.cwd ? "Working directory: " + s.cwd : "";
+    const others = S.others || [];
+    $("status-others").classList.toggle("hidden", !others.length);
+    $("status-others").textContent = others.length ? " · also open in " + othersText(others) : "";
     $("status-model").textContent = (s && s.model) || (S.settings && S.settings.provider.model) || "";
     const u = S.usage && S.usage[S.current];
     $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
@@ -2040,7 +2045,14 @@
     rendered.clear(); // a reload may carry edited messages
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
-    request({ type: "subscribe", sessions: [id], deltas: true }).catch(() => {});
+    S.others = [];
+    request({ type: "subscribe", sessions: [id], deltas: true, client: CLIENT_LABEL })
+      .then((r) => {
+        // The client list can arrive before this reply: drop ourselves now.
+        S.conn = r && r.conn;
+        S.others = (S.others || []).filter((c) => c.conn !== S.conn);
+        renderStatus();
+      }).catch(() => {});
     prefs.set("session", id);
     S.streaming = "";
     S.thinking = "";
@@ -2065,6 +2077,24 @@
     S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)];
     await openSession(s.id);
     $("input").focus();
+  }
+  /** What this client is called to others on the same Session (§10.4). */
+  const CLIENT_LABEL = document.querySelector('meta[name="formless-local"]') ? "web" : "web (relay)";
+  /** "TUI, web ×2" for the other clients on this Session. */
+  function othersText(others) {
+    const counts = new Map();
+    for (const o of others) counts.set(o.label, (counts.get(o.label) || 0) + 1);
+    return [...counts].map(([l, n]) => (n > 1 ? l + " ×" + n : l)).join(", ");
+  }
+  /** The client a user message came from, when it wasn't this one: another
+   * kind of client, or another one still attached. */
+  function sentElsewhere(m) {
+    let c;
+    try { c = JSON.parse(m.meta || "{}").client; } catch (_) {}
+    if (!c || !c.label) return null;
+    const otherKind = !c.label.startsWith("web");
+    const otherHere = c.conn !== S.conn && (S.others || []).some((o) => o.conn === c.conn);
+    return otherKind || otherHere ? c.label : null;
   }
   /** Ctrl/⌘+K: fuzzy-switch Sessions by name, tags or last message;
    * Enter opens, Ctrl/⌘+Enter starts a Session named after the query. */
@@ -2686,6 +2716,23 @@
         if (ev.usage.context_tokens > 0) (S.contextFill = S.contextFill || {})[ev.session_id] = { used: ev.usage.context_used, size: ev.usage.context_tokens };
         if (here) renderStatus();
         break;
+      case "session_clients":
+        if (ev.session_id === S.current) {
+          S.others = (ev.clients || []).filter((c) => c.conn !== S.conn);
+          renderStatus();
+        }
+        break;
+      case "approval_answered": {
+        // Answered in another client: close ours and say where.
+        const before = S.approvals.length;
+        S.approvals = S.approvals.filter((a) => !(a.kind === "tool" && a.id === ev.approval_id));
+        if (S.approvals.length < before) {
+          note("approval " + (ev.approved ? "granted" : "denied") + " in " + (ev.by || "another client"));
+          renderApproval();
+          renderStatus();
+        }
+        break;
+      }
       case "user_question_closed":
         // Answered elsewhere (or the Run stopped): close our prompt.
         if (S.questionId === ev.question_id) { S.questionId = null; closeAsk(null); }

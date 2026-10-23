@@ -3,7 +3,7 @@ use formless_protocol::*;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -22,6 +22,7 @@ type Subs = Arc<StdMutex<Vec<Subscriber>>>;
 
 /// A connected client and the events it asked for (`Request::Subscribe`).
 struct Subscriber {
+    conn: u64,
     tx: mpsc::UnboundedSender<ServerMessage>,
     filter: Arc<StdMutex<EventFilter>>,
 }
@@ -30,6 +31,8 @@ struct EventFilter {
     /// None = every Session.
     sessions: Option<std::collections::HashSet<String>>,
     deltas: bool,
+    /// What the client calls itself, shown to the others on its Sessions.
+    label: Option<String>,
 }
 
 impl Default for EventFilter {
@@ -37,8 +40,19 @@ impl Default for EventFilter {
         Self {
             sessions: None,
             deltas: true,
+            label: None,
         }
     }
+}
+
+tokio::task_local! {
+    /// The connection (id, label) a request came from, for attribution.
+    static CLIENT: (u64, String);
+}
+
+/// The client a request came from, outside requests none.
+fn current_client() -> Option<(u64, String)> {
+    CLIENT.try_with(Clone::clone).ok()
 }
 
 impl EventFilter {
@@ -151,6 +165,8 @@ pub struct Daemon {
     readers: Vec<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
+    /// Ids for client connections.
+    next_conn: AtomicU64,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -229,6 +245,7 @@ impl Daemon {
             readers,
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
+            next_conn: AtomicU64::new(1),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
@@ -253,6 +270,34 @@ impl Daemon {
     }
 
     /// Connected clients that receive events (and can answer approvals).
+    /// The clients showing `session_id` (subscribed to it by id).
+    fn session_clients(&self, session_id: &str) -> Vec<AttachedClient> {
+        let mut subs = self.subs.lock().unwrap();
+        subs.retain(|sub| !sub.tx.is_closed());
+        subs.iter()
+            .filter_map(|sub| {
+                let f = sub.filter.lock().unwrap();
+                f.sessions
+                    .as_ref()?
+                    .contains(session_id)
+                    .then(|| AttachedClient {
+                        conn: sub.conn,
+                        label: f.label.clone().unwrap_or_else(|| "client".into()),
+                    })
+            })
+            .collect()
+    }
+
+    fn broadcast_clients<'a>(&self, sessions: impl IntoIterator<Item = &'a String>) {
+        for id in sessions {
+            let clients = self.session_clients(id);
+            self.broadcast(Event::SessionClients {
+                session_id: id.clone(),
+                clients,
+            });
+        }
+    }
+
     pub fn subscriber_count(&self) -> usize {
         let mut subs = self.subs.lock().unwrap();
         subs.retain(|sub| !sub.tx.is_closed());
@@ -1690,6 +1735,13 @@ impl Daemon {
                     Some(tx) => tx.send((approved, scope)).is_ok(),
                     None => false,
                 };
+                if resolved {
+                    self.broadcast(Event::ApprovalAnswered {
+                        approval_id,
+                        approved,
+                        by: current_client().map(|c| c.1),
+                    });
+                }
                 Ok(json!({"resolved": resolved}))
             }
         }
@@ -4611,7 +4663,15 @@ impl Daemon {
             .unwrap()
             .remove(session_id)
             .unwrap_or_default();
-        let meta = (!atts.is_empty()).then(|| json!({"attachments": atts}).to_string());
+        let mut meta = json!({});
+        if !atts.is_empty() {
+            meta["attachments"] = json!(atts);
+        }
+        // Who sent it, so other clients on the Session can tell (§10.4).
+        if let Some((conn, label)) = current_client() {
+            meta["client"] = json!({"conn": conn, "label": label});
+        }
+        let meta = (meta != json!({})).then(|| meta.to_string());
         self.with_store(|st| st.append_message_meta(session_id, "user", content, meta))
     }
 
@@ -6179,10 +6239,20 @@ impl Daemon {
         let (read_half, mut write_half) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
         let filter = Arc::new(StdMutex::new(EventFilter::default()));
+        let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
         self.subs.lock().unwrap().push(Subscriber {
+            conn,
             tx: tx.clone(),
             filter: filter.clone(),
         });
+        // Requests run as this client, for attribution (SPEC §10.4).
+        let client = {
+            let filter = filter.clone();
+            move || {
+                let label = filter.lock().unwrap().label.clone();
+                (conn, label.unwrap_or_else(|| "client".into()))
+            }
+        };
         for w in &self.startup_warnings {
             let _ = tx.send(ServerMessage::Event(Event::Note {
                 session_id: None,
@@ -6206,10 +6276,10 @@ impl Daemon {
         // requests (Esc, approvals, answers, Ping) skip the queue (SPEC §9.3).
         let (work_tx, mut work_rx) = mpsc::unbounded_channel::<RequestEnvelope>();
         let worker = {
-            let (this, tx) = (self.clone(), tx.clone());
+            let (this, tx, client) = (self.clone(), tx.clone(), client.clone());
             tokio::spawn(async move {
                 while let Some(env) = work_rx.recv().await {
-                    let resp = match this.handle(env.request).await {
+                    let resp = match CLIENT.scope(client(), this.handle(env.request)).await {
                         Ok(v) => ServerMessage::ok(env.id, v),
                         Err(e) => ServerMessage::err(env.id, e.to_string()),
                     };
@@ -6234,17 +6304,31 @@ impl Daemon {
                                 env.protocol
                             ),
                         )
-                    } else if let Request::Subscribe { sessions, deltas } = env.request {
+                    } else if let Request::Subscribe {
+                        sessions,
+                        deltas,
+                        client: label,
+                    } = env.request
+                    {
                         // Per connection, so handled here rather than in `handle`.
-                        *filter.lock().unwrap() = EventFilter {
-                            sessions: sessions.map(|s| s.into_iter().collect()),
-                            deltas,
+                        let before = {
+                            let mut f = filter.lock().unwrap();
+                            let before = f.sessions.take().unwrap_or_default();
+                            *f = EventFilter {
+                                sessions: sessions.map(|s| s.into_iter().collect()),
+                                deltas,
+                                label: label.or(f.label.take()),
+                            };
+                            before
                         };
-                        ServerMessage::ok(env.id, json!({"subscribed": true}))
+                        // Both the Sessions it left and the ones it joined.
+                        let now = filter.lock().unwrap().sessions.clone().unwrap_or_default();
+                        self.broadcast_clients(before.union(&now));
+                        ServerMessage::ok(env.id, json!({"subscribed": true, "conn": conn}))
                     } else if is_control(&env.request) {
-                        let (this, tx) = (self.clone(), tx.clone());
+                        let (this, tx, who) = (self.clone(), tx.clone(), client());
                         tokio::spawn(async move {
-                            let resp = match this.handle(env.request).await {
+                            let resp = match CLIENT.scope(who, this.handle(env.request)).await {
                                 Ok(v) => ServerMessage::ok(env.id, v),
                                 Err(e) => ServerMessage::err(env.id, e.to_string()),
                             };
@@ -6265,6 +6349,10 @@ impl Daemon {
             }
         }
         drop(work_tx);
+        // Gone from its Sessions: tell the clients still there.
+        self.subs.lock().unwrap().retain(|sub| sub.conn != conn);
+        let left = filter.lock().unwrap().sessions.take().unwrap_or_default();
+        self.broadcast_clients(&left);
         // Let queued requests finish (their replies are dropped if the
         // client is gone), then stop writing.
         let _ = worker.await;
