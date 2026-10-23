@@ -856,6 +856,9 @@ struct App {
     /// While an approval is open: whether keys go to the input (Tab
     /// toggles) instead of the approval (SPEC §10.3).
     input_focus: bool,
+    /// What to open once the Session list arrives: "last", "new" or
+    /// "picker" (`tui.on_start`, or a launch flag).
+    on_start: String,
     /// `/quit` while Runs are working asks first (SPEC §10.5).
     quit_confirm: bool,
     /// `?` in an approval: explain each capability under it.
@@ -1053,6 +1056,7 @@ impl App {
             input_focus: false,
             approval_explain: false,
             quit_confirm: false,
+            on_start: cfg.tui.on_start.clone(),
             approval_code: None,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
@@ -1163,9 +1167,10 @@ impl App {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
                                 self.sessions = v;
                                 if self.current.is_none() {
-                                    if let Some(first) =
-                                        self.sessions.iter().find(|s| !s.archived).cloned()
-                                    {
+                                    if self.on_start == "picker" {
+                                        self.view = View::Sessions;
+                                    }
+                                    if let Some(first) = self.start_session() {
                                         self.switch_session(first.id.clone());
                                         self.request(
                                             Pending::GetSession,
@@ -6616,6 +6621,20 @@ impl App {
         self.marked.clear();
     }
 
+    /// The Session to open on launch (SPEC §10.1): the most recently
+    /// active one (not the first row: pinned Sessions list first), or none
+    /// when starting fresh.
+    fn start_session(&self) -> Option<SessionInfo> {
+        if self.on_start == "new" {
+            return None;
+        }
+        self.sessions
+            .iter()
+            .filter(|s| !s.archived)
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+            .cloned()
+    }
+
     /// Pin or unpin a Session (SPEC §10.4).
     fn toggle_pin(&mut self, s: &SessionInfo) {
         self.request(
@@ -9050,11 +9069,20 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
 }
 
 pub fn run(paths: Paths) -> Result<()> {
+    run_with(paths, None)
+}
+
+/// [`run`], opening `start` ("last", "new" or "picker") instead of
+/// `tui.on_start` (SPEC §10.1): `formless --continue` / `--new`.
+pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     // Screen readers get the line-oriented mode (SPEC §10.7).
     if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
         return plain::run(paths);
     }
     let mut app = App::new(paths)?;
+    if let Some(s) = start {
+        app.on_start = s.to_string();
+    }
     app.load_drafts();
     enable_raw_mode()?;
     let mut out = stdout();
@@ -9296,6 +9324,7 @@ mod tests {
             input_focus: false,
             approval_explain: false,
             quit_confirm: false,
+            on_start: "last".into(),
             approval_code: None,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
@@ -11481,6 +11510,34 @@ mod tests {
         app.key(key(KeyCode::Char(' ')));
         app.key(key(KeyCode::Esc));
         assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn launch_opens_the_most_recent_or_a_fresh_session() {
+        let mut app = test_app();
+        let session = |id: &str, at: &str, pinned: bool, archived: bool| SessionInfo {
+            id: id.into(),
+            name: id.into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: at.into(),
+            updated_at: at.into(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned,
+            archived,
+            tags: Vec::new(),
+        };
+        app.sessions = vec![
+            session("home", "2026-01-01", true, false),
+            session("recent", "2026-03-01", false, false),
+            session("old-archived", "2026-04-01", false, true),
+        ];
+        assert_eq!(app.start_session().unwrap().id, "recent");
+        app.on_start = "new".into();
+        assert!(app.start_session().is_none());
     }
 
     #[test]
