@@ -2199,7 +2199,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   Tools (detail, code editor, optimise, retire/restore, rollback, purge,
   import/export), Metrics, Proposals, and Settings (including Providers &
   Roles: list, add or edit named providers with a write-only key field,
-  test a connection, and add, edit or delete Roles) — over the
+  test a connection, and add, edit or delete Roles; and Harness changes:
+  what the agent changed in its own setup, when and why, with before/after
+  and Undo per entry) — over the
   same daemon protocol, decrypted in the browser. `GetSettings` returns a
   read-only configuration summary for remote clients and never includes
   `provider.extra_headers` or any other credential-bearing field. The
