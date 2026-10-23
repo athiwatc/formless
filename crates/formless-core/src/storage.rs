@@ -8,6 +8,10 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+/// Token use for one key and model: (key, model, prompt, completion,
+/// cached).
+pub type GroupedUsage = (String, String, i64, i64, i64);
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
@@ -1447,6 +1451,16 @@ impl Store {
     }
 
     /// Record why a Run stopped.
+    pub fn run_error(&self, run_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT error FROM runs WHERE id=?1", params![run_id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .ok()
+            .flatten())
+    }
+
     pub fn set_run_error(&self, run_id: &str, error: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET error=?2 WHERE id=?1",
@@ -1571,6 +1585,15 @@ impl Store {
     }
 
     /// One model call made in a Run (a step).
+    pub fn run_steps(&self, run_id: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT steps FROM runs WHERE id=?1", params![run_id], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0))
+    }
+
     pub fn bump_run_steps(&self, run_id: &str) -> Result<()> {
         self.conn
             .execute("UPDATE runs SET steps=steps+1 WHERE id=?1", params![run_id])?;
@@ -3595,11 +3618,7 @@ impl Store {
     /// Token use since `since` grouped by `by` ("model", "role",
     /// "session", else the UTC day) and model (for pricing): (key, model,
     /// prompt, completion, cached).
-    pub fn usage_grouped(
-        &self,
-        since: Option<&str>,
-        by: &str,
-    ) -> Result<Vec<(String, String, i64, i64, i64)>> {
+    pub fn usage_grouped(&self, since: Option<&str>, by: &str) -> Result<Vec<GroupedUsage>> {
         let key = match by {
             "model" => "u.model",
             "session" => "COALESCE(s.name, u.session_id)",

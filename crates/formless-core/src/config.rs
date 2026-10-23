@@ -21,6 +21,7 @@ pub struct Config {
     pub artifacts: ArtifactsCfg,
     pub mcp: McpCfg,
     pub skills: SkillsCfg,
+    pub limits: LimitsCfg,
     /// `[[hooks]]` (SPEC §9.8): user policy and automation around Tool
     /// calls and Runs.
     pub hooks: Vec<HookCfg>,
@@ -30,6 +31,19 @@ pub struct Config {
     /// Roles: a purpose mapped to a provider + model, described for the
     /// agent so it can pick one for sub-agents (SPEC §4.5).
     pub roles: BTreeMap<String, RoleCfg>,
+}
+
+/// Opt-in spending limits (SPEC §5.2): unset means no limit. Dollar
+/// limits apply only while every model used has a price.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LimitsCfg {
+    /// Provider spend across all Sessions per UTC day.
+    pub daily_usd: Option<f64>,
+    /// Provider spend of one Run.
+    pub run_usd: Option<f64>,
+    /// Model steps of one Run.
+    pub run_steps: Option<u64>,
 }
 
 /// One Role (SPEC §4.5).
@@ -249,6 +263,7 @@ pub const SETTABLE: &[&str] = &[
     "naming.",
     "skills.",
     "artifacts.",
+    "limits.",
 ];
 
 /// External MCP servers ((SPEC §7.9)). None ship by default.

@@ -78,6 +78,18 @@ async fn the_daemon_writes_the_file_without_env_overrides() {
         .await
         .unwrap();
     assert_eq!(r["restart_required"], false);
+    // Spending limits are settable: a decimal, then cleared with null.
+    for value in [serde_json::json!(2.5), serde_json::Value::Null] {
+        daemon
+            .handle(Request::SetSetting {
+                key: "limits.daily_usd".into(),
+                value: value.clone(),
+            })
+            .await
+            .unwrap();
+        let limit = Config::load_file_only(&paths).unwrap().limits.daily_usd;
+        assert_eq!(limit, value.as_f64());
+    }
     let saved = Config::load_file_only(&paths).unwrap();
     assert!(saved.tui.multi_pane);
     assert_eq!(saved.provider.model, "file-model");

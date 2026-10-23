@@ -405,8 +405,16 @@ task, with quality as a gate**.
 - Each user message in a Session starts a **Run**: the agent loops
   (think → tool call(s) → observe) autonomously until it produces a final
   answer, is interrupted, or pauses on provider failure/limit-free errors.
-- **No limits:** there is no max-step, token-budget, or wall-clock cap on a
-  Run. Config contains no such settings. The user is the limit.
+- **No limits by default:** there is no max-step, token-budget, or
+  wall-clock cap on a Run unless the user sets one. The user is the limit.
+- **Opt-in spending limits.** `[limits]` `daily_usd` (all Sessions, per
+  UTC day), `run_usd` and `run_steps` (per Run), all unset by default and
+  settable from Settings. Dollar limits count only while every model used
+  has a `provider.prices` entry. Before each model request the daemon
+  checks them: at 80% it posts a note ("Spending: …"), and at 100% it pauses
+  the Run with a `budget:` error (explained category `budget`). The pause
+  banner's Resume goes past the limits for that one Run. Raising or
+  clearing the limit (empty or "off") lifts it for the next one.
 - Completed Runs are appended to Session history. A Run interrupted by user
   action, provider exhaustion, or daemon crash is marked accordingly and is
   resumable per §5.4/§9.5.

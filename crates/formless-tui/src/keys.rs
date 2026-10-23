@@ -64,6 +64,7 @@ const METRICS: &[Hint] = &[
     h("j k", "move", 0),
     h("g G", "top/bottom", 2),
     h("r", "range", 1),
+    h("b", "tokens by", 2),
     h("Tab", "views", 1),
 ];
 

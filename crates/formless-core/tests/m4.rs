@@ -2208,3 +2208,95 @@ async fn enabled_skills_are_indexed_in_the_system_prompt() {
     );
     server.abort();
 }
+
+/// Opt-in spending limits pause a Run, warn first, and Resume goes past
+/// them once (SPEC §5.2).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_step_limit_warns_then_pauses_and_resume_goes_past_it() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4budget");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n < 8 {
+                            sse_tool(&format!("c{n}"), "no_such_tool", json!({}))
+                        } else {
+                            sse_text("done")
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let mut cfg = formless_core::Config::load(&paths).unwrap();
+    cfg.limits.run_steps = Some(5);
+    cfg.save(&paths).unwrap();
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut warned = false;
+    let mut explained = None;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(&line) {
+            Ok(ServerMessage::Event(Event::Note { text, .. })) if text.starts_with("Spending:") => {
+                warned = true
+            }
+            Ok(ServerMessage::Event(Event::RunPaused { explained: e, .. })) => explained = e,
+            Ok(ServerMessage::Event(Event::RunFinished { status, .. })) => {
+                assert_eq!(status, "paused");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(warned, "a warning at 80%");
+    let explained = explained.unwrap();
+    assert_eq!(explained.category, "budget");
+    assert!(
+        explained.message.contains("5 of 5 steps"),
+        "{}",
+        explained.message
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // Resume continues past the limit, to the end.
+    c.send(Request::ResumeRun {
+        session_id: id.clone(),
+    })
+    .await;
+    assert_eq!(c.run_to_finish().await, "done");
+    server.abort();
+}

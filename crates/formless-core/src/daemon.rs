@@ -167,6 +167,11 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Ids for client connections.
     next_conn: AtomicU64,
+    /// Spending warnings already given ("run:<id>:<limit>", "day:<date>"),
+    /// and Sessions allowed past the limits for their next Run (Resume
+    /// from a budget pause).
+    budget_warned: StdMutex<std::collections::HashSet<String>>,
+    budget_waived: StdMutex<std::collections::HashSet<String>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -246,6 +251,8 @@ impl Daemon {
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             next_conn: AtomicU64::new(1),
+            budget_warned: StdMutex::new(Default::default()),
+            budget_waived: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
@@ -724,6 +731,18 @@ impl Daemon {
                     .with_store(|st| st.last_run(&session_id))?
                     .filter(|(_, s)| s == "interrupted" || s == "paused")
                     .context("nothing to resume: the last run was not interrupted or paused")?;
+                // Resuming from a spending pause goes past the limits once.
+                let budget = self
+                    .with_reader(|st| st.run_error(&run_id))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|e| e.starts_with("budget:"));
+                if budget {
+                    self.budget_waived
+                        .lock()
+                        .unwrap()
+                        .insert(session_id.clone());
+                }
                 self.with_store(|st| st.set_run_status(&run_id, "resumed"))?;
                 let note = format!(
                     "The previous run was {status} before it finished. Continue the user's \
@@ -2027,6 +2046,7 @@ impl Daemon {
             let _ = self.with_store(|st| st.set_run_status(&run_id, final_status));
         }
         self.runs.lock().unwrap().remove(&session_id);
+        self.budget_waived.lock().unwrap().remove(&session_id);
         self.broadcast(Event::RunFinished {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
@@ -2373,6 +2393,8 @@ impl Daemon {
             if cancel.is_cancelled() {
                 return Err(anyhow!("interrupted"));
             }
+            // Spending limits, before each model request (SPEC §5.2).
+            self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
             let ctx = self
@@ -4547,6 +4569,78 @@ impl Daemon {
         self.with_store(|st| st.mark_harness_undone(&cid))?;
         let _ = self.with_store(|st| st.audit("user", "harness.undo", &format!("{cid} ({op})")));
         Ok(json!({"undone": cid, "op": op}))
+    }
+
+    /// Opt-in spending limits (SPEC §5.2), checked before each model step:
+    /// a note at 80%, and at 100% an error that pauses the Run ("budget:
+    /// …"). Dollar limits apply only while every model used has a price.
+    fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
+        let l = &cfg.limits;
+        if l.daily_usd.is_none() && l.run_usd.is_none() && l.run_steps.is_none() {
+            return Ok(());
+        }
+        if self.budget_waived.lock().unwrap().contains(session_id) {
+            return Ok(());
+        }
+        let run = self.usage_info(None, Some(run_id), cfg)?;
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut checks: Vec<(String, f64, f64, String)> = Vec::new();
+        if let Some(max) = l.run_steps {
+            let steps = self.with_reader(|st| st.run_steps(run_id))?;
+            checks.push((
+                "run_steps".into(),
+                steps as f64,
+                max as f64,
+                format!("this Run took {steps} of {max} steps"),
+            ));
+        }
+        if let (Some(max), Some(cost)) = (l.run_usd, run.cost) {
+            checks.push((
+                "run_usd".into(),
+                cost,
+                max,
+                format!("this Run spent ${cost:.2} of ${max:.2}"),
+            ));
+        }
+        if let Some(max) = l.daily_usd {
+            let rows = self.with_reader(|st| st.usage_grouped(Some(&today), "model"))?;
+            let day: Option<f64> = rows
+                .iter()
+                .map(|(_, model, p, c, cached)| {
+                    cfg.provider
+                        .prices
+                        .get(model)
+                        .map(|m| m.cost(*p, *c, *cached))
+                })
+                .sum();
+            if let Some(cost) = day {
+                checks.push((
+                    "daily_usd".into(),
+                    cost,
+                    max,
+                    format!("today's spend is ${cost:.2} of ${max:.2}"),
+                ));
+            }
+        }
+        for (name, used, max, what) in checks {
+            if max > 0.0 && used >= max {
+                return Err(anyhow!(
+                    "budget: {what} (limits.{name}). The Run is paused."
+                ));
+            }
+            let key = if name == "daily_usd" {
+                format!("day:{today}")
+            } else {
+                format!("run:{run_id}:{name}")
+            };
+            if used >= max * 0.8 && self.budget_warned.lock().unwrap().insert(key) {
+                self.broadcast(Event::Note {
+                    session_id: Some(session_id.to_string()),
+                    text: format!("Spending: {what} (80% of limits.{name})."),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Usage of a Run or Session, priced with `provider.prices` when every
