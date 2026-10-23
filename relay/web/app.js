@@ -446,6 +446,7 @@
       h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
       h("button", { type: "button", onclick: () => { closePopover(); suggestName(s); } }, "Suggest name"),
       h("button", { type: "button", onclick: () => { closePopover(); tagSession(s); } }, "Tags…"),
+      h("button", { type: "button", onclick: () => { closePopover(); editInstructions(s); } }, "Instructions…"),
       h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
       h("button", { type: "button", onclick: () => { closePopover(); exportSession(s.id); } }, "Export"),
       h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
@@ -2145,6 +2146,17 @@
     const name = await ask({ title: "Suggested name", input: true, value: r.name, ok: "Rename" });
     if (name && name.trim() && name.trim() !== s.name) await act({ type: "rename_session", id: s.id, name: name.trim() });
   }
+  /** Standing instructions for one Session's agent; empty clears them. */
+  async function editInstructions(s, text) {
+    if (text === undefined) {
+      text = await ask({ title: "Instructions for " + s.name, input: true, value: s.instructions || "", placeholder: "Answer in Thai. This Session is about the billing service.", ok: "Save" });
+      if (text == null) return;
+    }
+    const r = await act({ type: "set_session_instructions", id: s.id, instructions: text.trim() || null }, text.trim() ? "Instructions saved" : "Instructions cleared");
+    if (!r) return;
+    const i = S.sessions.findIndex((x) => x.id === r.id);
+    if (i >= 0) S.sessions[i] = r;
+  }
   async function forkSession(id) {
     if (!id) return;
     const s = await act({ type: "fork_session", id, name: null, up_to_seq: null }, "Forked session");
@@ -2285,6 +2297,11 @@
       if (arg === "auto") return suggestName(s);
       if (arg) return act({ type: "rename_session", id: s.id, name: arg });
       return renameSession(s);
+    } },
+    { name: "instructions", args: "[TEXT|clear]", group: "Session", desc: "standing instructions for this Session's agent", run: (arg) => {
+      const s = S.sessions.find((x) => x.id === S.current);
+      if (!s) return toast("No current session.", true);
+      return editInstructions(s, arg === "clear" ? "" : arg || undefined);
     } },
     { name: "context", group: "Session", desc: "how full the context window is, and what fills it", run: () => showContext() },
     { name: "stop", group: "Run control", desc: "stop the current Run (Esc)", run: () => stop() },

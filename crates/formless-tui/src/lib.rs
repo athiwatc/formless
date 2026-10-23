@@ -890,6 +890,8 @@ struct App {
     import_mode: Option<ImportKind>,
     /// The Session being renamed (the input holds its new name).
     renaming: Option<String>,
+    /// The Session whose instructions the input is editing.
+    instructing: Option<String>,
     /// Sessions marked with Space for a bulk action (SPEC §10.4), and a
     /// bulk action waiting for its typed input (tags, or "delete").
     marked: HashSet<String>,
@@ -1076,6 +1078,7 @@ impl App {
             subagents: Vec::new(),
             import_mode: None,
             renaming: None,
+            instructing: None,
             marked: HashSet::new(),
             bulk: None,
             modules: Vec::new(),
@@ -2516,6 +2519,10 @@ impl App {
             self.finish_bulk(action, ids, &text);
             return;
         }
+        if let Some(id) = self.instructing.take() {
+            self.set_instructions(id, &text);
+            return;
+        }
         if let Some(id) = self.renaming.take() {
             let name = text.trim().to_string();
             if !name.is_empty() {
@@ -2892,6 +2899,7 @@ impl App {
         if self.palette_hidden.as_deref() == Some(&*self.input)
             || self.search_mode
             || self.renaming.is_some()
+            || self.instructing.is_some()
             || self.import_mode.is_some()
         {
             return Vec::new();
@@ -3385,6 +3393,9 @@ impl App {
                     "timestamps {} (remembered)",
                     if self.show_timestamps { "on" } else { "off" }
                 ));
+            }
+            cmd if cmd == "instructions" || cmd.starts_with("instructions ") => {
+                self.instructions_cmd(cmd[12..].trim())
             }
             cmd if cmd == "rename" || cmd.starts_with("rename ") => {
                 self.rename_cmd(cmd[6..].trim())
@@ -5041,10 +5052,11 @@ impl App {
             KeyCode::Esc if !self.running() && self.toasts.iter().any(|t| t.2) => {
                 self.toasts.clear();
             }
-            KeyCode::Esc if self.renaming.is_some() => {
+            KeyCode::Esc if self.renaming.is_some() || self.instructing.is_some() => {
                 self.renaming = None;
+                self.instructing = None;
                 self.input.clear();
-                self.notes.push("rename cancelled".into());
+                self.notes.push("cancelled".into());
             }
             KeyCode::Esc if self.bulk.is_some() => {
                 self.bulk = None;
@@ -5820,6 +5832,8 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         )
     } else if app.renaming.is_some() {
         ("rename › ", Color::Magenta)
+    } else if app.instructing.is_some() {
+        ("instructions › ", Color::Magenta)
     } else if app.search_mode {
         ("search › ", Color::Magenta)
     } else if app.import_mode.is_some() {
@@ -6749,6 +6763,47 @@ impl App {
         }
     }
 
+    /// `/instructions` edits this Session's standing instructions in the
+    /// input, `/instructions TEXT` sets them, `/instructions clear` clears.
+    fn instructions_cmd(&mut self, arg: &str) {
+        let Some(id) = self.current.clone() else {
+            self.notes.push("no current session".into());
+            return;
+        };
+        match arg {
+            "" => {
+                let text = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| s.instructions.clone())
+                    .unwrap_or_default();
+                self.instructing = Some(id);
+                self.view = View::Chat;
+                self.input.set(&text);
+                self.notes.push(
+                    "Edit this Session's standing instructions, then Enter (empty clears, Esc cancels)."
+                        .into(),
+                );
+            }
+            "clear" => self.set_instructions(id, ""),
+            text => self.set_instructions(id, text),
+        }
+    }
+
+    fn set_instructions(&mut self, id: String, text: &str) {
+        let text = text.trim();
+        self.fire(Request::SetSessionInstructions {
+            id,
+            instructions: Some(text.to_string()).filter(|t| !t.is_empty()),
+        });
+        self.notes.push(if text.is_empty() {
+            "instructions cleared".into()
+        } else {
+            "instructions set; the agent follows them from its next step".into()
+        });
+    }
+
     /// Rename Session `id` in the input, starting from `name` (Esc
     /// cancels).
     fn start_rename(&mut self, id: &str, name: &str) {
@@ -6796,7 +6851,7 @@ impl App {
                     .cmp(&self.sessions[a.1].updated_at)
             });
         } else {
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.sort_by_key(|s| std::cmp::Reverse(s.0));
         }
         scored.into_iter().map(|(_, i)| i).collect()
     }
@@ -9559,6 +9614,7 @@ mod tests {
             subagents: Vec::new(),
             import_mode: None,
             renaming: None,
+            instructing: None,
             marked: HashSet::new(),
             bulk: None,
             modules: Vec::new(),
@@ -10124,6 +10180,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: Vec::new(),
+            instructions: None,
         }];
         app.key(key(KeyCode::Char('d')));
         assert_eq!(app.delete_arm.as_deref(), Some("s1"));
@@ -10908,6 +10965,7 @@ mod tests {
                 pinned: false,
                 archived: false,
                 tags: Vec::new(),
+                instructions: None,
             })
             .collect();
         app.switch_session("refactor-auth".into());
@@ -11487,6 +11545,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: Vec::new(),
+            instructions: None,
         }];
         app.switch_session("s".into());
         assert_eq!(app.work_dir(), here.join("src"));
@@ -11516,6 +11575,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: Vec::new(),
+            instructions: None,
         };
         app.sessions = vec![session("a", Some("paused")), session("b", None)];
         app.running_sessions.insert("b".into());
@@ -11553,6 +11613,7 @@ mod tests {
             pinned,
             archived: false,
             tags: Vec::new(),
+            instructions: None,
         };
         app.sessions = vec![
             session("new", "2026-02-01", false),
@@ -11590,6 +11651,7 @@ mod tests {
             pinned: false,
             archived,
             tags: Vec::new(),
+            instructions: None,
         };
         app.sessions = vec![session("old", true), session("live", false)];
         let names = |app: &App| -> Vec<String> {
@@ -11624,6 +11686,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            instructions: None,
         };
         app.sessions = vec![
             session("alpha", &["work"]),
@@ -11668,6 +11731,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: Vec::new(),
+            instructions: None,
         }];
         app.view = View::Sessions;
         app.key(key(KeyCode::Char('d')));
@@ -11701,6 +11765,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: Vec::new(),
+            instructions: None,
         };
         app.sessions = vec![session("a1"), session("b2"), session("c3")];
         app.view = View::Sessions;
@@ -11748,6 +11813,7 @@ mod tests {
             pinned,
             archived,
             tags: Vec::new(),
+            instructions: None,
         };
         app.sessions = vec![
             session("home", "2026-01-01", true, false),
@@ -11777,6 +11843,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: vec![],
+            instructions: None,
         }];
         app.view = View::Sessions;
         app.key(key(KeyCode::Char('r')));
@@ -11802,6 +11869,15 @@ mod tests {
         app.drain_daemon();
         assert_eq!(app.renaming.as_deref(), Some("a"));
         assert_eq!(&*app.input, "Token code split");
+        // `/instructions` edits them the same way.
+        app.renaming = None;
+        app.sessions[0].instructions = Some("answer in Thai".into());
+        app.slash("instructions");
+        assert_eq!(app.instructing.as_deref(), Some("a"));
+        assert_eq!(&*app.input, "answer in Thai");
+        assert!(render(&mut app, 80, 20).contains("instructions ›"));
+        app.key(key(KeyCode::Esc));
+        assert!(app.instructing.is_none());
     }
 
     #[test]
@@ -11823,6 +11899,7 @@ mod tests {
             pinned: false,
             archived: false,
             tags: vec!["client".into()],
+            instructions: None,
         };
         app.sessions = vec![
             session("a", "Refactor auth", "2026-01-01", "split the token code"),
