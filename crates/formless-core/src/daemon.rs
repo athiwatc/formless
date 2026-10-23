@@ -1525,7 +1525,29 @@ impl Daemon {
                     )?)
                 }
             }
-            Request::ExportSession { id } => {
+            Request::ExportSession { id, format } => {
+                let format = format.as_deref().unwrap_or("json").to_ascii_lowercase();
+                if format != "json" {
+                    let (s, msgs) = self.with_reader(|st| {
+                        let s = st.get_session(&id)?.context("session not found")?;
+                        Ok((s, st.list_messages(&id)?))
+                    })?;
+                    let content = match format.as_str() {
+                        "markdown" | "md" => crate::transcript::markdown(&s.name, &msgs),
+                        "html" => crate::transcript::html(&s.name, &msgs),
+                        other => {
+                            return Err(anyhow!(
+                                "unknown export format '{other}' (json, markdown or html)"
+                            ))
+                        }
+                    };
+                    let format = if format == "md" {
+                        "markdown".into()
+                    } else {
+                        format
+                    };
+                    return Ok(json!({ "name": s.name, "format": format, "content": content }));
+                }
                 let bundle = self.with_reader(|st| {
                     let s = st.get_session(&id)?.context("session not found")?;
                     let msgs = st.list_messages(&id)?;

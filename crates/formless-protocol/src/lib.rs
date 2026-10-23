@@ -994,8 +994,13 @@ pub enum Request {
     ImportTool {
         bundle: serde_json::Value,
     },
+    /// `format`: "json" (default; the re-importable bundle), or
+    /// "markdown" / "html", which return `{name, format, content}`
+    /// (SPEC §5.1).
     ExportSession {
         id: String,
+        #[serde(default)]
+        format: Option<String>,
     },
     ImportSession {
         bundle: serde_json::Value,

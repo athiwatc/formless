@@ -21,6 +21,7 @@ rand.workspace = true
 sha2.workspace = true
 hkdf.workspace = true
 ignore.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 rustls = { version = "0.23", features = ["ring"] }
 tokio-tungstenite.workspace = true
 chrono.workspace = true

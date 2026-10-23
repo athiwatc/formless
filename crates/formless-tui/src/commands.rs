@@ -78,6 +78,12 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("templates", "", "list Session templates", Session),
     cmd(
+        "export",
+        "[json|md|html]",
+        "export this Session: a re-importable bundle, or a readable transcript",
+        Session,
+    ),
+    cmd(
         "pin",
         "",
         "pin or unpin this Session (P in Sessions)",

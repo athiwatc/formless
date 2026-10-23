@@ -389,6 +389,16 @@ task, with quality as a gate**.
   - TUI and web: `/new TEMPLATE`, `/template save NAME [FIRST MESSAGE]`,
     `/template delete NAME`, `/templates`. The web "+ New session" button
     offers the templates (or a blank Session) when any exist.
+- **Export formats.** `ExportSession {id, format?}`: "json" (default) is
+  the re-importable bundle; "markdown" and "html" return `{name, format,
+  content}`, a readable transcript: user and assistant turns, notes, and
+  each Tool call folded into `<details>` with its arguments and result
+  (results over 4000 characters are cut). The HTML page is
+  self-contained (inline styles, no scripts or external resources), and
+  any HTML in messages is shown as text. TUI `/export [json|md|html]`
+  (writes to the exports directory), the web "Export…" dialog and
+  `/export`, and `formless sessions export ID --format md|html|json
+  [-o FILE]`.
 
 ### 5.2 Run lifecycle
 

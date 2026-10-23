@@ -1840,11 +1840,20 @@ impl App {
                             let dir = self.paths.data_dir.join("exports");
                             let _ = std::fs::create_dir_all(&dir);
                             let label = result["name"].as_str().unwrap_or("export").to_string();
-                            let file = dir.join(format!("{label}.json"));
-                            match std::fs::write(
-                                &file,
-                                serde_json::to_string_pretty(&result).unwrap_or_default(),
-                            ) {
+                            // Names may hold path separators.
+                            let label = label.replace(['/', '\\'], "-");
+                            // A readable transcript, or the JSON bundle.
+                            let (ext, body) =
+                                match (result["format"].as_str(), result["content"].as_str()) {
+                                    (Some("markdown"), Some(c)) => ("md", c.to_string()),
+                                    (Some("html"), Some(c)) => ("html", c.to_string()),
+                                    _ => (
+                                        "json",
+                                        serde_json::to_string_pretty(&result).unwrap_or_default(),
+                                    ),
+                                };
+                            let file = dir.join(format!("{label}.{ext}"));
+                            match std::fs::write(&file, body) {
                                 Ok(()) => {
                                     self.notes.push(format!("exported to {}", file.display()))
                                 }
@@ -3165,6 +3174,16 @@ impl App {
             "templates" | "template" | "template list" => {
                 self.request(Pending::ListTemplates, Request::ListSessionTemplates)
             }
+            cmd if cmd == "export" || cmd.starts_with("export ") => match self.current.clone() {
+                Some(id) => {
+                    let format = Some(cmd[6..].trim().to_string()).filter(|f| !f.is_empty());
+                    self.request(
+                        Pending::ExportSession,
+                        Request::ExportSession { id, format },
+                    );
+                }
+                None => self.notes.push("no current session".into()),
+            },
             cmd if cmd.starts_with("template ") => self.template_cmd(cmd[9..].trim()),
             "search" => {
                 self.search_mode = true;
@@ -4313,7 +4332,13 @@ impl App {
                 }
                 KeyCode::Char('e') => {
                     if let Some(s) = self.selected_session().cloned() {
-                        self.request(Pending::ExportSession, Request::ExportSession { id: s.id });
+                        self.request(
+                            Pending::ExportSession,
+                            Request::ExportSession {
+                                id: s.id,
+                                format: None,
+                            },
+                        );
                     }
                 }
                 KeyCode::Char('i') => {
@@ -6739,7 +6764,10 @@ impl App {
             }
             KeyCode::Char('e') => {
                 for id in ids {
-                    self.request(Pending::ExportSession, Request::ExportSession { id });
+                    self.request(
+                        Pending::ExportSession,
+                        Request::ExportSession { id, format: None },
+                    );
                 }
                 self.notes.push(format!("exporting {n} Sessions"));
                 self.marked.clear();
