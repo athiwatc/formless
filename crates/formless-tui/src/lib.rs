@@ -887,7 +887,8 @@ struct App {
     /// The current Session's sub-agents, as last listed by `/agents`.
     subagents: Vec<SubagentInfo>,
     import_mode: Option<ImportKind>,
-    renaming: bool,
+    /// The Session being renamed (the input holds its new name).
+    renaming: Option<String>,
     /// Sessions marked with Space for a bulk action (SPEC §10.4), and a
     /// bulk action waiting for its typed input (tags, or "delete").
     marked: HashSet<String>,
@@ -1073,7 +1074,7 @@ impl App {
             delete_arm: None,
             subagents: Vec::new(),
             import_mode: None,
-            renaming: false,
+            renaming: None,
             marked: HashSet::new(),
             bulk: None,
             modules: Vec::new(),
@@ -2502,10 +2503,10 @@ impl App {
             self.finish_bulk(action, ids, &text);
             return;
         }
-        if self.renaming {
-            self.renaming = false;
-            if let Some(id) = self.current.clone() {
-                self.fire(Request::RenameSession { id, name: text });
+        if let Some(id) = self.renaming.take() {
+            let name = text.trim().to_string();
+            if !name.is_empty() {
+                self.fire(Request::RenameSession { id, name });
             }
             return;
         }
@@ -2877,7 +2878,7 @@ impl App {
         };
         if self.palette_hidden.as_deref() == Some(&*self.input)
             || self.search_mode
-            || self.renaming
+            || self.renaming.is_some()
             || self.import_mode.is_some()
         {
             return Vec::new();
@@ -4237,10 +4238,9 @@ impl App {
                         .push("Type a session bundle file path, then Enter.".into());
                 }
                 KeyCode::Char('r') => {
-                    self.renaming = true;
-                    self.view = View::Chat;
-                    self.notes
-                        .push("Type the new session name, then Enter.".into());
+                    if let Some(s) = self.selected_session().cloned() {
+                        self.start_rename(&s);
+                    }
                 }
                 KeyCode::Esc => self.view = View::Chat,
                 _ => {}
@@ -5025,6 +5025,11 @@ impl App {
             KeyCode::Esc if !self.running() && self.toasts.iter().any(|t| t.2) => {
                 self.toasts.clear();
             }
+            KeyCode::Esc if self.renaming.is_some() => {
+                self.renaming = None;
+                self.input.clear();
+                self.notes.push("rename cancelled".into());
+            }
             KeyCode::Esc if self.bulk.is_some() => {
                 self.bulk = None;
                 self.input.clear();
@@ -5797,7 +5802,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
             },
             Color::Red,
         )
-    } else if app.renaming {
+    } else if app.renaming.is_some() {
         ("rename › ", Color::Magenta)
     } else if app.search_mode {
         ("search › ", Color::Magenta)
@@ -6703,6 +6708,16 @@ impl App {
             }
         }
         self.marked.clear();
+    }
+
+    /// Rename `s` in the input, starting from its current name (Esc
+    /// cancels).
+    fn start_rename(&mut self, s: &SessionInfo) {
+        self.renaming = Some(s.id.clone());
+        self.view = View::Chat;
+        self.input.set(&s.name);
+        self.notes
+            .push("Edit the name, then Enter (Esc cancels).".into());
     }
 
     /// Sessions matching the switcher's query, best first (newest first
@@ -9504,7 +9519,7 @@ mod tests {
             delete_arm: None,
             subagents: Vec::new(),
             import_mode: None,
-            renaming: false,
+            renaming: None,
             marked: HashSet::new(),
             bulk: None,
             modules: Vec::new(),
@@ -11703,6 +11718,35 @@ mod tests {
         assert_eq!(app.start_session().unwrap().id, "recent");
         app.on_start = "new".into();
         assert!(app.start_session().is_none());
+    }
+
+    #[test]
+    fn rename_starts_from_the_current_name() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.sessions = vec![SessionInfo {
+            id: "a".into(),
+            name: "Refactor auth".into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: "2026-01-01".into(),
+            updated_at: "2026-01-01".into(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned: false,
+            archived: false,
+            tags: vec![],
+        }];
+        app.view = View::Sessions;
+        app.key(key(KeyCode::Char('r')));
+        assert_eq!(app.view, View::Chat);
+        assert_eq!(&*app.input, "Refactor auth");
+        assert!(render(&mut app, 80, 20).contains("rename ›"));
+        app.key(key(KeyCode::Esc));
+        assert!(app.renaming.is_none());
+        assert_eq!(&*app.input, "");
     }
 
     #[test]
