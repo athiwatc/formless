@@ -1744,6 +1744,7 @@ fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
         Request::RunMetrics {
             limit: Some(limit),
             session_id: None,
+            since: None,
         },
     )?;
     if json {

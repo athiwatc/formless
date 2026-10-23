@@ -167,6 +167,7 @@ enum Pending {
     SetTags,
     ContextReport,
     SuggestName,
+    ToolMetrics,
     RunToolInput,
     RunTool,
     Subscribed,
@@ -791,6 +792,10 @@ struct App {
     tool_idx: usize,
     tool_filter: lists::ListFilter,
     tool_detail: Option<ToolDetail>,
+    /// The Metrics view's range (`METRIC_RANGES`), and per-Tool (calls,
+    /// success rate) in it.
+    metrics_range: usize,
+    range_tools: HashMap<String, (i64, Option<f64>)>,
     /// The selected recent call in the Tool detail (`[`/`]`).
     call_idx: Option<usize>,
     /// After opening a Session from a Tool call: focus the call made at
@@ -1047,6 +1052,8 @@ impl App {
             tool_idx: 0,
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
+            metrics_range: 0,
+            range_tools: HashMap::new(),
             call_idx: None,
             jump_to: None,
             rollback_pick: None,
@@ -1604,6 +1611,19 @@ impl App {
                             self.conn = result["conn"].as_u64();
                             let me = self.conn;
                             self.others.retain(|c| Some(c.conn) != me);
+                        }
+                        Pending::ToolMetrics => {
+                            self.range_tools = result
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|r| {
+                                    Some((
+                                        r["tool_id"].as_str()?.to_string(),
+                                        (r["invocations"].as_i64()?, r["success_rate"].as_f64()),
+                                    ))
+                                })
+                                .collect();
                         }
                         Pending::SuggestName => {
                             match (self.current.clone(), result["name"].as_str()) {
@@ -3212,15 +3232,7 @@ impl App {
             }
             View::Metrics => {
                 self.request(Pending::ListTools, Request::ListTools);
-                self.request(Pending::ListModelStats, Request::ListModelStats);
-                self.request(
-                    Pending::RunMetrics,
-                    Request::RunMetrics {
-                        limit: Some(200),
-                        session_id: None,
-                    },
-                );
-                self.request(Pending::ListBuiltinStats, Request::ListBuiltinStats);
+                self.load_metrics();
             }
             View::Proposals => self.request(Pending::ListProposals, Request::ListProposals),
             View::Settings => self.request(Pending::SettingsProviders, Request::ListProviders),
@@ -4335,6 +4347,12 @@ impl App {
                 KeyCode::Esc => self.view = View::Chat,
                 _ => {}
             },
+            View::Metrics => {
+                if key.code == KeyCode::Char('r') {
+                    self.metrics_range = (self.metrics_range + 1) % METRIC_RANGES.len();
+                    self.load_metrics();
+                }
+            }
             View::Proposals => match key.code {
                 KeyCode::Up => self.proposal_idx = self.proposal_idx.saturating_sub(1),
                 KeyCode::Down => {
@@ -7520,8 +7538,45 @@ impl App {
             Request::RunMetrics {
                 limit: Some(500),
                 session_id: Some(session_id.to_string()),
+                since: None,
             },
         );
+    }
+
+    /// The start of the Metrics range, None for all history.
+    fn metrics_since(&self) -> Option<String> {
+        let days = METRIC_RANGES[self.metrics_range % METRIC_RANGES.len()].1?;
+        Some((chrono::Utc::now() - chrono::Duration::hours((days * 24.0) as i64)).to_rfc3339())
+    }
+
+    /// (Re)load the Metrics view's stats for its range.
+    fn load_metrics(&mut self) {
+        let since = self.metrics_since();
+        self.request(
+            Pending::ListModelStats,
+            Request::ListModelStats {
+                since: since.clone(),
+            },
+        );
+        self.request(
+            Pending::RunMetrics,
+            Request::RunMetrics {
+                limit: Some(200),
+                session_id: None,
+                since: since.clone(),
+            },
+        );
+        self.request(
+            Pending::ListBuiltinStats,
+            Request::ListBuiltinStats {
+                since: since.clone(),
+            },
+        );
+        if since.is_some() {
+            self.request(Pending::ToolMetrics, Request::ListToolMetrics { since });
+        } else {
+            self.range_tools.clear();
+        }
     }
 
     /// `/panes wider|narrower|left|right|reset`: side pane widths (SPEC
@@ -8813,6 +8868,14 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
 
 const NO_TOOLS: &str = "No Tools yet — the agent builds them via create_tool.";
 
+/// The Metrics view's ranges: label and days (None = all history).
+const METRIC_RANGES: &[(&str, Option<f64>)] = &[
+    ("all time", None),
+    ("24h", Some(1.0)),
+    ("7d", Some(7.0)),
+    ("30d", Some(30.0)),
+];
+
 fn metrics_summary(tools: &[ToolInfo]) -> String {
     let total_calls: i64 = tools.iter().map(|t| t.invocations).sum();
     let attention = tools.iter().filter(|t| t.needs_attention).count();
@@ -8970,7 +9033,22 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             parts[3],
         );
     }
-    let mut sorted: Vec<&ToolInfo> = app.tools.iter().collect();
+    // In a range, each Tool's calls and success rate within it.
+    let ranged = !app.metrics_range.is_multiple_of(METRIC_RANGES.len());
+    let tools: Vec<ToolInfo> = app
+        .tools
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            if ranged {
+                let (n, rate) = app.range_tools.get(&t.id).copied().unwrap_or((0, None));
+                t.invocations = n;
+                t.success_rate = rate;
+            }
+            t
+        })
+        .collect();
+    let mut sorted: Vec<&ToolInfo> = tools.iter().collect();
     sorted.sort_by_key(|t| std::cmp::Reverse(t.invocations));
     let rows: Vec<Row> = sorted
         .iter()
@@ -8983,16 +9061,17 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             Row::new(row_cells)
         })
         .collect();
+    let range = METRIC_RANGES[app.metrics_range % METRIC_RANGES.len()].0;
     let title = match app.run_summary.as_ref().filter(|s| s.runs > 0) {
         Some(s) => format!(
-            " Metrics · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
-            metrics_summary(&app.tools),
+            " Metrics · {range} (r) · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
+            metrics_summary(&tools),
             s.runs,
             s.completed * 100.0,
             (s.edited + s.corrected) * 100.0,
             s.avg_steps
         ),
-        None => format!(" Metrics · {} ", metrics_summary(&app.tools)),
+        None => format!(" Metrics · {range} (r) · {} ", metrics_summary(&tools)),
     };
     let block = ui::panel(title, app.color, Color::Green);
     if rows.is_empty() {
@@ -10307,6 +10386,8 @@ mod tests {
             tool_idx: 0,
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
+            metrics_range: 0,
+            range_tools: HashMap::new(),
             call_idx: None,
             jump_to: None,
             rollback_pick: None,
@@ -12855,6 +12936,38 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.contains("\"title\": \"Example\"")));
+    }
+
+    #[test]
+    fn r_cycles_the_metrics_range() {
+        let mut app = test_app();
+        app.view = View::Metrics;
+        app.tools = vec![ToolInfo {
+            id: "t".into(),
+            name: "fetch_page".into(),
+            description: String::new(),
+            retired: false,
+            current_version: 1,
+            capabilities: vec![],
+            memory_mb: 64,
+            invocations: 500,
+            success_rate: Some(0.99),
+            needs_attention: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            recent: String::new(),
+            author: "agent".into(),
+        }];
+        assert!(render(&mut app, 160, 30).contains("all time (r)"));
+        assert!(app.metrics_since().is_none());
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.metrics_since().is_some());
+        // In the range the Tool made 4 calls, half of them good.
+        app.range_tools.insert("t".into(), (4, Some(0.5)));
+        let screen = render(&mut app, 160, 30);
+        assert!(screen.contains("24h (r)"), "{screen}");
+        assert!(screen.contains("4 invocations"), "{screen}");
+        assert!(screen.contains("50%"), "{screen}");
     }
 
     #[test]

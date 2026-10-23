@@ -1803,6 +1803,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   attention first, then active, then retired). Groups get headers with
   counts; `z` folds the selected Tool's group, `Z` unfolds them all.
   Filter, sort and quick filters apply inside groups.
+- **Metrics range.** `r` in the TUI Metrics view cycles all time / 24h /
+  7d / 30d, applied to Tool calls and success rates (`ListToolMetrics
+  {since}`), Runs (`RunMetrics.since`), model outcomes and token use
+  (`ListModelStats {since}`) and built-in calls (`ListBuiltinStats
+  {since}`). Model outcomes in a range come from the `model_events` log
+  (migration v38), so ranges only cover history from that version on;
+  "all time" still uses the running totals.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,

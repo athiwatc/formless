@@ -55,8 +55,11 @@ fn run_metrics_record_steps_tokens_and_followups() {
     // One Session's Runs only (for the TUI's answer footers).
     let other = store.create_session(None).unwrap().id;
     store.create_run(&other).unwrap();
-    assert_eq!(store.run_metrics_for(Some(&s), 10).unwrap().len(), 4);
-    assert_eq!(store.run_metrics_for(Some(&other), 10).unwrap().len(), 1);
+    assert_eq!(store.run_metrics_for(Some(&s), 10, None).unwrap().len(), 4);
+    assert_eq!(
+        store.run_metrics_for(Some(&other), 10, None).unwrap().len(),
+        1
+    );
     // The Sessions list's summary: count, last user message, last Run.
     store.append_message(&s, "user", "first ask").unwrap();
     store
@@ -165,7 +168,7 @@ fn builtin_outcomes_and_stats() {
         .unwrap();
     assert!(store.run_had_empty_find("r1").unwrap());
     assert!(!store.run_had_empty_find("r2").unwrap());
-    let stats = store.builtin_stats().unwrap();
+    let stats = store.builtin_stats(None).unwrap();
     let create = stats.iter().find(|s| s.name == "create_tool").unwrap();
     assert_eq!((create.calls, create.failures), (2, 1));
     assert_eq!(create.kinds.get("near-duplicate"), Some(&1));
@@ -201,7 +204,7 @@ async fn built_in_calls_are_recorded_without_payloads() {
         )
         .await;
     let stats = daemon
-        .handle(formless_protocol::Request::ListBuiltinStats)
+        .handle(formless_protocol::Request::ListBuiltinStats { since: None })
         .await
         .unwrap();
     assert_eq!(stats[0]["name"], "find_tools");
@@ -533,4 +536,58 @@ fn tool_detail_explains_what_needs_attention() {
         "{all}"
     );
     assert!(all.contains("rolled back to v1"), "{all}");
+}
+
+#[test]
+fn stats_can_be_limited_to_a_time_range() {
+    let store = Store::open_in_memory().unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let (t, v) = store
+        .create_tool_version(
+            "echo",
+            "d",
+            "{}",
+            "{}",
+            "function run(i){return i;}",
+            &caps,
+            64,
+            "agent",
+        )
+        .unwrap();
+    for status in ["success", "failure", "success"] {
+        store
+            .record_invocation(
+                &t.id, v, None, None, None, status, "", "{}", "", "", 1, 1000,
+            )
+            .unwrap();
+    }
+    store.record_model_outcome("m1", true, 100).unwrap();
+    store.record_model_outcome("m1", false, 50).unwrap();
+    let s = store.create_session(None).unwrap().id;
+    store.create_run(&s).unwrap();
+    let past = "2000-01-01T00:00:00+00:00";
+    let future = "2999-01-01T00:00:00+00:00";
+
+    let tools = store.tool_metrics_since(past).unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].1, 3);
+    assert!((tools[0].2.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+    assert!(store.tool_metrics_since(future).unwrap().is_empty());
+
+    let models = store.model_stats_since(past).unwrap();
+    assert_eq!(
+        (models[0].successes, models[0].failures, models[0].total_ms),
+        (1, 1, 150)
+    );
+    assert!(store.model_stats_since(future).unwrap().is_empty());
+
+    assert_eq!(
+        store.run_metrics_for(None, 10, Some(past)).unwrap().len(),
+        1
+    );
+    assert!(store
+        .run_metrics_for(None, 10, Some(future))
+        .unwrap()
+        .is_empty());
+    assert!(store.builtin_stats(Some(future)).unwrap().is_empty());
 }

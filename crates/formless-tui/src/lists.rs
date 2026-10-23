@@ -142,7 +142,7 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
     }
     // Grouped: by group (stable, so the sort holds inside each), without
     // the collapsed groups' Tools.
-    if f.group % TOOL_GROUPS.len() != 0 {
+    if !f.group.is_multiple_of(TOOL_GROUPS.len()) {
         idx.sort_by_cached_key(|&i| {
             group_rank(&tool_group(&tools[i], f.group).unwrap_or_default(), f.group)
         });

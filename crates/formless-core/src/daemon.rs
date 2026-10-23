@@ -1248,12 +1248,28 @@ impl Daemon {
                 let answered = tx.is_some_and(|tx| tx.send((answer, answers)).is_ok());
                 Ok(json!({"answered": answered}))
             }
-            Request::ListBuiltinStats => Ok(serde_json::to_value(
-                self.with_reader(|st| st.builtin_stats())?,
+            Request::ListBuiltinStats { since } => Ok(serde_json::to_value(
+                self.with_reader(|st| st.builtin_stats(since.as_deref()))?,
             )?),
-            Request::RunMetrics { limit, session_id } => {
+            Request::ListToolMetrics { since } => {
+                let since = since.unwrap_or_else(|| "0000".into());
+                let rows = self.with_reader(|st| st.tool_metrics_since(&since))?;
+                Ok(json!(rows
+                    .into_iter()
+                    .map(|(id, n, rate)| json!({"tool_id": id, "invocations": n, "success_rate": rate}))
+                    .collect::<Vec<_>>()))
+            }
+            Request::RunMetrics {
+                limit,
+                session_id,
+                since,
+            } => {
                 let runs = self.with_reader(|st| {
-                    st.run_metrics_for(session_id.as_deref(), limit.unwrap_or(200))
+                    st.run_metrics_for(
+                        session_id.as_deref(),
+                        limit.unwrap_or(200),
+                        since.as_deref(),
+                    )
                 })?;
                 let summary = crate::runs::summarize(&runs);
                 Ok(json!({"runs": runs, "summary": summary}))
@@ -1709,9 +1725,14 @@ impl Daemon {
             Request::ListProposals => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_proposals())?,
             )?),
-            Request::ListModelStats => {
-                let (stats, usage) =
-                    self.with_reader(|s| Ok((s.list_model_stats()?, s.usage_by_model()?)))?;
+            Request::ListModelStats { since } => {
+                let (stats, usage) = self.with_reader(|s| {
+                    let stats = match since.as_deref() {
+                        Some(t) => s.model_stats_since(t)?,
+                        None => s.list_model_stats()?,
+                    };
+                    Ok((stats, s.usage_by_model(since.as_deref())?))
+                })?;
                 let stats: Vec<ModelStatInfo> = stats
                     .into_iter()
                     .map(|s| {
@@ -4572,7 +4593,7 @@ impl Daemon {
                 let runs = st.run_metrics(limit.max(50))?;
                 Ok(json!({"summary": crate::runs::summarize(&runs)}))
             }
-            "builtins" => Ok(json!({"builtins": st.builtin_stats()?})),
+            "builtins" => Ok(json!({"builtins": st.builtin_stats(None)?})),
             "duplicates" => Ok(json!({"duplicates": crate::dupes::near_duplicates(&st.current_tools()?)
                 .into_iter()
                 .take(limit)
