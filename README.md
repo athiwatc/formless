@@ -291,6 +291,18 @@ Piped stdin is read only when stdin isn't a terminal; from a script that leaves 
 
 Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
 
+### Sessions from the command line
+
+```bash
+formless sessions list                     # --archived, --json
+formless sessions show 3f9c                # the transcript (--json for scripts)
+formless sessions search "invoice"         # across every Session
+formless sessions rename 3f9c "Q3 report"
+formless sessions export 3f9c --format md -o q3.md
+formless sessions import bundle.json
+formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
+```
+
 ### 3.6 Daemon, diagnostics and reset
 
 ```bash

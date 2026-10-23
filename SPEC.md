@@ -2210,6 +2210,13 @@ run_tool = "network_policy"     # a registry Tool, or…
 ## 12. CLI
 
 - `formless` (no args) launches the TUI (auto-starting the daemon).
+- `formless sessions` manages Sessions with the same protocol requests as
+  the TUI and web: `list [--archived] [--json]`, `show ID [--json]`, `rename
+  ID NAME`, `rm ID` (restorable for `daemon.delete_undo_secs`; it prints the
+  restore command), `restore ID`, `archive`/`unarchive ID`, `export ID
+  [--format json|md|html] [-o FILE]`, `import FILE`, and `search QUERY
+  [--limit N] [--json]`. IDs may be a unique prefix (`restore` needs the
+  full id).
 - `formless run "task"` — headless Run (§5 semantics) in an ephemeral
   Session, or `--session <id|name>` to continue an existing one. When stdin
   isn't a terminal, `formless run -` takes the task from stdin, and with a
