@@ -841,6 +841,8 @@ struct App {
     /// While an approval is open: whether keys go to the input (Tab
     /// toggles) instead of the approval (SPEC §10.3).
     input_focus: bool,
+    /// `/quit` while Runs are working asks first (SPEC §10.5).
+    quit_confirm: bool,
     /// `?` in an approval: explain each capability under it.
     approval_explain: bool,
     /// The version whose full code `v` asked for.
@@ -1031,6 +1033,7 @@ impl App {
             pane_widths: pane_widths(&cfg.tui.pane_widths),
             input_focus: false,
             approval_explain: false,
+            quit_confirm: false,
             approval_code: None,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
@@ -3446,6 +3449,7 @@ impl App {
                     styled: Vec::new(),
                 })
             }
+            "quit" if !self.running_sessions.is_empty() => self.quit_confirm = true,
             "quit" => self.should_quit = true,
             other => self.notes.push(match commands::closest(other) {
                 Some(name) => format!("unknown command: /{other} — did you mean /{name}?"),
@@ -3839,6 +3843,20 @@ impl App {
         }
         if self.model_overlay.is_some() {
             self.model_key(key);
+            return;
+        }
+        if self.quit_confirm {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Enter => self.should_quit = true,
+                KeyCode::Char('s') => {
+                    for session_id in self.running_sessions.clone() {
+                        self.fire(Request::InterruptRun { session_id });
+                    }
+                    self.should_quit = true;
+                }
+                KeyCode::Esc | KeyCode::Char('c') => self.quit_confirm = false,
+                _ => {}
+            }
             return;
         }
         let modal_open = !self.approvals.is_empty() || !self.promotions.is_empty();
@@ -5024,6 +5042,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.view == View::Chat || app.multi_pane {
         draw_toasts(f, toast_area, app);
     }
+    if app.quit_confirm {
+        draw_quit_confirm(f, app);
+    }
     if let Some(p) = &app.pager {
         let area = f.area();
         let height = area.height.saturating_sub(2) as usize;
@@ -5809,6 +5830,50 @@ fn is_error_note(note: &str) -> bool {
 
 /// How long an ordinary toast stays.
 const TOAST_SECS: u64 = 6;
+
+/// "Runs are still working" before quitting.
+fn draw_quit_confirm(f: &mut Frame, app: &App) {
+    let n = app.running_sessions.len();
+    let lines = vec![
+        Line::raw(""),
+        Line::raw(format!(
+            "  {n} Run{} still working in the daemon. {} keep going if you quit.",
+            if n == 1 { " is" } else { "s are" },
+            if n == 1 { "It will" } else { "They'll" }
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " q ",
+                bold_fg(app.color, Color::Green).add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw(" quit    "),
+            Span::styled(
+                " s ",
+                bold_fg(app.color, Color::Red).add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw(" stop them and quit    "),
+            Span::styled(" Esc ", ui::dim(app.color).add_modifier(Modifier::REVERSED)),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    let area = f.area();
+    let w = 66.min(area.width.saturating_sub(2)).max(1);
+    let h = 6.min(area.height);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    );
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(ui::panel(" Quit? ", app.color, Color::Yellow))
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
 
 /// Recent notes as toasts in the top-right corner of `area`, newest at
 /// the bottom; errors in red until dismissed.
@@ -8792,6 +8857,7 @@ mod tests {
             pane_widths: (22, 26),
             input_focus: false,
             approval_explain: false,
+            quit_confirm: false,
             approval_code: None,
             image_placed: Vec::new(),
             painted_images: Vec::new(),
@@ -10676,6 +10742,25 @@ mod tests {
             narrow.contains("a apply") && !narrow.contains("v status"),
             "{narrow}"
         );
+    }
+
+    #[test]
+    fn quit_asks_while_runs_are_working() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.slash("quit");
+        assert!(app.should_quit, "nothing running: quits at once");
+        let mut app = test_app();
+        app.running_sessions.insert("s1".into());
+        app.running_sessions.insert("s2".into());
+        app.slash("quit");
+        assert!(!app.should_quit && app.quit_confirm);
+        assert!(render(&mut app, 100, 24).contains("2 Runs are still working"));
+        app.key(key(KeyCode::Esc));
+        assert!(!app.quit_confirm && !app.should_quit);
+        app.slash("quit");
+        app.key(key(KeyCode::Char('s')));
+        assert!(app.should_quit);
     }
 
     #[test]

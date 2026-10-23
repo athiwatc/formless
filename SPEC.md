@@ -1795,6 +1795,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   Shortcuts never fire while typing or while a dialog is open. Approvals
   keep `y`/`o`/`n`.
 
+- **Quitting while Runs work (TUI).** `/quit` with a Run active in any
+  Session asks first: "2 Runs are still working in the daemon. They'll
+  keep going if you quit." `q` (or Enter) quits, `s` stops them and quits,
+  and Esc cancels. With nothing running it quits at once.
 - **Key hint bar (TUI).** The right side of the status line shows the
   current view's keys in one format (`Enter open · n new · f fork · d
   delete`). They come from a per-view key table with an importance rank,
