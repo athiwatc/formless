@@ -1934,6 +1934,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
   action (§15).
+  - No settable key needs a daemon restart: the daemon re-reads the file,
+    and running TUIs reload their `tui.*` display settings on
+    `SettingsChanged` (theme, colours, line numbers, images, panes,
+    timestamps, hyperlinks).
+  - Only `config::ON_TUI_START` (`tui.on_start`, `tui.screen_reader`)
+    apply when the TUI next starts. `GetSettings` lists them as
+    `on_tui_start`, and `SetSetting` answers `applies: "now" |
+    "on_tui_start"`. The web marks those rows and, after saving one, says
+    to restart any running TUI.
   In the TUI the rows are selectable (↑/↓ or j/k, Enter or Space):
   - booleans toggle and enums cycle (`reasoning_effort`, `api_style`,
     `tool_mode`; the last two are settable and validated against their

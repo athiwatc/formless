@@ -2323,6 +2323,11 @@ impl App {
                     theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
                     markdown::set_line_numbers(cfg.tui.code_line_numbers);
                     self.image_proto = images::detect(&cfg.tui.inline_images);
+                    // Changed elsewhere (the web Settings): apply here too.
+                    self.multi_pane = cfg.tui.multi_pane;
+                    self.show_timestamps = cfg.tui.timestamps;
+                    self.hyperlinks = links::enabled(&cfg.tui.hyperlinks);
+                    self.pane_widths = pane_widths(&cfg.tui.pane_widths);
                     // Rendered answers carry the old colours and options.
                     self.md_cache.borrow_mut().clear();
                     self.model_label = cfg.provider.model;
@@ -12141,8 +12146,13 @@ mod tests {
         let mut cfg = Config::default();
         cfg.tui.theme = "light".into();
         cfg.tui.colors.insert("user".into(), "#ff0000".into());
+        cfg.tui.timestamps = !app.show_timestamps;
+        cfg.tui.multi_pane = !app.multi_pane;
         cfg.save(&app.paths).unwrap();
+        let (ts, mp) = (cfg.tui.timestamps, cfg.tui.multi_pane);
         app.on_event(Event::SettingsChanged);
+        // Changed from another client (the web): applied live.
+        assert_eq!((app.show_timestamps, app.multi_pane), (ts, mp));
         assert_eq!(fg(true, Color::Yellow).fg, Some(Color::Rgb(150, 100, 0)));
         assert_eq!(role_style(true, "user").fg, Some(Color::Rgb(255, 0, 0)));
         assert_eq!(fg(false, Color::Yellow).fg, None, "NO_COLOR still wins");
