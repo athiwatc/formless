@@ -539,8 +539,18 @@ struct EditorState {
     name: String,
     chars: Vec<char>,
     cursor: usize,
-    /// Editing a Tool's input to run it by hand, not its code.
-    run: bool,
+    mode: EditMode,
+}
+
+/// What the Tool editor is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMode {
+    Code,
+    /// An input to run the Tool with by hand.
+    Run,
+    Description,
+    /// `{"input_schema": …, "output_schema": …}`.
+    Schemas,
 }
 
 impl EditorState {
@@ -4049,7 +4059,12 @@ impl App {
 
     fn editor_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let Some(ed) = self.editor.as_ref().filter(|e| e.run) {
+            let mode = self.editor.as_ref().map(|e| e.mode);
+            if mode == Some(EditMode::Description) || mode == Some(EditMode::Schemas) {
+                self.save_tool_spec();
+                return;
+            }
+            if let Some(ed) = self.editor.as_ref().filter(|e| e.mode == EditMode::Run) {
                 let input = match serde_json::from_str::<serde_json::Value>(&ed.text()) {
                     Ok(v) if v.is_object() => v,
                     Ok(_) => {
@@ -4504,7 +4519,22 @@ impl App {
                         (Some(i), false) => Some(i - 1),
                     };
                 }
-                KeyCode::Char('S') => {
+                KeyCode::Char('D') | KeyCode::Char('S') => {
+                    let mode = if key.code == KeyCode::Char('D') {
+                        EditMode::Description
+                    } else {
+                        EditMode::Schemas
+                    };
+                    if let Some(tool) = self.selected_tool().cloned() {
+                        match self.tool_detail.clone().filter(|d| d.tool.id == tool.id) {
+                            Some(d) => self.start_spec_editor(&d, mode),
+                            None => self
+                                .notes
+                                .push("open the Tool's detail first (Enter)".into()),
+                        }
+                    }
+                }
+                KeyCode::Char('J') => {
                     if let Some(call) = self.selected_call() {
                         match call.session_id {
                             Some(id) if self.sessions.iter().any(|s| s.id == id) => {
@@ -4540,7 +4570,7 @@ impl App {
                                     name: tool.name.clone(),
                                     chars,
                                     cursor,
-                                    run: false,
+                                    mode: EditMode::Code,
                                 });
                             }
                             _ => {
@@ -7160,8 +7190,82 @@ impl App {
             name: d.tool.name.clone(),
             cursor: chars.len(),
             chars,
-            run: true,
+            mode: EditMode::Run,
         });
+    }
+
+    /// Edit Tool `d`'s description (`D`) or schemas (`S`) in the editor.
+    fn start_spec_editor(&mut self, d: &ToolDetail, mode: EditMode) {
+        let current = d
+            .versions
+            .iter()
+            .find(|v| v.version == d.tool.current_version)
+            .or_else(|| d.versions.last());
+        let text = match mode {
+            EditMode::Schemas => {
+                let parse = |s: Option<&String>| {
+                    s.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}))
+                };
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "input_schema": parse(current.map(|v| &v.input_schema)),
+                    "output_schema": parse(current.map(|v| &v.output_schema)),
+                }))
+                .unwrap_or_default()
+            }
+            _ => d.tool.description.clone(),
+        };
+        let chars: Vec<char> = text.chars().collect();
+        self.editor = Some(EditorState {
+            tool_id: d.tool.id.clone(),
+            name: d.tool.name.clone(),
+            cursor: chars.len(),
+            chars,
+            mode,
+        });
+    }
+
+    /// Ctrl+S in the description or schemas editor: a new version.
+    fn save_tool_spec(&mut self) {
+        let Some(ed) = &self.editor else {
+            return;
+        };
+        let id = ed.tool_id.clone();
+        let req = if ed.mode == EditMode::Description {
+            let text = ed.text().trim().to_string();
+            if text.is_empty() {
+                self.notes.push("the description can't be empty".into());
+                return;
+            }
+            Request::UpdateToolSpec {
+                id,
+                description: Some(text),
+                input_schema: None,
+                output_schema: None,
+            }
+        } else {
+            let v = match serde_json::from_str::<serde_json::Value>(&ed.text()) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.notes.push(format!("not valid JSON: {e}"));
+                    return;
+                }
+            };
+            let (input, output) = (v["input_schema"].clone(), v["output_schema"].clone());
+            if !input.is_object() || !output.is_object() {
+                self.notes
+                    .push("needs input_schema and output_schema, each a JSON object".into());
+                return;
+            }
+            Request::UpdateToolSpec {
+                id,
+                description: None,
+                input_schema: Some(input),
+                output_schema: Some(output),
+            }
+        };
+        self.request(Pending::UpdateTool, req);
+        self.notes.push("saving a new version…".into());
     }
 
     /// The recent call selected in the open Tool's detail.
@@ -7187,7 +7291,7 @@ impl App {
                 c.status, c.version, c.duration_ms, c.created_at
             ),
             format!(
-                "Session: {}  (S opens it at this call)",
+                "Session: {}  (J in the Tools view opens it at this call)",
                 c.session_id
                     .as_deref()
                     .map(|id| self.session_name(id))
@@ -9181,7 +9285,7 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                 lines.push(Line::from(vec![
                     Span::styled("Recent calls", bold_fg(app.color, Color::Cyan)),
                     Span::styled(
-                        "  [ ] select · Enter full call · S open its Session",
+                        "  [ ] select · Enter full call · J jump to its Session",
                         ui::dim(app.color),
                     ),
                 ]));
@@ -9593,10 +9697,11 @@ fn draw_approval(
 fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     let area = f.area();
     let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
-    let title = if ed.run {
-        format!(" Run {} · input (JSON) ", ed.name)
-    } else {
-        format!(" Edit {} ", ed.name)
+    let title = match ed.mode {
+        EditMode::Run => format!(" Run {} · input (JSON) ", ed.name),
+        EditMode::Description => format!(" {} · description ", ed.name),
+        EditMode::Schemas => format!(" {} · schemas (JSON) ", ed.name),
+        EditMode::Code => format!(" Edit {} ", ed.name),
     };
     let block = ui::panel(title, app.color, Color::Yellow);
     let inner = block.inner(parts[0]);
@@ -9641,10 +9746,9 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
                 bold_fg(app.color, Color::Yellow),
             ),
             Span::styled(
-                if ed.run {
-                    " Ctrl+S run (asks for approval as usual) · Esc cancel"
-                } else {
-                    " Ctrl+S save as new version (smoke-tested) · Esc cancel"
+                match ed.mode {
+                    EditMode::Run => " Ctrl+S run (asks for approval as usual) · Esc cancel",
+                    _ => " Ctrl+S save as new version (smoke-tested) · Esc cancel",
                 },
                 ui::dim(app.color),
             ),
@@ -10575,7 +10679,7 @@ mod tests {
             name: "writer".into(),
             chars: "line1\nline2".chars().collect(),
             cursor: 11,
-            run: false,
+            mode: EditMode::Code,
         });
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         app.key(key(KeyCode::Char('!')));
@@ -10867,7 +10971,7 @@ mod tests {
             name: "t".into(),
             chars: "a\nb".chars().collect(),
             cursor: 3,
-            run: false,
+            mode: EditMode::Code,
         });
         for (w, h) in [(1, 1), (12, 4), (80, 10)] {
             render(&mut app, w, h);
@@ -12630,9 +12734,25 @@ mod tests {
         app.current = Some("s1".into());
         app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         let ed = app.editor.as_ref().expect("run editor");
-        assert!(ed.run);
+        assert_eq!(ed.mode, EditMode::Run);
         assert_eq!(ed.text(), "{\n  \"url\": \"\"\n}");
         assert!(render(&mut app, 100, 20).contains("Run fetch_page"));
+        // D and S edit the description and schemas instead.
+        app.editor = None;
+        app.key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditMode::Description);
+        app.editor = None;
+        app.key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE));
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.mode, EditMode::Schemas);
+        assert!(ed.text().contains("\"input_schema\": {"), "{}", ed.text());
+        assert!(render(&mut app, 100, 20).contains("fetch_page · schemas"));
+        // Schemas must stay objects.
+        app.editor.as_mut().unwrap().chars = r#"{"input_schema": 3, "output_schema": {}}"#.chars().collect();
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.notes.last().unwrap().contains("each a JSON object"));
+        app.editor = None;
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         // Bad JSON stays in the editor.
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
@@ -12735,8 +12855,8 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.contains("\"url\": \"https://example.com\"")));
-        // S opens the Session, focusing the call made then.
-        app.key(key(KeyCode::Char('S')));
+        // J opens the Session, focusing the call made then.
+        app.key(key(KeyCode::Char('J')));
         assert_eq!(app.view, View::Chat);
         assert_eq!(app.current.as_deref(), Some("s1"));
         app.messages = vec![MessageInfo {

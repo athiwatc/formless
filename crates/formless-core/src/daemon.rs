@@ -1487,6 +1487,40 @@ impl Daemon {
                 let result = self.call_tool_direct(&session_id, &tool.name, input).await;
                 Ok(json!({ "result": result }))
             }
+            Request::UpdateToolSpec {
+                id,
+                description,
+                input_schema,
+                output_schema,
+            } => {
+                let (info, ver) = self
+                    .with_store(|st| st.get_tool_current(&id))?
+                    .context("tool not found")?;
+                for s in [&input_schema, &output_schema].into_iter().flatten() {
+                    if !s.is_object() {
+                        return Err(anyhow!("a schema must be a JSON object"));
+                    }
+                }
+                let description = description.map(|d| d.trim().to_string());
+                if description.as_deref() == Some("") {
+                    return Err(anyhow!("the description can't be empty"));
+                }
+                let cfg = self.config()?;
+                let current = |s: &str| {
+                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({"type":"object"}))
+                };
+                let args = json!({
+                    "name": info.name,
+                    "description": description.unwrap_or(info.description),
+                    "input_schema": input_schema.unwrap_or_else(|| current(&ver.input_schema)),
+                    "output_schema": output_schema.unwrap_or_else(|| current(&ver.output_schema)),
+                    "implementation_js": ver.code,
+                    "capabilities": ver.capabilities,
+                    "memory_mb": ver.memory_mb,
+                });
+                let (info, version, _) = self.create_tool_as(&args, &cfg, "user", None).await?;
+                Ok(json!({"tool": info, "version": version}))
+            }
             Request::UpdateToolCode { id, code } => {
                 // In-TUI editor save: a new immutable version with the same
                 // schemas/capabilities/memory as the current version, run

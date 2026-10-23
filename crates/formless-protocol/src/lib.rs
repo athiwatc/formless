@@ -992,6 +992,18 @@ pub enum Request {
         input: serde_json::Value,
         session_id: String,
     },
+    /// Save a new version with a new description and/or schemas, the
+    /// rest as the current version, through the usual gates with author
+    /// `user` (SPEC §10.4).
+    UpdateToolSpec {
+        id: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        input_schema: Option<serde_json::Value>,
+        #[serde(default)]
+        output_schema: Option<serde_json::Value>,
+    },
     /// Save edited Tool JS as a new version (in-TUI editor, v2).
     UpdateToolCode {
         id: String,

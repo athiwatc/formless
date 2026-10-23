@@ -492,7 +492,16 @@ fn tool_detail_explains_what_needs_attention() {
     let store = Store::open_in_memory().unwrap();
     let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
     let (t, v) = store
-        .create_tool_version("flaky", "d", "{}", "{}", "function run(i){return i;}", &caps, 64, "agent")
+        .create_tool_version(
+            "flaky",
+            "d",
+            "{}",
+            "{}",
+            "function run(i){return i;}",
+            &caps,
+            64,
+            "agent",
+        )
         .unwrap();
     let healthy = store.tool_detail(&t.id).unwrap().unwrap();
     assert!(healthy.attention.is_empty());
@@ -504,7 +513,9 @@ fn tool_detail_explains_what_needs_attention() {
         ("failure", "HTTP 503 from upstream"),
     ] {
         store
-            .record_invocation(&t.id, v, None, None, None, status, "", "{}", "", error, 1, 1000)
+            .record_invocation(
+                &t.id, v, None, None, None, status, "", "{}", "", error, 1, 1000,
+            )
             .unwrap();
     }
     store.set_consecutive_failures(&t.id, 3).unwrap();
@@ -512,8 +523,14 @@ fn tool_detail_explains_what_needs_attention() {
     store.audit("user", "tool.rollback", "flaky v1").unwrap();
     let d = store.tool_detail(&t.id).unwrap().unwrap();
     let all = d.attention.join("\n");
-    assert!(all.contains("gave up after 3 failed candidate fixes"), "{all}");
+    assert!(
+        all.contains("gave up after 3 failed candidate fixes"),
+        "{all}"
+    );
     assert!(all.contains("only 20% of 5 calls succeed"), "{all}");
-    assert!(all.contains("the last 4 calls failed: HTTP 503 from upstream"), "{all}");
+    assert!(
+        all.contains("the last 4 calls failed: HTTP 503 from upstream"),
+        "{all}"
+    );
     assert!(all.contains("rolled back to v1"), "{all}");
 }

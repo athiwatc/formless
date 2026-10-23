@@ -47,6 +47,7 @@ const TOOLS: &[Hint] = &[
     h("[ ]", "calls", 4),
     h("E", "edit", 2),
     h("t", "try it", 3),
+    h("D S", "describe/schemas", 5),
     h("o", "optimise", 4),
     h("x", "retire", 3),
     h("b", "rollback", 3),
