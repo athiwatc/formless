@@ -419,11 +419,21 @@
     if (popover) { popover.remove(); popover = null; }
     document.querySelectorAll(".menu[aria-expanded]").forEach((m) => m.removeAttribute("aria-expanded"));
   }
+  /** Pinned Sessions list first (SPEC §10.4). */
+  async function pinSession(s) {
+    const r = await act({ type: "set_session_pinned", id: s.id, pinned: !s.pinned });
+    if (!r) return;
+    const i = S.sessions.findIndex((x) => x.id === r.id);
+    if (i >= 0) S.sessions[i] = r;
+    S.sessions.sort((a, b) => (b.pinned - a.pinned) || b.updated_at.localeCompare(a.updated_at));
+    renderSessions();
+  }
   function sessionMenu(btn, s) {
     closePopover();
     btn.setAttribute("aria-expanded", "true");
     const r = btn.getBoundingClientRect();
     popover = h("div", { class: "popover", role: "menu" },
+      h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
       h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
       h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
       h("button", { type: "button", onclick: () => { closePopover(); exportSession(s.id); } }, "Export"),
@@ -472,7 +482,7 @@
       },
       S.running.has(s.id) ? h("span", { class: "running", title: "running" })
         : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-      h("span", { class: "name", title: s.name }, s.name,
+      h("span", { class: "name", title: s.name }, s.pinned ? "★ " : null, s.name,
         s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
       h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
       menu));

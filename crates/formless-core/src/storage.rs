@@ -338,7 +338,7 @@ const SESSION_SUMMARY: &str = "(SELECT COUNT(*) FROM messages m WHERE m.session_
      (SELECT status FROM runs r WHERE r.session_id=s.id ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1) AS last_run_status";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 32;
+pub const SCHEMA_VERSION: i64 = 33;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -353,7 +353,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 32] = [
+const MIGRATIONS: [(i64, MigrationStep); 33] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -447,6 +447,10 @@ const MIGRATIONS: [(i64, MigrationStep); 32] = [
     }),
     // A working directory per Session (SPEC §5.1).
     (32, |c| add_column(c, "sessions", "cwd TEXT")),
+    // Pinned Sessions (SPEC §10.4).
+    (33, |c| {
+        add_column(c, "sessions", "pinned INTEGER NOT NULL DEFAULT 0")
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -551,6 +555,7 @@ impl Store {
                     out
                 }),
             last_run_status: r.get("last_run_status").ok().flatten(),
+            pinned: r.get::<_, i64>("pinned").unwrap_or(0) != 0,
         })
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
@@ -582,7 +587,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT s.*, {SESSION_SUMMARY} FROM sessions s WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+                "SELECT s.*, {SESSION_SUMMARY} FROM sessions s WHERE deleted_at IS NULL ORDER BY pinned DESC, updated_at DESC"
             ))?;
         let rows = stmt
             .query_map([], Self::row_session)?
@@ -619,6 +624,15 @@ impl Store {
         if n == 0 {
             return Ok(None);
         }
+        self.get_session(id)
+    }
+
+    /// Pinning doesn't count as activity: `updated_at` stays.
+    pub fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<Option<SessionInfo>> {
+        self.conn.execute(
+            "UPDATE sessions SET pinned=?2 WHERE id=?1",
+            params![id, pinned as i64],
+        )?;
         self.get_session(id)
     }
 

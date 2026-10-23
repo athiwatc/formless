@@ -425,6 +425,13 @@ impl Daemon {
                 let s = self.with_store(|st| st.create_session(name))?;
                 Ok(serde_json::to_value(s)?)
             }
+            Request::SetSessionPinned { id, pinned } => {
+                let s = self
+                    .with_store(|st| st.set_session_pinned(&id, pinned))?
+                    .context("session not found")?;
+                self.broadcast(Event::SessionUpdated { session: s.clone() });
+                Ok(serde_json::to_value(s)?)
+            }
             Request::RenameSession { id, name } => {
                 let s = self
                     .with_store(|st| st.rename_session(&id, &name))?

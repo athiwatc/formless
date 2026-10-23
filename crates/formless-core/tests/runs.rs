@@ -67,6 +67,18 @@ fn run_metrics_record_steps_tokens_and_followups() {
     assert_eq!(row.preview.as_deref(), Some("latest ask, which goes on"));
     assert!(row.message_count >= 2);
     assert_eq!(row.last_run_status.as_deref(), Some("running"));
+    // Pinned Sessions list first, even when older.
+    let pinned = store.set_session_pinned(&other, true).unwrap().unwrap();
+    assert!(pinned.pinned);
+    let newest = store.create_session(None).unwrap().id;
+    let order: Vec<String> = store
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|x| x.id)
+        .collect();
+    assert_eq!(order[0], other);
+    assert_eq!(order[1], newest);
     let first = runs.iter().find(|r| r.run_id == r1).unwrap();
     assert_eq!(
         (

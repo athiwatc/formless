@@ -25,6 +25,9 @@ pub struct SessionInfo {
     pub preview: Option<String>,
     #[serde(default)]
     pub last_run_status: Option<String>,
+    /// Pinned Sessions sort first (SPEC §10.4).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -542,6 +545,11 @@ pub enum Request {
     },
     /// Set (or, with `None`, clear) a Session's working directory; it must
     /// exist on the daemon's machine. Returns the Session.
+    /// Pin or unpin a Session (pinned ones list first). Returns it.
+    SetSessionPinned {
+        id: String,
+        pinned: bool,
+    },
     SetSessionCwd {
         id: String,
         cwd: Option<String>,

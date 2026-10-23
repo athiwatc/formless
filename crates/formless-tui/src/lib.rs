@@ -162,6 +162,7 @@ enum Pending {
     ContextFill,
     SessionRuns,
     SetCwd,
+    SetPin,
     ContextReport,
     MentionAttach,
     ApprovalCode,
@@ -1392,6 +1393,18 @@ impl App {
                             self.mention_attached();
                         }
                         Pending::SettingsProviders => self.providers_info = result,
+                        Pending::SetPin => {
+                            if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
+                                self.notes.push(format!(
+                                    "{} {}",
+                                    if s.pinned { "pinned" } else { "unpinned" },
+                                    s.name
+                                ));
+                                if let Some(old) = self.sessions.iter_mut().find(|x| x.id == s.id) {
+                                    *old = s;
+                                }
+                            }
+                        }
                         Pending::SetCwd => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
                                 self.notes.push(format!(
@@ -3251,6 +3264,15 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "pin" => match self
+                .current
+                .as_ref()
+                .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+                .cloned()
+            {
+                Some(s) => self.toggle_pin(&s),
+                None => self.notes.push("no current session".into()),
+            },
             "cd" => self.change_dir(""),
             cmd if cmd.starts_with("cd ") => self.change_dir(cmd[3..].trim()),
             "notes" => {
@@ -4060,6 +4082,11 @@ impl App {
                     Pending::CreateSession,
                     Request::CreateSession { name: None },
                 ),
+                KeyCode::Char('P') => {
+                    if let Some(s) = self.selected_session().cloned() {
+                        self.toggle_pin(&s);
+                    }
+                }
                 KeyCode::Char('f') => {
                     if let Some(s) = self.selected_session().cloned() {
                         self.request(
@@ -6355,6 +6382,17 @@ impl App {
         self.toasts.drain(..extra);
     }
 
+    /// Pin or unpin a Session (SPEC §10.4).
+    fn toggle_pin(&mut self, s: &SessionInfo) {
+        self.request(
+            Pending::SetPin,
+            Request::SetSessionPinned {
+                id: s.id.clone(),
+                pinned: !s.pinned,
+            },
+        );
+    }
+
     /// The current Session's working directory, else the TUI's own
     /// (SPEC §5.1).
     fn work_dir(&self) -> std::path::PathBuf {
@@ -7459,6 +7497,10 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                         fg(app.color, Color::Cyan),
                     ),
                     Span::styled(format!("{icon} "), style),
+                    Span::styled(
+                        if s.pinned { "★ " } else { "  " },
+                        fg(app.color, Color::Yellow),
+                    ),
                     Span::raw(ui::pad(&s.name, name_w)),
                     Span::styled(format!(" {meta}"), ui::dim(app.color)),
                     Span::styled(
@@ -9576,6 +9618,7 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
+            pinned: false,
         }];
         app.key(key(KeyCode::Char('d')));
         assert_eq!(app.delete_arm.as_deref(), Some("s1"));
@@ -10357,6 +10400,7 @@ mod tests {
                 message_count: 0,
                 preview: None,
                 last_run_status: None,
+                pinned: false,
             })
             .collect();
         app.switch_session("refactor-auth".into());
@@ -10933,6 +10977,7 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
+            pinned: false,
         }];
         app.switch_session("s".into());
         assert_eq!(app.work_dir(), here.join("src"));
@@ -10959,6 +11004,7 @@ mod tests {
             message_count: 12,
             preview: Some(format!("fix the {id} build")),
             last_run_status: status.map(str::to_string),
+            pinned: false,
         };
         app.sessions = vec![session("a", Some("paused")), session("b", None)];
         app.running_sessions.insert("b".into());
@@ -10966,10 +11012,51 @@ mod tests {
         let screen = render(&mut app, 140, 20);
         assert!(screen.contains("12 msgs · gpt-x"), "{screen}");
         assert!(screen.contains("“fix the a build”"));
+        let row = |name: &str| {
+            screen
+                .lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_default()
+                .to_string()
+        };
         assert!(
-            screen.contains("⏸ a work") && screen.contains("◐ b work"),
+            row("a work").contains('⏸') && row("b work").contains('◐'),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn pinned_sessions_sort_first() {
+        let mut app = test_app();
+        let session = |id: &str, at: &str, pinned: bool| SessionInfo {
+            id: id.into(),
+            name: id.into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: at.into(),
+            updated_at: at.into(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned,
+        };
+        app.sessions = vec![
+            session("new", "2026-02-01", false),
+            session("home", "2026-01-01", true),
+            session("mid", "2026-01-15", false),
+        ];
+        let names = |app: &App| -> Vec<String> {
+            app.visible_sessions()
+                .iter()
+                .map(|&i| app.sessions[i].name.clone())
+                .collect()
+        };
+        assert_eq!(names(&app), ["home", "new", "mid"]);
+        app.session_filter.sort = 2; // by name: pinned still first
+        assert_eq!(names(&app), ["home", "mid", "new"]);
+        app.view = View::Sessions;
+        assert!(render(&mut app, 120, 20).contains("★ home"));
     }
 
     #[test]
