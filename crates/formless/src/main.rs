@@ -161,6 +161,9 @@ enum Cmd {
         /// No progress lines ([tool], [approval], …) on stderr; errors still show
         #[arg(long, short)]
         quiet: bool,
+        /// Interrupt the Run after this long (90s, 10m, 1h30m) and exit 124
+        #[arg(long, value_parser = parse_duration)]
+        timeout: Option<std::time::Duration>,
         /// Model for this Run (with --session: this Run only)
         #[arg(long, conflicts_with = "role")]
         model: Option<String>,
@@ -535,6 +538,7 @@ fn main() -> Result<()> {
             json,
             output,
             quiet,
+            timeout,
             model,
             effort,
             role,
@@ -603,6 +607,7 @@ fn main() -> Result<()> {
                 answer,
                 output,
                 quiet,
+                timeout,
             );
             if let Some(s) = restore {
                 let _ = formless_tui::client::request_once(
@@ -1182,6 +1187,53 @@ fn doctor(paths: Paths) -> Result<()> {
 
 /// Headless Run (SPEC §12): streams events, answers approvals fail-closed
 /// unless `yes`, exits 0 answered / 1 errored-paused / 2 usage.
+/// `90`, `90s`, `10m`, `2h`, `1h30m` as a duration (bare numbers are
+/// seconds).
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    let bad = || format!("'{s}' is not a duration (like 90s, 10m or 1h30m)");
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    let (mut total, mut num) = (0u64, String::new());
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        let n: u64 = num.parse().map_err(|_| bad())?;
+        num.clear();
+        total += n * match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            _ => return Err(bad()),
+        };
+    }
+    if !num.is_empty() || total == 0 {
+        return Err(bad());
+    }
+    Ok(std::time::Duration::from_secs(total))
+}
+
+/// `1h30m`, `10m`, `45s`.
+fn format_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, sec) = (s / 3600, s % 3600 / 60, s % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if sec > 0 || out.is_empty() {
+        out.push_str(&format!("{sec}s"));
+    }
+    out
+}
+
 /// What `formless run` prints (SPEC §12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum RunOutput {
@@ -1267,6 +1319,7 @@ fn run_headless(
     answer: Option<String>,
     output: RunOutput,
     quiet: bool,
+    timeout: Option<std::time::Duration>,
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let json_out = output == RunOutput::JsonlEvents;
@@ -1348,7 +1401,26 @@ fn run_headless(
     let sigints = count_sigints();
     let mut interrupting = false;
     let mut code = 1;
+    let started = std::time::Instant::now();
+    // --timeout: interrupt, give the Run a moment to stop, then exit 124.
+    let mut timed_out: Option<std::time::Instant> = None;
     loop {
+        if let Some(limit) = timeout {
+            match timed_out {
+                None if started.elapsed() >= limit => {
+                    eprintln!(
+                        "timed out after {}; interrupting the run",
+                        format_duration(limit)
+                    );
+                    client.send(Request::InterruptRun {
+                        session_id: session_id.clone(),
+                    });
+                    timed_out = Some(std::time::Instant::now());
+                }
+                Some(at) if at.elapsed() >= std::time::Duration::from_secs(10) => break,
+                _ => {}
+            }
+        }
         // Ctrl+C (SPEC §12): first interrupts the Run and waits for it to
         // stop (exit 130); a second one exits at once.
         match sigints.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1490,6 +1562,10 @@ fn run_headless(
             Err(_) => break,
         }
     }
+    if timed_out.is_some() {
+        code = 124;
+        run_error.get_or_insert_with(|| "timed out".into());
+    }
     match output {
         RunOutput::Final => {
             if let Some(a) = &final_answer {
@@ -1500,7 +1576,7 @@ fn run_headless(
             "{}",
             serde_json::json!({
                 "session_id": session_id,
-                "status": match code { 0 => "completed", 130 => "interrupted", _ if run_error.is_some() => "paused", _ => "failed" },
+                "status": match code { 0 => "completed", 124 => "timed_out", 130 => "interrupted", _ if run_error.is_some() => "paused", _ => "failed" },
                 "answer": final_answer,
                 "error": run_error,
             })
@@ -2401,6 +2477,21 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn durations_parse_and_print() {
+        let d = |s: &str| parse_duration(s).map(|d| d.as_secs());
+        assert_eq!(d("90"), Ok(90));
+        assert_eq!(d("90s"), Ok(90));
+        assert_eq!(d("10m"), Ok(600));
+        assert_eq!(d("1h30m"), Ok(5400));
+        assert!(d("10x").is_err() && d("m").is_err() && d("1h3").is_err() && d("0s").is_err());
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(5400)),
+            "1h30m"
+        );
+        assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
+    }
 
     #[test]
     fn attachments_are_read_and_checked_up_front() {

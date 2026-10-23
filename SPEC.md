@@ -2228,6 +2228,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   - `json`: one `{session_id, status, answer, error}` object at the end;
   - `jsonl-events`: every event, one per line; `--json` is the same.
 
+  `--timeout DURATION` (`90`, `90s`, `10m`, `1h30m`) interrupts the Run
+  when it expires. The command says "timed out after …", waits up to 10 s
+  for the Run to stop, and exits 124 (JSON status `timed_out`).
   `--quiet` drops the progress lines (errors still go to stderr), and
   exit codes are unchanged. `--attach FILE` (repeatable) sends
   files and images with the task through `AttachFile`, with the same 20 MB
