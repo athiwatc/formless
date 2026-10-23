@@ -1943,6 +1943,10 @@ run_tool = "network_policy"     # a registry Tool, or…
     `on_tui_start`, and `SetSetting` answers `applies: "now" |
     "on_tui_start"`. The web marks those rows and, after saving one, says
     to restart any running TUI.
+  - The web Settings view has a filter box. Rows (and table rows) whose
+    label, key, value or description contain every typed word stay, with
+    the words marked in the label. Sections left empty hide unless their
+    title matches.
   In the TUI the rows are selectable (↑/↓ or j/k, Enter or Space):
   - booleans toggle and enums cycle (`reasoning_effort`, `api_style`,
     `tool_mode`; the last two are settable and validated against their

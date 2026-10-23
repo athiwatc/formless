@@ -540,3 +540,7 @@ button.linkish:hover { text-decoration: underline; }
 .subagent-log { max-height: 55vh; overflow-y: auto; display: grid; gap: 6px; font-size: 13px; }
 .subagent-msg { white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--line); padding-left: 8px; }
 .subagent-msg.assistant { border-color: var(--accent); }
+
+/* Settings filter */
+.settings-filter { width: 100%; max-width: 520px; padding: 8px 12px; margin: 0 0 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
+mark.find { background: var(--accent-soft); color: inherit; border-radius: 3px; padding: 0 1px; }
