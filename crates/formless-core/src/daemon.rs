@@ -1251,6 +1251,40 @@ impl Daemon {
             Request::ListBuiltinStats { since } => Ok(serde_json::to_value(
                 self.with_reader(|st| st.builtin_stats(since.as_deref()))?,
             )?),
+            Request::UsageByDay { since, by } => {
+                let by = by.unwrap_or_default();
+                let cfg = self.config()?;
+                let rows = self.with_reader(|st| st.usage_grouped(since.as_deref(), &by))?;
+                // Merge the per-model rows of each key, pricing as we go
+                // (no cost when a model in it has no price).
+                let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
+                for (key, model, p, c, cached) in rows {
+                    let price = cfg
+                        .provider
+                        .prices
+                        .get(&model)
+                        .map(|m| m.cost(p, c, cached));
+                    match out.last_mut().filter(|o| o.0 == key) {
+                        Some(o) => {
+                            o.1 += p;
+                            o.2 += c;
+                            o.3 += cached;
+                            o.4 = o.4.zip(price).map(|(a, b)| a + b);
+                        }
+                        None => out.push((key, p, c, cached, price)),
+                    }
+                }
+                if !by.is_empty() {
+                    out.sort_by_key(|o| std::cmp::Reverse(o.1 + o.2));
+                }
+                Ok(json!(out
+                    .into_iter()
+                    .map(|(key, p, c, cached, cost)| json!({
+                        "key": key, "prompt_tokens": p, "completion_tokens": c,
+                        "cached_tokens": cached, "cost": cost,
+                    }))
+                    .collect::<Vec<_>>()))
+            }
             Request::ListToolMetrics { since } => {
                 let since = since.unwrap_or_else(|| "0000".into());
                 let rows = self.with_reader(|st| st.tool_metrics_since(&since))?;

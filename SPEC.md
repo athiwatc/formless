@@ -1810,6 +1810,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   {since}`). Model outcomes in a range come from the `model_events` log
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
+- **Token and cost chart.** `UsageByDay {since, by}` sums provider token
+  use (prompt, completion, cached) per UTC day, or with `by` = "model",
+  "role" or "session" per that key over the range, priced with
+  `provider.prices` (no cost when a model in the bucket has no price). The
+  TUI Metrics view charts it for the selected range: a bar per day (or key)
+  split into cached, fresh prompt and completion tokens, with totals and
+  cost; `b` cycles the breakdown.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,

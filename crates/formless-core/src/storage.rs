@@ -3592,6 +3592,34 @@ impl Store {
         Ok(rows)
     }
 
+    /// Token use since `since` grouped by `by` ("model", "role",
+    /// "session", else the UTC day) and model (for pricing): (key, model,
+    /// prompt, completion, cached).
+    pub fn usage_grouped(
+        &self,
+        since: Option<&str>,
+        by: &str,
+    ) -> Result<Vec<(String, String, i64, i64, i64)>> {
+        let key = match by {
+            "model" => "u.model",
+            "session" => "COALESCE(s.name, u.session_id)",
+            "role" => "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')",
+            _ => "substr(u.created_at, 1, 10)",
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {key}, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens), SUM(u.cached_tokens)
+             FROM run_usage u LEFT JOIN sessions s ON s.id=u.session_id
+             WHERE ?1 IS NULL OR u.created_at >= ?1
+             GROUP BY 1, 2 ORDER BY 1"
+        ))?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Summed usage of a Run's provider requests.
     pub fn run_usage(&self, run_id: &str) -> Result<crate::provider::Usage> {
         Ok(self.conn.query_row(
