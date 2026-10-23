@@ -4122,6 +4122,8 @@ impl App {
                         self.toggle_pin(&s);
                     }
                 }
+                // Undo the last delete (within `daemon.delete_undo_secs`).
+                KeyCode::Char('u') => self.slash("undo"),
                 KeyCode::Char('a') => {
                     if let Some(s) = self.selected_session().cloned() {
                         self.request(
@@ -4149,8 +4151,11 @@ impl App {
                     if let Some(s) = self.selected_session().cloned() {
                         if self.delete_arm.as_deref() == Some(&s.id) {
                             self.delete_arm = None;
+                            let secs = Config::load(&self.paths)
+                                .map(|c| c.daemon.delete_undo_secs)
+                                .unwrap_or(30);
                             self.notes.push(format!(
-                                "deleted session {} · /undo to restore it (30s)",
+                                "deleted session {} · u (or /undo) restores it for {secs}s",
                                 s.name
                             ));
                             self.last_deleted = Some((s.id.clone(), s.name.clone()));
@@ -11244,6 +11249,39 @@ mod tests {
             .map(|&i| app.sessions[i].name.clone())
             .collect();
         assert_eq!(names, ["alpha"], "#work is an exact tag, not #workshop");
+    }
+
+    #[test]
+    fn u_undoes_a_session_delete() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.sessions = vec![SessionInfo {
+            id: "s".into(),
+            name: "doomed".into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned: false,
+            archived: false,
+            tags: Vec::new(),
+        }];
+        app.view = View::Sessions;
+        app.key(key(KeyCode::Char('d')));
+        app.key(key(KeyCode::Char('d')));
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("u (or /undo) restores it for 30s"));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(app.notes.last().unwrap(), "restoring session doomed");
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(app.notes.last().unwrap(), "nothing to undo");
     }
 
     #[test]
