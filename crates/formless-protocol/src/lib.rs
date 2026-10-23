@@ -607,6 +607,9 @@ pub enum Request {
     RunMetrics {
         #[serde(default)]
         limit: Option<usize>,
+        /// Only this Session's Runs.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     /// Built-in call stats (SPEC §8.8).
     ListBuiltinStats,

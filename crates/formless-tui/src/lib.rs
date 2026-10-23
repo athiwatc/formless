@@ -158,6 +158,7 @@ enum Pending {
     ListFiles,
     /// Context fill for the status line (quiet) or `/context` (report).
     ContextFill,
+    SessionRuns,
     ContextReport,
     MentionAttach,
     ApprovalCode,
@@ -794,6 +795,8 @@ struct App {
     questions: Vec<OpenQuestion>,
     /// Latest Run usage per Session, for the status line (SPEC §10.6).
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
+    /// The current Session's Runs, for the footer under each answer.
+    session_runs: Vec<RunMetricsInfo>,
     /// Context fill per Session: (last prompt tokens, context size).
     context_fill: HashMap<String, (i64, i64)>,
     /// The current Session's unfinished last Run: (status, reason).
@@ -1007,6 +1010,7 @@ impl App {
             questions: Vec::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
+            session_runs: Vec::new(),
             run_banner: None,
             last_error: None,
             call_focus: None,
@@ -1368,6 +1372,13 @@ impl App {
                             self.mention_attached();
                         }
                         Pending::SettingsProviders => self.providers_info = result,
+                        Pending::SessionRuns => {
+                            let runs: Vec<RunMetricsInfo> =
+                                serde_json::from_value(result["runs"].clone()).unwrap_or_default();
+                            if runs.first().map(|r| &r.session_id) == self.current.as_ref() {
+                                self.session_runs = runs;
+                            }
+                        }
                         Pending::ApprovalCode => {
                             if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
                                 let want = self.approval_code.take();
@@ -1854,6 +1865,8 @@ impl App {
                 session_id: id.clone(),
             },
         );
+        self.session_runs.clear();
+        self.request_session_runs(&id);
         // Each Session keeps its own unsent input (SPEC §10.2).
         if self.current.as_deref() != Some(id.as_str()) {
             if let Some(old) = self.current.take() {
@@ -1968,6 +1981,9 @@ impl App {
                 session_id, status, ..
             } => {
                 self.running_sessions.remove(&session_id);
+                if self.is_current(&session_id) {
+                    self.request_session_runs(&session_id);
+                }
                 // Refresh names/order even when the Run was elsewhere.
                 self.request(Pending::ListSessions, Request::ListSessions);
                 if !self.is_current(&session_id) {
@@ -2924,7 +2940,10 @@ impl App {
                 self.request(Pending::ListModelStats, Request::ListModelStats);
                 self.request(
                     Pending::RunMetrics,
-                    Request::RunMetrics { limit: Some(200) },
+                    Request::RunMetrics {
+                        limit: Some(200),
+                        session_id: None,
+                    },
                 );
                 self.request(Pending::ListBuiltinStats, Request::ListBuiltinStats);
             }
@@ -6112,6 +6131,17 @@ impl App {
         self.toasts.drain(..extra);
     }
 
+    /// Fetch a Session's Runs for the answer footers.
+    fn request_session_runs(&mut self, session_id: &str) {
+        self.request(
+            Pending::SessionRuns,
+            Request::RunMetrics {
+                limit: Some(500),
+                session_id: Some(session_id.to_string()),
+            },
+        );
+    }
+
     /// `/panes wider|narrower|left|right|reset`: side pane widths (SPEC
     /// §10.2), saved in `tui.pane_widths`.
     fn resize_panes(&mut self, how: &str) {
@@ -6424,6 +6454,52 @@ fn focus_hint(color: bool, user: bool) -> Line<'static> {
     )
 }
 
+/// The footer under each finished Run's last message (SPEC §10.2), by
+/// message index: a Run's messages are those before the next Run began.
+fn run_footers(app: &App) -> HashMap<usize, String> {
+    let mut runs: Vec<&RunMetricsInfo> = app
+        .session_runs
+        .iter()
+        .filter(|r| r.status != "running")
+        .collect();
+    runs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    let latest = runs.last().map(|r| r.run_id.clone());
+    let mut out = HashMap::new();
+    for (k, run) in runs.iter().enumerate() {
+        let until = runs.get(k + 1).map(|r| r.created_at.as_str());
+        let last = app.messages.iter().rposition(|m| {
+            m.created_at >= run.created_at && until.is_none_or(|u| m.created_at.as_str() < u)
+        });
+        let Some(i) = last else { continue };
+        let took = format_elapsed(Duration::from_millis(run.duration_ms.max(0) as u64));
+        let mut text = match run.status.as_str() {
+            "completed" => format!("✓ {took}"),
+            "interrupted" => format!("■ interrupted after {took}"),
+            "paused" => format!("⏸ paused after {took}"),
+            other => format!("{other} · {took}"),
+        };
+        text.push_str(&format!(
+            " · {} step{} · {} tool{}",
+            run.steps,
+            if run.steps == 1 { "" } else { "s" },
+            run.tool_calls,
+            if run.tool_calls == 1 { "" } else { "s" }
+        ));
+        // Cost is known for the Run just finished (from RunUsage).
+        let cost = app
+            .current
+            .as_ref()
+            .and_then(|s| app.run_usage.get(s))
+            .and_then(|u| u.cost)
+            .filter(|_| latest.as_deref() == Some(run.run_id.as_str()));
+        if let Some(c) = cost {
+            text.push_str(&format!(" · ${c:.2}"));
+        }
+        out.insert(i, text);
+    }
+    out
+}
+
 /// A persisted tool call: (call id, name, raw arguments).
 fn persisted_calls(meta: &str) -> Vec<(String, String, String)> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(meta) else {
@@ -6644,8 +6720,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             *group = Some(g);
         }
     };
+    let footers = run_footers(app);
     let mut day = None;
-    for m in &app.messages {
+    for (mi, m) in app.messages.iter().enumerate() {
         let when = Some(m.created_at.as_str());
         // A separator when the local date changes (not before the first).
         if let Some(d) = ui::local_day(&m.created_at).filter(|_| app.show_timestamps) {
@@ -6719,6 +6796,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     }
                 }
             }
+        }
+        if let Some(footer) = footers.get(&mi) {
+            lines.push(Line::styled(format!("  {footer}"), ui::dim(app.color)));
         }
     }
     // Live call tree (persisted lines above keep the history): running
@@ -8576,6 +8656,7 @@ mod tests {
             questions: Vec::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
+            session_runs: Vec::new(),
             run_banner: None,
             last_error: None,
             call_focus: None,
@@ -10323,6 +10404,60 @@ mod tests {
         // /notes keeps the whole history.
         app.slash("notes");
         assert_eq!(app.pager.as_ref().unwrap().lines.len(), 2);
+    }
+
+    #[test]
+    fn finished_runs_get_a_footer_under_their_answer() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        let msg = |id: &str, role: &str, at: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 0,
+            role: role.into(),
+            content: format!("{id} text"),
+            created_at: at.into(),
+            meta: None,
+        };
+        app.messages = vec![
+            msg("u1", "user", "2026-01-01T10:00:00Z"),
+            msg("a1", "assistant", "2026-01-01T10:00:30Z"),
+            msg("u2", "user", "2026-01-01T10:05:00Z"),
+            msg("a2", "assistant", "2026-01-01T10:05:10Z"),
+        ];
+        let run =
+            |id: &str, status: &str, at: &str, ms: i64, steps: i64, tools: i64| RunMetricsInfo {
+                run_id: id.into(),
+                session_id: "s".into(),
+                status: status.into(),
+                outcome: status.into(),
+                steps,
+                tool_calls: tools,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                duration_ms: ms,
+                created_at: at.into(),
+            };
+        app.session_runs = vec![
+            run("r2", "interrupted", "2026-01-01T10:05:00Z", 12_000, 1, 0),
+            run("r1", "completed", "2026-01-01T10:00:00Z", 134_000, 7, 3),
+        ];
+        app.run_usage.insert(
+            "s".into(),
+            formless_protocol::UsageInfo {
+                steps: 1,
+                cost: Some(0.04),
+                ..Default::default()
+            },
+        );
+        let footers = run_footers(&app);
+        assert_eq!(footers[&1], "✓ 2m14s · 7 steps · 3 tools");
+        assert_eq!(
+            footers[&3],
+            "■ interrupted after 12s · 1 step · 0 tools · $0.04"
+        );
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("✓ 2m14s · 7 steps · 3 tools"), "{screen}");
     }
 
     #[test]

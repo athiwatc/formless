@@ -1057,8 +1057,10 @@ impl Daemon {
             Request::ListBuiltinStats => Ok(serde_json::to_value(
                 self.with_reader(|st| st.builtin_stats())?,
             )?),
-            Request::RunMetrics { limit } => {
-                let runs = self.with_reader(|st| st.run_metrics(limit.unwrap_or(200)))?;
+            Request::RunMetrics { limit, session_id } => {
+                let runs = self.with_reader(|st| {
+                    st.run_metrics_for(session_id.as_deref(), limit.unwrap_or(200))
+                })?;
                 let summary = crate::runs::summarize(&runs);
                 Ok(json!({"runs": runs, "summary": summary}))
             }

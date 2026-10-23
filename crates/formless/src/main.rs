@@ -1618,7 +1618,13 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
 
 fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
-    let v = formless_tui::client::request_once(&paths, Request::RunMetrics { limit: Some(limit) })?;
+    let v = formless_tui::client::request_once(
+        &paths,
+        Request::RunMetrics {
+            limit: Some(limit),
+            session_id: None,
+        },
+    )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());

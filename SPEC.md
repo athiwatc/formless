@@ -1547,6 +1547,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   and hints for `/help`, `/model` and `@`. In the TUI, 1–4 on an empty
   input put an example in the input to edit or send; on the web the
   examples are buttons.
+- **Run footers (TUI).** Under the last message of each finished Run, a
+  dim footer: `✓ 2m14s · 7 steps · 3 tools · $0.04`, or
+  `■ interrupted after …` / `⏸ paused after …`. Footers come from the
+  Session's Run metrics (`RunMetrics {session_id}`), so earlier Runs keep
+  theirs; a Run's messages are those before the next Run began. Cost
+  shows for the Run just finished, when prices are configured.
 - **Moving through a long Session (TUI).** Ctrl+↑/Ctrl+↓, or `{`/`}` on
   an empty input, jump to the previous/next user message. Past the last
   one, the chat follows the live bottom again. Home on an empty input
