@@ -2307,6 +2307,11 @@ run_tool = "network_policy"     # a registry Tool, or…
     Without `--session` it runs in a new Session that is archived
     afterwards. It prints the result and exits 0, or 1 when the call fails
     or is denied (2 for a bad `--input`).
+  - `retire NAME`, `restore NAME`, and `rollback NAME [--to N]` (default:
+    the version before the current one) mirror the Tools view.
+  - `purge NAME` deletes a Tool and its history for good. On a terminal it
+    asks for the Tool's name; without one, `--force` is required (exit 2
+    otherwise), matching the web's typed confirmation.
   (same trust rules as §7.8).
 - `formless doctor` — diagnostics: config validity, data dir, keychain
   reachability, endpoint connectivity + tool-calling probe result.
