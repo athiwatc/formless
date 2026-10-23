@@ -2220,7 +2220,16 @@ run_tool = "network_policy"     # a registry Tool, or…
   and `--role` with `--model` is refused) set the Run's model. On the
   ephemeral Session they simply apply; with `--session` they apply to that
   Run, and the Session's own model and effort are restored afterwards
-  (`--effort` alone keeps its model). `--attach FILE` (repeatable) sends
+  (`--effort` alone keeps its model). `--output text|final|json|jsonl-events`
+  picks what is printed:
+  - `text` (default): the answer streams, progress on stderr;
+  - `final`: only the last answer, on stdout when the Run ends, with
+    progress on stderr only when it's a terminal;
+  - `json`: one `{session_id, status, answer, error}` object at the end;
+  - `jsonl-events`: every event, one per line; `--json` is the same.
+
+  `--quiet` drops the progress lines (errors still go to stderr), and
+  exit codes are unchanged. `--attach FILE` (repeatable) sends
   files and images with the task through `AttachFile`, with the same 20 MB
   limit and type and vision handling as `/attach`. Every file is read and
   checked first; a missing or too-large one is a usage error (exit 2)

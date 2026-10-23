@@ -276,6 +276,8 @@ Approvals for broad Capabilities appear as a modal — the request names the exa
 formless run "summarise the CHANGELOG of this repo"        # ephemeral Session
 formless run "now group those by author" --session 3f9c    # continue a Session
 formless run "audit my Downloads folder" --json            # one JSON event per line
+formless run "one-line summary of README.md" --output final -q   # just the answer on stdout
+formless run "triage this" --output json                   # {session_id, status, answer, error}
 formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
 formless run "classify these titles" --model small-model --effort low
 formless run "plan the migration" --role planner           # a configured Role's provider and model

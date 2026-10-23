@@ -150,9 +150,17 @@ enum Cmd {
         /// terminal, otherwise tell the agent nobody can answer)
         #[arg(long)]
         answer: Option<String>,
-        /// Emit one JSON event per line
+        /// Emit one JSON event per line (same as --output jsonl-events)
         #[arg(long)]
         json: bool,
+        /// text: stream the answer and progress; final: only the final
+        /// answer on stdout; json: one result object at the end;
+        /// jsonl-events: every event, one per line
+        #[arg(long, value_enum, default_value = "text")]
+        output: RunOutput,
+        /// No progress lines ([tool], [approval], …) on stderr; errors still show
+        #[arg(long, short)]
+        quiet: bool,
         /// Model for this Run (with --session: this Run only)
         #[arg(long, conflicts_with = "role")]
         model: Option<String>,
@@ -525,11 +533,14 @@ fn main() -> Result<()> {
             yes,
             answer,
             json,
+            output,
+            quiet,
             model,
             effort,
             role,
             attach,
         }) => {
+            let output = if json { RunOutput::JsonlEvents } else { output };
             // Piped input: the task itself (`-`) or an attachment.
             use std::io::{IsTerminal, Read};
             let piped = if std::io::stdin().is_terminal() {
@@ -582,7 +593,17 @@ fn main() -> Result<()> {
                     effort,
                 )
             });
-            let code = run_headless(paths.clone(), task, files, session, pick, yes, answer, json);
+            let code = run_headless(
+                paths.clone(),
+                task,
+                files,
+                session,
+                pick,
+                yes,
+                answer,
+                output,
+                quiet,
+            );
             if let Some(s) = restore {
                 let _ = formless_tui::client::request_once(
                     &paths,
@@ -1161,6 +1182,16 @@ fn doctor(paths: Paths) -> Result<()> {
 
 /// Headless Run (SPEC §12): streams events, answers approvals fail-closed
 /// unless `yes`, exits 0 answered / 1 errored-paused / 2 usage.
+/// What `formless run` prints (SPEC §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RunOutput {
+    Text,
+    Final,
+    Json,
+    #[value(name = "jsonl-events")]
+    JsonlEvents,
+}
+
 /// The `--attach` files as (name, bytes); a missing, unreadable or too
 /// large file is an error before anything runs.
 fn read_attachments(paths: &[std::path::PathBuf]) -> Result<Vec<(String, Vec<u8>)>, String> {
@@ -1234,8 +1265,23 @@ fn run_headless(
     pick: Option<ModelPick>,
     yes: bool,
     answer: Option<String>,
-    json_out: bool,
+    output: RunOutput,
+    quiet: bool,
 ) -> Result<i32> {
+    use std::io::IsTerminal;
+    let json_out = output == RunOutput::JsonlEvents;
+    // The answer streams only in text mode; progress goes to stderr in
+    // text mode, and in final mode when someone is watching.
+    let stream = output == RunOutput::Text;
+    let progress = !quiet
+        && match output {
+            RunOutput::Text => true,
+            RunOutput::Final => std::io::stderr().is_terminal(),
+            _ => false,
+        };
+    let interactive = matches!(output, RunOutput::Text | RunOutput::Final);
+    let mut final_answer: Option<String> = None;
+    let mut run_error: Option<String> = None;
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
         eprintln!("not configured; run `formless` for the wizard");
@@ -1333,18 +1379,22 @@ fn run_headless(
                 }
                 match ev {
                     Event::MessageDelta { delta, .. } => {
-                        if !json_out {
+                        if stream {
                             print!("{delta}");
                             let _ = std::io::stdout().flush();
                         }
                     }
-                    Event::MessageComplete { .. } => {
-                        if !json_out {
+                    Event::MessageComplete { message, .. } => {
+                        if stream {
                             println!();
+                        }
+                        // The last answer the agent gave is the final one.
+                        if message.role == "assistant" && !message.content.trim().is_empty() {
+                            final_answer = Some(message.content);
                         }
                     }
                     Event::ToolCallStarted { tool_name, .. } => {
-                        if !json_out {
+                        if progress {
                             eprintln!("[tool] {tool_name}");
                         }
                     }
@@ -1355,11 +1405,10 @@ fn run_headless(
                         questions,
                         ..
                     } => {
-                        use std::io::IsTerminal;
                         let (reply, answers) = match &answer {
                             // --answer is one free-text reply to the whole call.
                             Some(a) => (a.clone(), Vec::new()),
-                            None if std::io::stdin().is_terminal() && !json_out => {
+                            None if std::io::stdin().is_terminal() && interactive => {
                                 // An older daemon sends only the single-question
                                 // form (and ignores `answers`).
                                 let questions = if questions.is_empty() {
@@ -1373,7 +1422,7 @@ fn run_headless(
                             }
                             None => ("[no answer: this is a non-interactive run; proceed on your best assumption and state it]".to_string(), Vec::new()),
                         };
-                        if !json_out {
+                        if progress {
                             eprintln!("[answer] {reply}");
                         }
                         client.send(Request::AnswerQuestion {
@@ -1387,7 +1436,7 @@ fn run_headless(
                         tool_name,
                         ..
                     } => {
-                        if !json_out {
+                        if progress {
                             eprintln!(
                                 "[approval] {} -> {}",
                                 tool_name,
@@ -1408,6 +1457,11 @@ fn run_headless(
                     Event::RunPaused {
                         error, explained, ..
                     } => {
+                        run_error = Some(
+                            explained
+                                .as_ref()
+                                .map_or_else(|| error.clone(), |x| x.message.clone()),
+                        );
                         match explained {
                             Some(x) => {
                                 eprintln!("run paused: {}", x.message);
@@ -1435,6 +1489,23 @@ fn run_headless(
             Ok(_) => {}
             Err(_) => break,
         }
+    }
+    match output {
+        RunOutput::Final => {
+            if let Some(a) = &final_answer {
+                println!("{}", a.trim_end());
+            }
+        }
+        RunOutput::Json => println!(
+            "{}",
+            serde_json::json!({
+                "session_id": session_id,
+                "status": match code { 0 => "completed", 130 => "interrupted", _ if run_error.is_some() => "paused", _ => "failed" },
+                "answer": final_answer,
+                "error": run_error,
+            })
+        ),
+        _ => {}
     }
     Ok(code)
 }
@@ -2342,8 +2413,14 @@ mod tests {
         let missing = read_attachments(&[dir.join("nope.png")]).unwrap_err();
         assert!(missing.starts_with("cannot attach"), "{missing}");
         let big = dir.join("big.bin");
-        std::fs::write(&big, vec![0u8; formless_core::daemon::MAX_ATTACHMENT_BYTES + 1]).unwrap();
-        assert!(read_attachments(&[big]).unwrap_err().contains("larger than 20 MB"));
+        std::fs::write(
+            &big,
+            vec![0u8; formless_core::daemon::MAX_ATTACHMENT_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_attachments(&[big])
+            .unwrap_err()
+            .contains("larger than 20 MB"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
