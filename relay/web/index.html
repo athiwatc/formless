@@ -156,7 +156,7 @@
     <span class="sep">│</span><span id="status-model" class="muted clickable" title="Change model (/model)"></span>
     <span id="status-usage" class="muted"></span>
     <span id="status-context" class="muted clickable hidden" title="Context window (/context)"></span>
-    <span id="status-approvals" class="warn hidden"></span>
+    <button id="status-approvals" class="warn linkish hidden" type="button" title="Show it (a)"></button>
     <span class="spacer"></span>
     <span id="status-note" class="muted note"></span>
   </footer>
@@ -170,6 +170,7 @@
     <div class="modal-actions">
       <span id="modal-more" class="muted"></span>
       <span class="spacer"></span>
+      <button class="btn ghost" id="modal-later" type="button" title="Esc · bring it back with a or the status bar">Later</button>
       <button class="btn danger" id="modal-deny" type="button"><kbd>n</kbd> Deny</button>
       <button class="btn" id="modal-once" type="button"><kbd>o</kbd> Allow once</button>
       <button class="btn primary" id="modal-approve" type="button"><kbd>y</kbd> Approve</button>

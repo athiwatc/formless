@@ -549,6 +549,11 @@ pasting paths.
   messages (an earlier one drops the turns after it, and says so), Fork
   from here (`ForkSession` up to that message), and copying a Tool call's
   input or a result's output.
+- **Web pending prompts.** An approval can be set aside (Esc or Later),
+  and a question dialog can be cancelled without answering. Either stays
+  pending: the status bar shows "⚠ N awaiting approval" or "? the agent
+  asked you something", and clicking it or pressing `a` brings back the
+  oldest approval (Approve focused), else the question.
 - **Web streaming.** While an answer streams, the web client renders only
   its finished blocks (up to the last blank line outside a code fence) as
   Markdown, reusing that render, and shows the unfinished tail as plain
