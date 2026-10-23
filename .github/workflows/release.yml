@@ -39,6 +39,10 @@ jobs:
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/formless" "$name/"
           cp README.md SPEC.md "$name/"
+          # The man page, from the target binary (or a host build when the
+          # runner can't run the target).
+          "target/${{ matrix.target }}/release/formless" man > "$name/formless.1" \
+            || cargo run -q --release --locked --bin formless -- man > "$name/formless.1"
           # Optional signing: when the repository provides an Apple Developer ID
           # certificate via the standard signing secrets, sign here before notarization.
           tar -czf "$name.tar.gz" "$name"

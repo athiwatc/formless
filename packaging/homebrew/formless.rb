@@ -13,6 +13,7 @@ class Formless < Formula
     system "cargo", "install", *std_cargo_args(path: "crates/formless")
     # `formless completions bash|zsh|fish` prints each script.
     generate_completions_from_executable(bin/"formless", "completions")
+    (man1/"formless.1").write Utils.safe_popen_read(bin/"formless", "man")
   end
 
   test do
