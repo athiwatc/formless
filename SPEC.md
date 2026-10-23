@@ -2206,7 +2206,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   path, zip or git URL on the daemon's machine, or a bundle uploaded from
   the browser); and New job: a task, a schedule from presets (every day,
   every weekday, every week at a time, hourly, once) or cron, previewed in
-  words, and a target Session) — over the
+  words, and a target Session; a top-bar theme switch, Auto (the system's)
+  / Light / Dark, remembered per browser) — over the
   same daemon protocol, decrypted in the browser. `GetSettings` returns a
   read-only configuration summary for remote clients and never includes
   `provider.extra_headers` or any other credential-bearing field. The

@@ -736,6 +736,24 @@
   let mermaidQueue = Promise.resolve();
   let mermaidSeq = 0;
   const darkScheme = window.matchMedia("(prefers-color-scheme: dark)");
+  /** Dark unless the user picked light, or picked nothing and the system is light. */
+  const isDark = () => {
+    const t = document.documentElement.dataset.theme;
+    return t ? t === "dark" : darkScheme.matches;
+  };
+  /** Auto (the system's), Light or Dark; remembered in this browser. */
+  function applyTheme(t) {
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    else delete document.documentElement.dataset.theme;
+    $("theme").value = t === "light" || t === "dark" ? t : "auto";
+  }
+  applyTheme(prefs.get("theme", "auto"));
+  $("theme").addEventListener("change", (e) => {
+    prefs.set("theme", e.target.value);
+    applyTheme(e.target.value);
+    mermaidCache.clear();
+    renderAll();
+  });
   function loadMermaid() {
     if (!mermaidReady) {
       mermaidReady = new Promise((resolve, reject) => {
@@ -756,7 +774,7 @@
     return vars;
   }
   function renderMermaid(src) {
-    const theme = darkScheme.matches ? "dark" : "default";
+    const theme = isDark() ? "dark" : "default";
     const key = theme + "\n" + src;
     if (!mermaidCache.has(key)) {
       const job = mermaidQueue.then(async () => {
