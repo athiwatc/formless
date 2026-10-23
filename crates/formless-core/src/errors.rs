@@ -55,7 +55,16 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         .next()
         .unwrap_or_default();
     let local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
-    let (category, message, action) = if t.contains("context")
+    let (category, message, action) = if t.starts_with("budget:") {
+        (
+            "budget",
+            raw.trim_start_matches("budget:").trim().to_string(),
+            Some(
+                "Resume to continue past it this once, or raise the limit in Settings (limits.*)"
+                    .to_string(),
+            ),
+        )
+    } else if t.contains("context")
         && (t.contains("length")
             || t.contains("too long")
             || t.contains("window")

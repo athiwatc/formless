@@ -67,6 +67,11 @@ fn on(b: bool) -> String {
 
 /// The rows for `cfg`, with providers and Roles from a `ListProviders`
 /// result.
+/// An optional dollar limit: "off" when unset.
+fn limit(v: Option<f64>) -> String {
+    v.map_or("off".into(), |v| format!("{v}"))
+}
+
 pub fn rows(
     cfg: &Config,
     providers: &Value,
@@ -203,6 +208,27 @@ pub fn rows(
             Number,
         ),
         Row::new(
+            "Limits",
+            "limits.daily_usd",
+            "daily_usd",
+            limit(cfg.limits.daily_usd),
+            Number,
+        ),
+        Row::new(
+            "Limits",
+            "limits.run_usd",
+            "run_usd",
+            limit(cfg.limits.run_usd),
+            Number,
+        ),
+        Row::new(
+            "Limits",
+            "limits.run_steps",
+            "run_steps",
+            cfg.limits.run_steps.map_or("off".into(), |n| n.to_string()),
+            Number,
+        ),
+        Row::new(
             "Naming",
             "naming.enabled",
             "auto-naming",
@@ -317,11 +343,22 @@ pub fn next_choice(choices: &[&str], current: &str) -> Value {
 }
 
 /// Validate a typed number for `key`.
+/// A whole number; for optional limits, a decimal too, and empty or
+/// "off" clears it (null).
 pub fn parse_number(text: &str) -> Result<Value, String> {
-    text.trim()
-        .parse::<u64>()
-        .map(|n| json!(n))
-        .map_err(|_| format!("'{}' is not a whole number", text.trim()))
+    let t = text.trim();
+    if t.is_empty() || t == "off" {
+        return Ok(Value::Null);
+    }
+    if let Ok(n) = t.parse::<u64>() {
+        return Ok(json!(n));
+    }
+    t.trim_start_matches('$')
+        .parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .map(|f| json!(f))
+        .ok_or_else(|| format!("'{t}' is not a number"))
 }
 
 pub struct Field {
@@ -491,7 +528,9 @@ mod tests {
         );
         assert_eq!(next_choice(&["chat", "responses"], "weird"), json!("chat"));
         assert!(parse_number(" 42 ").is_ok());
-        assert!(parse_number("4k").unwrap_err().contains("whole number"));
+        assert!(parse_number("4k").unwrap_err().contains("not a number"));
+        assert_eq!(parse_number("$2.50").unwrap(), json!(2.5));
+        assert_eq!(parse_number("off").unwrap(), Value::Null);
     }
 
     #[test]

@@ -11357,8 +11357,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .1
-            .contains("whole number"));
-        assert!(render(&mut app, 100, 40).contains("whole number"));
+            .contains("not a number"));
+        assert!(render(&mut app, 100, 40).contains("not a number"));
         app.key(key(KeyCode::Esc));
         assert!(app.settings_edit.is_none());
         // Model opens the picker for the global default.
