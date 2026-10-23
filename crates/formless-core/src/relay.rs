@@ -269,6 +269,9 @@ struct MuxFrame {
     f: Option<String>,
 }
 
+/// Pushes for waiting approvals and questions are at least this far apart.
+const PUSH_GAP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One relay connection. Each browser handshakes, then its encrypted
 /// protocol lines are fed to its own daemon connection over an in-process
 /// duplex stream, and everything the daemon sends back is encrypted on
@@ -295,9 +298,22 @@ pub async fn connect_once(
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     let mut clients: HashMap<String, RelayClient> = HashMap::new();
     let mut generation = 0u64;
+    // Approvals and questions become Web Pushes to the browsers that opted
+    // in, at most one per PUSH_GAP (the relay holds the subscriptions).
+    let mut attention = daemon.attention.subscribe();
+    let mut last_push: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
+            Ok(()) = attention.recv() => {
+                if last_push.is_some_and(|t| t.elapsed() < PUSH_GAP) {
+                    continue;
+                }
+                last_push = Some(std::time::Instant::now());
+                if ws_write.send(Message::Text(r#"{"relay":"push"}"#.into())).await.is_err() {
+                    return Ok(());
+                }
+            }
             msg = ws_read.next() => {
                 let frame = match msg {
                     Some(Ok(Message::Text(frame))) => frame,

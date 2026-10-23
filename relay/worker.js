@@ -12,6 +12,16 @@
 // {"relay":"client_open"|"client_close","cid"}, browser frames reach it as
 // {"cid","f":<frame>}, and its {"cid","f"} replies go to that browser only.
 // Older daemons (no mux) still get raw frames fanned out to every client.
+//
+// Web Push (opt-in): a browser sends {"relay":"push_subscribe","sub"} or
+// {"relay":"push_unsubscribe","endpoint"} in the clear (a subscription is
+// not Session data); the room keeps them. The daemon sends {"relay":"push"}
+// when an approval or question waits, and the room sends each subscription
+// a payload-free VAPID push (push.mjs).
+
+import { sendPush, validSubscription, vapidFrom } from "./push.mjs";
+
+const MAX_SUBSCRIPTIONS = 10;
 
 export class RelayRoom {
   constructor(state, env) {
@@ -75,9 +85,43 @@ export class RelayRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  /** A plain-text control frame for the room itself, if this is one. */
+  control(message) {
+    if (!message.startsWith('{"relay"')) return null;
+    try { return JSON.parse(message); } catch (_) { return null; }
+  }
+
+  async subKey(endpoint) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(endpoint));
+    return "push:" + [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  async pushAll() {
+    const vapid = vapidFrom(this.env);
+    if (!vapid) return;
+    const subs = await this.state.storage.list({ prefix: "push:" });
+    await Promise.all([...subs].map(async ([key, sub]) => {
+      try {
+        const status = await sendPush(sub, vapid);
+        if (status === 404 || status === 410) await this.state.storage.delete(key);
+      } catch (_) {}
+    }));
+  }
+
   async webSocketMessage(ws, message) {
     if (typeof message !== "string") return;
     const att = this.attachment(ws);
+    const ctl = this.control(message);
+    if (ctl && att.role === "daemon" && ctl.relay === "push") return this.pushAll();
+    if (ctl && att.role === "client") {
+      if (ctl.relay === "push_subscribe" && validSubscription(ctl.sub)) {
+        const subs = await this.state.storage.list({ prefix: "push:" });
+        if (subs.size < MAX_SUBSCRIPTIONS) await this.state.storage.put(await this.subKey(ctl.sub.endpoint), ctl.sub);
+      } else if (ctl.relay === "push_unsubscribe" && typeof ctl.endpoint === "string") {
+        await this.state.storage.delete(await this.subKey(ctl.endpoint));
+      }
+      return;
+    }
     if (att.role === "daemon") {
       let routed = null;
       if (att.mux) {
@@ -129,6 +173,10 @@ export const SECURITY_HEADERS = {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/push/key") {
+      const vapid = vapidFrom(env);
+      return vapid ? Response.json({ key: vapid.publicKey }) : new Response("push is not set up on this relay", { status: 404 });
+    }
     if (url.pathname === "/health") {
       return Response.json({ ok: true, service: "formless-relay", version: 2 });
     }

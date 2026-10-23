@@ -167,6 +167,9 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Ids for client connections.
     next_conn: AtomicU64,
+    /// Fires when an approval or question starts waiting on the user (the
+    /// relay turns it into a Web Push, SPEC §12).
+    pub(crate) attention: tokio::sync::broadcast::Sender<()>,
     /// Spending warnings already given ("run:<id>:<limit>", "day:<date>"),
     /// and Sessions allowed past the limits for their next Run (Resume
     /// from a budget pause).
@@ -251,6 +254,7 @@ impl Daemon {
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             next_conn: AtomicU64::new(1),
+            attention: tokio::sync::broadcast::channel(16).0,
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
@@ -417,6 +421,14 @@ impl Daemon {
     }
 
     pub(crate) fn broadcast(&self, ev: Event) {
+        if matches!(
+            ev,
+            Event::ApprovalRequested { .. }
+                | Event::PromotionApprovalRequested { .. }
+                | Event::UserQuestion { .. }
+        ) {
+            let _ = self.attention.send(());
+        }
         send_all(&self.subs, ev);
     }
 

@@ -18,12 +18,17 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SECURITY_HEADERS } from "./worker.js";
+import { sendPush, validSubscription, vapidFrom } from "./push.mjs";
+
+// Web Push as in worker.js: VAPID_PUBLIC_KEY / VAPID_PRIVATE_JWK from the
+// environment (node relay/vapid-keys.mjs makes them).
+const vapid = vapidFrom(process.env);
 
 const args = process.argv.slice(2);
 const port = Number(args[args.indexOf("--port") + 1]) || 8787;
 const mock = args.includes("--mock-provider");
 const webRoot = fileURLToPath(new URL("./web/", import.meta.url));
-const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
+const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 
 // ------------------------------------------------------------ websockets
 function wsAccept(req, socket) {
@@ -78,7 +83,7 @@ function close(conn) {
 // ----------------------------------------------------------------- rooms
 const rooms = new Map(); // room -> { daemon, mux, clients:Map<cid, conn> }
 function joinRoom(room, role, conn, reject, mux) {
-  const r = rooms.get(room) || { daemon: null, mux: false, clients: new Map() };
+  const r = rooms.get(room) || { daemon: null, mux: false, clients: new Map(), subs: new Map() };
   rooms.set(room, r);
   const notifyDaemon = (kind, cid) => { if (r.daemon && r.mux) sendText(r.daemon, JSON.stringify({ relay: kind, cid })); };
   if (role === "daemon") {
@@ -88,6 +93,16 @@ function joinRoom(room, role, conn, reject, mux) {
     for (const cid of r.clients.keys()) notifyDaemon("client_open", cid);
     for (const c of r.clients.values()) sendText(c, JSON.stringify({ relay: "daemon_online" }));
     conn.onText = (t) => {
+      if (t.startsWith('{"relay":"push"')) {
+        if (!vapid) return;
+        for (const [endpoint, sub] of r.subs) {
+          sendPush(sub, vapid).then((status) => {
+            console.log("relay: push → " + status);
+            if (status === 404 || status === 410) r.subs.delete(endpoint);
+          }).catch((e) => console.log("relay: push failed: " + e.message));
+        }
+        return;
+      }
       let routed = null;
       if (r.mux) { try { routed = JSON.parse(t); } catch (_) {} }
       if (routed && typeof routed.cid === "string" && typeof routed.f === "string") {
@@ -106,7 +121,16 @@ function joinRoom(room, role, conn, reject, mux) {
     r.clients.set(cid, conn);
     notifyDaemon("client_open", cid);
     sendText(conn, JSON.stringify({ relay: r.daemon ? "daemon_online" : "daemon_offline" }));
-    conn.onText = (t) => { if (r.daemon) sendText(r.daemon, r.mux ? JSON.stringify({ cid, f: t }) : t); };
+    conn.onText = (t) => {
+      if (t.startsWith('{"relay"')) {
+        let ctl = null;
+        try { ctl = JSON.parse(t); } catch (_) {}
+        if (ctl && ctl.relay === "push_subscribe" && validSubscription(ctl.sub, true) && r.subs.size < 10) r.subs.set(ctl.sub.endpoint, ctl.sub);
+        if (ctl && ctl.relay === "push_unsubscribe") r.subs.delete(ctl.endpoint);
+        return;
+      }
+      if (r.daemon) sendText(r.daemon, r.mux ? JSON.stringify({ cid, f: t }) : t);
+    };
     conn.onClose = () => { r.clients.delete(cid); notifyDaemon("client_close", cid); };
   }
   console.log("relay: " + role + " joined " + room.slice(0, 8) + "… (" + r.clients.size + " client(s), daemon " + (r.daemon ? "online" : "offline") + ")");
@@ -192,6 +216,10 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ ok: true, service: "formless-relay-dev", version: 2 }));
+  }
+  if (url.pathname === "/push/key") {
+    res.writeHead(vapid ? 200 : 404, { "content-type": "application/json" });
+    return res.end(vapid ? JSON.stringify({ key: vapid.publicKey }) : "{}");
   }
   const rel = url.pathname === "/" ? "index.html" : normalize(url.pathname).replace(/^[/\\]+/, "");
   const file = join(webRoot, rel);
