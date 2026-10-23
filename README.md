@@ -288,7 +288,7 @@ cat task.md | formless run -                               # `-` reads the task 
 
 Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
-Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `130` interrupted.
+Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
 
 ### 3.6 Daemon, diagnostics and reset
 
