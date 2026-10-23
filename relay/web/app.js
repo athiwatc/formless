@@ -2074,11 +2074,19 @@
     // A row is [label, value] or [label, value, settingKey, kind]: the
     // latter gets an Edit control (SetSetting, validated by the daemon).
     const onTuiStart = new Set((S.settings && S.settings.on_tui_start) || []);
+    const docs = (S.settings && S.settings.docs) || {};
+    const help = (key) => {
+      const d = key && docs[key];
+      if (!d) return null;
+      const def = typeof d.default === "string" ? d.default : JSON.stringify(d.default);
+      return h("div", { class: "setting-desc muted" }, d.description + (def ? " · default " + def : ""));
+    };
     const section = (title, rows) => h("section", null, h("h3", null, title), h("dl", { class: "kv" },
-      rows.map(([k, v, key, kind]) => [h("dt", null, k), h("dd", null,
+      rows.map(([k, v, key, kind]) => [h("dt", { title: key || "" }, k), h("dd", null,
         v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : String(v),
         key && onTuiStart.has(key) ? h("span", { class: "tag", title: "A running TUI keeps the old value until it restarts" }, "applies when the TUI starts") : null,
-        key ? h("button", { class: "btn ghost small", type: "button", onclick: () => editSetting(key, v, kind) }, "Edit") : null)])));
+        key ? h("button", { class: "btn ghost small", type: "button", onclick: () => editSetting(key, v, kind) }, "Edit") : null,
+        help(key))])));
     const on = (b) => (b ? "on" : "off");
     const grid = h("div", { class: "settings-grid" });
     const c = S.settings;

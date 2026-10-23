@@ -2297,6 +2297,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   hooks are never settable this way, locally or over the relay. The TUI
   (`/panes`) and the web Settings view (Edit) use `SetSetting`.
 
+This table is also the help text clients show. The daemon parses it at
+build time (`config::setting_docs`) and serves `{key: {description,
+default}}` as `GetSettings.docs`, taking defaults from the config types
+when they have one. The web Settings rows and the TUI's selected row show
+the meaning and default. A test fails when a settable key, or one a
+Settings view shows, is missing here.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `daemon.idle_grace_secs` | 60 | Idle-close grace after last Run + last client (§9.1) |
@@ -2313,6 +2320,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `provider.extra_headers` | {} | Free-form headers per request (§4.1) |
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
+| `provider.model_context_tokens` | {} | Context size per model id, overriding `context_tokens` for that model (§4.2, §11) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
 | `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
@@ -2378,6 +2386,9 @@ run_tool = "network_policy"     # a registry Tool, or…
 | `tui.on_start` | last | What the TUI opens on launch: `last`, `new` or `picker`; `formless -c` / `--new` override it (§10.1) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
+| `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2) |
+| `naming.enabled` | true | Rename "Untitled" Sessions after their first Run |
+| `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / true / 30 | Embedded naming model (empty: a heuristic title), fetched on first use, and how long one naming may take before the heuristic is used |
 
 ## 14. Security
 

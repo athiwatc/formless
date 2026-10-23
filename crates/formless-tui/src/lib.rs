@@ -8882,6 +8882,9 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
         lines.push(Line::from(spans));
+        if let Some(help) = selected.then(|| setting_help(&row.key)).flatten() {
+            lines.push(Line::styled(format!("    {help}"), ui::dim(app.color)));
+        }
         if let Some((k, e)) = &app.settings_error {
             if *k == row.key {
                 lines.push(Line::styled(
@@ -8911,6 +8914,19 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     if let Some(form) = &app.settings_form {
         draw_settings_form(f, form, app.color);
     }
+}
+
+/// What a setting means and its default, from SPEC §13 (the same text the
+/// web Settings view shows).
+fn setting_help(key: &str) -> Option<String> {
+    static DOCS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let d = &DOCS.get_or_init(formless_core::config::setting_docs_json)[key];
+    let description = d["description"].as_str()?;
+    let default = match &d["default"] {
+        serde_json::Value::String(s) => s.clone(),
+        v => v.to_string(),
+    };
+    Some(format!("{description} · default {default}"))
 }
 
 fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
@@ -11446,6 +11462,10 @@ mod tests {
         app.open_view(View::Settings);
         let rows = app.settings_rows();
         let at = |k: &str| rows.iter().position(|r| r.key == k).unwrap();
+        // The selected row says what it means and its default (SPEC §13).
+        app.settings_sel = at("provider.max_retries");
+        let screen = render(&mut app, 160, 60);
+        assert!(screen.contains("Bounded backoff attempts · default 5"), "{screen}");
         // A toggle saves through the daemon.
         app.settings_sel = at("provider.tool_use_nudge");
         app.key(key(KeyCode::Enter));

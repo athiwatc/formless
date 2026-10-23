@@ -230,6 +230,78 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("tui.on_start", &["last", "new", "picker"]),
 ];
 
+/// SPEC §13's settings table is the one description of every key; the
+/// daemon serves it to clients (`GetSettings.docs`).
+const SPEC: &str = include_str!("../../../SPEC.md");
+
+/// Every key in SPEC §13 with (meaning, default as SPEC writes it). Rows
+/// like `daemon.log_max_bytes` / `log_keep` name several keys of one
+/// section; their defaults split on " / " the same way.
+pub fn setting_docs() -> BTreeMap<String, (String, String)> {
+    let section = SPEC
+        .split("\n## 13.")
+        .nth(1)
+        .and_then(|s| s.split("\n## ").next())
+        .unwrap_or_default();
+    let mut out = BTreeMap::new();
+    for line in section.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = line.trim_matches('|').split(" | ").map(str::trim).collect();
+        let [keys, default, meaning] = cells[..] else {
+            continue;
+        };
+        let names: Vec<&str> = keys
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|k| !k.starts_with('['))
+            .collect();
+        let Some(first) = names.first() else { continue };
+        let prefix = first.rsplit_once('.').map_or("", |(p, _)| p);
+        let defaults: Vec<&str> = default.split(" / ").collect();
+        // Plain words: no Markdown ticks, no section references.
+        let mut text = meaning.replace('`', "");
+        while let Some(i) = text.find(" (§") {
+            let Some(j) = text[i..].find(')') else { break };
+            text.replace_range(i..i + j + 1, "");
+        }
+        for (i, name) in names.iter().enumerate() {
+            let key = if name.contains('.') {
+                name.to_string()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            let d = defaults
+                .get(i)
+                .or(defaults.first())
+                .copied()
+                .unwrap_or_default();
+            out.insert(key, (text.trim().to_string(), d.replace('`', "")));
+        }
+    }
+    out
+}
+
+/// `{key: {description, default}}` for clients: the default is the real
+/// one from `Config::default()` when it has a value, else SPEC's text.
+pub fn setting_docs_json() -> serde_json::Value {
+    let defaults = serde_json::to_value(Config::default()).unwrap_or_default();
+    let docs: serde_json::Map<String, serde_json::Value> = setting_docs()
+        .into_iter()
+        .map(|(key, (description, spec_default))| {
+            let pointer = format!("/{}", key.replace('.', "/"));
+            let default = match defaults.pointer(&pointer) {
+                Some(v) if !v.is_null() && v != "" => v.clone(),
+                _ => serde_json::Value::String(spec_default),
+            };
+            (
+                key,
+                serde_json::json!({"description": description, "default": default}),
+            )
+        })
+        .collect();
+    serde_json::Value::Object(docs)
+}
+
 /// Settable keys a running client can't pick up: they apply when the TUI
 /// next starts (SPEC §10.4). Every other settable key is hot: the daemon
 /// re-reads the file, and running TUIs reload on `SettingsChanged`.
@@ -902,6 +974,8 @@ impl Config {
             },
             // Keys that apply only when the TUI next starts.
             "on_tui_start": ON_TUI_START,
+            // What each key means and its default (SPEC §13).
+            "docs": setting_docs_json(),
             "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
             "naming": {
                 "enabled": self.naming.enabled,
