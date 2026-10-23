@@ -2322,8 +2322,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   `--timeout DURATION` (`90`, `90s`, `10m`, `1h30m`) interrupts the Run
   when it expires. The command says "timed out after …", waits up to 10 s
   for the Run to stop, and exits 124 (JSON status `timed_out`).
-  `--quiet` drops the progress lines (errors still go to stderr), and
-  exit codes are unchanged. `--attach FILE` (repeatable) sends
+  When progress lines are shown, the Run ends with one summary line on
+  stderr, with the same figures as the TUI status line: outcome, duration,
+  steps, Tools created and used, tokens in and out, and cost when priced.
+  For example: `completed in 1m15s · 3 steps · Tools: 1 created, 1 used ·
+  13.0k tokens (12.4k in, 610 out) · $0.0123`.
+  `--quiet` drops the progress lines and the summary (errors still go to
+  stderr), and exit codes are unchanged. `--attach FILE` (repeatable) sends
   files and images with the task through `AttachFile`, with the same 20 MB
   limit and type and vision handling as `/attach`. Every file is read and
   checked first; a missing or too-large one is a usage error (exit 2)

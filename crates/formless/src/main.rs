@@ -1993,6 +1993,7 @@ fn run_headless(
     let interactive = matches!(output, RunOutput::Text | RunOutput::Final);
     let mut final_answer: Option<String> = None;
     let mut run_error: Option<String> = None;
+    let mut summary = RunSummary::default();
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
         eprintln!("not configured; run `formless` for the wizard");
@@ -2133,7 +2134,14 @@ fn run_headless(
                         if progress {
                             eprintln!("[tool] {tool_name}");
                         }
+                        summary.tool_started(&tool_name);
                     }
+                    Event::ToolCallFinished { tool_name, ok, .. } => {
+                        if ok && tool_name == formless_core::tools::CREATE_TOOL {
+                            summary.tools_created += 1;
+                        }
+                    }
+                    Event::RunUsage { usage, .. } => summary.usage = usage,
                     Event::UserQuestion {
                         question_id,
                         question,
@@ -2230,6 +2238,19 @@ fn run_headless(
         code = 124;
         run_error.get_or_insert_with(|| "timed out".into());
     }
+    let status = match code {
+        0 => "completed",
+        124 => "timed_out",
+        130 => "interrupted",
+        _ if run_error.is_some() => "paused",
+        _ => "failed",
+    };
+    if progress {
+        eprintln!(
+            "{}",
+            summary.line(&status.replace('_', " "), started.elapsed())
+        );
+    }
     match output {
         RunOutput::Final => {
             if let Some(a) = &final_answer {
@@ -2240,7 +2261,7 @@ fn run_headless(
             "{}",
             serde_json::json!({
                 "session_id": session_id,
-                "status": match code { 0 => "completed", 124 => "timed_out", 130 => "interrupted", _ if run_error.is_some() => "paused", _ => "failed" },
+                "status": status,
                 "answer": final_answer,
                 "error": run_error,
             })
@@ -2248,6 +2269,59 @@ fn run_headless(
         _ => {}
     }
     Ok(code)
+}
+
+/// What a headless Run did, for the line `formless run` ends with on stderr
+/// (the TUI status line's figures).
+#[derive(Default)]
+struct RunSummary {
+    usage: formless_protocol::UsageInfo,
+    tools_created: usize,
+    tools_used: std::collections::BTreeSet<String>,
+}
+
+impl RunSummary {
+    fn tool_started(&mut self, name: &str) {
+        if !formless_core::tools::is_builtin(name) {
+            self.tools_used.insert(name.to_string());
+        }
+    }
+
+    fn line(&self, status: &str, elapsed: std::time::Duration) -> String {
+        let u = &self.usage;
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        let mut parts = vec![
+            format!("{status} in {}", format_duration(elapsed)),
+            plural(u.steps as usize, "step"),
+        ];
+        if self.tools_created > 0 || !self.tools_used.is_empty() {
+            parts.push(format!(
+                "Tools: {} created, {} used",
+                self.tools_created,
+                self.tools_used.len()
+            ));
+        }
+        let tokens = u.prompt_tokens + u.completion_tokens;
+        parts.push(format!(
+            "{} tokens ({} in, {} out)",
+            compact_count(tokens),
+            compact_count(u.prompt_tokens),
+            compact_count(u.completion_tokens)
+        ));
+        if let Some(cost) = u.cost {
+            parts.push(format!("${cost:.4}"));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// 950, 1.2k, 3.4M.
+fn compact_count(n: i64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
+        n => n.to_string(),
+    }
 }
 
 /// Count Ctrl+C presses on a background thread instead of dying on the
@@ -3869,6 +3943,28 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn run_summary_line() {
+        let mut s = RunSummary::default();
+        s.tool_started("fetch_weather");
+        s.tool_started("fetch_weather");
+        s.tool_started("create_tool");
+        s.tools_created = 1;
+        s.usage = formless_protocol::UsageInfo {
+            steps: 3,
+            prompt_tokens: 12_400,
+            completion_tokens: 610,
+            cost: Some(0.01234),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.line("completed", std::time::Duration::from_secs(75)),
+            "completed in 1m15s · 3 steps · Tools: 1 created, 1 used · 13.0k tokens (12.4k in, 610 out) · $0.0123"
+        );
+        let empty = RunSummary::default().line("paused", std::time::Duration::from_secs(2));
+        assert_eq!(empty, "paused in 2s · 0 steps · 0 tokens (0 in, 0 out)");
+    }
 
     #[test]
     fn update_lists_newer_releases_oldest_first() {
