@@ -1952,14 +1952,15 @@
       jobs.length ? h("table", { class: "table" },
         h("tbody", null, jobs.map((j) => h("tr", null,
           h("td", null, h("div", null, j.prompt),
-            h("div", { class: "muted" }, (j.cron || "once") + " · next " + (j.next_run ? new Date(j.next_run).toLocaleString() : "-") + (j.last_status ? " · last: " + j.last_status : "") + " · " + j.author)),
+            h("div", { class: "muted" }, (j.cron ? describeCron(j.cron) : "once") + " · next " + (j.next_run ? new Date(j.next_run).toLocaleString() : "-") + (j.last_status ? " · last: " + j.last_status : "") + " · " + j.author)),
           h("td", null,
             h("button", { class: "btn small" + (j.enabled && j.approved ? "" : " primary"), type: "button", onclick: () => act({ type: "set_job_enabled", id: j.id, enabled: !(j.enabled && j.approved) }, "Updated").then(refreshSettings) },
               !j.approved ? "Approve" : j.enabled ? "Disable" : "Enable"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               if (await ask({ title: "Delete this job?", text: j.prompt, ok: "Delete", danger: true })) { await act({ type: "delete_job", id: j.id }, "Deleted"); refreshSettings(); }
             } }, "Delete"))))))
-        : h("p", { class: "muted" }, "None. The agent can schedule_run, or: formless jobs add PROMPT --cron \"0 3 * * *\"")));
+        : h("p", { class: "muted" }, "None yet. The agent can also schedule_run."),
+      h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => newJob() }, "New job"))));
     const memories = S.memories || [];
     grid.append(h("section", null, h("h3", null, "Memory"),
       h("p", { class: "muted" }, "Notes the agent keeps about your preferences; they go into new sessions' prompts."),
@@ -2167,6 +2168,73 @@
     const bundle = await pickJson();
     if (!bundle) return;
     if (await act({ type: "import_skill", bundle }, "Imported; review and enable it below")) refreshSettings();
+  }
+  const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  /** A 5-field cron in words where it's a common shape, else as is. */
+  function describeCron(expr) {
+    const e = expr.trim();
+    const named = { "@hourly": "every hour", "@daily": "every day at 0:00", "@weekly": "every Sunday at 0:00", "@monthly": "on the 1st of each month at 0:00" };
+    if (named[e]) return named[e];
+    const f = e.split(/\s+/);
+    if (f.length !== 5) return e;
+    const [m, hr, dom, mon, dow] = f;
+    const step = m.match(/^\*\/(\d+)$/);
+    if (step && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every " + step[1] + " minutes";
+    if (/^\d+$/.test(m) && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every hour at :" + m.padStart(2, "0");
+    if (!/^\d+$/.test(m) || !/^\d+$/.test(hr) || mon !== "*") return e;
+    const time = hr + ":" + m.padStart(2, "0");
+    if (dom === "*" && dow === "*") return "every day at " + time;
+    if (dom === "*" && dow === "1-5") return "every weekday at " + time;
+    if (dom === "*" && /^[0-7](,[0-7])*$/.test(dow)) return "every " + dow.split(",").map((d) => DAYS[Number(d) % 7]).join(", ") + " at " + time;
+    if (/^\d+$/.test(dom) && dow === "*") return "on day " + dom + " of each month at " + time;
+    return e;
+  }
+  /** Settings → New job: a task, when to run it, and which Session. */
+  async function newJob() {
+    const prompt = h("textarea", { rows: 3, placeholder: "Summarise yesterday's GitHub notifications" });
+    const when = h("select", null,
+      [["daily", "Every day"], ["weekdays", "Every weekday"], ["weekly", "Every week"], ["hourly", "Every hour"], ["once", "Once"], ["cron", "Custom (cron)"]]
+        .map(([v, l]) => h("option", { value: v }, l)));
+    const time = h("input", { type: "time", value: "09:00" });
+    const day = h("select", null, DAYS.map((d, i) => h("option", { value: String(i), selected: i === 1 }, d)));
+    const at = h("input", { type: "datetime-local" });
+    const cron = h("input", { type: "text", placeholder: "0 9 * * 1-5", spellcheck: "false" });
+    const session = h("select", null, h("option", { value: "" }, "A new Session each time"),
+      S.sessions.filter((s) => !s.archived).map((s) => h("option", { value: s.id }, s.name)));
+    const preview = h("div", { class: "muted" });
+    const fields = { time: field("Time", time), day: field("Day", day), at: field("When", at), cron: field("Cron (minute hour day month weekday)", cron) };
+    const schedule = () => {
+      const [hh, mm] = (time.value || "09:00").split(":").map(Number);
+      switch (when.value) {
+        case "daily": return { cron: mm + " " + hh + " * * *" };
+        case "weekdays": return { cron: mm + " " + hh + " * * 1-5" };
+        case "weekly": return { cron: mm + " " + hh + " * * " + day.value };
+        case "hourly": return { cron: "0 * * * *" };
+        case "once": return at.value ? { at: at.value.replace("T", " ") } : {};
+        default: return cron.value.trim() ? { cron: cron.value.trim() } : {};
+      }
+    };
+    const sync = () => {
+      const v = when.value;
+      fields.time.classList.toggle("hidden", !["daily", "weekdays", "weekly"].includes(v));
+      fields.day.classList.toggle("hidden", v !== "weekly");
+      fields.at.classList.toggle("hidden", v !== "once");
+      fields.cron.classList.toggle("hidden", v !== "cron");
+      const s = schedule();
+      preview.textContent = s.cron ? "Runs " + describeCron(s.cron) + " (" + s.cron + ")" : s.at ? "Runs once at " + s.at : "";
+    };
+    for (const el of [when, time, day, at, cron]) el.addEventListener("input", sync);
+    when.addEventListener("change", sync);
+    sync();
+    const body = h("div", { class: "try-form" }, field("Task", prompt), field("Schedule", when),
+      fields.time, fields.day, fields.at, fields.cron, preview, field("Session", session),
+      h("p", { class: "muted" }, "It runs with the Session's model; pick a Session set to the model or Role you want."));
+    if (!(await ask({ title: "New job", body, ok: "Schedule" }))) return;
+    const s = schedule();
+    if (!prompt.value.trim()) return toast("The job needs a task.", true);
+    if (!s.cron && !s.at) return toast("Pick when it runs.", true);
+    const j = await act({ type: "add_job", prompt: prompt.value.trim(), session_id: session.value || null, cron: s.cron || null, at: s.at || null });
+    if (j) { note("Scheduled: next run " + new Date(j.next_run).toLocaleString()); refreshSettings(); }
   }
   /** A labelled form field for ask() bodies. */
   function field(label, input) {
