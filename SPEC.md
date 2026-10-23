@@ -1763,6 +1763,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   participants (like two terminals on one tmux session); messages are
   attributed by client; an approval is resolved by **whoever answers
   first** (the other modal closes: “answered elsewhere”).
+- **Tool trend.** `ToolInfo.recent` holds the outcomes of the last 40
+  finished Invocations, oldest first (`s`/`f`; denied and cancelled
+  calls don't count). The TUI Tools list shows the last 20 as a sparkline
+  (tall green success, short red failure) with ↑/↓ when the success rate
+  moved 10 points or more against the 20 before (both windows ≥5 calls).
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,

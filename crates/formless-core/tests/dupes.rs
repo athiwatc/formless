@@ -20,6 +20,7 @@ fn tool(name: &str, desc: &str, schema: &str, code: &str) -> (ToolInfo, ToolVers
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            recent: String::new(),
         },
         ToolVersionInfo {
             version: 1,

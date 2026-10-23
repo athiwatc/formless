@@ -437,3 +437,29 @@ async fn unfinished_last_run_comes_with_the_session() {
     store.set_run_status(&r2, "completed").unwrap();
     assert!(get().await["unfinished_run"].is_null());
 }
+
+#[test]
+fn tools_list_their_recent_outcomes_oldest_first() {
+    let store = Store::open_in_memory().unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let (t, v) = store
+        .create_tool_version(
+            "echo",
+            "d",
+            "{}",
+            "{}",
+            "function run(i){return i;}",
+            &caps,
+            64,
+            "agent",
+        )
+        .unwrap();
+    // Denied and cancelled calls say nothing about the Tool itself.
+    for status in ["success", "denied", "failure", "failure", "cancelled", "success"] {
+        store
+            .record_invocation(&t.id, v, None, None, None, status, "", "{}", "", "", 1, 1000)
+            .unwrap();
+    }
+    let listed = store.list_tools(false).unwrap();
+    assert_eq!(listed[0].recent, "sffs");
+}

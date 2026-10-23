@@ -1968,6 +1968,18 @@ impl Store {
             })
             .unwrap_or_default();
         let metrics = self.tool_metrics(&id, None)?;
+        let mut recent: Vec<char> = {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT status FROM invocations WHERE tool_id=?1 AND status IN ('success','failure')
+                 ORDER BY created_at DESC, rowid DESC LIMIT 40",
+            )?;
+            let rows = stmt
+                .query_map(params![id], |r| r.get::<_, String>(0))?
+                .map(|s| s.map(|s| if s == "success" { 's' } else { 'f' }))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        recent.reverse();
         Ok(Some(ToolInfo {
             id,
             name,
@@ -1981,6 +1993,7 @@ impl Store {
             needs_attention: needs_attention != 0,
             created_at,
             updated_at,
+            recent: recent.into_iter().collect(),
         }))
     }
 
