@@ -1833,6 +1833,17 @@ run_tool = "network_policy"     # a registry Tool, or…
   under "Recent calls": `[`/`]` select one, Enter opens its full input,
   output and error in the pager, and `J` opens its Session focused on the
   first Tool result at or after the call's time.
+- **Web code editor.** The web Tool code editor:
+  - highlights JavaScript (a highlighted layer behind a transparent
+    textarea, using the client's own highlighter);
+  - marks the bracket pair at the cursor;
+  - checks the code as you type with `CheckToolCode {code}` → `{ok,
+    error?, line?}`, the same gate saving uses, then marks the failing
+    line and shows the error under the editor.
+
+  The syntax gate now reports the thrown error itself ("SyntaxError: …
+  at eval_script:3:35") rather than a generic "exception", so agents see
+  it too.
 - **Running a Tool by hand.** `RunTool {id, input, session_id}` runs a
   Tool as the agent would (same approval path, recorded as an Invocation
   in that Session) and returns `{result}`. TUI: `t` in the Tools view opens
