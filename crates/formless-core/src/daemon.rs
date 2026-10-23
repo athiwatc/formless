@@ -846,6 +846,23 @@ impl Daemon {
                 });
                 Ok(json!({"started": true, "up_to": last}))
             }
+            Request::SuggestSessionName { id } => {
+                let recent = self.with_reader(|st| {
+                    let msgs = st.list_messages(&id)?;
+                    let users: Vec<String> = msgs
+                        .into_iter()
+                        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
+                        .map(|m| m.content)
+                        .collect();
+                    // The last few user messages, oldest first.
+                    Ok(users[users.len().saturating_sub(4)..].join("\n"))
+                })?;
+                let recent: String = recent.chars().take(2000).collect();
+                if recent.trim().is_empty() {
+                    return Ok(json!({ "name": null }));
+                }
+                Ok(json!({ "name": self.generate_name(&self.config()?, recent).await }))
+            }
             Request::ContextUsage { session_id } => {
                 let cfg = self.config()?;
                 let model = self.session_base_model(&session_id, &cfg);
@@ -1841,39 +1858,43 @@ impl Daemon {
                 self.spawn_model_download(spec);
             }
         }
-        let timeout = std::time::Duration::from_secs(cfg.naming.timeout_secs.max(1));
         let this = self.clone();
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            let Ok(permit) = this.naming.clone().acquire_owned().await else {
-                return;
-            };
-            let fallback = namer::heuristic_title(&user);
-            let paths = this.paths.clone();
-            // The permit moves into the blocking job: a timed-out job keeps
-            // it until it really finishes, so jobs never pile up.
-            let job = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                namer::title(&paths, spec.as_ref(), &user)
-            });
-            let name = match tokio::time::timeout(timeout, job).await {
-                Ok(Ok(name)) => name,
-                Ok(Err(e)) => {
-                    tracing::warn!("session naming panicked: {e}");
-                    fallback
-                }
-                Err(_) => {
-                    tracing::warn!("session naming timed out after {timeout:?}");
-                    fallback
-                }
-            };
-            let Some(name) = name else {
+            let Some(name) = this.generate_name(&cfg, user).await else {
                 return;
             };
             if let Ok(Some(s)) = this.with_store(|st| st.auto_name_session(&session_id, &name)) {
                 this.broadcast(Event::SessionUpdated { session: s });
             }
         });
+    }
+
+    /// A title for `text` from the naming model, falling back to the
+    /// heuristic when it's missing, fails or times out.
+    async fn generate_name(&self, cfg: &Config, text: String) -> Option<String> {
+        let spec = cfg.naming.spec();
+        let timeout = std::time::Duration::from_secs(cfg.naming.timeout_secs.max(1));
+        let permit = self.naming.clone().acquire_owned().await.ok()?;
+        let fallback = namer::heuristic_title(&text);
+        let paths = self.paths.clone();
+        // The permit moves into the blocking job: a timed-out job keeps
+        // it until it really finishes, so jobs never pile up.
+        let job = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            namer::title(&paths, spec.as_ref(), &text)
+        });
+        match tokio::time::timeout(timeout, job).await {
+            Ok(Ok(name)) => name,
+            Ok(Err(e)) => {
+                tracing::warn!("session naming panicked: {e}");
+                fallback
+            }
+            Err(_) => {
+                tracing::warn!("session naming timed out after {timeout:?}");
+                fallback
+            }
+        }
     }
 
     /// After a Run: retire unused or unhelpful auto skills, and distil a

@@ -156,6 +156,12 @@ pub const COMMANDS: &[Command] = &[
         Session,
     ),
     cmd(
+        "rename",
+        "[NAME|auto]",
+        "rename the Session; auto suggests a name from recent messages",
+        Session,
+    ),
+    cmd(
         "context",
         "",
         "how full the context window is, and what fills it",

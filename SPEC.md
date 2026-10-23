@@ -1714,6 +1714,10 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### 10.4 Sessions, Tools, and Settings views
 
+- **Renaming.** Rename starts from the current name (Esc cancels).
+  `/rename auto` (web: "Suggest name") re-runs the namer on the last few
+  user messages and offers its name for editing before it's applied;
+  `/rename NAME` sets it directly.
 - **Sessions view:** list/create/rename/resume/delete/export/import. Two
   TUIs may attach to the same Session simultaneously: both are full
   participants (like two terminals on one tmux session); messages are
