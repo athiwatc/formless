@@ -168,6 +168,7 @@ enum Pending {
     ContextReport,
     SuggestName,
     ToolMetrics,
+    ProposalDiff,
     Usage,
     RunToolInput,
     RunTool,
@@ -795,6 +796,8 @@ struct App {
     tool_detail: Option<ToolDetail>,
     /// The Metrics view's range (`METRIC_RANGES`), and per-Tool (calls,
     /// success rate) in it.
+    /// The Proposal shown in the pager for review (`a`/`r` decide).
+    reviewing: Option<String>,
     metrics_range: usize,
     range_tools: HashMap<String, (i64, Option<f64>)>,
     /// Token use in the range: breakdown (`USAGE_BY`) and its rows.
@@ -1057,6 +1060,7 @@ impl App {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            reviewing: None,
             usage_by: 0,
             usage_rows: Vec::new(),
             range_tools: HashMap::new(),
@@ -1632,6 +1636,7 @@ impl App {
                                 })
                                 .collect();
                         }
+                        Pending::ProposalDiff => self.show_proposal_diff(&result),
                         Pending::ToolMetrics => {
                             self.range_tools = result
                                 .as_array()
@@ -4190,6 +4195,33 @@ impl App {
             self.ctrl_c();
             return;
         }
+        // Reviewing a Proposal: decide from the same screen.
+        if self.pager.is_some() {
+            if let Some(id) = self.reviewing.clone() {
+                let decision = match key.code {
+                    KeyCode::Char('a') => Some(true),
+                    KeyCode::Char('r') => Some(false),
+                    _ => None,
+                };
+                if let Some(approved) = decision {
+                    self.fire(Request::ProposalDecision { id, approved });
+                    self.notes.push(
+                        if approved {
+                            "applying the proposal…"
+                        } else {
+                            "rejected the proposal"
+                        }
+                        .into(),
+                    );
+                    self.pager = None;
+                    self.reviewing = None;
+                    return;
+                }
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.reviewing = None;
+                }
+            }
+        }
         if let Some(p) = &mut self.pager {
             let page = 20;
             let last = p.lines.len().saturating_sub(1);
@@ -4383,7 +4415,13 @@ impl App {
                         .min(self.visible_proposals().len().saturating_sub(1))
                 }
                 KeyCode::Char('n') => self.generate_proposal(),
-                KeyCode::Char('a') | KeyCode::Enter => {
+                KeyCode::Enter => {
+                    if let Some(p) = self.selected_proposal().cloned() {
+                        self.reviewing = Some(p.id.clone());
+                        self.request(Pending::ProposalDiff, Request::ProposalDiff { id: p.id });
+                    }
+                }
+                KeyCode::Char('a') => {
                     if let Some(p) = self.selected_proposal().cloned() {
                         self.fire(Request::ProposalDecision {
                             id: p.id,
@@ -7325,6 +7363,69 @@ impl App {
         };
         self.request(Pending::UpdateTool, req);
         self.notes.push("saving a new version…".into());
+    }
+
+    /// A Proposal's change and eval results in the pager (SPEC §10.4).
+    fn show_proposal_diff(&mut self, result: &serde_json::Value) {
+        let Some(p) = self
+            .reviewing
+            .as_ref()
+            .and_then(|id| self.proposals.iter().find(|p| &p.id == id))
+            .cloned()
+        else {
+            return;
+        };
+        let pct = |s: Option<f64>| {
+            s.map(|s| format!("{:.0}%", s * 100.0))
+                .unwrap_or_else(|| "-".into())
+        };
+        let mut styled: Vec<Line<'static>> = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{} proposal", p.kind),
+                    bold_fg(self.color, Color::Cyan),
+                ),
+                Span::styled(format!("  · {}", p.status), ui::dim(self.color)),
+            ]),
+            Line::raw(format!("Why: {}", p.rationale)),
+            Line::raw(format!(
+                "Eval: candidate {} vs baseline {} over {} runs · about {} more tokens per request",
+                pct(p.candidate_score),
+                pct(p.baseline_score),
+                p.eval_total,
+                p.est_tokens
+            )),
+            Line::raw(""),
+            Line::styled(
+                format!(
+                    "Changes to {}{}:",
+                    result["target"].as_str().unwrap_or("the prompt"),
+                    if result["applied"] == true {
+                        " (applied)"
+                    } else {
+                        ""
+                    }
+                ),
+                bold_fg(self.color, Color::Cyan),
+            ),
+        ];
+        for d in result["diff"].as_array().into_iter().flatten() {
+            let (op, line) = (d[0].as_str().unwrap_or(" "), d[1].as_str().unwrap_or(""));
+            let style = match op {
+                "+" => fg(self.color, Color::Green),
+                "-" => fg(self.color, Color::Red),
+                _ => ui::dim(self.color),
+            };
+            styled.push(Line::styled(format!("{op} {line}"), style));
+        }
+        let lines = styled.iter().map(|l| l.to_string()).collect();
+        self.pager = Some(Pager {
+            title: "Proposal · a apply · r reject · Esc back".into(),
+            lines,
+            top: 0,
+            left: 0,
+            styled,
+        });
     }
 
     /// The recent call selected in the open Tool's detail.
@@ -10517,6 +10618,7 @@ mod tests {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            reviewing: None,
             usage_by: 0,
             usage_rows: Vec::new(),
             range_tools: HashMap::new(),
@@ -13068,6 +13170,45 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.contains("\"title\": \"Example\"")));
+    }
+
+    #[test]
+    fn enter_reviews_a_proposal_and_decides_from_the_diff() {
+        let mut app = test_app();
+        app.view = View::Proposals;
+        app.proposals = vec![PromptProposalInfo {
+            id: "p1".into(),
+            kind: "prompt".into(),
+            content: "Check the output schema.".into(),
+            rationale: "fewer invalid outputs".into(),
+            status: "measured".into(),
+            baseline_score: Some(0.5),
+            candidate_score: Some(0.8),
+            eval_total: 20,
+            est_tokens: 12,
+            created_at: String::new(),
+            applied_at: None,
+        }];
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.reviewing.as_deref(), Some("p1"));
+        app.show_proposal_diff(&serde_json::json!({
+            "target": "learned guidance",
+            "applied": false,
+            "diff": [[" ", "Learned guidance (v1): Prefer existing Tools."],
+                     ["+", "Learned guidance (v2): Check the output schema."]],
+        }));
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("candidate 80% vs baseline 50% over 20 runs"),
+            "{screen}"
+        );
+        assert!(screen.contains("+ Learned guidance (v2)"), "{screen}");
+        assert!(screen.contains("a apply · r reject"), "{screen}");
+        // r rejects from the review and closes it.
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.pager.is_none() && app.reviewing.is_none());
+        assert!(app.notes.iter().any(|n| n == "rejected the proposal"));
     }
 
     #[test]

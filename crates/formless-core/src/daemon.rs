@@ -1818,6 +1818,49 @@ impl Daemon {
                 });
                 Ok(json!({"started": true}))
             }
+            Request::ProposalDiff { id } => {
+                let (p, applied, memories) = self.with_reader(|st| {
+                    Ok((
+                        st.get_proposal(&id)?.context("proposal not found")?,
+                        st.applied_proposals()?,
+                        st.list_memories()?,
+                    ))
+                })?;
+                let is_applied = p.status == "applied";
+                // The text without this proposal, and with it.
+                let (target, without, with) = if p.kind == "memory" {
+                    let notes: Vec<String> = memories
+                        .iter()
+                        .filter(|m| !(is_applied && m.text.trim() == p.content.trim()))
+                        .map(|m| format!("- {}", m.text.trim()))
+                        .collect();
+                    let mut with = notes.clone();
+                    with.push(format!("- {}", p.content.trim()));
+                    ("memory", notes.join("\n"), with.join("\n"))
+                } else {
+                    let others: Vec<&PromptProposalInfo> = applied
+                        .iter()
+                        .filter(|a| a.kind != "memory" && a.id != p.id)
+                        .collect();
+                    let guidance = |list: &[&PromptProposalInfo]| {
+                        list.iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                format!("Learned guidance (v{}): {}", i + 1, a.content.trim())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    let mut with = others.clone();
+                    with.push(&p);
+                    ("learned guidance", guidance(&others), guidance(&with))
+                };
+                let diff: Vec<Value> = crate::diff::line_diff(&without, &with)
+                    .into_iter()
+                    .map(|(op, line)| json!([op.to_string(), line]))
+                    .collect();
+                Ok(json!({ "target": target, "diff": diff, "applied": is_applied }))
+            }
             Request::ProposalDecision { id, approved } => {
                 let status = if approved { "applied" } else { "rejected" };
                 // Applying requires a measured improvement (gate in optimiser
