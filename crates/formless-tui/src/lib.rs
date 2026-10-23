@@ -3935,7 +3935,7 @@ impl App {
             self.cycle_view(key.code == KeyCode::Tab);
             return;
         }
-        if self.list_filter_key(key.code) {
+        if self.list_filter_key(key.code) || self.list_nav_key(&key) {
             return;
         }
         match self.view {
@@ -3965,7 +3965,7 @@ impl App {
                     self.proposal_idx = (self.proposal_idx + 1)
                         .min(self.visible_proposals().len().saturating_sub(1))
                 }
-                KeyCode::Char('g') => self.generate_proposal(),
+                KeyCode::Char('n') => self.generate_proposal(),
                 KeyCode::Char('a') | KeyCode::Enter => {
                     if let Some(p) = self.selected_proposal().cloned() {
                         self.fire(Request::ProposalDecision {
@@ -4203,6 +4203,38 @@ impl App {
         let v = self.visible_proposals();
         v.get(self.proposal_idx.min(v.len().saturating_sub(1)))
             .map(|&i| &self.proposals[i])
+    }
+
+    /// Vim-style movement in every list view (SPEC §10.5): j/k, g/G (or
+    /// Home/End) and Ctrl+D/Ctrl+U by half a page; true when used.
+    fn list_nav_key(&mut self, key: &KeyEvent) -> bool {
+        let len = match self.view {
+            View::Sessions => self.visible_sessions().len(),
+            View::Tools | View::Metrics => self.visible_tools().len(),
+            View::Proposals => self.visible_proposals().len(),
+            _ => return false,
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let idx = match self.view {
+            View::Sessions => &mut self.session_idx,
+            View::Proposals => &mut self.proposal_idx,
+            _ => &mut self.tool_idx,
+        };
+        let last = len.saturating_sub(1);
+        let half = 10;
+        *idx = match key.code {
+            KeyCode::Char('j') if !ctrl => (*idx + 1).min(last),
+            KeyCode::Char('k') if !ctrl => idx.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => (*idx + half).min(last),
+            KeyCode::Char('u') if ctrl => idx.saturating_sub(half),
+            KeyCode::Char('g') | KeyCode::Home => 0,
+            KeyCode::Char('G') | KeyCode::End => last,
+            // The Metrics view had no list keys of its own.
+            KeyCode::Down if self.view == View::Metrics => (*idx + 1).min(last),
+            KeyCode::Up if self.view == View::Metrics => idx.saturating_sub(1),
+            _ => return false,
+        };
+        true
     }
 
     /// `/`, `s` and `v` in a list view (SPEC §10.4); true when used.
@@ -7728,13 +7760,13 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
         title.push_str(&format!("· {} generating… ", app.spinner()));
     }
     let block = ui::panel(title, app.color, Color::Blue).title_bottom(ui::hint(
-        "g generate (costs tokens) · a apply measured · r reject · b roll back · / filter · s sort · v status",
+        "n new proposal (costs tokens) · a apply measured · r reject · b roll back · / filter · s sort · v status",
         app.color,
     ));
     if app.proposals.is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(
-                "No proposals yet. Press g (or /propose) to generate a measured one.",
+                "No proposals yet. Press n (or /propose) to generate a measured one.",
                 ui::dim(app.color),
             ))
             .block(block),
@@ -10604,6 +10636,46 @@ mod tests {
             .unwrap();
         let state: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(state["code"], src);
+    }
+
+    #[test]
+    fn vim_keys_move_in_every_list_view() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.tools = (0..30)
+            .map(|i| ToolInfo {
+                id: format!("t{i:02}"),
+                name: format!("t{i:02}"),
+                description: String::new(),
+                retired: false,
+                current_version: 1,
+                capabilities: vec![],
+                memory_mb: 64,
+                invocations: 0,
+                success_rate: None,
+                needs_attention: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect();
+        for view in [View::Tools, View::Metrics] {
+            app.view = view;
+            app.tool_idx = 0;
+            app.key(key(KeyCode::Char('j')));
+            app.key(key(KeyCode::Char('j')));
+            app.key(key(KeyCode::Char('k')));
+            assert_eq!(app.selected_tool().unwrap().name, "t01", "{view:?}");
+            app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+            assert_eq!(app.selected_tool().unwrap().name, "t11");
+            app.key(key(KeyCode::Char('G')));
+            assert_eq!(app.selected_tool().unwrap().name, "t29");
+            app.key(key(KeyCode::Char('g')));
+            assert_eq!(app.selected_tool().unwrap().name, "t00");
+        }
+        // In Proposals, g is "top" now; n generates.
+        app.view = View::Proposals;
+        app.key(key(KeyCode::Char('g')));
+        assert!(!app.proposal_generating);
     }
 
     #[test]

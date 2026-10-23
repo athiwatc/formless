@@ -1795,6 +1795,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   Shortcuts never fire while typing or while a dialog is open. Approvals
   keep `y`/`o`/`n`.
 
+- **List keys (TUI).** Every list view (Sessions, Tools, Metrics,
+  Proposals) takes ↑/↓ and j/k, g/G or Home/End for the first/last row,
+  and Ctrl+D/Ctrl+U for half a page. List views take no typed input, so
+  these don't conflict. In Proposals, `n` now generates a new proposal
+  (it was `g`).
 - **Mouse (TUI).** While mouse capture is on: clicking a tab switches
   views, clicking a row in the Sessions, Tools or Proposals list selects
   it and a double-click opens it (as Enter), and clicking a tool call's

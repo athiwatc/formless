@@ -329,6 +329,10 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
     ("PgUp / PgDn, ↑ / ↓", "scroll the chat"),
+    (
+        "j / k, g / G, Ctrl+D / Ctrl+U",
+        "move in list views (Sessions, Tools, Metrics, Proposals)",
+    ),
     ("/", "command palette (Tab completes)"),
     ("@", "reference a file"),
     ("?", "this help (on an empty input)"),
