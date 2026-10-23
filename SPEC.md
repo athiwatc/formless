@@ -1950,6 +1950,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   selection follows the visible rows. The web Tools and Proposals views
   have the same filter box, sort and show menus; web Sessions use the
   sidebar search.
+  The web Tools table headers (Tool, Ver, Calls, Success, Last used)
+  sort by that column on click or Enter; a second click reverses it. Each
+  column's natural order is names A→Z and numbers or dates biggest first.
+  The headers carry `aria-sort`, and the Sort menu follows.
 - **Settings view:** edits file-backed config (§13) and per-Session
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
