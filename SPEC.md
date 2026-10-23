@@ -557,6 +557,11 @@ pasting paths.
     are hidden from screen readers);
   - keep Tab inside the dialog, and give focus back to where it was when
     they close.
+- **Reduced motion (web).** Under `prefers-reduced-motion: reduce` nothing
+  animates or transitions: spinners become a still "⋯", the running dot
+  stops pulsing, toasts appear without sliding, the mobile sidebar opens
+  without sliding, and scrolling jumps instead of gliding. There is no
+  blinking cursor or smooth-scroll code elsewhere.
 - **Web pending prompts.** An approval can be set aside (Esc or Later),
   and a question dialog can be cancelled without answering. Either stays
   pending: the status bar shows "⚠ N awaiting approval" or "? the agent

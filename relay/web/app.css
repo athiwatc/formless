@@ -402,7 +402,13 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
   .kv { grid-template-columns: 90px minmax(0, 1fr); }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
 }
-@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+/* Reduced motion: nothing moves. Spinners become a still "⋯" (a frozen ring
+   would read as an empty circle) and scrolling jumps instead of gliding. */
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  .spinner { border: 0; width: auto; height: auto; }
+  .spinner::before { content: "⋯"; font-weight: 700; line-height: 1; }
+}
 
 /* Tool version diffs */
 .diff { margin: 0; padding: 8px; overflow-x: auto; font: 12px/1.4 var(--mono); background: var(--code-bg); }
