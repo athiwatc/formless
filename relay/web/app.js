@@ -1850,6 +1850,8 @@
   $("status-model").onclick = () => openModelPicker();
   $("status-context").onclick = () => showContext();
   for (const id of ["tools-filter", "tools-sort", "tools-quick"]) $(id).addEventListener("input", () => renderTools());
+  // The Sort menu picks a column in its natural order.
+  $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderTools(); });
   for (const id of ["proposals-filter", "proposals-quick"]) $(id).addEventListener("input", () => renderProposals());
   $("modal-approve").onclick = () => decide(true);
   $("modal-once").onclick = () => decide(true, "once");
@@ -1859,12 +1861,25 @@
   function toolStatusDot(t) {
     return h("span", { class: "dot" + (t.needs_attention ? " attention" : t.retired ? " retired" : ""), title: t.needs_attention ? "needs attention" : t.retired ? "retired" : "active" });
   }
+  // Tools table columns: [label, sort key or null, numeric].
+  const TOOL_COLS = [["Tool", "name"], ["Ver", "version"], ["Calls", "calls", true], ["Success", "rate", true], ["Last used", "used"]];
   function toolsTable(table, tools, opts) {
     table.replaceChildren();
-    const cols = ["Tool", "Ver", "Calls", "Success", opts.bars ? "" : "Capabilities"];
-    table.append(h("thead", null, h("tr", null, cols.map((c, i) => h("th", { class: i === 2 || i === 3 ? "num" : null }, c)))));
+    const sort = opts.sortable && S.toolSort;
+    const cols = TOOL_COLS.concat([[opts.bars ? "" : "Capabilities", null]]);
+    // Sortable headers: click (or Enter) sorts by the column, again reverses.
+    table.append(h("thead", null, h("tr", null, cols.map(([label, key, num]) => {
+      const active = sort && key && sort.key === key;
+      const th = h("th", { class: num ? "num" : null, "aria-sort": active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null },
+        opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
+          S.toolSort = { key, reverse: active ? !sort.reverse : false };
+          if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
+          renderTools();
+        } }, label, active ? (sort.reverse ? " ▴" : " ▾") : "") : label);
+      return th;
+    }))));
     const body = h("tbody");
-    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: 5 }, "No Tools yet — the agent builds them with create_tool.")));
+    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: cols.length }, "No Tools yet — the agent builds them with create_tool.")));
     for (const t of tools) {
       body.append(h("tr", {
         class: opts.selected === t.id ? "selected" : null, tabindex: 0,
@@ -1875,6 +1890,7 @@
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
       h("td", { class: "num" }, rateCell(t.success_rate)),
+      h("td", { class: "muted" }, t.invocations ? relTime(t.updated_at) : "—"),
       opts.bars ? h("td", null, bar(t.success_rate)) : h("td", { class: "caps" }, (t.capabilities || []).join(", ") || "—")));
     }
     table.append(body);
@@ -1892,18 +1908,25 @@
       if (quick === "attention" && !t.needs_attention) return false;
       return !q || fuzzyMatch(q, t.name) || fuzzyMatch(q, t.description || "");
     });
+    // Each column's natural order (names A→Z, numbers and dates biggest
+    // first); a second click on the header reverses it.
     const by = {
       name: (a, b) => a.name.localeCompare(b.name),
+      version: (a, b) => a.current_version - b.current_version,
       rate: (a, b) => (b.success_rate ?? -1) - (a.success_rate ?? -1),
       used: (a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""),
       calls: (a, b) => b.invocations - a.invocations,
-    }[$("tools-sort").value];
-    return by ? rows.sort(by) : rows;
+    };
+    const sort = S.toolSort || { key: $("tools-sort").value, reverse: false };
+    const cmp = by[sort.key];
+    if (!cmp) return rows;
+    rows.sort(cmp);
+    return sort.reverse ? rows.reverse() : rows;
   }
   function renderTools() {
     const rows = visibleTools();
     $("tools-count").textContent = "(" + (rows.length === S.tools.length ? S.tools.length : rows.length + "/" + S.tools.length) + ")";
-    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool });
+    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true });
     const box = $("tool-detail");
     box.replaceChildren();
     const d = S.toolDetail;
