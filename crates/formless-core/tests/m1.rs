@@ -59,6 +59,69 @@ fn storage_resume_is_byte_identical_and_compaction_flags() {
     assert!(!needs2);
 }
 
+/// A nameless tool call stored before #540 was fixed is left out of the
+/// context with its result, so strict endpoints accept the Session again (#541).
+#[test]
+fn context_drops_stored_tool_calls_without_a_name() {
+    let paths = temp_paths("nameless");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let s = store.create_session(None).unwrap();
+    let call = |id: &str, name: &str| json!({"id": id, "type": "function", "function": {"name": name, "arguments": "{}"}});
+    let tool_result = |id: &str, name: &str| json!({"tool_call_id": id, "name": name}).to_string();
+    store.append_message(&s.id, "user", "count lines").unwrap();
+    // Phantom alongside a real call: only the phantom goes.
+    let meta = json!({"tool_calls": [call("call_0", ""), call("call_1", "find_tools")]});
+    store
+        .append_message_meta(&s.id, "assistant", "", Some(meta.to_string()))
+        .unwrap();
+    store
+        .append_message_meta(
+            &s.id,
+            "tool",
+            "error: invalid JSON",
+            Some(tool_result("call_0", "")),
+        )
+        .unwrap();
+    store
+        .append_message_meta(
+            &s.id,
+            "tool",
+            "{\"tools\":[]}",
+            Some(tool_result("call_1", "find_tools")),
+        )
+        .unwrap();
+    // Only a phantom: the turn keeps its text, or goes when it has none.
+    let only = json!({"tool_calls": [call("call_2", " ")]}).to_string();
+    store
+        .append_message_meta(&s.id, "assistant", "Let me look.", Some(only.clone()))
+        .unwrap();
+    store
+        .append_message_meta(&s.id, "tool", "error", Some(tool_result("call_2", "")))
+        .unwrap();
+    let only = only.replace("call_2", "call_3");
+    store
+        .append_message_meta(&s.id, "assistant", "", Some(only))
+        .unwrap();
+    store
+        .append_message_meta(&s.id, "tool", "error", Some(tool_result("call_3", "")))
+        .unwrap();
+    store.append_message(&s.id, "user", "again").unwrap();
+
+    let (ctx, _, _) = build_context(&store, &s.id, "sys", 1_000_000, 0.8).unwrap();
+    let roles: Vec<&str> = ctx.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "tool", "assistant", "user"]
+    );
+    assert_eq!(ctx[2]["tool_calls"].as_array().unwrap().len(), 1);
+    assert_eq!(ctx[2]["tool_calls"][0]["function"]["name"], "find_tools");
+    assert_eq!(ctx[3]["tool_call_id"], "call_1");
+    assert_eq!(
+        ctx[4],
+        json!({"role": "assistant", "content": "Let me look."})
+    );
+}
+
 #[test]
 fn context_has_one_leading_system_message() {
     let paths = temp_paths("onesystem");

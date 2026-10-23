@@ -4038,6 +4038,9 @@ pub struct ContextCache {
     live_seqs: Vec<i64>,
     /// Indexes into `live_seqs` where a user message starts a turn.
     turn_starts: Vec<usize>,
+    /// Ids of stored tool calls left out for having no name (their
+    /// results are left out too).
+    dropped_calls: std::collections::HashSet<String>,
 }
 
 impl ContextCache {
@@ -4095,7 +4098,34 @@ impl ContextCache {
                 self.turn_starts.push(self.live_seqs.len());
             }
             self.live_seqs.push(m.seq);
-            let msg = provider_message(&m);
+            let mut msg = provider_message(&m);
+            // A tool call without a name (stored before #540 was fixed) makes
+            // strict endpoints reject every request: leave it, and its
+            // result, out so the Session recovers (#541).
+            if msg["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| self.dropped_calls.contains(id))
+            {
+                continue;
+            }
+            if let Some(calls) = msg["tool_calls"].as_array_mut() {
+                calls.retain(|c| {
+                    let named = c["function"]["name"]
+                        .as_str()
+                        .is_some_and(|n| !n.trim().is_empty());
+                    if !named {
+                        let id = c["id"].as_str().unwrap_or_default();
+                        self.dropped_calls.insert(id.to_string());
+                    }
+                    named
+                });
+                if calls.is_empty() {
+                    if m.content.is_empty() {
+                        continue;
+                    }
+                    msg = json!({"role": "assistant", "content": m.content});
+                }
+            }
             // A harness note right after a user message joins it, so strictly
             // alternating templates never see two user turns in a row.
             if m.role == "system-note" {

@@ -536,6 +536,67 @@ async fn real_token_usage_is_read_from_both_apis() {
     assert_eq!(out.usage.unwrap().prompt_tokens, 50);
 }
 
+/// `output_index` counts reasoning items too: a call at index 1 after a
+/// reasoning item at 0 must come back alone, not after an empty phantom
+/// call (#540). Nameless calls never leave the provider on either API.
+#[tokio::test]
+async fn tool_calls_after_reasoning_have_no_phantom_slot() {
+    let ev = |v: Value| format!("data: {v}\n\n");
+    let resp = ev(
+        json!({"type": "response.output_item.added", "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []}}),
+    ) + &ev(
+        json!({"type": "response.reasoning_text.delta", "output_index": 0, "delta": "use the tool"}),
+    ) + &ev(
+        json!({"type": "response.output_item.added", "output_index": 1,
+            "item": {"id": "fc_1", "type": "function_call", "call_id": "call_w", "name": "get_weather", "arguments": ""}}),
+    ) + &ev(
+        json!({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "{\"city\":"}),
+    ) + &ev(
+        json!({"type": "response.function_call_arguments.delta", "output_index": 1, "delta": "\"Paris\"}"}),
+    ) + &ev(
+        json!({"type": "response.output_item.done", "output_index": 1,
+            "item": {"id": "fc_1", "type": "function_call", "call_id": "call_w", "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}"}}),
+    ) + &ev(json!({"type": "response.completed", "response": {"output": []}}));
+    // Chat Completions with a gap in `index`: slot 0 never gets a name.
+    let chat = ev(
+        json!({"choices": [{"delta": {"tool_calls": [{"index": 1, "id": "call_c",
+            "function": {"name": "get_weather", "arguments": "{}"}}]}}]}),
+    ) + "data: [DONE]\n\n";
+    for (style, endpoint, body, id, args) in [
+        (
+            "responses",
+            "/responses",
+            resp,
+            "call_w",
+            "{\"city\":\"Paris\"}",
+        ),
+        ("chat", "/chat/completions", chat, "call_c", "{}"),
+    ] {
+        let base = scripted_sse(endpoint, vec![body]).await;
+        let mut c = cfg(&base);
+        c.api_style = style.into();
+        c.fallback_models.clear();
+        let p = Provider::new(c, "k".into()).unwrap();
+        let out = p
+            .chat_stream(
+                &[json!({"role": "user", "content": "weather?"})],
+                &[],
+                "good",
+                None,
+                &CancellationToken::new(),
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.tool_calls.len(), 1, "{style}: {:?}", out.tool_calls);
+        assert_eq!(out.tool_calls[0].name, "get_weather", "{style}");
+        assert_eq!(out.tool_calls[0].id, id, "{style}");
+        assert_eq!(out.tool_calls[0].arguments, args, "{style}");
+    }
+}
+
 /// Endpoints that reject `stream_options` still work: it is dropped.
 #[tokio::test]
 async fn stream_options_is_dropped_when_rejected() {
