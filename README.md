@@ -434,7 +434,7 @@ formless --profile sandbox
 | `formless tools retire\|restore\|rollback [--to N]\|purge [--force]` | Tool lifecycle, as in the Tools view |
 | `formless auth login\|status\|logout` | OAuth sign-in for subscription providers (v2) |
 | `formless prompts list\|generate\|apply\|reject\|rollback` | Measured prompt/memory proposals (v2) |
-| `formless update check` | Compare with the latest GitHub release; never modifies the binary |
+| `formless update [--check]` | Show the release notes of every newer release, then the upgrade command for how you installed (`--check` / `update check` only reports); never modifies the binary |
 | `formless naming status\|pull\|test "<message>"` | Session-naming model: install state, download now, preview a title |
 | `formless doctor` | Config validity, data dir, keychain reachability, endpoint + tool-calling probe |
 | `formless reset [--force]` | Full wipe of config, keychain entry and data dir |
@@ -443,7 +443,7 @@ Global flag: `--profile <name>`. Headless approvals **fail closed**: an unapprov
 
 ### 3.12 Updating
 
-`formless update check` prints the newest GitHub release and its URL when it is newer than the running binary; it never downloads or replaces anything. Re-run `scripts/install.sh` (it always fetches the latest release and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
+`formless update` lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it always fetches the latest release and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
 
 ---
 
