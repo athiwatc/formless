@@ -4496,6 +4496,24 @@ impl App {
                         self.request(Pending::GetTool, Request::GetTool { id: tool.id });
                     }
                 }
+                KeyCode::Char('c') => {
+                    let f = &mut self.tool_filter;
+                    f.group = (f.group + 1) % lists::TOOL_GROUPS.len();
+                    f.collapsed.clear();
+                    self.tool_idx = 0;
+                }
+                KeyCode::Char('z') => {
+                    let group = self
+                        .selected_tool()
+                        .and_then(|t| lists::tool_group(t, self.tool_filter.group));
+                    if let Some(g) = group {
+                        self.tool_filter.collapsed.insert(g);
+                        self.tool_idx = self
+                            .tool_idx
+                            .min(self.visible_tools().len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Char('Z') => self.tool_filter.collapsed.clear(),
                 KeyCode::Char('t') => {
                     if let Some(tool) = self.selected_tool().cloned() {
                         match self.tool_detail.clone().filter(|d| d.tool.id == tool.id) {
@@ -9438,7 +9456,8 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
 
 fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_tools();
-    let list_h = (visible.len().max(1) as u16 + 3)
+    let groups = lists::tool_groups(&app.tools, &app.tool_filter);
+    let list_h = ((visible.len() + groups.len()).max(1) as u16 + 3)
         .min(area.height / 2)
         .max(4);
     let parts = Layout::vertical([Constraint::Length(list_h), Constraint::Min(3)]).split(area);
@@ -9449,8 +9468,12 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         lists::TOOL_SORTS,
         lists::TOOL_QUICK,
     );
+    let title = match lists::TOOL_GROUPS[app.tool_filter.group % lists::TOOL_GROUPS.len()] {
+        "none" => title,
+        g => format!("{title}· by {g} (z fold, Z unfold) "),
+    };
     let block = ui::panel(title, app.color, Color::Yellow);
-    if app.tools.is_empty() || visible.is_empty() {
+    if app.tools.is_empty() || (visible.is_empty() && groups.is_empty()) {
         let empty = if app.tools.is_empty() {
             NO_TOOLS
         } else {
@@ -9461,11 +9484,36 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
             parts[0],
         );
     } else {
+        // Rows: group headers (when grouping) and Tools, with each Tool
+        // row's position in `visible`.
+        let mut layout: Vec<Result<usize, &str>> = Vec::new();
+        let mut pos = 0;
+        for (name, _) in &groups {
+            layout.push(Err(name.as_str()));
+            while pos < visible.len()
+                && lists::tool_group(&app.tools[visible[pos]], app.tool_filter.group).as_deref()
+                    == Some(name.as_str())
+            {
+                layout.push(Ok(pos));
+                pos += 1;
+            }
+        }
+        layout.extend((pos..visible.len()).map(Ok));
+        let sel = app.tool_idx.min(visible.len().saturating_sub(1));
         let mut state = TableState::default();
-        state.select(Some(app.tool_idx.min(visible.len() - 1)));
-        f.render_stateful_widget(
-            Table::new(
-                visible.iter().map(|&i| &app.tools[i]).map(|t| {
+        state.select(layout.iter().position(|r| *r == Ok(sel)));
+        let rows = layout.iter().map(|r| match r {
+            Err(name) => {
+                let n = groups.iter().find(|g| g.0 == *name).map_or(0, |g| g.1);
+                let folded = app.tool_filter.collapsed.contains(*name);
+                Row::new(vec![Cell::from(Span::styled(
+                    format!("{} {name} ({n})", if folded { "▸" } else { "▾" }),
+                    bold_fg(app.color, Color::Cyan),
+                ))])
+            }
+            Ok(p) => {
+                let t = &app.tools[visible[*p]];
+                {
                     let mut cells = tool_cells(t, app.color);
                     cells.push(Cell::from(tool_spark(t, app.color)));
                     cells.push(Cell::from(tool_status(t, app.color)));
@@ -9478,7 +9526,12 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
                         ui::dim(app.color),
                     )));
                     Row::new(cells)
-                }),
+                }
+            }
+        });
+        f.render_stateful_widget(
+            Table::new(
+                rows,
                 [
                     Constraint::Length(26),
                     Constraint::Length(5),
@@ -9508,7 +9561,23 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
             parts[0],
             &mut state,
         );
-        clickable_rows(app, parts[0], 1, state.offset(), visible.len(), Click::Tool);
+        // Clicks select Tools; headers between them take rows too.
+        let top = parts[0].y + 2;
+        let height = parts[0].height.saturating_sub(3) as usize;
+        for (k, r) in layout.iter().enumerate().skip(state.offset()).take(height) {
+            if let Ok(p) = r {
+                clickable(
+                    app,
+                    Rect::new(
+                        parts[0].x + 1,
+                        top + (k - state.offset()) as u16,
+                        parts[0].width.saturating_sub(2),
+                        1,
+                    ),
+                    Click::Tool(*p),
+                );
+            }
+        }
     }
     let lines = tool_detail_lines(app);
     // Keep the selected recent call (marked "› ") in view.
@@ -10627,6 +10696,7 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 recent: String::new(),
+                author: "agent".into(),
             },
             ToolInfo {
                 id: "2".into(),
@@ -10642,6 +10712,7 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 recent: String::new(),
+                author: "agent".into(),
             },
         ];
         let summary = metrics_summary(&tools);
@@ -11242,6 +11313,7 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 recent: String::new(),
+                author: "agent".into(),
             })
             .collect();
         app.view = View::Tools;
@@ -11993,6 +12065,7 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 recent: String::new(),
+                author: "agent".into(),
             })
             .collect();
         render(&mut app, 120, 30);
@@ -12166,6 +12239,7 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 recent: String::new(),
+                author: "agent".into(),
             })
             .collect();
         for view in [View::Tools, View::Metrics] {
@@ -12684,6 +12758,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             recent: falling,
+            author: "agent".into(),
         }];
         app.view = View::Tools;
         let screen = render(&mut app, 140, 20);
@@ -12709,6 +12784,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             recent: String::new(),
+            author: "agent".into(),
         };
         app.tools = vec![tool.clone()];
         app.tool_detail = Some(ToolDetail {
@@ -12748,7 +12824,8 @@ mod tests {
         assert!(ed.text().contains("\"input_schema\": {"), "{}", ed.text());
         assert!(render(&mut app, 100, 20).contains("fetch_page · schemas"));
         // Schemas must stay objects.
-        app.editor.as_mut().unwrap().chars = r#"{"input_schema": 3, "output_schema": {}}"#.chars().collect();
+        app.editor.as_mut().unwrap().chars =
+            r#"{"input_schema": 3, "output_schema": {}}"#.chars().collect();
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.notes.last().unwrap().contains("each a JSON object"));
         app.editor = None;
@@ -12781,6 +12858,48 @@ mod tests {
     }
 
     #[test]
+    fn c_groups_the_tools_list_and_z_folds_a_group() {
+        let tool = |name: &str, cap: &str| ToolInfo {
+            id: name.into(),
+            name: name.into(),
+            description: String::new(),
+            retired: false,
+            current_version: 1,
+            capabilities: vec![cap.into()],
+            memory_mb: 64,
+            invocations: 1,
+            success_rate: Some(1.0),
+            needs_attention: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            recent: String::new(),
+            author: "agent".into(),
+        };
+        let mut app = test_app();
+        app.tools = vec![
+            tool("read_file", "fs:read:/tmp"),
+            tool("http_get", "net:example.com"),
+        ];
+        app.view = View::Tools;
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        app.key(key('c'));
+        let screen = render(&mut app, 140, 30);
+        assert!(screen.contains("by capability"), "{screen}");
+        assert!(
+            screen.contains("▾ fs (1)") && screen.contains("▾ net (1)"),
+            "{screen}"
+        );
+        // The first Tool (fs) is selected; z folds its group.
+        app.key(key('z'));
+        let screen = render(&mut app, 140, 30);
+        assert!(screen.contains("▸ fs (1)"), "{screen}");
+        assert!(!screen.contains("read_file"), "{screen}");
+        assert_eq!(app.selected_tool().unwrap().name, "http_get");
+        app.key(key('Z'));
+        assert!(render(&mut app, 140, 30).contains("read_file"));
+    }
+
+    #[test]
     fn tool_detail_lists_recent_calls_to_open_and_jump_to() {
         let mut app = test_app();
         let tool = ToolInfo {
@@ -12797,6 +12916,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             recent: "sf".into(),
+            author: "agent".into(),
         };
         app.tools = vec![tool.clone()];
         app.sessions = vec![SessionInfo {
