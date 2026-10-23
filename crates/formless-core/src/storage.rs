@@ -336,13 +336,14 @@ impl ModelStat {
     }
 }
 
-/// Per-Session summary columns for the Sessions list.
-const SESSION_SUMMARY: &str = "(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id) AS message_count,
-     (SELECT content FROM messages m WHERE m.session_id=s.id AND m.role='user' ORDER BY m.seq DESC LIMIT 1) AS preview,
-     (SELECT status FROM runs r WHERE r.session_id=s.id ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1) AS last_run_status";
+/// Per-Session summary columns for the Sessions list. They live on the
+/// Session row itself (`message_count`, `preview`, `last_run_status`,
+/// schema v39) and triggers on `messages`/`runs` keep them true, so the
+/// list is one scan instead of three correlated subqueries per Session.
+const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 38;
+pub const SCHEMA_VERSION: i64 = 39;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -354,10 +355,80 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
     }
 }
 
+/// Indexes the query plans were missing (found with `EXPLAIN QUERY PLAN`
+/// against a real database): `list_sessions` scanned `runs` once per
+/// Session row, `attribute_step_tokens`/`run_metrics_for` scanned
+/// `invocations` per call, and the daemon's orphan sweep scanned it at
+/// startup.
+const SCHEMA_V39_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_inv_run ON invocations(run_id);
+CREATE INDEX IF NOT EXISTS idx_inv_session ON invocations(session_id, tool_id);
+CREATE INDEX IF NOT EXISTS idx_inv_running ON invocations(tool_id) WHERE status='running';
+CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_at);
+";
+
+/// Triggers that keep `sessions.message_count`, `sessions.preview` and
+/// `sessions.last_run_status` true, so the Sessions list reads them
+/// instead of counting messages per row (measured 0.47 ms -> 0.07 ms for
+/// 27 Sessions on the reference database; a message append pays ~0.07 ms
+/// for the trigger, which the write-side PRAGMA wins back several times
+/// over).
+const SCHEMA_V39_TRIGGERS: &str = "
+CREATE TRIGGER IF NOT EXISTS sessions_msg_ai AFTER INSERT ON messages BEGIN
+  UPDATE sessions SET message_count = message_count + 1,
+    preview = CASE WHEN new.role='user' THEN substr(new.content,1,2000) ELSE preview END
+  WHERE id = new.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_msg_ad AFTER DELETE ON messages BEGIN
+  UPDATE sessions SET message_count = message_count - 1,
+    preview = CASE
+      WHEN old.role='user' AND NOT EXISTS (
+        SELECT 1 FROM messages WHERE session_id=old.session_id AND role='user' AND seq > old.seq)
+      THEN (SELECT substr(content,1,2000) FROM messages WHERE session_id=old.session_id AND role='user' ORDER BY seq DESC LIMIT 1)
+      ELSE preview END
+  WHERE id = old.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_msg_au AFTER UPDATE OF content ON messages BEGIN
+  UPDATE sessions SET
+    preview = (SELECT substr(content,1,2000) FROM messages WHERE session_id=old.session_id AND role='user' ORDER BY seq DESC LIMIT 1)
+  WHERE id = old.session_id AND old.role='user';
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_run_ai AFTER INSERT ON runs BEGIN
+  UPDATE sessions SET last_run_status = new.status WHERE id = new.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_run_au AFTER UPDATE OF status ON runs BEGIN
+  UPDATE sessions SET last_run_status = (
+    SELECT status FROM runs WHERE session_id=new.session_id ORDER BY created_at DESC, rowid DESC LIMIT 1)
+  WHERE id = new.session_id;
+END;
+";
+
+/// v39: indexes, then the denormalised Session summary backfilled from the
+/// existing rows before its triggers take over.
+fn migrate_v39(c: &Connection) -> Result<()> {
+    c.execute_batch(SCHEMA_V39_INDEXES)?;
+    add_column(c, "sessions", "message_count INTEGER NOT NULL DEFAULT 0")?;
+    add_column(c, "sessions", "preview TEXT")?;
+    add_column(c, "sessions", "last_run_status TEXT")?;
+    c.execute_batch(
+        "UPDATE sessions SET
+           message_count = (SELECT COUNT(*) FROM messages m WHERE m.session_id=sessions.id),
+           preview = (SELECT substr(content,1,2000) FROM messages m
+                        WHERE m.session_id=sessions.id AND m.role='user'
+                        ORDER BY m.seq DESC LIMIT 1),
+           last_run_status = (SELECT status FROM runs r WHERE r.session_id=sessions.id
+                                ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1);",
+    )?;
+    c.execute_batch(SCHEMA_V39_TRIGGERS)?;
+    Ok(())
+}
+
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 38] = [
+const MIGRATIONS: [(i64, MigrationStep); 39] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -480,6 +551,9 @@ const MIGRATIONS: [(i64, MigrationStep); 38] = [
              CREATE INDEX IF NOT EXISTS idx_model_events ON model_events(created_at);",
         )?)
     }),
+    // Storage performance: the indexes the query plans asked for, and the
+    // Session summary denormalised onto the Session row (SPEC §9.4).
+    (39, migrate_v39),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -525,13 +599,92 @@ fn backup_before_migration(conn: &Connection, file: &Path, version: i64) -> Resu
     Ok(dest)
 }
 
+/// Settings every connection gets. `synchronous=NORMAL` is SQLite's
+/// recommendation under WAL: a commit survives an application crash (only a
+/// power cut can lose the last few) and, unlike the `FULL` default, needs no
+/// fsync — 0.10 ms per commit becomes 0.03 ms, and the daemon commits
+/// several times per agent step. The rest are latency settings: a busy
+/// timeout instead of an instant `SQLITE_BUSY` when another process (the
+/// CLI, another connection of this daemon) holds the write lock, memory for temp
+/// B-trees, a 32 MiB page cache, a 256 MiB read map, and a 64 MiB cap so a
+/// long Run cannot leave an unbounded `-wal` file behind.
+const PRAGMAS: &str = "\
+PRAGMA journal_mode=WAL;\
+PRAGMA synchronous=NORMAL;\
+PRAGMA foreign_keys=ON;\
+PRAGMA busy_timeout=5000;\
+PRAGMA temp_store=MEMORY;\
+PRAGMA cache_size=-32000;\
+PRAGMA mmap_size=268435456;\
+PRAGMA journal_size_limit=67108864;";
+
+/// A read-only connection: the same memory and locking settings, minus the
+/// ones that need write access.
+const READER_PRAGMAS: &str = "\
+PRAGMA query_only=ON;\
+PRAGMA foreign_keys=ON;\
+PRAGMA busy_timeout=5000;\
+PRAGMA temp_store=MEMORY;\
+PRAGMA cache_size=-32000;\
+PRAGMA mmap_size=268435456;";
+
+/// In-memory databases (tests) get the settings that do not involve a file.
+const MEMORY_PRAGMAS: &str = "\
+PRAGMA foreign_keys=ON;\
+PRAGMA temp_store=MEMORY;\
+PRAGMA cache_size=-32000;";
+
+/// Keep the newest `retention` finished Invocations of a Tool. The old
+/// `rowid NOT IN (… ORDER BY rowid DESC LIMIT n)` form made SQLite read the
+/// Tool's whole index range on every call; finding the cutoff rowid once
+/// and deleting the prefix below it touches the rows that go away only.
+/// `running` rows are never pruned: the daemon needs them to mark a crashed
+/// invocation interrupted.
+fn prune_invocations(tx: &Connection, tool_id: &str, retention: usize) -> Result<()> {
+    if retention == 0 {
+        tx.execute(
+            "DELETE FROM invocations WHERE tool_id=?1 AND status!='running'",
+            params![tool_id],
+        )?;
+        return Ok(());
+    }
+    let cutoff: i64 = tx.query_row(
+        "SELECT COALESCE(MIN(rowid),0) FROM (SELECT rowid FROM invocations \
+         WHERE tool_id=?1 AND status!='running' ORDER BY rowid DESC LIMIT ?2)",
+        params![tool_id, retention as i64],
+        |r| r.get(0),
+    )?;
+    if cutoff > 0 {
+        tx.execute(
+            "DELETE FROM invocations WHERE tool_id=?1 AND status!='running' AND rowid < ?2",
+            params![tool_id, cutoff],
+        )?;
+    }
+    Ok(())
+}
+
+/// Prepared statements kept per connection: the agent loop and the TUI's
+/// polling re-run the same few dozen statements, so re-parsing them on
+/// every call is pure overhead.
+const STMT_CACHE: usize = 128;
+
+impl Drop for Store {
+    /// `PRAGMA optimize` is SQLite's documented close-time hook: it runs
+    /// ANALYZE only on tables whose query patterns changed since the last
+    /// run, so the planner keeps good statistics without a full ANALYZE.
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch("PRAGMA optimize;");
+    }
+}
+
 impl Store {
     pub fn open(file: &Path) -> Result<Self> {
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(PRAGMAS)?;
+        conn.set_prepared_statement_cache_capacity(STMT_CACHE);
         migrate(&conn, Some(file))?;
         Ok(Self {
             conn,
@@ -543,7 +696,8 @@ impl Store {
     /// migrated). WAL lets it read while the main connection writes.
     pub fn open_reader(file: &Path) -> Result<Self> {
         let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
-        conn.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(READER_PRAGMAS)?;
+        conn.set_prepared_statement_cache_capacity(STMT_CACHE);
         Ok(Self {
             conn,
             rewrites: Default::default(),
@@ -552,12 +706,23 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(MEMORY_PRAGMAS)?;
+        conn.set_prepared_statement_cache_capacity(STMT_CACHE);
         migrate(&conn, None)?;
         Ok(Self {
             conn,
             rewrites: Default::default(),
         })
+    }
+
+    /// `execute` through the connection's statement cache.
+    fn ex(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+        Ok(self.conn.prepare_cached(sql)?.execute(params)?)
+    }
+
+    /// `prepare` through the connection's statement cache.
+    fn ps(&self, sql: &str) -> Result<rusqlite::CachedStatement<'_>> {
+        Ok(self.conn.prepare_cached(sql)?)
     }
 
     fn row_session(r: &rusqlite::Row) -> rusqlite::Result<SessionInfo> {
@@ -612,7 +777,7 @@ impl Store {
         let name = name
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_SESSION_NAME.into());
-        self.conn.execute(
+        self.ex(
             "INSERT INTO sessions(id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",
             params![id, name, t],
         )?;
@@ -623,7 +788,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT s.*, {SESSION_SUMMARY} FROM sessions s WHERE deleted_at IS NULL ORDER BY archived, pinned DESC, updated_at DESC"
+                "SELECT {SESSION_SUMMARY} FROM sessions s WHERE deleted_at IS NULL ORDER BY archived, pinned DESC, updated_at DESC"
             ))?;
         let rows = stmt
             .query_map([], Self::row_session)?
@@ -632,7 +797,7 @@ impl Store {
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<SessionInfo>> {
-        let mut stmt = self.conn.prepare("SELECT * FROM sessions WHERE id=?1")?;
+        let mut stmt = self.ps("SELECT * FROM sessions WHERE id=?1")?;
         let mut rows = stmt.query_map(params![id], Self::row_session)?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
@@ -641,7 +806,7 @@ impl Store {
     }
 
     pub fn rename_session(&self, id: &str, name: &str) -> Result<Option<SessionInfo>> {
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET name=?2, updated_at=?3 WHERE id=?1",
             params![id, name, now()],
         )?;
@@ -653,7 +818,7 @@ impl Store {
     /// `updated_at` alone (naming is not activity). Returns the Session
     /// when the rename applied.
     pub fn auto_name_session(&self, id: &str, name: &str) -> Result<Option<SessionInfo>> {
-        let n = self.conn.execute(
+        let n = self.ex(
             "UPDATE sessions SET name=?2 WHERE id=?1 AND name=?3",
             params![id, name, DEFAULT_SESSION_NAME],
         )?;
@@ -672,7 +837,7 @@ impl Store {
             .collect();
         clean.sort();
         clean.dedup();
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET tags=?2 WHERE id=?1",
             params![id, serde_json::to_string(&clean)?],
         )?;
@@ -680,7 +845,7 @@ impl Store {
     }
 
     pub fn save_template(&self, t: &TemplateInfo) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT OR REPLACE INTO session_templates
                (name, model, reasoning_effort, instructions, cwd, first_message, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -698,7 +863,7 @@ impl Store {
     }
 
     pub fn list_templates(&self) -> Result<Vec<TemplateInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT name, model, reasoning_effort, instructions, cwd, first_message
              FROM session_templates ORDER BY name COLLATE NOCASE",
         )?;
@@ -730,7 +895,7 @@ impl Store {
         instructions: Option<&str>,
     ) -> Result<Option<SessionInfo>> {
         let text = instructions.map(str::trim).filter(|t| !t.is_empty());
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET instructions=?2 WHERE id=?1",
             params![id, text],
         )?;
@@ -739,7 +904,7 @@ impl Store {
 
     /// Archiving doesn't count as activity either.
     pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<Option<SessionInfo>> {
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET archived=?2 WHERE id=?1",
             params![id, archived as i64],
         )?;
@@ -748,7 +913,7 @@ impl Store {
 
     /// Pinning doesn't count as activity: `updated_at` stays.
     pub fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<Option<SessionInfo>> {
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET pinned=?2 WHERE id=?1",
             params![id, pinned as i64],
         )?;
@@ -756,7 +921,7 @@ impl Store {
     }
 
     pub fn set_session_cwd(&self, id: &str, cwd: Option<&str>) -> Result<Option<SessionInfo>> {
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET cwd=?2, updated_at=?3 WHERE id=?1",
             params![id, cwd, now()],
         )?;
@@ -769,7 +934,7 @@ impl Store {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<Option<SessionInfo>> {
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET model=?2, reasoning_effort=?3, updated_at=?4 WHERE id=?1",
             params![id, model, effort, now()],
         )?;
@@ -783,7 +948,7 @@ impl Store {
 
     /// Hide a Session for its undo window (SPEC §5.1).
     pub fn soft_delete_session(&self, id: &str) -> Result<bool> {
-        Ok(self.conn.execute(
+        Ok(self.ex(
             "UPDATE sessions SET deleted_at=?2 WHERE id=?1 AND deleted_at IS NULL",
             params![id, now()],
         )? > 0)
@@ -791,7 +956,7 @@ impl Store {
 
     /// Undo a soft delete still in its window.
     pub fn restore_session(&self, id: &str) -> Result<Option<SessionInfo>> {
-        if self.conn.execute(
+        if self.ex(
             "UPDATE sessions SET deleted_at=NULL WHERE id=?1 AND deleted_at IS NOT NULL",
             params![id],
         )? == 0
@@ -911,7 +1076,7 @@ impl Store {
     }
 
     pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq",
         )?;
         let rows = stmt
@@ -1010,7 +1175,7 @@ impl Store {
              WHERE instr(lower(m.content), lower(?1)) > 0 \
              ORDER BY m.created_at DESC LIMIT ?2"
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.ps(sql)?;
         let arg = fts.unwrap_or_else(|| query.to_string());
         let rows = stmt.query_map(params![arg, limit], |r| {
             Ok((
@@ -1064,22 +1229,26 @@ impl Store {
             return Ok(None);
         }
         self.note_rewrite();
-        self.conn.execute(
+        // One edit is one commit: four separate ones cost four fsyncs (or
+        // four WAL commits) for a single user action.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
             params![session_id, message_id, content],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
             params![session_id, msg.seq],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM checkpoints WHERE session_id=?1 AND up_to_seq>=?2",
             params![session_id, msg.seq],
         )?;
-        self.conn.execute(
+        tx.execute(
             "UPDATE sessions SET updated_at=?2 WHERE id=?1",
             params![session_id, now()],
         )?;
+        tx.commit()?;
         msg.content = content.to_string();
         Ok(Some(msg))
     }
@@ -1087,7 +1256,7 @@ impl Store {
     pub fn create_run(&self, session_id: &str) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
-        self.conn.execute(
+        self.ex(
             "INSERT INTO runs(id,session_id,status,created_at,updated_at) VALUES(?1,?2,'running',?3,?3)",
             params![id, session_id, t],
         )?;
@@ -1114,7 +1283,7 @@ impl Store {
         kind: &str,
         duration_ms: i64,
     ) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO builtin_calls(name,session_id,run_id,ok,kind,duration_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![name, session_id, run_id, ok, kind, duration_ms, now()],
         )?;
@@ -1135,7 +1304,7 @@ impl Store {
         &self,
         since: Option<&str>,
     ) -> Result<Vec<formless_protocol::BuiltinStatInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT name, kind, COUNT(*), SUM(ok=0), AVG(duration_ms) FROM builtin_calls
              WHERE ?1 IS NULL OR created_at >= ?1 GROUP BY name, kind ORDER BY name, kind",
         )?;
@@ -1189,16 +1358,18 @@ impl Store {
             return Ok(());
         }
         let share = tokens / calls as i64;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE invocations SET tokens=tokens+?3 WHERE run_id=?1 AND parent_id IS NULL AND created_at>=?2",
             params![run_id, since, share],
         )?;
         // A run_script call's share is split over the Tools it called.
-        self.conn.execute(
+        tx.execute(
             "UPDATE invocations SET tokens=tokens+?3/(SELECT count(*) FROM invocations s WHERE s.parent_id=invocations.parent_id) \
              WHERE run_id=?1 AND parent_id LIKE 'script:%' AND created_at>=?2",
             params![run_id, since, share],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1217,7 +1388,7 @@ impl Store {
         duration_ms: i64,
         saved_tool: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO scripts(id,session_id,run_id,hash,source,uses,status,error,duration_ms,saved_tool,created_at) \
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
@@ -1253,7 +1424,7 @@ impl Store {
         threshold: usize,
         limit: usize,
     ) -> Result<Vec<(usize, Vec<String>, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT count(DISTINCT session_id) AS n, \
                     (SELECT uses FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1), \
                     (SELECT source FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1) \
@@ -1277,7 +1448,7 @@ impl Store {
 
     /// Tokens a Tool spent itself (`llm.complete` inside it).
     pub fn add_invocation_tokens(&self, inv_id: &str, tokens: i64) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE invocations SET tokens=tokens+?2 WHERE id=?1",
             params![inv_id, tokens],
         )?;
@@ -1310,7 +1481,7 @@ impl Store {
         author: &str,
     ) -> Result<formless_protocol::JobInfo> {
         let id = format!("j{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.conn.execute(
+        self.ex(
             "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)",
             params![id, prompt, session_id, cron, next_run, approved, author, now()],
         )?;
@@ -1354,7 +1525,7 @@ impl Store {
 
     /// The user enables (which also approves) or disables a job.
     pub fn set_job_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
-        Ok(self.conn.execute(
+        Ok(self.ex(
             "UPDATE jobs SET enabled=?2, approved=CASE WHEN ?2 THEN 1 ELSE approved END WHERE id=?1",
             params![id, enabled],
         )? > 0)
@@ -1362,7 +1533,7 @@ impl Store {
 
     /// Record a job's run; `next_run` None ends a one-shot job.
     pub fn job_ran(&self, id: &str, status: &str, next_run: Option<&str>) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE jobs SET last_run=?2, last_status=?3, next_run=?4,
                enabled=CASE WHEN ?4 IS NULL THEN 0 ELSE enabled END WHERE id=?1",
             params![id, now(), status, next_run],
@@ -1389,7 +1560,7 @@ impl Store {
 
     /// Queue a Tool for the optimiser (persisted; no duplicates).
     pub fn enqueue_optimise(&self, tool_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT OR IGNORE INTO optimiser_queue(tool_id, queued_at) VALUES(?1, ?2)",
             params![tool_id, now()],
         )?;
@@ -1408,7 +1579,7 @@ impl Store {
     }
 
     pub fn dequeue_optimise(&self, tool_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "DELETE FROM optimiser_queue WHERE tool_id=?1",
             params![tool_id],
         )?;
@@ -1433,7 +1604,7 @@ impl Store {
         session_id: Option<&str>,
         run_id: Option<&str>,
     ) -> Result<(Vec<ModelUsage>, i64)> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage
              WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR run_id=?2) GROUP BY model",
         )?;
@@ -1462,7 +1633,7 @@ impl Store {
     }
 
     pub fn set_run_error(&self, run_id: &str, error: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE runs SET error=?2 WHERE id=?1",
             params![run_id, error],
         )?;
@@ -1500,7 +1671,7 @@ impl Store {
         turns: i64,
         outcome: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO task_stats(id,role,model,session_id,run_id,task_hash,ms,tokens,turns,outcome,created_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![uuid::Uuid::new_v4().to_string(), role, model, session_id, run_id, task_hash, ms, tokens, turns, outcome, now()],
@@ -1511,7 +1682,7 @@ impl Store {
     /// The same task started again in the same Run: the earlier result was
     /// not good enough, so it no longer counts as good.
     pub fn mark_task_respawned(&self, role: &str, run_id: &str, task_hash: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE task_stats SET outcome='respawned' WHERE role=?1 AND run_id=?2 AND task_hash=?3 AND outcome='completed'",
             params![role, run_id, task_hash],
         )?;
@@ -1520,7 +1691,7 @@ impl Store {
 
     /// Per-model task stats of a role.
     pub fn task_stats(&self, role: &str) -> Result<Vec<crate::routing::TaskStat>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT model, COUNT(*), SUM(outcome='completed'), AVG(ms), AVG(tokens) FROM task_stats WHERE role=?1 GROUP BY model",
         )?;
         let rows = stmt
@@ -1548,7 +1719,7 @@ impl Store {
         reason: &str,
     ) -> Result<String> {
         let id = format!("h{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.conn.execute(
+        self.ex(
             "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![id, op, target, before.to_string(), after.to_string(), tool, reason, now()],
         )?;
@@ -1557,7 +1728,7 @@ impl Store {
 
     /// Harness changes, newest first.
     pub fn harness_changes(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT id, op, target, before, after, tool, reason, undone, created_at FROM harness_changes
              ORDER BY created_at DESC, rowid DESC LIMIT ?1",
         )?;
@@ -1577,7 +1748,7 @@ impl Store {
     }
 
     pub fn mark_harness_undone(&self, id: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE harness_changes SET undone=1 WHERE id=?1",
             params![id],
         )?;
@@ -1604,14 +1775,14 @@ impl Store {
     /// goal: `edited` (the user edited and re-ran) or `corrected` (the next
     /// message reads like "that's wrong"). The first follow-up wins.
     pub fn mark_last_run_followup(&self, session_id: &str, followup: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE runs SET followup=?2 WHERE id=(SELECT id FROM runs WHERE session_id=?1
                ORDER BY created_at DESC, rowid DESC LIMIT 1) AND followup=''",
             params![session_id, followup],
         )?;
         // A primary role's task that the user corrected was not good
         // (SPEC §4.6).
-        self.conn.execute(
+        self.ex(
             "UPDATE task_stats SET outcome=?2 WHERE run_id=(SELECT id FROM runs WHERE session_id=?1
                ORDER BY created_at DESC, rowid DESC LIMIT 1) AND outcome='completed'",
             params![session_id, followup],
@@ -1631,7 +1802,7 @@ impl Store {
         limit: usize,
         since: Option<&str>,
     ) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT r.id, r.session_id, r.status, r.followup, r.steps,
                (SELECT COUNT(*) FROM invocations i WHERE i.run_id=r.id),
                (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
@@ -1674,7 +1845,7 @@ impl Store {
     }
 
     pub fn set_run_status(&self, run_id: &str, status: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE runs SET status=?2, updated_at=?3 WHERE id=?1",
             params![run_id, status, now()],
         )?;
@@ -1690,7 +1861,7 @@ impl Store {
     ) -> Result<SubagentInfo> {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
-        self.conn.execute(
+        self.ex(
             "INSERT INTO subagents(id,session_id,run_id,task,depth,status,created_at,updated_at,model) VALUES(?1,?2,?3,?4,?5,'running',?6,?6,?7)",
             params![id, session_id, run_id, task, depth, t, model],
         )?;
@@ -1736,7 +1907,7 @@ impl Store {
 
     /// Append one provider-shaped message to a sub-agent's transcript.
     pub fn append_subagent_message(&self, subagent_id: &str, message: &Value) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO subagent_messages(subagent_id,seq,message) VALUES(?1,(SELECT COALESCE(MAX(seq),0)+1 FROM subagent_messages WHERE subagent_id=?1),?2)",
             params![subagent_id, message.to_string()],
         )?;
@@ -1757,7 +1928,7 @@ impl Store {
     }
 
     pub fn set_subagent_steps(&self, id: &str, steps: i64) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE subagents SET steps=?2, updated_at=?3 WHERE id=?1",
             params![id, steps, now()],
         )?;
@@ -1765,7 +1936,7 @@ impl Store {
     }
 
     pub fn finish_subagent(&self, id: &str, status: &str, result: &str) -> Result<SubagentInfo> {
-        self.conn.execute(
+        self.ex(
             "UPDATE subagents SET status=?2, result=?3, updated_at=?4 WHERE id=?1",
             params![id, status, result, now()],
         )?;
@@ -1775,7 +1946,7 @@ impl Store {
     /// Record a Pending Invocation handle the agent was given (§6.2), so it
     /// can still be answered after a daemon restart.
     pub fn add_pending_handle(&self, handle: &str, session_id: &str, tool: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT OR REPLACE INTO pending_handles(handle,session_id,tool_name,status,created_at) VALUES(?1,?2,?3,'pending',?4)",
             params![handle, session_id, tool, now()],
         )?;
@@ -1784,7 +1955,7 @@ impl Store {
 
     /// The handle's result was delivered (or dropped): forget it.
     pub fn remove_pending_handle(&self, handle: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "DELETE FROM pending_handles WHERE handle=?1",
             params![handle],
         )?;
@@ -1806,13 +1977,13 @@ impl Store {
     /// On daemon startup: every handle still pending lost its in-memory
     /// work. Marks them interrupted and returns (handle, session, tool).
     pub fn interrupt_pending_handles(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT handle, session_id, tool_name FROM pending_handles WHERE status='pending'",
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        self.conn.execute(
+        self.ex(
             "UPDATE pending_handles SET status='interrupted' WHERE status='pending'",
             [],
         )?;
@@ -1821,7 +1992,7 @@ impl Store {
 
     /// Queue a message to start its own Run after the current one (§5.3).
     pub fn enqueue_message(&self, session_id: &str, content: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO queued_messages(session_id,content,created_at) VALUES(?1,?2,?3)",
             params![session_id, content, now()],
         )?;
@@ -1856,7 +2027,7 @@ impl Store {
     }
 
     pub fn clear_queued_messages(&self, session_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "DELETE FROM queued_messages WHERE session_id=?1",
             params![session_id],
         )?;
@@ -1918,18 +2089,18 @@ impl Store {
     /// On daemon startup, runs left 'running' were interrupted by a crash (SPEC §9.5).
     pub fn mark_orphan_runs_interrupted(&self) -> Result<usize> {
         // In-flight invocations: outcome unknown, never re-executed (§9.5).
-        let _ = self.conn.execute(
+        let _ = self.ex(
             "UPDATE invocations SET status='interrupted', tag='interrupted' WHERE status='running'",
             [],
         );
-        let _ = self.conn.execute(
+        let _ = self.ex(
             "UPDATE subagents SET status='interrupted', updated_at=?1 WHERE status='running'",
             params![now()],
         );
-        Ok(self.conn.execute(
+        self.ex(
             "UPDATE runs SET status='interrupted', error='the daemon stopped while this Run was going', updated_at=?1 WHERE status='running'",
             params![now()],
-        )?)
+        )
     }
 
     pub fn save_checkpoint(
@@ -1939,14 +2110,14 @@ impl Store {
         up_to_seq: i64,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        self.ex(
             "INSERT INTO checkpoints(id,session_id,summary,up_to_seq,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![id, session_id, summary, up_to_seq, now()],
         )?;
         Ok(id)
     }
     pub fn latest_checkpoint(&self, session_id: &str) -> Result<Option<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![session_id], |r| {
@@ -1961,7 +2132,7 @@ impl Store {
     // --- Tools (SPEC §7, §8) ---
 
     fn tool_info(&self, id: &str) -> Result<Option<ToolInfo>> {
-        let mut stmt = self.conn.prepare("SELECT * FROM tools WHERE id=?1")?;
+        let mut stmt = self.ps("SELECT * FROM tools WHERE id=?1")?;
         let mut rows = stmt.query_map(params![id], |r| {
             Ok((
                 r.get::<_, String>("id")?,
@@ -2079,18 +2250,18 @@ impl Store {
             }
             None => {
                 let tid = uuid::Uuid::new_v4().to_string();
-                self.conn.execute(
+                self.ex(
                     "INSERT INTO tools(id,name,name_lower,description,current_version,created_at,updated_at) VALUES(?1,?2,?3,?4,0,?5,?5)",
                     params![tid, name, lower, description, t],
                 )?;
                 (tid, 1)
             }
         };
-        self.conn.execute(
+        self.ex(
             "INSERT INTO tool_versions(id,tool_id,version,input_schema,output_schema,code,capabilities,memory_mb,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![uuid::Uuid::new_v4().to_string(), tool_id, version, input_schema, output_schema, code, serde_json::to_string(&caps.to_specs())?, memory_mb, author, t],
         )?;
-        self.conn.execute(
+        self.ex(
             "UPDATE tools SET description=?2, current_version=?3, updated_at=?4 WHERE id=?1",
             params![tool_id, description, version, t],
         )?;
@@ -2142,7 +2313,7 @@ impl Store {
             } else {
                 "SELECT id FROM tools WHERE retired=0 ORDER BY name_lower"
             };
-            let mut stmt = self.conn.prepare(sql)?;
+            let mut stmt = self.ps(sql)?;
             let rows = stmt
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2211,18 +2382,18 @@ impl Store {
             }
             None => {
                 let mid = uuid::Uuid::new_v4().to_string();
-                self.conn.execute(
+                self.ex(
                     "INSERT INTO modules(id,name,name_lower,description,current_version,created_at,updated_at) VALUES(?1,?2,?3,?4,0,?5,?5)",
                     params![mid, name, lower, description, t],
                 )?;
                 (mid, 1)
             }
         };
-        self.conn.execute(
+        self.ex(
             "INSERT INTO module_versions(id,module_id,version,code,author,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![uuid::Uuid::new_v4().to_string(), module_id, version, code, author, t],
         )?;
-        self.conn.execute(
+        self.ex(
             "UPDATE modules SET description=?2, current_version=?3, updated_at=?4 WHERE id=?1",
             params![module_id, description, version, t],
         )?;
@@ -2255,7 +2426,7 @@ impl Store {
 
     /// Every version of a module as (version, code, author, created_at).
     pub fn module_versions(&self, module_id: &str) -> Result<Vec<(i64, String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT version, code, author, created_at FROM module_versions WHERE module_id=?1 ORDER BY version",
         )?;
         let rows = stmt
@@ -2351,7 +2522,7 @@ impl Store {
         est_tokens: i64,
     ) -> Result<PromptProposalInfo> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        self.ex(
             "INSERT INTO prompt_proposals(id,kind,content,rationale,status,est_tokens,created_at) VALUES(?1,?2,?3,?4,'proposed',?5,?6)",
             params![id, kind, content, rationale, est_tokens, now()],
         )?;
@@ -2370,7 +2541,7 @@ impl Store {
     }
 
     pub fn list_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals ORDER BY created_at DESC",
         )?;
         let rows = stmt
@@ -2395,7 +2566,7 @@ impl Store {
         candidate: f64,
         total: i64,
     ) -> Result<Option<PromptProposalInfo>> {
-        self.conn.execute(
+        self.ex(
             "UPDATE prompt_proposals SET status='measured', baseline_score=?2, candidate_score=?3, eval_total=?4 WHERE id=?1 AND status IN ('proposed','measured')",
             params![id, baseline, candidate, total],
         )?;
@@ -2416,12 +2587,12 @@ impl Store {
             other => return Err(anyhow::anyhow!("unknown proposal status '{other}'")),
         };
         let changed = if applied {
-            self.conn.execute(
+            self.ex(
                 &format!("UPDATE prompt_proposals SET status='applied', applied_at=?2 WHERE id=?1 AND {from}"),
                 params![id, now()],
             )?
         } else {
-            self.conn.execute(
+            self.ex(
                 &format!("UPDATE prompt_proposals SET status=?2 WHERE id=?1 AND {from}"),
                 params![id, status],
             )?
@@ -2435,7 +2606,7 @@ impl Store {
             match status {
                 "applied" => {
                     let (m, _) = self.add_memory(&p.content, "global", "optimiser", None)?;
-                    self.conn.execute(
+                    self.ex(
                         "UPDATE memories SET proposal_id=?2 WHERE id=?1",
                         params![m.id, p.id],
                     )?;
@@ -2474,7 +2645,7 @@ impl Store {
         if model.trim().is_empty() || model.eq_ignore_ascii_case("auto") {
             return Ok(());
         }
-        self.conn.execute(
+        self.ex(
             "INSERT INTO model_stats(model,successes,failures,total_ms,updated_at) VALUES(?1,?2,?3,?4,?5) \
              ON CONFLICT(model) DO UPDATE SET successes=successes+excluded.successes, failures=failures+excluded.failures, total_ms=total_ms+excluded.total_ms, updated_at=excluded.updated_at",
             params![
@@ -2485,7 +2656,7 @@ impl Store {
                 now()
             ],
         )?;
-        self.conn.execute(
+        self.ex(
             "INSERT INTO model_events(model, ok, ms, created_at) VALUES(?1, ?2, ?3, ?4)",
             params![model, ok as i64, elapsed_ms.max(0), now()],
         )?;
@@ -2494,7 +2665,7 @@ impl Store {
 
     /// Model outcomes since `since` (from the event log, kept since v38).
     pub fn model_stats_since(&self, since: &str) -> Result<Vec<ModelStat>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT model, SUM(ok), SUM(ok=0), SUM(ms) FROM model_events
              WHERE created_at >= ?1 GROUP BY model ORDER BY model",
         )?;
@@ -2514,7 +2685,7 @@ impl Store {
     /// Each Tool's calls and success rate since `since`: (tool id, calls,
     /// success rate over successes and failures).
     pub fn tool_metrics_since(&self, since: &str) -> Result<Vec<(String, i64, Option<f64>)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT tool_id, COUNT(*), SUM(status='success'), SUM(status='failure')
              FROM invocations WHERE created_at >= ?1 GROUP BY tool_id",
         )?;
@@ -2553,7 +2724,7 @@ impl Store {
             return Ok(None);
         };
         let versions = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.ps(
                 "SELECT version,author,created_at,capabilities,memory_mb,input_schema,output_schema,code FROM tool_versions WHERE tool_id=?1 ORDER BY version",
             )?;
             let rows = stmt
@@ -2597,7 +2768,7 @@ impl Store {
             format!("{}… (cut)", &s[..end])
         };
         let recent_calls = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.ps(
                 "SELECT id, version, session_id, status, input, output, error, duration_ms, created_at
                  FROM invocations WHERE tool_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 20",
             )?;
@@ -2717,7 +2888,7 @@ impl Store {
         source: &str,
     ) -> Result<()> {
         for id in tool_ids {
-            self.conn.execute(
+            self.ex(
                 // Loading again revives a Tool the Session had unloaded.
                 "INSERT INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(session_id, tool_id) DO UPDATE SET source=excluded.source, loaded_at=excluded.loaded_at, unload=0 \
@@ -2734,11 +2905,11 @@ impl Store {
     pub fn request_unload(&self, session_id: &str, tool_ids: &[String]) -> Result<usize> {
         let mut n = 0;
         for id in tool_ids {
-            self.conn.execute(
+            self.ex(
                 "INSERT OR IGNORE INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, 'called', ?3)",
                 params![session_id, id, now()],
             )?;
-            n += self.conn.execute(
+            n += self.ex(
                 "UPDATE session_tools SET unload=1 WHERE session_id=?1 AND tool_id=?2 AND source!='created'",
                 params![session_id, id],
             )?;
@@ -2750,7 +2921,7 @@ impl Store {
     /// `max_loaded` listed Tools (oldest found/filler/called first; a
     /// Session's own creations stay). Returns how many were unloaded.
     pub fn apply_unloads(&self, session_id: &str, max_loaded: usize) -> Result<usize> {
-        let mut n = self.conn.execute(
+        let mut n = self.ex(
             "UPDATE session_tools SET source='unloaded', unload=0, pinned_def=NULL, pinned_version=NULL WHERE session_id=?1 AND unload=1",
             params![session_id],
         )?;
@@ -2761,7 +2932,7 @@ impl Store {
         )?;
         let excess = (loaded as usize).saturating_sub(max_loaded.max(1));
         if excess > 0 {
-            n += self.conn.execute(
+            n += self.ex(
                 "UPDATE session_tools SET source='unloaded', pinned_def=NULL, pinned_version=NULL WHERE rowid IN (
                    SELECT rowid FROM session_tools WHERE session_id=?1 AND source NOT IN ('unloaded','created')
                    ORDER BY loaded_at LIMIT ?2)",
@@ -2774,7 +2945,7 @@ impl Store {
     /// Forget the frozen most-used "filler" picks, so the next listing
     /// chooses them again from current usage (called at compaction).
     pub fn reset_filler(&self, session_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "DELETE FROM session_tools WHERE session_id=?1 AND source='filler'",
             params![session_id],
         )?;
@@ -2804,7 +2975,7 @@ impl Store {
     }
 
     pub fn set_session_system_prompt(&self, session_id: &str, prompt: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE sessions SET system_prompt=?2 WHERE id=?1",
             params![session_id, prompt],
         )?;
@@ -2830,7 +3001,7 @@ impl Store {
     /// Pinned definitions of a Session's Tools that are no longer active
     /// (retired, e.g. an MCP server dropped them), as (tool id, definition).
     pub fn pinned_inactive(&self, session_id: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT st.tool_id, st.pinned_def FROM session_tools st JOIN tools t ON t.id = st.tool_id
              WHERE st.session_id=?1 AND st.pinned_def IS NOT NULL AND st.source!='unloaded' AND t.retired=1",
         )?;
@@ -2847,11 +3018,11 @@ impl Store {
         version: i64,
         def: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT OR IGNORE INTO session_tools(session_id, tool_id, source, loaded_at) VALUES (?1, ?2, 'called', ?3)",
             params![session_id, tool_id, now()],
         )?;
-        self.conn.execute(
+        self.ex(
             "UPDATE session_tools SET pinned_version=?3, pinned_def=?4 WHERE session_id=?1 AND tool_id=?2",
             params![session_id, tool_id, version, def],
         )?;
@@ -2866,7 +3037,7 @@ impl Store {
         session_id: &str,
         tool_ids: Option<&[String]>,
     ) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT tool_id, pinned_version FROM session_tools WHERE session_id=?1 AND pinned_def IS NOT NULL",
         )?;
         let pinned: Vec<(String, i64)> = stmt
@@ -2877,7 +3048,7 @@ impl Store {
             .filter(|(id, _)| tool_ids.is_none_or(|ids| ids.contains(id)))
             .collect();
         for (id, _) in &dropped {
-            self.conn.execute(
+            self.ex(
                 "UPDATE session_tools SET pinned_version=NULL, pinned_def=NULL WHERE session_id=?1 AND tool_id=?2",
                 params![session_id, id],
             )?;
@@ -2886,7 +3057,7 @@ impl Store {
     }
 
     pub fn session_tool_ids(&self, session_id: &str) -> Result<std::collections::HashSet<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT tool_id FROM session_tools WHERE session_id=?1 AND source!='unloaded'
              UNION SELECT DISTINCT tool_id FROM invocations WHERE session_id=?1
                AND tool_id NOT IN (SELECT tool_id FROM session_tools WHERE session_id=?1 AND source='unloaded')",
@@ -2903,7 +3074,7 @@ impl Store {
         tool_id: &str,
         limit: usize,
     ) -> Result<Vec<(i64, String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT version, tag, input, error FROM invocations
              WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC LIMIT ?2",
         )?;
@@ -2916,7 +3087,7 @@ impl Store {
     }
 
     pub fn set_tool_retired(&self, id: &str, retired: bool) -> Result<Option<ToolInfo>> {
-        self.conn.execute(
+        self.ex(
             "UPDATE tools SET retired=?2, updated_at=?3 WHERE id=?1",
             params![id, retired as i64, now()],
         )?;
@@ -2955,7 +3126,7 @@ impl Store {
                 KV_MAX_NAMESPACE / 1024 / 1024
             );
         }
-        self.conn.execute(
+        self.ex(
             "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES(?1,?2,?3,?4)
              ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             params![namespace, key, text, now()],
@@ -2964,7 +3135,7 @@ impl Store {
     }
 
     pub fn kv_delete(&self, namespace: &str, key: &str) -> Result<bool> {
-        Ok(self.conn.execute(
+        Ok(self.ex(
             "DELETE FROM tool_kv WHERE namespace=?1 AND key=?2",
             params![namespace, key],
         )? > 0)
@@ -2972,7 +3143,7 @@ impl Store {
 
     /// Keys under `prefix`, sorted (at most 1000).
     pub fn kv_list(&self, namespace: &str, prefix: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT key FROM tool_kv WHERE namespace=?1 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000",
         )?;
         let rows = stmt
@@ -2983,7 +3154,7 @@ impl Store {
 
     pub fn purge_tool(&self, id: &str) -> Result<bool> {
         // The Tool's own store goes with it.
-        self.conn.execute(
+        self.ex(
             "DELETE FROM tool_kv WHERE namespace=?1",
             params![format!("tool:{id}")],
         )?;
@@ -3006,7 +3177,7 @@ impl Store {
         if !exists {
             return Ok(None);
         }
-        self.conn.execute(
+        self.ex(
             "UPDATE tools SET current_version=?2, updated_at=?3 WHERE id=?1",
             params![id, version, now()],
         )?;
@@ -3024,17 +3195,19 @@ impl Store {
         parent_id: Option<&str>,
         input: &str,
     ) -> Result<String> {
+        let tx = self.conn.unchecked_transaction()?;
         if let Some(run) = run_id {
-            let _ = self.conn.execute(
+            let _ = tx.execute(
                 "UPDATE invocations SET retried=1 WHERE rowid=(SELECT MAX(rowid) FROM invocations WHERE tool_id=?1 AND run_id=?2 AND status='success')",
                 params![tool_id, run],
             );
         }
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO invocations(id,tool_id,version,session_id,run_id,parent_id,status,tag,input,output,error,duration_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,'running','',?7,'','',0,?8)",
             params![id, tool_id, version, session_id, run_id, parent_id, input, now()],
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3050,19 +3223,18 @@ impl Store {
         duration_ms: i64,
         retention: usize,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE invocations SET status=?2, tag=?3, output=?4, error=?5, duration_ms=?6 WHERE id=?1",
             params![id, status, tag, output, error, duration_ms],
         )?;
-        self.conn.execute(
-            "DELETE FROM invocations WHERE tool_id=?1 AND status!='running' AND rowid NOT IN (SELECT rowid FROM invocations WHERE tool_id=?1 ORDER BY rowid DESC LIMIT ?2)",
-            params![tool_id, retention as i64],
-        )?;
+        prune_invocations(&tx, tool_id, retention)?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn set_invocation_tag(&self, id: &str, tag: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE invocations SET tag=?2 WHERE id=?1",
             params![id, tag],
         )?;
@@ -3098,21 +3270,20 @@ impl Store {
     ) -> Result<String> {
         // Retry signal (SPEC §8.1): a new invocation of the same Tool in the
         // same Run immediately after a success marks that success retried.
+        let tx = self.conn.unchecked_transaction()?;
         if let Some(run) = run_id {
-            let _ = self.conn.execute(
+            let _ = tx.execute(
                 "UPDATE invocations SET retried=1 WHERE rowid=(SELECT MAX(rowid) FROM invocations WHERE tool_id=?1 AND run_id=?2 AND status='success')",
                 params![tool_id, run],
             );
         }
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO invocations(id,tool_id,version,session_id,run_id,parent_id,status,tag,input,output,error,duration_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![id, tool_id, version, session_id, run_id, parent_id, status, tag, input, output, error, duration_ms, now()],
         )?;
-        self.conn.execute(
-            "DELETE FROM invocations WHERE tool_id=?1 AND rowid NOT IN (SELECT rowid FROM invocations WHERE tool_id=?1 ORDER BY rowid DESC LIMIT ?2)",
-            params![tool_id, retention as i64],
-        )?;
+        prune_invocations(&tx, tool_id, retention)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3131,7 +3302,7 @@ impl Store {
         )?;
         let per_success = |v: i64| (success > 0).then(|| v as f64 / success as f64);
         let mut durations: Vec<i64> = {
-            let mut stmt = self.conn.prepare("SELECT duration_ms FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2) AND status='success' ORDER BY duration_ms")?;
+            let mut stmt = self.ps("SELECT duration_ms FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2) AND status='success' ORDER BY duration_ms")?;
             let rows = stmt
                 .query_map(params![tool_id, version], |r| r.get::<_, i64>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3223,7 +3394,7 @@ impl Store {
     }
 
     pub fn set_approval(&self, tool_id: &str, caps: &Capabilities, memory_mb: u32) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO approvals(tool_id,capabilities,memory_mb,approved_at) VALUES(?1,?2,?3,?4) ON CONFLICT(tool_id) DO UPDATE SET capabilities=excluded.capabilities, memory_mb=excluded.memory_mb, approved_at=excluded.approved_at",
             params![tool_id, serde_json::to_string(&caps.to_specs())?, memory_mb, now()],
         )?;
@@ -3252,7 +3423,7 @@ impl Store {
         has_scripts: bool,
     ) -> Result<formless_protocol::SkillInfo> {
         let t = now();
-        self.conn.execute(
+        self.ex(
             "INSERT INTO skills(id,name,description,current_version,enabled,source,author,has_scripts,created_at,updated_at)
              VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?8)
              ON CONFLICT(name) DO UPDATE SET description=excluded.description, current_version=excluded.current_version,
@@ -3260,7 +3431,7 @@ impl Store {
                retired=0, updated_at=excluded.updated_at",
             params![uuid::Uuid::new_v4().to_string(), name, description, version, source, author, has_scripts, t],
         )?;
-        self.conn.execute(
+        self.ex(
             "INSERT OR REPLACE INTO skill_versions(skill_id,version,path,created_at) SELECT id,?2,?3,?4 FROM skills WHERE name=?1",
             params![name, version, path, t],
         )?;
@@ -3286,7 +3457,7 @@ impl Store {
     }
 
     pub fn list_skills(&self) -> Result<Vec<formless_protocol::SkillInfo>> {
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.ps(&format!(
             "SELECT {SKILL_COLS} FROM skills s ORDER BY s.name"
         ))?;
         let rows = stmt
@@ -3320,7 +3491,7 @@ impl Store {
 
     /// Enabling also restores a retired skill.
     pub fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
-        Ok(self.conn.execute(
+        Ok(self.ex(
             "UPDATE skills SET enabled=?2, retired=CASE WHEN ?2 THEN 0 ELSE retired END, updated_at=?3 WHERE name=?1",
             params![name, enabled, now()],
         )? > 0)
@@ -3328,7 +3499,7 @@ impl Store {
 
     /// Record that a Session loaded a skill (usage metrics).
     pub fn record_skill_load(&self, name: &str, session_id: &str, run_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO skill_loads(skill_id, session_id, run_id, created_at) SELECT id, ?2, ?3, ?4 FROM skills WHERE name=?1",
             params![name, session_id, run_id, now()],
         )?;
@@ -3364,7 +3535,7 @@ impl Store {
             let unhelpful =
                 s.runs >= min_runs.max(1) && (s.runs_completed as f64) < min_rate * s.runs as f64;
             if idle || unhelpful {
-                self.conn.execute(
+                self.ex(
                     "UPDATE skills SET retired=1, enabled=0, updated_at=?2 WHERE name=?1",
                     params![s.name, now()],
                 )?;
@@ -3376,7 +3547,7 @@ impl Store {
 
     /// Registry Tools a Run called, in order, with input and status.
     pub fn run_invocations(&self, run_id: &str) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT t.name, i.input, i.status FROM invocations i JOIN tools t ON t.id=i.tool_id
              WHERE i.run_id=?1 ORDER BY i.created_at, i.rowid",
         )?;
@@ -3389,7 +3560,7 @@ impl Store {
     /// Whether a completed Run in another Session called the same Tools in
     /// the same order (a repeated pattern worth a skill).
     pub fn tool_sequence_seen_elsewhere(&self, session_id: &str, seq: &[String]) -> Result<bool> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT r.id FROM runs r WHERE r.session_id!=?1 AND r.status='completed'
                AND EXISTS(SELECT 1 FROM invocations i WHERE i.run_id=r.id)
              ORDER BY r.created_at DESC LIMIT 500",
@@ -3421,7 +3592,7 @@ impl Store {
 
     /// Delete a skill's rows; returns its version folders to remove.
     pub fn remove_skill(&self, name: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT v.path FROM skill_versions v JOIN skills s ON s.id=v.skill_id WHERE s.name=?1",
         )?;
         let paths: Vec<String> = stmt
@@ -3474,7 +3645,7 @@ impl Store {
             .ok();
         let (id, created) = match existing {
             Some(id) => {
-                self.conn.execute(
+                self.ex(
                     "UPDATE memories SET enabled=1, updated_at=?2 WHERE id=?1",
                     params![id, t],
                 )?;
@@ -3482,7 +3653,7 @@ impl Store {
             }
             None => {
                 let id = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                self.conn.execute(
+                self.ex(
                     "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
                     params![id, crate::memory::clean(text), key, scope, author, session_id, t],
                 )?;
@@ -3527,7 +3698,7 @@ impl Store {
         let text = text.unwrap_or(&cur.text);
         let scope = scope.unwrap_or(&cur.scope);
         crate::memory::validate(text, scope)?;
-        self.conn.execute(
+        self.ex(
             "UPDATE memories SET text=?2, dedup_key=?3, scope=?4, enabled=?5, updated_at=?6 WHERE id=?1",
             params![
                 id,
@@ -3550,7 +3721,7 @@ impl Store {
 
     /// Mark the enabled notes as used (a Session's prompt included them).
     pub fn touch_memories(&self) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE memories SET last_used=?1 WHERE enabled=1",
             params![now()],
         )?;
@@ -3567,7 +3738,7 @@ impl Store {
     }
 
     pub fn approve_mcp_server(&self, server: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT OR REPLACE INTO mcp_server_grants(server, approved_at) VALUES(?1, ?2)",
             params![server, now()],
         )?;
@@ -3582,7 +3753,7 @@ impl Store {
         model: &str,
         usage: &crate::provider::Usage,
     ) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 session_id,
@@ -3603,7 +3774,7 @@ impl Store {
         &self,
         since: Option<&str>,
     ) -> Result<std::collections::HashMap<String, (i64, i64, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage
              WHERE ?1 IS NULL OR created_at >= ?1 GROUP BY model",
         )?;
@@ -3625,7 +3796,7 @@ impl Store {
             "role" => "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')",
             _ => "substr(u.created_at, 1, 10)",
         };
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.ps(&format!(
             "SELECT {key}, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens), SUM(u.cached_tokens)
              FROM run_usage u LEFT JOIN sessions s ON s.id=u.session_id
              WHERE ?1 IS NULL OR u.created_at >= ?1
@@ -3673,7 +3844,7 @@ impl Store {
 
     /// (id, path, bytes, created_at) of every artifact, oldest first.
     pub fn list_artifacts(&self) -> Result<Vec<(String, String, i64, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT id, path, bytes, created_at FROM artifacts ORDER BY created_at, rowid",
         )?;
         let rows = stmt
@@ -3714,7 +3885,7 @@ impl Store {
     }
 
     pub fn delete_session_artifact_rows(&self, session_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "DELETE FROM artifacts WHERE session_id=?1",
             params![session_id],
         )?;
@@ -3729,7 +3900,7 @@ impl Store {
         bytes: i64,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        self.ex(
             "INSERT INTO artifacts(id,session_id,path,preview,bytes,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![id, session_id, path, preview, bytes, now()],
         )?;
@@ -3758,7 +3929,7 @@ impl Store {
 
     pub fn replay_set(&self, tool_id: &str) -> Result<Vec<ReplayItem>> {
         let query = |status: &str, limit: i64| -> Result<Vec<ReplayItem>> {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.ps(
                 "SELECT input, error, tag FROM invocations WHERE tool_id=?1 AND status=?2 ORDER BY rowid DESC LIMIT ?3",
             )?;
             let rows = stmt
@@ -3788,7 +3959,7 @@ impl Store {
         est_tokens: i64,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        self.ex(
             "INSERT INTO optimiser_attempts(id,tool_id,base_version,status,candidate_code,candidate_description,candidate_input_schema,candidate_output_schema,candidate_capabilities,candidate_memory_mb,est_tokens,created_at) VALUES(?1,?2,?3,'generated',?4,?5,?6,?7,?8,?9,?10,?11)",
             params![id, tool_id, base_version, cand.code, cand.description, cand.input_schema, cand.output_schema, serde_json::to_string(&cand.capabilities)?, cand.memory_mb, est_tokens, now()],
         )?;
@@ -3806,7 +3977,7 @@ impl Store {
         replay_total: i64,
         regressions: i64,
     ) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE optimiser_attempts SET status=?2, detail=?3, candidate_score=?4, baseline_score=?5, replay_total=?6, regressions=?7 WHERE id=?1",
             params![id, status, detail, candidate_score, baseline_score, replay_total, regressions],
         )?;
@@ -3841,7 +4012,7 @@ impl Store {
         tool_id: &str,
         limit: i64,
     ) -> Result<Vec<formless_protocol::OptimiserAttemptInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT id,base_version,status,detail,candidate_score,baseline_score,replay_total,regressions,created_at FROM optimiser_attempts WHERE tool_id=?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
         let rows = stmt
@@ -3890,7 +4061,7 @@ impl Store {
     }
 
     pub fn set_cooldown(&self, tool_id: &str, until_rfc3339: Option<&str>) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE tools SET cooldown_until=?2 WHERE id=?1",
             params![tool_id, until_rfc3339],
         )?;
@@ -3898,7 +4069,7 @@ impl Store {
     }
 
     pub fn set_consecutive_failures(&self, tool_id: &str, n: i64) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE tools SET consecutive_failures=?2 WHERE id=?1",
             params![tool_id, n],
         )?;
@@ -3906,7 +4077,7 @@ impl Store {
     }
 
     pub fn set_needs_attention(&self, tool_id: &str, on: bool) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "UPDATE tools SET needs_attention=?2, updated_at=?3 WHERE id=?1",
             params![tool_id, on as i64, now()],
         )?;
@@ -3920,7 +4091,7 @@ impl Store {
         action_prefix: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, String, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT actor, action, detail, created_at FROM audit
              WHERE ?1 IS NULL OR substr(action,1,length(?1))=?1
              ORDER BY created_at DESC, rowid DESC LIMIT ?2",
@@ -3941,7 +4112,7 @@ impl Store {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<formless_protocol::AuditEntry>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.ps(
             "SELECT actor, action, detail, created_at FROM audit
              WHERE (?1 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?1)) > 0)
                AND (?2 IS NULL OR created_at < ?2)
@@ -3983,7 +4154,7 @@ impl Store {
     }
 
     pub fn audit(&self, actor: &str, action: &str, detail: &str) -> Result<()> {
-        self.conn.execute(
+        self.ex(
             "INSERT INTO audit(id,actor,action,detail,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![
                 uuid::Uuid::new_v4().to_string(),

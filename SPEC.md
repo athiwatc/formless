@@ -1514,6 +1514,20 @@ such as `read_file`, `read_text_file` and `file_read`.
   older than the build). Each step runs in a transaction with its version
   bump, and a database newer than the build is refused, never downgraded. On corruption it refuses to guess: it stops,
   reports, and points at the backup (see Edge Cases, §16).
+ - **Connection settings** (every connection): WAL, `synchronous=NORMAL`
+   (SQLite's recommendation under WAL — commits survive a crash of the
+   process, and the agent loop commits several times per step), a 5 s busy
+   timeout, in-memory temp tables, a 32 MiB page cache, a 256 MiB read map
+   and a 64 MiB WAL cap. A statement cache keeps the few dozen statements the
+   loop re-runs from being re-parsed, and `PRAGMA optimize` runs on close.
+ - **The Sessions list is one scan:** `sessions.message_count`, `preview` and
+   `last_run_status` are columns kept true by triggers on `messages` and
+   `runs` (schema v39, backfilled from the rows that existed) instead of
+   three correlated subqueries per Session. v39 also adds the indexes the
+   query plans asked for: `runs(session_id, created_at)`,
+   `invocations(run_id)`, `invocations(session_id, tool_id)`,
+   `invocations(tool_id) WHERE status='running'`, `artifacts(session_id)`
+   and `audit(created_at)`.
 
 ### 9.5 Crash recovery
 
