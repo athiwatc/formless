@@ -44,6 +44,7 @@ const SESSIONS: &[Hint] = &[
 
 const TOOLS: &[Hint] = &[
     h("Enter", "detail", 0),
+    h("[ ]", "calls", 4),
     h("E", "edit", 2),
     h("o", "optimise", 4),
     h("x", "retire", 3),

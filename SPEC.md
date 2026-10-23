@@ -1768,6 +1768,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   calls don't count). The TUI Tools list shows the last 20 as a sparkline
   (tall green success, short red failure) with ↑/↓ when the success rate
   moved 10 points or more against the 20 before (both windows ≥5 calls).
+- **Recent calls.** `ToolDetail.recent_calls` lists the last 20
+  Invocations, newest first (time, Session, status, duration, input,
+  output and error, each capped at 20 KB). The TUI Tool detail shows them
+  under "Recent calls": `[`/`]` select one, Enter opens its full input,
+  output and error in the pager, and `S` opens its Session focused on the
+  first Tool result at or after the call's time.
 - **Tools view (browser):** list with success-rate/latency summaries, detail
   per Tool — descriptions, schemas, Capabilities, `memory_mb`, version
   history (author, timestamps, replaced-version stats), Invocation tallies,
