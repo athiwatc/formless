@@ -329,6 +329,8 @@ formless daemon stop
 formless daemon serve     # foreground, for watching logs
 formless doctor           # config, dirs, keychain, endpoint + tool-calling probe
 formless tools list       # registry inspection (also export / import)
+formless tools show fetch_page                       # description, schemas, versions, stats
+formless tools run fetch_page --input '{"url":"https://example.com"}' --yes
 formless reset --force    # destructive: config, key, whole data dir
 ```
 
@@ -414,7 +416,7 @@ formless --profile sandbox
 | `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one; `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run (nothing is stored) |
 | `formless daemon start\|stop\|status\|serve` | Daemon lifecycle |
 | `formless relay enable\|disable\|status` | Encrypted browser access (v2) |
-| `formless tools list\|export\|import` | Registry inspection and transfer (no secrets, no metrics) |
+| `formless tools list\|show\|run\|export\|import` | Registry inspection, direct runs, and transfer (no secrets, no metrics) |
 | `formless auth login\|status\|logout` | OAuth sign-in for subscription providers (v2) |
 | `formless prompts list\|generate\|apply\|reject\|rollback` | Measured prompt/memory proposals (v2) |
 | `formless update check` | Compare with the latest GitHub release; never modifies the binary |

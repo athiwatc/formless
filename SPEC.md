@@ -2297,7 +2297,16 @@ run_tool = "network_policy"     # a registry Tool, or…
     link, because session cookies don't survive a restart. Pasting a new
     link into an open tab signs in with it. Relay mode uses the same
     visible countdown.
-- `formless tools list|export|import …` — registry inspection/transfer
+- `formless tools list|show|run|export|import …` — registry inspection,
+  direct runs and transfer.
+  - `show NAME [--json]` prints the description, Capabilities, memory,
+    stats, attention reasons, versions and schemas.
+  - `run NAME --input JSON [--yes] [--session ID]` runs the Tool through
+    `RunTool`. Approval requests are answered by the command: once with
+    `--yes`, otherwise denied (fail closed), and nothing is remembered.
+    Without `--session` it runs in a new Session that is archived
+    afterwards. It prints the result and exits 0, or 1 when the call fails
+    or is denied (2 for a bad `--input`).
   (same trust rules as §7.8).
 - `formless doctor` — diagnostics: config validity, data dir, keychain
   reachability, endpoint connectivity + tool-calling probe result.
