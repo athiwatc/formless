@@ -303,6 +303,13 @@ formless sessions import bundle.json
 formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
 ```
 
+### Reporting a bug
+
+```bash
+formless bug-report      # writes formless-bug-report-<time>.md (secrets redacted) to attach to an issue
+formless doctor --json   # the same checks, machine-readable
+```
+
 ### Daemon log
 
 ```bash
