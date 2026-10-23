@@ -169,27 +169,27 @@
 
 <!-- Approval dialog -->
 <div id="modal-backdrop" class="backdrop hidden">
-  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-body">
     <h2 id="modal-title"></h2>
     <div id="modal-body"></div>
     <div class="modal-actions">
       <span id="modal-more" class="muted"></span>
       <span class="spacer"></span>
       <button class="btn ghost" id="modal-later" type="button" title="Esc · bring it back with a or the status bar">Later</button>
-      <button class="btn danger" id="modal-deny" type="button"><kbd>n</kbd> Deny</button>
-      <button class="btn" id="modal-once" type="button"><kbd>o</kbd> Allow once</button>
-      <button class="btn primary" id="modal-approve" type="button"><kbd>y</kbd> Approve</button>
+      <button class="btn danger" id="modal-deny" type="button" aria-keyshortcuts="n"><kbd aria-hidden="true">n</kbd> Deny</button>
+      <button class="btn" id="modal-once" type="button" aria-keyshortcuts="o"><kbd aria-hidden="true">o</kbd> Allow once</button>
+      <button class="btn primary" id="modal-approve" type="button" aria-keyshortcuts="y"><kbd aria-hidden="true">y</kbd> Approve</button>
     </div>
   </div>
 </div>
 
 <!-- Generic prompt/confirm dialog -->
 <div id="ask-backdrop" class="backdrop hidden">
-  <form class="modal" id="ask-form">
+  <form class="modal" id="ask-form" role="dialog" aria-modal="true" aria-labelledby="ask-title" aria-describedby="ask-text">
     <h2 id="ask-title"></h2>
     <p id="ask-text" class="muted"></p>
     <div id="ask-body"></div>
-    <input id="ask-input" type="text" spellcheck="false">
+    <input id="ask-input" type="text" spellcheck="false" aria-labelledby="ask-title">
     <div class="modal-actions">
       <span class="spacer"></span>
       <button class="btn ghost" id="ask-cancel" type="button">Cancel</button>

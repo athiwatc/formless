@@ -549,6 +549,14 @@ pasting paths.
   messages (an earlier one drops the turns after it, and says so), Fork
   from here (`ForkSession` up to that message), and copying a Tool call's
   input or a result's output.
+- **Accessible dialogs (web).** The approval and question dialogs:
+  - are modal (`aria-modal`), labelled by their title and described by
+    their body;
+  - list the requested Capabilities under their own label;
+  - expose key shortcuts as `aria-keyshortcuts` (the visible key hints
+    are hidden from screen readers);
+  - keep Tab inside the dialog, and give focus back to where it was when
+    they close.
 - **Web pending prompts.** An approval can be set aside (Esc or Later),
   and a question dialog can be cancelled without answering. Either stays
   pending: the status bar shows "⚠ N awaiting approval" or "? the agent
