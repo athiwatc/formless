@@ -73,6 +73,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Settings: get, set (validated by the daemon), edit or locate config.toml
     Config {
         #[command(subcommand)]
@@ -493,6 +498,17 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // Completions need nothing else: no profile, config or daemon.
+    if let Some(Cmd::Completions { shell }) = cli.cmd {
+        use clap::CommandFactory;
+        clap_complete::generate(
+            shell,
+            &mut Cli::command(),
+            "formless",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
     let paths = Paths::resolve(cli.profile.as_deref())?;
     match cli.cmd {
         None | Some(Cmd::Tui) if cli.plain => formless_tui::plain::run(paths),
@@ -514,6 +530,7 @@ fn main() -> Result<()> {
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
+        Some(Cmd::Completions { .. }) => unreachable!("handled before the profile is set up"),
         Some(Cmd::Roles { action }) => roles_cmd(paths, action),
         Some(Cmd::Web {
             port,

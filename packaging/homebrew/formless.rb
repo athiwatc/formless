@@ -11,6 +11,8 @@ class Formless < Formula
 
   def install
     system "cargo", "install", *std_cargo_args(path: "crates/formless")
+    # `formless completions bash|zsh|fish` prints each script.
+    generate_completions_from_executable(bin/"formless", "completions")
   end
 
   test do

@@ -4,10 +4,25 @@
 set -eu
 PREFIX="${PREFIX:-$HOME/.local}"
 REPO="https://github.com/athiwatc/formless"
+
+# Shell completions under $PREFIX/share, where bash-completion, zsh (with
+# $PREFIX/share/zsh/site-functions on fpath) and fish look for them.
+install_completions() {
+  bin="$PREFIX/bin/formless"
+  mkdir -p "$PREFIX/share/bash-completion/completions" "$PREFIX/share/zsh/site-functions" \
+    "$PREFIX/share/fish/vendor_completions.d"
+  "$bin" completions bash > "$PREFIX/share/bash-completion/completions/formless" &&
+    "$bin" completions zsh > "$PREFIX/share/zsh/site-functions/_formless" &&
+    "$bin" completions fish > "$PREFIX/share/fish/vendor_completions.d/formless.fish" &&
+    echo "completions: $PREFIX/share/{bash-completion,zsh/site-functions,fish/vendor_completions.d}" ||
+    echo "note: could not install shell completions (formless completions <shell> prints them)" >&2
+}
+
 if [ "${FORMLESS_FROM_SOURCE:-0}" = "1" ]; then
   command -v cargo >/dev/null 2>&1 || { echo "error: cargo is required for a source install" >&2; exit 1; }
   cargo install --git "$REPO" --path crates/formless --locked --root "$PREFIX"
   echo "installed: $PREFIX/bin/formless"
+  install_completions
   exit 0
 fi
 os="$(uname -s)"; arch="$(uname -m)"
@@ -32,3 +47,4 @@ tar -xzf "$tmp/$asset" -C "$tmp"
 cp "$tmp/formless-$version-$target/formless" "$PREFIX/bin/formless"
 chmod +x "$PREFIX/bin/formless"
 echo "installed: $PREFIX/bin/formless ($version)"
+install_completions

@@ -2210,6 +2210,11 @@ run_tool = "network_policy"     # a registry Tool, or…
 ## 12. CLI
 
 - `formless` (no args) launches the TUI (auto-starting the daemon).
+- `formless completions <bash|zsh|fish|powershell|elvish>` prints a
+  completion script, generated from the command definitions (clap_complete),
+  with no daemon or profile needed. `scripts/install.sh` writes bash, zsh
+  and fish completions under `$PREFIX/share`, and the Homebrew formula
+  installs them with `generate_completions_from_executable`.
 - `formless config`:
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);

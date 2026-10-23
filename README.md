@@ -303,6 +303,14 @@ formless sessions import bundle.json
 formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
 ```
 
+### Shell completions
+
+The installer and the Homebrew formula install bash, zsh and fish completions. Otherwise:
+
+```bash
+formless completions zsh > ~/.zfunc/_formless      # also bash, fish, powershell, elvish
+```
+
 ### Settings from the command line
 
 ```bash
