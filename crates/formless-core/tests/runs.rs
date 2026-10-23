@@ -79,6 +79,13 @@ fn run_metrics_record_steps_tokens_and_followups() {
         .collect();
     assert_eq!(order[0], other);
     assert_eq!(order[1], newest);
+    // Archived Sessions list last (clients hide them by default) and
+    // stay searchable.
+    let a = store.set_session_archived(&s, true).unwrap().unwrap();
+    assert!(a.archived);
+    let listed = store.list_sessions().unwrap();
+    assert_eq!(listed.last().unwrap().id, s);
+    assert!(!store.search_sessions("latest ask", 10).unwrap().is_empty());
     let first = runs.iter().find(|r| r.run_id == r1).unwrap();
     assert_eq!(
         (

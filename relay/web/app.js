@@ -419,6 +419,14 @@
     if (popover) { popover.remove(); popover = null; }
     document.querySelectorAll(".menu[aria-expanded]").forEach((m) => m.removeAttribute("aria-expanded"));
   }
+  /** Archived Sessions are hidden but kept (SPEC §10.4). */
+  async function archiveSession(s) {
+    const r = await act({ type: "set_session_archived", id: s.id, archived: !s.archived }, s.archived ? "Restored " + s.name : "Archived " + s.name);
+    if (!r) return;
+    const i = S.sessions.findIndex((x) => x.id === r.id);
+    if (i >= 0) S.sessions[i] = r;
+    renderSessions();
+  }
   /** Pinned Sessions list first (SPEC §10.4). */
   async function pinSession(s) {
     const r = await act({ type: "set_session_pinned", id: s.id, pinned: !s.pinned });
@@ -434,6 +442,7 @@
     const r = btn.getBoundingClientRect();
     popover = h("div", { class: "popover", role: "menu" },
       h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
+      h("button", { type: "button", onclick: () => { closePopover(); archiveSession(s); } }, s.archived ? "Unarchive" : "Archive"),
       h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
       h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
       h("button", { type: "button", onclick: () => { closePopover(); exportSession(s.id); } }, "Export"),
@@ -469,7 +478,10 @@
       list.append(h("li", { class: "muted", style: "padding:8px" }, "No sessions yet."));
       return;
     }
-    for (const s of S.sessions) {
+    // Archived Sessions sit in their own collapsible group at the end.
+    const archived = S.sessions.filter((s) => s.archived);
+    const shown = S.sessions.filter((s) => !s.archived || S.showArchived);
+    for (const s of shown) {
       const menu = h("button", {
         class: "icon-btn menu", type: "button", "aria-label": "Session actions",
         onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
@@ -486,6 +498,12 @@
         s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
       h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
       menu));
+    }
+    if (archived.length) {
+      list.append(h("li", { class: "session archived-toggle muted", tabindex: 0,
+        onclick: () => { S.showArchived = !S.showArchived; renderSessions(); },
+        onkeydown: (e) => { if (e.key === "Enter") { S.showArchived = !S.showArchived; renderSessions(); } } },
+      (S.showArchived ? "▾ " : "▸ ") + "Archived (" + archived.length + ")"));
     }
   }
 

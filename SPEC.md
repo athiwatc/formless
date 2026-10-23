@@ -1724,6 +1724,16 @@ run_tool = "network_policy"     # a registry Tool, or…
   smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
+- **Archived Sessions.** `SetSessionArchived {id, archived}`
+  (`sessions.archived`, migration v34) tidies the list without losing
+  history. `ListSessions` still returns archived Sessions, last and
+  flagged; clients hide them by default, and search still finds them.
+  - TUI: `a` archives or restores the selected Session, and the `v`
+    quick filter cycles all → running → archived.
+  - Web: a collapsible "Archived (N)" group and Archive/Unarchive in the
+    Session menu.
+  - CLI: `formless sessions list [--archived]`, `formless sessions
+    archive|unarchive ID` (an id prefix is enough).
 - **Pinned Sessions.** `SetSessionPinned {id, pinned}` (`sessions.pinned`,
   migration v33) keeps a Session at the top: the daemon lists pinned ones
   first, and every TUI sort keeps them first. Toggle it with `P` in the

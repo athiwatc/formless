@@ -67,7 +67,7 @@ pub const TOOL_QUICK: &[&str] = &[
     "needs attention",
 ];
 pub const SESSION_SORTS: &[&str] = &["last activity", "created", "name"];
-pub const SESSION_QUICK: &[&str] = &["all", "running"];
+pub const SESSION_QUICK: &[&str] = &["all", "running", "archived"];
 pub const PROPOSAL_SORTS: &[&str] = &["newest", "score"];
 pub const PROPOSAL_QUICK: &[&str] = &["all", "pending", "applied", "rejected"];
 
@@ -103,9 +103,11 @@ pub fn sessions(sessions: &[SessionInfo], running: &HashSet<String>, f: &ListFil
     let mut idx: Vec<usize> = (0..sessions.len())
         .filter(|&i| {
             let s = &sessions[i];
+            // Archived Sessions only show under their own filter.
             let quick = match f.quick % SESSION_QUICK.len() {
-                1 => running.contains(&s.id),
-                _ => true,
+                1 => running.contains(&s.id) && !s.archived,
+                2 => s.archived,
+                _ => !s.archived,
             };
             quick && f.hit(&[&s.name])
         })

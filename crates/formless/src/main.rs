@@ -62,6 +62,11 @@ enum Cmd {
         #[command(subcommand)]
         action: ProvidersAction,
     },
+    /// Sessions: list, archive or restore them
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
     /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
     Roles {
         #[command(subcommand)]
@@ -438,6 +443,7 @@ fn main() -> Result<()> {
         Some(Cmd::Runs { limit, json }) => runs_cmd(paths, limit, json),
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
+        Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Roles { action }) => roles_cmd(paths, action),
         Some(Cmd::Web {
             port,
@@ -1405,6 +1411,71 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
             println!("(could not open a browser; open the link above)");
         }
     }
+    Ok(())
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List Sessions (archived ones only with --archived)
+    List {
+        #[arg(long)]
+        archived: bool,
+    },
+    /// Hide a Session from the default list (kept and searchable)
+    Archive { id: String },
+    /// Bring an archived Session back
+    Unarchive { id: String },
+}
+
+fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
+    formless_core::daemon::ensure_daemon(&paths)?;
+    let daemon = |r| formless_tui::client::request_once(&paths, r);
+    match action {
+        SessionsAction::List { archived } => {
+            let list: Vec<SessionInfo> = serde_json::from_value(daemon(Request::ListSessions)?)?;
+            for s in list.iter().filter(|s| s.archived == archived) {
+                println!(
+                    "{}  {}  {}{}",
+                    &s.id[..8.min(s.id.len())],
+                    s.updated_at.get(..16).unwrap_or(&s.updated_at),
+                    s.name,
+                    if s.pinned { "  (pinned)" } else { "" }
+                );
+            }
+        }
+        SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
+        SessionsAction::Unarchive { id } => set_archived(&paths, &id, false)?,
+    }
+    Ok(())
+}
+
+/// Archive or restore a Session given its id or an id prefix.
+fn set_archived(paths: &Paths, id: &str, archived: bool) -> Result<()> {
+    let list: Vec<SessionInfo> = serde_json::from_value(formless_tui::client::request_once(
+        paths,
+        Request::ListSessions,
+    )?)?;
+    let matches: Vec<&SessionInfo> = list.iter().filter(|s| s.id.starts_with(id)).collect();
+    let s = match matches.as_slice() {
+        [one] => *one,
+        [] => anyhow::bail!("no Session '{id}' (formless sessions list)"),
+        _ => anyhow::bail!(
+            "'{id}' matches {} Sessions; give more of the id",
+            matches.len()
+        ),
+    };
+    formless_tui::client::request_once(
+        paths,
+        Request::SetSessionArchived {
+            id: s.id.clone(),
+            archived,
+        },
+    )?;
+    println!(
+        "{} {}",
+        if archived { "archived" } else { "restored" },
+        s.name
+    );
     Ok(())
 }
 

@@ -31,11 +31,12 @@ const SESSIONS: &[Hint] = &[
     h("r", "rename", 3),
     h("d", "delete", 2),
     h("P", "pin", 4),
+    h("a", "archive", 5),
     h("e", "export", 5),
     h("i", "import", 5),
     h("/", "filter", 4),
     h("s", "sort", 6),
-    h("v", "running", 6),
+    h("v", "running/archived", 6),
 ];
 
 const TOOLS: &[Hint] = &[
