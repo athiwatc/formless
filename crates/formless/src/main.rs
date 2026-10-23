@@ -276,6 +276,28 @@ enum PromptsAction {
 #[derive(Subcommand)]
 enum ToolsAction {
     List,
+    /// A Tool's description, schemas, Capabilities, versions and stats
+    Show {
+        /// Tool name or id
+        name: String,
+        /// The full detail as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a Tool directly; sensitive Capabilities are denied unless --yes
+    Run {
+        /// Tool name or id
+        name: String,
+        /// The input, a JSON object
+        #[arg(long, default_value = "{}")]
+        input: String,
+        /// Approve this run's Capabilities once (nothing is remembered)
+        #[arg(long)]
+        yes: bool,
+        /// Run as part of this Session (default: a new one, archived after)
+        #[arg(long)]
+        session: Option<String>,
+    },
     Export {
         /// Tool name or id (omit with --all)
         name: Option<String>,
@@ -2729,12 +2751,229 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             }
             Ok(())
         }
+        ToolsAction::Show { name, json } => {
+            let tool = find_tool(&paths, &name)?;
+            let d: formless_protocol::ToolDetail =
+                serde_json::from_value(request_once(&paths, Request::GetTool { id: tool.id })?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+                return Ok(());
+            }
+            print_tool_detail(&d);
+            Ok(())
+        }
+        ToolsAction::Run {
+            name,
+            input,
+            yes,
+            session,
+        } => {
+            let input: serde_json::Value = match serde_json::from_str(&input) {
+                Ok(v @ serde_json::Value::Object(_)) => v,
+                _ => {
+                    eprintln!("--input must be a JSON object, like '{{\"url\": \"https://…\"}}'");
+                    std::process::exit(2);
+                }
+            };
+            let tool = find_tool(&paths, &name)?;
+            let code = tool_run(&paths, tool, input, yes, session)?;
+            std::process::exit(code);
+        }
         ToolsAction::Import { file } => {
             let text = std::fs::read_to_string(&file)?;
             let bundle: serde_json::Value = serde_json::from_str(&text)?;
             let v = request_once(&paths, Request::ImportTool { bundle })?;
             println!("imported: {v}");
             Ok(())
+        }
+    }
+}
+
+/// The Tool with this name or id.
+fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
+    let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(
+        formless_tui::client::request_once(paths, Request::ListTools)?,
+    )?;
+    tools
+        .into_iter()
+        .find(|t| t.name == name || t.id == name)
+        .ok_or_else(|| anyhow::anyhow!("no tool '{name}' (formless tools list)"))
+}
+
+fn print_tool_detail(d: &formless_protocol::ToolDetail) {
+    let t = &d.tool;
+    let status = if t.retired {
+        "retired"
+    } else if t.needs_attention {
+        "needs attention"
+    } else {
+        "active"
+    };
+    println!("{} v{}  [{status}]", t.name, t.current_version);
+    println!("{}", t.description);
+    println!();
+    println!(
+        "capabilities: {}",
+        if t.capabilities.is_empty() {
+            "none".into()
+        } else {
+            t.capabilities.join(", ")
+        }
+    );
+    println!("memory:       {} MB", t.memory_mb);
+    let m = &d.metrics;
+    println!(
+        "calls:        {} ({} ok, {} failed, {} denied) · success {} · p50 {}",
+        m.total,
+        m.success,
+        m.failure,
+        m.denied,
+        m.success_rate
+            .map(|r| format!("{:.0}%", r * 100.0))
+            .unwrap_or_else(|| "-".into()),
+        m.p50_ms
+            .map(|v| format!("{v:.0}ms"))
+            .unwrap_or_else(|| "-".into())
+    );
+    for reason in &d.attention {
+        println!("attention:    {reason}");
+    }
+    println!(
+        "versions:     {}",
+        d.versions
+            .iter()
+            .map(|v| format!(
+                "v{} {} {}",
+                v.version,
+                v.author,
+                v.created_at.get(..10).unwrap_or(&v.created_at)
+            ))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
+    if let Some(v) = d.versions.iter().find(|v| v.version == t.current_version) {
+        let pretty = |s: &str| {
+            serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                .unwrap_or_else(|| s.to_string())
+        };
+        println!("\ninput schema:\n{}", pretty(&v.input_schema));
+        println!("\noutput schema:\n{}", pretty(&v.output_schema));
+    }
+}
+
+/// `tools run`: run a Tool directly through the daemon (`RunTool`), the
+/// way the agent would. Approval requests are answered here: once with
+/// `--yes`, else denied (fail closed). Exit 0 on success, 1 on a failed
+/// or denied call.
+fn tool_run(
+    paths: &Paths,
+    tool: formless_protocol::ToolInfo,
+    input: serde_json::Value,
+    yes: bool,
+    session: Option<String>,
+) -> Result<i32> {
+    let (client, rx) = formless_tui::client::DaemonClient::connect(paths)?;
+    let wait = |id: u64| -> Result<serde_json::Value> {
+        loop {
+            match rx.recv()? {
+                ServerMessage::Response {
+                    id: rid,
+                    ok,
+                    result,
+                    error,
+                } if rid == id => {
+                    return if ok {
+                        Ok(result.unwrap_or_default())
+                    } else {
+                        Err(anyhow::anyhow!(error.unwrap_or_default()))
+                    };
+                }
+                _ => {}
+            }
+        }
+    };
+    let (session_id, ephemeral) = match session {
+        Some(id) => (find_session(paths, &id)?.id, false),
+        None => {
+            let id = client.send(Request::CreateSession {
+                name: Some(format!("tools run {}", tool.name)),
+            });
+            (
+                wait(id)?["id"].as_str().unwrap_or_default().to_string(),
+                true,
+            )
+        }
+    };
+    let run = client.send(Request::RunTool {
+        id: tool.id.clone(),
+        input,
+        session_id: session_id.clone(),
+    });
+    let result = loop {
+        match rx.recv()? {
+            ServerMessage::Event(Event::ApprovalRequested {
+                approval_id,
+                tool_name,
+                capabilities,
+                ..
+            }) => {
+                eprintln!(
+                    "[approval] {tool_name} wants {} -> {}",
+                    capabilities.join(", "),
+                    if yes {
+                        "approved once (--yes)"
+                    } else {
+                        "DENIED (fail closed; pass --yes)"
+                    }
+                );
+                client.send(Request::ApprovalDecision {
+                    approval_id,
+                    approved: yes,
+                    scope: ApprovalScope::Once,
+                });
+            }
+            ServerMessage::Response {
+                id,
+                ok,
+                result,
+                error,
+            } if id == run => {
+                break if ok {
+                    Ok(result.unwrap_or_default())
+                } else {
+                    Err(error.unwrap_or_default())
+                };
+            }
+            _ => {}
+        }
+    };
+    // The throwaway Session stays out of the way (kept, archived).
+    if ephemeral {
+        let id = client.send(Request::SetSessionArchived {
+            id: session_id,
+            archived: true,
+        });
+        let _ = wait(id);
+    }
+    match result {
+        Ok(v) => {
+            let text = v["result"].as_str().unwrap_or_default().to_string();
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(j) => println!("{}", serde_json::to_string_pretty(&j)?),
+                Err(_) => println!("{text}"),
+            }
+            // The agent's result text marks failures with "error:".
+            Ok(if text.trim_start().starts_with("error") {
+                1
+            } else {
+                0
+            })
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            Ok(1)
         }
     }
 }
