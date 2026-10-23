@@ -1089,10 +1089,20 @@
     if (at.query === mention.query) return;
     mention.query = at.query;
     const seq = ++mention.seq;
+    // Tools load with their view; fetch them once if it hasn't opened.
+    if (!S.tools.length && !mention.toolsAsked) {
+      mention.toolsAsked = true;
+      S.tools = (await request({ type: "list_tools" }).catch(() => null)) || [];
+    }
     let r;
     try { r = await request({ type: "list_files", query: at.query, limit: 8, session_id: S.current }); } catch (_) { return; }
     if (seq !== mention.seq || !mentionAtCaret()) return;
-    mention.files = r.files || [];
+    // Tools first when their names match, then files.
+    const tools = (S.tools || []).filter((t) => !t.retired)
+      .map((t) => ({ t, m: fuzzyMatch(at.query, t.name) })).filter((x) => x.m)
+      .sort((a, b) => b.m[0] - a.m[0]).slice(0, at.query ? 4 : 3)
+      .map((x) => ({ tool: true, path: x.t.name, description: x.t.description }));
+    mention.files = tools.concat(r.files || []);
     mention.sel = 0;
     drawMentions();
   }
@@ -1104,7 +1114,8 @@
     }
     mention.box.replaceChildren(...mention.files.map((f, i) => {
       const li = h("li", { role: "option", "aria-selected": String(i === mention.sel), class: i === mention.sel ? "sel" : null },
-        f.path + (f.dir ? "/" : ""));
+        f.tool ? [h("span", { class: "picker-tag" }, "Tool"), " " + f.path, h("span", { class: "muted" }, " " + (f.description || "").slice(0, 60))]
+          : f.path + (f.dir ? "/" : ""));
       li.onmousedown = (e) => { e.preventDefault(); mention.sel = i; acceptMention(); };
       return li;
     }));
@@ -1121,6 +1132,23 @@
     mention.query = null;
     autosize();
     updateMentions();
+    // A chosen file is attached now, shown as a chip (× takes it back).
+    if (!f.tool && !f.dir) attachMention(f.path);
+  }
+  /** Paths already attached from the @ popup, by Session (not attached
+   * again on send). */
+  const mentionAttached = {};
+  async function attachMention(path) {
+    const sid = S.current;
+    if (!sid) return;
+    try {
+      const a = await request({ type: "attach_path", session_id: sid, path });
+      (mentionAttached[sid] = mentionAttached[sid] || new Set()).add(path);
+      (S.chips[sid] = S.chips[sid] || []).push({ id: a.reference ? a.path : a.id, name: a.name, mime: a.mime || (a.reference ? "reference" : ""), bytes: a.bytes || 0, path });
+      renderChips();
+    } catch (e) {
+      note("cannot attach @" + path + ": " + e.message, true);
+    }
   }
   // ---------------------------------------------------------- / palette
   const palette = { box: null, items: [], sel: 0, hidden: null };
@@ -2845,7 +2873,11 @@
     // `@path` mentions are attached first (the daemon resolves them in its
     // working directory); words that aren't files are left as text.
     closeMentions();
+    const toolNames = new Set((S.tools || []).map((t) => t.name));
+    const already = mentionAttached[S.current] || new Set();
     for (const path of mentionsIn(text)) {
+      // Tools are named for the agent; chosen files are attached already.
+      if (toolNames.has(path) || already.has(path)) continue;
       try {
         const a = await request({ type: "attach_path", session_id: S.current, path });
         note(a.reference ? "referenced " + a.name + " (the agent reads it with its Tools)" : "attached " + a.name);
@@ -2855,7 +2887,7 @@
     }
     const r = await act({ type: "send_message", session_id: S.current, content: text, mode });
     // The attachments went with it.
-    if (r) { delete S.chips[S.current]; renderChips(); }
+    if (r) { delete S.chips[S.current]; delete mentionAttached[S.current]; renderChips(); }
     if (r && mode !== "send") note(mode === "queue" ? "queued for after this run" : "steering the current run");
   }
   function stop() {
@@ -3393,6 +3425,7 @@
         const sid = S.current;
         if (await act({ type: "detach_file", session_id: sid, id: a.id })) {
           S.chips[sid] = (S.chips[sid] || []).filter((x) => x.id !== a.id);
+          // Its @path stays in the text but isn't attached again on send.
           renderChips();
         }
       } }, "×"))));
