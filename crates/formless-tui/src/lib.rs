@@ -164,6 +164,7 @@ enum Pending {
     SetCwd,
     SetPin,
     SetArchive,
+    SetTags,
     ContextReport,
     MentionAttach,
     ApprovalCode,
@@ -1396,6 +1397,18 @@ impl App {
                             self.mention_attached();
                         }
                         Pending::SettingsProviders => self.providers_info = result,
+                        Pending::SetTags => {
+                            if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
+                                self.notes.push(if s.tags.is_empty() {
+                                    format!("{} has no tags", s.name)
+                                } else {
+                                    format!("{} tags: #{}", s.name, s.tags.join(" #"))
+                                });
+                                if let Some(old) = self.sessions.iter_mut().find(|x| x.id == s.id) {
+                                    *old = s;
+                                }
+                            }
+                        }
                         Pending::SetArchive => {
                             if let Ok(s) = serde_json::from_value::<SessionInfo>(result) {
                                 self.notes.push(format!(
@@ -3283,6 +3296,9 @@ impl App {
                 self.attach_path_file(std::path::Path::new(&path));
             }
             "paste" => self.paste_image(),
+            "tag" | "tags" => self.tag_cmd("", true),
+            cmd if cmd.starts_with("tag ") => self.tag_cmd(cmd[4..].trim(), true),
+            cmd if cmd.starts_with("untag ") => self.tag_cmd(cmd[6..].trim(), false),
             "pin" => match self
                 .current
                 .as_ref()
@@ -6412,6 +6428,55 @@ impl App {
         self.toasts.drain(..extra);
     }
 
+    /// `/tag NAME…` adds tags to the current Session, `/untag NAME…`
+    /// removes them, and `/tag` alone lists them (SPEC §10.4).
+    fn tag_cmd(&mut self, args: &str, add: bool) {
+        let Some(s) = self
+            .current
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .cloned()
+        else {
+            self.notes.push("no current session".into());
+            return;
+        };
+        if args.is_empty() {
+            let mut all: Vec<&String> = self.sessions.iter().flat_map(|s| &s.tags).collect();
+            all.sort();
+            all.dedup();
+            self.notes.push(format!(
+                "{}: {} · all tags: {} · filter Sessions with /#tag",
+                s.name,
+                if s.tags.is_empty() {
+                    "no tags".to_string()
+                } else {
+                    format!("#{}", s.tags.join(" #"))
+                },
+                if all.is_empty() {
+                    "none".to_string()
+                } else {
+                    all.iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            ));
+            return;
+        }
+        let given: Vec<String> = args
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .map(|t| t.trim_start_matches('#').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let mut tags = s.tags.clone();
+        if add {
+            tags.extend(given);
+        } else {
+            tags.retain(|t| !given.contains(t));
+        }
+        self.request(Pending::SetTags, Request::SetSessionTags { id: s.id, tags });
+    }
+
     /// Pin or unpin a Session (SPEC §10.4).
     fn toggle_pin(&mut self, s: &SessionInfo) {
         self.request(
@@ -7520,6 +7585,9 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                 }
                 if let Some(d) = &s.cwd {
                     meta.push_str(&format!(" · {}", short_dir(d)));
+                }
+                if !s.tags.is_empty() {
+                    meta.push_str(&format!(" · #{}", s.tags.join(" #")));
                 }
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -9651,6 +9719,7 @@ mod tests {
             last_run_status: None,
             pinned: false,
             archived: false,
+            tags: Vec::new(),
         }];
         app.key(key(KeyCode::Char('d')));
         assert_eq!(app.delete_arm.as_deref(), Some("s1"));
@@ -10434,6 +10503,7 @@ mod tests {
                 last_run_status: None,
                 pinned: false,
                 archived: false,
+                tags: Vec::new(),
             })
             .collect();
         app.switch_session("refactor-auth".into());
@@ -11012,6 +11082,7 @@ mod tests {
             last_run_status: None,
             pinned: false,
             archived: false,
+            tags: Vec::new(),
         }];
         app.switch_session("s".into());
         assert_eq!(app.work_dir(), here.join("src"));
@@ -11040,6 +11111,7 @@ mod tests {
             last_run_status: status.map(str::to_string),
             pinned: false,
             archived: false,
+            tags: Vec::new(),
         };
         app.sessions = vec![session("a", Some("paused")), session("b", None)];
         app.running_sessions.insert("b".into());
@@ -11076,6 +11148,7 @@ mod tests {
             last_run_status: None,
             pinned,
             archived: false,
+            tags: Vec::new(),
         };
         app.sessions = vec![
             session("new", "2026-02-01", false),
@@ -11112,6 +11185,7 @@ mod tests {
             last_run_status: None,
             pinned: false,
             archived,
+            tags: Vec::new(),
         };
         app.sessions = vec![session("old", true), session("live", false)];
         let names = |app: &App| -> Vec<String> {
@@ -11126,6 +11200,50 @@ mod tests {
         app.key(key(KeyCode::Char('v')));
         assert_eq!(names(&app), ["old"]);
         assert!(render(&mut app, 120, 20).contains("archived"));
+    }
+
+    #[test]
+    fn tags_show_and_filter_the_sessions_list() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let session = |id: &str, tags: &[&str]| SessionInfo {
+            id: id.into(),
+            name: id.into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: None,
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            pinned: false,
+            archived: false,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        };
+        app.sessions = vec![
+            session("alpha", &["work"]),
+            session("beta", &["home", "workshop"]),
+        ];
+        app.current = Some("alpha".into());
+        app.slash("tag");
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("all tags: #home #work #workshop"));
+        app.view = View::Sessions;
+        assert!(render(&mut app, 140, 20).contains("#home #workshop"));
+        for c in "/#work".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        let names: Vec<String> = app
+            .visible_sessions()
+            .iter()
+            .map(|&i| app.sessions[i].name.clone())
+            .collect();
+        assert_eq!(names, ["alpha"], "#work is an exact tag, not #workshop");
     }
 
     #[test]

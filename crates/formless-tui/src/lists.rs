@@ -109,7 +109,12 @@ pub fn sessions(sessions: &[SessionInfo], running: &HashSet<String>, f: &ListFil
                 2 => s.archived,
                 _ => !s.archived,
             };
-            quick && f.hit(&[&s.name])
+            // `#tag` matches a tag exactly; other queries also search tags.
+            let hit = match f.query.trim().strip_prefix('#') {
+                Some(tag) if !tag.is_empty() => s.tags.iter().any(|t| t == &tag.to_lowercase()),
+                _ => f.hit(&[&s.name, &s.tags.join(" ")]),
+            };
+            quick && hit
         })
         .collect();
     match f.sort % SESSION_SORTS.len() {

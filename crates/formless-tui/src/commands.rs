@@ -72,6 +72,13 @@ pub const COMMANDS: &[Command] = &[
         Session,
     ),
     cmd(
+        "tag",
+        "[NAME…]",
+        "tag this Session, or list tags (filter Sessions with /#tag)",
+        Session,
+    ),
+    cmd("untag", "NAME…", "remove tags from this Session", Session),
+    cmd(
         "cd",
         "[PATH]",
         "show or change this Session's working directory",

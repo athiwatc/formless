@@ -1724,6 +1724,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   smoke gate.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
+- **Tags.** `SetSessionTags {id, tags}` (`sessions.tags`, a JSON array,
+  migration v35) groups Sessions with free-form tags, normalised to
+  lowercase without `#`, unique and sorted.
+  - TUI: `/tag NAME…` adds, `/untag NAME…` removes, and `/tag` lists the
+    current Session's tags and all tags. Rows show `#tags`, and the
+    Sessions `/` filter matches them; `#work` matches that tag exactly.
+  - Web: tag chips above the list filter it, and the Session menu has
+    Tags….
 - **Archived Sessions.** `SetSessionArchived {id, archived}`
   (`sessions.archived`, migration v34) tidies the list without losing
   history. `ListSessions` still returns archived Sessions, last and
