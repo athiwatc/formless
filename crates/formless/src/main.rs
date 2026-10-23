@@ -137,7 +137,8 @@ enum Cmd {
     },
     /// Headless single Run (SPEC §12). Approvals fail closed unless --yes.
     Run {
-        /// Task text
+        /// Task text; `-` reads it from stdin. With a task, piped stdin is
+        /// attached as stdin.txt (`git diff | formless run "review this"`)
         task: String,
         /// Continue an existing session by id (default: ephemeral)
         #[arg(long)]
@@ -512,7 +513,23 @@ fn main() -> Result<()> {
             answer,
             json,
         }) => {
-            let code = run_headless(paths, task, session, yes, answer, json)?;
+            // Piped input: the task itself (`-`) or an attachment.
+            use std::io::{IsTerminal, Read};
+            let piped = if std::io::stdin().is_terminal() {
+                None
+            } else {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf)?;
+                Some(buf)
+            };
+            let (task, attachment) = match run_input(task, piped) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            let code = run_headless(paths, task, attachment, session, yes, answer, json)?;
             std::process::exit(code);
         }
     }
@@ -1080,9 +1097,24 @@ fn doctor(paths: Paths) -> Result<()> {
 
 /// Headless Run (SPEC §12): streams events, answers approvals fail-closed
 /// unless `yes`, exits 0 answered / 1 errored-paused / 2 usage.
+/// The task and optional stdin attachment for `formless run`: `-` takes
+/// the task from stdin; otherwise non-empty piped stdin rides along as
+/// stdin.txt.
+fn run_input(task: String, stdin: Option<Vec<u8>>) -> Result<(String, Option<Vec<u8>>), String> {
+    let piped = stdin.filter(|b| !b.iter().all(u8::is_ascii_whitespace));
+    if task == "-" {
+        let bytes = piped.ok_or("`-` reads the task from stdin, but nothing was piped in")?;
+        let text = String::from_utf8(bytes).map_err(|_| "the task on stdin is not UTF-8 text")?;
+        return Ok((text.trim().to_string(), None));
+    }
+    Ok((task, piped))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_headless(
     paths: Paths,
     task: String,
+    attachment: Option<Vec<u8>>,
     session: Option<String>,
     yes: bool,
     answer: Option<String>,
@@ -1126,6 +1158,17 @@ fn run_headless(
         deltas: true,
         client: Some("CLI".into()),
     });
+    // Requests on one connection run in order: the attachment is stored
+    // before the message that carries it.
+    if let Some(bytes) = attachment {
+        use base64::Engine;
+        client.send(Request::AttachFile {
+            session_id: session_id.clone(),
+            name: "stdin.txt".into(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime: Some("text/plain".into()),
+        });
+    }
     client.send(Request::SendMessage {
         session_id: session_id.clone(),
         content: task,
@@ -2162,6 +2205,33 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn run_takes_its_task_or_an_attachment_from_stdin() {
+        let piped = |s: &str| Some(s.as_bytes().to_vec());
+        // `-`: the task is stdin.
+        assert_eq!(
+            run_input("-".into(), piped("summarise this\n")).unwrap(),
+            ("summarise this".to_string(), None)
+        );
+        assert!(run_input("-".into(), None).is_err());
+        assert!(run_input("-".into(), piped("  \n")).is_err());
+        // A task with piped input: the input rides along.
+        assert_eq!(
+            run_input("review this".into(), piped("diff --git a b")).unwrap(),
+            ("review this".to_string(), Some(b"diff --git a b".to_vec()))
+        );
+        // Nothing (or only blanks) piped: no attachment.
+        assert_eq!(
+            run_input("hi".into(), None).unwrap(),
+            ("hi".to_string(), None)
+        );
+        assert_eq!(
+            run_input("hi".into(), piped("\n")).unwrap(),
+            ("hi".to_string(), None)
+        );
+    }
+
     use super::*;
     use std::cmp::Ordering;
 

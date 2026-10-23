@@ -12,6 +12,7 @@ name = "formless"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 formless-core = { path = "../formless-core" }

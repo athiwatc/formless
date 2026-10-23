@@ -277,7 +277,11 @@ formless run "summarise the CHANGELOG of this repo"        # ephemeral Session
 formless run "now group those by author" --session 3f9c    # continue a Session
 formless run "audit my Downloads folder" --json            # one JSON event per line
 formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
+git diff | formless run "review this"                      # piped input goes along as stdin.txt
+cat task.md | formless run -                               # `-` reads the task itself from stdin
 ```
+
+Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
 Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `130` interrupted.
 

@@ -2211,7 +2211,11 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 - `formless` (no args) launches the TUI (auto-starting the daemon).
 - `formless run "task"` — headless Run (§5 semantics) in an ephemeral
-  Session, or `--session <id|name>` to continue an existing one. Streaming
+  Session, or `--session <id|name>` to continue an existing one. When stdin
+  isn't a terminal, `formless run -` takes the task from stdin, and with a
+  task given, non-empty piped stdin is attached to the message as
+  `stdin.txt` (`git diff | formless run "review this"`); `-` with nothing
+  piped is a usage error (exit 2). Streaming
   human-readable output on stdout; daemon logs on stderr; `--json` emits one
   JSON event per line (the §9.3 event stream). **Approvals fail closed** in
   headless mode: an unapproved sensitive Invocation fails with a clear error
