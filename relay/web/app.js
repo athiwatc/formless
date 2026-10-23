@@ -1899,6 +1899,7 @@
         ["credential", auth.credential_present ? "present" : "missing"], ["auth mode", auth.mode],
         ["token expires", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : ""]]));
     }
+    grid.append(providersSection());
     const mcp = S.mcpServers || [];
     grid.append(h("section", null, h("h3", null, "MCP servers"),
       mcp.length ? h("table", { class: "table" },
@@ -2041,8 +2042,75 @@
     S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
     renderView();
   }
+  /** Settings → Providers & Roles (SPEC §4.5): list, add or edit (keys
+   * are write-only), test a connection, and edit Roles. */
+  function providersSection() {
+    const { providers = [], roles = {} } = S.providers || {};
+    const names = providers.map((p) => p.name);
+    return h("section", null, h("h3", null, "Providers & Roles"),
+      h("table", { class: "table" }, h("tbody", null, providers.map((p) => h("tr", null,
+        h("td", null, h("strong", null, p.name), h("div", { class: "muted" }, p.base_url || "(not set)")),
+        h("td", null, p.model || h("span", { class: "muted" }, "no default model")),
+        h("td", null, p.has_key ? "key stored" : h("span", { class: "muted" }, "no key")),
+        h("td", null,
+          h("button", { class: "btn small", type: "button", onclick: () => testProvider(p.name) }, "Test"),
+          p.name === "default" ? null : h("button", { class: "btn small", type: "button", onclick: () => editProvider(p) }, "Edit"),
+          p.name === "default" ? null : h("button", { class: "btn small danger", type: "button", onclick: async () => {
+            if (await ask({ title: "Remove provider " + p.name + "?", text: "Refused while a Role uses it.", ok: "Remove", danger: true })) {
+              if (await act({ type: "remove_provider", name: p.name }, "Removed " + p.name)) refreshSettings();
+            }
+          } }, "Remove")))))),
+      h("p", { class: "muted" }, "The default provider is set up in the wizard (formless setup) or config.toml."),
+      h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => editProvider(null) }, "Add provider")),
+      h("h3", null, "Roles"),
+      Object.keys(roles).length ? h("table", { class: "table" }, h("tbody", null, Object.entries(roles).map(([name, r]) => h("tr", null,
+        h("td", null, h("strong", null, name), h("div", { class: "muted" }, r.description || "")),
+        h("td", null, (r.provider || "default") + " · " + (r.model || "provider default") + (r.reasoning_effort ? " · " + r.reasoning_effort : "")),
+        h("td", null,
+          h("button", { class: "btn small", type: "button", onclick: () => editRole(name, r, names) }, "Edit"),
+          h("button", { class: "btn small danger", type: "button", onclick: async () => {
+            if (await ask({ title: "Delete role " + name + "?", ok: "Delete", danger: true })) {
+              if (await act({ type: "delete_role", name }, "Deleted " + name)) refreshSettings();
+            }
+          } }, "Delete"))))))
+        : h("p", { class: "muted" }, "None. A Role maps a purpose (\"fast search\") to a provider and model for sub-agents."),
+      h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => editRole("", {}, names) }, "Add role")));
+  }
+  /** A labelled form field for ask() bodies. */
+  function field(label, input) {
+    return h("label", { class: "try-field" }, h("span", null, label), input);
+  }
+  async function testProvider(name) {
+    toast("Testing " + name + "…");
+    const r = await act({ type: "test_provider", name }, null, 30000);
+    if (r) note(name + ": connected, " + (r.models || []).length + " models" + ((r.models || []).length ? " (" + r.models.slice(0, 5).join(", ") + (r.models.length > 5 ? ", …" : "") + ")" : ""));
+  }
+  async function editProvider(p) {
+    const name = h("input", { type: "text", value: p ? p.name : "", disabled: !!p, placeholder: "openrouter", spellcheck: "false" });
+    const base = h("input", { type: "text", value: p ? p.base_url : "", placeholder: "https://openrouter.ai/api/v1", spellcheck: "false" });
+    const model = h("input", { type: "text", value: p ? p.model : "", placeholder: "default model (optional)", spellcheck: "false" });
+    // Write-only: an existing key is never sent back; blank keeps it.
+    const key = h("input", { type: "password", value: "", placeholder: p && p.has_key ? "stored · leave blank to keep" : "API key (stored in the keychain)", autocomplete: "off" });
+    const body = h("div", { class: "try-form" }, field("Name", name), field("Base URL", base), field("Model", model), field("API key", key));
+    if (!(await ask({ title: p ? "Edit provider " + p.name : "Add provider", body, ok: "Save" }))) return;
+    const r = await act({ type: "upsert_provider", name: name.value.trim(), base_url: base.value.trim(), model: model.value.trim() || null, api_key: key.value || null }, "Saved " + name.value.trim());
+    key.value = "";
+    if (r) refreshSettings();
+  }
+  async function editRole(existing, r, providers) {
+    const name = h("input", { type: "text", value: existing, disabled: !!existing, placeholder: "fast", spellcheck: "false" });
+    const desc = h("input", { type: "text", value: r.description || "", placeholder: "When to use it, written for the agent" });
+    const prov = h("select", null, providers.map((p) => h("option", { value: p, selected: (r.provider || "default") === p }, p)));
+    const model = h("input", { type: "text", value: r.model || "", placeholder: "model (blank = the provider's default)", spellcheck: "false" });
+    const effort = h("select", null, ["", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
+    const body = h("div", { class: "try-form" }, field("Name", name), field("Description", desc), field("Provider", prov), field("Model", model), field("Reasoning effort", effort));
+    if (!(await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save" }))) return;
+    const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
+    if (await act({ type: "upsert_role", name: name.value.trim(), role }, "Saved role " + name.value.trim())) refreshSettings();
+  }
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
+    S.providers = (await request({ type: "list_providers" }).catch(() => null)) || { providers: [], roles: {} };
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
