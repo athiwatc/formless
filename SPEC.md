@@ -2245,6 +2245,20 @@ run_tool = "network_policy"     # a registry Tool, or…
   (clap_mangen) by a hidden `formless man`. Releases put it in each Unix
   tarball. `scripts/install.sh` installs it to `$PREFIX/share/man/man1`, and
   the Homebrew formula into `man1`.
+- `formless doctor` ends with the problems it found, each with what to
+  run next: a stale socket or lock, a daemon that runs but doesn't answer,
+  secret files (`api_key`, `relay_secret`, `oauth_tokens.json`,
+  `config.toml`) others can read, a missing credential, an unconfigured
+  provider, a failed probe, or a model without tool calling. `--fix`
+  applies only the safe fixes:
+  - remove the stale socket or lock (only when no formless process holds
+    the lock);
+  - stop a stuck daemon (SIGTERM, only if the lock's pid is a formless
+    process) and start a new one;
+  - make the secret files private (600).
+
+  Then it checks again, re-running the provider probe. A daemon that
+  simply isn't running isn't flagged, since it starts on demand.
 - `formless logs [-f] [--level warn] [--since 10m] [-n 200]` shows the
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level

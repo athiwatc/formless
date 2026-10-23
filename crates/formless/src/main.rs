@@ -46,7 +46,12 @@ enum Cmd {
         action: DaemonAction,
     },
     /// Diagnostics: config, dirs, keychain, endpoint probe
-    Doctor,
+    Doctor {
+        /// Apply the safe fixes: clear a stale socket or lock, restart a
+        /// stuck daemon, tighten secret file permissions, then check again
+        #[arg(long)]
+        fix: bool,
+    },
     /// Apply artifact retention now (artifacts.max_total_mb / max_age_days)
     Gc,
     /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
@@ -642,7 +647,7 @@ fn main() -> Result<()> {
             },
         ),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
-        Some(Cmd::Doctor) => doctor(paths),
+        Some(Cmd::Doctor { fix }) => doctor(paths, fix),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
@@ -1236,7 +1241,215 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
     }
 }
 
-fn doctor(paths: Paths) -> Result<()> {
+/// A problem `doctor` found: what's wrong, what to run, and a safe fix.
+struct Problem {
+    what: String,
+    next: Option<String>,
+    fix: Option<Fix>,
+}
+
+enum Fix {
+    /// Leftovers of a daemon that is gone.
+    RemoveStale(Vec<std::path::PathBuf>),
+    /// A daemon process that no longer answers: stop it, start a new one.
+    RestartStuck(u32),
+    /// Secret files others can read.
+    Chmod600(Vec<std::path::PathBuf>),
+}
+
+/// Whether `pid` is a live formless process (unix: `ps`).
+#[cfg(unix)]
+fn formless_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("formless"))
+        .unwrap_or(false)
+}
+
+/// The daemon and file checks `--fix` can act on.
+fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
+    let mut out = Vec::new();
+    #[cfg(unix)]
+    if !daemon_reachable(paths) {
+        let sock = paths.socket_path();
+        let lock = paths.lock_file();
+        let pid = std::fs::read_to_string(&lock)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        match pid {
+            Some(pid) if formless_pid_alive(pid) => out.push(Problem {
+                what: format!("the daemon (pid {pid}) is running but doesn't answer on its socket"),
+                next: Some(format!(
+                    "kill {pid}; then any formless command starts a new one"
+                )),
+                fix: Some(Fix::RestartStuck(pid)),
+            }),
+            _ => {
+                let stale: Vec<std::path::PathBuf> =
+                    [sock, lock].into_iter().filter(|p| p.exists()).collect();
+                if !stale.is_empty() {
+                    out.push(Problem {
+                        what: format!(
+                            "a daemon that is gone left {}",
+                            stale
+                                .iter()
+                                .map(|p| p
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned())
+                                .collect::<Vec<_>>()
+                                .join(" and ")
+                        ),
+                        next: Some(format!(
+                            "rm {}",
+                            stale
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )),
+                        fix: Some(Fix::RemoveStale(stale)),
+                    });
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open: Vec<std::path::PathBuf> = [
+            paths.key_fallback_file(),
+            paths.relay_secret_file(),
+            paths.oauth_tokens_file(),
+            paths.config_file(),
+        ]
+        .into_iter()
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0))
+        .collect();
+        if !open.is_empty() {
+            out.push(Problem {
+                what: format!(
+                    "others can read {}",
+                    open.iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                next: Some(format!(
+                    "chmod 600 {}",
+                    open.iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )),
+                fix: Some(Fix::Chmod600(open)),
+            });
+        }
+    }
+    out
+}
+
+/// Apply one fix; what was done, or why it wasn't.
+fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
+    match fix {
+        Fix::RemoveStale(files) => {
+            for f in files {
+                std::fs::remove_file(f).map_err(|e| format!("{}: {e}", f.display()))?;
+            }
+            Ok("removed the stale files".into())
+        }
+        Fix::RestartStuck(pid) => {
+            let killed = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .map_err(|e| e.to_string())?;
+            if !killed.success() {
+                return Err(format!("could not stop pid {pid}"));
+            }
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                #[cfg(unix)]
+                if !formless_pid_alive(*pid) {
+                    break;
+                }
+            }
+            let _ = std::fs::remove_file(paths.lock_file());
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(paths.socket_path());
+            formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+            Ok(format!("stopped pid {pid} and started a new daemon"))
+        }
+        Fix::Chmod600(files) => {
+            #[cfg(unix)]
+            for f in files {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("{}: {e}", f.display()))?;
+            }
+            Ok("made the secret files private (600)".into())
+        }
+    }
+}
+
+fn doctor(paths: Paths, fix: bool) -> Result<()> {
+    let problems = doctor_report(&paths)?;
+    if problems.is_empty() {
+        println!("\nno problems found");
+        return Ok(());
+    }
+    println!("\n{} problem(s):", problems.len());
+    for p in &problems {
+        println!("  ✗ {}", p.what);
+        if let Some(next) = &p.next {
+            println!("    → {next}");
+        }
+        if fix && p.fix.is_none() {
+            println!("    (not fixed automatically)");
+        }
+    }
+    let fixes: Vec<&Fix> = problems.iter().filter_map(|p| p.fix.as_ref()).collect();
+    if !fix {
+        if !fixes.is_empty() {
+            println!(
+                "\n`formless doctor --fix` can fix {} of these.",
+                fixes.len()
+            );
+        }
+        return Ok(());
+    }
+    if fixes.is_empty() {
+        return Ok(());
+    }
+    println!("\nfixing:");
+    for f in fixes {
+        match apply_fix(&paths, f) {
+            Ok(done) => println!("  ✓ {done}"),
+            Err(e) => println!("  ✗ {e}"),
+        }
+    }
+    // Check again (this re-runs the probe too).
+    println!("\nchecking again:");
+    let left = doctor_report(&paths)?;
+    if left.is_empty() {
+        println!("\nno problems left");
+    } else {
+        println!("\n{} problem(s) left:", left.len());
+        for p in &left {
+            println!("  ✗ {}", p.what);
+            if let Some(next) = &p.next {
+                println!("    → {next}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print the doctor report and return the problems found.
+fn doctor_report(paths: &Paths) -> Result<Vec<Problem>> {
+    let paths = paths.clone();
+    let mut problems = doctor_local_problems(&paths);
     use formless_core::Store;
     println!("data dir:   {}", paths.data_dir.display());
     println!("config dir: {}", paths.config_dir.display());
@@ -1336,6 +1549,17 @@ fn doctor(paths: Paths) -> Result<()> {
     let credential = formless_core::auth::resolve_provider_token_blocking(&paths, &cfg.provider);
     if let Err(error) = &credential {
         println!("auth error: {error:#}");
+        if cfg.provider.is_configured() {
+            problems.push(Problem {
+                what: format!("no usable credential for the provider ({error})"),
+                next: Some(if cfg.provider.oauth() {
+                    "formless auth login".into()
+                } else {
+                    "formless (the wizard stores the key), or set FORMLESS_API_KEY".into()
+                }),
+                fix: None,
+            });
+        }
     }
     println!("naming:     {}", naming_model_status(&paths, &cfg));
     println!(
@@ -1370,6 +1594,11 @@ fn doctor(paths: Paths) -> Result<()> {
                         );
                         if !r.tool_calling {
                             println!("WARNING: endpoint/model does not support tool-calling; sessions will be refused (SPEC §4.3).");
+                            problems.push(Problem {
+                                what: format!("{probe_model} doesn't call tools on this endpoint"),
+                                next: Some("formless config set provider.tool_mode prompt (or pick a model that supports tools: formless config set provider.model …)".into()),
+                                fix: None,
+                            });
                         }
                         match formless_core::provider::cache_probe_blocking(
                             &cfg.provider,
@@ -1396,9 +1625,14 @@ fn doctor(paths: Paths) -> Result<()> {
                             &formless_core::errors::ErrorContext::from_config(&cfg, &probe_model),
                         );
                         println!("probe:      FAILED ({}): {}", x.category, x.message);
-                        if let Some(action) = x.action {
+                        if let Some(action) = &x.action {
                             println!("            next: {action}");
                         }
+                        problems.push(Problem {
+                            what: format!("the provider probe failed: {}", x.message),
+                            next: x.action.clone(),
+                            fix: None,
+                        });
                         println!("            details: {e:#}");
                     }
                 }
@@ -1406,8 +1640,13 @@ fn doctor(paths: Paths) -> Result<()> {
         }
     } else {
         println!("probe:      skipped (not configured; run `formless` for the wizard)");
+        problems.push(Problem {
+            what: "no provider is configured".into(),
+            next: Some("formless (the setup wizard)".into()),
+            fix: None,
+        });
     }
-    Ok(())
+    Ok(problems)
 }
 
 /// Headless Run (SPEC §12): streams events, answers approvals fail-closed
@@ -3446,7 +3685,10 @@ mod tests {
                     2026-10-23T10:00:02.3Z ERROR formless_core::relay: boom";
         let entries = parse_log(text);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries.iter().map(|e| e.level).collect::<Vec<_>>(), [2, 1, 0]);
+        assert_eq!(
+            entries.iter().map(|e| e.level).collect::<Vec<_>>(),
+            [2, 1, 0]
+        );
         assert!(entries[1].text.ends_with("caused by: exit 1"));
         assert!(entries[0].at.is_some());
     }
