@@ -162,6 +162,10 @@ enum Cmd {
         /// Run on a configured Role's provider and model
         #[arg(long)]
         role: Option<String>,
+        /// Attach a file or image to the task (repeatable; same limits and
+        /// image handling as /attach)
+        #[arg(long = "attach", value_name = "FILE")]
+        attach: Vec<std::path::PathBuf>,
     },
 }
 
@@ -524,6 +528,7 @@ fn main() -> Result<()> {
             model,
             effort,
             role,
+            attach,
         }) => {
             // Piped input: the task itself (`-`) or an attachment.
             use std::io::{IsTerminal, Read};
@@ -541,6 +546,17 @@ fn main() -> Result<()> {
                     std::process::exit(2);
                 }
             };
+            // `--attach` files, read and checked before anything starts.
+            let mut files = match read_attachments(&attach) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            if let Some(bytes) = attachment {
+                files.push(("stdin.txt".into(), bytes));
+            }
             let pick = match run_model(&paths, model, effort, role) {
                 Ok(p) => p,
                 Err(e) => {
@@ -566,16 +582,7 @@ fn main() -> Result<()> {
                     effort,
                 )
             });
-            let code = run_headless(
-                paths.clone(),
-                task,
-                attachment,
-                session,
-                pick,
-                yes,
-                answer,
-                json,
-            );
+            let code = run_headless(paths.clone(), task, files, session, pick, yes, answer, json);
             if let Some(s) = restore {
                 let _ = formless_tui::client::request_once(
                     &paths,
@@ -1154,6 +1161,34 @@ fn doctor(paths: Paths) -> Result<()> {
 
 /// Headless Run (SPEC §12): streams events, answers approvals fail-closed
 /// unless `yes`, exits 0 answered / 1 errored-paused / 2 usage.
+/// The `--attach` files as (name, bytes); a missing, unreadable or too
+/// large file is an error before anything runs.
+fn read_attachments(paths: &[std::path::PathBuf]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let max = formless_core::daemon::MAX_ATTACHMENT_BYTES;
+    paths
+        .iter()
+        .map(|p| {
+            let bytes =
+                std::fs::read(p).map_err(|e| format!("cannot attach {}: {e}", p.display()))?;
+            if bytes.len() > max {
+                return Err(format!(
+                    "cannot attach {}: larger than {} MB",
+                    p.display(),
+                    max / 1024 / 1024
+                ));
+            }
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "attachment".into());
+            Ok((name, bytes))
+        })
+        .collect()
+}
+
+/// A model and effort to set on a Run's Session.
+type ModelPick = (Option<String>, Option<String>);
+
 /// `--model` / `--effort` / `--role` as the (model, effort) to set on the
 /// Run's Session, or None to leave it. A role must exist; it becomes the
 /// `role:<name>` model the daemon resolves.
@@ -1162,7 +1197,7 @@ fn run_model(
     model: Option<String>,
     effort: Option<String>,
     role: Option<String>,
-) -> Result<Option<(Option<String>, Option<String>)>, String> {
+) -> Result<Option<ModelPick>, String> {
     let model = match role {
         Some(r) => {
             let cfg = Config::load(paths).map_err(|e| e.to_string())?;
@@ -1194,9 +1229,9 @@ fn run_input(task: String, stdin: Option<Vec<u8>>) -> Result<(String, Option<Vec
 fn run_headless(
     paths: Paths,
     task: String,
-    attachment: Option<Vec<u8>>,
+    files: Vec<(String, Vec<u8>)>,
     session: Option<String>,
-    pick: Option<(Option<String>, Option<String>)>,
+    pick: Option<ModelPick>,
     yes: bool,
     answer: Option<String>,
     json_out: bool,
@@ -1248,13 +1283,15 @@ fn run_headless(
             reasoning_effort: effort,
         });
     }
-    if let Some(bytes) = attachment {
+    for (name, bytes) in files {
         use base64::Engine;
+        // The daemon guesses the type from the name (images go to vision
+        // models inline), as for /attach.
         client.send(Request::AttachFile {
             session_id: session_id.clone(),
-            name: "stdin.txt".into(),
+            name,
             data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-            mime: Some("text/plain".into()),
+            mime: None,
         });
     }
     client.send(Request::SendMessage {
@@ -2293,6 +2330,22 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn attachments_are_read_and_checked_up_front() {
+        let dir = std::env::temp_dir().join(format!("fl-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("notes.md");
+        std::fs::write(&note, "# hi").unwrap();
+        let files = read_attachments(&[note.clone()]).unwrap();
+        assert_eq!(files, vec![("notes.md".to_string(), b"# hi".to_vec())]);
+        let missing = read_attachments(&[dir.join("nope.png")]).unwrap_err();
+        assert!(missing.starts_with("cannot attach"), "{missing}");
+        let big = dir.join("big.bin");
+        std::fs::write(&big, vec![0u8; formless_core::daemon::MAX_ATTACHMENT_BYTES + 1]).unwrap();
+        assert!(read_attachments(&[big]).unwrap_err().contains("larger than 20 MB"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn run_picks_a_model_effort_or_role() {

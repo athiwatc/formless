@@ -7656,7 +7656,8 @@ pub fn builtin_outcome(name: &str, text: &str) -> (bool, &'static str) {
 }
 
 /// Largest attachment accepted (SPEC §5.6).
-const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+/// Largest file an attachment may be (SPEC §5.6).
+pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 /// `@`-mentioned text files up to this size are attached; larger ones and
 /// directories go as a reference (SPEC §5.6).
 const MAX_MENTION_INLINE_BYTES: usize = 256 * 1024;
