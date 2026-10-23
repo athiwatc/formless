@@ -2125,6 +2125,48 @@
     draw();
     input.focus();
   }
+  /** "+ New session": with templates saved, pick one (or blank) first. */
+  async function pickNewSession() {
+    const list = (await request({ type: "list_session_templates" }).catch(() => [])) || [];
+    if (!list.length) return newSession();
+    const opts = ["", ...list.map((t) => t.name)];
+    const body = h("div", { class: "questions" }, opts.map((name, i) => h("label", { class: "q-option" },
+      h("input", { type: "radio", name: "tpl", value: name, checked: i === 0 }),
+      h("span", {}, h("span", { text: name || "Blank Session" }),
+        name ? h("span", { class: "muted", text: templateSummary(list[i - 1]) }) : null))));
+    if (!(await ask({ title: "New session", body, ok: "Create" }))) return;
+    const picked = body.querySelector("input:checked");
+    return picked && picked.value ? newFromTemplate(picked.value) : newSession();
+  }
+  function templateSummary(t) {
+    return [t.model && "model " + t.model, t.reasoning_effort && "effort " + t.reasoning_effort, t.cwd && "in " + t.cwd,
+      t.instructions && "instructions", t.first_message && "“" + t.first_message.slice(0, 40) + "”"].filter(Boolean).join(" · ") || "defaults";
+  }
+  /** A Session set up from a template, its first message in the composer. */
+  async function newFromTemplate(template) {
+    const r = await act({ type: "create_session_from_template", template, name: null });
+    if (!r || !r.session) return;
+    S.sessions = [r.session, ...S.sessions.filter((x) => x.id !== r.session.id)];
+    await openSession(r.session.id);
+    if (r.first_message) $("input").value = r.first_message;
+    $("input").focus();
+  }
+  async function templateCommand(arg) {
+    const [verb, name, ...rest] = (arg || "").trim().split(/\s+/);
+    if (!verb || verb === "list") {
+      const list = await act({ type: "list_session_templates" });
+      if (!list) return;
+      return note(list.length ? list.map((t) => "template " + t.name + ": " + templateSummary(t)).join("\n") : "no templates yet: /template save NAME [FIRST MESSAGE]");
+    }
+    if (!name) return toast("usage: /template save NAME [FIRST MESSAGE] · /template delete NAME", true);
+    if (verb === "save") {
+      if (!S.current) return toast("No current session.", true);
+      const t = await act({ type: "save_session_template", id: S.current, name, first_message: rest.join(" ") || null });
+      if (t) note("saved template " + t.name + " (use it with /new " + t.name + ")");
+    } else if (verb === "delete" || verb === "rm") {
+      if (await act({ type: "delete_session_template", name })) note("deleted template " + name);
+    } else toast("usage: /template save NAME [FIRST MESSAGE] · /template delete NAME", true);
+  }
   async function tagSession(s) {
     const text = await ask({ title: "Tags for " + s.name, input: true, value: (s.tags || []).join(" "), placeholder: "work client-a", ok: "Save" });
     if (text == null) return;
@@ -2261,7 +2303,9 @@
   // Slash commands (SPEC §10.2): one table drives the dispatcher, the `/`
   // palette and /help, so they can't drift apart.
   const COMMANDS = [
-    { name: "new", group: "Session", desc: "start a new Session", run: () => newSession() },
+    { name: "new", args: "[TEMPLATE]", group: "Session", desc: "start a new Session, optionally from a template", run: (arg) => (arg ? newFromTemplate(arg) : newSession()) },
+    { name: "template", args: "save|delete NAME [FIRST MESSAGE]", group: "Session", desc: "save this Session's setup as a template, or delete one", run: (arg) => templateCommand(arg) },
+    { name: "templates", group: "Session", desc: "list Session templates", run: () => templateCommand("") },
     { name: "sessions", group: "Session", desc: "list and switch Sessions", run: () => { setView("chat"); openSidebar(); $("search").focus(); } },
     { name: "fork", group: "Session", desc: "fork the current Session", run: () => forkSession(S.current) },
     { name: "search", args: "[QUERY]", group: "Session", desc: "search all Sessions", run: (arg) => { setView("chat"); openSidebar(); $("search").value = arg; return arg ? search(arg) : $("search").focus(); } },
@@ -2936,7 +2980,7 @@
   $("pair-form").addEventListener("submit", (e) => { e.preventDefault(); connect($("secret").value.trim()); });
   $("disconnect").onclick = forget;
   document.querySelectorAll("#tabs button").forEach((b) => (b.onclick = () => setView(b.dataset.view)));
-  $("new-session").onclick = newSession;
+  $("new-session").onclick = pickNewSession;
   $("import-session").onclick = importSession;
   $("fork-btn").onclick = () => forkSession(S.current);
   $("export-session").onclick = () => exportSession(S.current);

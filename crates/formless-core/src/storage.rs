@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use formless_protocol::{
-    MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo, ToolInfo,
-    ToolMetricsInfo, ToolVersionInfo,
+    MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo,
+    TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection};
@@ -338,7 +338,7 @@ const SESSION_SUMMARY: &str = "(SELECT COUNT(*) FROM messages m WHERE m.session_
      (SELECT status FROM runs r WHERE r.session_id=s.id ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1) AS last_run_status";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 36;
+pub const SCHEMA_VERSION: i64 = 37;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -353,7 +353,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 36] = [
+const MIGRATIONS: [(i64, MigrationStep); 37] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -460,6 +460,14 @@ const MIGRATIONS: [(i64, MigrationStep); 36] = [
     }),
     // Per-Session standing instructions (SPEC §5.1).
     (36, |c| add_column(c, "sessions", "instructions TEXT")),
+    // Session templates (SPEC §5.1).
+    (37, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_templates (
+               name TEXT PRIMARY KEY, model TEXT, reasoning_effort TEXT,
+               instructions TEXT, cwd TEXT, first_message TEXT, created_at TEXT NOT NULL);",
+        )?)
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -657,6 +665,50 @@ impl Store {
             params![id, serde_json::to_string(&clean)?],
         )?;
         self.get_session(id)
+    }
+
+    pub fn save_template(&self, t: &TemplateInfo) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO session_templates
+               (name, model, reasoning_effort, instructions, cwd, first_message, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                t.name,
+                t.model,
+                t.reasoning_effort,
+                t.instructions,
+                t.cwd,
+                t.first_message,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_templates(&self) -> Result<Vec<TemplateInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, model, reasoning_effort, instructions, cwd, first_message
+             FROM session_templates ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TemplateInfo {
+                name: r.get(0)?,
+                model: r.get(1)?,
+                reasoning_effort: r.get(2)?,
+                instructions: r.get(3)?,
+                cwd: r.get(4)?,
+                first_message: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether a template of that name existed.
+    pub fn delete_template(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM session_templates WHERE name=?1", params![name])?
+            > 0)
     }
 
     /// Blank instructions clear them.

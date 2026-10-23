@@ -379,6 +379,16 @@ task, with quality as a gate**.
     shared prefix, so other Sessions' prompt caches are unaffected. A
     change refreshes the prompt snapshot; the agent follows them from its
     next step. Forks keep them.
+- **Templates.** `SaveSessionTemplate {id, name, first_message?}` saves a
+  Session's model, effort, instructions and working directory as a named
+  template (migration v37; same name replaces). `CreateSessionFromTemplate
+  {template, name?}` makes a Session set up from it (named after the
+  template by default; a working directory that's gone is skipped) and
+  returns `{session, first_message}`. The first message isn't sent:
+  clients put it in the input to edit and send.
+  - TUI and web: `/new TEMPLATE`, `/template save NAME [FIRST MESSAGE]`,
+    `/template delete NAME`, `/templates`. The web "+ New session" button
+    offers the templates (or a blank Session) when any exist.
 
 ### 5.2 Run lifecycle
 

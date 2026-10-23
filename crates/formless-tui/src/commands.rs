@@ -64,7 +64,19 @@ const fn cmd(name: &'static str, args: &'static str, desc: &'static str, group: 
 use Group::*;
 
 pub const COMMANDS: &[Command] = &[
-    cmd("new", "", "start a new Session", Session),
+    cmd(
+        "new",
+        "[TEMPLATE]",
+        "start a new Session, optionally from a template",
+        Session,
+    ),
+    cmd(
+        "template",
+        "save|delete NAME [FIRST MESSAGE]",
+        "save this Session's setup as a template, or delete one",
+        Session,
+    ),
+    cmd("templates", "", "list Session templates", Session),
     cmd(
         "pin",
         "",
