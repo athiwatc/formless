@@ -544,6 +544,11 @@ pasting paths.
   The web client shows pending attachments as chips above the composer,
   each with ×. Files can be picked, pasted, or dropped anywhere on the
   chat, which shows a drop zone while dragging.
+- **Web message actions.** Each message has a ⋯ menu (shown on hover, and
+  always on touch screens): Copy, Copy as Markdown, Edit & re-run for user
+  messages (an earlier one drops the turns after it, and says so), Fork
+  from here (`ForkSession` up to that message), and copying a Tool call's
+  input or a result's output.
 - **Web streaming.** While an answer streams, the web client renders only
   its finished blocks (up to the last blank line outside a code fence) as
   Markdown, reusing that render, and shows the unfinished tail as plain
