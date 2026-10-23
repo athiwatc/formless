@@ -153,6 +153,15 @@ enum Cmd {
         /// Emit one JSON event per line
         #[arg(long)]
         json: bool,
+        /// Model for this Run (with --session: this Run only)
+        #[arg(long, conflicts_with = "role")]
+        model: Option<String>,
+        /// Reasoning effort for this Run: low, medium or high
+        #[arg(long, value_parser = ["low", "medium", "high"])]
+        effort: Option<String>,
+        /// Run on a configured Role's provider and model
+        #[arg(long)]
+        role: Option<String>,
     },
 }
 
@@ -512,6 +521,9 @@ fn main() -> Result<()> {
             yes,
             answer,
             json,
+            model,
+            effort,
+            role,
         }) => {
             // Piped input: the task itself (`-`) or an attachment.
             use std::io::{IsTerminal, Read};
@@ -529,7 +541,52 @@ fn main() -> Result<()> {
                     std::process::exit(2);
                 }
             };
-            let code = run_headless(paths, task, attachment, session, yes, answer, json)?;
+            let pick = match run_model(&paths, model, effort, role) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            // An existing Session gets its own model back after this Run.
+            let restore = match (&session, &pick) {
+                (Some(id), Some(_)) => {
+                    formless_core::daemon::ensure_daemon(&paths)?;
+                    let list: Vec<SessionInfo> = serde_json::from_value(
+                        formless_tui::client::request_once(&paths, Request::ListSessions)?,
+                    )?;
+                    list.into_iter().find(|s| &s.id == id)
+                }
+                _ => None,
+            };
+            // `--effort` alone keeps the Session's model.
+            let pick = pick.map(|(model, effort)| {
+                (
+                    model.or_else(|| restore.as_ref().and_then(|s| s.model.clone())),
+                    effort,
+                )
+            });
+            let code = run_headless(
+                paths.clone(),
+                task,
+                attachment,
+                session,
+                pick,
+                yes,
+                answer,
+                json,
+            );
+            if let Some(s) = restore {
+                let _ = formless_tui::client::request_once(
+                    &paths,
+                    Request::SetSessionModel {
+                        id: s.id,
+                        model: s.model,
+                        reasoning_effort: s.reasoning_effort,
+                    },
+                );
+            }
+            let code = code?;
             std::process::exit(code);
         }
     }
@@ -1097,6 +1154,29 @@ fn doctor(paths: Paths) -> Result<()> {
 
 /// Headless Run (SPEC §12): streams events, answers approvals fail-closed
 /// unless `yes`, exits 0 answered / 1 errored-paused / 2 usage.
+/// `--model` / `--effort` / `--role` as the (model, effort) to set on the
+/// Run's Session, or None to leave it. A role must exist; it becomes the
+/// `role:<name>` model the daemon resolves.
+fn run_model(
+    paths: &Paths,
+    model: Option<String>,
+    effort: Option<String>,
+    role: Option<String>,
+) -> Result<Option<(Option<String>, Option<String>)>, String> {
+    let model = match role {
+        Some(r) => {
+            let cfg = Config::load(paths).map_err(|e| e.to_string())?;
+            if !cfg.roles.contains_key(&r) {
+                let known: Vec<&String> = cfg.roles.keys().collect();
+                return Err(format!("no role '{r}' (configured: {known:?})"));
+            }
+            Some(format!("role:{r}"))
+        }
+        None => model.filter(|m| !m.trim().is_empty()),
+    };
+    Ok((model.is_some() || effort.is_some()).then_some((model, effort)))
+}
+
 /// The task and optional stdin attachment for `formless run`: `-` takes
 /// the task from stdin; otherwise non-empty piped stdin rides along as
 /// stdin.txt.
@@ -1116,6 +1196,7 @@ fn run_headless(
     task: String,
     attachment: Option<Vec<u8>>,
     session: Option<String>,
+    pick: Option<(Option<String>, Option<String>)>,
     yes: bool,
     answer: Option<String>,
     json_out: bool,
@@ -1158,8 +1239,15 @@ fn run_headless(
         deltas: true,
         client: Some("CLI".into()),
     });
-    // Requests on one connection run in order: the attachment is stored
-    // before the message that carries it.
+    // Requests on one connection run in order: the model is set and the
+    // attachment stored before the message.
+    if let Some((model, effort)) = pick {
+        client.send(Request::SetSessionModel {
+            id: session_id.clone(),
+            model,
+            reasoning_effort: effort,
+        });
+    }
     if let Some(bytes) = attachment {
         use base64::Engine;
         client.send(Request::AttachFile {
@@ -2205,6 +2293,33 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn run_picks_a_model_effort_or_role() {
+        let dir = std::env::temp_dir().join(format!("fl-runmodel-{}", std::process::id()));
+        let paths = Paths {
+            data_dir: dir.join("d"),
+            config_dir: dir.join("c"),
+            profile: "test-runmodel".into(),
+        };
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.roles.insert("fast".into(), Default::default());
+        cfg.save(&paths).unwrap();
+        assert_eq!(run_model(&paths, None, None, None).unwrap(), None);
+        assert_eq!(
+            run_model(&paths, Some("gpt-x".into()), Some("low".into()), None).unwrap(),
+            Some((Some("gpt-x".into()), Some("low".into())))
+        );
+        assert_eq!(
+            run_model(&paths, None, None, Some("fast".into())).unwrap(),
+            Some((Some("role:fast".into()), None))
+        );
+        assert!(run_model(&paths, None, None, Some("nope".into()))
+            .unwrap_err()
+            .contains("no role 'nope'"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn run_takes_its_task_or_an_attachment_from_stdin() {

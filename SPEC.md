@@ -2215,7 +2215,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   isn't a terminal, `formless run -` takes the task from stdin, and with a
   task given, non-empty piped stdin is attached to the message as
   `stdin.txt` (`git diff | formless run "review this"`); `-` with nothing
-  piped is a usage error (exit 2). Streaming
+  piped is a usage error (exit 2). `--model`, `--effort` (low, medium,
+  high) and `--role NAME` (as `role:NAME`; a missing Role is a usage error,
+  and `--role` with `--model` is refused) set the Run's model. On the
+  ephemeral Session they simply apply; with `--session` they apply to that
+  Run, and the Session's own model and effort are restored afterwards
+  (`--effort` alone keeps its model). Streaming
   human-readable output on stdout; daemon logs on stderr; `--json` emits one
   JSON event per line (the §9.3 event stream). **Approvals fail closed** in
   headless mode: an unapproved sensitive Invocation fails with a clear error
