@@ -160,10 +160,13 @@ enum Cmd {
         #[command(subcommand)]
         action: PromptsAction,
     },
-    /// Check for a newer Formless release
+    /// Check for a newer release, show what changed, and how to upgrade
     Update {
         #[command(subcommand)]
-        action: UpdateAction,
+        action: Option<UpdateAction>,
+        /// Only report (same as `update check`)
+        #[arg(long)]
+        check: bool,
     },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
     Tools {
@@ -701,7 +704,9 @@ fn main() -> Result<()> {
         Some(Cmd::Auth { action }) => auth_cmd(paths, action),
         Some(Cmd::Relay { action }) => relay_cmd(paths, action),
         Some(Cmd::Prompts { action }) => prompts_cmd(paths, action),
-        Some(Cmd::Update { .. }) => update_check(),
+        Some(Cmd::Update { action, check }) => {
+            update_cmd(check || matches!(action, Some(UpdateAction::Check)))
+        }
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
@@ -855,9 +860,49 @@ pub fn compare_versions(current: &str, latest_tag: &str) -> Option<std::cmp::Ord
     Some(parse_version(current)?.cmp(&parse_version(latest_tag)?))
 }
 
-fn update_check() -> Result<()> {
+/// Published releases newer than `current`, oldest first, as (tag, notes,
+/// url). Drafts and pre-releases are left out.
+fn newer_releases(releases: &Value, current: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = releases
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["draft"] != true && r["prerelease"] != true)
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            (compare_versions(current, tag)? == std::cmp::Ordering::Less).then(|| {
+                (
+                    tag.to_string(),
+                    r["body"].as_str().unwrap_or_default().trim().to_string(),
+                    r["html_url"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+        })
+        .collect();
+    out.sort_by_key(|(tag, _, _)| parse_version(tag));
+    out
+}
+
+/// How this binary was installed, as the command that upgrades it.
+fn upgrade_command() -> &'static str {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/") {
+        "brew upgrade formless"
+    } else if exe.contains("/.cargo/bin/") {
+        "cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked --force"
+    } else {
+        "curl -fsSL https://formless.athiwat.xyz/install.sh | sh"
+    }
+}
+
+/// `formless update`: what's newer than this build and what changed in
+/// each release, then how to upgrade (`--check` stops after the report).
+fn update_cmd(check: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    let body = match http_get("https://api.github.com/repos/athiwatc/formless/releases/latest") {
+    let body = match http_get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50")
+    {
         Ok(b) => b,
         Err(e) if e.to_string().contains("404") => {
             println!("installed: v{current}");
@@ -866,19 +911,34 @@ fn update_check() -> Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let v: Value = serde_json::from_str(&body).context("parse latest release")?;
-    let tag = v["tag_name"]
-        .as_str()
-        .context("latest release has no tag_name")?;
-    let url = v["html_url"]
-        .as_str()
-        .unwrap_or("https://github.com/athiwatc/formless/releases/latest");
+    let releases: Value = serde_json::from_str(&body).context("parse releases")?;
+    let newer = newer_releases(&releases, current);
     println!("installed: v{current}");
-    println!("latest:    {tag}");
-    match compare_versions(current, tag) {
-        Some(std::cmp::Ordering::Less) => println!("update available: {url}"),
-        Some(_) => println!("up to date"),
-        None => println!("could not compare versions"),
+    let Some((latest, _, url)) = newer.last() else {
+        println!("up to date");
+        return Ok(());
+    };
+    println!("latest:    {latest}  ({url})");
+    println!();
+    for (tag, notes, _) in &newer {
+        println!("── {tag} ──");
+        println!(
+            "{}",
+            if notes.is_empty() {
+                "(no release notes)"
+            } else {
+                notes
+            }
+        );
+        println!();
+    }
+    if check {
+        println!(
+            "{} newer release(s); `formless update` shows how to upgrade.",
+            newer.len()
+        );
+    } else {
+        println!("To upgrade to {latest}:\n  {}", upgrade_command());
     }
     Ok(())
 }
@@ -3811,6 +3871,22 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 mod tests {
 
     #[test]
+    fn update_lists_newer_releases_oldest_first() {
+        let releases = serde_json::json!([
+            {"tag_name": "v0.3.0", "body": "New: run --timeout", "html_url": "u3"},
+            {"tag_name": "v0.2.1-rc1", "prerelease": true, "body": "rc", "html_url": "x"},
+            {"tag_name": "v0.2.0", "body": "New: sessions CLI", "html_url": "u2"},
+            {"tag_name": "v0.4.0", "draft": true, "body": "draft", "html_url": "x"},
+            {"tag_name": "v0.1.0", "body": "first", "html_url": "u1"},
+        ]);
+        let newer = newer_releases(&releases, "0.1.0");
+        let tags: Vec<&str> = newer.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(tags, ["v0.2.0", "v0.3.0"]);
+        assert_eq!(newer[1].1, "New: run --timeout");
+        assert!(newer_releases(&releases, "0.3.0").is_empty());
+    }
+
+    #[test]
     fn bug_reports_redact_secrets() {
         let home = std::env::var("HOME").unwrap_or_default();
         let text = format!(
@@ -3826,7 +3902,15 @@ mod tests {
             "x".repeat(48)
         );
         let r = redact(&text);
-        for secret in ["abc.def.ghi", "sk-live", "c2VjcmV0", "0123abcd", "hunter2", "ABCDEFGHIJ", &"x".repeat(48)] {
+        for secret in [
+            "abc.def.ghi",
+            "sk-live",
+            "c2VjcmV0",
+            "0123abcd",
+            "hunter2",
+            "ABCDEFGHIJ",
+            &"x".repeat(48),
+        ] {
             assert!(!r.contains(secret), "{secret} leaked:\n{r}");
         }
         if !home.is_empty() {
