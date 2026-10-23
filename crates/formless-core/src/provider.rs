@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -297,6 +298,25 @@ pub fn responses_text(v: &Value) -> String {
         }
     }
     out
+}
+
+/// The `tool_calls` slot for a Responses stream event. `output_index`
+/// counts every output item (reasoning, messages, calls), so it is mapped
+/// to a slot rather than used as one: a reasoning item at index 0 must not
+/// leave an empty call behind (#540). Events without an index get a new slot.
+fn responses_slot(
+    tool_calls: &mut Vec<ToolCall>,
+    slots: &mut HashMap<u64, usize>,
+    event: &Value,
+) -> usize {
+    let mut new_slot = || {
+        tool_calls.push(ToolCall::default());
+        tool_calls.len() - 1
+    };
+    match event["output_index"].as_u64() {
+        Some(i) => *slots.entry(i).or_insert_with(new_slot),
+        None => new_slot(),
+    }
 }
 
 fn responses_tool_calls(v: &Value) -> Vec<ToolCall> {
@@ -753,6 +773,8 @@ impl Provider {
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Responses `output_index` → position in `tool_calls`.
+        let mut call_slots: HashMap<u64, usize> = HashMap::new();
         let mut truncated = false;
         let mut usage = None;
         let mut attempt = 0;
@@ -785,6 +807,7 @@ impl Provider {
                                 content.clear();
                                 reasoning.clear();
                                 tool_calls.clear();
+                                call_slots.clear();
                                 truncated = false;
                                 usage = None;
                                 tokio::time::sleep(self.backoff(attempt, None)).await;
@@ -845,10 +868,7 @@ impl Provider {
                                             "response.output_item.added" | "response.output_item.done" => {
                                                 let item = &v["item"];
                                                 if item["type"].as_str() == Some("function_call") {
-                                                    let idx = v["output_index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
-                                                    while tool_calls.len() <= idx {
-                                                        tool_calls.push(ToolCall::default());
-                                                    }
+                                                    let idx = responses_slot(&mut tool_calls, &mut call_slots, &v);
                                                     let slot = &mut tool_calls[idx];
                                                     if let Some(id) = item["call_id"].as_str().or_else(|| item["id"].as_str()) {
                                                         slot.id = id.to_string();
@@ -864,10 +884,7 @@ impl Provider {
                                                 }
                                             }
                                             "response.function_call_arguments.delta" => {
-                                                let idx = v["output_index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
-                                                while tool_calls.len() <= idx {
-                                                    tool_calls.push(ToolCall::default());
-                                                }
+                                                let idx = responses_slot(&mut tool_calls, &mut call_slots, &v);
                                                 if let Some(d) = v["delta"].as_str() {
                                                     tool_calls[idx].arguments.push_str(d);
                                                 }
@@ -961,6 +978,16 @@ impl Provider {
             if !calls.is_empty() {
                 tool_calls = calls;
             }
+        }
+        // A call without a name can never be dispatched, and once stored it
+        // makes every later request of the Session fail (#541).
+        let before = tool_calls.len();
+        tool_calls.retain(|c| !c.name.trim().is_empty());
+        if tool_calls.len() < before {
+            tracing::warn!(
+                "dropped {} tool call(s) without a name from the provider response",
+                before - tool_calls.len()
+            );
         }
         for (i, tc) in tool_calls.iter_mut().enumerate() {
             if tc.id.is_empty() {
