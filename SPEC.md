@@ -1795,6 +1795,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   Shortcuts never fire while typing or while a dialog is open. Approvals
   keep `y`/`o`/`n`.
 
+- **Key hint bar (TUI).** The right side of the status line shows the
+  current view's keys in one format (`Enter open · n new · f fork · d
+  delete`). They come from a per-view key table with an importance rank,
+  and narrow terminals show only the most important hints that fit.
+  The table replaces the hand-written panel footers.
 - **List keys (TUI).** Every list view (Sessions, Tools, Metrics,
   Proposals) takes ↑/↓ and j/k, g/G or Home/End for the first/last row,
   and Ctrl+D/Ctrl+U for half a page. List views take no typed input, so

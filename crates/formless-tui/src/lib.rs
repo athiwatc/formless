@@ -4,6 +4,7 @@ mod commands;
 mod highlight;
 mod images;
 mod input;
+mod keys;
 mod links;
 mod lists;
 mod markdown;
@@ -5778,10 +5779,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     }
     let width = area.width as usize;
     let used: usize = left.iter().map(|s| s.width()).sum();
-    // Notes show as toasts; the status line keeps a key tip.
+    // Notes show as toasts; the right side is this view's key hints,
+    // from one table, trimmed by importance to fit (SPEC §10.5).
     let mut spans = left;
-    let tip = "Tab views · /help · /notes · Ctrl+C ×2 detach ";
-    if used + tip.chars().count() + 2 < width {
+    let tip = format!("{} ", keys::line(app.view, width.saturating_sub(used + 3)));
+    if tip.len() > 1 {
         spans.push(Span::raw(" ".repeat(width - used - tip.chars().count())));
         spans.push(Span::styled(tip, ui::dim(app.color)));
     }
@@ -7270,23 +7272,17 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let count = visible.len();
     f.render_stateful_widget(
         List::new(items)
-            .block(
-                ui::panel(
-                    app.session_filter.title(
-                        "Sessions",
-                        visible.len(),
-                        app.sessions.len(),
-                        lists::SESSION_SORTS,
-                        lists::SESSION_QUICK,
-                    ),
-                    app.color,
-                    Color::Cyan,
-                )
-                .title_bottom(ui::hint(
-                    "Enter open · n new · f fork · r rename · d delete · e export · i import · / filter · s sort · v running",
-                    app.color,
-                )),
-            )
+            .block(ui::panel(
+                app.session_filter.title(
+                    "Sessions",
+                    visible.len(),
+                    app.sessions.len(),
+                    lists::SESSION_SORTS,
+                    lists::SESSION_QUICK,
+                ),
+                app.color,
+                Color::Cyan,
+            ))
             .highlight_style(bold_fg(app.color, Color::Cyan).add_modifier(Modifier::REVERSED))
             .highlight_symbol("› "),
         area,
@@ -7359,12 +7355,11 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let height = area.height.saturating_sub(2) as usize;
     let top = sel_line.saturating_sub(height.saturating_sub(2));
     f.render_widget(
-        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).block(
-            ui::panel(" Settings ", app.color, Color::Cyan).title_bottom(ui::hint(
-                "↑↓ select · Enter change · d remove · Esc back · saved through the daemon",
-                app.color,
-            )),
-        ),
+        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).block(ui::panel(
+            " Settings ",
+            app.color,
+            Color::Cyan,
+        )),
         area,
     );
     if let Some(form) = &app.settings_form {
@@ -7450,14 +7445,11 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     }
     f.render_stateful_widget(
         List::new(items)
-            .block(
-                ui::panel(
-                    format!(" Search ({} hits) ", app.search_hits.len()),
-                    app.color,
-                    Color::Magenta,
-                )
-                .title_bottom(ui::hint("Enter open session · Esc back", app.color)),
-            )
+            .block(ui::panel(
+                format!(" Search ({} hits) ", app.search_hits.len()),
+                app.color,
+                Color::Magenta,
+            ))
             .highlight_style(bold_fg(app.color, Color::Magenta).add_modifier(Modifier::REVERSED))
             .highlight_symbol("› "),
         area,
@@ -7759,10 +7751,7 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
     if app.proposal_generating {
         title.push_str(&format!("· {} generating… ", app.spinner()));
     }
-    let block = ui::panel(title, app.color, Color::Blue).title_bottom(ui::hint(
-        "n new proposal (costs tokens) · a apply measured · r reject · b roll back · / filter · s sort · v status",
-        app.color,
-    ));
+    let block = ui::panel(title, app.color, Color::Blue);
     if app.proposals.is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(
@@ -8017,10 +8006,7 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         lists::TOOL_SORTS,
         lists::TOOL_QUICK,
     );
-    let block = ui::panel(title, app.color, Color::Yellow).title_bottom(ui::hint(
-        "Enter detail · E edit · o optimise · x retire · b rollback · e export · i import · p purge · / filter · s sort · v show",
-        app.color,
-    ));
+    let block = ui::panel(title, app.color, Color::Yellow);
     if app.tools.is_empty() || visible.is_empty() {
         let empty = if app.tools.is_empty() {
             NO_TOOLS
@@ -10676,6 +10662,20 @@ mod tests {
         app.view = View::Proposals;
         app.key(key(KeyCode::Char('g')));
         assert!(!app.proposal_generating);
+    }
+
+    #[test]
+    fn hint_bar_follows_the_view() {
+        let mut app = test_app();
+        assert!(render(&mut app, 140, 20).contains("Enter send · / commands"));
+        app.view = View::Sessions;
+        assert!(render(&mut app, 140, 20).contains("Enter open · n new · f fork"));
+        app.view = View::Proposals;
+        let narrow = render(&mut app, 60, 20);
+        assert!(
+            narrow.contains("a apply") && !narrow.contains("v status"),
+            "{narrow}"
+        );
     }
 
     #[test]
