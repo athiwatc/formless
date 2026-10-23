@@ -279,6 +279,7 @@ formless run "audit my Downloads folder" --json            # one JSON event per 
 formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
 formless run "classify these titles" --model small-model --effort low
 formless run "plan the migration" --role planner           # a configured Role's provider and model
+formless run "what's wrong here?" --attach shot.png --attach app.log   # files and images
 git diff | formless run "review this"                      # piped input goes along as stdin.txt
 cat task.md | formless run -                               # `-` reads the task itself from stdin
 ```

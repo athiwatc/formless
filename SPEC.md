@@ -2220,7 +2220,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   and `--role` with `--model` is refused) set the Run's model. On the
   ephemeral Session they simply apply; with `--session` they apply to that
   Run, and the Session's own model and effort are restored afterwards
-  (`--effort` alone keeps its model). Streaming
+  (`--effort` alone keeps its model). `--attach FILE` (repeatable) sends
+  files and images with the task through `AttachFile`, with the same 20 MB
+  limit and type and vision handling as `/attach`. Every file is read and
+  checked first; a missing or too-large one is a usage error (exit 2)
+  before anything runs. Streaming
   human-readable output on stdout; daemon logs on stderr; `--json` emits one
   JSON event per line (the §9.3 event stream). **Approvals fail closed** in
   headless mode: an unapproved sensitive Invocation fails with a clear error
