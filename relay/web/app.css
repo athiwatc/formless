@@ -565,3 +565,16 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 3px; 
 /* Sortable table headers */
 .th-sort { background: none; border: 0; padding: 0; font: inherit; color: inherit; cursor: pointer; text-transform: inherit; letter-spacing: inherit; }
 .th-sort:hover { text-decoration: underline; }
+
+/* Tool code editor: highlighted and marks layers behind a transparent textarea */
+.code-editor { position: relative; }
+.code-editor .editor { position: relative; z-index: 2; color: transparent; caret-color: var(--text); background: transparent; white-space: pre; overflow: auto; }
+.code-editor .editor::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); color: transparent; }
+.ed-layer { position: absolute; inset: 0; margin: 0; overflow: hidden; pointer-events: none; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; padding: 10px 12px; border: 1px solid transparent; tab-size: 2; white-space: pre; }
+/* Bottom to top: marks (and the editor background), highlighted text,
+   then the transparent textarea, so mark backgrounds never hide text. */
+.ed-marks { z-index: 0; color: transparent; background: var(--code-bg); border-radius: 8px; }
+.ed-hl { z-index: 1; color: var(--text); }
+.ed-bracket { background: color-mix(in srgb, var(--accent) 35%, transparent); border-radius: 2px; }
+.ed-err { background: var(--err-soft); }
+.ed-status { font-size: 12px; margin-top: 4px; font-family: var(--mono); }

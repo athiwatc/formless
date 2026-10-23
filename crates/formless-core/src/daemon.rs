@@ -103,6 +103,23 @@ fn send_all(subs: &Subs, ev: Event) {
     });
 }
 
+/// The line a JS error points at (`eval_script:3:13`, `<eval>:3`, `line
+/// 3`), if it says.
+fn error_line(e: &str) -> Option<u32> {
+    let after = |key: &str| {
+        e.find(key).and_then(|i| {
+            let digits: String = e[i + key.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse().ok()
+        })
+    };
+    after("eval_script:")
+        .or_else(|| after(">:"))
+        .or_else(|| after("line "))
+}
+
 /// Tool result for a call whose arguments hit the output token limit.
 fn truncated_call_message(tool: &str) -> String {
     format!(
@@ -1613,6 +1630,17 @@ impl Daemon {
                 let _ = self.with_store(|st| st.audit("user", "tool.run", &tool.name));
                 let result = self.call_tool_direct(&session_id, &tool.name, input).await;
                 Ok(json!({ "result": result }))
+            }
+            Request::CheckToolCode { code } => {
+                // The gate evaluates top-level code (bounded), so off the
+                // async workers.
+                let checked =
+                    tokio::task::spawn_blocking(move || formless_runtime::check_syntax(&code))
+                        .await?;
+                Ok(match checked {
+                    Ok(()) => json!({ "ok": true }),
+                    Err(e) => json!({ "ok": false, "error": e, "line": error_line(&e) }),
+                })
             }
             Request::UpdateToolSpec {
                 id,

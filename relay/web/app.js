@@ -2047,8 +2047,9 @@
     }
     if (editing) {
       box.append(h("h3", null, "Edit v" + t.current_version + " ", h("span", { class: "muted" }, "→ saves as a new version through the smoke gate")));
-      const area = h("textarea", { class: "editor", spellcheck: "false", "aria-label": "Tool code" });
+      const area = h("textarea", { class: "editor", spellcheck: "false", "aria-label": "Tool code", "aria-describedby": "editor-status" });
       area.value = S.editingCode.code;
+      const ed = codeEditor(area);
       area.addEventListener("input", () => { S.editingCode.code = area.value; });
       area.addEventListener("keydown", (e) => {
         if (e.key === "Tab") {
@@ -2065,7 +2066,7 @@
           renderTools();
         }
       });
-      box.append(area, h("div", { class: "detail-actions" },
+      box.append(ed, h("div", { class: "detail-actions" },
         h("button", { class: "btn primary small", type: "button", onclick: () => saveCode(t) }, "Save new version"),
         h("button", { class: "btn ghost small", type: "button", onclick: () => { S.editingCode = null; renderTools(); } }, "Cancel"),
         h("span", { class: "muted", style: "font-size:12px" }, "Ctrl/⌘+S save · Esc cancel")));
@@ -2075,6 +2076,85 @@
       const rows = current.code.split("\n").map((l, i) => h("tr", null, h("td", { class: "ln" }, i + 1), h("td", { class: "src" }, l)));
       box.append(h("div", { class: "code" }, h("table", null, h("tbody", null, rows))));
     }
+  }
+
+  /** The Tool code editor (SPEC §10.4): the textarea's text is drawn by a
+   * highlighted layer behind it, a second layer marks the bracket pair at
+   * the cursor and the line of a syntax error, and the daemon's syntax gate
+   * checks the code as you type (CheckToolCode), with its error below. */
+  function codeEditor(area) {
+    const hl = h("pre", { class: "ed-layer ed-hl", "aria-hidden": "true" });
+    const marks = h("pre", { class: "ed-layer ed-marks", "aria-hidden": "true" });
+    const status = h("div", { class: "ed-status muted", id: "editor-status", "aria-live": "polite" });
+    const wrap = h("div", { class: "code-editor" }, hl, marks, area);
+    let errLine = null, timer = null, seq = 0;
+    const PAIRS = { "(": ")", "[": "]", "{": "}" };
+    const CLOSE = { ")": "(", "]": "[", "}": "{" };
+    // The bracket at (or just before) the cursor and its partner.
+    function bracketPair(text, at) {
+      for (const i of [at, at - 1]) {
+        const c = text[i];
+        if (PAIRS[c]) {
+          let depth = 0;
+          for (let j = i; j < text.length; j++) {
+            if (text[j] === c) depth++;
+            else if (text[j] === PAIRS[c] && --depth === 0) return [i, j];
+          }
+        } else if (CLOSE[c]) {
+          let depth = 0;
+          for (let j = i; j >= 0; j--) {
+            if (text[j] === c) depth++;
+            else if (text[j] === CLOSE[c] && --depth === 0) return [j, i];
+          }
+        }
+      }
+      return null;
+    }
+    function paint() {
+      const text = area.value;
+      const nodes = highlight(text + "\n", "js");
+      hl.replaceChildren(...(nodes || [text + "\n"]));
+      // Marks: the same text, invisible, with backgrounds where it counts.
+      const lines = (text + "\n").split("\n");
+      const pair = bracketPair(text, area.selectionStart);
+      let offset = 0;
+      marks.replaceChildren(...lines.map((line, n) => {
+        const start = offset;
+        offset += line.length + 1;
+        const parts = [];
+        let at = 0;
+        for (const p of pair || []) {
+          if (p >= start && p < start + line.length) {
+            parts.push(line.slice(at, p - start), h("span", { class: "ed-bracket" }, line[p - start]));
+            at = p - start + 1;
+          }
+        }
+        parts.push(line.slice(at));
+        const el = h("span", { class: errLine === n + 1 ? "ed-line ed-err" : "ed-line" }, ...parts);
+        return n < lines.length - 1 ? [el, "\n"] : el;
+      }).flat());
+      sync();
+    }
+    function sync() {
+      for (const layer of [hl, marks]) {
+        layer.scrollTop = area.scrollTop;
+        layer.scrollLeft = area.scrollLeft;
+      }
+    }
+    async function check() {
+      const mine = ++seq;
+      const r = await request({ type: "check_tool_code", code: area.value }).catch(() => null);
+      if (mine !== seq || !r) return;
+      errLine = r.ok ? null : r.line || null;
+      status.className = "ed-status " + (r.ok ? "muted" : "error");
+      status.textContent = r.ok ? "✓ syntax ok" : "✗ " + (r.line ? "line " + r.line + ": " : "") + r.error;
+      paint();
+    }
+    area.addEventListener("input", () => { paint(); clearTimeout(timer); timer = setTimeout(check, 400); });
+    for (const ev of ["click", "keyup", "select"]) area.addEventListener(ev, paint);
+    area.addEventListener("scroll", sync);
+    setTimeout(() => { paint(); check(); }, 0);
+    return h("div", null, wrap, status);
   }
 
   function renderMetrics() {

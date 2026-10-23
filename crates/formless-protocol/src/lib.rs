@@ -1047,6 +1047,11 @@ pub enum Request {
         input: serde_json::Value,
         session_id: String,
     },
+    /// Run Tool JS through the same syntax gate as saving, without saving
+    /// (the web editor's inline errors): `{ok, error?, line?}`.
+    CheckToolCode {
+        code: String,
+    },
     /// Save a new version with a new description and/or schemas, the
     /// rest as the current version, through the usual gates with author
     /// `user` (SPEC §10.4).
