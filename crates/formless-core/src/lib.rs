@@ -25,6 +25,7 @@ pub mod scripts;
 pub mod skills;
 pub mod storage;
 pub mod tools;
+pub mod transcript;
 pub mod webui;
 #[cfg(windows)]
 pub mod win_pipe;

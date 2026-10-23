@@ -1438,6 +1438,17 @@ enum SessionsAction {
     Archive { id: String },
     /// Bring an archived Session back
     Unarchive { id: String },
+    /// Export a Session: the re-importable JSON bundle, or a readable
+    /// Markdown or HTML transcript
+    Export {
+        id: String,
+        /// json, markdown (md) or html
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Write here instead of standard output
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
@@ -1458,25 +1469,45 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
         }
         SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
         SessionsAction::Unarchive { id } => set_archived(&paths, &id, false)?,
+        SessionsAction::Export { id, format, output } => {
+            let s = find_session(&paths, &id)?;
+            let r = daemon(Request::ExportSession {
+                id: s.id,
+                format: Some(format),
+            })?;
+            let text = match r["content"].as_str() {
+                Some(c) => c.to_string(),
+                None => serde_json::to_string_pretty(&r)?,
+            };
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, text)?;
+                    eprintln!("exported {} to {}", s.name, path.display());
+                }
+                None => print!("{text}"),
+            }
+        }
     }
     Ok(())
 }
 
-/// Archive or restore a Session given its id or an id prefix.
-fn set_archived(paths: &Paths, id: &str, archived: bool) -> Result<()> {
+/// The Session with this id or id prefix.
+fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
     let list: Vec<SessionInfo> = serde_json::from_value(formless_tui::client::request_once(
         paths,
         Request::ListSessions,
     )?)?;
-    let matches: Vec<&SessionInfo> = list.iter().filter(|s| s.id.starts_with(id)).collect();
-    let s = match matches.as_slice() {
-        [one] => *one,
-        [] => anyhow::bail!("no Session '{id}' (formless sessions list)"),
-        _ => anyhow::bail!(
-            "'{id}' matches {} Sessions; give more of the id",
-            matches.len()
-        ),
-    };
+    let mut matches: Vec<SessionInfo> = list.into_iter().filter(|s| s.id.starts_with(id)).collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => anyhow::bail!("no Session '{id}' (formless sessions list)"),
+        n => anyhow::bail!("'{id}' matches {n} Sessions; give more of the id"),
+    }
+}
+
+/// Archive or restore a Session given its id or an id prefix.
+fn set_archived(paths: &Paths, id: &str, archived: bool) -> Result<()> {
+    let s = find_session(paths, id)?;
     formless_tui::client::request_once(
         paths,
         Request::SetSessionArchived {

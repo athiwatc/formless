@@ -473,7 +473,12 @@ async fn tool_and_session_export_import_across_profiles() {
         bundle.get("success_rate").is_none() && bundle.get("invocations").is_none(),
         "bundle must carry no metrics: {bundle}"
     );
-    let sbundle = a.rpc(Request::ExportSession { id: session_id }).await;
+    let sbundle = a
+        .rpc(Request::ExportSession {
+            id: session_id,
+            format: None,
+        })
+        .await;
     server_a.abort();
 
     let server_b = start_daemon(&paths_b).await;

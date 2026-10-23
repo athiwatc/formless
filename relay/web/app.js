@@ -448,7 +448,7 @@
       h("button", { type: "button", onclick: () => { closePopover(); tagSession(s); } }, "Tags…"),
       h("button", { type: "button", onclick: () => { closePopover(); editInstructions(s); } }, "Instructions…"),
       h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
-      h("button", { type: "button", onclick: () => { closePopover(); exportSession(s.id); } }, "Export"),
+      h("button", { type: "button", onclick: () => { closePopover(); pickExport(s.id); } }, "Export…"),
       h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
     popover.style.top = Math.min(r.bottom + 4, innerHeight - 170) + "px";
     popover.style.left = Math.min(r.left, innerWidth - 170) + "px";
@@ -2227,10 +2227,24 @@
     S.marked.clear();
     await refreshSessions();
   }
-  async function exportSession(id) {
+  /** `format`: json (the re-importable bundle), markdown or html. */
+  async function exportSession(id, format) {
     if (!id) return;
-    const bundle = await act({ type: "export_session", id });
-    if (bundle) download("formless-session-" + slug(bundle.name) + ".json", bundle);
+    const r = await act({ type: "export_session", id, format: format || null });
+    if (!r) return;
+    const base = "formless-session-" + slug(r.name);
+    if (r.format === "markdown") downloadBlob(base + ".md", new Blob([r.content], { type: "text/markdown" }));
+    else if (r.format === "html") downloadBlob(base + ".html", new Blob([r.content], { type: "text/html" }));
+    else download(base + ".json", r);
+  }
+  async function pickExport(id) {
+    if (!id) return;
+    const formats = [["markdown", "Markdown", "readable; Tool calls folded"], ["html", "HTML", "a self-contained page"], ["json", "JSON bundle", "re-importable"]];
+    const body = h("div", { class: "questions" }, formats.map(([v, label, desc], i) => h("label", { class: "q-option" },
+      h("input", { type: "radio", name: "fmt", value: v, checked: i === 0 }),
+      h("span", {}, h("span", { text: label }), h("span", { class: "muted", text: desc })))));
+    if (!(await ask({ title: "Export session", body, ok: "Export" }))) return;
+    exportSession(id, body.querySelector("input:checked").value);
   }
   async function importSession() {
     const bundle = await pickJson();
@@ -2305,6 +2319,7 @@
   const COMMANDS = [
     { name: "new", args: "[TEMPLATE]", group: "Session", desc: "start a new Session, optionally from a template", run: (arg) => (arg ? newFromTemplate(arg) : newSession()) },
     { name: "template", args: "save|delete NAME [FIRST MESSAGE]", group: "Session", desc: "save this Session's setup as a template, or delete one", run: (arg) => templateCommand(arg) },
+    { name: "export", args: "[json|md|html]", group: "Session", desc: "export this Session: a re-importable bundle, or a readable transcript", run: (arg) => (arg ? exportSession(S.current, arg) : pickExport(S.current)) },
     { name: "templates", group: "Session", desc: "list Session templates", run: () => templateCommand("") },
     { name: "sessions", group: "Session", desc: "list and switch Sessions", run: () => { setView("chat"); openSidebar(); $("search").focus(); } },
     { name: "fork", group: "Session", desc: "fork the current Session", run: () => forkSession(S.current) },
@@ -2983,7 +2998,7 @@
   $("new-session").onclick = pickNewSession;
   $("import-session").onclick = importSession;
   $("fork-btn").onclick = () => forkSession(S.current);
-  $("export-session").onclick = () => exportSession(S.current);
+  $("export-session").onclick = () => pickExport(S.current);
   $("show-thinking").onchange = (e) => setThinking(e.target.checked);
   $("search-form").addEventListener("submit", (e) => { e.preventDefault(); search($("search").value); });
   $("search").addEventListener("search", () => { if (!$("search").value) renderSearch(null); });
