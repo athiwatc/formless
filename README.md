@@ -281,6 +281,7 @@ formless run "triage this" --output json                   # {session_id, status
 formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
 formless run "classify these titles" --model small-model --effort low
 formless run "plan the migration" --role planner           # a configured Role's provider and model
+formless run "fix the failing test" --cwd ~/src/app        # act on that folder (default: where you run it)
 formless run "what's wrong here?" --attach shot.png --attach app.log   # files and images
 git diff | formless run "review this"                      # piped input goes along as stdin.txt
 cat task.md | formless run -                               # `-` reads the task itself from stdin

@@ -2228,6 +2228,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   - `json`: one `{session_id, status, answer, error}` object at the end;
   - `jsonl-events`: every event, one per line; `--json` is the same.
 
+  `--cwd DIR` sets the Run's working directory (§5.1). A new headless
+  Session uses `--cwd`, or else the directory `formless run` was started
+  in. With `--session` the Session keeps its own unless `--cwd` is given;
+  then `--cwd` applies to that Run and the Session's own is restored
+  afterwards. A missing directory is a usage error (exit 2).
   `--timeout DURATION` (`90`, `90s`, `10m`, `1h30m`) interrupts the Run
   when it expires. The command says "timed out after …", waits up to 10 s
   for the Run to stop, and exits 124 (JSON status `timed_out`).
