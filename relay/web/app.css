@@ -544,3 +544,4 @@ button.linkish:hover { text-decoration: underline; }
 /* Settings filter */
 .settings-filter { width: 100%; max-width: 520px; padding: 8px 12px; margin: 0 0 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
 mark.find { background: var(--accent-soft); color: inherit; border-radius: 3px; padding: 0 1px; }
+.setting-desc { font-size: 12px; margin-top: 2px; }
