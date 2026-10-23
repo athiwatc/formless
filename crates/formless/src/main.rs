@@ -68,10 +68,15 @@ enum Cmd {
         #[command(subcommand)]
         action: ProvidersAction,
     },
-    /// Sessions: list, archive or restore them
+    /// Sessions: list, show, search, rename, delete, export or import them
     Sessions {
         #[command(subcommand)]
         action: SessionsAction,
+    },
+    /// Settings: get, set (validated by the daemon), edit or locate config.toml
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
     Roles {
@@ -508,6 +513,7 @@ fn main() -> Result<()> {
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
+        Some(Cmd::Config { action }) => config_cmd(paths, action),
         Some(Cmd::Roles { action }) => roles_cmd(paths, action),
         Some(Cmd::Web {
             port,
@@ -2018,6 +2024,122 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print where config.toml is
+    Path,
+    /// Print a setting's value (with FORMLESS_* overrides applied)
+    Get { key: String },
+    /// Set a setting through the daemon: validated, audited and applied at
+    /// once. VALUE is JSON when it parses as JSON (5, true, ["a"]), else text
+    Set { key: String, value: String },
+    /// Edit config.toml in $EDITOR; it is replaced only if it still parses
+    Edit,
+}
+
+fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
+    match action {
+        ConfigAction::Path => println!("{}", paths.config_file().display()),
+        ConfigAction::Get { key } => {
+            let cfg = serde_json::to_value(Config::load(&paths)?)?;
+            match cfg.pointer(&format!("/{}", key.replace('.', "/"))) {
+                Some(serde_json::Value::String(s)) => println!("{s}"),
+                Some(v) => println!("{}", serde_json::to_string_pretty(v)?),
+                None => {
+                    eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
+                    std::process::exit(2);
+                }
+            }
+        }
+        ConfigAction::Set { key, value } => {
+            let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
+            formless_core::daemon::ensure_daemon(&paths)?;
+            let r = formless_tui::client::request_once(
+                &paths,
+                Request::SetSetting {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+            )?;
+            println!(
+                "{key} = {value}{}",
+                if r["applies"] == "on_tui_start" {
+                    " (applies when the TUI next starts)"
+                } else {
+                    ""
+                }
+            );
+        }
+        ConfigAction::Edit => config_edit(&paths)?,
+    }
+    Ok(())
+}
+
+/// `config edit`: edit a copy, check it parses as a Config, then replace
+/// config.toml (a broken edit never lands; you can edit again).
+fn config_edit(paths: &Paths) -> Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let file = paths.config_file();
+    if !file.exists() {
+        Config::default().save(paths)?;
+    }
+    let draft = file.with_extension("toml.edit");
+    std::fs::copy(&file, &draft)?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    loop {
+        // $EDITOR may carry arguments and quotes ("code --wait"): let the
+        // shell read it, as git does.
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} \"$@\""))
+            .arg("sh")
+            .arg(&draft)
+            .status();
+        #[cfg(not(unix))]
+        let status = {
+            let mut words = editor.split_whitespace();
+            std::process::Command::new(words.next().unwrap_or("notepad"))
+                .args(words)
+                .arg(&draft)
+                .status()
+        };
+        let status = status.with_context(|| format!("start editor '{editor}'"))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&draft);
+            anyhow::bail!("the editor exited with {status}; config.toml unchanged");
+        }
+        match Config::load_from(&draft) {
+            Ok(_) => {
+                std::fs::rename(&draft, &file)?;
+                println!(
+                    "saved {} (the daemon picks it up on its next read)",
+                    file.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("config.toml would not parse:\n{e:#}");
+                if !std::io::stdin().is_terminal() {
+                    let _ = std::fs::remove_file(&draft);
+                    anyhow::bail!("config.toml unchanged");
+                }
+                eprint!("Edit again? [Y/n] ");
+                let _ = std::io::stderr().flush();
+                let mut answer = String::new();
+                std::io::stdin().lock().read_line(&mut answer)?;
+                if answer.trim().eq_ignore_ascii_case("n") {
+                    let _ = std::fs::remove_file(&draft);
+                    println!("config.toml unchanged");
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 /// The Session with this id or id prefix.
