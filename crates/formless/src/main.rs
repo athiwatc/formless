@@ -169,6 +169,24 @@ enum AuthAction {
     Logout,
 }
 
+/// The pairing link as a terminal QR code, for a phone's camera; only on a
+/// terminal (it holds the secret, so it never goes into a pipe or a log).
+fn print_pairing_qr(url: &str) {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    if let Some(code) = formless_tui::qr::ansi(url) {
+        println!();
+        print!("{code}");
+        println!("            Scan with your phone. This code contains the pairing secret:");
+        println!(
+            "            anyone who sees it can use your daemon. Rotate with --rotate if it leaks."
+        );
+        println!();
+    }
+}
+
 #[derive(Subcommand)]
 enum RelayAction {
     /// Enable the relay (generates a pairing secret on first use) and print the browser URL
@@ -186,7 +204,11 @@ enum RelayAction {
         forget: bool,
     },
     /// Show relay config and the browser URL
-    Status,
+    Status {
+        /// Also print the browser URL as a QR code (it contains the secret)
+        #[arg(long)]
+        qr: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -628,6 +650,7 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
                 formless_core::relay::browser_url(&cfg.relay, &secret)
             );
             println!("            (the #k= secret never leaves your machines; the relay only forwards ciphertext)");
+            print_pairing_qr(&formless_core::relay::browser_url(&cfg.relay, &secret));
             if daemon_reachable(&paths) {
                 println!("daemon:     running — restart it to connect: formless daemon stop, then any formless command");
             } else {
@@ -651,14 +674,17 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
             );
             Ok(())
         }
-        RelayAction::Status => {
+        RelayAction::Status { qr } => {
             println!("enabled:    {}", cfg.relay.enabled);
             println!("url:        {}", cfg.relay.url);
             match load_relay_secret(&paths) {
-                Some(secret) => println!(
-                    "browser:    {}",
-                    formless_core::relay::browser_url(&cfg.relay, &secret)
-                ),
+                Some(secret) => {
+                    let url = formless_core::relay::browser_url(&cfg.relay, &secret);
+                    println!("browser:    {url}");
+                    if qr {
+                        print_pairing_qr(&url);
+                    }
+                }
                 None => println!("secret:     none yet (run: formless relay enable)"),
             }
             println!(

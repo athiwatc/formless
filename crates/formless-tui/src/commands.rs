@@ -78,6 +78,12 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("templates", "", "list Session templates", Session),
     cmd(
+        "relay",
+        "",
+        "pair a phone or browser: the relay link as a QR code",
+        Settings,
+    ),
+    cmd(
         "export",
         "[json|md|html]",
         "export this Session: a re-importable bundle, or a readable transcript",

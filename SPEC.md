@@ -2278,6 +2278,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   page loads no inline script (`script-src 'self'`), because its URL
   fragment carries the key, and it removes the key from the address bar
   once connected.
+  **Pairing by QR code:** `formless relay enable` (and `formless relay
+  status --qr`) print the browser link as a terminal QR code, white on
+  black so phones read it on any theme, and only on a terminal, never into
+  a pipe or log. The TUI's `/relay` shows the same in the pager when the
+  relay is on. Each warns that the code holds the pairing secret and
+  points to `--rotate` if it leaks.
   **Session links:** the fragment may also carry `s=<session-id>`
   (`#k=…&s=…`, `#local=…&s=…`, or `#s=…` in a tab that's already
   connected), which opens that Session. The Session menu's "Copy link"
