@@ -518,3 +518,7 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .attach-chip .btn { padding: 0 4px; line-height: 1; }
 .chat-view { position: relative; }
 .drop-zone { position: absolute; inset: 8px; z-index: 20; display: flex; align-items: center; justify-content: center; border: 2px dashed var(--accent); border-radius: 14px; background: color-mix(in srgb, var(--bg) 85%, transparent); color: var(--accent); font-weight: 600; pointer-events: none; }
+
+/* Streaming answers: finished blocks as Markdown, the rest as plain text */
+.stream-tail { white-space: pre-wrap; overflow-wrap: anywhere; }
+#transcript { overflow-anchor: auto; }

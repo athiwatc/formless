@@ -544,6 +544,11 @@ pasting paths.
   The web client shows pending attachments as chips above the composer,
   each with ×. Files can be picked, pasted, or dropped anywhere on the
   chat, which shows a drop zone while dragging.
+- **Web streaming.** While an answer streams, the web client renders only
+  its finished blocks (up to the last blank line outside a code fence) as
+  Markdown, reusing that render, and shows the unfinished tail as plain
+  text. Open code fences, tables and lists don't reflow, and the view stays
+  anchored.
 - **Web `@` mentions.** `@` in the web composer completes Tool names
   (labelled "Tool"; inserted as `@name` for the agent to see) and files
   from the Session's working directory, through the daemon. A chosen file
