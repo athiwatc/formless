@@ -19,8 +19,9 @@
   --radius: 10px;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
+/* Light: the system's choice unless the user picked a theme (data-theme). */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme="dark"]) {
     color-scheme: light;
     --bg: #f6f8f7;
     --panel: #ffffff;
@@ -39,6 +40,25 @@
     --code-bg: #f0f3f2;
     --shadow: 0 12px 40px rgba(20, 30, 25, .18);
   }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f8f7;
+  --panel: #ffffff;
+  --panel-2: #eef2f0;
+  --line: #dce3e0;
+  --text: #17201c;
+  --muted: #5f6d67;
+  --accent: #1f9d5a;
+  --accent-ink: #ffffff;
+  --accent-soft: #dff3e8;
+  --user: #1f7fa8;
+  --warn: #a87700;
+  --err: #c33a2c;
+  --err-soft: #fbe4e1;
+  --think: #8a4aa3;
+  --code-bg: #f0f3f2;
+  --shadow: 0 12px 40px rgba(20, 30, 25, .18);
 }
 
 * { box-sizing: border-box; }
@@ -197,7 +217,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .tok-add { color: var(--accent); background: var(--accent-soft); display: inline-block; min-width: 100%; }
 .tok-del { color: var(--err); background: var(--err-soft); display: inline-block; min-width: 100%; }
 .tok-hunk { color: var(--user); } .tok-meta { font-weight: 700; }
-@media (prefers-color-scheme: light) { .tok-fn, .tok-key { color: #2f5fb3; } }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .tok-fn, :root:not([data-theme="dark"]) .tok-key { color: #2f5fb3; } }
+:root[data-theme="light"] .tok-fn, :root[data-theme="light"] .tok-key { color: #2f5fb3; }
 /* Mermaid */
 .diagram .lang { display: flex; align-items: center; gap: 4px; padding: 3px 6px 3px 10px; }
 .diagram .lang .btn, .diagram .lang .copy { position: static; opacity: 1; font-size: 11px; padding: 2px 8px; }
@@ -487,3 +508,6 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .try-field input[type=checkbox] { width: auto; margin: 0; justify-self: start; }
 .attention { border: 1px solid var(--err); border-radius: 8px; padding: 8px 12px; margin: 10px 0; }
 .attention ul { margin: 4px 0 0; padding-left: 18px; }
+
+/* Theme switch in the top bar */
+#theme { width: auto; padding: 3px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; font-size: 13px; }
