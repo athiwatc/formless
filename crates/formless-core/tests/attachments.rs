@@ -71,6 +71,24 @@ async fn attachments_ride_on_the_next_message() {
         })
         .await
         .is_err());
+    // One taken back before sending doesn't go.
+    let dropped = daemon
+        .handle(Request::AttachFile {
+            session_id: sid.clone(),
+            name: "oops.txt".into(),
+            data_b64: b64(b"wrong file"),
+            mime: None,
+        })
+        .await
+        .unwrap();
+    let r = daemon
+        .handle(Request::DetachFile {
+            session_id: sid.clone(),
+            id: dropped["id"].as_str().unwrap().into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(r["removed"], true);
 
     daemon
         .handle(Request::SendMessage {
@@ -97,6 +115,7 @@ async fn attachments_ride_on_the_next_message() {
         text.contains("[attached: notes.txt (text/plain, 11 bytes)"),
         "{text}"
     );
+    assert!(!text.contains("oops.txt"), "{text}");
     assert_eq!(
         pm["_attachments"].as_array().unwrap().len(),
         1,

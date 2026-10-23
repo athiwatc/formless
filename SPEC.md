@@ -539,6 +539,11 @@ pasting paths.
   the extension when not given). The file waits for the Session's next
   user message, whether sent, steered or queued, and is recorded in that
   message's metadata.
+- **`DetachFile {session_id, id}`** takes a pending attachment back
+  before the message goes (`id` is its id, or a referenced path).
+  The web client shows pending attachments as chips above the composer,
+  each with ×. Files can be picked, pasted, or dropped anywhere on the
+  chat, which shows a drop zone while dragging.
 - **What the model sees:** each attachment adds a reference line to the
   message, `[attached: name (mime, bytes), artifact ID; read it with
   read_artifact]`. Images also go inline as `image_url` parts (8 MB max)
