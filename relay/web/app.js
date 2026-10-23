@@ -2073,9 +2073,11 @@
     box.replaceChildren();
     // A row is [label, value] or [label, value, settingKey, kind]: the
     // latter gets an Edit control (SetSetting, validated by the daemon).
+    const onTuiStart = new Set((S.settings && S.settings.on_tui_start) || []);
     const section = (title, rows) => h("section", null, h("h3", null, title), h("dl", { class: "kv" },
       rows.map(([k, v, key, kind]) => [h("dt", null, k), h("dd", null,
         v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : String(v),
+        key && onTuiStart.has(key) ? h("span", { class: "tag", title: "A running TUI keeps the old value until it restarts" }, "applies when the TUI starts") : null,
         key ? h("button", { class: "btn ghost small", type: "button", onclick: () => editSetting(key, v, kind) }, "Edit") : null)])));
     const on = (b) => (b ? "on" : "off");
     const grid = h("div", { class: "settings-grid" });
@@ -2089,7 +2091,10 @@
           ["fallback_models", (c.provider.fallback_models || []).join(", "), "provider.fallback_models", "list"]]),
         section("Interface", [["multi_pane", on(c.tui.multi_pane), "tui.multi_pane", "bool"], ["queue_key", c.tui.queue_key],
           ["notify (off, bell, desktop)", c.tui.notify, "tui.notify", "text"],
-          ["notify_min_secs", c.tui.notify_min_secs, "tui.notify_min_secs", "number"]]),
+          ["notify_min_secs", c.tui.notify_min_secs, "tui.notify_min_secs", "number"],
+          ["timestamps", on(c.tui.timestamps), "tui.timestamps", "bool"],
+          ["on_start (last, new, picker)", c.tui.on_start, "tui.on_start", "text"],
+          ["screen_reader", on(c.tui.screen_reader), "tui.screen_reader", "bool"]]),
         section("Relay", [["enabled", on(c.relay.enabled)], ["url", c.relay.url]]),
         section("Paths", [["config", c.paths.config], ["data", c.paths.data]]));
     } else if (c && c.error) {
@@ -2288,7 +2293,11 @@
       else if (kind === "optional") value = text.trim() ? text.trim() : null;
       else value = text.trim();
     }
-    if (await act({ type: "set_setting", key, value }, "Saved " + key)) refreshSettings();
+    const r = await act({ type: "set_setting", key, value });
+    if (!r) return;
+    if (r.applies === "on_tui_start") note("Saved " + key + ". It applies when the TUI next starts; restart any running TUI.");
+    else note("Saved " + key + " (in effect now).");
+    refreshSettings();
   }
   async function loadAudit(older) {
     const before = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1].created_at : null;

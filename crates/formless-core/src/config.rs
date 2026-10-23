@@ -230,6 +230,11 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("tui.on_start", &["last", "new", "picker"]),
 ];
 
+/// Settable keys a running client can't pick up: they apply when the TUI
+/// next starts (SPEC §10.4). Every other settable key is hot: the daemon
+/// re-reads the file, and running TUIs reload on `SettingsChanged`.
+pub const ON_TUI_START: &[&str] = &["tui.on_start", "tui.screen_reader"];
+
 pub const SETTABLE: &[&str] = &[
     "provider.model",
     "provider.reasoning_effort",
@@ -891,7 +896,12 @@ impl Config {
                 "queue_key": self.tui.queue_key,
                 "notify": self.tui.notify,
                 "notify_min_secs": self.tui.notify_min_secs,
+                "timestamps": self.tui.timestamps,
+                "on_start": self.tui.on_start,
+                "screen_reader": self.tui.screen_reader,
             },
+            // Keys that apply only when the TUI next starts.
+            "on_tui_start": ON_TUI_START,
             "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
             "naming": {
                 "enabled": self.naming.enabled,

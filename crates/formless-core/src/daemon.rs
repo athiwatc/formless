@@ -932,7 +932,16 @@ impl Daemon {
                 // Hot: the next config() read sees the new file and
                 // broadcasts SettingsChanged.
                 let _ = self.config();
-                Ok(json!({"key": key, "value": value, "restart_required": false}))
+                // Nothing settable needs a daemon restart; a few TUI keys
+                // apply when the TUI next starts.
+                let applies = if crate::config::ON_TUI_START.contains(&key.as_str()) {
+                    "on_tui_start"
+                } else {
+                    "now"
+                };
+                Ok(
+                    json!({"key": key, "value": value, "restart_required": false, "applies": applies}),
+                )
             }
             Request::RevokeApproval {
                 tool_id,

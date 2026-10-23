@@ -78,6 +78,23 @@ async fn the_daemon_writes_the_file_without_env_overrides() {
         .await
         .unwrap();
     assert_eq!(r["restart_required"], false);
+    assert_eq!(r["applies"], "now");
+    // A key the TUI only reads when it starts says so.
+    let r = daemon
+        .handle(Request::SetSetting {
+            key: "tui.on_start".into(),
+            value: serde_json::json!("new"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(r["applies"], "on_tui_start");
+    let summary = daemon.handle(Request::GetSettings).await.unwrap();
+    assert_eq!(summary["tui"]["on_start"], "new");
+    assert!(summary["on_tui_start"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k == "tui.screen_reader"));
     // Spending limits are settable: a decimal, then cleared with null.
     for value in [serde_json::json!(2.5), serde_json::Value::Null] {
         daemon
