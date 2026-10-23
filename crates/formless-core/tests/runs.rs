@@ -86,6 +86,20 @@ fn run_metrics_record_steps_tokens_and_followups() {
     let listed = store.list_sessions().unwrap();
     assert_eq!(listed.last().unwrap().id, s);
     assert!(!store.search_sessions("latest ask", 10).unwrap().is_empty());
+    // Tags are normalised: no `#`, lowercase, unique, sorted.
+    let t = store
+        .set_session_tags(
+            &other,
+            &["#Work".into(), "client-a".into(), "work".into(), " ".into()],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(t.tags, ["client-a", "work"]);
+    let listed = store.list_sessions().unwrap();
+    assert_eq!(
+        listed.iter().find(|x| x.id == other).unwrap().tags,
+        ["client-a", "work"]
+    );
     let first = runs.iter().find(|r| r.run_id == r1).unwrap();
     assert_eq!(
         (

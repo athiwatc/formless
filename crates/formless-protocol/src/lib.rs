@@ -31,6 +31,9 @@ pub struct SessionInfo {
     /// Archived: hidden from the default list, still searchable.
     #[serde(default)]
     pub archived: bool,
+    /// Free-form tags for grouping (SPEC §10.4), lowercase, sorted.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -548,6 +551,12 @@ pub enum Request {
     },
     /// Set (or, with `None`, clear) a Session's working directory; it must
     /// exist on the daemon's machine. Returns the Session.
+    /// Replace a Session's tags (normalised: trimmed, lowercase, no `#`,
+    /// deduplicated, sorted). Returns it.
+    SetSessionTags {
+        id: String,
+        tags: Vec<String>,
+    },
     /// Archive or unarchive a Session: archived ones are hidden from the
     /// default list but kept, searchable and restorable. Returns it.
     SetSessionArchived {

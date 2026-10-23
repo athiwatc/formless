@@ -338,7 +338,7 @@ const SESSION_SUMMARY: &str = "(SELECT COUNT(*) FROM messages m WHERE m.session_
      (SELECT status FROM runs r WHERE r.session_id=s.id ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1) AS last_run_status";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 35;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -353,7 +353,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 34] = [
+const MIGRATIONS: [(i64, MigrationStep); 35] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -454,6 +454,9 @@ const MIGRATIONS: [(i64, MigrationStep); 34] = [
     // Archived Sessions (SPEC §10.4).
     (34, |c| {
         add_column(c, "sessions", "archived INTEGER NOT NULL DEFAULT 0")
+    }), // Session tags, a JSON array (SPEC §10.4).
+    (35, |c| {
+        add_column(c, "sessions", "tags TEXT NOT NULL DEFAULT '[]'")
     }),
 ];
 
@@ -561,6 +564,11 @@ impl Store {
             last_run_status: r.get("last_run_status").ok().flatten(),
             pinned: r.get::<_, i64>("pinned").unwrap_or(0) != 0,
             archived: r.get::<_, i64>("archived").unwrap_or(0) != 0,
+            tags: r
+                .get::<_, String>("tags")
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default(),
         })
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
@@ -629,6 +637,22 @@ impl Store {
         if n == 0 {
             return Ok(None);
         }
+        self.get_session(id)
+    }
+
+    /// Normalised tags: trimmed, lowercase, without `#`, unique, sorted.
+    pub fn set_session_tags(&self, id: &str, tags: &[String]) -> Result<Option<SessionInfo>> {
+        let mut clean: Vec<String> = tags
+            .iter()
+            .map(|t| t.trim().trim_start_matches('#').to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        clean.sort();
+        clean.dedup();
+        self.conn.execute(
+            "UPDATE sessions SET tags=?2 WHERE id=?1",
+            params![id, serde_json::to_string(&clean)?],
+        )?;
         self.get_session(id)
     }
 

@@ -444,6 +444,7 @@
       h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
       h("button", { type: "button", onclick: () => { closePopover(); archiveSession(s); } }, s.archived ? "Unarchive" : "Archive"),
       h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
+      h("button", { type: "button", onclick: () => { closePopover(); tagSession(s); } }, "Tags…"),
       h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
       h("button", { type: "button", onclick: () => { closePopover(); exportSession(s.id); } }, "Export"),
       h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
@@ -478,9 +479,18 @@
       list.append(h("li", { class: "muted", style: "padding:8px" }, "No sessions yet."));
       return;
     }
+    // Tag chips filter the list (SPEC §10.4).
+    const tags = [...new Set(S.sessions.flatMap((s) => s.tags || []))].sort();
+    if (S.tagFilter && !tags.includes(S.tagFilter)) S.tagFilter = null;
+    if (tags.length) {
+      list.append(h("li", { class: "tag-chips" }, tags.map((t) =>
+        h("button", { type: "button", class: "chip-btn" + (S.tagFilter === t ? " on" : ""), "aria-pressed": String(S.tagFilter === t),
+          onclick: () => { S.tagFilter = S.tagFilter === t ? null : t; renderSessions(); } }, "#" + t))));
+    }
+    const tagged = (s) => !S.tagFilter || (s.tags || []).includes(S.tagFilter);
     // Archived Sessions sit in their own collapsible group at the end.
-    const archived = S.sessions.filter((s) => s.archived);
-    const shown = S.sessions.filter((s) => !s.archived || S.showArchived);
+    const archived = S.sessions.filter((s) => s.archived && tagged(s));
+    const shown = S.sessions.filter((s) => tagged(s) && (!s.archived || S.showArchived));
     for (const s of shown) {
       const menu = h("button", {
         class: "icon-btn menu", type: "button", "aria-label": "Session actions",
@@ -2037,6 +2047,15 @@
     S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)];
     await openSession(s.id);
     $("input").focus();
+  }
+  async function tagSession(s) {
+    const text = await ask({ title: "Tags for " + s.name, input: true, value: (s.tags || []).join(" "), placeholder: "work client-a", ok: "Save" });
+    if (text == null) return;
+    const r = await act({ type: "set_session_tags", id: s.id, tags: text.split(/[\s,]+/).filter(Boolean) });
+    if (!r) return;
+    const i = S.sessions.findIndex((x) => x.id === r.id);
+    if (i >= 0) S.sessions[i] = r;
+    renderSessions();
   }
   async function renameSession(s) {
     const name = await ask({ title: "Rename session", input: true, value: s.name, ok: "Rename" });
