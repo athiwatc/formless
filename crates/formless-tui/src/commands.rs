@@ -162,6 +162,12 @@ pub const COMMANDS: &[Command] = &[
         Session,
     ),
     cmd(
+        "instructions",
+        "[TEXT|clear]",
+        "standing instructions for this Session's agent",
+        Session,
+    ),
+    cmd(
         "context",
         "",
         "how full the context window is, and what fills it",

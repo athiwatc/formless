@@ -338,7 +338,7 @@ const SESSION_SUMMARY: &str = "(SELECT COUNT(*) FROM messages m WHERE m.session_
      (SELECT status FROM runs r WHERE r.session_id=s.id ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1) AS last_run_status";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 35;
+pub const SCHEMA_VERSION: i64 = 36;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -353,7 +353,7 @@ fn add_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 35] = [
+const MIGRATIONS: [(i64, MigrationStep); 36] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -458,6 +458,8 @@ const MIGRATIONS: [(i64, MigrationStep); 35] = [
     (35, |c| {
         add_column(c, "sessions", "tags TEXT NOT NULL DEFAULT '[]'")
     }),
+    // Per-Session standing instructions (SPEC §5.1).
+    (36, |c| add_column(c, "sessions", "instructions TEXT")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -569,6 +571,7 @@ impl Store {
                 .ok()
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default(),
+            instructions: r.get("instructions").ok().flatten(),
         })
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
@@ -652,6 +655,20 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions SET tags=?2 WHERE id=?1",
             params![id, serde_json::to_string(&clean)?],
+        )?;
+        self.get_session(id)
+    }
+
+    /// Blank instructions clear them.
+    pub fn set_session_instructions(
+        &self,
+        id: &str,
+        instructions: Option<&str>,
+    ) -> Result<Option<SessionInfo>> {
+        let text = instructions.map(str::trim).filter(|t| !t.is_empty());
+        self.conn.execute(
+            "UPDATE sessions SET instructions=?2 WHERE id=?1",
+            params![id, text],
         )?;
         self.get_session(id)
     }
@@ -897,10 +914,13 @@ impl Store {
             &messages,
             &checkpoints,
         )?;
-        // The fork works in the same directory.
+        // The fork works in the same directory, to the same instructions.
+        if orig.instructions.is_some() {
+            self.set_session_instructions(&fork.id, orig.instructions.as_deref())?;
+        }
         match orig.cwd.as_deref() {
             Some(cwd) => self.set_session_cwd(&fork.id, Some(cwd)),
-            None => Ok(Some(fork)),
+            None => self.get_session(&fork.id),
         }
     }
 

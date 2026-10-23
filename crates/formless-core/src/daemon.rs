@@ -846,6 +846,17 @@ impl Daemon {
                 });
                 Ok(json!({"started": true, "up_to": last}))
             }
+            Request::SetSessionInstructions { id, instructions } => {
+                let s = self
+                    .with_store(|st| st.set_session_instructions(&id, instructions.as_deref()))?
+                    .context("session not found")?;
+                // A fresh prompt snapshot: the agent follows them from its
+                // next step.
+                let prompt = self.fresh_session_prompt(&id);
+                self.with_store(|st| st.set_session_system_prompt(&id, &prompt))?;
+                self.broadcast(Event::SessionUpdated { session: s.clone() });
+                Ok(serde_json::to_value(s)?)
+            }
             Request::SuggestSessionName { id } => {
                 let recent = self.with_reader(|st| {
                     let msgs = st.list_messages(&id)?;
@@ -3292,21 +3303,32 @@ impl Daemon {
     /// the cached prefix stays valid).
     fn fresh_session_prompt(&self, session_id: &str) -> String {
         let mut prompt = self.effective_system_prompt();
-        if let Some(cwd) = self.session_cwd(session_id) {
+        let session = self
+            .with_reader(|st| st.get_session(session_id))
+            .ok()
+            .flatten();
+        if let Some(cwd) = session.as_ref().and_then(|s| s.cwd.as_deref()) {
             prompt.push_str(&format!(
                 "\n\nWorking directory: {cwd}. Paths the user gives without a leading / are relative to it; pass absolute paths to Tools."
             ));
         }
-        let Ok(cfg) = self.config() else {
-            return prompt;
-        };
-        if !cfg.provider.tool_use_nudge {
-            return prompt;
+        if let Ok(cfg) = self.config() {
+            let model = self.session_base_model(session_id, &cfg);
+            if let Some(extra) = cfg
+                .provider
+                .tool_use_nudge
+                .then(|| crate::provider::model_family_addendum(&model))
+                .flatten()
+            {
+                prompt.push_str("\n\n");
+                prompt.push_str(extra);
+            }
         }
-        let model = self.session_base_model(session_id, &cfg);
-        if let Some(extra) = crate::provider::model_family_addendum(&model) {
-            prompt.push_str("\n\n");
-            prompt.push_str(extra);
+        // Last, after the shared prefix, so other Sessions' caches hold.
+        if let Some(text) = session.and_then(|s| s.instructions) {
+            prompt.push_str(&format!(
+                "\n\nStanding instructions for this Session, from the user:\n{text}"
+            ));
         }
         prompt
     }

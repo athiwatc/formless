@@ -34,6 +34,9 @@ pub struct SessionInfo {
     /// Free-form tags for grouping (SPEC §10.4), lowercase, sorted.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Standing instructions for this Session's agent (SPEC §5.1).
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -531,6 +534,12 @@ pub enum Request {
     /// confirms with `RenameSession`.
     SuggestSessionName {
         id: String,
+    },
+    /// Set (or with null/empty, clear) a Session's standing instructions
+    /// (SPEC §5.1); they take effect at the agent's next step.
+    SetSessionInstructions {
+        id: String,
+        instructions: Option<String>,
     },
     DeleteSession {
         id: String,

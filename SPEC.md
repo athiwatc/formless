@@ -371,6 +371,14 @@ task, with quality as a gate**.
   - `@` mentions and the TUI's file links resolve against it. It shows
     in the status line and the Sessions list. Sessions without one use
     the daemon's directory, as before.
+- **Standing instructions.** A Session may carry free-text instructions
+  (`instructions`, migration v36), set with `SetSessionInstructions {id,
+  instructions}` (blank clears): `/instructions [TEXT|clear]` in the TUI
+  and web, or "Instructions…" in the web Session menu.
+  - They're appended last to the Session's system prompt, after the
+    shared prefix, so other Sessions' prompt caches are unaffected. A
+    change refreshes the prompt snapshot; the agent follows them from its
+    next step. Forks keep them.
 
 ### 5.2 Run lifecycle
 
