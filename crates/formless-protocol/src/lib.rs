@@ -229,6 +229,25 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// One version of a module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModuleVersionInfo {
+    pub version: i64,
+    pub author: String,
+    pub created_at: String,
+    pub code: String,
+}
+
+/// A module with its history and the Tools that load it (SPEC §7.7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModuleDetail {
+    pub module: ModuleInfo,
+    /// Oldest first.
+    pub versions: Vec<ModuleVersionInfo>,
+    /// Active Tools whose current code loads it, sorted.
+    pub used_by: Vec<String>,
+}
+
 /// One audit-log entry (SPEC §14).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AuditEntry {
@@ -1094,6 +1113,25 @@ pub enum Request {
     },
     ListTools,
     ListModules,
+    /// A module by id or name, with versions and the Tools using it.
+    GetModule {
+        id: String,
+    },
+    /// Save new module code as a new version (author `user`), through the
+    /// same syntax and load check as `create_module`.
+    UpdateModuleCode {
+        id: String,
+        code: String,
+    },
+    /// Make an earlier version's code current again, as a new version.
+    RollbackModule {
+        id: String,
+        version: i64,
+    },
+    /// Delete a module and all its versions (Tools that load it will fail).
+    DeleteModule {
+        id: String,
+    },
     GetTool {
         id: String,
     },
@@ -1404,6 +1442,9 @@ pub enum Event {
     ModuleUpdated {
         module: ModuleInfo,
     },
+    ModuleDeleted {
+        id: String,
+    },
     ProposalUpdated {
         proposal: PromptProposalInfo,
     },
@@ -1527,6 +1568,7 @@ impl Event {
             | Event::UserQuestionClosed { .. }
             | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }
+            | Event::ModuleDeleted { .. }
             | Event::ProposalUpdated { .. }
             | Event::ToolDeleted { .. }
             | Event::OptimiserActivity { .. }

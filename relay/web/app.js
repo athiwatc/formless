@@ -1966,8 +1966,52 @@
     }
     if (S.modules.length) {
       box.append(h("h3", null, "Shared modules ", h("span", { class: "muted" }, "(requireModule)")));
-      box.append(h("dl", { class: "kv" }, S.modules.map((m) => [h("dt", null, m.name + " v" + m.current_version), h("dd", null, m.description)])));
+      box.append(h("dl", { class: "kv" }, S.modules.map((m) => [
+        h("dt", null, h("button", { class: "linkish", type: "button", "aria-expanded": S.moduleDetail && S.moduleDetail.module.id === m.id ? "true" : "false",
+          onclick: () => openModule(S.moduleDetail && S.moduleDetail.module.id === m.id ? null : m.id) }, m.name + " v" + m.current_version)),
+        h("dd", null, m.description)])));
+      const md = S.moduleDetail;
+      if (md && S.modules.some((m) => m.id === md.module.id)) box.append(moduleDetail(md));
     }
+  }
+
+  // ----------------------------------------------------- modules (§7.7)
+  async function openModule(id) {
+    S.moduleEditing = false;
+    S.moduleDetail = id ? await act({ type: "get_module", id }) : null;
+    renderTools();
+  }
+  function moduleDetail(d) {
+    const m = d.module;
+    const cur = d.versions.find((v) => v.version === m.current_version) || d.versions[d.versions.length - 1] || { code: "" };
+    const box = h("div", { class: "module-detail" },
+      h("h3", null, "Module " + m.name),
+      h("dl", { class: "kv" },
+        h("dt", null, "Versions"), h("dd", null, h("div", { class: "versions" }, d.versions.map((v) =>
+          v.version === m.current_version
+            ? h("span", { class: "version current", title: "current" }, "v" + v.version + " " + v.author)
+            : h("button", { class: "version", type: "button", title: "Make v" + v.version + "'s code current again (as a new version)", onclick: async () => {
+              if (await act({ type: "rollback_module", id: m.id, version: v.version }, "Rolled " + m.name + " back to v" + v.version + "'s code")) openModule(m.id);
+            } }, "v" + v.version + " " + v.author)))),
+        h("dt", null, "Used by"), h("dd", null, d.used_by.length ? dependencyLinks(d.used_by) : h("span", { class: "muted" }, "no Tool"))));
+    if (S.moduleEditing) {
+      const area = h("textarea", { class: "editor", spellcheck: "false", "aria-label": "Module code" });
+      area.value = cur.code;
+      box.append(area, h("div", { class: "detail-actions" },
+        h("button", { class: "btn small primary", type: "button", onclick: async () => {
+          const r = await act({ type: "update_module_code", id: m.id, code: area.value });
+          if (r) { toast("Saved " + m.name + " v" + r.version); openModule(m.id); }
+        } }, "Save as new version"),
+        h("button", { class: "btn small", type: "button", onclick: () => { S.moduleEditing = false; renderTools(); } }, "Cancel")));
+    } else {
+      box.append(h("pre", { class: "code" }, cur.code), h("div", { class: "detail-actions" },
+        h("button", { class: "btn small", type: "button", onclick: () => { S.moduleEditing = true; renderTools(); } }, "Edit code"),
+        h("button", { class: "btn small danger", type: "button", onclick: async () => {
+          const ok = await ask({ title: "Delete module " + m.name + "?", text: (d.used_by.length ? "It is loaded by " + d.used_by.join(", ") + "; they will fail. " : "") + "All its versions are deleted.", ok: "Delete", danger: true });
+          if (ok && (await act({ type: "delete_module", id: m.id }, "Deleted module " + m.name))) { S.moduleDetail = null; renderTools(); }
+        } }, "Delete")));
+    }
+    return box;
   }
 
   function metricsBlock(m) {
@@ -3644,9 +3688,15 @@
       case "module_updated": {
         const i = S.modules.findIndex((m) => m.id === ev.module.id);
         if (i >= 0) S.modules[i] = ev.module; else S.modules.push(ev.module);
-        renderView();
+        if (S.moduleDetail && S.moduleDetail.module.id === ev.module.id && !S.moduleEditing) openModule(ev.module.id);
+        else renderView();
         break;
       }
+      case "module_deleted":
+        S.modules = S.modules.filter((m) => m.id !== ev.id);
+        if (S.moduleDetail && S.moduleDetail.module.id === ev.id) S.moduleDetail = null;
+        renderView();
+        break;
       case "proposal_updated": {
         const i = S.proposals.findIndex((p) => p.id === ev.proposal.id);
         if (i >= 0) S.proposals[i] = ev.proposal; else S.proposals.unshift(ev.proposal);

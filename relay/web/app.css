@@ -311,6 +311,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .import-preview pre { max-height: 240px; overflow: auto; }
+.module-detail { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 6px; }
+.module-detail pre.code { padding: 8px 10px; white-space: pre; }
 .import-preview details { display: block; margin: 6px 0; }
 .tool-pin { color: var(--accent); }
 .tool-tag { color: var(--accent); font-size: 12px; margin-left: 6px; }

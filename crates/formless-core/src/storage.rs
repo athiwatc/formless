@@ -2498,6 +2498,21 @@ impl Store {
         Ok(out)
     }
 
+    /// A module by id, or else by name.
+    pub fn find_module(&self, id_or_name: &str) -> Result<Option<ModuleInfo>> {
+        if let Some(m) = self.module_info(id_or_name)? {
+            return Ok(Some(m));
+        }
+        Ok(self.get_module_by_name(id_or_name)?.map(|(m, _)| m))
+    }
+
+    /// Delete a module with all its versions.
+    pub fn delete_module(&self, id: &str) -> Result<()> {
+        self.ex("DELETE FROM module_versions WHERE module_id=?1", params![id])?;
+        self.ex("DELETE FROM modules WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
     pub fn list_modules(&self) -> Result<Vec<ModuleInfo>> {
         let ids: Vec<String> = {
             let mut stmt = self
