@@ -398,6 +398,10 @@ enum ToolsAction {
         /// Run as part of this Session (default: a new one, archived after)
         #[arg(long)]
         session: Option<String>,
+        /// No real side effects: writes stay in memory, processes and
+        /// non-GET requests aren't made; prints what it would have done
+        #[arg(long)]
+        dry_run: bool,
     },
     Export {
         /// Tool name or id (omit with --all)
@@ -3756,6 +3760,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             input,
             yes,
             session,
+            dry_run,
         } => {
             let input: serde_json::Value = match serde_json::from_str(&input) {
                 Ok(v @ serde_json::Value::Object(_)) => v,
@@ -3765,7 +3770,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 }
             };
             let tool = find_tool(&paths, &name)?;
-            let code = tool_run(&paths, tool, input, yes, session)?;
+            let code = tool_run(&paths, tool, input, yes, session, dry_run)?;
             std::process::exit(code);
         }
         ToolsAction::Undo => {
@@ -4228,6 +4233,7 @@ fn tool_run(
     input: serde_json::Value,
     yes: bool,
     session: Option<String>,
+    dry_run: bool,
 ) -> Result<i32> {
     let (client, rx) = formless_tui::client::DaemonClient::connect(paths)?;
     let wait = |id: u64| -> Result<serde_json::Value> {
@@ -4261,10 +4267,18 @@ fn tool_run(
             )
         }
     };
-    let run = client.send(Request::RunTool {
-        id: tool.id.clone(),
-        input,
-        session_id: session_id.clone(),
+    let run = client.send(if dry_run {
+        Request::DryRunTool {
+            id: tool.id.clone(),
+            input,
+            session_id: session_id.clone(),
+        }
+    } else {
+        Request::RunTool {
+            id: tool.id.clone(),
+            input,
+            session_id: session_id.clone(),
+        }
     });
     let result = loop {
         match rx.recv()? {
@@ -4313,6 +4327,30 @@ fn tool_run(
         let _ = wait(id);
     }
     match result {
+        Ok(v) if dry_run => {
+            let effects: Vec<&str> = v["effects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.as_str())
+                .collect();
+            eprintln!("dry run: nothing was changed.");
+            if effects.is_empty() {
+                eprintln!("it would have had no side effects");
+            } else {
+                eprintln!("it would have:");
+                for e in &effects {
+                    eprintln!("  - {e}");
+                }
+            }
+            if v["ok"] == true {
+                println!("{}", serde_json::to_string_pretty(&v["result"])?);
+                Ok(0)
+            } else {
+                eprintln!("error: {}", v["error"].as_str().unwrap_or_default());
+                Ok(1)
+            }
+        }
         Ok(v) => {
             let text = v["result"].as_str().unwrap_or_default().to_string();
             match serde_json::from_str::<serde_json::Value>(&text) {

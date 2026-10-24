@@ -2046,7 +2046,9 @@
       return { name, type, p, input, el: h("label", { class: "try-field" },
         h("span", null, name, required.has(name) ? " *" : "", p.description ? h("span", { class: "muted" }, " — " + p.description) : null), input) };
     });
-    const body = h("div", { class: "try-form" }, fields.length ? fields.map((f) => f.el) : h("p", { class: "muted" }, "This Tool takes no input."));
+    const dry = h("input", { type: "checkbox" });
+    const body = h("div", { class: "try-form" }, fields.length ? fields.map((f) => f.el) : h("p", { class: "muted" }, "This Tool takes no input."),
+      h("label", { class: "try-field try-dry" }, dry, " Dry run: nothing is changed (writes stay in memory, commands and non-GET requests aren't made); shows what it would do"));
     if (!(await ask({ title: "Try " + t.name, text: "Runs in the current Session, asking for approval as usual.", body, ok: "Run" }))) return;
     const input = {};
     for (const f of fields) {
@@ -2058,6 +2060,17 @@
         else if (f.type === "string") { if (el.value !== "" || required.has(f.name)) input[f.name] = el.value; }
         else input[f.name] = JSON.parse(el.value || "null");
       } catch (e) { return toast(f.name + ": not valid JSON", true); }
+    }
+    if (dry.checked) {
+      toast("Dry run of " + t.name + "…");
+      const d = await act({ type: "dry_run_tool", id: t.id, input, session_id: S.current }, null, 300000);
+      if (!d) return;
+      const effects = d.effects || [];
+      await ask({ title: t.name + " dry run", text: "Nothing was changed.", ok: "Close", body: h("div", null,
+        h("p", null, effects.length ? "It would have:" : "It would have had no side effects."),
+        effects.length ? h("ul", { class: "dry-effects" }, effects.map((e) => h("li", null, e))) : null,
+        d.ok ? h("pre", { class: "try-result" }, JSON.stringify(d.result, null, 2)) : h("p", { class: "error" }, "Error: " + d.error)) });
+      return;
     }
     toast("Running " + t.name + "…");
     const r = await act({ type: "run_tool", id: t.id, input, session_id: S.current }, null, 300000);
