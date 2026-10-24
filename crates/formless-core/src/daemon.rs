@@ -212,6 +212,12 @@ pub struct Daemon {
     /// The parallel batch a Session's approvals belong to while
     /// `approve_calls` asks: (batch id, held calls, next call to match).
     approval_batches: StdMutex<HashMap<String, (String, Vec<HeldCall>, usize)>>,
+    /// Which client answered each approval, by approval id, until
+    /// `ensure_approval` records it with the grant.
+    approval_by: StdMutex<HashMap<String, String>>,
+    /// When and by whom Session and timed grants were given, by (scope,
+    /// session id or "", tool id).
+    grant_meta: StdMutex<HashMap<(ApprovalScope, String, String), (String, String)>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -300,6 +306,8 @@ impl Daemon {
             session_grants: StdMutex::new(Default::default()),
             timed_grants: StdMutex::new(Default::default()),
             approval_batches: StdMutex::new(Default::default()),
+            approval_by: StdMutex::new(Default::default()),
+            grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
@@ -1019,6 +1027,43 @@ impl Daemon {
                 capability,
             } => {
                 if !self.with_store(|st| st.revoke_approval(&tool_id, capability.as_deref()))? {
+                    return Err(anyhow!("nothing to revoke"));
+                }
+                let what = format!("{tool_id} {}", capability.as_deref().unwrap_or("(all)"));
+                let _ = self.with_store(|st| st.audit("user", "tool.revoke", &what));
+                if let Ok(Some((tool, _))) = self.with_store(|st| st.get_tool_current(&tool_id)) {
+                    self.broadcast(Event::ToolUpdated { tool });
+                }
+                Ok(json!({"revoked": true}))
+            }
+            Request::ListApprovals => Ok(serde_json::to_value(self.list_grants()?)?),
+            Request::RevokeGrant {
+                tool_id,
+                capability,
+                scope,
+                session_id,
+            } => {
+                let revoked = match scope {
+                    ApprovalScope::Session => {
+                        let key = (session_id.clone().unwrap_or_default(), tool_id.clone());
+                        revoke_in(
+                            &mut self.session_grants.lock().unwrap(),
+                            &key,
+                            capability.as_deref(),
+                            |g| &mut g.0,
+                        )
+                    }
+                    ApprovalScope::Hour => revoke_in(
+                        &mut self.timed_grants.lock().unwrap(),
+                        &tool_id,
+                        capability.as_deref(),
+                        |g| &mut g.0,
+                    ),
+                    _ => {
+                        self.with_store(|st| st.revoke_approval(&tool_id, capability.as_deref()))?
+                    }
+                };
+                if !revoked {
                     return Err(anyhow!("nothing to revoke"));
                 }
                 let what = format!("{tool_id} {}", capability.as_deref().unwrap_or("(all)"));
@@ -2188,6 +2233,12 @@ impl Daemon {
                 scope,
             } => {
                 // First answer wins (SPEC §10.4): removing the sender resolves it.
+                if let Some((_, label)) = current_client() {
+                    self.approval_by
+                        .lock()
+                        .unwrap()
+                        .insert(approval_id.clone(), label);
+                }
                 let tx = self.approvals.lock().unwrap().remove(&approval_id);
                 let resolved = match tx {
                     Some(tx) => tx.send((approved, scope)).is_ok(),
@@ -3205,6 +3256,96 @@ impl Daemon {
             index: at + 1,
             calls: calls.clone(),
         })
+    }
+
+    /// Every grant, one row per Capability (SPEC §10.3): stored grants
+    /// first, then Session and timed ones; expired timed grants dropped.
+    fn list_grants(&self) -> Result<Vec<GrantInfo>> {
+        let mut out = Vec::new();
+        for (tool_id, tool_name, caps, at, by, last) in
+            self.with_reader(|st| st.list_approvals())?
+        {
+            for capability in caps {
+                out.push(GrantInfo {
+                    tool_id: tool_id.clone(),
+                    tool_name: tool_name.clone(),
+                    capability,
+                    scope: ApprovalScope::Always,
+                    granted_at: Some(at.clone()),
+                    granted_by: by.clone(),
+                    expires_at: None,
+                    session_id: None,
+                    last_used: last.clone(),
+                });
+            }
+        }
+        let meta = self.grant_meta.lock().unwrap().clone();
+        let name_of = |id: &str| -> (String, Option<String>) {
+            self.with_reader(|st| {
+                let name = st
+                    .get_tool_current(id)?
+                    .map(|(t, _)| t.name)
+                    .unwrap_or_default();
+                Ok((name, st.tool_last_invocation(id)?))
+            })
+            .unwrap_or_default()
+        };
+        let sessions: Vec<_> = self
+            .session_grants
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.0.to_specs()))
+            .collect();
+        for ((session_id, tool_id), specs) in sessions {
+            let (tool_name, last_used) = name_of(&tool_id);
+            let (at, by) = meta
+                .get(&(ApprovalScope::Session, session_id.clone(), tool_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            for capability in specs {
+                out.push(GrantInfo {
+                    tool_id: tool_id.clone(),
+                    tool_name: tool_name.clone(),
+                    capability,
+                    scope: ApprovalScope::Session,
+                    granted_at: (!at.is_empty()).then(|| at.clone()),
+                    granted_by: by.clone(),
+                    expires_at: None,
+                    session_id: Some(session_id.clone()),
+                    last_used: last_used.clone(),
+                });
+            }
+        }
+        let now = chrono::Utc::now();
+        let timed: Vec<_> = {
+            let mut t = self.timed_grants.lock().unwrap();
+            t.retain(|_, g| g.2 > now);
+            t.iter()
+                .map(|(k, v)| (k.clone(), v.0.to_specs(), v.2))
+                .collect()
+        };
+        for (tool_id, specs, until) in timed {
+            let (tool_name, last_used) = name_of(&tool_id);
+            let (at, by) = meta
+                .get(&(ApprovalScope::Hour, String::new(), tool_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            for capability in specs {
+                out.push(GrantInfo {
+                    tool_id: tool_id.clone(),
+                    tool_name: tool_name.clone(),
+                    capability,
+                    scope: ApprovalScope::Hour,
+                    granted_at: (!at.is_empty()).then(|| at.clone()),
+                    granted_by: by.clone(),
+                    expires_at: Some(until.to_rfc3339()),
+                    session_id: None,
+                    last_used: last_used.clone(),
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// The calls of a batch that would ask for approval, in order.
@@ -6671,6 +6812,24 @@ impl Daemon {
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.lock().unwrap().remove(&approval_id);
+        let by = self
+            .approval_by
+            .lock()
+            .unwrap()
+            .remove(&approval_id)
+            .unwrap_or_default();
+        let now = chrono::Utc::now().to_rfc3339();
+        if approved && matches!(scope, ApprovalScope::Hour | ApprovalScope::Session) {
+            let session = if scope == ApprovalScope::Session {
+                session_id
+            } else {
+                ""
+            };
+            self.grant_meta.lock().unwrap().insert(
+                (scope, session.to_string(), info.id.clone()),
+                (now.clone(), by.clone()),
+            );
+        }
         if approved && scope == ApprovalScope::Once {
             let _ = self.with_store(|st| st.audit("user", "tool.approve_once", &info.name));
         } else if approved && scope == ApprovalScope::Hour {
@@ -6701,7 +6860,7 @@ impl Daemon {
                 Some((p, m)) => (p.union(caps), ver.memory_mb.max(*m)),
                 None => (caps.clone(), ver.memory_mb),
             };
-            let _ = self.with_store(|st| st.set_approval(&info.id, &grant, mem));
+            let _ = self.with_store(|st| st.set_approval_by(&info.id, &grant, mem, &by));
             let _ = self.with_store(|st| st.audit("user", "tool.approve", &info.name));
         } else {
             let _ = self.with_store(|st| st.audit("user", "tool.deny", &info.name));
@@ -7851,6 +8010,33 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// Remove one Capability (or, with none, the whole grant) from an
+/// in-memory grant map. Whether anything was revoked.
+fn revoke_in<K: std::hash::Hash + Eq, V>(
+    map: &mut HashMap<K, V>,
+    key: &K,
+    capability: Option<&str>,
+    caps: impl Fn(&mut V) -> &mut Capabilities,
+) -> bool {
+    let Some(capability) = capability else {
+        return map.remove(key).is_some();
+    };
+    let Some(v) = map.get_mut(key) else {
+        return false;
+    };
+    let specs = caps(v).to_specs();
+    if !specs.iter().any(|s| s == capability) {
+        return false;
+    }
+    let rest: Vec<String> = specs.into_iter().filter(|s| s != capability).collect();
+    if rest.is_empty() {
+        map.remove(key);
+    } else if let Ok(c) = Capabilities::parse(&rest) {
+        *caps(v) = c;
+    }
+    true
 }
 
 /// create_tool arguments for new code on a Tool, keeping everything else

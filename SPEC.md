@@ -1935,6 +1935,24 @@ run_tool = "network_policy"     # a registry Tool, or…
   ends, or the daemon restarts, the next call asks again. For MCP
   server approvals,
   both act as *once*. Headless `--yes` answers every prompt with *once*.
+- **One list of every grant.** `ListApprovals` returns `GrantInfo` rows,
+  one per Capability, covering stored, Session and timed (`hour`) grants.
+  - **Each row has:** Tool, Capability, scope, when the grant was last
+    widened, which client answered (stored as `approvals.granted_by`,
+    schema v45; kept in memory for the others), when an hour grant ends,
+    the Session of a Session grant, and the Tool's last Invocation.
+  - **Revoking:** `RevokeGrant {tool_id, capability?, scope,
+    session_id?}` removes one Capability, or the whole grant, from any of
+    the three.
+  - **TUI:** `/approvals [FAMILY]` (a table in the pager) and `/revoke all
+    [FAMILY]`; `/revoke TOOL [CAPABILITY]` also drops the Tool's hour grant
+    and its grant in the current Session. `/approve` still lists the
+    approvals waiting now.
+  - **Web:** an Approvals tab with a family filter, revoke per row,
+    "Revoke selected" and "Revoke all shown".
+  - **CLI:** `formless approvals list [--family F] [--json]` and
+    `formless approvals revoke TOOL [CAPABILITY] [--scope …] [--session
+    …]` or `--all [--family F]`.
 - The prompt (`ApprovalRequested`) carries `already_allowed`, the Tool's
   current grant. Clients mark those Capabilities "already allowed" and the
   rest "new". It also carries `code_preview`, the first 15 lines of the

@@ -198,6 +198,14 @@
     if (s < 604800) return Math.floor(s / 86400) + "d ago";
     return new Date(t).toLocaleDateString();
   }
+  /** "in 42m": how long until a future time. */
+  function untilTime(ts) {
+    const s = (Date.parse(ts) - Date.now()) / 1000;
+    if (isNaN(s)) return ts || "";
+    if (s <= 0) return "ended";
+    if (s < 3600) return "in " + Math.max(1, Math.ceil(s / 60)) + "m";
+    return "in " + Math.round(s / 3600) + "h";
+  }
   function clock(ts) {
     const t = Date.parse(ts);
     return isNaN(t) ? "" : new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -371,7 +379,7 @@
       if (b.dataset.view === S.view) b.setAttribute("aria-current", "page");
       else b.removeAttribute("aria-current");
     });
-    for (const v of ["chat", "tools", "metrics", "proposals", "settings"]) {
+    for (const v of ["chat", "tools", "metrics", "proposals", "approvals", "settings"]) {
       $("view-" + v).classList.toggle("hidden", v !== S.view);
     }
     $("sidebar").classList.toggle("hidden", S.view !== "chat");
@@ -412,6 +420,7 @@
     if (S.view === "tools") renderTools();
     else if (S.view === "metrics") renderMetrics();
     else if (S.view === "proposals") renderProposals();
+    else if (S.view === "approvals") renderApprovals();
     else if (S.view === "settings") renderSettings();
   }
 
@@ -421,6 +430,7 @@
     if (view === "tools") { refreshTools(); refreshModules(); }
     if (view === "metrics") { refreshTools(); refreshModelStats(); }
     if (view === "proposals") refreshProposals();
+    if (view === "approvals") refreshApprovals();
     if (view === "settings") refreshSettings();
     renderChrome();
     renderView();
@@ -1995,6 +2005,58 @@
       if (md && S.modules.some((m) => m.id === md.module.id)) box.append(moduleDetail(md));
     }
   }
+
+  // --------------------------------------------------- approvals (§10.3)
+  const capFamily = (c) => String(c).split(":")[0];
+  async function refreshApprovals() {
+    const list = await act({ type: "list_approvals" });
+    if (list) { S.grants = list; S.grantsSelected = new Set(); renderApprovals(); }
+  }
+  const grantKey = (g) => [g.tool_id, g.capability, g.scope, g.session_id || ""].join("|");
+  function shownGrants() {
+    const fam = $("approvals-family").value;
+    return (S.grants || []).filter((g) => !fam || capFamily(g.capability) === fam);
+  }
+  function renderApprovals() {
+    const all = S.grants || [];
+    const sel = $("approvals-family");
+    const fams = [...new Set(all.map((g) => capFamily(g.capability)))].sort();
+    const cur = sel.value;
+    sel.replaceChildren(h("option", { value: "" }, "All families"), ...fams.map((f) => h("option", { value: f }, f)));
+    sel.value = fams.includes(cur) ? cur : "";
+    const rows = shownGrants();
+    $("approvals-count").textContent = "(" + rows.length + ")";
+    const when = (t) => (t ? relTime(t) : "—");
+    const table = $("approvals-table");
+    table.replaceChildren(h("thead", null, h("tr", null, ["", "Tool", "Capability", "Scope", "Granted", "By", "Ends", "Last used", ""].map((c) => h("th", null, c)))));
+    const body = h("tbody");
+    if (!rows.length) body.append(h("tr", null, h("td", { class: "empty", colspan: 9 }, "Nothing approved yet.")));
+    for (const g of rows) {
+      const key = grantKey(g);
+      body.append(h("tr", null,
+        h("td", null, h("input", { type: "checkbox", "aria-label": "Select " + g.tool_name + " " + g.capability, checked: S.grantsSelected.has(key),
+          onchange: (e) => { if (e.target.checked) S.grantsSelected.add(key); else S.grantsSelected.delete(key); } })),
+        h("td", null, g.tool_name),
+        h("td", null, h("span", { class: "tag" + (isBroad(g.capability) ? " broad" : "") }, g.capability)),
+        h("td", null, g.scope === "always" ? "always" : g.scope === "session" ? "this Session" : "for an hour"),
+        h("td", { class: "muted" }, when(g.granted_at)),
+        h("td", { class: "muted" }, g.granted_by || "—"),
+        h("td", { class: "muted" }, g.expires_at ? untilTime(g.expires_at) : "—"),
+        h("td", { class: "muted" }, when(g.last_used)),
+        h("td", null, h("button", { class: "btn ghost small", type: "button", onclick: () => revokeGrants([g]) }, "Revoke"))));
+    }
+    table.append(body);
+  }
+  async function revokeGrants(grants) {
+    if (!grants.length) return toast("Select grants to revoke first.", true);
+    if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
+    for (const g of grants) await act({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
+    toast("Revoked " + grants.length + " grant" + (grants.length === 1 ? "" : "s"));
+    refreshApprovals();
+  }
+  $("approvals-family").addEventListener("input", () => renderApprovals());
+  $("revoke-selected").onclick = () => revokeGrants(shownGrants().filter((g) => S.grantsSelected.has(grantKey(g))));
+  $("revoke-all").onclick = () => revokeGrants(shownGrants());
 
   // ----------------------------------------------------- modules (§7.7)
   async function openModule(id) {

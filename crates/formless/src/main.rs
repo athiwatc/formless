@@ -55,6 +55,11 @@ enum Cmd {
         #[arg(long)]
         new: bool,
     },
+    /// Every approval grant, and revoking them
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalsAction,
+    },
     /// List or remove profiles (isolated data dirs made with --profile)
     Profiles {
         #[command(subcommand)]
@@ -639,6 +644,172 @@ enum NamingAction {
 }
 
 #[derive(Subcommand)]
+enum ApprovalsAction {
+    /// Every grant: Tool, Capability, scope, when, by which client, last used
+    List {
+        /// Only this Capability family (fs, net, process, env, …)
+        #[arg(long)]
+        family: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a Tool's grant (one Capability, or all of it), or --all
+    Revoke {
+        /// Tool name (omit with --all)
+        tool: Option<String>,
+        /// One Capability, e.g. net:example.com (default: the whole grant)
+        capability: Option<String>,
+        /// Which grant: always (stored), session or hour
+        #[arg(long, default_value = "always")]
+        scope: String,
+        /// The Session of a session grant
+        #[arg(long)]
+        session: Option<String>,
+        /// Every grant (with --family, every grant of that family)
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        family: Option<String>,
+    },
+}
+
+/// A Capability's family: "fs" for fs:read:/x, "net" for net:host.
+fn cap_family(cap: &str) -> &str {
+    cap.split(':').next().unwrap_or(cap)
+}
+
+fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
+    use formless_protocol::{ApprovalScope, GrantInfo};
+    use formless_tui::client::request_once;
+    formless_core::daemon::ensure_daemon(paths)?;
+    let grants = |family: &Option<String>| -> Result<Vec<GrantInfo>> {
+        let mut g: Vec<GrantInfo> =
+            serde_json::from_value(request_once(paths, Request::ListApprovals)?)?;
+        if let Some(f) = family {
+            g.retain(|x| cap_family(&x.capability) == f);
+        }
+        Ok(g)
+    };
+    let scope_word = |s: ApprovalScope| match s {
+        ApprovalScope::Session => "session",
+        ApprovalScope::Hour => "hour",
+        _ => "always",
+    };
+    match action {
+        ApprovalsAction::List { family, json } => {
+            let list = grants(&family)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
+            if list.is_empty() {
+                println!("(nothing approved)");
+                return Ok(());
+            }
+            let when = |t: &Option<String>| {
+                t.as_deref()
+                    .map(|s| s.get(..16).unwrap_or(s).replace('T', " "))
+                    .unwrap_or_else(|| "-".into())
+            };
+            let mut tbl = Table::new(&[
+                "TOOL",
+                "CAPABILITY",
+                "SCOPE",
+                "GRANTED",
+                "BY",
+                "ENDS",
+                "LAST USED",
+            ]);
+            for g in &list {
+                tbl.row(vec![
+                    t(g.tool_name.clone(), Tone::Strong),
+                    c(g.capability.clone()),
+                    t(
+                        scope_word(g.scope),
+                        if g.scope == ApprovalScope::Always {
+                            Tone::Plain
+                        } else {
+                            Tone::Warn
+                        },
+                    ),
+                    c(when(&g.granted_at)),
+                    c(if g.granted_by.is_empty() {
+                        "-".to_string()
+                    } else {
+                        g.granted_by.clone()
+                    }),
+                    c(when(&g.expires_at)),
+                    c(when(&g.last_used)),
+                ]);
+            }
+            tbl.print();
+            Ok(())
+        }
+        ApprovalsAction::Revoke {
+            tool,
+            capability,
+            scope,
+            session,
+            all,
+            family,
+        } => {
+            let scope_of = |s: &str| -> Result<ApprovalScope> {
+                Ok(match s {
+                    "always" => ApprovalScope::Always,
+                    "session" => ApprovalScope::Session,
+                    "hour" => ApprovalScope::Hour,
+                    other => anyhow::bail!("--scope is always, session or hour, not {other}"),
+                })
+            };
+            let targets: Vec<(String, Option<String>, ApprovalScope, Option<String>)> = if all {
+                grants(&family)?
+                    .into_iter()
+                    .map(|g| {
+                        // Without a family, whole grants; with one, each Capability.
+                        let cap = family.as_ref().map(|_| g.capability.clone());
+                        (g.tool_id, cap, g.scope, g.session_id)
+                    })
+                    .collect()
+            } else {
+                let tool = tool.ok_or_else(|| anyhow::anyhow!("name a Tool, or pass --all"))?;
+                let id = find_tool(paths, &tool)?.id;
+                vec![(id, capability, scope_of(&scope)?, session)]
+            };
+            let mut seen = std::collections::HashSet::new();
+            let mut n = 0;
+            for (tool_id, capability, scope, session_id) in targets {
+                if !seen.insert((
+                    tool_id.clone(),
+                    capability.clone(),
+                    scope_word(scope),
+                    session_id.clone(),
+                )) {
+                    continue;
+                }
+                if request_once(
+                    paths,
+                    Request::RevokeGrant {
+                        tool_id,
+                        capability,
+                        scope,
+                        session_id,
+                    },
+                )
+                .is_ok()
+                {
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                anyhow::bail!("nothing to revoke");
+            }
+            println!("revoked {n} grant(s)");
+            Ok(())
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum ProfilesAction {
     /// Every profile, whether its daemon runs, and where its data lives
     List {
@@ -819,6 +990,7 @@ fn main() -> Result<()> {
         ),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Profiles { action }) => profiles_cmd(&paths, action),
+        Some(Cmd::Approvals { action }) => approvals_cmd(&paths, action),
         Some(Cmd::Chat { session, new }) => {
             use formless_tui::plain::{run_with, ChatStart};
             let start = match (session, new) {

@@ -229,6 +229,31 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// One granted Capability, for the central approvals list (SPEC §10.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GrantInfo {
+    pub tool_id: String,
+    pub tool_name: String,
+    pub capability: String,
+    /// always, session or hour.
+    pub scope: ApprovalScope,
+    /// When the grant was last widened (RFC 3339).
+    #[serde(default)]
+    pub granted_at: Option<String>,
+    /// The client that answered ("TUI", "web", …); empty when unknown.
+    #[serde(default)]
+    pub granted_by: String,
+    /// When an `hour` grant ends.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// The Session a `session` grant belongs to.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The Tool's latest Invocation.
+    #[serde(default)]
+    pub last_used: Option<String>,
+}
+
 /// One call of a parallel batch that waits for approval.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HeldCall {
@@ -998,6 +1023,19 @@ pub enum Request {
         #[serde(default)]
         capability: Option<String>,
     },
+    /// Every grant, one row per Capability: stored, Session and timed
+    /// ones (`Vec<GrantInfo>`, SPEC §10.3).
+    ListApprovals,
+    /// Revoke one grant from the list: a Capability (or, with none, the
+    /// whole grant) of a stored, Session or timed grant.
+    RevokeGrant {
+        tool_id: String,
+        #[serde(default)]
+        capability: Option<String>,
+        scope: ApprovalScope,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     /// How full a Session's context is (SPEC §10.6): `{model,
     /// context_tokens, used_tokens, measured, breakdown: {system_prompt,
     /// tool_schemas, history, attachments}}`. `used_tokens` is the last
@@ -1332,7 +1370,7 @@ fn default_true() -> bool {
 }
 
 /// How long an approval lasts (SPEC §10.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalScope {
     /// This call only; nothing is stored.
