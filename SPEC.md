@@ -2121,6 +2121,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   - Commands: `/new`, `/sessions`, `/switch N`, `/stop`, `/help`, `/quit`.
     Anything else is a message (a steer while a Run is active). It opens
     the most recent Session.
+  - `formless chat [--session ID | --new]` is the same line-mode client
+    as its own command, a REPL between the full-screen TUI and one-shot
+    `run`, for dumb terminals and SSH sessions with poor TERM support. It
+    opens the given Session, a new one, or the most recent one.
 
 ### 10.6 Live feedback (v2)
 

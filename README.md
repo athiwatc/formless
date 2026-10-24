@@ -432,6 +432,7 @@ formless profiles rm sandbox     # stops its daemon, deletes its data, config an
 | Command | Behaviour |
 |---|---|
 | `formless` (or `formless tui`) | Launch the TUI, auto-starting the daemon |
+| `formless chat [--session ID \| --new]` | Line-mode REPL (no full screen): streamed answers, approvals and questions answered inline, for dumb terminals, SSH and screen readers |
 | `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one (`--continue`/`-c` = the last run's); `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run (nothing is stored) |
 | `formless daemon start\|stop\|status\|serve` | Daemon lifecycle |
 | `formless relay enable\|disable\|status` | Encrypted browser access (v2) |

@@ -130,6 +130,20 @@ pub(crate) fn question_text(q: &Question, n: usize, total: usize) -> String {
 }
 
 pub fn run(paths: Paths) -> Result<()> {
+    run_with(paths, ChatStart::Recent, "plain mode")
+}
+
+/// Which Session a line-mode chat opens on.
+pub enum ChatStart {
+    /// The most recently used one (or a new one when there are none).
+    Recent,
+    New,
+    Session(String),
+}
+
+/// The line-oriented client: the TUI's `--plain`/screen-reader mode and
+/// `formless chat` (SPEC §10.7).
+pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
         eprintln!(
@@ -158,19 +172,35 @@ pub fn run(paths: Paths) -> Result<()> {
             }
         }
     };
-    // Continue the most recent Session, or start one.
-    let sessions: Vec<SessionInfo> =
-        serde_json::from_value(wait(client.send(Request::ListSessions))?).unwrap_or_default();
-    let mut session = match sessions.into_iter().next() {
-        Some(s) => s,
-        None => serde_json::from_value(wait(client.send(Request::CreateSession { name: None }))?)?,
+    let create = || -> Result<SessionInfo> {
+        Ok(serde_json::from_value(wait(
+            client.send(Request::CreateSession { name: None }),
+        )?)?)
+    };
+    let mut session = match start {
+        // Continue the most recent Session, or start one.
+        ChatStart::Recent => {
+            let sessions: Vec<SessionInfo> =
+                serde_json::from_value(wait(client.send(Request::ListSessions))?)
+                    .unwrap_or_default();
+            match sessions.into_iter().next() {
+                Some(s) => s,
+                None => create()?,
+            }
+        }
+        ChatStart::New => create()?,
+        ChatStart::Session(id) => {
+            let v = wait(client.send(Request::GetSession { id: id.clone() }))
+                .map_err(|e| anyhow::anyhow!("Session {id}: {e}"))?;
+            serde_json::from_value(v["session"].clone())?
+        }
     };
     let say = |s: &str| {
         println!("{s}");
         let _ = std::io::stdout().flush();
     };
     say(&format!(
-        "Formless, plain mode. Session: {}. Type a message and press Enter; /help lists commands.",
+        "Formless, {label}. Session: {}. Type a message and press Enter; /help lists commands.",
         session.name
     ));
     client.send(Request::Subscribe {
