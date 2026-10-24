@@ -267,6 +267,21 @@
     return null;
   }
   function isBroad(cap) { return broadWhy(cap) !== null; }
+  /** Where an fs: path lies, as [warn, note] or null (SPEC §10.3; the same
+   * rule as `path_note` in the protocol crate). */
+  function pathNote(cap, cwd) {
+    const m = /^fs:(read|write):(.*)$/.exec(cap);
+    if (!m) return null;
+    const path = m[2];
+    const seg = path.split("/").filter(Boolean);
+    const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
+    for (const [dir, what] of secret) if (seg.includes(dir)) return [true, "holds " + what];
+    for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
+    if (seg[0] === "etc") return [true, "system configuration"];
+    if (!cwd) return null;
+    const c = cwd.replace(/\/+$/, "");
+    return path === c || path.startsWith(c + "/") ? [false, "inside the working folder"] : [true, "outside the working folder " + c];
+  }
   function capTags(caps) {
     if (!caps || !caps.length) return h("span", { class: "muted" }, "none");
     return caps.map((c) => h("span", { class: "tag" + (isBroad(c) ? " broad" : ""), title: isBroad(c) ? "broad access: " + broadWhy(c) : null }, c));
@@ -1827,7 +1842,8 @@
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           (req.already || []).includes(c)
             ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
-            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null)),
+            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
+              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + n[1]) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)))),
         req.detail ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
       req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
       h("p", { class: "muted" }, promo
@@ -3772,7 +3788,7 @@
       }
       case "approval_requested":
         S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
-          already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null });
+          already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id });
         if (here) setActivity("awaiting your approval");
         renderApproval();
         break;

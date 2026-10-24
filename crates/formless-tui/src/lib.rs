@@ -6188,12 +6188,19 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .unwrap_or_default();
             (b, answers)
         });
+        // The Session's working folder, to place the paths it asks for.
+        let cwd = req
+            .session_id
+            .as_deref()
+            .and_then(|id| app.sessions.iter().find(|s| s.id == id))
+            .and_then(|s| s.cwd.as_deref());
         draw_approval(
             f,
             req,
             title,
             summary,
             batch,
+            cwd,
             promotion,
             more,
             app.color,
@@ -10834,6 +10841,7 @@ fn draw_approval(
     title: &str,
     summary: Option<&str>,
     batch: Option<(&ApprovalBatch, &[(usize, String)])>,
+    cwd: Option<&str>,
     promotion: bool,
     more: usize,
     color: bool,
@@ -10950,6 +10958,18 @@ fn draw_approval(
             ]));
         } else {
             lines.push(Line::raw(format!("  • {cap}")));
+        }
+        // Where a path lies: outside the working folder, or a secrets
+        // folder, warns (§10.3).
+        if let Some((warn, note)) = path_note(cap, cwd) {
+            lines.push(Line::styled(
+                format!("      {}{note}", if warn { "⚠ " } else { "" }),
+                if warn {
+                    fg(color, Color::Red)
+                } else {
+                    ui::dim(color)
+                },
+            ));
         }
         if explain {
             lines.push(Line::styled(
@@ -12979,6 +12999,46 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(app.approvals.is_empty());
         assert_eq!(app.notes.last().unwrap(), "approved echo_write for an hour");
+    }
+
+    #[test]
+    fn approvals_place_paths_against_the_working_folder() {
+        let mut app = test_app();
+        app.sessions = vec![SessionInfo {
+            id: "s".into(),
+            name: "notes".into(),
+            model: None,
+            reasoning_effort: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            cwd: Some("/Users/ada/project".into()),
+            message_count: 0,
+            preview: None,
+            last_run_status: None,
+            archived: false,
+            tags: Vec::new(),
+            pinned: false,
+            instructions: None,
+        }];
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "a1".into(),
+            session_id: "s".into(),
+            tool_name: "copier".into(),
+            version: 1,
+            capabilities: vec![
+                "fs:read:/Users/ada/project/notes.md".into(),
+                "fs:write:/Users/ada/.ssh/config".into(),
+            ],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+            batch: None,
+        });
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("inside the working folder"), "{screen}");
+        assert!(screen.contains("⚠ holds SSH keys"), "{screen}");
     }
 
     #[test]
