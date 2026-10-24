@@ -1757,17 +1757,38 @@ impl Daemon {
                     .with_store(|st| st.get_tool_current(&id))?
                     .context("tool not found")?;
                 let cfg = self.config()?;
-                let args = json!({
-                    "name": info.name,
-                    "description": info.description,
-                    "input_schema": serde_json::from_str::<Value>(&ver.input_schema).unwrap_or_else(|_| json!({"type":"object"})),
-                    "output_schema": serde_json::from_str::<Value>(&ver.output_schema).unwrap_or_else(|_| json!({"type":"object"})),
-                    "implementation_js": code,
-                    "capabilities": ver.capabilities,
-                    "memory_mb": ver.memory_mb,
-                });
+                let args = edit_args(&info, &ver, &code);
                 let (info, version, _) = self.create_tool_as(&args, &cfg, "user", None).await?;
                 Ok(json!({"tool": info, "version": version}))
+            }
+            Request::PreviewToolCode { id, code } => {
+                let (info, ver) = self
+                    .with_reader(|st| st.get_tool_current(&id))?
+                    .context("tool not found")?;
+                let cfg = self.config()?;
+                let mut draft = ver.clone();
+                draft.code = code.clone();
+                draft.version = ver.version + 1;
+                let mut out =
+                    json!({ "diff": crate::diff::version_diff(&ver, &draft), "ok": true });
+                // The same gate as saving, without the save.
+                let checked = match ToolDraft::parse(&edit_args(&info, &ver, &code), &cfg, true) {
+                    Err(e) => Err(("syntax", e.to_string())),
+                    Ok(d) => self
+                        .smoke_gate(&d, &cfg, None)
+                        .await
+                        .map_err(|e| ("smoke", e.to_string())),
+                };
+                match checked {
+                    Ok(note) => out["smoke_note"] = json!(note),
+                    Err((stage, e)) => {
+                        out["ok"] = json!(false);
+                        out["stage"] = json!(stage);
+                        out["line"] = json!(error_line(&e));
+                        out["error"] = json!(e);
+                    }
+                }
+                Ok(out)
             }
             Request::GetTool { id } => {
                 let mut d = self
@@ -4366,18 +4387,15 @@ impl Daemon {
         Ok((out.to_string(), info.id))
     }
 
-    /// Create a Tool version through the validation gate (SPEC §7.1).
-    /// Returns a note when the smoke test was inconclusive: the Tool failed
-    /// only after a stubbed effect (fake fetch body, unbound input scope,
-    /// ...), which says more about the stub than about the Tool.
-    async fn create_tool_as(
-        self: &Arc<Self>,
-        args: &Value,
+    /// The smoke test of the save gate (SPEC §7.1): the draft runs in the
+    /// stubbed sandbox on a schema-minimal input. `Ok(Some(note))` when the
+    /// result is inconclusive, an error when it fails.
+    async fn smoke_gate(
+        &self,
+        d: &ToolDraft,
         cfg: &Config,
-        author: &str,
         cancel: Option<Arc<AtomicBool>>,
-    ) -> Result<(ToolInfo, i64, Option<String>)> {
-        let d = ToolDraft::parse(args, cfg, true)?;
+    ) -> Result<Option<String>> {
         // Smoke test in the stubbed sandbox with a schema-minimal input.
         // Input-bound scopes stay as templates: the runtime stubs them.
         let req = ExecRequest {
@@ -4394,7 +4412,7 @@ impl Daemon {
         // Bounded and cancellable (SPEC §7.1): it is a validation gate on
         // synthetic input, not user work.
         let limit = std::time::Duration::from_secs(cfg.tools.smoke_timeout_secs.max(1));
-        let smoke_note = match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), cancel, limit).await {
+        let note = match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), cancel, limit).await {
             Bounded::Done(Ok(_)) => None,
             Bounded::Done(Err(e)) if e.after_stub && e.kind != ExecErrorKind::Resource => Some(format!(
                 "inconclusive (failed after a stubbed effect: {}); call the Tool or test_tool it with real input",
@@ -4408,6 +4426,22 @@ impl Daemon {
             Bounded::Cancelled => return Err(anyhow!("interrupted")),
             Bounded::Panicked(e) => return Err(anyhow!("smoke test panicked: {e}")),
         };
+        Ok(note)
+    }
+
+    /// Create a Tool version through the validation gate (SPEC §7.1).
+    /// Returns a note when the smoke test was inconclusive: the Tool failed
+    /// only after a stubbed effect (fake fetch body, unbound input scope,
+    /// ...), which says more about the stub than about the Tool.
+    async fn create_tool_as(
+        self: &Arc<Self>,
+        args: &Value,
+        cfg: &Config,
+        author: &str,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<(ToolInfo, i64, Option<String>)> {
+        let d = ToolDraft::parse(args, cfg, true)?;
+        let smoke_note = self.smoke_gate(&d, cfg, cancel).await?;
         let before = self
             .with_reader(|st| st.get_tool_by_name(&d.name))?
             .map_or(0, |(i, _)| i.current_version);
@@ -7430,6 +7464,20 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// create_tool arguments for new code on a Tool, keeping everything else
+/// of its current version (the editors' saves and previews).
+fn edit_args(info: &ToolInfo, ver: &ToolVersionInfo, code: &str) -> Value {
+    json!({
+        "name": info.name,
+        "description": info.description,
+        "input_schema": serde_json::from_str::<Value>(&ver.input_schema).unwrap_or_else(|_| json!({"type":"object"})),
+        "output_schema": serde_json::from_str::<Value>(&ver.output_schema).unwrap_or_else(|_| json!({"type":"object"})),
+        "implementation_js": code,
+        "capabilities": ver.capabilities,
+        "memory_mb": ver.memory_mb,
+    })
 }
 
 /// JSON text as a value, or the text itself when it isn't JSON.

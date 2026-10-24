@@ -1183,6 +1183,13 @@ pub enum Request {
     CheckToolCode {
         code: String,
     },
+    /// Review an edit before saving it (the TUI editor's Ctrl+D): the diff
+    /// against the current version and what the save gate would say,
+    /// `{diff, ok, stage?, error?, line?, smoke_note?}`. Nothing is saved.
+    PreviewToolCode {
+        id: String,
+        code: String,
+    },
     /// Save a new version with a new description and/or schemas, the
     /// rest as the current version, through the usual gates with author
     /// `user` (SPEC §10.4).
