@@ -3918,6 +3918,26 @@
     const bundle = await pickJson();
     if (bundle && (await act({ type: "import_tool", bundle }, "Imported — the Tool needs first-run approval"))) refreshTools();
   };
+  // From an https URL or gist (SPEC §7.8): fetched by the daemon, shown in
+  // full (source, Capabilities, code), imported only on a second yes.
+  $("import-tool-url").onclick = async () => {
+    const url = await ask({ title: "Import Tools from a URL", text: "An https link to a Tool bundle: a gist, a GitHub file, or any JSON export.", input: true, placeholder: "https://gist.github.com/…", ok: "Fetch" });
+    if (!url || !url.trim()) return;
+    const fetched = await act({ type: "fetch_tool_bundle", url: url.trim() });
+    if (!fetched) return;
+    const b = fetched.bundle;
+    const tools = Array.isArray(b.tools) ? b.tools : [b];
+    const body = h("div", { class: "import-preview" },
+      h("p", { class: "muted" }, "Source: " + fetched.source + (fetched.file ? " (" + fetched.file + ")" : "")),
+      tools.map((t) => h("details", { class: "chip", open: tools.length === 1 },
+        h("summary", null, h("strong", null, t.name || "?"), " ", h("span", { class: "muted" }, t.description || "")),
+        h("p", null, (t.capabilities && t.capabilities.length ? t.capabilities : ["(no capabilities)"]).map((c) =>
+          h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c)), h("span", { class: "tag" }, "memory " + (t.memory_mb || 256) + " MB")),
+        h("pre", { class: "diff" }, t.implementation_js || ""))),
+      h("p", { class: "muted" }, "Imported Tools are never trusted: each asks before its first sensitive call."));
+    if (!(await ask({ title: "Import " + tools.length + " Tool" + (tools.length === 1 ? "" : "s") + "?", body, ok: "Import" }))) return;
+    if (await act({ type: "import_tool", bundle: b }, "Imported — the Tool needs first-run approval")) refreshTools();
+  };
   $("export-tools").onclick = async () => {
     const bundle = await act({ type: "export_tools" });
     if (bundle) download("formless-tools.json", bundle);

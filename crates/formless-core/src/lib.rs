@@ -8,6 +8,7 @@ pub mod errors;
 pub mod files;
 pub mod fuzzy;
 pub mod hooks;
+pub mod import_url;
 pub mod jobs;
 pub mod logs;
 pub mod mcp;

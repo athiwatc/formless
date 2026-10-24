@@ -344,21 +344,13 @@ enum ToolsAction {
         tag: Option<String>,
     },
     /// Switch a Tool off: hidden from the agent and uncallable, nothing else changes
-    Disable {
-        name: String,
-    },
+    Disable { name: String },
     /// Switch a Tool back on
-    Enable {
-        name: String,
-    },
+    Enable { name: String },
     /// Always list a Tool to the agent (from each Session's next listing)
-    Pin {
-        name: String,
-    },
+    Pin { name: String },
     /// Stop always listing a Tool
-    Unpin {
-        name: String,
-    },
+    Unpin { name: String },
     /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
     Tag {
         /// Tool name or id
@@ -374,13 +366,9 @@ enum ToolsAction {
         json: bool,
     },
     /// Retire a Tool: hidden from the agent, kept with its history
-    Retire {
-        name: String,
-    },
+    Retire { name: String },
     /// Bring a retired Tool back
-    Restore {
-        name: String,
-    },
+    Restore { name: String },
     /// Make an earlier version current again (default: the one before)
     Rollback {
         name: String,
@@ -416,8 +404,14 @@ enum ToolsAction {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Import a bundle from a file, or from an https URL or gist (shown
+    /// in full and confirmed first)
     Import {
+        /// A bundle file, or an https:// URL (gists and GitHub file pages work)
         file: String,
+        /// Import from a URL without asking (non-interactive use)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -3842,14 +3836,83 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             println!("purged {}", tool.name);
             Ok(())
         }
-        ToolsAction::Import { file } => {
-            let text = std::fs::read_to_string(&file)?;
-            let bundle: serde_json::Value = serde_json::from_str(&text)?;
+        ToolsAction::Import { file, yes } => {
+            let bundle: serde_json::Value = if file.contains("://") {
+                let fetched = request_once(&paths, Request::FetchToolBundle { url: file })?;
+                print_bundle_preview(&fetched);
+                if !yes && !confirm(
+                    "Import it? Imported Tools still ask before their first sensitive call. [y/N] ",
+                )? {
+                    eprintln!("not imported");
+                    std::process::exit(2);
+                }
+                fetched["bundle"].clone()
+            } else {
+                serde_json::from_str(&std::fs::read_to_string(&file)?)?
+            };
             let v = request_once(&paths, Request::ImportTool { bundle })?;
             println!("imported: {v}");
             Ok(())
         }
     }
+}
+
+/// What a fetched bundle holds, in full, before anything is imported
+/// (SPEC §7.8): its source, and each Tool's Capabilities and code.
+fn print_bundle_preview(fetched: &serde_json::Value) {
+    let b = &fetched["bundle"];
+    let tools: Vec<&serde_json::Value> = match b["tools"].as_array() {
+        Some(list) => list.iter().collect(),
+        None => vec![b],
+    };
+    print!("source: {}", fetched["source"].as_str().unwrap_or_default());
+    match fetched["file"].as_str() {
+        Some(f) => println!(" ({f})"),
+        None => println!(),
+    }
+    println!("{} Tool(s):", tools.len());
+    for t in tools {
+        let caps: Vec<&str> = t["capabilities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.as_str())
+            .collect();
+        println!();
+        println!(
+            "── {} ──  {}",
+            t["name"].as_str().unwrap_or("?"),
+            t["description"].as_str().unwrap_or_default()
+        );
+        println!(
+            "capabilities: {}",
+            if caps.is_empty() {
+                "none".to_string()
+            } else {
+                caps.join(", ")
+            }
+        );
+        println!("memory: {} MB", t["memory_mb"].as_u64().unwrap_or(256));
+        println!("code:");
+        for line in t["implementation_js"].as_str().unwrap_or_default().lines() {
+            println!("  {line}");
+        }
+    }
+    println!();
+}
+
+/// A yes/no question on the terminal; no terminal means no.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprintln!("(no terminal to confirm on: pass --yes to import without asking)");
+        return Ok(false);
+    }
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Retire or restore a Tool by name or id.

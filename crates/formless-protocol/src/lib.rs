@@ -1182,6 +1182,11 @@ pub enum Request {
     ImportTool {
         bundle: serde_json::Value,
     },
+    /// Fetch a Tool bundle from an https URL or gist to preview it before
+    /// importing: `{source, file?, bundle}`. Nothing is imported.
+    FetchToolBundle {
+        url: String,
+    },
     /// `format`: "json" (default; the re-importable bundle), or
     /// "markdown" / "html", which return `{name, format, content}`
     /// (SPEC §5.1).
