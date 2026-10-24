@@ -456,6 +456,19 @@ pub struct ToolDetail {
     /// §10.4); empty when nothing stands out.
     #[serde(default)]
     pub attention: Vec<String>,
+    /// A real call: the latest successful Invocation (SPEC §10.4).
+    #[serde(default)]
+    pub example: Option<ToolExample>,
+}
+
+/// One concrete call of a Tool: its (redacted) input and output, as
+/// recorded, the output cut to a few KB.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolExample {
+    pub version: i64,
+    pub input: String,
+    pub output: String,
+    pub created_at: String,
 }
 
 /// One past Invocation of a Tool, for its detail view.

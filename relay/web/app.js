@@ -2040,6 +2040,14 @@
         h("ul", null, d.attention.map((r) => h("li", null, r)))));
     }
     box.append(metricsBlock(d.metrics));
+    if (d.example) {
+      // A real call: the latest successful Invocation, redacted (SPEC §10.4).
+      const pretty = (s) => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch (_) { return s; } };
+      box.append(h("details", { class: "chip example", open: true },
+        h("summary", null, "Example ", h("span", { class: "muted" }, "· the latest successful call, v" + d.example.version + " · " + relTime(d.example.created_at))),
+        h("div", { class: "muted" }, "input"), h("pre", null, pretty(d.example.input)),
+        h("div", { class: "muted" }, "output"), h("pre", null, pretty(d.example.output))));
+    }
     const idx = d.versions.findIndex((v) => v.version === t.current_version);
     if (idx > 0) {
       // What the current version changed (optimiser promotion or agent edit).

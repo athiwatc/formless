@@ -3659,6 +3659,7 @@ impl Daemon {
         let Some((info, ver)) = self.with_store(|st| st.get_tool_current(id))? else {
             return Ok(None);
         };
+        let example = self.with_reader(|st| st.tool_example(id))?;
         Ok(Some(json!({
             "format": "formless.tool/1",
             "name": info.name,
@@ -3669,6 +3670,7 @@ impl Daemon {
             "implementation_js": ver.code,
             "capabilities": ver.capabilities,
             "memory_mb": ver.memory_mb,
+            "example": example.map(|e| json!({"input": parse_or_text(&e.input), "output": parse_or_text(&e.output)})),
         })))
     }
 
@@ -5602,6 +5604,7 @@ impl Daemon {
             .find(|v| v.version == want)
             .with_context(|| format!("'{name}' has no version {want}"))?;
         let failures = self.with_store(|st| st.recent_failures(&info.id, 5))?;
+        let example = self.with_reader(|st| st.tool_example(&info.id))?;
         let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or(json!(s));
         Ok(json!({
             "name": info.name,
@@ -5624,6 +5627,7 @@ impl Daemon {
             "memory_mb": ver.memory_mb,
             "implementation_js": ver.code,
             "metrics": {"invocations": info.invocations, "success_rate": info.success_rate, "needs_attention": info.needs_attention},
+            "example": example.map(|e| json!({"version": e.version, "input": parse(&e.input), "output": parse(&e.output)})),
             "recent_failures": failures.iter().map(|(v, tag, input, error)| json!({
                 "version": v, "tag": tag, "input": parse(input),
                 "error": error.lines().next().unwrap_or_default(),
@@ -7198,6 +7202,11 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// JSON text as a value, or the text itself when it isn't JSON.
+fn parse_or_text(s: &str) -> Value {
+    serde_json::from_str(s).unwrap_or_else(|_| json!(s))
 }
 
 /// The `title` a create_tool call gives, trimmed to one short line.
