@@ -1778,7 +1778,9 @@
     body.replaceChildren(h("div", null,
       req.detail
         ? h("p", { class: "detail-text" }, req.detail)
-        : h("p", null, "Tool ", h("strong", null, req.tool_name), req.version ? " v" + req.version : "",
+        : h("p", null, "Tool ", h("strong", null, toolTitleByName(req.tool_name) || req.tool_name),
+          toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + req.tool_name + ")") : null,
+          req.version ? " v" + req.version : "",
           promo ? " is ready to be promoted." : " wants sensitive capabilities:"),
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
       h("ul", { "aria-label": promo ? "Capabilities" : "Capabilities requested" },
@@ -1876,6 +1878,14 @@
   function toolStatusDot(t) {
     return h("span", { class: "dot" + (t.needs_attention ? " attention" : t.retired ? " retired" : ""), title: t.needs_attention ? "needs attention" : t.retired ? "retired" : "active" });
   }
+  /** A Tool's title with its name as secondary text, or just the name (SPEC §7.2). */
+  function toolLabel(t) {
+    return t.title ? [t.title, h("span", { class: "muted tool-name" }, " " + t.name)] : t.name;
+  }
+  function toolTitleByName(name) {
+    const t = (S.tools || []).find((x) => x.name === name);
+    return t && t.title;
+  }
   // Tools table columns: [label, sort key or null, numeric].
   const TOOL_COLS = [["Tool", "name"], ["Ver", "version"], ["Calls", "calls", true], ["Success", "rate", true], ["Last used", "used"]];
   function toolsTable(table, tools, opts) {
@@ -1901,7 +1911,7 @@
         onclick: () => opts.onselect(t.id),
         onkeydown: (e) => { if (e.key === "Enter") opts.onselect(t.id); },
       },
-      h("td", null, toolStatusDot(t), t.name, t.retired ? h("span", { class: "muted" }, " (retired)") : null),
+      h("td", null, toolStatusDot(t), toolLabel(t), t.retired ? h("span", { class: "muted" }, " (retired)") : null),
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
       h("td", { class: "num" }, rateCell(t.success_rate)),
@@ -1921,7 +1931,7 @@
       if (quick === "retired" && !t.retired) return false;
       if (quick === "failing" && !(t.success_rate != null && t.success_rate < 0.8)) return false;
       if (quick === "attention" && !t.needs_attention) return false;
-      return !q || fuzzyMatch(q, t.name) || fuzzyMatch(q, t.description || "");
+      return !q || fuzzyMatch(q, t.name) || fuzzyMatch(q, t.title || "") || fuzzyMatch(q, t.description || "");
     });
     // Each column's natural order (names A→Z, numbers and dates biggest
     // first); a second click on the header reverses it.
@@ -2009,7 +2019,7 @@
   function renderToolDetail(box, d) {
     const t = d.tool;
     const current = d.versions.find((v) => v.version === t.current_version) || d.versions[d.versions.length - 1];
-    box.append(h("h3", null, t.name), h("p", { class: "muted", style: "margin:0" }, t.description));
+    box.append(h("h3", null, toolLabel(t)), h("p", { class: "muted", style: "margin:0" }, t.description));
     box.append(h("dl", { class: "kv" },
       h("dt", null, "Status"), h("dd", null, h("span", { class: "status-pill " + (t.needs_attention ? "bad" : t.retired ? "" : "good") }, t.needs_attention ? "needs attention" : t.retired ? "retired" : "active")),
       h("dt", null, "Versions"), h("dd", null, h("div", { class: "versions" }, d.versions.map((v) =>

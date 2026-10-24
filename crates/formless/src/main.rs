@@ -3590,8 +3590,15 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             if tools.is_empty() {
                 println!("(no tools yet - the agent builds them via create_tool)");
             }
-            let mut tbl =
-                Table::new(&["TOOL", "VER", "CALLS", "SUCCESS", "STATUS", "CAPABILITIES"]);
+            let mut tbl = Table::new(&[
+                "TOOL",
+                "TITLE",
+                "VER",
+                "CALLS",
+                "SUCCESS",
+                "STATUS",
+                "CAPABILITIES",
+            ]);
             for tool in tools {
                 let status = if tool.retired {
                     t("retired", Tone::Dim)
@@ -3603,6 +3610,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 let rate = tool.success_rate;
                 tbl.row(vec![
                     t(tool.name, Tone::Strong),
+                    c(tool.title),
                     c(format!("v{}", tool.current_version)),
                     c(tool.invocations.to_string()),
                     t(
@@ -3912,6 +3920,9 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
         "active"
     };
     println!("{} v{}  [{status}]", t.name, t.current_version);
+    if !t.title.is_empty() {
+        println!("{}", t.title);
+    }
     println!("{}", t.description);
     println!();
     println!(

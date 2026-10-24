@@ -102,6 +102,10 @@ pub struct MessageInfo {
 pub struct ToolInfo {
     pub id: String,
     pub name: String,
+    /// A short human title ("Last git author"); empty when the Tool has
+    /// none. UIs show it first, with the name as secondary text.
+    #[serde(default)]
+    pub title: String,
     pub description: String,
     pub retired: bool,
     pub current_version: i64,

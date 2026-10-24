@@ -10,6 +10,7 @@ fn tool(name: &str, desc: &str, schema: &str, code: &str) -> (ToolInfo, ToolVers
         ToolInfo {
             id: name.into(),
             name: name.into(),
+            title: String::new(),
             description: desc.into(),
             retired: false,
             current_version: 1,

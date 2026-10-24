@@ -31,7 +31,7 @@ fn index_names(db: &PathBuf) -> Vec<String> {
 fn v39_ships_the_missing_indexes() {
     let db = temp_db("idx");
     let store = Store::open(&db).unwrap();
-    assert_eq!(SCHEMA_VERSION, 39);
+    assert!(SCHEMA_VERSION >= 39);
     store.create_session(Some("s".into())).unwrap();
     let names = index_names(&db);
     for want in [

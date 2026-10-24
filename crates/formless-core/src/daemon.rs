@@ -3662,6 +3662,7 @@ impl Daemon {
         Ok(Some(json!({
             "format": "formless.tool/1",
             "name": info.name,
+            "title": info.title,
             "description": info.description,
             "input_schema": serde_json::from_str::<Value>(&ver.input_schema).unwrap_or(json!({})),
             "output_schema": serde_json::from_str::<Value>(&ver.output_schema).unwrap_or(json!({})),
@@ -4215,6 +4216,13 @@ impl Daemon {
                 author,
             )
         })?;
+        // A new version keeps the Tool's title unless one is given.
+        let info = match tool_title(args) {
+            Some(title) => self
+                .with_store(|st| st.set_tool_title(&info.id, &title))?
+                .unwrap_or(info),
+            None => info,
+        };
         let _ = self
             .with_store(|st| st.audit(author, "tool.create", &format!("{} v{version}", d.name)));
         self.broadcast(Event::ToolUpdated { tool: info.clone() });
@@ -5597,6 +5605,7 @@ impl Daemon {
         let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or(json!(s));
         Ok(json!({
             "name": info.name,
+            "title": info.title,
             "description": info.description,
             "version": ver.version,
             "current_version": info.current_version,
@@ -5869,6 +5878,7 @@ impl Daemon {
         let info = existing.map(|(i, _)| i).unwrap_or_else(|| ToolInfo {
             id: format!("test:{}", d.name),
             name: format!("{} (test)", d.name),
+            title: String::new(),
             description: d.description.clone(),
             retired: false,
             current_version: 0,
@@ -7188,6 +7198,12 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// The `title` a create_tool call gives, trimmed to one short line.
+fn tool_title(args: &Value) -> Option<String> {
+    let title = args["title"].as_str()?.lines().next()?.trim();
+    (!title.is_empty()).then(|| title.chars().take(60).collect())
 }
 
 impl ToolDraft {

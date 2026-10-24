@@ -128,7 +128,7 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
                 4 => t.needs_attention,
                 _ => true,
             };
-            quick && f.hit(&[&t.name, &t.description])
+            quick && f.hit(&[&t.name, &t.title, &t.description])
         })
         .collect();
     match f.sort % TOOL_SORTS.len() {
@@ -273,6 +273,7 @@ mod tests {
         ToolInfo {
             id: name.into(),
             name: name.into(),
+            title: String::new(),
             description: format!("{name} things"),
             retired,
             current_version: 1,

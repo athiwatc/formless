@@ -5673,9 +5673,16 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some((req, promotion)) = modal {
         let more = app.approvals.len() + app.promotions.len() - 1;
+        let title = app
+            .tools
+            .iter()
+            .find(|t| req.tool_id.as_ref() == Some(&t.id) || t.name == req.tool_name)
+            .map(|t| t.title.as_str())
+            .unwrap_or_default();
         draw_approval(
             f,
             req,
+            title,
             promotion,
             more,
             app.color,
@@ -9281,13 +9288,26 @@ fn tool_status(t: &ToolInfo, color: bool) -> Span<'static> {
     }
 }
 
+/// A Tool's glyph and label: its title with the name as secondary text,
+/// or just the name when it has no title (SPEC §7.2).
+fn tool_label(t: &ToolInfo, color: bool) -> Line<'static> {
+    let mut spans = vec![tool_glyph(t, color)];
+    if t.title.is_empty() {
+        spans.push(Span::raw(t.name.clone()));
+    } else {
+        spans.push(Span::raw(t.title.clone()));
+        spans.push(Span::styled(
+            format!(" {}", t.name),
+            fg(color, Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// Name, version, calls, and success cells shared by Tool tables.
 fn tool_cells(t: &ToolInfo, color: bool) -> Vec<Cell<'static>> {
     vec![
-        Cell::from(Line::from(vec![
-            tool_glyph(t, color),
-            Span::raw(t.name.clone()),
-        ])),
+        Cell::from(tool_label(t, color)),
         Cell::from(format!("v{}", t.current_version)),
         Cell::from(Line::raw(t.invocations.to_string()).right_aligned()),
         Cell::from(
@@ -9541,7 +9561,11 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         ];
         f.render_widget(
             Paragraph::new(lines).block(ui::panel(
-                format!(" {} ", d.tool.name),
+                if d.tool.title.is_empty() {
+                    format!(" {} ", d.tool.name)
+                } else {
+                    format!(" {} · {} ", d.tool.title, d.tool.name)
+                },
                 app.color,
                 Color::Yellow,
             )),
@@ -10082,6 +10106,7 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
 fn draw_approval(
     f: &mut Frame,
     req: &ApprovalReq,
+    title: &str,
     promotion: bool,
     more: usize,
     color: bool,
@@ -10101,7 +10126,22 @@ fn draw_approval(
         None => vec![
             Line::from(vec![
                 Span::raw("Tool "),
-                Span::styled(req.tool_name.clone(), bold_fg(color, Color::Yellow)),
+                Span::styled(
+                    if title.is_empty() {
+                        req.tool_name.clone()
+                    } else {
+                        title.to_string()
+                    },
+                    bold_fg(color, Color::Yellow),
+                ),
+                Span::styled(
+                    if title.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", req.tool_name)
+                    },
+                    fg(color, Color::DarkGray),
+                ),
                 Span::raw(format!(
                     " v{} {}",
                     req.version,
@@ -10359,10 +10399,7 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             Table::new(
                 app.tools.iter().map(|t| {
                     Row::new(vec![
-                        Cell::from(Line::from(vec![
-                            tool_glyph(t, app.color),
-                            Span::raw(t.name.clone()),
-                        ])),
+                        Cell::from(tool_label(t, app.color)),
                         Cell::from(
                             Line::styled(
                                 ui::rate_text(t.success_rate),
@@ -11169,6 +11206,7 @@ mod tests {
             ToolInfo {
                 id: "1".into(),
                 name: "writer".into(),
+                title: String::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 2,
@@ -11185,6 +11223,7 @@ mod tests {
             ToolInfo {
                 id: "2".into(),
                 name: "old".into(),
+                title: String::new(),
                 description: String::new(),
                 retired: true,
                 current_version: 1,
@@ -11793,6 +11832,7 @@ mod tests {
             .map(|(i, n)| ToolInfo {
                 id: n.to_string(),
                 name: n.to_string(),
+                title: String::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -12587,6 +12627,7 @@ mod tests {
             .map(|n| ToolInfo {
                 id: n.to_string(),
                 name: n.to_string(),
+                title: String::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -12761,6 +12802,7 @@ mod tests {
             .map(|i| ToolInfo {
                 id: format!("t{i:02}"),
                 name: format!("t{i:02}"),
+                title: String::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -13280,6 +13322,7 @@ mod tests {
         app.tools = vec![ToolInfo {
             id: "t".into(),
             name: "fetch_page".into(),
+            title: String::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13306,6 +13349,7 @@ mod tests {
         let tool = ToolInfo {
             id: "t".into(),
             name: "fetch_page".into(),
+            title: String::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13466,6 +13510,7 @@ mod tests {
         app.tools = vec![ToolInfo {
             id: "t".into(),
             name: "fetch_page".into(),
+            title: String::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13524,6 +13569,7 @@ mod tests {
         let tool = |name: &str, cap: &str| ToolInfo {
             id: name.into(),
             name: name.into(),
+            title: String::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13567,6 +13613,7 @@ mod tests {
         let tool = ToolInfo {
             id: "t".into(),
             name: "fetch_page".into(),
+            title: String::new(),
             description: String::new(),
             retired: false,
             current_version: 1,

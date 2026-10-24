@@ -446,6 +446,7 @@ async fn tool_and_session_export_import_across_profiles() {
             )
             .unwrap();
         tool_id = info.id.clone();
+        store.set_tool_title(&tool_id, "Port checker").unwrap();
         store
             .record_invocation(
                 &tool_id, 1, None, None, None, "success", "", "{}", "{}", "", 1, 200,
@@ -469,6 +470,7 @@ async fn tool_and_session_export_import_across_profiles() {
         })
         .await;
     assert_eq!(bundle["format"], "formless.tool/1");
+    assert_eq!(bundle["title"], "Port checker");
     assert!(
         bundle.get("success_rate").is_none() && bundle.get("invocations").is_none(),
         "bundle must carry no metrics: {bundle}"
@@ -489,6 +491,7 @@ async fn tool_and_session_export_import_across_profiles() {
         })
         .await;
     assert_eq!(imported["name"], "porter");
+    assert_eq!(imported["title"], "Port checker", "the title travels");
     assert_eq!(
         imported["invocations"], 0,
         "imported tool metrics must start fresh"
@@ -496,6 +499,14 @@ async fn tool_and_session_export_import_across_profiles() {
     // Collision: second import becomes a new tool, never a version overwrite.
     let imported2 = b.rpc(Request::ImportTool { bundle }).await;
     assert_eq!(imported2["name"], "porter_imported");
+    // A new version without a title keeps the Tool's title (SPEC §7.2).
+    let edited = b
+        .rpc(Request::UpdateToolCode {
+            id: imported2["id"].as_str().unwrap().to_string(),
+            code: "function run(i){ return {ok:false}; }".into(),
+        })
+        .await;
+    assert_eq!(edited["tool"]["title"], "Port checker", "{edited}");
     let s2 = b.rpc(Request::ImportSession { bundle: sbundle }).await;
     let got = b
         .rpc(Request::GetSession {

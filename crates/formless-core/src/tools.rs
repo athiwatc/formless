@@ -182,6 +182,7 @@ pub fn create_tool_definition() -> Value {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "snake_case, 1-64 chars; names the general operation (read_text_file), never one project or file"},
+                    "title": {"type": "string", "description": "Short human title shown to the user in lists and approval prompts, 2-5 words in sentence case (e.g. \"Last git author\"). Always set it."},
                     "description": {"type": "string"},
                     "input_schema": {"type": "object", "description": "JSON Schema (draft 2020-12) for run(input)"},
                     "output_schema": {"type": "object", "description": "JSON Schema for the return value"},
