@@ -45,6 +45,11 @@ enum Cmd {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// List or remove profiles (isolated data dirs made with --profile)
+    Profiles {
+        #[command(subcommand)]
+        action: ProfilesAction,
+    },
     /// Diagnostics: config, dirs, keychain, endpoint probe
     Doctor {
         /// Apply the safe fixes: clear a stale socket or lock, restart a
@@ -595,6 +600,115 @@ enum NamingAction {
 }
 
 #[derive(Subcommand)]
+enum ProfilesAction {
+    /// Every profile, whether its daemon runs, and where its data lives
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a profile's data, config and stored secrets
+    Rm {
+        name: String,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
+    match action {
+        ProfilesAction::List { json } => {
+            let rows: Vec<Value> = paths
+                .list_profiles()
+                .iter()
+                .map(|p| {
+                    let running = daemon_reachable(p);
+                    let last_used = std::fs::metadata(p.db_file())
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .map(|t| {
+                            chrono::DateTime::<chrono::Local>::from(t)
+                                .format("%Y-%m-%d %H:%M")
+                                .to_string()
+                        });
+                    serde_json::json!({
+                        "name": p.profile,
+                        "current": p.profile == paths.profile,
+                        "daemon_running": running,
+                        "last_used": last_used,
+                        "data_dir": p.data_dir,
+                        "config_dir": p.config_dir,
+                    })
+                })
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            let mut tbl = Table::new(&["PROFILE", "DAEMON", "LAST USED", "DATA DIR"]);
+            for r in &rows {
+                let mut name = r["name"].as_str().unwrap_or_default().to_string();
+                if r["current"] == true {
+                    name.push_str(" *");
+                }
+                tbl.row(vec![
+                    c(name),
+                    if r["daemon_running"] == true {
+                        t("running", Tone::Good)
+                    } else {
+                        t("stopped", Tone::Dim)
+                    },
+                    c(r["last_used"].as_str().unwrap_or("never")),
+                    c(r["data_dir"].as_str().unwrap_or_default()),
+                ]);
+            }
+            tbl.print();
+            Ok(())
+        }
+        ProfilesAction::Rm { name, yes } => {
+            if name == "default" {
+                anyhow::bail!("the default profile can't be removed; `formless reset` wipes it");
+            }
+            let Some(target) = paths
+                .list_profiles()
+                .into_iter()
+                .find(|p| p.profile == name)
+            else {
+                anyhow::bail!("no profile named '{name}' (see `formless profiles list`)");
+            };
+            if !yes {
+                eprint!(
+                    "This deletes profile '{name}': its config, API key, Tools and Sessions in {}. Type the profile name to confirm: ",
+                    target.data_dir.display()
+                );
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if line.trim() != name {
+                    eprintln!("aborted");
+                    std::process::exit(2);
+                }
+            }
+            if daemon_reachable(&target) {
+                let _ = formless_tui::client::request_once(&target, Request::Shutdown);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while daemon_reachable(&target) || target.lock_file().exists() {
+                    if std::time::Instant::now() > deadline {
+                        anyhow::bail!(
+                            "profile '{name}''s daemon did not stop; nothing was deleted"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            formless_core::config::reset_all(&target)?;
+            println!("removed profile '{name}'");
+            Ok(())
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum DaemonAction {
     /// Run the daemon (used by client auto-start; blocks)
     Serve,
@@ -665,6 +779,7 @@ fn main() -> Result<()> {
             },
         ),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
+        Some(Cmd::Profiles { action }) => profiles_cmd(&paths, action),
         Some(Cmd::Doctor { json: true, .. }) => {
             println!("{}", serde_json::to_string_pretty(&doctor_json(&paths)?)?);
             Ok(())
