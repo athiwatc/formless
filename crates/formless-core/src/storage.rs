@@ -343,7 +343,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 39;
+pub const SCHEMA_VERSION: i64 = 40;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -428,7 +428,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 39] = [
+const MIGRATIONS: [(i64, MigrationStep); 40] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -554,6 +554,8 @@ const MIGRATIONS: [(i64, MigrationStep); 39] = [
     // Storage performance: the indexes the query plans asked for, and the
     // Session summary denormalised onto the Session row (SPEC §9.4).
     (39, migrate_v39),
+    // A short human title for each Tool (SPEC §7.2).
+    (40, |c| add_column(c, "tools", "title TEXT NOT NULL DEFAULT ''")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -2143,6 +2145,7 @@ impl Store {
                 r.get::<_, i64>("needs_attention")?,
                 r.get::<_, String>("created_at")?,
                 r.get::<_, String>("updated_at")?,
+                r.get::<_, String>("title")?,
             ))
         })?;
         let Some(row) = rows.next() else {
@@ -2157,6 +2160,7 @@ impl Store {
             needs_attention,
             created_at,
             updated_at,
+            title,
         ) = row?;
         drop(rows);
         drop(stmt);
@@ -2197,6 +2201,7 @@ impl Store {
         Ok(Some(ToolInfo {
             id,
             name,
+            title,
             description,
             retired: retired != 0,
             current_version,
@@ -3084,6 +3089,15 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// A Tool's human title (SPEC §7.2); empty clears it.
+    pub fn set_tool_title(&self, id: &str, title: &str) -> Result<Option<ToolInfo>> {
+        self.ex(
+            "UPDATE tools SET title=?2 WHERE id=?1",
+            params![id, title],
+        )?;
+        self.tool_info(id)
     }
 
     pub fn set_tool_retired(&self, id: &str, retired: bool) -> Result<Option<ToolInfo>> {

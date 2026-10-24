@@ -734,6 +734,16 @@ pattern (§4.4).
 
 ### 7.2 Tool lifecycle
 
+- **Title:** besides its machine name (`git_last_author`), a Tool may have
+  a short human title ("Last git author"). It is set by `create_tool`'s
+  optional `title`, which the system prompt asks the agent to always give.
+  - A new version without a title keeps the current one.
+  - The title travels in export bundles and is searchable.
+  - UIs show the title first, with the name as secondary text: the TUI and
+    web Tool lists, the detail header and approval prompts. The CLI's
+    `tools list` has a TITLE column, and `tools show` prints it under the
+    name.
+  - Stored on the Tool (schema v40).
 - Tools are never edited in place. Any change (agent-driven or optimiser
   Candidate) creates a **new integer version** (`v1`, `v2`, …; no semver).
   Each version records timestamp, author (`agent` | `optimiser` | `import`),
