@@ -489,9 +489,13 @@ impl Daemon {
                         "expires_at": status.expires_at,
                     })
                 });
+                let mut running: Vec<String> = self.runs.lock().unwrap().keys().cloned().collect();
+                running.sort();
                 Ok(json!({
                     "protocol": PROTOCOL_VERSION,
+                    "version": env!("CARGO_PKG_VERSION"),
                     "sessions": sessions,
+                    "running_sessions": running,
                     "pid": std::process::id(),
                     "auth": auth.ok(),
                 }))

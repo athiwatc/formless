@@ -338,8 +338,9 @@ formless config edit                       # $EDITOR; saved only if it still par
 
 ```bash
 formless daemon start     # start it if it is not already up
-formless daemon status    # pid, protocol, session count
+formless daemon status    # pid, version, protocol, sessions, running Runs
 formless daemon stop
+formless daemon restart   # waits for running Runs (--force interrupts them)
 formless daemon serve     # foreground, for watching logs
 formless doctor           # config, dirs, keychain, endpoint + tool-calling probe
 formless tools list       # registry inspection (also export / import)
