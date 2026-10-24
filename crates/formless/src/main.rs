@@ -193,9 +193,12 @@ enum Cmd {
         /// Task text; `-` reads it from stdin. With a task, piped stdin is
         /// attached as stdin.txt (`git diff | formless run "review this"`)
         task: String,
-        /// Continue an existing session by id (default: ephemeral)
+        /// Continue an existing session by id, or `last` (default: ephemeral)
         #[arg(long)]
         session: Option<String>,
+        /// Continue the Session the last `formless run` used (= --session last)
+        #[arg(long = "continue", short = 'c', conflicts_with = "session")]
+        continue_last: bool,
         /// Auto-approve sensitive tools for this Run only
         #[arg(long)]
         yes: bool,
@@ -834,6 +837,7 @@ fn main() -> Result<()> {
         Some(Cmd::Run {
             task,
             session,
+            continue_last,
             yes,
             answer,
             json,
@@ -847,6 +851,17 @@ fn main() -> Result<()> {
             attach,
         }) => {
             let output = if json { RunOutput::JsonlEvents } else { output };
+            let session = if continue_last || session.as_deref() == Some("last") {
+                match last_run_session(&paths) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                session
+            };
             // Piped input: the task itself (`-`) or an attachment.
             use std::io::{IsTerminal, Read};
             let piped = if std::io::stdin().is_terminal() {
@@ -2094,6 +2109,23 @@ fn run_input(task: String, stdin: Option<Vec<u8>>) -> Result<(String, Option<Vec
     Ok((task, piped))
 }
 
+/// The Session the last `formless run` used, if it still exists.
+fn last_run_session(paths: &Paths) -> Result<String, String> {
+    let id = std::fs::read_to_string(paths.last_run_session_file())
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or("no earlier `formless run` Session to continue; run once without --continue")?;
+    formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+    match formless_tui::client::request_once(paths, Request::GetSession { id: id.clone() }) {
+        Ok(_) => Ok(id),
+        Err(e) if !e.to_string().contains("session not found") => Err(format!("{e:#}")),
+        Err(_) => Err(format!(
+            "the last `formless run` Session ({id}) no longer exists; run once without --continue"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_headless(
     paths: Paths,
@@ -2161,6 +2193,7 @@ fn run_headless(
             found.unwrap()
         }
     };
+    let _ = std::fs::write(paths.last_run_session_file(), &session_id);
     client.send(Request::Subscribe {
         sessions: Some(vec![session_id.clone()]),
         deltas: true,

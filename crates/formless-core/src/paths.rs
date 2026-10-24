@@ -99,6 +99,10 @@ impl Paths {
         })
     }
 
+    /// The Session the last `formless run` used (`run --continue`).
+    pub fn last_run_session_file(&self) -> PathBuf {
+        self.data_dir.join("last_run_session")
+    }
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }

@@ -275,6 +275,7 @@ Approvals for broad Capabilities appear as a modal — the request names the exa
 ```bash
 formless run "summarise the CHANGELOG of this repo"        # ephemeral Session
 formless run "now group those by author" --session 3f9c    # continue a Session
+formless run -c "and sort them by date"                     # continue the last `formless run` Session
 formless run "audit my Downloads folder" --json            # one JSON event per line
 formless run "one-line summary of README.md" --output final -q   # just the answer on stdout
 formless run "triage this" --output json                   # {session_id, status, answer, error}
@@ -431,7 +432,7 @@ formless profiles rm sandbox     # stops its daemon, deletes its data, config an
 | Command | Behaviour |
 |---|---|
 | `formless` (or `formless tui`) | Launch the TUI, auto-starting the daemon |
-| `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one; `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run (nothing is stored) |
+| `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one (`--continue`/`-c` = the last run's); `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run (nothing is stored) |
 | `formless daemon start\|stop\|status\|serve` | Daemon lifecycle |
 | `formless relay enable\|disable\|status` | Encrypted browser access (v2) |
 | `formless tools list\|show\|run\|export\|import` | Registry inspection, direct runs, and transfer (no secrets, no metrics) |

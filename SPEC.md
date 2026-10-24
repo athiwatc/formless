@@ -2323,7 +2323,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   [--limit N] [--json]`. IDs may be a unique prefix (`restore` needs the
   full id).
 - `formless run "task"` — headless Run (§5 semantics) in an ephemeral
-  Session, or `--session <id|name>` to continue an existing one. When stdin
+  Session, or `--session <id|name>` to continue an existing one.
+  `--continue` (`-c`, same as `--session last`) continues the Session the
+  previous `formless run` used, recorded per profile in
+  `<data dir>/last_run_session`. If there is none, or it was deleted, that
+  is a usage error (exit 2). When stdin
   isn't a terminal, `formless run -` takes the task from stdin, and with a
   task given, non-empty piped stdin is attached to the message as
   `stdin.txt` (`git diff | formless run "review this"`); `-` with nothing
