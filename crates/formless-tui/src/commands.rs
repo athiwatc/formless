@@ -234,6 +234,12 @@ pub const COMMANDS: &[Command] = &[
         Tools,
     ),
     cmd(
+        "toolpin",
+        "NAME",
+        "pin or unpin a Tool: pinned Tools are always listed to the agent",
+        Tools,
+    ),
+    cmd(
         "tooltag",
         "NAME [TAG…]",
         "set a Tool's tags (none clears them); filter the Tools view with #tag",

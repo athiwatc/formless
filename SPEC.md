@@ -708,6 +708,21 @@ pattern (§4.4).
   functions (not called through a generic proxy) so the provider sees
   their exact schemas. Registries may grow without bound; context cost
   stays bounded.
+- **Pinned Tools.** The user can pin a Tool so the agent always has it
+  (`SetToolPinned`, `ToolInfo.pinned`, schema v42).
+  - **Listing:** a pinned Tool joins each Session's listing at the
+    Session's next listing point (its first listing, or after compaction),
+    never mid-Session, so cached prefixes hold. It counts outside
+    `tools.inline_limit`.
+  - **Position:** pinned Tools come first among registry Tools, by name,
+    at a stable position in the prefix.
+  - **Cost shown first:** `ToolDetail.listing_tokens` estimates what
+    listing the Tool adds to each request (its definition, at about 4
+    characters per token). It is shown before pinning: on the web's
+    "Pin (~N tokens/request)" button, in the TUI detail with
+    `/toolpin NAME`, and by `formless tools pin NAME`.
+  - **Undoing it:** `formless tools unpin NAME`, or the same toggles.
+    Pinned Tools are marked ⚲ in lists.
 - **Validation gate at creation:** name rules (§7.3), both schemas validated
   (JSON Schema draft 2020-12), JS syntax-checked, and smoke-tested in the
   replay-style sandbox (§8.4) with a schema-minimal input. Any failure ⇒

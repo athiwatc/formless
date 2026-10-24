@@ -1704,9 +1704,18 @@ impl Daemon {
                 Ok(json!({"tool": info, "version": version}))
             }
             Request::GetTool { id } => {
-                let d = self
+                let mut d = self
                     .with_reader(|st| st.tool_detail(&id))?
                     .context("tool not found")?;
+                // What listing it costs per request (the price of pinning).
+                if let Some(v) = d
+                    .versions
+                    .iter()
+                    .find(|v| v.version == d.tool.current_version)
+                {
+                    let def = toolreg::registry_definition(&d.tool, v);
+                    d.listing_tokens = crate::storage::estimate_tokens(&def.to_string());
+                }
                 Ok(serde_json::to_value(d)?)
             }
             Request::RetireTool { id } => {
@@ -1714,6 +1723,15 @@ impl Daemon {
                     .with_store(|st| st.set_tool_retired(&id, true))?
                     .context("tool not found")?;
                 let _ = self.with_store(|st| st.audit("user", "tool.retire", &t.name));
+                self.broadcast(Event::ToolUpdated { tool: t.clone() });
+                Ok(serde_json::to_value(t)?)
+            }
+            Request::SetToolPinned { id, pinned } => {
+                let t = self
+                    .with_store(|st| st.set_tool_pinned(&id, pinned))?
+                    .context("tool not found")?;
+                let action = if pinned { "tool.pin" } else { "tool.unpin" };
+                let _ = self.with_store(|st| st.audit("user", action, &t.name));
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -5910,6 +5928,7 @@ impl Daemon {
             name: format!("{} (test)", d.name),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: d.description.clone(),
             retired: false,
             current_version: 0,

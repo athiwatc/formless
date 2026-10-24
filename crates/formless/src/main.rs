@@ -343,6 +343,14 @@ enum ToolsAction {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Always list a Tool to the agent (from each Session's next listing)
+    Pin {
+        name: String,
+    },
+    /// Stop always listing a Tool
+    Unpin {
+        name: String,
+    },
     /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
     Tag {
         /// Tool name or id
@@ -3585,6 +3593,34 @@ fn naming_model_status(paths: &Paths, cfg: &Config) -> String {
     }
 }
 
+/// `tools pin|unpin`: pinning says what it costs per request.
+fn set_tool_pinned(paths: &Paths, name: &str, pinned: bool) -> Result<()> {
+    use formless_tui::client::request_once;
+    let tool = find_tool(paths, name)?;
+    let detail: formless_protocol::ToolDetail = serde_json::from_value(request_once(
+        paths,
+        Request::GetTool {
+            id: tool.id.clone(),
+        },
+    )?)?;
+    request_once(
+        paths,
+        Request::SetToolPinned {
+            id: tool.id,
+            pinned,
+        },
+    )?;
+    if pinned {
+        println!(
+            "pinned {}: every Session lists it to the agent from its next listing, ~{} tokens per request",
+            tool.name, detail.listing_tokens
+        );
+    } else {
+        println!("unpinned {}", tool.name);
+    }
+    Ok(())
+}
+
 fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
@@ -3703,6 +3739,8 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             let code = tool_run(&paths, tool, input, yes, session)?;
             std::process::exit(code);
         }
+        ToolsAction::Pin { name } => set_tool_pinned(&paths, &name, true),
+        ToolsAction::Unpin { name } => set_tool_pinned(&paths, &name, false),
         ToolsAction::Tag { name, tags } => {
             let tool = find_tool(&paths, &name)?;
             let t: formless_protocol::ToolInfo = serde_json::from_value(request_once(

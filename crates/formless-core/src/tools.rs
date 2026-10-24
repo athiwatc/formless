@@ -822,6 +822,16 @@ pub fn search_tools(store: &Store, query: &str, limit: usize) -> Result<Vec<Tool
     Ok(scored.into_iter().take(limit).map(|(_, t)| t).collect())
 }
 
+/// The function definition a registry Tool is listed to the model with.
+pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionInfo) -> Value {
+    let params: Value =
+        serde_json::from_str(&v.input_schema).unwrap_or_else(|_| json!({"type": "object"}));
+    json!({
+        "type": "function",
+        "function": {"name": info.name, "description": info.description, "parameters": params}
+    })
+}
+
 /// Provider tool definitions: the built-ins plus registry Tools, sorted by
 /// name. Small registries are listed whole. Past `inline_limit`, a Session
 /// sees the Tools it has loaded (found, created or called) plus the
@@ -850,6 +860,17 @@ pub fn tool_definitions(
             None => false,
         };
         if !frozen {
+            // Pinned Tools are always listed (they join at this refresh
+            // point, never mid-Session, so the cached prefix holds).
+            let pinned: Vec<String> = tools
+                .iter()
+                .filter(|t| t.pinned && !loaded.contains(&t.id))
+                .map(|t| t.id.clone())
+                .collect();
+            if let Some(s) = session_id {
+                store.load_session_tools(s, &pinned, "pinned")?;
+            }
+            loaded.extend(pinned);
             let mut rest: Vec<&ToolInfo> =
                 tools.iter().filter(|t| !loaded.contains(&t.id)).collect();
             rest.sort_by_key(|t| std::cmp::Reverse(t.invocations));
@@ -863,12 +884,20 @@ pub fn tool_definitions(
             }
             loaded.extend(filler);
         }
-        // list_tools is name-ordered, so the listing is too.
-        tools
-            .into_iter()
+        // Pinned Tools first, then the rest; each group by name.
+        let mut shown: Vec<ToolInfo> = tools
+            .iter()
             .filter(|t| loaded.contains(&t.id))
-            .collect()
+            .cloned()
+            .collect();
+        shown.sort_by_key(|t| !t.pinned);
+        shown
     };
+    let pinned_names: std::collections::HashSet<String> = tools
+        .iter()
+        .filter(|t| t.pinned)
+        .map(|t| t.name.to_lowercase())
+        .collect();
     let mut defs = vec![
         create_tool_definition(),
         create_module_definition(),
@@ -908,12 +937,7 @@ pub fn tool_definitions(
             }
         }
         if let Some((_i, v)) = store.get_tool_current(&info.id)? {
-            let params: Value =
-                serde_json::from_str(&v.input_schema).unwrap_or_else(|_| json!({"type": "object"}));
-            let def = json!({
-                "type": "function",
-                "function": {"name": info.name, "description": info.description, "parameters": params}
-            });
+            let def = registry_definition(&info, &v);
             if let Some(s) = session_id {
                 store.pin_definition(s, &info.id, v.version, &def.to_string())?;
             }
@@ -932,8 +956,11 @@ pub fn tool_definitions(
                 registry.push(def);
             }
         }
-        // Same name order as the listing itself.
-        registry.sort_by_key(|d| fn_name(d).to_lowercase());
+        // Same order as the listing itself: pinned first, then by name.
+        registry.sort_by_key(|d| {
+            let name = fn_name(d).to_lowercase();
+            (!pinned_names.contains(&name), name)
+        });
         defs.extend(registry);
     }
     Ok(defs)

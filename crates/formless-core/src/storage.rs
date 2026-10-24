@@ -343,7 +343,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 41;
+pub const SCHEMA_VERSION: i64 = 42;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -428,7 +428,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 41] = [
+const MIGRATIONS: [(i64, MigrationStep); 42] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -558,6 +558,8 @@ const MIGRATIONS: [(i64, MigrationStep); 41] = [
     (40, |c| add_column(c, "tools", "title TEXT NOT NULL DEFAULT ''")),
     // Topic tags on each Tool, a JSON array (SPEC §7.2).
     (41, |c| add_column(c, "tools", "tags TEXT NOT NULL DEFAULT '[]'")),
+    // Tools the user pinned for the agent (SPEC §7.1).
+    (42, |c| add_column(c, "tools", "user_pinned INTEGER NOT NULL DEFAULT 0")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -2149,6 +2151,7 @@ impl Store {
                 r.get::<_, String>("updated_at")?,
                 r.get::<_, String>("title")?,
                 r.get::<_, String>("tags")?,
+                r.get::<_, i64>("user_pinned")?,
             ))
         })?;
         let Some(row) = rows.next() else {
@@ -2165,6 +2168,7 @@ impl Store {
             updated_at,
             title,
             tags,
+            pinned,
         ) = row?;
         drop(rows);
         drop(stmt);
@@ -2207,6 +2211,7 @@ impl Store {
             name,
             title,
             tags: serde_json::from_str(&tags).unwrap_or_default(),
+            pinned: pinned != 0,
             description,
             retired: retired != 0,
             current_version,
@@ -2812,6 +2817,7 @@ impl Store {
             recent_calls,
             attention,
             example,
+            listing_tokens: 0,
         }))
     }
 
@@ -3137,6 +3143,15 @@ impl Store {
         self.ex(
             "UPDATE tools SET title=?2 WHERE id=?1",
             params![id, title],
+        )?;
+        self.tool_info(id)
+    }
+
+    /// Pin a Tool for the agent, or unpin it (SPEC §7.1).
+    pub fn set_tool_pinned(&self, id: &str, pinned: bool) -> Result<Option<ToolInfo>> {
+        self.ex(
+            "UPDATE tools SET user_pinned=?2 WHERE id=?1",
+            params![id, pinned as i64],
         )?;
         self.tool_info(id)
     }

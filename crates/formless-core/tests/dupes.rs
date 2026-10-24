@@ -12,6 +12,7 @@ fn tool(name: &str, desc: &str, schema: &str, code: &str) -> (ToolInfo, ToolVers
             name: name.into(),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: desc.into(),
             retired: false,
             current_version: 1,

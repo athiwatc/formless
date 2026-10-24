@@ -110,6 +110,9 @@ pub struct ToolInfo {
     /// the user (SPEC §7.2).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Pinned by the user: always listed to the model (SPEC §7.1).
+    #[serde(default)]
+    pub pinned: bool,
     pub description: String,
     pub retired: bool,
     pub current_version: i64,
@@ -463,6 +466,10 @@ pub struct ToolDetail {
     /// A real call: the latest successful Invocation (SPEC §10.4).
     #[serde(default)]
     pub example: Option<ToolExample>,
+    /// About how many tokens listing this Tool adds to each request, the
+    /// price of pinning it (SPEC §7.1).
+    #[serde(default)]
+    pub listing_tokens: usize,
 }
 
 /// One concrete call of a Tool: its (redacted) input and output, as
@@ -1103,6 +1110,11 @@ pub enum Request {
     },
     RetireTool {
         id: String,
+    },
+    /// Pin a Tool so every Session lists it to the model, or unpin it.
+    SetToolPinned {
+        id: String,
+        pinned: bool,
     },
     /// Replace a Tool's tags (normalised; an empty list clears them).
     SetToolTags {
