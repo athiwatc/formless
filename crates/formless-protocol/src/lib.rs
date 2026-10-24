@@ -113,6 +113,10 @@ pub struct ToolInfo {
     /// Pinned by the user: always listed to the model (SPEC §7.1).
     #[serde(default)]
     pub pinned: bool,
+    /// Switched off by the user: hidden from the agent and uncallable
+    /// until switched back on; versions and metrics untouched (SPEC §7.2).
+    #[serde(default)]
+    pub disabled: bool,
     pub description: String,
     pub retired: bool,
     pub current_version: i64,
@@ -1110,6 +1114,11 @@ pub enum Request {
     },
     RetireTool {
         id: String,
+    },
+    /// Switch a Tool off (or back on) without retiring it.
+    SetToolDisabled {
+        id: String,
+        disabled: bool,
     },
     /// Pin a Tool so every Session lists it to the model, or unpin it.
     SetToolPinned {

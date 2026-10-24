@@ -773,6 +773,18 @@ pattern (§4.4).
     and plain text matches tags too; the CLI has `tools list --tag git`.
   - **Display:** tags show as `#tag` beside the Tool and travel in export
     bundles. They are stored as a JSON array (schema v41).
+- **Switched off:** a user-only toggle (`SetToolDisabled`,
+  `ToolInfo.disabled`, schema v43), separate from retirement, which the
+  optimiser also uses.
+  - **While off:** the Tool is left out of `find_tools` and new listings,
+    and every call fails with "switched off by the user", whether from the
+    agent, a nested `tools.call`, a script or `tools run`.
+  - **Sessions already listing it** keep its definition until their next
+    refresh point, as for a retired Tool, so their cached prefix holds.
+  - **Nothing else changes:** versions, metrics and approvals stay as they
+    are.
+  - **Toggles:** `formless tools disable|enable NAME`, `/tooloff NAME` in
+    the TUI, and the web detail's "Switch off/on". Lists show it as "off".
 - Tools are never edited in place. Any change (agent-driven or optimiser
   Candidate) creates a **new integer version** (`v1`, `v2`, …; no semver).
   Each version records timestamp, author (`agent` | `optimiser` | `import`),

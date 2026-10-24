@@ -1876,7 +1876,7 @@
 
   // ------------------------------------------------------------- tools
   function toolStatusDot(t) {
-    return h("span", { class: "dot" + (t.needs_attention ? " attention" : t.retired ? " retired" : ""), title: t.needs_attention ? "needs attention" : t.retired ? "retired" : "active" });
+    return h("span", { class: "dot" + (t.retired ? " retired" : t.disabled ? " off" : t.needs_attention ? " attention" : ""), title: t.retired ? "retired" : t.disabled ? "switched off" : t.needs_attention ? "needs attention" : "active" });
   }
   /** A Tool's title with its name as secondary text, or just the name (SPEC §7.2). */
   function toolLabel(t) {
@@ -2025,7 +2025,7 @@
     const current = d.versions.find((v) => v.version === t.current_version) || d.versions[d.versions.length - 1];
     box.append(h("h3", null, toolLabel(t)), h("p", { class: "muted", style: "margin:0" }, t.description));
     box.append(h("dl", { class: "kv" },
-      h("dt", null, "Status"), h("dd", null, h("span", { class: "status-pill " + (t.needs_attention ? "bad" : t.retired ? "" : "good") }, t.needs_attention ? "needs attention" : t.retired ? "retired" : "active")),
+      h("dt", null, "Status"), h("dd", null, h("span", { class: "status-pill " + (t.disabled ? "mid" : t.needs_attention ? "bad" : t.retired ? "" : "good") }, t.disabled ? "switched off" : t.needs_attention ? "needs attention" : t.retired ? "retired" : "active")),
       h("dt", null, "Versions"), h("dd", null, h("div", { class: "versions" }, d.versions.map((v) =>
         v.version === t.current_version
           ? h("span", { class: "version current", title: "current" }, "v" + v.version + " " + v.author)
@@ -2072,6 +2072,7 @@
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name) }, "Optimise"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name) }, t.retired ? "Restore" : "Retire"),
       t.current_version > 1 ? h("button", { class: "btn small", type: "button", onclick: () => rollbackTool(t, t.current_version - 1) }, "Roll back") : null,
+      t.retired ? null : h("button", { class: "btn small", type: "button", title: "Switched off: hidden from the agent and uncallable; versions and metrics stay", onclick: () => act({ type: "set_tool_disabled", id: t.id, disabled: !t.disabled }, (t.disabled ? "Switched on " : "Switched off ") + t.name) }, t.disabled ? "Switch on" : "Switch off"),
       h("button", { class: "btn small", type: "button", title: "Pinned Tools are listed to the agent in every Session (from its next listing)", onclick: () => act({ type: "set_tool_pinned", id: t.id, pinned: !t.pinned }, (t.pinned ? "Unpinned " : "Pinned ") + t.name) },
         t.pinned ? "Unpin" : "Pin (~" + (d.listing_tokens || 0) + " tokens/request)"),
       h("button", { class: "btn small", type: "button", onclick: () => exportTool(t) }, "Export"),
