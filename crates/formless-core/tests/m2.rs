@@ -291,6 +291,10 @@ async fn mock_m2_server(workdir: String) -> String {
                     return Json(json!({"choices": [{"message": {"tool_calls": [{"id": "p", "type": "function", "function": {"name": "probe_ping", "arguments": "{}"}}]}}]})).into_response();
                 }
                 let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+                // The approval prompt's plain-language summary (SPEC §10.3).
+                if msgs.first().and_then(|m| m["content"].as_str()).is_some_and(|c| c.starts_with("You explain small programs")) {
+                    return Json(json!({"choices": [{"message": {"role": "assistant", "content": "Writes the text you give it to a file in the work folder and reads it back."}}]})).into_response();
+                }
                 let tool_msgs: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "tool").collect();
                 let sse = match tool_msgs.len() {
                     0 => {
@@ -334,7 +338,13 @@ async fn scripted_flow(
     tag: &str,
     approve: bool,
     scope: formless_protocol::ApprovalScope,
-) -> (String, Paths, String, Vec<formless_protocol::ToolChange>) {
+) -> (
+    String,
+    Paths,
+    String,
+    Vec<formless_protocol::ToolChange>,
+    Option<String>,
+) {
     use formless_core::daemon::Daemon;
     use formless_core::Config;
     use formless_protocol::*;
@@ -413,6 +423,7 @@ async fn scripted_flow(
 
     let mut final_text = String::new();
     let mut tool_changes = Vec::new();
+    let mut summary = None;
     let mut next_id = 100u64;
     while let Some(line) = lines.next_line().await.unwrap() {
         if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
@@ -436,6 +447,7 @@ async fn scripted_flow(
                     write_half.write_all(b"\n").await.unwrap();
                 }
                 Event::RunToolChanges { changes, .. } => tool_changes = changes,
+                Event::ApprovalSummary { summary: s, .. } => summary = Some(s),
                 Event::RunFinished { status, .. } => {
                     assert_eq!(status, "completed");
                     break;
@@ -445,15 +457,33 @@ async fn scripted_flow(
             }
         }
     }
+    // The summary is written in the background: allow it a moment.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while approve && summary.is_none() {
+        let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, lines.next_line()).await else {
+            break;
+        };
+        if let Ok(ServerMessage::Event(Event::ApprovalSummary { summary: s, .. })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            summary = Some(s);
+        }
+    }
     server.abort();
-    (final_text, paths, workdir, tool_changes)
+    (final_text, paths, workdir, tool_changes, summary)
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_builds_and_uses_tool_with_approval() {
-    let (final_text, paths, workdir, changes) =
+    let (final_text, paths, workdir, changes, summary) =
         scripted_flow("m2a", true, formless_protocol::ApprovalScope::Always).await;
+    // The approval came with a plain-language summary (SPEC §10.3), and it
+    // is kept for that Tool version.
+    assert_eq!(
+        summary.as_deref(),
+        Some("Writes the text you give it to a file in the work folder and reads it back.")
+    );
     // The Run reports the Tool it added (SPEC §10.6).
     assert_eq!(changes.len(), 1, "{changes:?}");
     assert_eq!(
@@ -478,13 +508,21 @@ async fn daemon_builds_and_uses_tool_with_approval() {
     // Reuse across Sessions: registry persists in the same data dir.
     let (info, ver) = store.get_tool_by_name("echo_write").unwrap().unwrap();
     assert_eq!(info.current_version, 1);
+    let cached = store
+        .kv_get("harness:approval_summaries", &format!("{}:v1", info.id))
+        .unwrap();
+    assert_eq!(
+        cached.as_ref().and_then(|v| v.as_str()),
+        summary.as_deref(),
+        "kept per version"
+    );
     assert!(ver.code.contains("fs.write"));
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_once_runs_the_tool_without_storing_a_grant() {
-    let (final_text, paths, workdir, _) =
+    let (final_text, paths, workdir, _, _) =
         scripted_flow("m2o", true, formless_protocol::ApprovalScope::Once).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert!(std::path::Path::new(&format!("{workdir}/out.txt")).exists());
@@ -499,7 +537,7 @@ async fn approve_once_runs_the_tool_without_storing_a_grant() {
 #[cfg(unix)]
 #[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
-    let (final_text, paths, workdir, _) =
+    let (final_text, paths, workdir, _, _) =
         scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;
     assert!(
         final_text.to_lowercase().contains("denied"),

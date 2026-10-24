@@ -314,6 +314,9 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .module-detail { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 6px; }
 .module-detail pre.code { padding: 8px 10px; white-space: pre; }
 .import-preview details { display: block; margin: 6px 0; }
+.ai-summary { border-left: 3px solid var(--accent); padding: 4px 10px; margin-bottom: 8px; background: var(--accent-soft); border-radius: 4px; }
+.ai-summary p { margin: 2px 0 0; }
+.ai-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .tool-pin { color: var(--accent); }
 .tool-tag { color: var(--accent); font-size: 12px; margin-left: 6px; }
 .tags-input { font: inherit; font-size: 13px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--text); width: min(100%, 260px); }

@@ -1491,6 +1491,14 @@ pub enum Event {
         #[serde(default)]
         tool_id: Option<String>,
     },
+    /// A plain-language, AI-written summary of what the Tool behind an
+    /// open approval does (SPEC §10.3), sent after `ApprovalRequested`.
+    ApprovalSummary {
+        approval_id: String,
+        tool_id: String,
+        version: i64,
+        summary: String,
+    },
     ToolUpdated {
         tool: ToolInfo,
     },
@@ -1632,6 +1640,7 @@ impl Event {
             | Event::ProposalUpdated { .. }
             | Event::ToolDeleted { .. }
             | Event::RegistryChanged { .. }
+            | Event::ApprovalSummary { .. }
             | Event::OptimiserActivity { .. }
             | Event::PromotionApprovalRequested { .. }
             | Event::ApprovalAnswered { .. } => None,

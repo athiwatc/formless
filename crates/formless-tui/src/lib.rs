@@ -959,6 +959,8 @@ struct App {
     module_detail: Option<ModuleDetail>,
     /// A module others load, waiting for a second delete.
     module_delete_arm: Option<String>,
+    /// AI-written summaries of what approvals' Tools do, by approval id.
+    approval_summaries: HashMap<String, String>,
     model_stats: Vec<ModelStatInfo>,
     /// Run outcomes for the Metrics title (SPEC §8.7).
     run_summary: Option<formless_protocol::RunSummary>,
@@ -1160,6 +1162,7 @@ impl App {
             modules: Vec::new(),
             module_detail: None,
             module_delete_arm: None,
+            approval_summaries: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
             builtin_stats: Vec::new(),
@@ -2632,6 +2635,13 @@ impl App {
                     self.modules.push(module);
                 }
                 self.request(Pending::ListModules, Request::ListModules);
+            }
+            Event::ApprovalSummary {
+                approval_id,
+                summary,
+                ..
+            } => {
+                self.approval_summaries.insert(approval_id, summary);
             }
             Event::RegistryChanged { change } => {
                 self.notes
@@ -6009,10 +6019,15 @@ fn draw(f: &mut Frame, app: &mut App) {
             .find(|t| req.tool_id.as_ref() == Some(&t.id) || t.name == req.tool_name)
             .map(|t| t.title.as_str())
             .unwrap_or_default();
+        let summary = app
+            .approval_summaries
+            .get(&req.approval_id)
+            .map(String::as_str);
         draw_approval(
             f,
             req,
             title,
+            summary,
             promotion,
             more,
             app.color,
@@ -10587,6 +10602,7 @@ fn draw_approval(
     f: &mut Frame,
     req: &ApprovalReq,
     title: &str,
+    summary: Option<&str>,
     promotion: bool,
     more: usize,
     color: bool,
@@ -10635,6 +10651,20 @@ fn draw_approval(
             Line::raw(""),
         ],
     };
+    // What it does in plain words, AI-written and labelled so (SPEC §10.3).
+    if let Some(text) = summary.filter(|_| req.detail.is_none()) {
+        lines.insert(
+            0,
+            Line::from(vec![
+                Span::styled(
+                    "AI summary (may be wrong; the Capabilities below are what counts): ",
+                    ui::dim(color),
+                ),
+                Span::styled(text.to_string(), fg(color, Color::Cyan)),
+            ]),
+        );
+        lines.insert(1, Line::raw(""));
+    }
     if req.capabilities.is_empty() {
         lines.push(Line::styled("  • (no capabilities)", ui::dim(color)));
     }
@@ -11459,6 +11489,7 @@ mod tests {
             modules: Vec::new(),
             module_detail: None,
             module_delete_arm: None,
+            approval_summaries: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
             builtin_stats: Vec::new(),
@@ -12553,12 +12584,50 @@ mod tests {
     }
 
     #[test]
+    fn approvals_show_the_ai_summary_when_it_arrives() {
+        let mut app = test_app();
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "a1".into(),
+            session_id: "s".into(),
+            tool_name: "echo_write".into(),
+            version: 1,
+            capabilities: vec!["fs:write:/tmp".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: Some("t".into()),
+        });
+        assert!(!render(&mut app, 120, 30).contains("AI summary"));
+        app.on_event(Event::ApprovalSummary {
+            approval_id: "a1".into(),
+            tool_id: "t".into(),
+            version: 1,
+            summary: "Writes the text you give it to a file.".into(),
+        });
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("AI summary (may be wrong"), "{screen}");
+        assert!(
+            screen.contains("Writes the text you give it to a file."),
+            "{screen}"
+        );
+    }
+
+    #[test]
     fn dry_run_report_lists_effects_then_result() {
         let r = serde_json::json!({"ok": true, "result": {"n": 1}, "effects": ["write 3 bytes to /tmp/x", "run touch /tmp/y"]});
         let lines = dry_run_lines(&r);
-        assert_eq!(&lines[..3], ["It would have:", "  • write 3 bytes to /tmp/x", "  • run touch /tmp/y"]);
+        assert_eq!(
+            &lines[..3],
+            [
+                "It would have:",
+                "  • write 3 bytes to /tmp/x",
+                "  • run touch /tmp/y"
+            ]
+        );
         assert!(lines.contains(&"Result:".to_string()));
-        let failed = dry_run_lines(&serde_json::json!({"ok": false, "error": "boom", "effects": []}));
+        let failed =
+            dry_run_lines(&serde_json::json!({"ok": false, "error": "boom", "effects": []}));
         assert_eq!(failed[0], "It would have had no side effects.");
         assert_eq!(failed.last().unwrap(), "Error: boom");
     }
