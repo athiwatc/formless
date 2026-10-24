@@ -1164,11 +1164,18 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
             println!("daemon stopping");
             Ok(())
         }
-        DaemonAction::Restart { force } => daemon_restart(&paths, force),
+        DaemonAction::Restart { force } => {
+            formless_tui::client::restart_daemon(&paths, force, |line| println!("{line}"))
+        }
         DaemonAction::Status { json } => {
             if daemon_reachable(&paths) {
                 let v = formless_tui::client::request_once(&paths, Request::Status)?;
                 println!("{}", serde_json::to_string_pretty(&v)?);
+                let ours = env!("CARGO_PKG_VERSION");
+                if let Some(w) = formless_tui::client::version_warning(ours, v["version"].as_str())
+                {
+                    eprintln!("warning: {w}");
+                }
             } else if json {
                 println!("{}", serde_json::json!({ "running": false }));
             } else {
@@ -2007,6 +2014,11 @@ fn run_headless(
         return Ok(2);
     }
     formless_core::daemon::ensure_daemon(&paths)?;
+    if let Some(warning) = formless_tui::client::check_daemon_version(&paths)? {
+        if !quiet {
+            eprintln!("warning: {warning}");
+        }
+    }
     let (client, rx) = formless_tui::client::DaemonClient::connect(&paths)?;
     // Resolve/create session.
     let session_id = match session {
@@ -2329,60 +2341,6 @@ fn compact_count(n: i64) -> String {
         n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
         n => n.to_string(),
     }
-}
-
-/// `formless daemon restart`: wait for (or with `--force` interrupt) the
-/// running Runs, shut down, wait until the old daemon is gone, start anew.
-fn daemon_restart(paths: &Paths, force: bool) -> Result<()> {
-    use formless_tui::client::request_once;
-    if daemon_reachable(paths) {
-        let running = |paths: &Paths| -> Vec<String> {
-            request_once(paths, Request::Status)
-                .ok()
-                .and_then(|v| serde_json::from_value(v["running_sessions"].clone()).ok())
-                .unwrap_or_default()
-        };
-        let mut sessions = running(paths);
-        if !sessions.is_empty() {
-            if force {
-                eprintln!("interrupting {} running Run(s)…", sessions.len());
-                for id in &sessions {
-                    let _ = request_once(
-                        paths,
-                        Request::InterruptRun {
-                            session_id: id.clone(),
-                        },
-                    );
-                }
-            } else {
-                eprintln!(
-                    "waiting for {} running Run(s) to finish… (--force interrupts them)",
-                    sessions.len()
-                );
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-            while !sessions.is_empty() {
-                if force && std::time::Instant::now() > deadline {
-                    anyhow::bail!("Runs did not stop within 15s; the daemon was left running");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                sessions = running(paths);
-            }
-        }
-        let _ = request_once(paths, Request::Shutdown);
-        // Gone means not accepting and done flushing (it removes its lock last).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while daemon_reachable(paths) || paths.lock_file().exists() {
-            if std::time::Instant::now() > deadline {
-                anyhow::bail!("the old daemon did not exit within 30s; see `formless doctor`");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        println!("daemon stopped");
-    }
-    formless_core::daemon::ensure_daemon(paths)?;
-    println!("daemon running");
-    Ok(())
 }
 
 /// Count Ctrl+C presses on a background thread instead of dying on the

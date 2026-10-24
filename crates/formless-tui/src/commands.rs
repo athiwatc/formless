@@ -294,6 +294,12 @@ pub const COMMANDS: &[Command] = &[
         "all commands and keys (also ? on an empty input)",
         App,
     ),
+    cmd(
+        "restart-daemon",
+        "",
+        "restart the daemon (e.g. after an upgrade); waits for no Run to be going",
+        App,
+    ),
     cmd("quit", "", "quit the TUI (the daemon keeps running)", App),
 ];
 

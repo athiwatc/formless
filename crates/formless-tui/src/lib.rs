@@ -1160,11 +1160,43 @@ impl App {
 
     fn connect_daemon(&mut self) -> Result<()> {
         ensure_daemon(&self.paths)?;
+        // An incompatible daemon refuses here, with the fix; another
+        // version of a compatible one is a note (SPEC §9.1).
+        if let Some(warning) = client::check_daemon_version(&self.paths)? {
+            self.notes
+                .push(format!("Warning: {warning} Or type /restart-daemon."));
+        }
         let (client, inbox) = DaemonClient::connect(&self.paths)?;
         self.client = Some(client);
         self.inbox = Some(inbox);
         self.request(Pending::ListSessions, Request::ListSessions);
         Ok(())
+    }
+
+    /// `/restart-daemon`: replace the daemon and reconnect to the new one,
+    /// back on the Session on screen. Refuses while a Run is going.
+    fn restart_daemon(&mut self) {
+        if !self.running_sessions.is_empty() {
+            self.notes.push(
+                "A Run is going: wait for it, or run `formless daemon restart --force`.".into(),
+            );
+            return;
+        }
+        self.client = None;
+        self.inbox = None;
+        let result =
+            client::restart_daemon(&self.paths, false, |_| {}).and_then(|()| self.connect_daemon());
+        match result {
+            Ok(()) => {
+                self.notes.push("Daemon restarted.".into());
+                if let Some(id) = self.current.clone() {
+                    self.switch_session(id);
+                }
+            }
+            Err(e) => self
+                .notes
+                .push(format!("Could not restart the daemon: {e:#}")),
+        }
     }
 
     fn request(&mut self, kind: Pending, req: Request) {
@@ -3593,6 +3625,7 @@ impl App {
             "table" => self.open_table(""),
             cmd if cmd.starts_with("table ") => self.open_table(cmd["table ".len()..].trim()),
             "compact" => self.compact_now(None),
+            "restart-daemon" => self.restart_daemon(),
             cmd if cmd.starts_with("compact ") => {
                 let focus = cmd["compact ".len()..].trim().to_string();
                 self.compact_now(Some(focus));
