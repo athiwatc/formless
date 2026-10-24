@@ -1515,7 +1515,13 @@ such as `read_file`, `read_text_file` and `file_read`.
 - Single instance per data dir (lock file); starting a second daemon against
   the same dir is refused and points at the running one. `--profile <name>`
   gives an isolated daemon + data/config dirs (intended for testing
-  dangerous Tools).
+  dangerous Tools). Named profiles live in sub-directories of the default
+  profile's data and config dirs. `formless profiles list [--json]` shows
+  each profile (default first), whether its daemon runs, when it was last
+  used and its data dir, and marks the current one. `formless profiles rm
+  NAME [--yes]` asks for the name to be typed, stops that profile's daemon
+  and deletes its data, config, API key, OAuth tokens and relay secret. The
+  default profile cannot be removed this way (`formless reset`).
 - Data dir (OS-appropriate): `~/Library/Application Support/formless`
   (macOS), `$XDG_DATA_HOME/formless` (Linux), `%APPDATA%\formless`
   (Windows); config in the matching config dir (`config.toml` + keychain/

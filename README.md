@@ -398,6 +398,8 @@ Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed auto
 
 ```bash
 formless --profile sandbox
+formless profiles list           # every profile, whether its daemon runs, where its data is
+formless profiles rm sandbox     # stops its daemon, deletes its data, config and secrets
 ```
 
 | Variable | Effect |

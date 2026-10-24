@@ -43,6 +43,52 @@ impl Paths {
         })
     }
 
+    /// Every profile that exists: `default` first, then each named one
+    /// (a sub-directory with a database or config), sorted. Named
+    /// profiles live inside the default profile's directories.
+    pub fn list_profiles(&self) -> Vec<Paths> {
+        let base = self.base();
+        let mut names = std::collections::BTreeSet::new();
+        for dir in [&base.data_dir, &base.config_dir] {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let p = base.named(&name);
+                if entry.path().is_dir() && (p.db_file().exists() || p.config_file().exists()) {
+                    names.insert(name);
+                }
+            }
+        }
+        std::iter::once(base.clone())
+            .chain(names.into_iter().map(|n| base.named(&n)))
+            .collect()
+    }
+
+    /// The default profile's paths.
+    fn base(&self) -> Paths {
+        if self.profile == "default" {
+            return self.clone();
+        }
+        let up = |p: &PathBuf| p.parent().map(PathBuf::from).unwrap_or_else(|| p.clone());
+        Paths {
+            data_dir: up(&self.data_dir),
+            config_dir: up(&self.config_dir),
+            profile: "default".into(),
+        }
+    }
+
+    /// Another profile's paths, without creating anything.
+    pub fn named(&self, profile: &str) -> Paths {
+        let base = self.base();
+        if profile == "default" {
+            return base;
+        }
+        Paths {
+            data_dir: base.data_dir.join(profile),
+            config_dir: base.config_dir.join(profile),
+            profile: profile.to_string(),
+        }
+    }
+
     pub fn from_dirs(data_dir: PathBuf, config_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&config_dir)?;
