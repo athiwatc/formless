@@ -444,6 +444,7 @@ mod tests {
             already_allowed: vec![],
             code_preview: None,
             tool_id: None,
+            batch: None,
         };
         let text = format_event(&approval, &mut streaming).unwrap();
         assert!(

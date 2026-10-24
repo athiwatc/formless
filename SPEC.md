@@ -421,7 +421,13 @@ task, with quality as a gate**.
 - Multiple tool calls emitted in one model turn execute **in parallel**, each
   in its own isolated sandbox instance; results are returned together.
   Approval gates (§10.3) are evaluated per call before the batch starts:
-  approved calls run, held calls wait on one combined prompt.
+  approved calls run, held calls wait. When a batch holds more than one
+  call, each prompt carries `ApprovalRequested.batch {batch_id, index,
+  calls}`. Clients list every held call with its Tool and new
+  Capabilities (input-bound scopes resolved), and mark which is being
+  asked now and how each earlier one was answered. Each call is still
+  answered on its own, so some can be approved and others denied. A call
+  that an earlier "always" in the same batch already covers isn't asked.
 - **Building Tools instead of refusing** (`provider.tool_use_nudge`, on by
   default). The system prompt tells the agent that it has no abilities
   beyond its Tools and can always build one, and that it should never say
@@ -1913,8 +1919,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   as their resolved values, per call: approving a path/host adds it to the
   Tool's accumulated grant, and only an uncovered new path/host re-prompts, showing the capability diff (new items
   highlighted, broad unscoped grants flagged). Replay-limited promotions
-  (§8.4) use the same modal. In parallel batches, one combined modal covers
-  all held calls (§5.2). Modals are keyboard-driven, never lose scrollback.
+  (§8.4) use the same modal. In parallel batches, the modal lists all held
+  calls and asks for each in turn (§5.2). Modals are keyboard-driven,
+  never lose scrollback.
 - The answer has a scope (`ApprovalDecision.scope`): **always** (`y`, the
   default for clients that omit it) stores the grant as above; **once**
   (`o`) allows only the waiting call and stores nothing, so the next call

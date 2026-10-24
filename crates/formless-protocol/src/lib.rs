@@ -229,6 +229,24 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// One call of a parallel batch that waits for approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeldCall {
+    pub tool_name: String,
+    /// Its Capabilities, input-bound scopes resolved to this call's values.
+    pub capabilities: Vec<String>,
+    /// Those not already granted.
+    pub new_capabilities: Vec<String>,
+}
+
+/// A held call's place in its batch (SPEC §5.2): `index` is 1-based.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalBatch {
+    pub batch_id: String,
+    pub index: usize,
+    pub calls: Vec<HeldCall>,
+}
+
 /// The latest change to the Tool registry, the one `/undo tool` reverts
 /// (SPEC §7.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1496,6 +1514,10 @@ pub enum Event {
         /// The Tool's id, to fetch its full code (`GetTool`).
         #[serde(default)]
         tool_id: Option<String>,
+        /// When the model's parallel batch holds several calls: where this
+        /// one stands and all of them, so clients list each (SPEC §5.2).
+        #[serde(default)]
+        batch: Option<ApprovalBatch>,
     },
     /// A plain-language, AI-written summary of what the Tool behind an
     /// open approval does (SPEC §10.3), sent after `ApprovalRequested`.
