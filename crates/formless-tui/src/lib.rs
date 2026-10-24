@@ -125,6 +125,7 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    PreviewTool,
     UndoRegistry,
     GetModule,
     UpdateModule,
@@ -539,6 +540,13 @@ impl Wizard {
 struct Activity {
     label: String,
     since: Instant,
+}
+
+struct EditorReview {
+    diff: String,
+    /// "Passes the syntax and smoke checks", or what fails.
+    verdict: String,
+    ok: bool,
 }
 
 struct EditorState {
@@ -959,6 +967,9 @@ struct App {
     proposal_idx: usize,
     proposal_filter: lists::ListFilter,
     editor: Option<EditorState>,
+    /// Ctrl+D in the code editor: the diff and the save gate's verdict,
+    /// shown before saving (SPEC §10.4).
+    editor_review: Option<EditorReview>,
     search_hits: Vec<SearchHit>,
     search_idx: usize,
     search_mode: bool,
@@ -1155,6 +1166,7 @@ impl App {
             proposal_idx: 0,
             proposal_filter: lists::ListFilter::default(),
             editor: None,
+            editor_review: None,
             search_hits: Vec::new(),
             search_idx: 0,
             search_mode: false,
@@ -1402,6 +1414,30 @@ impl App {
                         Pending::ListModules => {
                             if let Ok(v) = serde_json::from_value::<Vec<ModuleInfo>>(result) {
                                 self.modules = v;
+                            }
+                        }
+                        Pending::PreviewTool => {
+                            let ok = result["ok"] == true;
+                            let verdict = if ok {
+                                match result["smoke_note"].as_str() {
+                                    Some(note) => {
+                                        format!("Passes the syntax check; smoke test {note}")
+                                    }
+                                    None => "Passes the syntax and smoke checks".into(),
+                                }
+                            } else {
+                                format!(
+                                    "Fails the {} check: {}",
+                                    result["stage"].as_str().unwrap_or("save"),
+                                    result["error"].as_str().unwrap_or_default()
+                                )
+                            };
+                            if self.editor.is_some() {
+                                self.editor_review = Some(EditorReview {
+                                    diff: result["diff"].as_str().unwrap_or_default().to_string(),
+                                    verdict,
+                                    ok,
+                                });
                             }
                         }
                         Pending::UndoRegistry => {
@@ -4273,7 +4309,27 @@ impl App {
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Reviewing: Ctrl+S saves, anything else goes back to editing.
+        if self.editor_review.is_some() && !(ctrl && key.code == KeyCode::Char('s')) {
+            self.editor_review = None;
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('d') {
+            if let Some(ed) = self.editor.as_ref().filter(|e| e.mode == EditMode::Code) {
+                self.request(
+                    Pending::PreviewTool,
+                    Request::PreviewToolCode {
+                        id: ed.tool_id.clone(),
+                        code: ed.text(),
+                    },
+                );
+                self.notes.push("checking the edit…".into());
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('s') && ctrl {
+            self.editor_review = None;
             let mode = self.editor.as_ref().map(|e| e.mode);
             if mode == Some(EditMode::Description) || mode == Some(EditMode::Schemas) {
                 self.save_tool_spec();
@@ -10636,6 +10692,10 @@ fn draw_approval(
 fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     let area = f.area();
     let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    if let Some(r) = &app.editor_review {
+        draw_editor_review(f, parts[0], parts[1], ed, r, app.color);
+        return;
+    }
     let title = match ed.mode {
         EditMode::Run => format!(" Run {} · input (JSON) ", ed.name),
         EditMode::Description => format!(" {} · description ", ed.name),
@@ -10688,12 +10748,69 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
             Span::styled(
                 match ed.mode {
                     EditMode::Run => " Ctrl+S run (asks for approval as usual) · Esc cancel",
+                    EditMode::Code => {
+                        " Ctrl+D review diff and checks · Ctrl+S save as new version (smoke-tested) · Esc cancel"
+                    }
                     _ => " Ctrl+S save as new version (smoke-tested) · Esc cancel",
                 },
                 ui::dim(app.color),
             ),
         ])),
         parts[1],
+    );
+}
+
+/// The editor's review: what the edit changes and the gate's verdict.
+fn draw_editor_review(
+    f: &mut Frame,
+    body: Rect,
+    footer: Rect,
+    ed: &EditorState,
+    r: &EditorReview,
+    color: bool,
+) {
+    let mut lines = vec![
+        Line::styled(
+            r.verdict.clone(),
+            if r.ok {
+                bold_fg(color, Color::Green)
+            } else {
+                bold_fg(color, Color::Red)
+            },
+        ),
+        Line::raw(""),
+    ];
+    if r.diff.trim().is_empty() {
+        lines.push(Line::styled("No changes.", ui::dim(color)));
+    }
+    for l in r.diff.lines() {
+        lines.push(match l.chars().next() {
+            Some('+') => Line::styled(l.to_string(), fg(color, Color::Green)),
+            Some('-') => Line::styled(l.to_string(), fg(color, Color::Red)),
+            Some('@') => Line::styled(l.to_string(), fg(color, Color::Cyan)),
+            _ => Line::raw(l.to_string()),
+        });
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(ui::panel(
+                format!(" Review {} ", ed.name),
+                color,
+                Color::Yellow,
+            ))
+            .wrap(Wrap { trim: false }),
+        body,
+    );
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            if r.ok {
+                " Ctrl+S save as a new version · any other key: back to editing"
+            } else {
+                " Saving would fail · any key: back to editing"
+            },
+            ui::dim(color),
+        )),
+        footer,
     );
 }
 
@@ -11275,6 +11392,7 @@ mod tests {
             proposal_idx: 0,
             proposal_filter: lists::ListFilter::default(),
             editor: None,
+            editor_review: None,
             search_hits: Vec::new(),
             search_idx: 0,
             search_mode: false,
@@ -12331,6 +12449,33 @@ mod tests {
         let ed = app.editor.as_ref().expect("module editor");
         assert_eq!(ed.mode, EditMode::Module);
         assert_eq!(ed.text(), "module.exports = 2;");
+    }
+
+    #[test]
+    fn the_code_editor_reviews_before_saving() {
+        let mut app = test_app();
+        app.editor = Some(EditorState {
+            tool_id: "t".into(),
+            name: "echo_text".into(),
+            chars: "function run(){}".chars().collect(),
+            cursor: 0,
+            mode: EditMode::Code,
+        });
+        app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.notes.last().unwrap(), "checking the edit…");
+        app.editor_review = Some(EditorReview {
+            diff: "@@ code (v1 → v2)\n-  return 1;\n+  return 2;".into(),
+            verdict: "Passes the syntax and smoke checks".into(),
+            ok: true,
+        });
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("Review echo_text"), "{screen}");
+        assert!(screen.contains("+  return 2;"), "{screen}");
+        assert!(screen.contains("Passes the syntax and smoke checks"));
+        // Any key but Ctrl+S goes back to editing, text untouched.
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.editor_review.is_none());
+        assert_eq!(app.editor.as_ref().unwrap().text(), "function run(){}");
     }
 
     #[test]

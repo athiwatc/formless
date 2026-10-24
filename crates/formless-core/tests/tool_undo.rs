@@ -77,3 +77,62 @@ async fn the_newest_registry_change_can_be_undone() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_is_reviewed_without_being_saved() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-prev-{short}"));
+    let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.provider.model = "m".into();
+    cfg.save(&paths).unwrap();
+    let id = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let caps = Capabilities::parse(&[]).unwrap();
+        store
+            .create_tool_version(
+                "echo_text",
+                "d",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(i){\n  return {a: 1};\n}",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+            .id
+    };
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let preview = |code: &str| {
+        let (d, id, code) = (daemon.clone(), id.clone(), code.to_string());
+        async move {
+            d.handle(Request::PreviewToolCode { id, code })
+                .await
+                .unwrap()
+        }
+    };
+    let good = preview("function run(i){\n  return {a: 2};\n}").await;
+    assert_eq!(good["ok"], true, "{good}");
+    let diff = good["diff"].as_str().unwrap();
+    assert!(
+        diff.contains("-   return {a: 1};") && diff.contains("+   return {a: 2};"),
+        "{diff}"
+    );
+
+    let broken = preview("function run(i){ return {a: ").await;
+    assert_eq!(
+        (broken["ok"].clone(), broken["stage"].clone()),
+        (serde_json::json!(false), serde_json::json!("syntax"))
+    );
+    let throws = preview("function run(i){ throw new Error('nope'); }").await;
+    assert_eq!(throws["stage"], "smoke", "{throws}");
+    assert!(throws["error"].as_str().unwrap().contains("nope"));
+
+    let store = Store::open(&paths.db_file()).unwrap();
+    let (info, _) = store.get_tool_current(&id).unwrap().unwrap();
+    assert_eq!(info.current_version, 1, "a preview saves nothing");
+    let _ = std::fs::remove_dir_all(dir);
+}

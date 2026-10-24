@@ -2063,6 +2063,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   current version's code; Ctrl+S saves it as a new immutable version
   (author `user`, same schemas/Capabilities) through the usual syntax +
   smoke gate.
+  Ctrl+D reviews the edit first: the diff against the current version and
+  the gate's verdict ("passes the syntax and smoke checks", or which check
+  fails and why, with an inconclusive smoke result noted). It comes from
+  `PreviewToolCode {id, code}`, which runs the same gate and saves nothing.
+  From the review, Ctrl+S saves, and any other key returns to editing.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
   invocations and success rate, with the selected Tool's detail.
 - **Bulk actions.** In the TUI Sessions view, Space marks rows (✓, with
