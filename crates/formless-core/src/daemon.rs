@@ -135,6 +135,9 @@ type ModuleCode = Arc<Vec<(String, String)>>;
 
 /// Read-only database connections for client queries (see `with_reader`).
 const READER_CONNECTIONS: usize = 4;
+/// Where the newest registry change is kept for `UndoRegistryChange`.
+const REGISTRY_NS: &str = "harness:registry";
+const LAST_CHANGE: &str = "last_change";
 
 /// What identifies a version of config.toml on disk: (mtime, length).
 type ConfigStamp = Option<(std::time::SystemTime, u64)>;
@@ -1798,6 +1801,7 @@ impl Daemon {
                     .with_store(|st| st.set_tool_retired(&id, true))?
                     .context("tool not found")?;
                 let _ = self.with_store(|st| st.audit("user", "tool.retire", &t.name));
+                self.note_registry_change(&t, "retired", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -1843,6 +1847,7 @@ impl Daemon {
                     .with_store(|st| st.set_tool_retired(&id, false))?
                     .context("tool not found")?;
                 let _ = self.with_store(|st| st.audit("user", "tool.restore", &t.name));
+                self.note_registry_change(&t, "restored", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -1853,13 +1858,38 @@ impl Daemon {
                 }
                 Ok(json!({"purged": existed}))
             }
+            Request::UndoRegistryChange => {
+                let change: RegistryChange = self
+                    .with_reader(|st| st.kv_get(REGISTRY_NS, LAST_CHANGE))?
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .context("nothing to undo in the Tool registry")?;
+                let id = change.tool_id.as_str();
+                let t = match change.action.as_str() {
+                    // A new Tool is retired, not purged: restorable.
+                    "created" | "restored" => {
+                        self.with_store(|st| st.set_tool_retired(id, true))?
+                    }
+                    "retired" => self.with_store(|st| st.set_tool_retired(id, false))?,
+                    _ => self.with_store(|st| st.rollback_tool(id, change.from_version))?,
+                }
+                .context("that Tool no longer exists")?;
+                self.with_store(|st| st.kv_set(REGISTRY_NS, LAST_CHANGE, &Value::Null))?;
+                let undone = change.summary();
+                let _ = self.with_store(|st| st.audit("user", "tool.undo", &undone));
+                self.broadcast(Event::ToolUpdated { tool: t.clone() });
+                Ok(json!({"undone": undone, "tool": t}))
+            }
             Request::RollbackTool { id, version } => {
+                let before = self
+                    .with_reader(|st| st.get_tool_current(&id))?
+                    .map_or(0, |(i, _)| i.current_version);
                 let t = self
                     .with_store(|st| st.rollback_tool(&id, version))?
                     .context("tool/version not found")?;
                 let _ = self.with_store(|st| {
                     st.audit("user", "tool.rollback", &format!("{} v{version}", t.name))
                 });
+                self.note_registry_change(&t, "rolled_back", before, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -2130,6 +2160,24 @@ impl Daemon {
                 Ok(json!({"resolved": resolved}))
             }
         }
+    }
+
+    /// Remember the newest registry change, the one `UndoRegistryChange`
+    /// reverts, and tell clients (they offer Undo).
+    fn note_registry_change(&self, t: &ToolInfo, action: &str, from_version: i64, author: &str) {
+        let change = RegistryChange {
+            tool_id: t.id.clone(),
+            name: t.name.clone(),
+            action: action.into(),
+            from_version,
+            to_version: t.current_version,
+            author: author.into(),
+            at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Ok(v) = serde_json::to_value(&change) {
+            let _ = self.with_store(|st| st.kv_set(REGISTRY_NS, LAST_CHANGE, &v));
+        }
+        self.broadcast(Event::RegistryChanged { change });
     }
 
     /// Remember that this Run changed a Tool, for its `RunToolChanges`.
@@ -3252,7 +3300,11 @@ impl Daemon {
                 let reason = args["reason"].as_str().unwrap_or_default();
                 match self.with_store(|st| st.get_tool_by_name(name)) {
                     Ok(Some((info, _))) => {
-                        let _ = self.with_store(|st| st.set_tool_retired(&info.id, true));
+                        if let Ok(Some(t)) =
+                            self.with_store(|st| st.set_tool_retired(&info.id, true))
+                        {
+                            self.note_registry_change(&t, "retired", t.current_version, "agent");
+                        }
                         self.note_tool_change(run_id, &info.id, Some("retired"));
                         let _ = self.with_store(|st| {
                             st.audit("agent", "tool.retire", &format!("{name}: {reason}"))
@@ -4356,6 +4408,9 @@ impl Daemon {
             Bounded::Cancelled => return Err(anyhow!("interrupted")),
             Bounded::Panicked(e) => return Err(anyhow!("smoke test panicked: {e}")),
         };
+        let before = self
+            .with_reader(|st| st.get_tool_by_name(&d.name))?
+            .map_or(0, |(i, _)| i.current_version);
         let (info, version) = self.with_store(|st| {
             st.create_tool_version(
                 &d.name,
@@ -4385,6 +4440,8 @@ impl Daemon {
         };
         let _ = self
             .with_store(|st| st.audit(author, "tool.create", &format!("{} v{version}", d.name)));
+        let action = if before == 0 { "created" } else { "updated" };
+        self.note_registry_change(&info, action, before, author);
         self.broadcast(Event::ToolUpdated { tool: info.clone() });
         Ok((info, version, smoke_note))
     }
