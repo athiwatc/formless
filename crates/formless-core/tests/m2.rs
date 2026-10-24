@@ -311,6 +311,8 @@ async fn mock_m2_server(workdir: String) -> String {
                         }))
                     }
                     1 => sse_tool_call("c2", "echo_write", json!({"text": "hello-m2"})),
+                    // A second call of the same Tool in the same Session.
+                    2 => sse_tool_call("c3", "echo_write", json!({"text": "hello-m2"})),
                     _ => {
                         let last = tool_msgs.last().map(|m| m["content"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
                         sse_text(&format!("done: {last}"))
@@ -344,6 +346,7 @@ async fn scripted_flow(
     String,
     Vec<formless_protocol::ToolChange>,
     Option<String>,
+    usize,
 ) {
     use formless_core::daemon::Daemon;
     use formless_core::Config;
@@ -424,12 +427,14 @@ async fn scripted_flow(
     let mut final_text = String::new();
     let mut tool_changes = Vec::new();
     let mut summary = None;
+    let mut prompts = 0;
     let mut next_id = 100u64;
     while let Some(line) = lines.next_line().await.unwrap() {
         if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
             match ev {
                 Event::MessageDelta { delta, .. } => final_text.push_str(&delta),
                 Event::ApprovalRequested { approval_id, .. } => {
+                    prompts += 1;
                     next_id += 1;
                     let env = RequestEnvelope {
                         id: next_id,
@@ -470,14 +475,15 @@ async fn scripted_flow(
         }
     }
     server.abort();
-    (final_text, paths, workdir, tool_changes, summary)
+    (final_text, paths, workdir, tool_changes, summary, prompts)
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_builds_and_uses_tool_with_approval() {
-    let (final_text, paths, workdir, changes, summary) =
+    let (final_text, paths, workdir, changes, summary, prompts) =
         scripted_flow("m2a", true, formless_protocol::ApprovalScope::Always).await;
+    assert_eq!(prompts, 1, "a stored approval covers the second call");
     // The approval came with a plain-language summary (SPEC §10.3), and it
     // is kept for that Tool version.
     assert_eq!(
@@ -503,7 +509,7 @@ async fn daemon_builds_and_uses_tool_with_approval() {
     let tools = store.list_tools(true).unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "echo_write");
-    assert_eq!(tools[0].invocations, 1);
+    assert_eq!(tools[0].invocations, 2, "called twice");
     assert_eq!(tools[0].success_rate, Some(1.0));
     // Reuse across Sessions: registry persists in the same data dir.
     let (info, ver) = store.get_tool_by_name("echo_write").unwrap().unwrap();
@@ -522,8 +528,9 @@ async fn daemon_builds_and_uses_tool_with_approval() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_once_runs_the_tool_without_storing_a_grant() {
-    let (final_text, paths, workdir, _, _) =
+    let (final_text, paths, workdir, _, _, prompts) =
         scripted_flow("m2o", true, formless_protocol::ApprovalScope::Once).await;
+    assert_eq!(prompts, 2, "once means asking again on the next call");
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert!(std::path::Path::new(&format!("{workdir}/out.txt")).exists());
     let store = Store::open(&paths.db_file()).unwrap();
@@ -536,8 +543,26 @@ async fn approve_once_runs_the_tool_without_storing_a_grant() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant() {
+    let (final_text, paths, _, _, _, prompts) =
+        scripted_flow("m2s", true, formless_protocol::ApprovalScope::Session).await;
+    assert!(final_text.contains("hello-m2"), "final text: {final_text}");
+    assert_eq!(
+        prompts, 1,
+        "the second call in the Session is covered (SPEC §10.3)"
+    );
+    let store = Store::open(&paths.db_file()).unwrap();
+    let (info, _) = store.get_tool_by_name("echo_write").unwrap().unwrap();
+    assert!(
+        store.get_approval(&info.id).unwrap().is_none(),
+        "not stored globally"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
-    let (final_text, paths, workdir, _, _) =
+    let (final_text, paths, workdir, _, _, _) =
         scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;
     assert!(
         final_text.to_lowercase().contains("denied"),
@@ -550,5 +575,9 @@ async fn denied_approval_blocks_execution_and_counts_denied() {
     let store = Store::open(&paths.db_file()).unwrap();
     let tools = store.list_tools(true).unwrap();
     let m = store.tool_metrics(&tools[0].id, None).unwrap();
-    assert_eq!((m.denied, m.success), (1, 0));
+    assert_eq!(
+        (m.denied, m.success),
+        (2, 0),
+        "both calls asked, both denied"
+    );
 }
