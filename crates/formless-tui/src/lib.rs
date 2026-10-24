@@ -967,6 +967,9 @@ struct App {
     approval_summaries: HashMap<String, String>,
     /// Batch positions of held calls, by approval id (SPEC §5.2) …
     approval_batches: HashMap<String, ApprovalBatch>,
+    /// An approval with broad new Capabilities waiting for its second
+    /// press: (approval id, the key pressed first) (SPEC §10.3).
+    broad_arm: Option<(String, char)>,
     /// The family `/approvals` or `/revoke all` was given.
     grants_family: Option<String>,
     /// … and what was answered for each call, by batch id: (index, word).
@@ -1175,6 +1178,7 @@ impl App {
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
             grants_family: None,
+            broad_arm: None,
             batch_answers: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
@@ -4666,6 +4670,32 @@ impl App {
                 });
                 self.notes.push(format!("approved {} once", req.tool_name));
                 return;
+            }
+            // Granting broad access beyond this call takes a second press.
+            if matches!(c, 'y' | 's' | '1') {
+                if let Some(req) = self.approvals.front() {
+                    let broad: Vec<&str> = req
+                        .capabilities
+                        .iter()
+                        .filter(|cap| !req.already_allowed.contains(cap))
+                        .filter(|cap| broad_capability(cap).is_some())
+                        .map(String::as_str)
+                        .collect();
+                    let armed = self
+                        .broad_arm
+                        .as_ref()
+                        .is_some_and(|(id, k)| *id == req.approval_id && *k == c);
+                    if !broad.is_empty() && !armed {
+                        self.notes.push(format!(
+                            "{} asks for broad access ({}): press {c} again to grant it, o for this call only, n to deny",
+                            req.tool_name,
+                            broad.join(", ")
+                        ));
+                        self.broad_arm = Some((req.approval_id.clone(), c));
+                        return;
+                    }
+                }
+                self.broad_arm = None;
             }
             if c == '1' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
@@ -10912,11 +10942,11 @@ fn draw_approval(
             ));
             continue;
         }
-        // Bare `net` / `process` are unscoped and flagged broad (§7.2).
-        if cap == "net" || cap == "process" {
+        // Unusually broad grants stand out (§10.3).
+        if let Some(why) = broad_capability(cap) {
             lines.push(Line::from(vec![
                 Span::styled(format!("  • {cap}"), bold_fg(color, Color::Red)),
-                Span::styled("  unscoped — broad access", fg(color, Color::Red)),
+                Span::styled(format!("  broad access: {why}"), fg(color, Color::Red)),
             ]));
         } else {
             lines.push(Line::raw(format!("  • {cap}")));
@@ -11738,6 +11768,7 @@ mod tests {
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
             grants_family: None,
+            broad_arm: None,
             batch_answers: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
@@ -12352,7 +12383,7 @@ mod tests {
             screen.contains("always") && screen.contains("once") && screen.contains("deny"),
             "{screen}"
         );
-        assert!(screen.contains("unscoped"), "{screen}");
+        assert!(screen.contains("broad access"), "{screen}");
         assert!(screen.contains("1 awaiting approval"), "{screen}");
     }
 
@@ -12948,6 +12979,42 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(app.approvals.is_empty());
         assert_eq!(app.notes.last().unwrap(), "approved echo_write for an hour");
+    }
+
+    #[test]
+    fn broad_grants_take_a_second_press() {
+        let mut app = test_app();
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "a1".into(),
+            session_id: "s".into(),
+            tool_name: "sweeper".into(),
+            version: 1,
+            capabilities: vec!["fs:write:/Users/ada".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+            batch: None,
+        });
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("broad access: writing anywhere in your files"),
+            "{screen}"
+        );
+        app.input_focus = false;
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.approvals.len(), 1, "the first y only warns");
+        assert!(app.notes.last().unwrap().contains("press y again"));
+        // A different key resets it; the same key twice grants.
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.approvals.len(), 1);
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.approvals.is_empty());
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "approved sweeper for this Session"
+        );
     }
 
     #[test]

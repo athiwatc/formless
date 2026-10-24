@@ -1935,6 +1935,19 @@ run_tool = "network_policy"     # a registry Tool, or…
   ends, or the daemon restarts, the next call asks again. For MCP
   server approvals,
   both act as *once*. Headless `--yes` answers every prompt with *once*.
+- **Broad grants stand out.** A new Capability is shown in red, with
+  what it reaches, when it is bare `net` ("any host on the internet") or
+  bare `process` ("any program on this computer"). The same goes for
+  `fs:write` on `/`, a home folder or `/Users`/`/home` ("writing anywhere
+  in your files"), and for `env` with a secret-looking key such as
+  `*TOKEN*`, `*SECRET*`, `*PASSWORD*` or `*KEY` ("a secret from your
+  environment").
+  - **The rule:** one rule (`formless_protocol::broad_capability`) that
+    the web mirrors.
+  - **Second press:** granting such a Capability beyond the one call
+    (always, this Session or for an hour) takes a second press of the
+    same key or button; the first only warns. Allowing it once and
+    denying take one press.
 - **One list of every grant.** `ListApprovals` returns `GrantInfo` rows,
   one per Capability, covering stored, Session and timed (`hour`) grants.
   - **Each row has:** Tool, Capability, scope, when the grant was last
