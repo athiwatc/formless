@@ -196,6 +196,8 @@ pub struct Daemon {
     /// from a budget pause).
     budget_warned: StdMutex<std::collections::HashSet<String>>,
     budget_waived: StdMutex<std::collections::HashSet<String>>,
+    /// Registry changes made by each running Run, by run id.
+    run_tool_changes: StdMutex<HashMap<String, Vec<ToolChange>>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -280,6 +282,7 @@ impl Daemon {
             relay_kick: StdMutex::new(None),
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: StdMutex::new(Default::default()),
+            run_tool_changes: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
@@ -2007,6 +2010,36 @@ impl Daemon {
         }
     }
 
+    /// Remember that this Run changed a Tool, for its `RunToolChanges`.
+    /// `change` defaults to created (version 1) or updated; one entry per
+    /// Tool, keeping what the Run first did and the version it ended on.
+    fn note_tool_change(&self, run_id: &str, tool_id: &str, change: Option<&str>) {
+        let Ok(Some((info, _))) = self.with_reader(|st| st.get_tool_current(tool_id)) else {
+            return;
+        };
+        let change = change.unwrap_or(if info.current_version == 1 {
+            "created"
+        } else {
+            "updated"
+        });
+        let mut all = self.run_tool_changes.lock().unwrap();
+        let list = all.entry(run_id.to_string()).or_default();
+        match list.iter_mut().find(|c| c.tool_id == tool_id) {
+            Some(c) => {
+                c.version = info.current_version;
+                if change == "retired" {
+                    c.change = change.into();
+                }
+            }
+            None => list.push(ToolChange {
+                tool_id: tool_id.to_string(),
+                name: info.name,
+                version: info.current_version,
+                change: change.into(),
+            }),
+        }
+    }
+
     /// Stop everything still working on a Session before it is deleted:
     /// drop its queued messages, interrupt its Run (and wait for it to
     /// finish writing), and abandon its background invocations.
@@ -2180,6 +2213,14 @@ impl Daemon {
         }
         self.runs.lock().unwrap().remove(&session_id);
         self.budget_waived.lock().unwrap().remove(&session_id);
+        let changes = self.run_tool_changes.lock().unwrap().remove(&run_id);
+        if let Some(changes) = changes.filter(|c| !c.is_empty()) {
+            self.broadcast(Event::RunToolChanges {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                changes,
+            });
+        }
         self.broadcast(Event::RunFinished {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
@@ -2943,6 +2984,7 @@ impl Daemon {
                     let _ = self.with_store(|st| {
                         st.load_session_tools(session_id, std::slice::from_ref(&tool_id), "created")
                     });
+                    self.note_tool_change(run_id, &tool_id, None);
                     // The search missed a Tool this one duplicates (§8.8).
                     if self.near_duplicate_after_empty_find(run_id, &tool_id, &args) {
                         created_kind = "near-duplicate";
@@ -3086,6 +3128,7 @@ impl Daemon {
                 match self.with_store(|st| st.get_tool_by_name(name)) {
                     Ok(Some((info, _))) => {
                         let _ = self.with_store(|st| st.set_tool_retired(&info.id, true));
+                        self.note_tool_change(run_id, &info.id, Some("retired"));
                         let _ = self.with_store(|st| {
                             st.audit("agent", "tool.retire", &format!("{name}: {reason}"))
                         });
@@ -5752,6 +5795,7 @@ impl Daemon {
                     let _ = self.with_store(|st| {
                         st.load_session_tools(session_id, std::slice::from_ref(&tool_id), "created")
                     });
+                    self.note_tool_change(run_id, &tool_id, None);
                     saved = save["name"].as_str().unwrap_or_default().to_string();
                     res["saved"] = serde_json::from_str(&text).unwrap_or(json!(text));
                 }

@@ -227,6 +227,12 @@ pub const COMMANDS: &[Command] = &[
         Settings,
     ),
     cmd("tools", "", "open the Tools view", Tools),
+    cmd(
+        "tool",
+        "NAME",
+        "open a Tool's detail in the Tools view",
+        Tools,
+    ),
     cmd("metrics", "", "open the Metrics view", Tools),
     cmd("proposals", "", "open the prompt Proposals view", Tools),
     cmd("propose", "", "generate a measured prompt proposal", Tools),
