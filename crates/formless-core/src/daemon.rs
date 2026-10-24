@@ -1726,6 +1726,19 @@ impl Daemon {
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
+            Request::SetToolDisabled { id, disabled } => {
+                let t = self
+                    .with_store(|st| st.set_tool_disabled(&id, disabled))?
+                    .context("tool not found")?;
+                let action = if disabled {
+                    "tool.disable"
+                } else {
+                    "tool.enable"
+                };
+                let _ = self.with_store(|st| st.audit("user", action, &t.name));
+                self.broadcast(Event::ToolUpdated { tool: t.clone() });
+                Ok(serde_json::to_value(t)?)
+            }
             Request::SetToolPinned { id, pinned } => {
                 let t = self
                     .with_store(|st| st.set_tool_pinned(&id, pinned))?
@@ -5735,6 +5748,9 @@ impl Daemon {
             if info.retired {
                 bail!("tool '{name}' is retired");
             }
+            if info.disabled {
+                bail!("tool '{name}' is switched off by the user");
+            }
             let caps = Capabilities::parse(&ver.capabilities).map_err(|e| anyhow!(e))?;
             if !self
                 .ensure_approval(cfg, session_id, &info, &ver, &caps.unbound(), None, cancel)
@@ -5929,6 +5945,7 @@ impl Daemon {
             title: String::new(),
             tags: Vec::new(),
             pinned: false,
+            disabled: false,
             description: d.description.clone(),
             retired: false,
             current_version: 0,
@@ -6272,6 +6289,11 @@ impl Daemon {
             };
             if info.retired {
                 return Err(format!("tool '{name}' is retired"));
+            }
+            if info.disabled {
+                return Err(format!(
+                    "tool '{name}' is switched off by the user; do this another way or ask them to switch it on"
+                ));
             }
             let mut input = input;
             self.localize_input(&session_id, &ver, &mut input);

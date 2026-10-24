@@ -281,6 +281,7 @@ mod tests {
             title: String::new(),
             tags: Vec::new(),
             pinned: false,
+            disabled: false,
             description: format!("{name} things"),
             retired,
             current_version: 1,

@@ -3389,6 +3389,23 @@ impl App {
             "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             cmd if cmd.starts_with("tool ") => self.open_tool(cmd["tool ".len()..].trim()),
+            cmd if cmd.starts_with("tooloff ") => {
+                let name = cmd["tooloff ".len()..].trim();
+                match self.tools.iter().find(|t| t.name == name) {
+                    Some(t) => {
+                        let (id, disabled) = (t.id.clone(), !t.disabled);
+                        self.notes.push(if disabled {
+                            format!("Switched off {name}: the agent can't find or call it (/tooloff {name} again switches it on).")
+                        } else {
+                            format!("Switched on {name}.")
+                        });
+                        self.fire(Request::SetToolDisabled { id, disabled });
+                    }
+                    None => self
+                        .notes
+                        .push(format!("No Tool named {name}; /tools lists them.")),
+                }
+            }
             cmd if cmd.starts_with("toolpin ") => {
                 let name = cmd["toolpin ".len()..].trim();
                 match self.tools.iter().find(|t| t.name == name) {
@@ -9307,6 +9324,8 @@ fn metrics_summary(tools: &[ToolInfo]) -> String {
 fn tool_glyph(t: &ToolInfo, color: bool) -> Span<'static> {
     if t.retired {
         Span::styled("○ ", ui::dim(color))
+    } else if t.disabled {
+        Span::styled("◌ ", fg(color, Color::Yellow))
     } else if t.needs_attention {
         Span::styled("! ", bold_fg(color, Color::Red))
     } else {
@@ -9318,6 +9337,8 @@ fn tool_glyph(t: &ToolInfo, color: bool) -> Span<'static> {
 fn tool_status(t: &ToolInfo, color: bool) -> Span<'static> {
     if t.retired {
         Span::styled("retired", bold_fg(color, Color::DarkGray))
+    } else if t.disabled {
+        Span::styled("off", bold_fg(color, Color::Yellow))
     } else if t.needs_attention {
         Span::styled("attention", bold_fg(color, Color::Red))
     } else {
@@ -11285,6 +11306,7 @@ mod tests {
                 title: String::new(),
                 tags: Vec::new(),
                 pinned: false,
+                disabled: false,
                 description: String::new(),
                 retired: false,
                 current_version: 2,
@@ -11304,6 +11326,7 @@ mod tests {
                 title: String::new(),
                 tags: Vec::new(),
                 pinned: false,
+                disabled: false,
                 description: String::new(),
                 retired: true,
                 current_version: 1,
@@ -11915,6 +11938,7 @@ mod tests {
                 title: String::new(),
                 tags: Vec::new(),
                 pinned: false,
+                disabled: false,
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -11988,6 +12012,7 @@ mod tests {
             title: String::new(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
             pinned: false,
+            disabled: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -12751,6 +12776,7 @@ mod tests {
                 title: String::new(),
                 tags: Vec::new(),
                 pinned: false,
+                disabled: false,
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -12928,6 +12954,7 @@ mod tests {
                 title: String::new(),
                 tags: Vec::new(),
                 pinned: false,
+                disabled: false,
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -13450,6 +13477,7 @@ mod tests {
             title: String::new(),
             tags: Vec::new(),
             pinned: false,
+            disabled: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13479,6 +13507,7 @@ mod tests {
             title: String::new(),
             tags: Vec::new(),
             pinned: false,
+            disabled: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13653,6 +13682,7 @@ mod tests {
             title: String::new(),
             tags: Vec::new(),
             pinned: false,
+            disabled: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13714,6 +13744,7 @@ mod tests {
             title: String::new(),
             tags: Vec::new(),
             pinned: false,
+            disabled: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13760,6 +13791,7 @@ mod tests {
             title: String::new(),
             tags: Vec::new(),
             pinned: false,
+            disabled: false,
             description: String::new(),
             retired: false,
             current_version: 1,

@@ -645,6 +645,13 @@ pub fn normalize_tags<'a>(raw: impl IntoIterator<Item = &'a str>) -> Vec<String>
     out
 }
 
+/// The Tools the agent may see: neither retired nor switched off.
+fn agent_tools(store: &Store) -> Result<Vec<ToolInfo>> {
+    let mut tools = store.list_tools(false)?;
+    tools.retain(|t| !t.disabled);
+    Ok(tools)
+}
+
 /// Search active Tools with the configured ranking (`tools.search`).
 pub fn search_tools_with(
     store: &Store,
@@ -706,7 +713,7 @@ fn stems(s: &str) -> Vec<String> {
 /// matches and the [`SYNONYMS`] groups at reduced weight. Ties go to the
 /// more used, more reliable Tool.
 pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
-    let tools = store.list_tools(false)?;
+    let tools = agent_tools(store)?;
     let docs: Vec<Vec<String>> = tools
         .iter()
         .map(|t| {
@@ -795,8 +802,7 @@ pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec
 /// description hits; ties go to the more used, more reliable Tool.
 pub fn search_tools(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
     let q = tokens(query);
-    let mut scored: Vec<(f64, ToolInfo)> = store
-        .list_tools(false)?
+    let mut scored: Vec<(f64, ToolInfo)> = agent_tools(store)?
         .into_iter()
         .filter_map(|t| {
             let name = tokens(&t.name);
@@ -843,7 +849,7 @@ pub fn tool_definitions(
     session_id: Option<&str>,
     inline_limit: usize,
 ) -> Result<Vec<Value>> {
-    let tools = store.list_tools(false)?;
+    let tools = agent_tools(store)?;
     // Every Session's listing is frozen at its first step (in small and
     // large registries alike): Tool definitions are part of the cached
     // prompt prefix, so a Tool created or used in another Session must not

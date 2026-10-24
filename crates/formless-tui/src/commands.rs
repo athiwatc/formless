@@ -234,6 +234,12 @@ pub const COMMANDS: &[Command] = &[
         Tools,
     ),
     cmd(
+        "tooloff",
+        "NAME",
+        "switch a Tool off for the agent, or back on (not a retirement)",
+        Tools,
+    ),
+    cmd(
         "toolpin",
         "NAME",
         "pin or unpin a Tool: pinned Tools are always listed to the agent",

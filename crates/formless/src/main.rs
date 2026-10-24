@@ -343,6 +343,14 @@ enum ToolsAction {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Switch a Tool off: hidden from the agent and uncallable, nothing else changes
+    Disable {
+        name: String,
+    },
+    /// Switch a Tool back on
+    Enable {
+        name: String,
+    },
     /// Always list a Tool to the agent (from each Session's next listing)
     Pin {
         name: String,
@@ -3593,6 +3601,28 @@ fn naming_model_status(paths: &Paths, cfg: &Config) -> String {
     }
 }
 
+/// `tools disable|enable`.
+fn set_tool_disabled(paths: &Paths, name: &str, disabled: bool) -> Result<()> {
+    use formless_tui::client::request_once;
+    let tool = find_tool(paths, name)?;
+    request_once(
+        paths,
+        Request::SetToolDisabled {
+            id: tool.id,
+            disabled,
+        },
+    )?;
+    if disabled {
+        println!(
+            "switched off {}: the agent can't find or call it until `formless tools enable {}`",
+            tool.name, tool.name
+        );
+    } else {
+        println!("switched on {}", tool.name);
+    }
+    Ok(())
+}
+
 /// `tools pin|unpin`: pinning says what it costs per request.
 fn set_tool_pinned(paths: &Paths, name: &str, pinned: bool) -> Result<()> {
     use formless_tui::client::request_once;
@@ -3652,6 +3682,8 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             for tool in tools {
                 let status = if tool.retired {
                     t("retired", Tone::Dim)
+                } else if tool.disabled {
+                    t("off", Tone::Warn)
                 } else if tool.needs_attention {
                     t("needs attention", Tone::Bad)
                 } else {
@@ -3739,6 +3771,8 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             let code = tool_run(&paths, tool, input, yes, session)?;
             std::process::exit(code);
         }
+        ToolsAction::Disable { name } => set_tool_disabled(&paths, &name, true),
+        ToolsAction::Enable { name } => set_tool_disabled(&paths, &name, false),
         ToolsAction::Pin { name } => set_tool_pinned(&paths, &name, true),
         ToolsAction::Unpin { name } => set_tool_pinned(&paths, &name, false),
         ToolsAction::Tag { name, tags } => {
@@ -3980,6 +4014,8 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     let t = &d.tool;
     let status = if t.retired {
         "retired"
+    } else if t.disabled {
+        "switched off"
     } else if t.needs_attention {
         "needs attention"
     } else {

@@ -296,6 +296,7 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; background: var(--accent); }
 .dot.attention { background: var(--err); }
 .dot.retired { background: var(--muted); }
+.dot.off { background: var(--warn); }
 .rate-good { color: var(--accent); } .rate-mid { color: var(--warn); } .rate-bad { color: var(--err); font-weight: 650; }
 .bar { display: inline-block; width: 120px; height: 7px; border-radius: 4px; background: var(--panel-2); overflow: hidden; vertical-align: middle; }
 .bar i { display: block; height: 100%; background: currentColor; border-radius: 4px; }
