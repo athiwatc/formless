@@ -1797,6 +1797,7 @@
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
     $("modal-once").classList.toggle("hidden", promo);
     $("modal-session").classList.toggle("hidden", promo);
+    $("modal-hour").classList.toggle("hidden", promo);
     $("modal-approve").replaceChildren(h("kbd", { "aria-hidden": "true" }, "y"), promo ? " Approve" : " Always");
     rememberFocus("modal-backdrop");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
@@ -1862,7 +1863,7 @@
     if (!req) return;
     if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
     else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always" });
-    note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : ""));
+    note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
     renderApproval();
     renderStatus();
@@ -1876,6 +1877,7 @@
   $("modal-approve").onclick = () => decide(true);
   $("modal-once").onclick = () => decide(true, "once");
   $("modal-session").onclick = () => decide(true, "session");
+  $("modal-hour").onclick = () => decide(true, "hour");
   $("modal-deny").onclick = () => decide(false);
 
   // ------------------------------------------------------------- tools
@@ -4167,6 +4169,7 @@
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
       if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
       if (e.key === "s" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "session"); return; }
+      if (e.key === "1" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "hour"); return; }
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
     }
     const dialogOpen = modalOpen || !$("ask-backdrop").classList.contains("hidden");
