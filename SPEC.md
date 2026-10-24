@@ -1492,7 +1492,15 @@ such as `read_file`, `read_text_file` and `file_read`.
   list and Run start/end stay global. A new connection receives everything;
   the TUI, web and headless clients subscribe to the Session they show.
 - A client whose protocol version mismatches the daemon's **refuses to
-  attach** with a clear message (no silent incompatibility).
+  attach** with a clear message (no silent incompatibility) that points to
+  `formless daemon restart`. Restart stops a daemon on another protocol by
+  signalling the pid in its lock file, since that daemon cannot be asked.
+- On connect, the TUI and `formless run` compare their version with the
+  daemon's (`Status.version`; a daemon that predates it counts as older).
+  If they differ but the protocol matches, for example an old daemon left
+  running after an upgrade, they warn and suggest `formless daemon
+  restart`; in the TUI, `/restart-daemon` restarts it and reconnects.
+  `daemon status` warns too.
 - **Ordering and responsiveness:** on each connection, ordinary requests
   run one at a time and in order on a per-connection worker, so a
   client's fire-and-forget sequences keep their order. Control requests

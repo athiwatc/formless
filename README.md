@@ -418,6 +418,7 @@ formless --profile sandbox
 | `not configured; run formless for the wizard` | headless runs need a configured provider first — launch the TUI once |
 | "does not support tool-calling" during onboarding | pick another model or endpoint; tool calling is mandatory |
 | TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
+| "the daemon is vX but this formless is vY" | an old daemon is still running after an upgrade: `formless daemon restart` (or `/restart-daemon` in the TUI) |
 | Daemon will not start | read `<data dir>/daemon.log`, then `formless doctor` and `formless daemon status` |
 | Keychain prompt on every launch | the `0600` `api_key` file in the config dir exists exactly for this; check it is present |
 | macOS refuses to run the binary | `xattr -d com.apple.quarantine formless` (releases are unsigned) |
