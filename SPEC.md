@@ -1918,7 +1918,12 @@ run_tool = "network_policy"     # a registry Tool, or…
 - The answer has a scope (`ApprovalDecision.scope`): **always** (`y`, the
   default for clients that omit it) stores the grant as above; **once**
   (`o`) allows only the waiting call and stores nothing, so the next call
-  asks again. Headless `--yes` answers every prompt with *once*.
+  asks again. **This Session** (`s`, scope `session`) covers the Tool's
+  later calls in the same Session, accumulating like a stored grant. It
+  is kept only in the daemon's memory, keyed by Session and Tool, and ends
+  when the Session is deleted or the daemon restarts; other Sessions
+  still ask. For MCP server approvals it acts as *once*. Headless `--yes`
+  answers every prompt with *once*.
 - The prompt (`ApprovalRequested`) carries `already_allowed`, the Tool's
   current grant. Clients mark those Capabilities "already allowed" and the
   rest "new". It also carries `code_preview`, the first 15 lines of the

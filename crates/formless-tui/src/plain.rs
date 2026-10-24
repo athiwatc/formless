@@ -95,7 +95,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
                 ),
             };
             format!(
-                "{}Approval needed. {what}. Type y to always allow, o for this once, or n to deny.",
+                "{}Approval needed. {what}. Type y to always allow, o for this once, s for this Session, or n to deny.",
                 end_stream(streaming)
             )
         }
@@ -294,9 +294,10 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     let (approved, scope) = match choice.as_str() {
                         "y" | "yes" => (true, ApprovalScope::Always),
                         "o" | "once" if !*promotion => (true, ApprovalScope::Once),
+                        "s" | "session" if !*promotion => (true, ApprovalScope::Session),
                         "n" | "no" => (false, ApprovalScope::Always),
                         _ => {
-                            say("Please type y, o or n.");
+                            say("Please type y, o, s or n.");
                             continue;
                         }
                     };

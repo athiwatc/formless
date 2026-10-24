@@ -203,6 +203,9 @@ pub struct Daemon {
     budget_waived: StdMutex<std::collections::HashSet<String>>,
     /// Registry changes made by each running Run, by run id.
     run_tool_changes: StdMutex<HashMap<String, Vec<ToolChange>>>,
+    /// Approvals for one Session only, by (session id, tool id): the
+    /// Capabilities and memory granted. In memory, never stored.
+    session_grants: StdMutex<HashMap<(String, String), (Capabilities, u32)>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -288,6 +291,7 @@ impl Daemon {
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: StdMutex::new(Default::default()),
             run_tool_changes: StdMutex::new(Default::default()),
+            session_grants: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
@@ -2327,6 +2331,11 @@ impl Daemon {
     /// drop its queued messages, interrupt its Run (and wait for it to
     /// finish writing), and abandon its background invocations.
     async fn stop_session_work(&self, session_id: &str) {
+        // Session-only approvals end with the Session (SPEC §10.3).
+        self.session_grants
+            .lock()
+            .unwrap()
+            .retain(|(s, _), _| s != session_id);
         let _ = self.with_store(|st| st.clear_queued_messages(session_id));
         if let Some(ctl) = self.runs.lock().unwrap().get(session_id) {
             ctl.cancel_flag.store(true, Ordering::SeqCst);
@@ -6468,6 +6477,18 @@ impl Daemon {
                 return true;
             }
         }
+        let session_key = (session_id.to_string(), info.id.clone());
+        let session_grant = self
+            .session_grants
+            .lock()
+            .unwrap()
+            .get(&session_key)
+            .cloned();
+        if let Some((granted, mem)) = &session_grant {
+            if granted.covers(caps) && ver.memory_mb <= *mem {
+                return true;
+            }
+        }
         // Fail closed when nobody can answer (SPEC §12 headless rule).
         if self.subscriber_count() == 0 {
             return false;
@@ -6504,6 +6525,17 @@ impl Daemon {
         self.approvals.lock().unwrap().remove(&approval_id);
         if approved && scope == ApprovalScope::Once {
             let _ = self.with_store(|st| st.audit("user", "tool.approve_once", &info.name));
+        } else if approved && scope == ApprovalScope::Session {
+            // For this Session only; accumulates like a stored grant.
+            let grant = match &session_grant {
+                Some((g, m)) => (g.union(caps), ver.memory_mb.max(*m)),
+                None => (caps.clone(), ver.memory_mb),
+            };
+            self.session_grants
+                .lock()
+                .unwrap()
+                .insert(session_key, grant);
+            let _ = self.with_store(|st| st.audit("user", "tool.approve_session", &info.name));
         } else if approved {
             // Accumulate: approving a new bound path keeps earlier ones.
             let (grant, mem) = match &prior {

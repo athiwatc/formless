@@ -1319,6 +1319,9 @@ fn default_true() -> bool {
 pub enum ApprovalScope {
     /// This call only; nothing is stored.
     Once,
+    /// Every call of the Tool in this Session, until the Session is
+    /// deleted (or the daemon restarts); never stored globally.
+    Session,
     /// Stored for the Tool until its Capabilities widen.
     #[default]
     Always,

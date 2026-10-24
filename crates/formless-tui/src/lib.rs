@@ -3598,7 +3598,7 @@ impl App {
                     .collect();
                 for w in waiting {
                     self.notes.push(format!(
-                        "{w} · answer in the dialog: y always, o once, n deny"
+                        "{w} · answer in the dialog: y always, o once, s this Session, n deny"
                     ));
                 }
             }
@@ -4544,7 +4544,7 @@ impl App {
             // Typing anything else while the approval has focus moves
             // focus to the input (and types it).
             if modal_keys
-                && !matches!(c, 'y' | 'n' | 'o' | 'v' | '?')
+                && !matches!(c, 'y' | 'n' | 'o' | 's' | 'v' | '?')
                 && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             {
                 self.input_focus = true;
@@ -4575,6 +4575,17 @@ impl App {
                     scope: ApprovalScope::Once,
                 });
                 self.notes.push(format!("approved {} once", req.tool_name));
+                return;
+            }
+            if c == 's' && !self.approvals.is_empty() {
+                let req = self.approvals.pop_front().unwrap();
+                self.fire(Request::ApprovalDecision {
+                    approval_id: req.approval_id,
+                    approved: true,
+                    scope: ApprovalScope::Session,
+                });
+                self.notes
+                    .push(format!("approved {} for this Session", req.tool_name));
                 return;
             }
             if c == 'y' || c == 'n' {
@@ -10732,6 +10743,11 @@ fn draw_approval(
             bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
         ));
         keys.push(Span::raw(" once    "));
+        keys.push(Span::styled(
+            " s ",
+            bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
+        ));
+        keys.push(Span::raw(" this Session    "));
     }
     keys.extend([
         Span::styled(
@@ -12598,7 +12614,9 @@ mod tests {
             code_preview: None,
             tool_id: Some("t".into()),
         });
-        assert!(!render(&mut app, 120, 30).contains("AI summary"));
+        let screen = render(&mut app, 120, 30);
+        assert!(!screen.contains("AI summary"));
+        assert!(screen.contains("this Session"), "{screen}");
         app.on_event(Event::ApprovalSummary {
             approval_id: "a1".into(),
             tool_id: "t".into(),
@@ -12610,6 +12628,14 @@ mod tests {
         assert!(
             screen.contains("Writes the text you give it to a file."),
             "{screen}"
+        );
+        // `s` approves for this Session only.
+        app.input_focus = false;
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.approvals.is_empty());
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "approved echo_write for this Session"
         );
     }
 
