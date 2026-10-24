@@ -7221,6 +7221,46 @@ pub fn daemon_reachable(paths: &Paths) -> bool {
         .is_ok()
 }
 
+/// Why connecting to this profile's daemon failed, in words a user can act
+/// on (SPEC §9.1): someone else's socket, a stale one, or no daemon at all
+/// for this profile.
+pub fn explain_connect_error(paths: &Paths, err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    #[cfg(unix)]
+    let place = format!("socket {}", paths.socket_path().display());
+    #[cfg(windows)]
+    let place = format!("pipe {}", paths.pipe_name());
+    let profile = &paths.profile;
+    match err.kind() {
+        ErrorKind::PermissionDenied => {
+            #[cfg(unix)]
+            let owner = {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(paths.socket_path())
+                    .map(|m| format!(" (owned by uid {})", m.uid()))
+                    .unwrap_or_default()
+            };
+            #[cfg(windows)]
+            let owner = String::new();
+            format!(
+                "permission denied on the daemon {place}{owner}: it belongs to another user, \
+                 or the daemon was started with sudo. Stop that daemon (or remove the socket) \
+                 and let `formless` start it as you, or use your own profile with --profile."
+            )
+        }
+        ErrorKind::ConnectionRefused => format!(
+            "nothing is listening on the daemon {place} (profile '{profile}'): it is left over \
+             from a daemon that exited. Run `formless daemon start` to replace it; \
+             `formless doctor` shows why the last one stopped."
+        ),
+        ErrorKind::NotFound => format!(
+            "no daemon is running for profile '{profile}' (no {place}). A daemon serves one \
+             profile only: check --profile, or run `formless daemon start`."
+        ),
+        _ => format!("could not connect to the daemon {place}: {err}"),
+    }
+}
+
 /// Spawn `formless daemon serve` detached (client auto-start, SPEC §9.1).
 pub fn spawn_daemon(paths: &Paths) -> Result<()> {
     spawn_daemon_child(paths).map(|_| ())
@@ -7329,6 +7369,13 @@ fn log_tail(paths: &Paths, n: usize) -> String {
 pub fn ensure_daemon(paths: &Paths) -> Result<()> {
     if daemon_reachable(paths) {
         return Ok(());
+    }
+    // Another user's socket: starting our own daemon would only fail on it.
+    #[cfg(unix)]
+    if let Err(e) = std::os::unix::net::UnixStream::connect(paths.socket_path()) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return Err(anyhow!(explain_connect_error(paths, &e)));
+        }
     }
     let timeout = Config::load(paths)
         .map(|c| c.daemon.start_timeout_secs)

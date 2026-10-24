@@ -1465,6 +1465,13 @@ such as `read_file`, `read_text_file` and `file_read`.
   is connected**. When both reach zero, it waits a **60s grace period**
   (configurable), then shuts down gracefully, flushing Sessions, metrics,
   and checkpoints. State lives on disk, never only in memory.
+- A failed connection says what happened and what to do, never a bare IO
+  error. A socket owned by someone else (another user, or a daemon started
+  with sudo) is reported with its owner's uid, and the client does not try
+  to start a second daemon over it. A stale socket left by a daemon that
+  exited points to `formless daemon start` and `formless doctor`. A missing
+  socket names the profile, since each profile has its own daemon
+  (`--profile`).
 
 ### 9.2 Concurrency
 
