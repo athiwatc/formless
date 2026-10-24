@@ -347,6 +347,9 @@ enum ToolsAction {
     Disable { name: String },
     /// Switch a Tool back on
     Enable { name: String },
+    /// Revert the newest registry change (create, update, retire, restore
+    /// or rollback, by anyone)
+    Undo,
     /// Always list a Tool to the agent (from each Session's next listing)
     Pin { name: String },
     /// Stop always listing a Tool
@@ -3764,6 +3767,11 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             let tool = find_tool(&paths, &name)?;
             let code = tool_run(&paths, tool, input, yes, session)?;
             std::process::exit(code);
+        }
+        ToolsAction::Undo => {
+            let v = request_once(&paths, Request::UndoRegistryChange)?;
+            println!("undone: {}", v["undone"].as_str().unwrap_or_default());
+            Ok(())
         }
         ToolsAction::Disable { name } => set_tool_disabled(&paths, &name, true),
         ToolsAction::Enable { name } => set_tool_disabled(&paths, &name, false),

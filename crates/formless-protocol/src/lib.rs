@@ -229,6 +229,40 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// The latest change to the Tool registry, the one `/undo tool` reverts
+/// (SPEC §7.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RegistryChange {
+    pub tool_id: String,
+    pub name: String,
+    /// created, updated, retired, restored or rolled_back.
+    pub action: String,
+    /// The current version before the change (0 for a new Tool).
+    pub from_version: i64,
+    /// The current version after it.
+    pub to_version: i64,
+    /// agent, user, import or optimiser.
+    pub author: String,
+    pub at: String,
+}
+
+impl RegistryChange {
+    /// "agent created fetch_page v1", "user retired fetch_page".
+    pub fn summary(&self) -> String {
+        match self.action.as_str() {
+            "retired" | "restored" => format!("{} {} {}", self.author, self.action, self.name),
+            "rolled_back" => format!(
+                "{} rolled {} back to v{}",
+                self.author, self.name, self.to_version
+            ),
+            action => format!(
+                "{} {action} {} v{}",
+                self.author, self.name, self.to_version
+            ),
+        }
+    }
+}
+
 /// One version of a module.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModuleVersionInfo {
@@ -1169,6 +1203,10 @@ pub enum Request {
     RetireTool {
         id: String,
     },
+    /// Revert the newest registry change (`RegistryChange`): a new Tool is
+    /// retired, an update or rollback rolled back, a retire or restore
+    /// reversed. `{undone, tool}`; an error when there is nothing to undo.
+    UndoRegistryChange,
     /// Switch a Tool off (or back on) without retiring it.
     SetToolDisabled {
         id: String,
@@ -1451,6 +1489,11 @@ pub enum Event {
     ToolDeleted {
         id: String,
     },
+    /// A create, update, retire, restore or rollback in the registry; the
+    /// newest is what `UndoRegistryChange` reverts.
+    RegistryChanged {
+        change: RegistryChange,
+    },
     InvocationPending {
         session_id: String,
         run_id: String,
@@ -1571,6 +1614,7 @@ impl Event {
             | Event::ModuleDeleted { .. }
             | Event::ProposalUpdated { .. }
             | Event::ToolDeleted { .. }
+            | Event::RegistryChanged { .. }
             | Event::OptimiserActivity { .. }
             | Event::PromotionApprovalRequested { .. }
             | Event::ApprovalAnswered { .. } => None,

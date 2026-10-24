@@ -3692,6 +3692,13 @@
         else renderView();
         break;
       }
+      case "registry_changed": {
+        // Every registry change offers Undo for a few seconds (SPEC §7.2).
+        const c = ev.change;
+        toast(c.author + " " + (c.action === "rolled_back" ? "rolled " + c.name + " back to v" + c.to_version : c.action + " " + c.name + (c.action === "retired" || c.action === "restored" ? "" : " v" + c.to_version)), false,
+          { label: "Undo", ms: 10000, run: async () => { const r = await act({ type: "undo_registry_change" }); if (r) toast("Undone: " + r.undone); } });
+        break;
+      }
       case "module_deleted":
         S.modules = S.modules.filter((m) => m.id !== ev.id);
         if (S.moduleDetail && S.moduleDetail.module.id === ev.id) S.moduleDetail = null;

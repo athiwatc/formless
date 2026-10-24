@@ -773,6 +773,18 @@ pattern (§4.4).
     and plain text matches tags too; the CLI has `tools list --tag git`.
   - **Display:** tags show as `#tag` beside the Tool and travel in export
     bundles. They are stored as a JSON array (schema v41).
+- **Undo:** the newest registry change, whoever made it (create, update,
+  retire, restore or rollback), is kept as a `RegistryChange` and
+  broadcast as `RegistryChanged`.
+  - **Reverting it:** `UndoRegistryChange` reverts it once. A new Tool is
+    retired (never purged, so it stays restorable), an update or rollback
+    goes back to the version before, and a retire or restore is reversed.
+    With nothing recorded, it says there is nothing to undo.
+  - **Where to find it:** `/undo tool` in the TUI (each change's note says
+    so), the Undo button on the web's toast for each change (10 s), and
+    `formless tools undo`.
+  - The record survives a daemon restart (daemon-only store; Tools can't
+    reach it).
 - **Switched off:** a user-only toggle (`SetToolDisabled`,
   `ToolInfo.disabled`, schema v43), separate from retirement, which the
   optimiser also uses.

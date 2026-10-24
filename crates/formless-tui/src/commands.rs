@@ -197,7 +197,12 @@ pub const COMMANDS: &[Command] = &[
         "how full the context window is, and what fills it",
         Session,
     ),
-    cmd("undo", "", "undo the last Session delete", Session),
+    cmd(
+        "undo",
+        "[tool]",
+        "undo the last Session delete; `tool`: the last Tool registry change",
+        Session,
+    ),
     cmd("stop", "", "stop the current Run (Esc)", Run),
     cmd("cancel", "", "cancel the stalled or pending Tool call", Run),
     cmd("resend", "", "re-send a stalled provider request", Run),

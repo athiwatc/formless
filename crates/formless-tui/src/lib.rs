@@ -125,6 +125,7 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    UndoRegistry,
     GetModule,
     UpdateModule,
     ListSessions,
@@ -1403,6 +1404,10 @@ impl App {
                                 self.modules = v;
                             }
                         }
+                        Pending::UndoRegistry => {
+                            let undone = result["undone"].as_str().unwrap_or_default();
+                            self.notes.push(format!("Undone: {undone}."));
+                        }
                         Pending::GetModule => {
                             if let Ok(d) = serde_json::from_value::<ModuleDetail>(result) {
                                 self.tool_detail = None;
@@ -2582,6 +2587,10 @@ impl App {
                 }
                 self.request(Pending::ListModules, Request::ListModules);
             }
+            Event::RegistryChanged { change } => {
+                self.notes
+                    .push(format!("{} · /undo tool reverts it", change.summary()));
+            }
             Event::ModuleDeleted { id } => {
                 self.modules.retain(|m| m.id != id);
                 if self
@@ -3429,6 +3438,10 @@ impl App {
             "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             cmd if cmd.starts_with("tool ") => self.open_tool(cmd["tool ".len()..].trim()),
+            "undo tool" => self.request(Pending::UndoRegistry, Request::UndoRegistryChange),
+            cmd if cmd.starts_with("undo ") => self.notes.push(
+                "/undo restores the last deleted Session; /undo tool reverts the last Tool registry change".into(),
+            ),
             "modules" => {
                 self.open_view(View::Tools);
                 let names: Vec<String> = self
@@ -12318,6 +12331,26 @@ mod tests {
         let ed = app.editor.as_ref().expect("module editor");
         assert_eq!(ed.mode, EditMode::Module);
         assert_eq!(ed.text(), "module.exports = 2;");
+    }
+
+    #[test]
+    fn registry_changes_offer_undo() {
+        let mut app = test_app();
+        app.on_event(Event::RegistryChanged {
+            change: formless_protocol::RegistryChange {
+                tool_id: "t".into(),
+                name: "fetch_page".into(),
+                action: "updated".into(),
+                from_version: 2,
+                to_version: 3,
+                author: "agent".into(),
+                at: String::new(),
+            },
+        });
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "agent updated fetch_page v3 · /undo tool reverts it"
+        );
     }
 
     #[test]
