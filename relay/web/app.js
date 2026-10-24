@@ -1680,6 +1680,21 @@
       } }, "Abandon"));
   }
 
+  /** Chips for the Tools the last Run created, updated or retired (SPEC §10.6). */
+  function renderRunTools() {
+    const box = $("run-tools");
+    const changes = S.runTools || [];
+    box.classList.toggle("hidden", !changes.length);
+    if (!changes.length) return box.replaceChildren();
+    box.replaceChildren(
+      h("span", { class: "muted" }, "Tools this Run:"),
+      ...changes.map((c) => h("button", { class: "chip " + c.change, type: "button", title: "Open " + c.name, onclick: () => {
+        setView("tools");
+        selectTool(c.tool_id);
+      } }, c.change + " " + c.name + (c.change === "retired" ? "" : " v" + c.version))),
+      h("button", { class: "btn small", type: "button", "aria-label": "Dismiss", onclick: () => { S.runTools = null; renderRunTools(); } }, "×"));
+  }
+
   function renderComposer() {
     const running = isRunning();
     $("composer").classList.toggle("running", running);
@@ -2824,6 +2839,8 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    S.runTools = null;
+    renderRunTools();
     request({ type: "context_usage", session_id: id }).then((r) => {
       (S.contextFill = S.contextFill || {})[id] = { used: r.used_tokens, size: r.context_tokens };
       renderStatus();
@@ -3434,8 +3451,11 @@
     switch (ev.type) {
       case "run_started":
         S.running.add(ev.session_id);
-        if (here) { S.unfinished = null; renderRunBanner(); }
+        if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); }
         if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = []; setActivity("waiting for model"); }
+        break;
+      case "run_tool_changes":
+        if (here) { S.runTools = ev.changes; renderRunTools(); }
         break;
       case "message_appended":
       case "message_complete":

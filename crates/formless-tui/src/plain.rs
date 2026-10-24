@@ -71,6 +71,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             format!("{}Run paused: {msg}{next}", end_stream(streaming))
         }
         Event::Note { text, .. } => format!("Note: {text}"),
+        Event::RunToolChanges { changes, .. } => format!("{}.", super::tool_changes_text(changes)),
         Event::CompactionNotice { .. } => "Note: the conversation was compacted.".into(),
         Event::ApprovalRequested {
             tool_name,

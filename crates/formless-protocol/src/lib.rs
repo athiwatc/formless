@@ -121,6 +121,17 @@ pub struct ToolInfo {
     pub author: String,
 }
 
+/// A registry change the agent made during a Run (SPEC §10.6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolChange {
+    pub tool_id: String,
+    pub name: String,
+    /// The version the Run left it at.
+    pub version: i64,
+    /// created, updated or retired.
+    pub change: String,
+}
+
 /// A provider failure explained for people (SPEC §4.4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ErrorExplained {
@@ -1373,6 +1384,13 @@ pub enum Event {
     McpServersChanged,
     /// Skills were installed, removed, enabled or disabled.
     SkillsChanged,
+    /// The Tools a Run created, updated or retired, sent just before its
+    /// `RunFinished` when there were any (SPEC §10.6).
+    RunToolChanges {
+        session_id: String,
+        run_id: String,
+        changes: Vec<ToolChange>,
+    },
     /// A Run's usage so far, after each model step (SPEC §10.6).
     RunUsage {
         session_id: String,
@@ -1421,6 +1439,7 @@ impl Event {
             | Event::ApprovalRequested { session_id, .. }
             | Event::UserQuestion { session_id, .. }
             | Event::RunUsage { session_id, .. }
+            | Event::RunToolChanges { session_id, .. }
             | Event::InvocationPending { session_id, .. }
             | Event::InvocationCompleted { session_id, .. }
             | Event::InvocationStalled { session_id, .. }

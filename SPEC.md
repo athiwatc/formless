@@ -2128,6 +2128,16 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### 10.6 Live feedback (v2)
 
+- **What a Run did to the registry:** before `RunFinished`, a Run that
+  created, updated or retired Tools sends `RunToolChanges` with one entry
+  per Tool: its id, name, the version the Run left it at, and the change.
+  Clients show it as a summary, for example "Tools this Run: created
+  search_repo v1, updated fetch_page v3":
+  - **TUI:** a note, and `/tool NAME` opens that Tool's detail in the
+    Tools view.
+  - **Plain mode:** a line.
+  - **Web:** a row of chips above the composer. Each chip opens the Tool,
+    and the row clears when the next Run starts.
 - **Live call tree:** `ToolCallStarted.depth` gives a call's `tools.call`
   nesting (0 for the agent's own calls). The TUI draws running calls as a
   tree:

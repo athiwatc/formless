@@ -334,7 +334,7 @@ async fn scripted_flow(
     tag: &str,
     approve: bool,
     scope: formless_protocol::ApprovalScope,
-) -> (String, Paths, String) {
+) -> (String, Paths, String, Vec<formless_protocol::ToolChange>) {
     use formless_core::daemon::Daemon;
     use formless_core::Config;
     use formless_protocol::*;
@@ -412,6 +412,7 @@ async fn scripted_flow(
     write_half.write_all(b"\n").await.unwrap();
 
     let mut final_text = String::new();
+    let mut tool_changes = Vec::new();
     let mut next_id = 100u64;
     while let Some(line) = lines.next_line().await.unwrap() {
         if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
@@ -434,6 +435,7 @@ async fn scripted_flow(
                         .unwrap();
                     write_half.write_all(b"\n").await.unwrap();
                 }
+                Event::RunToolChanges { changes, .. } => tool_changes = changes,
                 Event::RunFinished { status, .. } => {
                     assert_eq!(status, "completed");
                     break;
@@ -444,14 +446,24 @@ async fn scripted_flow(
         }
     }
     server.abort();
-    (final_text, paths, workdir)
+    (final_text, paths, workdir, tool_changes)
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_builds_and_uses_tool_with_approval() {
-    let (final_text, paths, workdir) =
+    let (final_text, paths, workdir, changes) =
         scripted_flow("m2a", true, formless_protocol::ApprovalScope::Always).await;
+    // The Run reports the Tool it added (SPEC §10.6).
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(
+        (
+            changes[0].name.as_str(),
+            changes[0].version,
+            changes[0].change.as_str()
+        ),
+        ("echo_write", 1, "created")
+    );
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(
         std::fs::read_to_string(format!("{workdir}/out.txt")).unwrap(),
@@ -472,7 +484,7 @@ async fn daemon_builds_and_uses_tool_with_approval() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_once_runs_the_tool_without_storing_a_grant() {
-    let (final_text, paths, workdir) =
+    let (final_text, paths, workdir, _) =
         scripted_flow("m2o", true, formless_protocol::ApprovalScope::Once).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert!(std::path::Path::new(&format!("{workdir}/out.txt")).exists());
@@ -487,7 +499,7 @@ async fn approve_once_runs_the_tool_without_storing_a_grant() {
 #[cfg(unix)]
 #[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
-    let (final_text, paths, workdir) =
+    let (final_text, paths, workdir, _) =
         scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;
     assert!(
         final_text.to_lowercase().contains("denied"),

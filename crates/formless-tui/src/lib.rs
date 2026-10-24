@@ -792,6 +792,8 @@ struct App {
     toasts: Vec<(String, Instant, bool)>,
     pending: HashMap<u64, Pending>,
     tools: Vec<ToolInfo>,
+    /// What the last Run on screen did to the registry (`/tool NAME`).
+    run_tool_changes: Vec<ToolChange>,
     tool_idx: usize,
     tool_filter: lists::ListFilter,
     tool_detail: Option<ToolDetail>,
@@ -1058,6 +1060,7 @@ impl App {
             pending: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
+            run_tool_changes: Vec::new(),
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
@@ -2439,6 +2442,19 @@ impl App {
                 }
                 self.questions.push(open);
             }
+            Event::RunToolChanges {
+                session_id,
+                changes,
+                ..
+            } => {
+                if self.is_current(&session_id) {
+                    self.notes.push(format!(
+                        "{} · /tool NAME opens one",
+                        tool_changes_text(&changes)
+                    ));
+                    self.run_tool_changes = changes;
+                }
+            }
             Event::RunUsage {
                 session_id, usage, ..
             } => {
@@ -3372,6 +3388,7 @@ impl App {
             "proposals" => self.open_view(View::Proposals),
             "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
+            cmd if cmd.starts_with("tool ") => self.open_tool(cmd["tool ".len()..].trim()),
             "settings" => self.open_view(View::Settings),
             "model" => self.open_model_picker(),
             cmd if cmd.starts_with("model ") => {
@@ -4795,6 +4812,35 @@ impl App {
 
     fn visible_proposals(&self) -> Vec<usize> {
         lists::proposals(&self.proposals, &self.proposal_filter)
+    }
+
+    /// `/tool NAME`: the Tools view with that Tool selected and its detail.
+    fn open_tool(&mut self, name: &str) {
+        let id = self
+            .run_tool_changes
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.tool_id.clone())
+            .or_else(|| {
+                self.tools
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.id.clone())
+            });
+        let Some(id) = id else {
+            self.notes
+                .push(format!("No Tool named {name}; /tools lists them."));
+            return;
+        };
+        self.open_view(View::Tools);
+        if let Some(pos) = self
+            .visible_tools()
+            .iter()
+            .position(|&i| self.tools[i].id == id)
+        {
+            self.tool_idx = pos;
+        }
+        self.request(Pending::GetTool, Request::GetTool { id });
     }
 
     fn selected_tool(&self) -> Option<&ToolInfo> {
@@ -6445,6 +6491,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Whether a note reports a problem (it stays until dismissed).
+/// "Tools this Run: created search_repo v1, updated fetch_page v3".
+fn tool_changes_text(changes: &[ToolChange]) -> String {
+    let parts: Vec<String> = changes
+        .iter()
+        .map(|c| match c.change.as_str() {
+            "retired" => format!("retired {}", c.name),
+            change => format!("{change} {} v{}", c.name, c.version),
+        })
+        .collect();
+    format!("Tools this Run: {}", parts.join(", "))
+}
+
 fn is_error_note(note: &str) -> bool {
     let lower = note.to_lowercase();
     [
@@ -10725,6 +10783,7 @@ mod tests {
             pending: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
+            run_tool_changes: Vec::new(),
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
@@ -11796,6 +11855,43 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.attachments.is_empty());
         assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+    }
+
+    #[test]
+    fn run_tool_changes_note_and_tool_command() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        let change = |id: &str, name: &str, version, change: &str| ToolChange {
+            tool_id: id.into(),
+            name: name.into(),
+            version,
+            change: change.into(),
+        };
+        app.on_event(Event::RunToolChanges {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            changes: vec![
+                change("t1", "search_repo", 1, "created"),
+                change("t2", "fetch_page", 3, "updated"),
+                change("t3", "old_tool", 2, "retired"),
+            ],
+        });
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "Tools this Run: created search_repo v1, updated fetch_page v3, retired old_tool · /tool NAME opens one"
+        );
+        // Another Session's Run says nothing here.
+        let before = app.notes.len();
+        app.on_event(Event::RunToolChanges {
+            session_id: "other".into(),
+            run_id: "r2".into(),
+            changes: vec![change("t9", "x", 1, "created")],
+        });
+        assert_eq!(app.notes.len(), before);
+        app.slash("tool fetch_page");
+        assert_eq!(app.view, View::Tools);
+        app.slash("tool nope");
+        assert!(app.notes.last().unwrap().starts_with("No Tool named nope"));
     }
 
     #[test]

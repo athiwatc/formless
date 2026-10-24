@@ -444,6 +444,10 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 
 .run-banner .banner-text { flex: 1; min-width: 0; }
 .run-banner details { margin-top: 4px; font-size: 12px; }
+.run-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; font-size: 13px; }
+.run-tools .chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; background: var(--panel); color: inherit; cursor: pointer; font: inherit; }
+.run-tools .chip.created { border-color: var(--accent); }
+.run-tools .chip.retired { opacity: 0.7; text-decoration: line-through; }
 .run-banner details summary { cursor: pointer; color: var(--muted); }
 .run-banner details code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 120px; overflow-y: auto; }
 
