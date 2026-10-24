@@ -9915,6 +9915,12 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             ),
                         ]),
                     ];
+            if m.model_tokens_per_call.is_some() {
+                lines.push(Line::from(vec![
+                    label("model use"),
+                    Span::styled(model_use_text(m), fg(app.color, Color::Magenta)),
+                ]));
+            }
             if !d.attention.is_empty() {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
@@ -10910,6 +10916,23 @@ fn usage_text(u: &formless_protocol::UsageInfo) -> String {
 }
 
 /// Cost per Success (SPEC §8.1): "1.2s, 3400 tok", or "-".
+/// A Tool's own model use per call: "1.2k tok, $0.0031 per call", or
+/// "" when it uses no model (SPEC §10.4).
+pub fn model_use_text(m: &formless_protocol::ToolMetricsInfo) -> String {
+    let Some(tokens) = m.model_tokens_per_call else {
+        return String::new();
+    };
+    let tokens = if tokens >= 1000.0 {
+        format!("{:.1}k", tokens / 1000.0)
+    } else {
+        format!("{tokens:.0}")
+    };
+    match m.model_cost_per_call {
+        Some(cost) => format!("{tokens} tok, ${cost:.4} per call"),
+        None => format!("{tokens} tok per call (unpriced)"),
+    }
+}
+
 fn cost_per_success(m: &formless_protocol::ToolMetricsInfo) -> String {
     match (m.ms_per_success, m.tokens_per_success) {
         (Some(ms), Some(tok)) => format!("{:.1}s, {tok:.0} tok", ms / 1000.0),
@@ -12061,6 +12084,19 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.attachments.is_empty());
         assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+    }
+
+    #[test]
+    fn model_use_reads_per_call() {
+        let mut m = formless_protocol::ToolMetricsInfo::default();
+        assert_eq!(model_use_text(&m), "");
+        m.model_tokens_per_call = Some(1234.0);
+        m.model_cost_per_call = Some(0.00315);
+        assert_eq!(model_use_text(&m), "1.2k tok, $0.0032 per call");
+        m.model_cost_per_call = None;
+        assert_eq!(model_use_text(&m), "1.2k tok per call (unpriced)");
+        m.model_tokens_per_call = Some(400.0);
+        assert_eq!(model_use_text(&m), "400 tok per call (unpriced)");
     }
 
     #[test]
@@ -13622,7 +13658,11 @@ mod tests {
         let screen = render(&mut app, 100, 30);
         assert!(screen.contains("used by summarise_page"), "{screen}");
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert!(app.notes.last().unwrap().contains("Press x again"), "{:?}", app.notes.last());
+        assert!(
+            app.notes.last().unwrap().contains("Press x again"),
+            "{:?}",
+            app.notes.last()
+        );
         assert_eq!(app.retire_arm.as_deref(), Some("t"));
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.retire_arm, None);

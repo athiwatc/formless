@@ -343,7 +343,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 43;
+pub const SCHEMA_VERSION: i64 = 44;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -428,7 +428,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 43] = [
+const MIGRATIONS: [(i64, MigrationStep); 44] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -562,6 +562,13 @@ const MIGRATIONS: [(i64, MigrationStep); 43] = [
     (42, |c| add_column(c, "tools", "user_pinned INTEGER NOT NULL DEFAULT 0")),
     // Tools the user switched off without retiring them (SPEC §7.2).
     (43, |c| add_column(c, "tools", "disabled INTEGER NOT NULL DEFAULT 0")),
+    // A Tool's own model use per Invocation: tokens, priced USD, and
+    // whether any of it had no price (SPEC §10.4).
+    (44, |c| {
+        add_column(c, "invocations", "model_tokens INTEGER NOT NULL DEFAULT 0")?;
+        add_column(c, "invocations", "model_cost REAL NOT NULL DEFAULT 0")?;
+        add_column(c, "invocations", "model_unpriced INTEGER NOT NULL DEFAULT 0")
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1455,6 +1462,22 @@ impl Store {
     }
 
     /// Tokens a Tool spent itself (`llm.complete` inside it).
+    /// Charge an Invocation for its Tool's own model use (`llm`, `agent`):
+    /// tokens, and USD when the model is priced.
+    pub fn add_invocation_model_use(
+        &self,
+        inv_id: &str,
+        tokens: i64,
+        cost: Option<f64>,
+    ) -> Result<()> {
+        self.ex(
+            "UPDATE invocations SET model_tokens=model_tokens+?2, model_cost=model_cost+COALESCE(?3,0), \
+             model_unpriced=MAX(model_unpriced, ?3 IS NULL) WHERE id=?1",
+            params![inv_id, tokens, cost],
+        )?;
+        Ok(())
+    }
+
     pub fn add_invocation_tokens(&self, inv_id: &str, tokens: i64) -> Result<()> {
         self.ex(
             "UPDATE invocations SET tokens=tokens+?2 WHERE id=?1",
@@ -3397,6 +3420,14 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let per_success = |v: i64| (success > 0).then(|| v as f64 / success as f64);
+        // The Tool's own model use, per call (§10.4).
+        let (model_tokens, model_cost, unpriced): (i64, f64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(model_tokens),0), COALESCE(SUM(model_cost),0), COALESCE(MAX(model_unpriced),0) \
+             FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2)",
+            params![tool_id, version],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let model_used = model_tokens > 0 && total > 0;
         let mut durations: Vec<i64> = {
             let mut stmt = self.ps("SELECT duration_ms FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2) AND status='success' ORDER BY duration_ms")?;
             let rows = stmt
@@ -3441,6 +3472,8 @@ impl Store {
             sessions,
             ms_per_success: per_success(all_ms),
             tokens_per_success: per_success(all_tokens),
+            model_tokens_per_call: model_used.then(|| model_tokens as f64 / total as f64),
+            model_cost_per_call: (model_used && unpriced == 0).then(|| model_cost / total as f64),
         })
     }
 

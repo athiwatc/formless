@@ -4164,6 +4164,19 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
             .map(|v| format!("{v:.0}ms"))
             .unwrap_or_else(|| "-".into())
     );
+    println!(
+        "latency:      p50 {} · p95 {}",
+        m.p50_ms
+            .map(|v| format!("{v:.0}ms"))
+            .unwrap_or_else(|| "-".into()),
+        m.p95_ms
+            .map(|v| format!("{v:.0}ms"))
+            .unwrap_or_else(|| "-".into())
+    );
+    let model_use = formless_tui::model_use_text(m);
+    if !model_use.is_empty() {
+        println!("model use:    {model_use}");
+    }
     for reason in &d.attention {
         println!("attention:    {reason}");
     }

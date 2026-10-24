@@ -194,6 +194,13 @@ pub struct ToolMetricsInfo {
     pub ms_per_success: Option<f64>,
     #[serde(default)]
     pub tokens_per_success: Option<f64>,
+    /// Tokens the Tool's own model use (`llm`, `agent`) spent per call, on
+    /// average; `None` when it has never used a model (SPEC §10.4).
+    #[serde(default)]
+    pub model_tokens_per_call: Option<f64>,
+    /// Their estimated USD per call, when every model it used is priced.
+    #[serde(default)]
+    pub model_cost_per_call: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

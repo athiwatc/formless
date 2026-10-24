@@ -262,6 +262,22 @@ fn cost_per_success_counts_attributed_tokens_and_time() {
         Some(480.0),
         "960 tokens over 2 successes"
     );
+    // The Tool's own model use, per call (SPEC §10.4): only the llm/agent
+    // spend, over all 3 calls, priced while every model had a price.
+    assert_eq!(m.model_tokens_per_call, None, "no model use yet");
+    store
+        .add_invocation_model_use(&ids[0], 600, Some(0.003))
+        .unwrap();
+    store
+        .add_invocation_model_use(&ids[1], 300, Some(0.0015))
+        .unwrap();
+    let m = store.tool_metrics(&t.id, None).unwrap();
+    assert_eq!(m.model_tokens_per_call, Some(300.0));
+    assert!((m.model_cost_per_call.unwrap() - 0.0015).abs() < 1e-12);
+    store.add_invocation_model_use(&ids[2], 300, None).unwrap();
+    let m = store.tool_metrics(&t.id, None).unwrap();
+    assert_eq!(m.model_tokens_per_call, Some(400.0));
+    assert_eq!(m.model_cost_per_call, None, "an unpriced model: no total");
 }
 
 #[tokio::test(flavor = "multi_thread")]
