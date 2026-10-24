@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use formless_protocol::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +14,9 @@ pub struct DaemonClient {
 fn connect_stream(paths: &Paths) -> Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     #[cfg(unix)]
     {
-        let stream = std::os::unix::net::UnixStream::connect(paths.socket_path())
-            .context("connect daemon socket")?;
+        let stream = std::os::unix::net::UnixStream::connect(paths.socket_path()).map_err(|e| {
+            anyhow::anyhow!(formless_core::daemon::explain_connect_error(paths, &e))
+        })?;
         let reader = stream.try_clone()?;
         Ok((Box::new(reader), Box::new(stream)))
     }
@@ -25,7 +26,9 @@ fn connect_stream(paths: &Paths) -> Result<(Box<dyn Read + Send>, Box<dyn Write 
             .read(true)
             .write(true)
             .open(paths.pipe_name())
-            .context("connect daemon pipe")?;
+            .map_err(|e| {
+                anyhow::anyhow!(formless_core::daemon::explain_connect_error(paths, &e))
+            })?;
         let reader = file.try_clone()?;
         Ok((Box::new(reader), Box::new(file)))
     }
