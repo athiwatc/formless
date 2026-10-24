@@ -280,6 +280,7 @@ mod tests {
             name: name.into(),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: format!("{name} things"),
             retired,
             current_version: 1,

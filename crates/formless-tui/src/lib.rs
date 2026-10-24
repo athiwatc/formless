@@ -3389,6 +3389,29 @@ impl App {
             "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             cmd if cmd.starts_with("tool ") => self.open_tool(cmd["tool ".len()..].trim()),
+            cmd if cmd.starts_with("toolpin ") => {
+                let name = cmd["toolpin ".len()..].trim();
+                match self.tools.iter().find(|t| t.name == name) {
+                    Some(t) => {
+                        let (id, pinned) = (t.id.clone(), !t.pinned);
+                        let cost = self
+                            .tool_detail
+                            .as_ref()
+                            .filter(|d| d.tool.id == id)
+                            .map(|d| format!(", ~{} tokens per request", d.listing_tokens))
+                            .unwrap_or_default();
+                        self.notes.push(if pinned {
+                            format!("Pinned {name}: listed to the agent from each Session's next listing{cost}.")
+                        } else {
+                            format!("Unpinned {name}.")
+                        });
+                        self.fire(Request::SetToolPinned { id, pinned });
+                    }
+                    None => self
+                        .notes
+                        .push(format!("No Tool named {name}; /tools lists them.")),
+                }
+            }
             cmd if cmd.starts_with("tooltag ") => {
                 let mut words = cmd["tooltag ".len()..].split_whitespace();
                 let name = words.next().unwrap_or_default();
@@ -9306,6 +9329,9 @@ fn tool_status(t: &ToolInfo, color: bool) -> Span<'static> {
 /// or just the name when it has no title (SPEC §7.2).
 fn tool_label(t: &ToolInfo, color: bool) -> Line<'static> {
     let mut spans = vec![tool_glyph(t, color)];
+    if t.pinned {
+        spans.push(Span::styled("⚲ ", fg(color, Color::Cyan)));
+    }
     if t.title.is_empty() {
         spans.push(Span::raw(t.name.clone()));
     } else {
@@ -9760,6 +9786,14 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             Span::styled(
                                 d.tool.tags.iter().map(|t| format!(" #{t}")).collect::<String>(),
                                 fg(app.color, Color::Cyan),
+                            ),
+                            Span::styled(
+                                if d.tool.pinned {
+                                    format!("  ⚲ pinned (~{} tokens/request; /toolpin {} unpins)", d.listing_tokens, d.tool.name)
+                                } else {
+                                    format!("  /toolpin {} always lists it (~{} tokens/request)", d.tool.name, d.listing_tokens)
+                                },
+                                ui::dim(app.color),
                             ),
                             Span::raw(format!("  {}", d.tool.description)),
                         ]),
@@ -11250,6 +11284,7 @@ mod tests {
                 name: "writer".into(),
                 title: String::new(),
                 tags: Vec::new(),
+                pinned: false,
                 description: String::new(),
                 retired: false,
                 current_version: 2,
@@ -11268,6 +11303,7 @@ mod tests {
                 name: "old".into(),
                 title: String::new(),
                 tags: Vec::new(),
+                pinned: false,
                 description: String::new(),
                 retired: true,
                 current_version: 1,
@@ -11505,9 +11541,9 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
-            pinned: false,
             archived: false,
             tags: Vec::new(),
+            pinned: false,
             instructions: None,
         }];
         app.key(key(KeyCode::Char('d')));
@@ -11878,6 +11914,7 @@ mod tests {
                 name: n.to_string(),
                 title: String::new(),
                 tags: Vec::new(),
+                pinned: false,
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -11950,6 +11987,7 @@ mod tests {
             name: id.into(),
             title: String::new(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            pinned: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -12377,9 +12415,9 @@ mod tests {
                 message_count: 0,
                 preview: None,
                 last_run_status: None,
-                pinned: false,
                 archived: false,
                 tags: Vec::new(),
+                pinned: false,
                 instructions: None,
             })
             .collect();
@@ -12712,6 +12750,7 @@ mod tests {
                 name: n.to_string(),
                 title: String::new(),
                 tags: Vec::new(),
+                pinned: false,
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -12888,6 +12927,7 @@ mod tests {
                 name: format!("t{i:02}"),
                 title: String::new(),
                 tags: Vec::new(),
+                pinned: false,
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -12970,9 +13010,9 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
-            pinned: false,
             archived: false,
             tags: Vec::new(),
+            pinned: false,
             instructions: None,
         }];
         app.switch_session("s".into());
@@ -13000,9 +13040,9 @@ mod tests {
             message_count: 12,
             preview: Some(format!("fix the {id} build")),
             last_run_status: status.map(str::to_string),
-            pinned: false,
             archived: false,
             tags: Vec::new(),
+            pinned: false,
             instructions: None,
         };
         app.sessions = vec![session("a", Some("paused")), session("b", None)];
@@ -13076,9 +13116,9 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
-            pinned: false,
             archived,
             tags: Vec::new(),
+            pinned: false,
             instructions: None,
         };
         app.sessions = vec![session("old", true), session("live", false)];
@@ -13111,9 +13151,9 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
-            pinned: false,
             archived: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            pinned: false,
             instructions: None,
         };
         app.sessions = vec![
@@ -13156,9 +13196,9 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
-            pinned: false,
             archived: false,
             tags: Vec::new(),
+            pinned: false,
             instructions: None,
         }];
         app.view = View::Sessions;
@@ -13190,9 +13230,9 @@ mod tests {
             message_count: 0,
             preview: None,
             last_run_status: None,
-            pinned: false,
             archived: false,
             tags: Vec::new(),
+            pinned: false,
             instructions: None,
         };
         app.sessions = vec![session("a1"), session("b2"), session("c3")];
@@ -13409,6 +13449,7 @@ mod tests {
             name: "fetch_page".into(),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13437,6 +13478,7 @@ mod tests {
             name: "fetch_page".into(),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13468,6 +13510,7 @@ mod tests {
             version_metrics: vec![],
             approval: None,
             recent_calls: vec![],
+            listing_tokens: 0,
             example: Some(formless_protocol::ToolExample {
                 version: 1,
                 input: r#"{"repo":"/src/app"}"#.into(),
@@ -13609,6 +13652,7 @@ mod tests {
             name: "fetch_page".into(),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13669,6 +13713,7 @@ mod tests {
             name: name.into(),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13714,6 +13759,7 @@ mod tests {
             name: "fetch_page".into(),
             title: String::new(),
             tags: Vec::new(),
+            pinned: false,
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13762,6 +13808,7 @@ mod tests {
             optimiser_attempts: vec![],
             version_metrics: vec![],
             approval: None,
+            listing_tokens: 0,
             example: None,
             recent_calls: vec![
                 call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z"),

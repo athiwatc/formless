@@ -1880,8 +1880,9 @@
   }
   /** A Tool's title with its name as secondary text, or just the name (SPEC §7.2). */
   function toolLabel(t) {
+    const pin = t.pinned ? h("span", { class: "tool-pin", title: "pinned: always listed to the agent" }, "⚲ ") : null;
     const tags = (t.tags || []).map((g) => h("span", { class: "tool-tag" }, "#" + g));
-    return [t.title ? [t.title, h("span", { class: "muted tool-name" }, " " + t.name)] : t.name, tags];
+    return [pin, t.title ? [t.title, h("span", { class: "muted tool-name" }, " " + t.name)] : t.name, tags];
   }
   function toolTitleByName(name) {
     const t = (S.tools || []).find((x) => x.name === name);
@@ -2071,6 +2072,8 @@
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name) }, "Optimise"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name) }, t.retired ? "Restore" : "Retire"),
       t.current_version > 1 ? h("button", { class: "btn small", type: "button", onclick: () => rollbackTool(t, t.current_version - 1) }, "Roll back") : null,
+      h("button", { class: "btn small", type: "button", title: "Pinned Tools are listed to the agent in every Session (from its next listing)", onclick: () => act({ type: "set_tool_pinned", id: t.id, pinned: !t.pinned }, (t.pinned ? "Unpinned " : "Pinned ") + t.name) },
+        t.pinned ? "Unpin" : "Pin (~" + (d.listing_tokens || 0) + " tokens/request)"),
       h("button", { class: "btn small", type: "button", onclick: () => exportTool(t) }, "Export"),
       h("button", { class: "btn small danger", type: "button", onclick: () => purgeTool(t) }, "Purge")));
     if (d.optimiser_attempts && d.optimiser_attempts.length) {
