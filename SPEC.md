@@ -1948,6 +1948,17 @@ run_tool = "network_policy"     # a registry Tool, or…
     (always, this Session or for an hour) takes a second press of the
     same key or button; the first only warns. Allowing it once and
     denying take one press.
+- **Where paths lie.** A prompt's Capabilities are its resolved values,
+  so input-bound scopes show the actual absolute path or host. For each
+  new `fs:` path, the prompt adds a note (`formless_protocol::path_note`,
+  mirrored by the web):
+  - **Secret folders** (⚠ in red): `.ssh`, `.aws`, `.gnupg`, `.kube`,
+    `.docker`, `Keychains`, `.password-store`, `.config/gh` and
+    `.config/gcloud` ("holds SSH keys", …), and `/etc`.
+  - **Outside the Session's working folder** (⚠): flagged with that
+    folder named.
+  - **Inside it:** a quiet "inside the working folder".
+  - **No working folder:** only the secret folders are flagged.
 - **One list of every grant.** `ListApprovals` returns `GrantInfo` rows,
   one per Capability, covering stored, Session and timed (`hour`) grants.
   - **Each row has:** Tool, Capability, scope, when the grant was last

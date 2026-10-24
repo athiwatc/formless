@@ -272,6 +272,48 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
     None
 }
 
+/// Where an `fs:` Capability's path lies (SPEC §10.3), for approval
+/// prompts: `(warn, note)`. Folders that hold secrets warn whatever the
+/// working folder; otherwise a path outside the Session's working folder
+/// warns and one inside it doesn't. `None` for other Capabilities, or
+/// when there is no working folder and nothing stands out.
+pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
+    let path = spec
+        .strip_prefix("fs:read:")
+        .or_else(|| spec.strip_prefix("fs:write:"))?;
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    const SECRET_DIRS: [(&str, &str); 7] = [
+        (".ssh", "SSH keys"),
+        (".aws", "cloud credentials"),
+        (".gnupg", "encryption keys"),
+        (".kube", "cluster credentials"),
+        (".docker", "registry credentials"),
+        ("Keychains", "the keychain"),
+        (".password-store", "saved passwords"),
+    ];
+    for (dir, what) in SECRET_DIRS {
+        if segments.contains(&dir) {
+            return Some((true, format!("holds {what}")));
+        }
+    }
+    if segments
+        .windows(2)
+        .any(|w| w == [".config", "gh"] || w == [".config", "gcloud"])
+    {
+        return Some((true, "holds account credentials".into()));
+    }
+    if segments.first() == Some(&"etc") {
+        return Some((true, "system configuration".into()));
+    }
+    let cwd = cwd.filter(|c| !c.is_empty())?.trim_end_matches('/');
+    let inside = path == cwd || path.starts_with(&format!("{cwd}/"));
+    Some(if inside {
+        (false, "inside the working folder".into())
+    } else {
+        (true, format!("outside the working folder {cwd}"))
+    })
+}
+
 /// One granted Capability, for the central approvals list (SPEC §10.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GrantInfo {
@@ -1887,5 +1929,33 @@ mod tests {
         ] {
             assert!(broad_capability(scoped).is_none(), "{scoped}");
         }
+    }
+
+    #[test]
+    fn paths_are_placed_against_the_working_folder() {
+        let cwd = Some("/Users/ada/project");
+        assert_eq!(
+            path_note("fs:write:/Users/ada/project/out.txt", cwd),
+            Some((false, "inside the working folder".into()))
+        );
+        assert_eq!(
+            path_note("fs:read:/Users/ada/projects-old/x", cwd),
+            Some((true, "outside the working folder /Users/ada/project".into())),
+            "a sibling with the same prefix is outside"
+        );
+        assert_eq!(
+            path_note("fs:read:/Users/ada/.ssh/id_ed25519", cwd),
+            Some((true, "holds SSH keys".into()))
+        );
+        assert_eq!(
+            path_note("fs:write:/etc/hosts", None),
+            Some((true, "system configuration".into()))
+        );
+        assert_eq!(
+            path_note("fs:read:/tmp/x", None),
+            None,
+            "no working folder, nothing special"
+        );
+        assert_eq!(path_note("net:example.com", cwd), None);
     }
 }
