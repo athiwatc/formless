@@ -4013,6 +4013,7 @@ impl Daemon {
         cancel_flag: &'a Arc<AtomicBool>,
         cancel: &'a CancellationToken,
         agent_depth: usize,
+        parent_inv: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
             if task.trim().is_empty() {
@@ -4042,6 +4043,8 @@ impl Daemon {
             }
             let task_started = std::time::Instant::now();
             let mut task_tokens = 0i64;
+            // USD of those tokens; None once a step's model has no price.
+            let mut task_cost = Some(0.0);
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -4116,6 +4119,16 @@ impl Daemon {
                     step += 1;
                     if let Some(u) = &result.usage {
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
+                        task_cost = match (task_cost, cfg.provider.prices.get(&model)) {
+                            (Some(sum), Some(p)) => Some(
+                                sum + p.cost(
+                                    u.prompt_tokens as i64,
+                                    u.completion_tokens as i64,
+                                    u.cached_tokens as i64,
+                                ),
+                            ),
+                            _ => None,
+                        };
                     }
                     let _ = self.with_store(|st| st.set_subagent_steps(&sub_id, step));
                     self.broadcast(Event::SubagentStep {
@@ -4169,6 +4182,11 @@ impl Daemon {
                 Ok(text) => ("completed", text.clone()),
                 Err(e) => ("failed", e.to_string()),
             };
+            // A Tool's `agents.run` is that Tool's model use (§10.4).
+            if let Some(inv) = parent_inv.filter(|_| task_tokens > 0) {
+                let _ =
+                    self.with_store(|st| st.add_invocation_model_use(inv, task_tokens, task_cost));
+            }
             // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
             // turns of the whole task, and whether it ended well.
             // An interrupt says nothing about the model: not recorded.
@@ -7696,6 +7714,7 @@ impl HostOps for NestedOps {
             system.map(str::to_string),
             model.map(str::to_string),
         );
+        let parent_inv = self.parent_inv.clone();
         self.block_cancellable(async move {
             daemon
                 .run_subagent_text(
@@ -7708,6 +7727,7 @@ impl HostOps for NestedOps {
                     &cancel_flag,
                     &cancel,
                     agent_depth,
+                    parent_inv.as_deref(),
                 )
                 .await
         })
@@ -7751,12 +7771,21 @@ impl HostOps for NestedOps {
             &model,
             effort.as_deref(),
         ))?;
-        // A Tool's own model calls count toward its Cost per Success.
+        // A Tool's own model calls count toward its Cost per Success, and
+        // as its model use (§10.4).
         if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
             let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
-            let _ = self
-                .daemon
-                .with_store(|st| st.add_invocation_tokens(inv, tokens));
+            let cost = self.cfg.provider.prices.get(&model).map(|p| {
+                p.cost(
+                    u.prompt_tokens as i64,
+                    u.completion_tokens as i64,
+                    u.cached_tokens as i64,
+                )
+            });
+            let _ = self.daemon.with_store(|st| {
+                st.add_invocation_tokens(inv, tokens)?;
+                st.add_invocation_model_use(inv, tokens, cost)
+            });
         }
         Ok(text)
     }

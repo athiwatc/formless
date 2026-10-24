@@ -1922,6 +1922,19 @@ run_tool = "network_policy"     # a registry Tool, or…
   participants (like two terminals on one tmux session); messages are
   attributed by client; an approval is resolved by **whoever answers
   first** (the other modal closes: “answered elsewhere”).
+- **What a Tool costs.** Besides p50/p95 latency and Cost per Success
+  (§8.1), Tool detail shows the Tool's own model use per call.
+  - **What counts:** tokens spent by its `llm` calls and the `agents.run`
+    sub-agents it starts, charged to the Invocation that made them
+    (`invocations.model_tokens`, `model_cost`, `model_unpriced`; schema
+    v44).
+  - **Cost:** `ToolMetricsInfo.model_tokens_per_call` and
+    `model_cost_per_call` average over all calls. USD comes from
+    `provider.prices` at the time of the call; if any model used was
+    unpriced, the cost is left out rather than understated.
+  - **Where it shows:** TUI "model use", web "Model use", and `formless
+    tools show` (with p50 and p95). Tools that never use a model show
+    nothing extra.
 - **Dependencies.** `ToolDetail.uses` lists the Tools a Tool's current
   code calls, and `ToolDetail.modules` the modules it loads.
   - **Which calls count:** literal names only, from `tools.call("x")`,
