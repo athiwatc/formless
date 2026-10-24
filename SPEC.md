@@ -2243,6 +2243,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   plus `runs`, `relay status` and `daemon status`. `relay status --json`
   leaves out the browser link (it holds the secret) and says `paired`.
   `daemon status --json` prints `{"running": false}` when no daemon runs.
+- `formless daemon restart` waits for the running Runs to finish, or with
+  `--force` interrupts them (waiting up to 15 s for them to stop). It then
+  shuts the daemon down, waits until the old process has exited (socket
+  closed, lock removed), and starts a fresh one. `daemon status` reports
+  the daemon's `version` and `running_sessions` for this.
 - `formless completions <bash|zsh|fish|powershell|elvish>` prints a
   completion script, generated from the command definitions (clap_complete),
   with no daemon or profile needed. `scripts/install.sh` writes bash, zsh
