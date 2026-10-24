@@ -125,6 +125,7 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    DryRunTool,
     PreviewTool,
     UndoRegistry,
     GetModule,
@@ -1484,6 +1485,15 @@ impl App {
                                 self.start_run_editor(&d);
                                 self.tool_detail = Some(d);
                             }
+                        }
+                        Pending::DryRunTool => {
+                            self.pager = Some(Pager {
+                                title: "Dry run (nothing was changed)".into(),
+                                lines: dry_run_lines(&result),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
                         }
                         Pending::RunTool => {
                             let text = result["result"].as_str().unwrap_or_default();
@@ -4316,6 +4326,14 @@ impl App {
             return;
         }
         if ctrl && key.code == KeyCode::Char('d') {
+            if self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.mode == EditMode::Run)
+            {
+                self.run_from_editor(true);
+                return;
+            }
             if let Some(ed) = self.editor.as_ref().filter(|e| e.mode == EditMode::Code) {
                 self.request(
                     Pending::PreviewTool,
@@ -4335,34 +4353,12 @@ impl App {
                 self.save_tool_spec();
                 return;
             }
-            if let Some(ed) = self.editor.as_ref().filter(|e| e.mode == EditMode::Run) {
-                let input = match serde_json::from_str::<serde_json::Value>(&ed.text()) {
-                    Ok(v) if v.is_object() => v,
-                    Ok(_) => {
-                        self.notes.push("the input must be a JSON object".into());
-                        return;
-                    }
-                    Err(e) => {
-                        self.notes.push(format!("not valid JSON: {e}"));
-                        return;
-                    }
-                };
-                let Some(session_id) = self.current.clone() else {
-                    self.notes
-                        .push("open a Session first: the run belongs to one".into());
-                    return;
-                };
-                let (id, name) = (ed.tool_id.clone(), ed.name.clone());
-                self.editor = None;
-                self.notes.push(format!("running {name}…"));
-                self.request(
-                    Pending::RunTool,
-                    Request::RunTool {
-                        id,
-                        input,
-                        session_id,
-                    },
-                );
+            if self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.mode == EditMode::Run)
+            {
+                self.run_from_editor(false);
                 return;
             }
             if let Some(ed) = self.editor.as_ref().filter(|e| e.mode == EditMode::Module) {
@@ -5019,6 +5015,53 @@ impl App {
 
     fn visible_proposals(&self) -> Vec<usize> {
         lists::proposals(&self.proposals, &self.proposal_filter)
+    }
+
+    /// Run the Tool with the run editor's input, for real or as a dry run
+    /// (Ctrl+D: nothing changes, the would-be effects are shown).
+    fn run_from_editor(&mut self, dry: bool) {
+        let Some(ed) = self.editor.as_ref() else {
+            return;
+        };
+        let input = match serde_json::from_str::<serde_json::Value>(&ed.text()) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => {
+                self.notes.push("the input must be a JSON object".into());
+                return;
+            }
+            Err(e) => {
+                self.notes.push(format!("not valid JSON: {e}"));
+                return;
+            }
+        };
+        let Some(session_id) = self.current.clone() else {
+            self.notes
+                .push("open a Session first: the run belongs to one".into());
+            return;
+        };
+        let (id, name) = (ed.tool_id.clone(), ed.name.clone());
+        self.editor = None;
+        if dry {
+            self.notes.push(format!("dry run of {name}…"));
+            self.request(
+                Pending::DryRunTool,
+                Request::DryRunTool {
+                    id,
+                    input,
+                    session_id,
+                },
+            );
+        } else {
+            self.notes.push(format!("running {name}…"));
+            self.request(
+                Pending::RunTool,
+                Request::RunTool {
+                    id,
+                    input,
+                    session_id,
+                },
+            );
+        }
     }
 
     /// `/module NAME [edit | rollback N | delete]` (SPEC §7.7).
@@ -6785,6 +6828,35 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Whether a note reports a problem (it stays until dismissed).
+/// A dry run's report: its would-be effects, then its result or error.
+fn dry_run_lines(r: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let effects: Vec<&str> = r["effects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.as_str())
+        .collect();
+    if effects.is_empty() {
+        out.push("It would have had no side effects.".to_string());
+    } else {
+        out.push("It would have:".to_string());
+        out.extend(effects.iter().map(|e| format!("  • {e}")));
+    }
+    out.push(String::new());
+    if r["ok"] == true {
+        out.push("Result:".into());
+        let pretty = serde_json::to_string_pretty(&r["result"]).unwrap_or_default();
+        out.extend(pretty.lines().map(str::to_string));
+    } else {
+        out.push(format!(
+            "Error: {}",
+            r["error"].as_str().unwrap_or_default()
+        ));
+    }
+    out
+}
+
 /// "fetch_page, parse_html · modules csv", or "nothing".
 fn dependency_text(uses: &[String], modules: &[String]) -> String {
     let mut parts = Vec::new();
@@ -10747,7 +10819,9 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
             ),
             Span::styled(
                 match ed.mode {
-                    EditMode::Run => " Ctrl+S run (asks for approval as usual) · Esc cancel",
+                    EditMode::Run => {
+                        " Ctrl+S run (asks for approval as usual) · Ctrl+D dry run · Esc cancel"
+                    }
                     EditMode::Code => {
                         " Ctrl+D review diff and checks · Ctrl+S save as new version (smoke-tested) · Esc cancel"
                     }
@@ -12476,6 +12550,17 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(app.editor_review.is_none());
         assert_eq!(app.editor.as_ref().unwrap().text(), "function run(){}");
+    }
+
+    #[test]
+    fn dry_run_report_lists_effects_then_result() {
+        let r = serde_json::json!({"ok": true, "result": {"n": 1}, "effects": ["write 3 bytes to /tmp/x", "run touch /tmp/y"]});
+        let lines = dry_run_lines(&r);
+        assert_eq!(&lines[..3], ["It would have:", "  • write 3 bytes to /tmp/x", "  • run touch /tmp/y"]);
+        assert!(lines.contains(&"Result:".to_string()));
+        let failed = dry_run_lines(&serde_json::json!({"ok": false, "error": "boom", "effects": []}));
+        assert_eq!(failed[0], "It would have had no side effects.");
+        assert_eq!(failed.last().unwrap(), "Error: boom");
     }
 
     #[test]

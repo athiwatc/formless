@@ -23,11 +23,17 @@ pub enum HostMode {
     /// Optimiser replay (SPEC §8.4): fs-writes to a throwaway overlay,
     /// network and process denied outright, env empty (no real secrets).
     Replay,
+    /// A user's dry run (SPEC §10.4): reads are real; fs and store writes
+    /// go to a throwaway overlay; processes, non-GET requests, clipboard
+    /// writes, notifications, harness changes, sub-agents and nested Tool
+    /// calls are not made. Each would-be effect is logged as
+    /// "[dry run] would …".
+    DryRun,
 }
 
 impl HostMode {
     pub fn is_overlay(self) -> bool {
-        matches!(self, HostMode::Smoke | HostMode::Replay)
+        matches!(self, HostMode::Smoke | HostMode::Replay | HostMode::DryRun)
     }
 }
 
@@ -142,6 +148,8 @@ pub struct ExecError {
     /// a Smoke-mode host call, so the failure may be the stub's, not the
     /// Tool's: the smoke test is inconclusive rather than failed (§7.1).
     pub after_stub: bool,
+    /// `log` lines (and a dry run's would-be effects) before it failed.
+    pub logs: Vec<String>,
 }
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -613,6 +621,13 @@ fn modified_ms(m: &std::fs::Metadata) -> Option<u64> {
 }
 
 impl State {
+    /// A dry run's would-be effect, kept in the logs (SPEC §10.4).
+    fn would(&self, what: String) {
+        if let Ok(mut g) = self.logs.lock() {
+            g.push(format!("[dry run] would {what}"));
+        }
+    }
+
     /// Smoke-mode stub: remember that the Tool has seen fake data.
     fn stub<T>(&self, v: T) -> T {
         self.stubbed.store(true, Ordering::SeqCst);
@@ -656,6 +671,13 @@ impl State {
                 if self.mode == HostMode::Smoke {
                     return Err(self.stub(denied("tools.call in smoke test")));
                 }
+                if self.mode == HostMode::DryRun {
+                    let name = a["name"].as_str().unwrap_or_default();
+                    self.would(format!("call the Tool {name} with {}", a["input"]));
+                    return Err(denied(format!(
+                        "dry run: the nested call to {name} was not made"
+                    )));
+                }
                 let mut calls = self.calls.lock().unwrap();
                 calls.next_id += 1;
                 let id = calls.next_id;
@@ -671,7 +693,7 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(self.stub(json!(""))),
                     HostMode::Replay => Err(denied("clipboard denied in replay")),
-                    HostMode::Live => Ok(json!(clipboard_read()?)),
+                    HostMode::Live | HostMode::DryRun => Ok(json!(clipboard_read()?)),
                 }
             }
             "clipboard_write" => {
@@ -681,6 +703,11 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(Value::Null),
                     HostMode::Replay => Err(denied("clipboard denied in replay")),
+                    HostMode::DryRun => {
+                        let n = a["text"].as_str().unwrap_or_default().chars().count();
+                        self.would(format!("copy {n} characters to the clipboard"));
+                        Ok(Value::Null)
+                    }
                     HostMode::Live => {
                         clipboard_write(a["text"].as_str().unwrap_or_default())?;
                         Ok(Value::Null)
@@ -694,6 +721,13 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(Value::Null),
                     HostMode::Replay => Err(denied("notify denied in replay")),
+                    HostMode::DryRun => {
+                        self.would(format!(
+                            "show the notification \"{}\"",
+                            a["title"].as_str().unwrap_or_default()
+                        ));
+                        Ok(Value::Null)
+                    }
                     HostMode::Live => {
                         notify(
                             a["title"].as_str().unwrap_or_default(),
@@ -712,6 +746,15 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(self.stub(json!({"stubbed": true}))),
                     HostMode::Replay => Err(denied("harness denied in replay")),
+                    // Reading the setup is harmless; changing it is not done.
+                    HostMode::DryRun if scope == "read" => {
+                        self.ops
+                            .harness(op, &a["args"], a["reason"].as_str().unwrap_or_default())
+                    }
+                    HostMode::DryRun => {
+                        self.would(format!("change the harness: {op} {}", a["args"]));
+                        Ok(json!({"dry_run": true}))
+                    }
                     HostMode::Live => {
                         self.ops
                             .harness(op, &a["args"], a["reason"].as_str().unwrap_or_default())
@@ -731,6 +774,32 @@ impl State {
                 let value = a.get("value").filter(|v| !v.is_null());
                 match self.mode {
                     HostMode::Live => self.ops.kv(op, ns, key, value),
+                    // Reads see real values (and this run's writes); writes
+                    // stay in memory.
+                    HostMode::DryRun => {
+                        let mut kv = self.kv_overlay.lock().unwrap();
+                        let k = (ns.to_string(), key.to_string());
+                        match op {
+                            "get" => match kv.get(&k) {
+                                Some(v) => Ok(v.clone()),
+                                None => self.ops.kv(op, ns, key, None),
+                            },
+                            "set" => {
+                                self.would(format!(
+                                    "store {key} = {}",
+                                    value.cloned().unwrap_or(Value::Null)
+                                ));
+                                kv.insert(k, value.cloned().unwrap_or(Value::Null));
+                                Ok(Value::Null)
+                            }
+                            "delete" => {
+                                self.would(format!("delete the stored {key}"));
+                                kv.insert(k, Value::Null);
+                                Ok(json!(true))
+                            }
+                            _ => self.ops.kv(op, ns, key, value),
+                        }
+                    }
                     HostMode::Smoke | HostMode::Replay => {
                         let mut kv = self.kv_overlay.lock().unwrap();
                         let k = (ns.to_string(), key.to_string());
@@ -756,7 +825,8 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(self.stub(json!(""))),
                     HostMode::Replay => Err(denied("llm denied in replay")),
-                    HostMode::Live => Ok(json!(self.ops.llm_complete(
+                    // A model call changes nothing: made for real.
+                    HostMode::Live | HostMode::DryRun => Ok(json!(self.ops.llm_complete(
                         a["prompt"].as_str().unwrap_or_default(),
                         a["system"].as_str(),
                         model,
@@ -768,6 +838,13 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(self.stub(json!(""))),
                     HostMode::Replay => Err(denied("agent denied in replay")),
+                    HostMode::DryRun => {
+                        self.would(format!(
+                            "start a sub-agent on: {}",
+                            a["task"].as_str().unwrap_or_default()
+                        ));
+                        Ok(json!(""))
+                    }
                     HostMode::Live => Ok(json!(self.ops.run_subagent(
                         a["task"].as_str().unwrap_or_default(),
                         a["system"].as_str(),
@@ -798,7 +875,9 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(self.stub(json!(""))),
                     HostMode::Replay => Ok(json!("")),
-                    HostMode::Live => Ok(json!(std::env::var(key).unwrap_or_default())),
+                    HostMode::Live | HostMode::DryRun => {
+                        Ok(json!(std::env::var(key).unwrap_or_default()))
+                    }
                 }
             }
             "fetch" => self.fetch(a),
@@ -840,6 +919,14 @@ impl State {
                         Vec::new()
                     };
                     full.extend_from_slice(&data);
+                    if self.mode == HostMode::DryRun {
+                        self.would(format!(
+                            "{} {} bytes to {}",
+                            if append { "append" } else { "write" },
+                            data.len(),
+                            p.display()
+                        ));
+                    }
                     self.overlay_put(&p, Some(full));
                     return Ok(json!(data.len()));
                 }
@@ -892,12 +979,17 @@ impl State {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), true)?;
                 if !self.mode.is_overlay() {
                     std::fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                } else if self.mode == HostMode::DryRun {
+                    self.would(format!("create the folder {}", p.display()));
                 }
                 Ok(Value::Null)
             }
             "fs_remove" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), true)?;
                 if self.mode.is_overlay() {
+                    if self.mode == HostMode::DryRun {
+                        self.would(format!("delete {}", p.display()));
+                    }
                     self.overlay_put(&p, None);
                     return Ok(Value::Null);
                 }
@@ -927,6 +1019,9 @@ impl State {
                         }
                         None => std::fs::read(&from).map_err(|e| e.to_string())?,
                     };
+                    if self.mode == HostMode::DryRun {
+                        self.would(format!("rename {} to {}", from.display(), to.display()));
+                    }
                     self.overlay_put(&to, Some(bytes));
                     self.overlay_put(&from, None);
                     return Ok(Value::Null);
@@ -1224,12 +1319,31 @@ impl State {
         json!({"status": resp.status().as_u16(), "url": resp.url().as_str(), "headers": headers})
     }
 
+    /// In a dry run, a request that may change something (anything but
+    /// GET/HEAD) is logged, not sent: `Some(method)` when skipped.
+    fn dry_run_skips(&self, a: &Value, url: &str) -> Option<String> {
+        if self.mode != HostMode::DryRun {
+            return None;
+        }
+        let method = a["method"].as_str().unwrap_or("GET").to_uppercase();
+        if matches!(method.as_str(), "GET" | "HEAD") {
+            return None;
+        }
+        self.would(format!("send {method} {url}"));
+        Some(method)
+    }
+
     fn fetch(&self, a: &Value) -> Result<Value, String> {
         let url = a["url"].as_str().unwrap_or_default();
         let (parsed, scope) = self.check_net(url)?;
         let enc = enc_of(&a["encoding"])?;
         if self.mode == HostMode::Smoke {
             return Ok(self.stub(json!({"status": 200, "url": url, "headers": {}, "body": ""})));
+        }
+        if let Some(method) = self.dry_run_skips(a, url) {
+            return Ok(
+                json!({"status": 200, "url": url, "headers": {}, "body": "", "dry_run": method}),
+            );
         }
         let req = self.build_request(a, parsed, scope)?;
         let (mut meta, bytes) = self.cancellable(move || {
@@ -1248,6 +1362,11 @@ impl State {
         let enc = enc_of(&a["encoding"])?;
         if self.mode == HostMode::Smoke {
             return Ok(self.stub(json!({"id": 0, "status": 200, "url": url, "headers": {}})));
+        }
+        if let Some(method) = self.dry_run_skips(a, url) {
+            return Ok(
+                json!({"id": 0, "status": 200, "url": url, "headers": {}, "dry_run": method}),
+            );
         }
         let req = self.build_request(a, parsed, scope)?;
         let resp = self.cancellable(move || send_request(req))?;
@@ -1322,6 +1441,20 @@ impl State {
         }
         if self.mode == HostMode::Smoke {
             return Ok(self.stub(json!({"code": 0, "signal": null, "stdout": "", "stderr": ""})));
+        }
+        if self.mode == HostMode::DryRun {
+            let args: Vec<&str> = a["args"]
+                .as_array()
+                .map(|v| v.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            self.would(
+                format!("run {cmd} {}", args.join(" "))
+                    .trim_end()
+                    .to_string(),
+            );
+            return Ok(
+                json!({"code": 0, "signal": null, "stdout": "", "stderr": "", "dry_run": true}),
+            );
         }
         let enc = enc_of(&a["encoding"])?;
         let args: Vec<String> = a["args"]
@@ -1612,6 +1745,7 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
             kind: ExecErrorKind::Cancelled,
             message: "interrupted".into(),
             after_stub: false,
+            logs: Vec::new(),
         };
     }
     let low = msg.to_lowercase();
@@ -1629,6 +1763,7 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
         kind,
         message: msg.to_string(),
         after_stub: false,
+        logs: Vec::new(),
     }
 }
 
@@ -1747,6 +1882,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     let err = |e: &dyn std::fmt::Display| {
         let mut x = classify(&e.to_string(), cancelled.load(Ordering::SeqCst));
         x.after_stub = state.stubbed.load(Ordering::SeqCst);
+        x.logs = state.logs.lock().map(|l| l.clone()).unwrap_or_default();
         x
     };
     let runtime = Runtime::new().map_err(|e| err(&e))?;

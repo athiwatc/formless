@@ -1178,6 +1178,16 @@ pub enum Request {
         input: serde_json::Value,
         session_id: String,
     },
+    /// Run a Tool by hand without real side effects (SPEC §10.4): reads
+    /// are real, writes go to a throwaway overlay, processes and non-GET
+    /// requests aren't made. Same approval as a real run; not recorded as
+    /// an Invocation. `{ok, result?, error?, effects, logs}`, where
+    /// `effects` are the would-be effects ("write 12 bytes to /tmp/x").
+    DryRunTool {
+        id: String,
+        input: serde_json::Value,
+        session_id: String,
+    },
     /// Run Tool JS through the same syntax gate as saving, without saving
     /// (the web editor's inline errors): `{ok, error?, line?}`.
     CheckToolCode {

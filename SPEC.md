@@ -1977,6 +1977,22 @@ run_tool = "network_policy"     # a registry Tool, or…
     naming them. The TUI needs a second `x` (purge already needs a second
     `p`). The web asks to confirm. The CLI prints a warning, and
     `tools retire` asks on a terminal.
+- **Dry run.** A Tool can be run by hand without real side effects
+  (`DryRunTool {id, input, session_id}`; `HostMode::DryRun`).
+  - **Real:** reads (files, GET and HEAD requests, env, the store,
+    `harness.read`) and `llm` calls.
+  - **Not made, logged instead:** file and store writes go to a throwaway
+    overlay that the run itself can read back. Process runs, non-GET
+    requests, clipboard writes, notifications, harness changes, sub-agents
+    and nested Tool calls aren't made, and emitted output is thrown away.
+  - **Approval and recording:** input validation and approval are as for a
+    real run, but nothing is recorded as an Invocation.
+  - **Result:** `{ok, result?, error?, effects, logs}`, where `effects`
+    are the would-be effects in order ("write 12 bytes to /tmp/x", "run
+    touch /tmp/y", "send POST https://…"). They are kept even when the
+    run fails.
+  - **Where:** `formless tools run NAME --dry-run`, Ctrl+D in the TUI run
+    editor, and the "Dry run" box in the web's Try it form.
 - **Example call.** `ToolDetail.example` is the Tool's latest successful
   Invocation: its version, input and output as recorded (already
   redacted, §15), with the output cut to 4 KB. It is shown as "Example" in

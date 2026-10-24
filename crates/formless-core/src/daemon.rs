@@ -1704,6 +1704,14 @@ impl Daemon {
                 let result = self.call_tool_direct(&session_id, &tool.name, input).await;
                 Ok(json!({ "result": result }))
             }
+            Request::DryRunTool {
+                id,
+                input,
+                session_id,
+            } => {
+                let _ = self.with_store(|st| st.audit("user", "tool.dry_run", &id));
+                self.dry_run_tool(&session_id, &id, input).await
+            }
             Request::CheckToolCode { code } => {
                 // The gate evaluates top-level code (bounded), so off the
                 // async workers.
@@ -3569,6 +3577,106 @@ impl Daemon {
 
     /// Run one built-in or registry Tool call outside a model turn, as the
     /// agent would (approvals fail closed without a client).
+    /// A by-hand run in `HostMode::DryRun` (SPEC §10.4): validated and
+    /// approved like a real call, but not recorded as an Invocation; its
+    /// would-be effects come back instead.
+    async fn dry_run_tool(
+        self: &Arc<Self>,
+        session_id: &str,
+        id: &str,
+        mut input: Value,
+    ) -> Result<Value> {
+        let (info, ver) = self
+            .with_reader(|st| st.get_tool_current(id))?
+            .context("tool not found")?;
+        if info.retired || info.disabled {
+            bail!(
+                "'{}' is {}",
+                info.name,
+                if info.retired {
+                    "retired"
+                } else {
+                    "switched off"
+                }
+            );
+        }
+        if !input.is_object() {
+            bail!("the input must be a JSON object");
+        }
+        self.localize_input(session_id, &ver, &mut input);
+        let schema: Value =
+            serde_json::from_str(&ver.input_schema).unwrap_or(json!({"type": "object"}));
+        let compiled = toolreg::compile_schema(&schema)
+            .map_err(|e| anyhow!("tool has invalid input schema: {e}"))?;
+        toolreg::validate_against(&compiled, &input)
+            .map_err(|e| anyhow!("input failed schema validation: {e}"))?;
+        let caps = bound_caps(&ver, &input).map_err(|e| anyhow!(e))?;
+        let cfg = self.config()?;
+        let cancel = CancellationToken::new();
+        // Reads are real (files, GETs, env), so the usual approval applies.
+        if !self
+            .ensure_approval(&cfg, session_id, &info, &ver, &caps, Some(&input), &cancel)
+            .await
+        {
+            bail!("approval denied");
+        }
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let ops = Arc::new(NestedOps {
+            daemon: self.clone(),
+            kv_scope: format!("tool:{}", info.id),
+            session_id: session_id.to_string(),
+            run_id: "dry-run".into(),
+            parent_inv: None,
+            activity: None,
+            depth: 1,
+            agent_depth: 0,
+            agent_ok: false,
+            script: None,
+            cancel_flag: cancel_flag.clone(),
+            cancel,
+            cfg: cfg.clone(),
+            handle: tokio::runtime::Handle::current(),
+            emitted: StdMutex::new(None),
+            // Emitted output lands somewhere throwaway, too.
+            artifact_dir: std::env::temp_dir()
+                .join(format!("formless-dry-run-{}", uuid::Uuid::new_v4())),
+        });
+        let req = ExecRequest {
+            code: ver.code.clone(),
+            input,
+            caps,
+            memory_mb: ver.memory_mb,
+            mode: HostMode::DryRun,
+            overlay: None,
+            activity: None,
+            modules: self.module_code(),
+            cancel: cancel_flag,
+        };
+        let ops_dyn: Arc<dyn HostOps> = ops;
+        let outcome =
+            tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn)).await?;
+        let split = |all: Vec<String>| -> (Vec<String>, Vec<String>) {
+            let (effects, logs): (Vec<String>, Vec<String>) = all
+                .into_iter()
+                .partition(|l| l.starts_with("[dry run] would "));
+            let effects = effects
+                .into_iter()
+                .map(|e| e["[dry run] would ".len()..].to_string())
+                .collect();
+            (effects, logs)
+        };
+        Ok(match outcome {
+            Ok(out) => {
+                let (effects, logs) = split(out.logs);
+                json!({"ok": true, "result": out.output, "effects": effects, "logs": logs})
+            }
+            Err(e) => {
+                let (effects, logs) = split(e.logs);
+                json!({"ok": false, "error": e.message, "effects": effects, "logs": logs})
+            }
+        })
+    }
+
     pub async fn call_tool_direct(
         self: &Arc<Self>,
         session_id: &str,
