@@ -22,6 +22,9 @@ pub struct Config {
     pub mcp: McpCfg,
     pub skills: SkillsCfg,
     pub limits: LimitsCfg,
+    /// Trusted folders (SPEC §10.3). Set in config.toml only, never from
+    /// a client or by the agent.
+    pub security: SecurityCfg,
     /// `[[hooks]]` (SPEC §9.8): user policy and automation around Tool
     /// calls and Runs.
     pub hooks: Vec<HookCfg>,
@@ -31,6 +34,43 @@ pub struct Config {
     /// Roles: a purpose mapped to a provider + model, described for the
     /// agent so it can pick one for sub-agents (SPEC §4.5).
     pub roles: BTreeMap<String, RoleCfg>,
+}
+
+/// Folders whose file access needs no approval (SPEC §10.3). Reading
+/// files never asks; writing inside a trusted folder doesn't either.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SecurityCfg {
+    /// Absolute paths (or `~/…`).
+    pub trusted_paths: Vec<String>,
+    /// Approve writes inside them automatically (logged). False keeps
+    /// writes asking, as if no folder were trusted.
+    pub trust_writes: bool,
+}
+
+impl Default for SecurityCfg {
+    fn default() -> Self {
+        Self {
+            trusted_paths: Vec::new(),
+            trust_writes: true,
+        }
+    }
+}
+
+impl SecurityCfg {
+    /// The trusted folders with `~` expanded and trailing slashes gone.
+    pub fn roots(&self) -> Vec<String> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        self.trusted_paths
+            .iter()
+            .map(|p| match p.strip_prefix('~') {
+                Some(rest) if !home.is_empty() => format!("{home}{rest}"),
+                _ => p.clone(),
+            })
+            .map(|p| p.trim_end_matches('/').to_string())
+            .filter(|p| p.starts_with('/') && p.len() > 1)
+            .collect()
+    }
 }
 
 /// Opt-in spending limits (SPEC §5.2): unset means no limit. Dollar
