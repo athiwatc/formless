@@ -449,7 +449,18 @@ async fn tool_and_session_export_import_across_profiles() {
         store.set_tool_title(&tool_id, "Port checker").unwrap();
         store
             .record_invocation(
-                &tool_id, 1, None, None, None, "success", "", "{}", "{}", "", 1, 200,
+                &tool_id,
+                1,
+                None,
+                None,
+                None,
+                "success",
+                "",
+                r#"{"port":80}"#,
+                r#"{"open":true}"#,
+                "",
+                1,
+                200,
             )
             .unwrap();
         store.set_approval(&tool_id, &caps, 256).unwrap();
@@ -471,6 +482,9 @@ async fn tool_and_session_export_import_across_profiles() {
         .await;
     assert_eq!(bundle["format"], "formless.tool/1");
     assert_eq!(bundle["title"], "Port checker");
+    // The latest successful call travels as an example (SPEC §10.4).
+    assert_eq!(bundle["example"]["input"]["port"], 80, "{bundle}");
+    assert_eq!(bundle["example"]["output"]["open"], true);
     assert!(
         bundle.get("success_rate").is_none() && bundle.get("invocations").is_none(),
         "bundle must carry no metrics: {bundle}"

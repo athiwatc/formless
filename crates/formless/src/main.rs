@@ -3973,6 +3973,11 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
         };
         println!("\ninput schema:\n{}", pretty(&v.input_schema));
         println!("\noutput schema:\n{}", pretty(&v.output_schema));
+        if let Some(ex) = &d.example {
+            println!("\nexample (the latest successful call, v{}):", ex.version);
+            println!("input:\n{}", pretty(&ex.input));
+            println!("output:\n{}", pretty(&ex.output));
+        }
     }
 }
 

@@ -2796,6 +2796,7 @@ impl Store {
         };
         let attention =
             self.attention_reasons(&tool, &metrics, &optimiser_attempts, &recent_calls)?;
+        let example = self.tool_example(id)?;
         Ok(Some(formless_protocol::ToolDetail {
             tool,
             versions,
@@ -2805,6 +2806,41 @@ impl Store {
             approval,
             recent_calls,
             attention,
+            example,
+        }))
+    }
+
+    /// The latest successful Invocation of a Tool, as its example call
+    /// (inputs and outputs are redacted when recorded).
+    pub fn tool_example(&self, id: &str) -> Result<Option<formless_protocol::ToolExample>> {
+        use rusqlite::OptionalExtension;
+        const MAX: usize = 4_000;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT version, input, output, created_at FROM invocations
+                 WHERE tool_id=?1 AND status='success'
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![id],
+                |r| {
+                    Ok(formless_protocol::ToolExample {
+                        version: r.get(0)?,
+                        input: r.get(1)?,
+                        output: r.get(2)?,
+                        created_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row.map(|mut ex| {
+            if ex.output.len() > MAX {
+                let mut end = MAX;
+                while !ex.output.is_char_boundary(end) {
+                    end -= 1;
+                }
+                ex.output = format!("{}… (cut)", &ex.output[..end]);
+            }
+            ex
         }))
     }
 

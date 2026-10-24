@@ -9800,6 +9800,27 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                     ));
                 }
             }
+            if let Some(ex) = &d.example {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Example", bold_fg(app.color, Color::Cyan)),
+                    Span::styled(
+                        format!(
+                            "  the latest successful call (v{}, {})",
+                            ex.version,
+                            ui::relative_time(&ex.created_at, now)
+                        ),
+                        ui::dim(app.color),
+                    ),
+                ]));
+                for (k, v) in [("input", &ex.input), ("output", &ex.output)] {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        label(k),
+                        Span::raw(truncate_chars(&v.replace('\n', " "), 200)),
+                    ]));
+                }
+            }
             if !d.recent_calls.is_empty() {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
@@ -13381,10 +13402,20 @@ mod tests {
             version_metrics: vec![],
             approval: None,
             recent_calls: vec![],
+            example: Some(formless_protocol::ToolExample {
+                version: 1,
+                input: r#"{"repo":"/src/app"}"#.into(),
+                output: r#"{"author":"ada"}"#.into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            }),
             attention: vec![],
         });
         app.view = View::Tools;
         app.current = Some("s1".into());
+        // The detail shows a real call as an example (SPEC §10.4).
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Example"), "{screen}");
+        assert!(screen.contains(r#"output    {"author":"ada"}"#), "{screen}");
         app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         let ed = app.editor.as_ref().expect("run editor");
         assert_eq!(ed.mode, EditMode::Run);
@@ -13662,6 +13693,7 @@ mod tests {
             optimiser_attempts: vec![],
             version_metrics: vec![],
             approval: None,
+            example: None,
             recent_calls: vec![
                 call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z"),
                 call("i1", "success", "", "2026-01-01T10:00:00Z"),

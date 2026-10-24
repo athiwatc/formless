@@ -1867,6 +1867,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   participants (like two terminals on one tmux session); messages are
   attributed by client; an approval is resolved by **whoever answers
   first** (the other modal closes: “answered elsewhere”).
+- **Example call.** `ToolDetail.example` is the Tool's latest successful
+  Invocation: its version, input and output as recorded (already
+  redacted, §15), with the output cut to 4 KB. It is shown as "Example" in
+  the TUI and web Tool detail and in `formless tools show`. It also appears
+  in `read_tool`'s result, so the agent sees a real call, and travels in
+  export bundles as `example: {input, output}` (import ignores it).
 - **Tool trend.** `ToolInfo.recent` holds the outcomes of the last 40
   finished Invocations, oldest first (`s`/`f`; denied and cancelled
   calls don't count). The TUI Tools list shows the last 20 as a sparkline
