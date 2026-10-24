@@ -1817,6 +1817,7 @@ impl Daemon {
                 }
                 Ok(json!({"format": "formless.tools/1", "tools": tools}))
             }
+            Request::FetchToolBundle { url } => crate::import_url::fetch(&self.http, &url).await,
             Request::ImportTool { bundle } => {
                 let cfg = self.config()?;
                 if bundle["format"].as_str() == Some("formless.tools/1") {

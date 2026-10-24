@@ -982,6 +982,20 @@ pattern (§4.4).
 - Imports are **never auto-trusted**: Capabilities displayed, first-run
   approval applies (§10.3), metrics start at zero, author recorded as
   `import`. A name collision imports as a new Tool, never a silent overwrite.
+- **From a URL:** `formless tools import <https-url>` and the web's
+  "Import URL" take a link instead of a file.
+  - **What counts as a link:** an https URL to a bundle, a GitHub file page
+    (`github.com/…/blob/…`, read from its raw file), or a gist (the first
+    of its files that is a bundle, through the GitHub API). Anything not
+    https, larger than 2 MB, or not a `formless.tool/1` or
+    `formless.tools/1` bundle is refused.
+  - **Fetched by the daemon** (`FetchToolBundle {url}` → `{source, file,
+    bundle}`), which only previews.
+  - **Shown before import:** the client shows the source and, for each
+    Tool, its Capabilities (broad ones flagged), memory and full code.
+    Importing takes a second, explicit yes (`--yes` for scripts; without a
+    terminal and without `--yes` the CLI refuses).
+  - The same never-trusted rules apply as for a file.
 - Skills export the same way (`formless skills export <name>|--all`,
   `formless.skill/1`: the files only, no loads or history). An import is
   author `import`, becomes the next version of a same-named skill, and is
