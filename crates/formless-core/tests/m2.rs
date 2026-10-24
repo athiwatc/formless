@@ -271,6 +271,16 @@ fn sse_tool_call(id: &str, name: &str, args: Value) -> String {
     let delta = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": id, "function": {"name": name, "arguments": args.to_string()}}]}}]});
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
+/// Several tool calls in one model turn: a parallel batch (SPEC §5.2).
+fn sse_tool_calls(calls: &[(&str, &str, Value)]) -> String {
+    let calls: Vec<Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (id, name, args))| json!({"index": i, "id": id, "function": {"name": name, "arguments": args.to_string()}}))
+        .collect();
+    let delta = json!({"choices": [{"delta": {"tool_calls": calls}}]});
+    format!("data: {delta}\n\ndata: [DONE]\n\n")
+}
 fn sse_text(text: &str) -> String {
     let delta = json!({"choices": [{"delta": {"content": text}}]});
     format!("data: {delta}\n\ndata: [DONE]\n\n")
@@ -310,6 +320,11 @@ async fn mock_m2_server(workdir: String) -> String {
                             "capabilities": [format!("fs:write:{workdir}"), format!("fs:read:{workdir}")]
                         }))
                     }
+                    // "twice": two calls of the new Tool in one turn.
+                    1 if msgs.iter().any(|m| m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.contains("twice"))) => sse_tool_calls(&[
+                        ("c2", "echo_write", json!({"text": "hello-m2"})),
+                        ("c2b", "echo_write", json!({"text": "hello-m2"})),
+                    ]),
                     1 => sse_tool_call("c2", "echo_write", json!({"text": "hello-m2"})),
                     // A second call of the same Tool in the same Session.
                     2 => sse_tool_call("c3", "echo_write", json!({"text": "hello-m2"})),
@@ -347,6 +362,7 @@ async fn scripted_flow(
     Vec<formless_protocol::ToolChange>,
     Option<String>,
     usize,
+    Vec<Option<formless_protocol::ApprovalBatch>>,
 ) {
     use formless_core::daemon::Daemon;
     use formless_core::Config;
@@ -414,7 +430,12 @@ async fn scripted_flow(
         protocol: PROTOCOL_VERSION,
         request: Request::SendMessage {
             session_id: session_id.clone(),
-            content: "write hello".into(),
+            content: if tag.ends_with('b') {
+                "write hello twice"
+            } else {
+                "write hello"
+            }
+            .into(),
             mode: SendMode::Send,
         },
     };
@@ -428,13 +449,17 @@ async fn scripted_flow(
     let mut tool_changes = Vec::new();
     let mut summary = None;
     let mut prompts = 0;
+    let mut batches = Vec::new();
     let mut next_id = 100u64;
     while let Some(line) = lines.next_line().await.unwrap() {
         if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
             match ev {
                 Event::MessageDelta { delta, .. } => final_text.push_str(&delta),
-                Event::ApprovalRequested { approval_id, .. } => {
+                Event::ApprovalRequested {
+                    approval_id, batch, ..
+                } => {
                     prompts += 1;
+                    batches.push(batch);
                     next_id += 1;
                     let env = RequestEnvelope {
                         id: next_id,
@@ -475,13 +500,21 @@ async fn scripted_flow(
         }
     }
     server.abort();
-    (final_text, paths, workdir, tool_changes, summary, prompts)
+    (
+        final_text,
+        paths,
+        workdir,
+        tool_changes,
+        summary,
+        prompts,
+        batches,
+    )
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_builds_and_uses_tool_with_approval() {
-    let (final_text, paths, workdir, changes, summary, prompts) =
+    let (final_text, paths, workdir, changes, summary, prompts, _) =
         scripted_flow("m2a", true, formless_protocol::ApprovalScope::Always).await;
     assert_eq!(prompts, 1, "a stored approval covers the second call");
     // The approval came with a plain-language summary (SPEC §10.3), and it
@@ -528,7 +561,7 @@ async fn daemon_builds_and_uses_tool_with_approval() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_once_runs_the_tool_without_storing_a_grant() {
-    let (final_text, paths, workdir, _, _, prompts) =
+    let (final_text, paths, workdir, _, _, prompts, _) =
         scripted_flow("m2o", true, formless_protocol::ApprovalScope::Once).await;
     assert_eq!(prompts, 2, "once means asking again on the next call");
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
@@ -544,7 +577,7 @@ async fn approve_once_runs_the_tool_without_storing_a_grant() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant() {
-    let (final_text, paths, _, _, _, prompts) =
+    let (final_text, paths, _, _, _, prompts, _) =
         scripted_flow("m2s", true, formless_protocol::ApprovalScope::Session).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(
@@ -562,7 +595,7 @@ async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant(
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_for_an_hour_covers_later_calls_without_storing_a_grant() {
-    let (final_text, paths, _, _, _, prompts) =
+    let (final_text, paths, _, _, _, prompts, _) =
         scripted_flow("m2h", true, formless_protocol::ApprovalScope::Hour).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(prompts, 1, "the hour covers the second call (SPEC §10.3)");
@@ -576,8 +609,27 @@ async fn approve_for_an_hour_covers_later_calls_without_storing_a_grant() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_batch_lists_each_held_call_and_asks_for_each() {
+    // Two calls of the new Tool in one turn, each answered "once".
+    let (final_text, _, _, _, _, prompts, batches) =
+        scripted_flow("m2b", true, formless_protocol::ApprovalScope::Once).await;
+    assert!(final_text.contains("hello-m2"), "final text: {final_text}");
+    assert_eq!(prompts, 2, "each held call is asked on its own");
+    let indexes: Vec<usize> = batches.iter().map(|b| b.as_ref().unwrap().index).collect();
+    assert_eq!(indexes, [1, 2]);
+    let b = batches[0].as_ref().unwrap();
+    assert_eq!(b.batch_id, batches[1].as_ref().unwrap().batch_id);
+    assert_eq!(b.calls.len(), 2);
+    assert!(b
+        .calls
+        .iter()
+        .all(|c| c.tool_name == "echo_write" && !c.new_capabilities.is_empty()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
-    let (final_text, paths, workdir, _, _, _) =
+    let (final_text, paths, workdir, _, _, _, _) =
         scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;
     assert!(
         final_text.to_lowercase().contains("denied"),

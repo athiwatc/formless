@@ -1776,6 +1776,16 @@
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
     body.replaceChildren(h("div", null,
+      // A parallel batch: every held call, each answered on its own (§5.2).
+      req.batch ? h("div", { class: "batch-list" },
+        h("strong", null, "Call " + req.batch.index + " of " + req.batch.calls.length + " held in this batch: answer each one"),
+        h("ol", null, req.batch.calls.map((c, i) => {
+          const answered = ((S.batchAnswers || {})[req.batch.batch_id] || {})[i + 1];
+          const now = i + 1 === req.batch.index;
+          return h("li", { class: now ? "now" : "muted" },
+            h("span", { class: "batch-state" }, answered || (now ? "▶ now" : "waiting")), " ", h("strong", null, c.tool_name), " ",
+            (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, cap)));
+        }))) : null,
       // What it does in plain words: AI-written, so labelled (SPEC §10.3).
       req.summary && !req.detail ? h("div", { class: "ai-summary" }, h("span", { class: "ai-label" }, "AI summary · may be wrong; the Capabilities are what counts"), h("p", null, req.summary)) : null,
       req.detail
@@ -1861,6 +1871,11 @@
   function decide(approved, scope) {
     const req = S.approvals.shift();
     if (!req) return;
+    // A batch's later prompts show how each earlier call was answered.
+    if (req.batch) {
+      const answers = (S.batchAnswers = S.batchAnswers || {})[req.batch.batch_id] = S.batchAnswers[req.batch.batch_id] || {};
+      answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
+    }
     if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
     else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always" });
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
@@ -3666,7 +3681,7 @@
       }
       case "approval_requested":
         S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
-          already: ev.already_allowed || [], code: ev.code_preview || null });
+          already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null });
         if (here) setActivity("awaiting your approval");
         renderApproval();
         break;

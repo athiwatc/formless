@@ -209,6 +209,9 @@ pub struct Daemon {
     /// Time-limited approvals by tool id: Capabilities, memory and when
     /// the grant ends (SPEC §10.3). In memory, never stored.
     timed_grants: StdMutex<HashMap<String, (Capabilities, u32, chrono::DateTime<chrono::Utc>)>>,
+    /// The parallel batch a Session's approvals belong to while
+    /// `approve_calls` asks: (batch id, held calls, next call to match).
+    approval_batches: StdMutex<HashMap<String, (String, Vec<HeldCall>, usize)>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -296,6 +299,7 @@ impl Daemon {
             run_tool_changes: StdMutex::new(Default::default()),
             session_grants: StdMutex::new(Default::default()),
             timed_grants: StdMutex::new(Default::default()),
+            approval_batches: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
@@ -3173,6 +3177,129 @@ impl Daemon {
         cancel: &CancellationToken,
     ) -> Result<HashMap<String, bool>> {
         let mut denied: HashMap<String, bool> = HashMap::new();
+        // Several held calls in one batch: each prompt lists them all
+        // (SPEC §5.2), and each is still answered on its own.
+        let held = self.held_calls(cfg, session_id, calls)?;
+        if held.len() > 1 {
+            self.approval_batches.lock().unwrap().insert(
+                session_id.to_string(),
+                (uuid::Uuid::new_v4().to_string(), held, 0),
+            );
+        }
+        let result = self
+            .approve_each(cfg, session_id, run_id, calls, cancel, &mut denied)
+            .await;
+        self.approval_batches.lock().unwrap().remove(session_id);
+        result.map(|()| denied)
+    }
+
+    /// This prompt's place in the Session's batch, if one is being asked:
+    /// the next held call of this Tool.
+    fn batch_position(&self, session_id: &str, tool_name: &str) -> Option<ApprovalBatch> {
+        let mut batches = self.approval_batches.lock().unwrap();
+        let (batch_id, calls, next) = batches.get_mut(session_id)?;
+        let at = (*next..calls.len()).find(|&i| calls[i].tool_name == tool_name)?;
+        *next = at + 1;
+        Some(ApprovalBatch {
+            batch_id: batch_id.clone(),
+            index: at + 1,
+            calls: calls.clone(),
+        })
+    }
+
+    /// The calls of a batch that would ask for approval, in order.
+    fn held_calls(
+        &self,
+        cfg: &Config,
+        session_id: &str,
+        calls: &[ToolCall],
+    ) -> Result<Vec<HeldCall>> {
+        let mut held = Vec::new();
+        for tc in calls {
+            if toolreg::is_builtin(&tc.name) {
+                continue;
+            }
+            let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? else {
+                continue;
+            };
+            let Ok(mut input) = serde_json::from_str::<Value>(&tc.arguments) else {
+                continue;
+            };
+            self.localize_input(session_id, &ver, &mut input);
+            let Ok(caps) = bound_caps(&ver, &input) else {
+                continue;
+            };
+            if let Some(new) = self.uncovered(cfg, session_id, &info, &ver, &caps) {
+                held.push(HeldCall {
+                    tool_name: info.name.clone(),
+                    capabilities: caps.to_specs(),
+                    new_capabilities: new,
+                });
+            }
+        }
+        Ok(held)
+    }
+
+    /// `Some(new capabilities)` when this call would ask for approval (no
+    /// stored, Session or timed grant covers it); MCP Tools aside.
+    fn uncovered(
+        &self,
+        cfg: &Config,
+        session_id: &str,
+        info: &ToolInfo,
+        ver: &ToolVersionInfo,
+        caps: &Capabilities,
+    ) -> Option<Vec<String>> {
+        if !(caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb)
+            || !caps.mcp.is_empty()
+        {
+            return None;
+        }
+        let covered = |g: &Capabilities, mem: u32| g.covers(caps) && ver.memory_mb <= mem;
+        let prior = self
+            .with_reader(|st| st.get_approval(&info.id))
+            .ok()
+            .flatten();
+        if prior.as_ref().is_some_and(|(g, m)| covered(g, *m)) {
+            return None;
+        }
+        let key = (session_id.to_string(), info.id.clone());
+        if self
+            .session_grants
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|(g, m)| covered(g, *m))
+        {
+            return None;
+        }
+        if self
+            .timed_grants
+            .lock()
+            .unwrap()
+            .get(&info.id)
+            .is_some_and(|(g, m, until)| *until > chrono::Utc::now() && covered(g, *m))
+        {
+            return None;
+        }
+        let had = prior.map(|(g, _)| g.to_specs()).unwrap_or_default();
+        Some(
+            caps.to_specs()
+                .into_iter()
+                .filter(|c| !had.contains(c))
+                .collect(),
+        )
+    }
+
+    async fn approve_each(
+        self: &Arc<Self>,
+        cfg: &Config,
+        session_id: &str,
+        run_id: &str,
+        calls: &[ToolCall],
+        cancel: &CancellationToken,
+        denied: &mut HashMap<String, bool>,
+    ) -> Result<()> {
         for tc in calls {
             if toolreg::is_builtin(&tc.name) {
                 continue;
@@ -3208,7 +3335,7 @@ impl Daemon {
                 }
             }
         }
-        Ok(denied)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6534,6 +6661,7 @@ impl Daemon {
                 .unwrap_or_default(),
             code_preview: (!preview.is_empty()).then_some(preview),
             tool_id: Some(info.id.clone()),
+            batch: self.batch_position(session_id, &info.name),
         });
         if cfg.tools.approval_summaries && caps.mcp.is_empty() {
             self.send_approval_summary(cfg, session_id, &approval_id, info, ver);
@@ -7374,6 +7502,7 @@ impl Daemon {
             already_allowed: Vec::new(),
             code_preview: None,
             tool_id: None,
+            batch: None,
         });
         let answer = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),

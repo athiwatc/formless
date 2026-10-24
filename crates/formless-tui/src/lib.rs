@@ -961,6 +961,10 @@ struct App {
     module_delete_arm: Option<String>,
     /// AI-written summaries of what approvals' Tools do, by approval id.
     approval_summaries: HashMap<String, String>,
+    /// Batch positions of held calls, by approval id (SPEC §5.2) …
+    approval_batches: HashMap<String, ApprovalBatch>,
+    /// … and what was answered for each call, by batch id: (index, word).
+    batch_answers: HashMap<String, Vec<(usize, String)>>,
     model_stats: Vec<ModelStatInfo>,
     /// Run outcomes for the Metrics title (SPEC §8.7).
     run_summary: Option<formless_protocol::RunSummary>,
@@ -1163,6 +1167,8 @@ impl App {
             module_detail: None,
             module_delete_arm: None,
             approval_summaries: HashMap::new(),
+            approval_batches: HashMap::new(),
+            batch_answers: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
             builtin_stats: Vec::new(),
@@ -2591,7 +2597,11 @@ impl App {
                 already_allowed,
                 code_preview,
                 tool_id,
+                batch,
             } => {
+                if let Some(b) = batch {
+                    self.approval_batches.insert(approval_id.clone(), b);
+                }
                 // Approvals stay global: a backgrounded Run still needs one.
                 if self.is_current(&session_id) {
                     self.set_activity("awaiting your approval");
@@ -4569,6 +4579,7 @@ impl App {
             }
             if c == 'o' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
+                self.note_batch_answer(&req.approval_id, "once");
                 self.fire(Request::ApprovalDecision {
                     approval_id: req.approval_id,
                     approved: true,
@@ -4579,6 +4590,7 @@ impl App {
             }
             if c == '1' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
+                self.note_batch_answer(&req.approval_id, "for 1 hour");
                 self.fire(Request::ApprovalDecision {
                     approval_id: req.approval_id,
                     approved: true,
@@ -4590,6 +4602,7 @@ impl App {
             }
             if c == 's' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
+                self.note_batch_answer(&req.approval_id, "this Session");
                 self.fire(Request::ApprovalDecision {
                     approval_id: req.approval_id,
                     approved: true,
@@ -4602,6 +4615,10 @@ impl App {
             if c == 'y' || c == 'n' {
                 if !self.approvals.is_empty() {
                     let req = self.approvals.pop_front().unwrap();
+                    self.note_batch_answer(
+                        &req.approval_id,
+                        if c == 'y' { "always" } else { "denied" },
+                    );
                     self.fire(Request::ApprovalDecision {
                         approval_id: req.approval_id,
                         approved: c == 'y',
@@ -5164,6 +5181,15 @@ impl App {
             (other, _) => self.notes.push(format!(
                 "/module NAME [edit | rollback N | delete], not {other}"
             )),
+        }
+    }
+
+    /// Remember how a batch's held call was answered, for the list the
+    /// next prompts of that batch show.
+    fn note_batch_answer(&mut self, approval_id: &str, word: &str) {
+        if let Some(b) = self.approval_batches.remove(approval_id) {
+            let answers = self.batch_answers.entry(b.batch_id).or_default();
+            answers.push((b.index, word.to_string()));
         }
     }
 
@@ -6045,11 +6071,20 @@ fn draw(f: &mut Frame, app: &mut App) {
             .approval_summaries
             .get(&req.approval_id)
             .map(String::as_str);
+        let batch = app.approval_batches.get(&req.approval_id).map(|b| {
+            let answers = app
+                .batch_answers
+                .get(&b.batch_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            (b, answers)
+        });
         draw_approval(
             f,
             req,
             title,
             summary,
+            batch,
             promotion,
             more,
             app.color,
@@ -10625,6 +10660,7 @@ fn draw_approval(
     req: &ApprovalReq,
     title: &str,
     summary: Option<&str>,
+    batch: Option<(&ApprovalBatch, &[(usize, String)])>,
     promotion: bool,
     more: usize,
     color: bool,
@@ -10673,6 +10709,41 @@ fn draw_approval(
             Line::raw(""),
         ],
     };
+    // A parallel batch: every held call, each answered on its own (§5.2).
+    if let Some((b, answers)) = batch {
+        let mut head = vec![Line::styled(
+            format!(
+                "Call {} of {} held in this batch: answer each one",
+                b.index,
+                b.calls.len()
+            ),
+            bold_fg(color, Color::Yellow),
+        )];
+        for (i, call) in b.calls.iter().enumerate() {
+            let n = i + 1;
+            let state = match answers.iter().find(|(k, _)| *k == n) {
+                Some((_, word)) => format!("{word:>12}"),
+                None if n == b.index => format!("{:>12}", "▶ now"),
+                None => format!("{:>12}", "waiting"),
+            };
+            let caps = if call.new_capabilities.is_empty() {
+                call.capabilities.join(", ")
+            } else {
+                format!("new: {}", call.new_capabilities.join(", "))
+            };
+            let style = if n == b.index {
+                bold_fg(color, Color::Yellow)
+            } else {
+                ui::dim(color)
+            };
+            head.push(Line::styled(
+                format!("  {state}  {n}. {}  {caps}", call.tool_name),
+                style,
+            ));
+        }
+        head.push(Line::raw(""));
+        lines.splice(0..0, head);
+    }
     // What it does in plain words, AI-written and labelled so (SPEC §10.3).
     if let Some(text) = summary.filter(|_| req.detail.is_none()) {
         lines.insert(
@@ -11522,6 +11593,8 @@ mod tests {
             module_detail: None,
             module_delete_arm: None,
             approval_summaries: HashMap::new(),
+            approval_batches: HashMap::new(),
+            batch_answers: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
             builtin_stats: Vec::new(),
@@ -11652,6 +11725,7 @@ mod tests {
             already_allowed: vec![],
             code_preview: None,
             tool_id: None,
+            batch: None,
         });
         assert!(app
             .activity_text()
@@ -12435,6 +12509,7 @@ mod tests {
             already_allowed: vec![],
             code_preview: None,
             tool_id: None,
+            batch: None,
         });
         assert!(app.notifications.is_empty());
         app.focused = false;
@@ -12616,6 +12691,62 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_lists_each_held_call_with_its_answer() {
+        let mut app = test_app();
+        let calls = vec![
+            HeldCall {
+                tool_name: "fetch_page".into(),
+                capabilities: vec!["net:a.com".into()],
+                new_capabilities: vec!["net:a.com".into()],
+            },
+            HeldCall {
+                tool_name: "save_file".into(),
+                capabilities: vec!["fs:write:/tmp/x".into()],
+                new_capabilities: vec!["fs:write:/tmp/x".into()],
+            },
+        ];
+        for (i, (id, tool)) in [("a1", "fetch_page"), ("a2", "save_file")]
+            .iter()
+            .enumerate()
+        {
+            app.on_event(Event::ApprovalRequested {
+                approval_id: id.to_string(),
+                session_id: "s".into(),
+                tool_name: tool.to_string(),
+                version: 1,
+                capabilities: calls[i].capabilities.clone(),
+                memory_mb: 64,
+                detail: None,
+                already_allowed: vec![],
+                code_preview: None,
+                tool_id: None,
+                batch: Some(ApprovalBatch {
+                    batch_id: "b".into(),
+                    index: i + 1,
+                    calls: calls.clone(),
+                }),
+            });
+        }
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Call 1 of 2 held in this batch"),
+            "{screen}"
+        );
+        assert!(screen.contains("1. fetch_page  new: net:a.com"), "{screen}");
+        assert!(
+            screen.contains("2. save_file  new: fs:write:/tmp/x"),
+            "{screen}"
+        );
+        // Approve the first once; the second's prompt shows that answer.
+        app.input_focus = false;
+        app.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Call 2 of 2"), "{screen}");
+        assert!(screen.contains("once  1. fetch_page"), "{screen}");
+        assert!(screen.contains("▶ now  2. save_file"), "{screen}");
+    }
+
+    #[test]
     fn approvals_show_the_ai_summary_when_it_arrives() {
         let mut app = test_app();
         app.on_event(Event::ApprovalRequested {
@@ -12629,6 +12760,7 @@ mod tests {
             already_allowed: vec![],
             code_preview: None,
             tool_id: Some("t".into()),
+            batch: None,
         });
         let screen = render(&mut app, 120, 30);
         assert!(!screen.contains("AI summary"));
@@ -12666,6 +12798,7 @@ mod tests {
             already_allowed: vec![],
             code_preview: None,
             tool_id: Some("t".into()),
+            batch: None,
         });
         app.input_focus = false;
         app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
@@ -14175,6 +14308,7 @@ mod tests {
             already_allowed: vec![],
             code_preview: None,
             tool_id: None,
+            batch: None,
         });
         app.on_event(Event::ApprovalAnswered {
             approval_id: "a1".into(),
