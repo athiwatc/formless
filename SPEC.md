@@ -1922,8 +1922,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   later calls in the same Session, accumulating like a stored grant. It
   is kept only in the daemon's memory, keyed by Session and Tool, and ends
   when the Session is deleted or the daemon restarts; other Sessions
-  still ask. For MCP server approvals it acts as *once*. Headless `--yes`
-  answers every prompt with *once*.
+  still ask. **For an hour** (`1` in the TUI and web, `h` in plain mode,
+  scope `hour`) covers the Tool's calls in every Session for the next
+  hour, accumulating the same way. It too is kept only in memory: when it
+  ends, or the daemon restarts, the next call asks again. For MCP
+  server approvals,
+  both act as *once*. Headless `--yes` answers every prompt with *once*.
 - The prompt (`ApprovalRequested`) carries `already_allowed`, the Tool's
   current grant. Clients mark those Capabilities "already allowed" and the
   rest "new". It also carries `code_preview`, the first 15 lines of the

@@ -3598,7 +3598,7 @@ impl App {
                     .collect();
                 for w in waiting {
                     self.notes.push(format!(
-                        "{w} · answer in the dialog: y always, o once, s this Session, n deny"
+                        "{w} · answer in the dialog: y always, o once, s this Session, 1 for an hour, n deny"
                     ));
                 }
             }
@@ -4544,7 +4544,7 @@ impl App {
             // Typing anything else while the approval has focus moves
             // focus to the input (and types it).
             if modal_keys
-                && !matches!(c, 'y' | 'n' | 'o' | 's' | 'v' | '?')
+                && !matches!(c, 'y' | 'n' | 'o' | 's' | '1' | 'v' | '?')
                 && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             {
                 self.input_focus = true;
@@ -4575,6 +4575,17 @@ impl App {
                     scope: ApprovalScope::Once,
                 });
                 self.notes.push(format!("approved {} once", req.tool_name));
+                return;
+            }
+            if c == '1' && !self.approvals.is_empty() {
+                let req = self.approvals.pop_front().unwrap();
+                self.fire(Request::ApprovalDecision {
+                    approval_id: req.approval_id,
+                    approved: true,
+                    scope: ApprovalScope::Hour,
+                });
+                self.notes
+                    .push(format!("approved {} for an hour", req.tool_name));
                 return;
             }
             if c == 's' && !self.approvals.is_empty() {
@@ -10748,6 +10759,11 @@ fn draw_approval(
             bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
         ));
         keys.push(Span::raw(" this Session    "));
+        keys.push(Span::styled(
+            " 1 ",
+            bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
+        ));
+        keys.push(Span::raw(" for 1 hour    "));
     }
     keys.extend([
         Span::styled(
@@ -12617,6 +12633,7 @@ mod tests {
         let screen = render(&mut app, 120, 30);
         assert!(!screen.contains("AI summary"));
         assert!(screen.contains("this Session"), "{screen}");
+        assert!(screen.contains("for 1 hour"), "{screen}");
         app.on_event(Event::ApprovalSummary {
             approval_id: "a1".into(),
             tool_id: "t".into(),
@@ -12637,6 +12654,23 @@ mod tests {
             app.notes.last().unwrap(),
             "approved echo_write for this Session"
         );
+        // `1` approves for an hour.
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "a2".into(),
+            session_id: "s".into(),
+            tool_name: "echo_write".into(),
+            version: 1,
+            capabilities: vec!["fs:write:/tmp".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: Some("t".into()),
+        });
+        app.input_focus = false;
+        app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(app.approvals.is_empty());
+        assert_eq!(app.notes.last().unwrap(), "approved echo_write for an hour");
     }
 
     #[test]

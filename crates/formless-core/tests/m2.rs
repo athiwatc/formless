@@ -561,6 +561,21 @@ async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant(
 
 #[cfg(unix)]
 #[tokio::test]
+async fn approve_for_an_hour_covers_later_calls_without_storing_a_grant() {
+    let (final_text, paths, _, _, _, prompts) =
+        scripted_flow("m2h", true, formless_protocol::ApprovalScope::Hour).await;
+    assert!(final_text.contains("hello-m2"), "final text: {final_text}");
+    assert_eq!(prompts, 1, "the hour covers the second call (SPEC §10.3)");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let (info, _) = store.get_tool_by_name("echo_write").unwrap().unwrap();
+    assert!(
+        store.get_approval(&info.id).unwrap().is_none(),
+        "not stored"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
     let (final_text, paths, workdir, _, _, _) =
         scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;

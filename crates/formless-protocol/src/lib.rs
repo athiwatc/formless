@@ -1322,6 +1322,9 @@ pub enum ApprovalScope {
     /// Every call of the Tool in this Session, until the Session is
     /// deleted (or the daemon restarts); never stored globally.
     Session,
+    /// Every call of the Tool, in any Session, for the next hour; then it
+    /// asks again. Kept in the daemon's memory only.
+    Hour,
     /// Stored for the Tool until its Capabilities widen.
     #[default]
     Always,
