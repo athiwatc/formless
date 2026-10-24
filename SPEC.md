@@ -1959,6 +1959,18 @@ run_tool = "network_policy"     # a registry Tool, or…
     folder named.
   - **Inside it:** a quiet "inside the working folder".
   - **No working folder:** only the secret folders are flagged.
+- **Trusted folders.** `[security] trusted_paths = ["~/code/app", …]`
+  lists folders whose file access needs no approval.
+  - **What's covered:** reading files never asks. A call whose only
+    sensitive Capabilities are `fs:write` inside a trusted folder (input
+    bound or fixed, resolved per call) runs without asking, and is logged
+    as `tool.approve_trusted`.
+  - **Never trusted:** paths with `..`, folders that hold secrets (`.ssh`,
+    …, as above), and anything else sensitive in the same call.
+  - **Turning writes off:** `trust_writes = false` keeps writes asking.
+  - **Where it's set:** `config.toml` only (`formless config edit`).
+    Clients can't set it over the protocol and the agent can't change it,
+    since it widens what runs unasked.
 - **One list of every grant.** `ListApprovals` returns `GrantInfo` rows,
   one per Capability, covering stored, Session and timed (`hour`) grants.
   - **Each row has:** Tool, Capability, scope, when the grant was last
@@ -2801,6 +2813,8 @@ Settings view shows, is missing here.
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
+| `security.trusted_paths` | [] | Folders where writes need no approval; config.toml only (§10.3) |
+| `security.trust_writes` | true | false keeps writes in trusted folders asking (§10.3) |
 | `tools.approval_summaries` | true | Ask the model, once per Tool version, for a plain-language summary shown on approval prompts (§10.3) |
 | `tools.subagent_max_turns` | 40 | Model turns a sub-agent may take (roles can override) (§4.6) |
 | `tools.task_min_samples` / `task_quality_bar` / `task_explore_rate` | 5 / 0.8 / 0.1 | Per-task routing for `auto` roles (§4.6) |

@@ -6729,6 +6729,17 @@ impl Daemon {
         if !needs {
             return true;
         }
+        // Only file access inside trusted folders: approved, and logged.
+        if trusted_only(&cfg.security, caps) && ver.memory_mb <= cfg.tools.default_memory_mb {
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "trusted",
+                    "tool.approve_trusted",
+                    &format!("{}: {}", info.name, caps.to_specs().join(", ")),
+                )
+            });
+            return true;
+        }
         let mut detail = None;
         if let Some(server) = caps.mcp.first() {
             match self
@@ -8010,6 +8021,41 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// Is everything sensitive these Capabilities ask for writing inside a
+/// trusted folder (SPEC §10.3)? (Reads never ask.) Not with
+/// `trust_writes = false`; paths with `..`, and folders that hold secrets
+/// (`.ssh`, …), are never trusted.
+fn trusted_only(sec: &crate::config::SecurityCfg, caps: &Capabilities) -> bool {
+    let roots = sec.roots();
+    if roots.is_empty() || !sec.trust_writes || !caps.mcp.is_empty() {
+        return false;
+    }
+    let inside = |spec: &str, path: &str| {
+        !path.split('/').any(|s| s == "..")
+            && !formless_protocol::path_note(spec, None).is_some_and(|(warn, _)| warn)
+            && roots
+                .iter()
+                .any(|r| path == r || path.starts_with(&format!("{r}/")))
+    };
+    let mut trusted_any = false;
+    let mut rest = Vec::new();
+    for spec in caps.to_specs() {
+        let ok = match spec.strip_prefix("fs:write:") {
+            Some(p) => inside(&spec, p),
+            None => spec.starts_with("fs:read:"),
+        };
+        if ok {
+            trusted_any = true;
+        } else {
+            rest.push(spec);
+        }
+    }
+    trusted_any
+        && Capabilities::parse(&rest)
+            .map(|c| !c.is_sensitive())
+            .unwrap_or(false)
 }
 
 /// Remove one Capability (or, with none, the whole grant) from an
