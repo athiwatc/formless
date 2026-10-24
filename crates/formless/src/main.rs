@@ -45,6 +45,16 @@ enum Cmd {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Line-mode chat: no full screen, for dumb terminals, SSH and screen
+    /// readers (approvals and questions are answered inline)
+    Chat {
+        /// Open this Session (default: the most recently used one)
+        #[arg(long, conflicts_with = "new")]
+        session: Option<String>,
+        /// Start a new Session
+        #[arg(long)]
+        new: bool,
+    },
     /// List or remove profiles (isolated data dirs made with --profile)
     Profiles {
         #[command(subcommand)]
@@ -783,6 +793,15 @@ fn main() -> Result<()> {
         ),
         Some(Cmd::Daemon { action }) => daemon_cmd(paths, action),
         Some(Cmd::Profiles { action }) => profiles_cmd(&paths, action),
+        Some(Cmd::Chat { session, new }) => {
+            use formless_tui::plain::{run_with, ChatStart};
+            let start = match (session, new) {
+                (Some(id), _) => ChatStart::Session(id),
+                (None, true) => ChatStart::New,
+                (None, false) => ChatStart::Recent,
+            };
+            run_with(paths, start, "chat")
+        }
         Some(Cmd::Doctor { json: true, .. }) => {
             println!("{}", serde_json::to_string_pretty(&doctor_json(&paths)?)?);
             Ok(())
