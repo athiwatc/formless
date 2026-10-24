@@ -2823,6 +2823,9 @@ impl Store {
             attention,
             example,
             listing_tokens: 0,
+            uses: Vec::new(),
+            modules: Vec::new(),
+            used_by: Vec::new(),
         }))
     }
 

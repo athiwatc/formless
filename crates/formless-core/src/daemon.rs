@@ -1715,7 +1715,19 @@ impl Daemon {
                 {
                     let def = toolreg::registry_definition(&d.tool, v);
                     d.listing_tokens = crate::storage::estimate_tokens(&def.to_string());
+                    (d.uses, d.modules) = toolreg::code_dependencies(&v.code);
                 }
+                // Who depends on it: active Tools whose code calls it.
+                d.used_by = self
+                    .with_reader(|st| st.current_tools())?
+                    .into_iter()
+                    .filter(|(t, v)| {
+                        t.id != d.tool.id
+                            && toolreg::code_dependencies(&v.code).0.contains(&d.tool.name)
+                    })
+                    .map(|(t, _)| t.name)
+                    .collect();
+                d.used_by.sort();
                 Ok(serde_json::to_value(d)?)
             }
             Request::RetireTool { id } => {

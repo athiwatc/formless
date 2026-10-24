@@ -921,6 +921,8 @@ struct App {
     invocations: Vec<formless_protocol::InvocationInfo>,
     promotions: std::collections::VecDeque<ApprovalReq>,
     purge_arm: Option<String>,
+    /// A Tool others call, waiting for a second `x` to retire it.
+    retire_arm: Option<String>,
     /// The last deleted Session, restorable with /undo while its window lasts.
     last_deleted: Option<(String, String)>,
     /// Open artifact viewer (/open).
@@ -1124,6 +1126,7 @@ impl App {
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
+            retire_arm: None,
             last_deleted: None,
             pager: None,
             delete_arm: None,
@@ -4802,9 +4805,21 @@ impl App {
                 }
                 KeyCode::Char('x') => {
                     if let Some(tool) = self.selected_tool().cloned() {
+                        let dependents = self.dependents_of(&tool.id);
                         if tool.retired {
                             self.fire(Request::RestoreTool { id: tool.id });
+                        } else if !dependents.is_empty()
+                            && self.retire_arm.as_deref() != Some(&tool.id)
+                        {
+                            // Others call it: their calls would fail (SPEC §10.4).
+                            self.notes.push(format!(
+                                "{} is used by {}; their calls to it will fail. Press x again to retire it.",
+                                tool.name,
+                                dependents.join(", ")
+                            ));
+                            self.retire_arm = Some(tool.id);
                         } else {
+                            self.retire_arm = None;
                             self.fire(Request::RetireTool { id: tool.id });
                         }
                     }
@@ -4844,7 +4859,16 @@ impl App {
                             self.fire(Request::PurgeTool { id: tool.id });
                         } else {
                             self.notes
-                                .push(format!("press p again to PURGE {} permanently", tool.name));
+                                .push(match self.dependents_of(&tool.id) {
+                                    d if d.is_empty() => {
+                                        format!("press p again to PURGE {} permanently", tool.name)
+                                    }
+                                    d => format!(
+                                        "{} is used by {}; press p again to PURGE it permanently anyway",
+                                        tool.name,
+                                        d.join(", ")
+                                    ),
+                                });
                             self.purge_arm = Some(tool.id);
                         }
                     }
@@ -4866,6 +4890,15 @@ impl App {
 
     fn visible_proposals(&self) -> Vec<usize> {
         lists::proposals(&self.proposals, &self.proposal_filter)
+    }
+
+    /// Tools whose code calls this one, from its loaded detail.
+    fn dependents_of(&self, tool_id: &str) -> Vec<String> {
+        self.tool_detail
+            .as_ref()
+            .filter(|d| d.tool.id == tool_id)
+            .map(|d| d.used_by.clone())
+            .unwrap_or_default()
     }
 
     /// `/tool NAME`: the Tools view with that Tool selected and its detail.
@@ -6552,6 +6585,22 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Whether a note reports a problem (it stays until dismissed).
+/// "fetch_page, parse_html · modules csv", or "nothing".
+fn dependency_text(uses: &[String], modules: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !uses.is_empty() {
+        parts.push(uses.join(", "));
+    }
+    if !modules.is_empty() {
+        parts.push(format!("modules {}", modules.join(", ")));
+    }
+    if parts.is_empty() {
+        "nothing".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 /// "Tools this Run: created search_repo v1, updated fetch_page v3".
 fn tool_changes_text(changes: &[ToolChange]) -> String {
     let parts: Vec<String> = changes
@@ -9820,6 +9869,16 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                         ]),
                         Line::from(versions),
                         Line::from(vec![
+                            label("uses"),
+                            Span::raw(dependency_text(&d.uses, &d.modules)),
+                            Span::styled("  · used by ", ui::dim(app.color)),
+                            Span::raw(if d.used_by.is_empty() {
+                                "no other Tool".to_string()
+                            } else {
+                                d.used_by.join(", ")
+                            }),
+                        ]),
+                        Line::from(vec![
                             label("caps"),
                             Span::raw(if d.tool.capabilities.is_empty() {
                                 "(none)".to_string()
@@ -10982,6 +11041,7 @@ mod tests {
             invocations: Vec::new(),
             promotions: std::collections::VecDeque::new(),
             purge_arm: None,
+            retire_arm: None,
             last_deleted: None,
             pager: None,
             delete_arm: None,
@@ -13540,6 +13600,9 @@ mod tests {
             approval: None,
             recent_calls: vec![],
             listing_tokens: 0,
+            uses: vec![],
+            modules: vec![],
+            used_by: vec![],
             example: Some(formless_protocol::ToolExample {
                 version: 1,
                 input: r#"{"repo":"/src/app"}"#.into(),
@@ -13554,6 +13617,16 @@ mod tests {
         let screen = render(&mut app, 100, 30);
         assert!(screen.contains("Example"), "{screen}");
         assert!(screen.contains(r#"output    {"author":"ada"}"#), "{screen}");
+        // Who calls it, and retiring it then takes a second x.
+        app.tool_detail.as_mut().unwrap().used_by = vec!["summarise_page".into()];
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("used by summarise_page"), "{screen}");
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.notes.last().unwrap().contains("Press x again"), "{:?}", app.notes.last());
+        assert_eq!(app.retire_arm.as_deref(), Some("t"));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.retire_arm, None);
+        app.tool_detail.as_mut().unwrap().used_by.clear();
         app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         let ed = app.editor.as_ref().expect("run editor");
         assert_eq!(ed.mode, EditMode::Run);
@@ -13841,6 +13914,9 @@ mod tests {
             version_metrics: vec![],
             approval: None,
             listing_tokens: 0,
+            uses: vec![],
+            modules: vec![],
+            used_by: vec![],
             example: None,
             recent_calls: vec![
                 call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z"),
