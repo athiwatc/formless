@@ -624,6 +624,49 @@ fn word_match(a: &str, b: &str) -> bool {
     a == b || (a.len() >= 3 && b.len() >= 3 && (a.starts_with(b) || b.starts_with(a)))
 }
 
+/// What a Tool's code depends on: the Tools it calls (`tools.call("x")`,
+/// or a saved script's `uses` list) and the modules it loads
+/// (`requireModule("y")`), each sorted and deduplicated. Only literal
+/// names count; a name built at run time can't be known.
+pub fn code_dependencies(code: &str) -> (Vec<String>, Vec<String>) {
+    fn literal_args(code: &str, call: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, _) in code.match_indices(call) {
+            let rest = code[i + call.len()..].trim_start();
+            let Some(q) = rest
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '"' | '\'' | '`'))
+            else {
+                continue;
+            };
+            if let Some(end) = rest[1..].find(q) {
+                let name = &rest[1..1 + end];
+                if !name.is_empty() && !name.contains("${") {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+    let mut tools = literal_args(code, "tools.call(");
+    // Scripts saved as Tools list what they may call (scripts.rs).
+    if let Some(i) = code.find("const __uses = ") {
+        let rest = &code[i + "const __uses = ".len()..];
+        if let Some(end) = rest.find(";\n") {
+            if let Ok(names) = serde_json::from_str::<Vec<String>>(&rest[..end]) {
+                tools.extend(names);
+            }
+        }
+    }
+    let mut modules = literal_args(code, "requireModule(");
+    for list in [&mut tools, &mut modules] {
+        list.sort();
+        list.dedup();
+    }
+    (tools, modules)
+}
+
 /// Tags as stored: lowercase, without `#`, letters, digits, `-` and `_`
 /// only, at most 24 characters each, no duplicates, at most 8.
 pub fn normalize_tags<'a>(raw: impl IntoIterator<Item = &'a str>) -> Vec<String> {

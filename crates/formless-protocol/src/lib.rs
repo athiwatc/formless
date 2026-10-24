@@ -474,6 +474,15 @@ pub struct ToolDetail {
     /// price of pinning it (SPEC §7.1).
     #[serde(default)]
     pub listing_tokens: usize,
+    /// Tools its current code calls (`tools.call`), sorted (SPEC §10.4).
+    #[serde(default)]
+    pub uses: Vec<String>,
+    /// Modules its current code loads (`requireModule`), sorted.
+    #[serde(default)]
+    pub modules: Vec<String>,
+    /// Active Tools whose current code calls this one, sorted.
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 /// One concrete call of a Tool: its (redacted) input and output, as

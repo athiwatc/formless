@@ -1922,6 +1922,19 @@ run_tool = "network_policy"     # a registry Tool, or…
   participants (like two terminals on one tmux session); messages are
   attributed by client; an approval is resolved by **whoever answers
   first** (the other modal closes: “answered elsewhere”).
+- **Dependencies.** `ToolDetail.uses` lists the Tools a Tool's current
+  code calls, and `ToolDetail.modules` the modules it loads.
+  - **Which calls count:** literal names only, from `tools.call("x")`,
+    `requireModule("y")` and a saved script's `uses` list. A name built at
+    run time can't be known.
+  - **Used by:** `ToolDetail.used_by` lists the active Tools whose current
+    code calls this one.
+  - **Where they show:** the TUI detail, the web detail (names link to
+    those Tools) and `formless tools show`.
+  - **Warnings:** retiring or purging a Tool that others use warns first,
+    naming them. The TUI needs a second `x` (purge already needs a second
+    `p`). The web asks to confirm. The CLI prints a warning, and
+    `tools retire` asks on a terminal.
 - **Example call.** `ToolDetail.example` is the Tool's latest successful
   Invocation: its version, input and output as recorded (already
   redacted, §15), with the output cut to 4 KB. It is shown as "Example" in

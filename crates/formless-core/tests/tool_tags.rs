@@ -97,3 +97,61 @@ async fn users_set_tags_through_the_daemon() {
     assert_eq!(t["tags"], serde_json::json!([]));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn dependencies_come_from_literal_calls_and_script_uses() {
+    use formless_core::tools::code_dependencies;
+    let code = r#"
+        const csv = requireModule("csv");
+        async function run(i) {
+            const a = await tools.call("fetch_page", {url: i.url});
+            const b = await tools.call( 'parse_html' , a);
+            await tools.call(`fetch_page`, {});
+            await tools.call(i.dynamic, {});
+            await tools.call(`x_${i.n}`, {});
+            return requireModule('csv').parse(b);
+        }"#;
+    let (tools, modules) = code_dependencies(code);
+    assert_eq!(tools, ["fetch_page", "parse_html"]);
+    assert_eq!(modules, ["csv"]);
+    // A script saved as a Tool lists what it may call.
+    let script =
+        formless_core::scripts::script_code("return 1;", &["a_tool".into(), "b_tool".into()]);
+    assert_eq!(code_dependencies(&script).0, ["a_tool", "b_tool"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_detail_lists_uses_and_used_by() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-deps-{short}"));
+    let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.provider.model = "m".into();
+    cfg.save(&paths).unwrap();
+    let base_id = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let caps = Capabilities::parse(&[]).unwrap();
+        let mk = |name: &str, code: &str| {
+            store
+                .create_tool_version(name, "d", "{}", "{}", code, &caps, 64, "agent")
+                .unwrap()
+                .0
+                .id
+        };
+        let base = mk("fetch_page", "function run(i){ return {}; }");
+        mk(
+            "summarise_page",
+            "async function run(i){ return tools.call('fetch_page', i); }",
+        );
+        base
+    };
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths).unwrap());
+    let d = daemon
+        .handle(Request::GetTool { id: base_id })
+        .await
+        .unwrap();
+    assert_eq!(d["used_by"], serde_json::json!(["summarise_page"]));
+    assert_eq!(d["uses"], serde_json::json!([]));
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -3807,6 +3807,14 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
         ToolsAction::Purge { name, force } => {
             use std::io::{BufRead, IsTerminal, Write};
             let tool = find_tool(&paths, &name)?;
+            let dependents = tool_dependents(&paths, &tool.id);
+            if !dependents.is_empty() {
+                eprintln!(
+                    "warning: {} is used by {}; their calls to it will fail",
+                    tool.name,
+                    dependents.join(", ")
+                );
+            }
             if !force {
                 if !std::io::stdin().is_terminal() {
                     eprintln!(
@@ -3915,10 +3923,36 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
-/// Retire or restore a Tool by name or id.
+/// Tools whose code calls this one (SPEC §10.4).
+fn tool_dependents(paths: &Paths, id: &str) -> Vec<String> {
+    formless_tui::client::request_once(paths, Request::GetTool { id: id.into() })
+        .ok()
+        .and_then(|v| serde_json::from_value(v["used_by"].clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Retire or restore a Tool by name or id. Retiring one that others call
+/// warns, and asks on a terminal.
 fn set_tool_retired(paths: &Paths, name: &str, retire: bool) -> Result<()> {
     let tool = find_tool(paths, name)?;
     let id = tool.id.clone();
+    let dependents = if retire {
+        tool_dependents(paths, &id)
+    } else {
+        Vec::new()
+    };
+    if !dependents.is_empty() {
+        eprintln!(
+            "warning: {} is used by {}; their calls to it will fail until it is restored",
+            tool.name,
+            dependents.join(", ")
+        );
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && !confirm("Retire it anyway? [y/N] ")? {
+            eprintln!("not retired");
+            std::process::exit(2);
+        }
+    }
     formless_tui::client::request_once(
         paths,
         if retire {
@@ -4090,6 +4124,20 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     }
     if !t.tags.is_empty() {
         println!("tags: {}", t.tags.join(" "));
+    }
+    if !d.uses.is_empty() || !d.modules.is_empty() {
+        println!(
+            "uses:         {}",
+            d.uses
+                .iter()
+                .cloned()
+                .chain(d.modules.iter().map(|m| format!("module {m}")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !d.used_by.is_empty() {
+        println!("used by:      {}", d.used_by.join(", "));
     }
     println!("{}", t.description);
     println!();

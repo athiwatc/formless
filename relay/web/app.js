@@ -2032,6 +2032,8 @@
           : h("button", { class: "version", type: "button", title: "Roll back to v" + v.version, onclick: () => rollbackTool(t, v.version) }, "v" + v.version + " " + v.author)))),
       h("dt", null, "Tags"), h("dd", null, h("input", { class: "tags-input", type: "text", value: (t.tags || []).join(" "), placeholder: "git web …", "aria-label": "Tags, separated by spaces", title: "Enter saves",
         onkeydown: (e) => { if (e.key === "Enter") act({ type: "set_tool_tags", id: t.id, tags: e.target.value.split(/[\s,]+/).filter(Boolean) }, "Tags saved"); } })),
+      h("dt", null, "Uses"), h("dd", null, dependencyLinks(d.uses), (d.modules || []).length ? h("span", { class: "muted" }, (d.uses || []).length ? " · modules " : "modules ", d.modules.join(", ")) : null, !(d.uses || []).length && !(d.modules || []).length ? h("span", { class: "muted" }, "nothing") : null),
+      h("dt", null, "Used by"), h("dd", null, (d.used_by || []).length ? dependencyLinks(d.used_by) : h("span", { class: "muted" }, "no other Tool")),
       h("dt", null, "Capabilities"), h("dd", null, capTags(t.capabilities)),
       h("dt", null, "Memory"), h("dd", null, t.memory_mb + " MB"),
       h("dt", null, "Approved"), h("dd", null, d.approval
@@ -2070,7 +2072,7 @@
       editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "" }; renderTools(); } }, "Edit code"),
       t.retired ? null : h("button", { class: "btn small", type: "button", onclick: () => tryTool(t, current) }, "Try it"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name) }, "Optimise"),
-      h("button", { class: "btn small", type: "button", onclick: () => act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name) }, t.retired ? "Restore" : "Retire"),
+      h("button", { class: "btn small", type: "button", onclick: () => retireTool(t, d) }, t.retired ? "Restore" : "Retire"),
       t.current_version > 1 ? h("button", { class: "btn small", type: "button", onclick: () => rollbackTool(t, t.current_version - 1) }, "Roll back") : null,
       t.retired ? null : h("button", { class: "btn small", type: "button", title: "Switched off: hidden from the agent and uncallable; versions and metrics stay", onclick: () => act({ type: "set_tool_disabled", id: t.id, disabled: !t.disabled }, (t.disabled ? "Switched on " : "Switched off ") + t.name) }, t.disabled ? "Switch on" : "Switch off"),
       h("button", { class: "btn small", type: "button", title: "Pinned Tools are listed to the agent in every Session (from its next listing)", onclick: () => act({ type: "set_tool_pinned", id: t.id, pinned: !t.pinned }, (t.pinned ? "Unpinned " : "Pinned ") + t.name) },
@@ -3148,8 +3150,24 @@
     ask({ title: "Roll back " + t.name + " to v" + version + "?", text: "Later Invocations use v" + version + "; every version is kept.", ok: "Roll back" })
       .then((ok) => { if (ok) act({ type: "rollback_tool", id: t.id, version }, t.name + " rolled back to v" + version).then(() => selectTool(t.id, true)); });
   }
+  /** Names of Tools, each opening its detail. */
+  function dependencyLinks(names) {
+    return (names || []).map((n, i) => [i ? ", " : null, h("button", { class: "linkish", type: "button", onclick: () => {
+      const t = S.tools.find((x) => x.name === n);
+      if (t) selectTool(t.id);
+    } }, n)]);
+  }
+  /** Retire (warning first when other Tools call it) or restore. */
+  async function retireTool(t, d) {
+    if (!t.retired && d && d.used_by && d.used_by.length) {
+      const ok = await ask({ title: "Retire " + t.name + "?", text: "It is used by " + d.used_by.join(", ") + "; their calls to it will fail until it is restored.", ok: "Retire", danger: true });
+      if (!ok) return;
+    }
+    act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name);
+  }
   async function purgeTool(t) {
-    const typed = await ask({ title: "Purge " + t.name + " permanently?", text: "All versions, metrics, and history are deleted. Type the Tool name to confirm.", input: true, placeholder: t.name, ok: "Purge", danger: true });
+    const users = S.toolDetail && S.toolDetail.tool.id === t.id ? S.toolDetail.used_by || [] : [];
+    const typed = await ask({ title: "Purge " + t.name + " permanently?", text: (users.length ? "It is used by " + users.join(", ") + "; their calls to it will fail. " : "") + "All versions, metrics, and history are deleted. Type the Tool name to confirm.", input: true, placeholder: t.name, ok: "Purge", danger: true });
     if (typed == null) return;
     if (typed.trim() !== t.name) { toast("Name did not match; nothing was purged.", true); return; }
     const r = await act({ type: "purge_tool", id: t.id }, "Purged " + t.name);
@@ -4048,7 +4066,7 @@
     { keys: ["k", "ArrowUp"], help: "previous Session or Tool", run: () => moveSelection(-1) },
     { keys: ["n"], help: "new Session", run: () => newSession() },
     { keys: ["a"], help: "show the pending approval or question", run: () => focusPending() },
-    { keys: ["x"], view: "tools", help: "retire / restore the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: t.retired ? "restore_tool" : "retire_tool", id: t.id }, (t.retired ? "Restored " : "Retired ") + t.name); } },
+    { keys: ["x"], view: "tools", help: "retire / restore the selected Tool", run: () => { const t = selectedTool(); if (t) retireTool(t, S.toolDetail && S.toolDetail.tool.id === t.id ? S.toolDetail : null); } },
     { keys: ["b"], view: "tools", help: "roll the selected Tool back one version", run: () => { const t = selectedTool(); if (t && t.current_version > 1) rollbackTool(t, t.current_version - 1); } },
     { keys: ["e"], view: "tools", help: "export the selected Tool", run: () => { const t = selectedTool(); if (t) exportTool(t); } },
     { keys: ["o"], view: "tools", help: "optimise the selected Tool", run: () => { const t = selectedTool(); if (t) act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name); } },
