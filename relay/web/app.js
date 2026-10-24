@@ -1776,6 +1776,8 @@
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
     body.replaceChildren(h("div", null,
+      // What it does in plain words: AI-written, so labelled (SPEC §10.3).
+      req.summary && !req.detail ? h("div", { class: "ai-summary" }, h("span", { class: "ai-label" }, "AI summary · may be wrong; the Capabilities are what counts"), h("p", null, req.summary)) : null,
       req.detail
         ? h("p", { class: "detail-text" }, req.detail)
         : h("p", null, "Tool ", h("strong", null, toolTitleByName(req.tool_name) || req.tool_name),
@@ -3653,6 +3655,11 @@
         // Answered elsewhere (or the Run stopped): close our prompt.
         if (S.questionId === ev.question_id) { S.questionId = null; S.pendingQuestion = null; if (S.questionOpen) closeAsk(null); renderStatus(); }
         break;
+      case "approval_summary": {
+        const req = S.approvals.find((a) => a.id === ev.approval_id);
+        if (req) { req.summary = ev.summary; renderApproval(); }
+        break;
+      }
       case "approval_requested":
         S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
           already: ev.already_allowed || [], code: ev.code_preview || null });

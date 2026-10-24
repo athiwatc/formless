@@ -1892,6 +1892,20 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### 10.3 Approvals (modal)
 
+- **Plain-language summary.** Code means little to non-programmers, so a
+  Tool's approval also shows what it does in a few plain sentences: what
+  it reads, what it changes or sends, anything risky.
+  - **How it's written:** the session's model writes it once per Tool
+    version, in the background (the prompt never waits for it). It's
+    cached in the daemon-only store (`harness:approval_summaries`,
+    `<tool id>:v<version>`) and sent as `ApprovalSummary {approval_id,
+    tool_id, version, summary}` after `ApprovalRequested`.
+  - **Labelling:** clients show it at the top, labelled as an AI summary
+    that may be wrong, with the Capabilities as what counts. The model
+    is told to treat the Tool's text as data, never instructions.
+  - **Which approvals:** MCP and other non-Tool approvals get none.
+  - **Turning it off:** `tools.approval_summaries = false`, so no model
+    call is made.
 - First execution of a Tool whose Capabilities are sensitive (`fs:write`,
   `net`, `process`, `env`, or any widening) requires approval. Approval is
   **per-Tool and survives version bumps; it re-prompts only when
@@ -2729,6 +2743,7 @@ Settings view shows, is missing here.
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
+| `tools.approval_summaries` | true | Ask the model, once per Tool version, for a plain-language summary shown on approval prompts (§10.3) |
 | `tools.subagent_max_turns` | 40 | Model turns a sub-agent may take (roles can override) (§4.6) |
 | `tools.task_min_samples` / `task_quality_bar` / `task_explore_rate` | 5 / 0.8 / 0.1 | Per-task routing for `auto` roles (§4.6) |
 | `tools.smoke_timeout_secs` | 10 | Creation smoke-test bound (§7.1) |

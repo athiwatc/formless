@@ -753,6 +753,9 @@ pub struct ToolsCfg {
     /// … and how often an under-sampled candidate is tried instead.
     #[serde(default = "default_task_explore_rate")]
     pub task_explore_rate: f64,
+    /// Ask the model, once per Tool version, for a plain-language summary
+    /// shown on approval prompts (SPEC §10.3).
+    pub approval_summaries: bool,
 }
 fn default_subagent_max_turns() -> u32 {
     40
@@ -813,6 +816,7 @@ impl Default for ToolsCfg {
             task_min_samples: default_task_min_samples(),
             task_quality_bar: default_task_quality_bar(),
             task_explore_rate: default_task_explore_rate(),
+            approval_summaries: true,
         }
     }
 }
