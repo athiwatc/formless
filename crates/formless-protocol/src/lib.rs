@@ -229,6 +229,49 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// Why a Capability is unusually broad, if it is (SPEC §10.3): bare `net`
+/// or `process`, `fs:write` on the whole disk or a home folder, or `env`
+/// for a key that looks like a secret. Approval prompts flag these loudly
+/// and ask twice before granting them beyond one call.
+pub fn broad_capability(spec: &str) -> Option<&'static str> {
+    match spec {
+        "net" => return Some("any host on the internet"),
+        "process" => return Some("any program on this computer"),
+        _ => {}
+    }
+    if let Some(path) = spec.strip_prefix("fs:write:") {
+        let p = path.trim_end_matches('/');
+        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let home = matches!(
+            parts.as_slice(),
+            [] | ["Users" | "home"] | ["Users" | "home", _] | ["root"]
+        );
+        if p.is_empty() || p == "~" || home {
+            return Some("writing anywhere in your files");
+        }
+    }
+    if let Some(key) = spec.strip_prefix("env:") {
+        let k = key.to_uppercase();
+        let secret = [
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "PRIVATE",
+            "AUTH",
+        ]
+        .iter()
+        .any(|w| k.contains(w))
+            || k.ends_with("KEY")
+            || k.ends_with("_PAT");
+        if secret {
+            return Some("a secret from your environment");
+        }
+    }
+    None
+}
+
 /// One granted Capability, for the central approvals list (SPEC §10.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GrantInfo {
@@ -1770,6 +1813,7 @@ mod tests {
             already_allowed: vec![],
             code_preview: None,
             tool_id: None,
+            batch: None,
         };
         assert_eq!(ev.session_id(), Some("s1"));
         let note = Event::Note {
@@ -1815,5 +1859,33 @@ mod tests {
             serde_json::from_str(r#"{"type":"answer_question","question_id":"q","answer":"a"}"#)
                 .unwrap();
         assert!(matches!(req, Request::AnswerQuestion { answers, .. } if answers.is_empty()));
+    }
+
+    #[test]
+    fn broad_capabilities_are_recognised() {
+        for broad in [
+            "net",
+            "process",
+            "fs:write:/",
+            "fs:write:/Users/ada",
+            "fs:write:/home/ada/",
+            "fs:write:~",
+            "env:GITHUB_TOKEN",
+            "env:OPENAI_API_KEY",
+            "env:DB_PASSWORD",
+        ] {
+            assert!(broad_capability(broad).is_some(), "{broad}");
+        }
+        for scoped in [
+            "net:example.com",
+            "process:git",
+            "fs:write:/Users/ada/project",
+            "fs:write:/tmp/out",
+            "fs:read:/",
+            "env:HOME",
+            "env:LANG",
+        ] {
+            assert!(broad_capability(scoped).is_none(), "{scoped}");
+        }
     }
 }

@@ -249,10 +249,27 @@
       return h("pre", null, text);
     }
   }
-  function isBroad(cap) { return cap === "net" || cap === "process"; }
+  /** Why a Capability is unusually broad, or null (SPEC §10.3; the same
+   * rule as `broad_capability` in the protocol crate). */
+  function broadWhy(cap) {
+    if (cap === "net") return "any host on the internet";
+    if (cap === "process") return "any program on this computer";
+    if (cap.startsWith("fs:write:")) {
+      const p = cap.slice(9).replace(/\/+$/, "");
+      const parts = p.split("/").filter(Boolean);
+      const home = parts.length === 0 || (["Users", "home"].includes(parts[0]) && parts.length <= 2) || (parts.length === 1 && parts[0] === "root");
+      if (p === "" || p === "~" || home) return "writing anywhere in your files";
+    }
+    if (cap.startsWith("env:")) {
+      const k = cap.slice(4).toUpperCase();
+      if (["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w)) || k.endsWith("KEY") || k.endsWith("_PAT")) return "a secret from your environment";
+    }
+    return null;
+  }
+  function isBroad(cap) { return broadWhy(cap) !== null; }
   function capTags(caps) {
     if (!caps || !caps.length) return h("span", { class: "muted" }, "none");
-    return caps.map((c) => h("span", { class: "tag" + (isBroad(c) ? " broad" : ""), title: isBroad(c) ? "unscoped — broad access" : null }, c));
+    return caps.map((c) => h("span", { class: "tag" + (isBroad(c) ? " broad" : ""), title: isBroad(c) ? "broad access: " + broadWhy(c) : null }, c));
   }
   function download(name, value) {
     downloadBlob(name, new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
@@ -1786,6 +1803,7 @@
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
     body.replaceChildren(h("div", null,
+      req.broadConfirm ? h("p", { class: "error broad-confirm" }, "This grants broad access. Press the same button (or key) again to confirm, or allow it once.") : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
         h("strong", null, "Call " + req.batch.index + " of " + req.batch.calls.length + " held in this batch: answer each one"),
@@ -1809,7 +1827,7 @@
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           (req.already || []).includes(c)
             ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
-            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " unscoped — broad access") : (req.already || []).length ? h("span", null, " new") : null)),
+            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null)),
         req.detail ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
       req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
       h("p", { class: "muted" }, promo
@@ -1879,6 +1897,17 @@
     else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   });
   function decide(approved, scope) {
+    // Granting broad access beyond this call takes a second press (§10.3).
+    const head = S.approvals[0];
+    if (approved && head && head.kind !== "promotion" && scope !== "once") {
+      const broad = (head.capabilities || []).filter((c) => !(head.already || []).includes(c) && isBroad(c));
+      if (broad.length && head.broadConfirm !== (scope || "always")) {
+        head.broadConfirm = scope || "always";
+        renderApproval();
+        toast("Broad access (" + broad.join(", ") + "): press again to grant it", true);
+        return;
+      }
+    }
     const req = S.approvals.shift();
     if (!req) return;
     // A batch's later prompts show how each earlier call was answered.
