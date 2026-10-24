@@ -106,6 +106,10 @@ pub struct ToolInfo {
     /// none. UIs show it first, with the name as secondary text.
     #[serde(default)]
     pub title: String,
+    /// Lowercase topic tags (`git`, `web`, `finance`), set by the agent or
+    /// the user (SPEC §7.2).
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub description: String,
     pub retired: bool,
     pub current_version: i64,
@@ -1099,6 +1103,11 @@ pub enum Request {
     },
     RetireTool {
         id: String,
+    },
+    /// Replace a Tool's tags (normalised; an empty list clears them).
+    SetToolTags {
+        id: String,
+        tags: Vec<String>,
     },
     RestoreTool {
         id: String,

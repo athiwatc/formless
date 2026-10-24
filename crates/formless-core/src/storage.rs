@@ -343,7 +343,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 40;
+pub const SCHEMA_VERSION: i64 = 41;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -428,7 +428,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 40] = [
+const MIGRATIONS: [(i64, MigrationStep); 41] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -556,6 +556,8 @@ const MIGRATIONS: [(i64, MigrationStep); 40] = [
     (39, migrate_v39),
     // A short human title for each Tool (SPEC §7.2).
     (40, |c| add_column(c, "tools", "title TEXT NOT NULL DEFAULT ''")),
+    // Topic tags on each Tool, a JSON array (SPEC §7.2).
+    (41, |c| add_column(c, "tools", "tags TEXT NOT NULL DEFAULT '[]'")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -2146,6 +2148,7 @@ impl Store {
                 r.get::<_, String>("created_at")?,
                 r.get::<_, String>("updated_at")?,
                 r.get::<_, String>("title")?,
+                r.get::<_, String>("tags")?,
             ))
         })?;
         let Some(row) = rows.next() else {
@@ -2161,6 +2164,7 @@ impl Store {
             created_at,
             updated_at,
             title,
+            tags,
         ) = row?;
         drop(rows);
         drop(stmt);
@@ -2202,6 +2206,7 @@ impl Store {
             id,
             name,
             title,
+            tags: serde_json::from_str(&tags).unwrap_or_default(),
             description,
             retired: retired != 0,
             current_version,
@@ -3132,6 +3137,15 @@ impl Store {
         self.ex(
             "UPDATE tools SET title=?2 WHERE id=?1",
             params![id, title],
+        )?;
+        self.tool_info(id)
+    }
+
+    /// A Tool's tags (SPEC §7.2), already normalised.
+    pub fn set_tool_tags(&self, id: &str, tags: &[String]) -> Result<Option<ToolInfo>> {
+        self.ex(
+            "UPDATE tools SET tags=?2 WHERE id=?1",
+            params![id, serde_json::to_string(tags)?],
         )?;
         self.tool_info(id)
     }

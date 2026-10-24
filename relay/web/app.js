@@ -1880,7 +1880,8 @@
   }
   /** A Tool's title with its name as secondary text, or just the name (SPEC §7.2). */
   function toolLabel(t) {
-    return t.title ? [t.title, h("span", { class: "muted tool-name" }, " " + t.name)] : t.name;
+    const tags = (t.tags || []).map((g) => h("span", { class: "tool-tag" }, "#" + g));
+    return [t.title ? [t.title, h("span", { class: "muted tool-name" }, " " + t.name)] : t.name, tags];
   }
   function toolTitleByName(name) {
     const t = (S.tools || []).find((x) => x.name === name);
@@ -1931,7 +1932,9 @@
       if (quick === "retired" && !t.retired) return false;
       if (quick === "failing" && !(t.success_rate != null && t.success_rate < 0.8)) return false;
       if (quick === "attention" && !t.needs_attention) return false;
-      return !q || fuzzyMatch(q, t.name) || fuzzyMatch(q, t.title || "") || fuzzyMatch(q, t.description || "");
+      // `#git` filters by tag; anything else also matches tags.
+      if (q.startsWith("#")) return (t.tags || []).some((g) => g.startsWith(q.slice(1).toLowerCase()));
+      return !q || fuzzyMatch(q, t.name) || fuzzyMatch(q, t.title || "") || fuzzyMatch(q, t.description || "") || fuzzyMatch(q, (t.tags || []).join(" "));
     });
     // Each column's natural order (names A→Z, numbers and dates biggest
     // first); a second click on the header reverses it.
@@ -2026,6 +2029,8 @@
         v.version === t.current_version
           ? h("span", { class: "version current", title: "current" }, "v" + v.version + " " + v.author)
           : h("button", { class: "version", type: "button", title: "Roll back to v" + v.version, onclick: () => rollbackTool(t, v.version) }, "v" + v.version + " " + v.author)))),
+      h("dt", null, "Tags"), h("dd", null, h("input", { class: "tags-input", type: "text", value: (t.tags || []).join(" "), placeholder: "git web …", "aria-label": "Tags, separated by spaces", title: "Enter saves",
+        onkeydown: (e) => { if (e.key === "Enter") act({ type: "set_tool_tags", id: t.id, tags: e.target.value.split(/[\s,]+/).filter(Boolean) }, "Tags saved"); } })),
       h("dt", null, "Capabilities"), h("dd", null, capTags(t.capabilities)),
       h("dt", null, "Memory"), h("dd", null, t.memory_mb + " MB"),
       h("dt", null, "Approved"), h("dd", null, d.approval

@@ -128,7 +128,12 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
                 4 => t.needs_attention,
                 _ => true,
             };
-            quick && f.hit(&[&t.name, &t.title, &t.description])
+            // `#git` filters by tag; anything else also matches tags.
+            let text = match f.query.trim().strip_prefix('#') {
+                Some(tag) => t.tags.iter().any(|g| g.starts_with(&tag.to_lowercase())),
+                None => f.hit(&[&t.name, &t.title, &t.description, &t.tags.join(" ")]),
+            };
+            quick && text
         })
         .collect();
     match f.sort % TOOL_SORTS.len() {
@@ -274,6 +279,7 @@ mod tests {
             id: name.into(),
             name: name.into(),
             title: String::new(),
+            tags: Vec::new(),
             description: format!("{name} things"),
             retired,
             current_version: 1,

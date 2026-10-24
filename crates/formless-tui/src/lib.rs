@@ -3389,6 +3389,20 @@ impl App {
             "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             cmd if cmd.starts_with("tool ") => self.open_tool(cmd["tool ".len()..].trim()),
+            cmd if cmd.starts_with("tooltag ") => {
+                let mut words = cmd["tooltag ".len()..].split_whitespace();
+                let name = words.next().unwrap_or_default();
+                match self.tools.iter().find(|t| t.name == name) {
+                    Some(t) => {
+                        let id = t.id.clone();
+                        let tags = words.map(str::to_string).collect();
+                        self.fire(Request::SetToolTags { id, tags });
+                    }
+                    None => self
+                        .notes
+                        .push(format!("No Tool named {name}; /tools lists them.")),
+                }
+            }
             "settings" => self.open_view(View::Settings),
             "model" => self.open_model_picker(),
             cmd if cmd.starts_with("model ") => {
@@ -9301,6 +9315,9 @@ fn tool_label(t: &ToolInfo, color: bool) -> Line<'static> {
             fg(color, Color::DarkGray),
         ));
     }
+    for tag in &t.tags {
+        spans.push(Span::styled(format!(" #{tag}"), fg(color, Color::Cyan)));
+    }
     Line::from(spans)
 }
 
@@ -9740,6 +9757,10 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             Span::raw("  ["),
                             tool_status(&d.tool, app.color),
                             Span::raw("]"),
+                            Span::styled(
+                                d.tool.tags.iter().map(|t| format!(" #{t}")).collect::<String>(),
+                                fg(app.color, Color::Cyan),
+                            ),
                             Span::raw(format!("  {}", d.tool.description)),
                         ]),
                         Line::from(versions),
@@ -11228,6 +11249,7 @@ mod tests {
                 id: "1".into(),
                 name: "writer".into(),
                 title: String::new(),
+                tags: Vec::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 2,
@@ -11245,6 +11267,7 @@ mod tests {
                 id: "2".into(),
                 name: "old".into(),
                 title: String::new(),
+                tags: Vec::new(),
                 description: String::new(),
                 retired: true,
                 current_version: 1,
@@ -11854,6 +11877,7 @@ mod tests {
                 id: n.to_string(),
                 name: n.to_string(),
                 title: String::new(),
+                tags: Vec::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -11916,6 +11940,44 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.attachments.is_empty());
         assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+    }
+
+    #[test]
+    fn tools_filter_by_tag_and_show_tags() {
+        let mut app = test_app();
+        let tool = |id: &str, tags: &[&str]| ToolInfo {
+            id: id.into(),
+            name: id.into(),
+            title: String::new(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            description: String::new(),
+            retired: false,
+            current_version: 1,
+            capabilities: vec![],
+            memory_mb: 64,
+            invocations: 0,
+            success_rate: None,
+            needs_attention: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+            recent: String::new(),
+            author: "agent".into(),
+        };
+        app.tools = vec![tool("git_log", &["git"]), tool("fetch_page", &["web"])];
+        app.view = View::Tools;
+        app.tool_filter.query = "#gi".into();
+        let names: Vec<&str> = app
+            .visible_tools()
+            .iter()
+            .map(|&i| app.tools[i].name.as_str())
+            .collect();
+        assert_eq!(names, ["git_log"]);
+        app.tool_filter.query = "web".into();
+        assert_eq!(app.visible_tools().len(), 1);
+        app.tool_filter.query.clear();
+        assert!(render(&mut app, 100, 20).contains("git_log #git"));
+        app.slash("tooltag nope x");
+        assert!(app.notes.last().unwrap().starts_with("No Tool named nope"));
     }
 
     #[test]
@@ -12649,6 +12711,7 @@ mod tests {
                 id: n.to_string(),
                 name: n.to_string(),
                 title: String::new(),
+                tags: Vec::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -12824,6 +12887,7 @@ mod tests {
                 id: format!("t{i:02}"),
                 name: format!("t{i:02}"),
                 title: String::new(),
+                tags: Vec::new(),
                 description: String::new(),
                 retired: false,
                 current_version: 1,
@@ -13344,6 +13408,7 @@ mod tests {
             id: "t".into(),
             name: "fetch_page".into(),
             title: String::new(),
+            tags: Vec::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13371,6 +13436,7 @@ mod tests {
             id: "t".into(),
             name: "fetch_page".into(),
             title: String::new(),
+            tags: Vec::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13542,6 +13608,7 @@ mod tests {
             id: "t".into(),
             name: "fetch_page".into(),
             title: String::new(),
+            tags: Vec::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13601,6 +13668,7 @@ mod tests {
             id: name.into(),
             name: name.into(),
             title: String::new(),
+            tags: Vec::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
@@ -13645,6 +13713,7 @@ mod tests {
             id: "t".into(),
             name: "fetch_page".into(),
             title: String::new(),
+            tags: Vec::new(),
             description: String::new(),
             retired: false,
             current_version: 1,
