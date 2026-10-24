@@ -339,6 +339,15 @@ enum ToolsAction {
         /// One JSON value instead of a table
         #[arg(long)]
         json: bool,
+        /// Only Tools with this tag
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
+    Tag {
+        /// Tool name or id
+        name: String,
+        tags: Vec<String>,
     },
     /// A Tool's description, schemas, Capabilities, versions and stats
     Show {
@@ -3580,19 +3589,24 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
-        ToolsAction::List { json } => {
+        ToolsAction::List { json, tag } => {
             let v = request_once(&paths, Request::ListTools)?;
+            let mut tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
+            if let Some(tag) = tag {
+                let tag = tag.trim_start_matches('#').to_lowercase();
+                tools.retain(|t| t.tags.contains(&tag));
+            }
             if json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
+                println!("{}", serde_json::to_string_pretty(&tools)?);
                 return Ok(());
             }
-            let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
             if tools.is_empty() {
                 println!("(no tools yet - the agent builds them via create_tool)");
             }
             let mut tbl = Table::new(&[
                 "TOOL",
                 "TITLE",
+                "TAGS",
                 "VER",
                 "CALLS",
                 "SUCCESS",
@@ -3611,6 +3625,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 tbl.row(vec![
                     t(tool.name, Tone::Strong),
                     c(tool.title),
+                    t(tool.tags.join(" "), Tone::Dim),
                     c(format!("v{}", tool.current_version)),
                     c(tool.invocations.to_string()),
                     t(
@@ -3687,6 +3702,19 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             let tool = find_tool(&paths, &name)?;
             let code = tool_run(&paths, tool, input, yes, session)?;
             std::process::exit(code);
+        }
+        ToolsAction::Tag { name, tags } => {
+            let tool = find_tool(&paths, &name)?;
+            let t: formless_protocol::ToolInfo = serde_json::from_value(request_once(
+                &paths,
+                Request::SetToolTags { id: tool.id, tags },
+            )?)?;
+            if t.tags.is_empty() {
+                println!("{}: no tags", t.name);
+            } else {
+                println!("{}: {}", t.name, t.tags.join(" "));
+            }
+            Ok(())
         }
         ToolsAction::Retire { name } => set_tool_retired(&paths, &name, true),
         ToolsAction::Restore { name } => set_tool_retired(&paths, &name, false),
@@ -3922,6 +3950,9 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     println!("{} v{}  [{status}]", t.name, t.current_version);
     if !t.title.is_empty() {
         println!("{}", t.title);
+    }
+    if !t.tags.is_empty() {
+        println!("tags: {}", t.tags.join(" "));
     }
     println!("{}", t.description);
     println!();

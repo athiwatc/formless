@@ -744,6 +744,20 @@ pattern (§4.4).
     `tools list` has a TITLE column, and `tools show` prints it under the
     name.
   - Stored on the Tool (schema v40).
+- **Tags:** Tools carry topic tags (`git`, `web`, `finance`).
+  - **Setting them:** the agent passes `create_tool`'s optional `tags`; a
+    new version without tags keeps the old ones. Users use `SetToolTags`:
+    `formless tools tag NAME [TAG…]`, `/tooltag NAME [TAG…]` in the TUI,
+    or the Tags field in the web Tool detail. None given clears them.
+  - **Normalised:** lowercase, without `#`, spaces become `-`, only
+    letters, digits, `-` and `_`, at most 24 characters each and 8 per
+    Tool.
+  - **Search:** `find_tools` counts tags like the name, in both rankings,
+    and returns them.
+  - **Filtering:** in the TUI and web Tools views, `#git` matches by tag
+    and plain text matches tags too; the CLI has `tools list --tag git`.
+  - **Display:** tags show as `#tag` beside the Tool and travel in export
+    bundles. They are stored as a JSON array (schema v41).
 - Tools are never edited in place. Any change (agent-driven or optimiser
   Candidate) creates a **new integer version** (`v1`, `v2`, …; no semver).
   Each version records timestamp, author (`agent` | `optimiser` | `import`),

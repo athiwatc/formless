@@ -1717,6 +1717,21 @@ impl Daemon {
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
+            Request::SetToolTags { id, tags } => {
+                let tags = toolreg::normalize_tags(tags.iter().map(String::as_str));
+                let t = self
+                    .with_store(|st| st.set_tool_tags(&id, &tags))?
+                    .context("tool not found")?;
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "user",
+                        "tool.tags",
+                        &format!("{}: {}", t.name, tags.join(" ")),
+                    )
+                });
+                self.broadcast(Event::ToolUpdated { tool: t.clone() });
+                Ok(serde_json::to_value(t)?)
+            }
             Request::RestoreTool { id } => {
                 let t = self
                     .with_store(|st| st.set_tool_retired(&id, false))?
@@ -3664,6 +3679,7 @@ impl Daemon {
             "format": "formless.tool/1",
             "name": info.name,
             "title": info.title,
+            "tags": info.tags,
             "description": info.description,
             "input_schema": serde_json::from_str::<Value>(&ver.input_schema).unwrap_or(json!({})),
             "output_schema": serde_json::from_str::<Value>(&ver.output_schema).unwrap_or(json!({})),
@@ -4218,11 +4234,19 @@ impl Daemon {
                 author,
             )
         })?;
-        // A new version keeps the Tool's title unless one is given.
+        // A new version keeps the Tool's title and tags unless given.
         let info = match tool_title(args) {
             Some(title) => self
                 .with_store(|st| st.set_tool_title(&info.id, &title))?
                 .unwrap_or(info),
+            None => info,
+        };
+        let info = match args["tags"].as_array() {
+            Some(tags) => {
+                let tags = toolreg::normalize_tags(tags.iter().filter_map(Value::as_str));
+                self.with_store(|st| st.set_tool_tags(&info.id, &tags))?
+                    .unwrap_or(info)
+            }
             None => info,
         };
         let _ = self
@@ -4255,6 +4279,7 @@ impl Daemon {
             .map(|t| {
                 let mut v = json!({
                     "name": t.name,
+                    "tags": t.tags,
                     "description": t.description,
                     "capabilities": t.capabilities,
                     "invocations": t.invocations,
@@ -5609,6 +5634,7 @@ impl Daemon {
         Ok(json!({
             "name": info.name,
             "title": info.title,
+            "tags": info.tags,
             "description": info.description,
             "version": ver.version,
             "current_version": info.current_version,
@@ -5883,6 +5909,7 @@ impl Daemon {
             id: format!("test:{}", d.name),
             name: format!("{} (test)", d.name),
             title: String::new(),
+            tags: Vec::new(),
             description: d.description.clone(),
             retired: false,
             current_version: 0,

@@ -233,6 +233,12 @@ pub const COMMANDS: &[Command] = &[
         "open a Tool's detail in the Tools view",
         Tools,
     ),
+    cmd(
+        "tooltag",
+        "NAME [TAG…]",
+        "set a Tool's tags (none clears them); filter the Tools view with #tag",
+        Tools,
+    ),
     cmd("metrics", "", "open the Metrics view", Tools),
     cmd("proposals", "", "open the prompt Proposals view", Tools),
     cmd("propose", "", "generate a measured prompt proposal", Tools),

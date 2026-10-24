@@ -11,6 +11,7 @@ fn tool(name: &str, desc: &str, schema: &str, code: &str) -> (ToolInfo, ToolVers
             id: name.into(),
             name: name.into(),
             title: String::new(),
+            tags: Vec::new(),
             description: desc.into(),
             retired: false,
             current_version: 1,

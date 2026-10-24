@@ -309,6 +309,8 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .kv { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 6px 12px; font-size: 14px; margin: 10px 0; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.tool-tag { color: var(--accent); font-size: 12px; margin-left: 6px; }
+.tags-input { font: inherit; font-size: 13px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--text); width: min(100%, 260px); }
 .tag { display: inline-block; font-family: var(--mono); font-size: 12px; padding: 1px 7px; border-radius: 5px; background: var(--panel-2); margin: 0 4px 4px 0; }
 .tag.broad { background: var(--err-soft); color: var(--err); }
 .versions { display: flex; flex-wrap: wrap; gap: 6px; }

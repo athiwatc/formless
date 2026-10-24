@@ -184,6 +184,7 @@ pub fn create_tool_definition() -> Value {
                     "name": {"type": "string", "description": "snake_case, 1-64 chars; names the general operation (read_text_file), never one project or file"},
                     "title": {"type": "string", "description": "Short human title shown to the user in lists and approval prompts, 2-5 words in sentence case (e.g. \"Last git author\"). Always set it."},
                     "description": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "1-3 lowercase topic tags (git, web, files, finance) that help find_tools; a new version keeps the old tags when omitted"},
                     "input_schema": {"type": "object", "description": "JSON Schema (draft 2020-12) for run(input)"},
                     "output_schema": {"type": "object", "description": "JSON Schema for the return value"},
                     "implementation_js": {"type": "string", "description": "Plain JS defining global function run(input) (may be async). Throw on failure; never return {error: ...}."},
@@ -623,6 +624,27 @@ fn word_match(a: &str, b: &str) -> bool {
     a == b || (a.len() >= 3 && b.len() >= 3 && (a.starts_with(b) || b.starts_with(a)))
 }
 
+/// Tags as stored: lowercase, without `#`, letters, digits, `-` and `_`
+/// only, at most 24 characters each, no duplicates, at most 8.
+pub fn normalize_tags<'a>(raw: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in raw {
+        let tag: String = t
+            .trim()
+            .trim_start_matches('#')
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_whitespace() { '-' } else { c })
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .take(24)
+            .collect();
+        if !tag.is_empty() && !out.contains(&tag) && out.len() < 8 {
+            out.push(tag);
+        }
+    }
+    out
+}
+
 /// Search active Tools with the configured ranking (`tools.search`).
 pub fn search_tools_with(
     store: &Store,
@@ -690,6 +712,12 @@ pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec
         .map(|t| {
             let name = stems(&t.name);
             let mut doc: Vec<String> = name.iter().chain(&name).chain(&name).cloned().collect();
+            // Tags weigh like the name; the title like the description.
+            for tag in &t.tags {
+                let tag = stems(tag);
+                doc.extend(tag.iter().chain(&tag).chain(&tag).cloned());
+            }
+            doc.extend(stems(&t.title));
             doc.extend(stems(&t.description));
             if let Ok(Some((_, v))) = store.get_tool_current(&t.id) {
                 if let Ok(schema) = serde_json::from_str::<Value>(&v.input_schema) {
@@ -772,10 +800,10 @@ pub fn search_tools(store: &Store, query: &str, limit: usize) -> Result<Vec<Tool
         .into_iter()
         .filter_map(|t| {
             let name = tokens(&t.name);
-            let desc = tokens(&t.description);
+            let desc = tokens(&format!("{} {}", t.title, t.description));
             let mut score = 0.0;
             for w in &q {
-                if name.iter().any(|n| n == w) {
+                if name.iter().any(|n| n == w) || t.tags.iter().any(|g| g == w) {
                     score += 3.0;
                 } else if name.iter().any(|n| word_match(n, w)) {
                     score += 2.0;
