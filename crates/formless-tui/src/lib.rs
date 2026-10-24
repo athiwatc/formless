@@ -125,6 +125,10 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/approvals [family]`: the central list (SPEC §10.3).
+    Approvals,
+    /// `/revoke all [family]`: revoke what the list returns.
+    RevokeAll,
     DryRunTool,
     PreviewTool,
     UndoRegistry,
@@ -963,6 +967,8 @@ struct App {
     approval_summaries: HashMap<String, String>,
     /// Batch positions of held calls, by approval id (SPEC §5.2) …
     approval_batches: HashMap<String, ApprovalBatch>,
+    /// The family `/approvals` or `/revoke all` was given.
+    grants_family: Option<String>,
     /// … and what was answered for each call, by batch id: (index, word).
     batch_answers: HashMap<String, Vec<(usize, String)>>,
     model_stats: Vec<ModelStatInfo>,
@@ -1168,6 +1174,7 @@ impl App {
             module_delete_arm: None,
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
+            grants_family: None,
             batch_answers: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
@@ -1494,6 +1501,53 @@ impl App {
                                 self.start_run_editor(&d);
                                 self.tool_detail = Some(d);
                             }
+                        }
+                        Pending::Approvals => {
+                            let family = self.grants_family.clone();
+                            let grants: Vec<GrantInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            self.pager = Some(Pager {
+                                title: "Approvals".into(),
+                                lines: approval_lines(&grants, family.as_deref()),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::RevokeAll => {
+                            let family = self.grants_family.take();
+                            let grants: Vec<GrantInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            let mut n = 0;
+                            let mut seen = HashSet::new();
+                            for g in grants.into_iter().filter(|g| {
+                                family
+                                    .as_deref()
+                                    .is_none_or(|f| cap_family(&g.capability) == f)
+                            }) {
+                                // Whole grants, or each Capability of a family.
+                                let capability = family.as_ref().map(|_| g.capability.clone());
+                                let key = (
+                                    g.tool_id.clone(),
+                                    capability.clone(),
+                                    format!("{:?}", g.scope),
+                                    g.session_id.clone(),
+                                );
+                                if seen.insert(key) {
+                                    self.fire(Request::RevokeGrant {
+                                        tool_id: g.tool_id,
+                                        capability,
+                                        scope: g.scope,
+                                        session_id: g.session_id,
+                                    });
+                                    n += 1;
+                                }
+                            }
+                            self.notes.push(match (n, family) {
+                                (0, _) => "nothing to revoke".to_string(),
+                                (n, Some(f)) => format!("revoked {n} {f} grant(s)"),
+                                (n, None) => format!("revoked {n} grant(s)"),
+                            });
                         }
                         Pending::DryRunTool => {
                             self.pager = Some(Pager {
@@ -3587,7 +3641,7 @@ impl App {
                     self.fire(Request::InterruptRun { session_id: id });
                 }
             }
-            "approve" | "approvals" => {
+            "approve" => {
                 // The dialog opens by itself while any approval waits; this
                 // lists them (and says so when none do).
                 if self.approvals.is_empty() && self.promotions.is_empty() {
@@ -3764,16 +3818,41 @@ impl App {
                     before: None,
                 },
             ),
+            cmd if cmd == "approvals" || cmd.starts_with("approvals ") => {
+                let family = cmd["approvals".len()..].trim();
+                self.grants_family = (!family.is_empty()).then(|| family.to_string());
+                self.request(Pending::Approvals, Request::ListApprovals);
+            }
+            cmd if cmd == "revoke all" || cmd.starts_with("revoke all ") => {
+                let family = cmd["revoke all".len()..].trim();
+                self.grants_family = (!family.is_empty()).then(|| family.to_string());
+                self.request(Pending::RevokeAll, Request::ListApprovals);
+            }
             cmd if cmd.starts_with("revoke ") => {
                 let mut words = cmd.split_whitespace().skip(1);
                 let name = words.next().unwrap_or_default();
                 let capability = words.next().map(str::to_string);
-                match self.tools.iter().find(|t| t.name == name) {
-                    Some(t) => {
+                match self.tools.iter().find(|t| t.name == name).map(|t| t.id.clone()) {
+                    Some(tool_id) => {
                         self.fire(Request::RevokeApproval {
-                            tool_id: t.id.clone(),
+                            tool_id: tool_id.clone(),
                             capability: capability.clone(),
                         });
+                        // Its hour grant and this Session's grant too.
+                        self.fire(Request::RevokeGrant {
+                            tool_id: tool_id.clone(),
+                            capability: capability.clone(),
+                            scope: ApprovalScope::Hour,
+                            session_id: None,
+                        });
+                        if let Some(s) = self.current.clone() {
+                            self.fire(Request::RevokeGrant {
+                                tool_id: tool_id.clone(),
+                                capability: capability.clone(),
+                                scope: ApprovalScope::Session,
+                                session_id: Some(s),
+                            });
+                        }
                         self.notes.push(format!(
                             "revoked {} for {name}; the next call asks again",
                             capability.as_deref().unwrap_or("every approval")
@@ -6900,6 +6979,70 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Whether a note reports a problem (it stays until dismissed).
+/// A Capability's family: "fs" for fs:read:/x, "net" for net:host.
+fn cap_family(cap: &str) -> &str {
+    cap.split(':').next().unwrap_or(cap)
+}
+
+/// The central approvals list (SPEC §10.3), optionally one family.
+fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
+    let rows: Vec<&GrantInfo> = grants
+        .iter()
+        .filter(|g| family.is_none_or(|f| cap_family(&g.capability) == f))
+        .collect();
+    if rows.is_empty() {
+        return vec![match family {
+            Some(f) => format!("Nothing in the {f} family is approved."),
+            None => "Nothing is approved.".into(),
+        }];
+    }
+    let when = |t: &Option<String>| {
+        t.as_deref()
+            .map(|s| s.get(..16).unwrap_or(s).replace('T', " "))
+            .unwrap_or_else(|| "-".into())
+    };
+    let w = rows
+        .iter()
+        .map(|g| g.tool_name.chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let cw = rows
+        .iter()
+        .map(|g| g.capability.chars().count())
+        .max()
+        .unwrap_or(10)
+        .max(10);
+    let mut out = vec![format!(
+        "{:w$}  {:cw$}  {:7}  {:16}  {:6}  {:16}  LAST USED",
+        "TOOL", "CAPABILITY", "SCOPE", "GRANTED", "BY", "ENDS"
+    )];
+    for g in rows {
+        let scope = match g.scope {
+            ApprovalScope::Session => "session",
+            ApprovalScope::Hour => "hour",
+            _ => "always",
+        };
+        out.push(format!(
+            "{:w$}  {:cw$}  {:7}  {:16}  {:6}  {:16}  {}",
+            g.tool_name,
+            g.capability,
+            scope,
+            when(&g.granted_at),
+            if g.granted_by.is_empty() {
+                "-"
+            } else {
+                &g.granted_by
+            },
+            when(&g.expires_at),
+            when(&g.last_used),
+        ));
+    }
+    out.push(String::new());
+    out.push("/revoke TOOL [CAPABILITY] · /revoke all [FAMILY] · /approvals FAMILY filters".into());
+    out
+}
+
 /// A dry run's report: its would-be effects, then its result or error.
 fn dry_run_lines(r: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
@@ -11594,6 +11737,7 @@ mod tests {
             module_delete_arm: None,
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
+            grants_family: None,
             batch_answers: HashMap::new(),
             model_stats: Vec::new(),
             run_summary: None,
@@ -12804,6 +12948,39 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(app.approvals.is_empty());
         assert_eq!(app.notes.last().unwrap(), "approved echo_write for an hour");
+    }
+
+    #[test]
+    fn approvals_list_by_family() {
+        let grant = |cap: &str, scope| GrantInfo {
+            tool_id: "t".into(),
+            tool_name: "netty".into(),
+            capability: cap.into(),
+            scope,
+            granted_at: Some("2026-10-24T13:43:00+00:00".into()),
+            granted_by: "web".into(),
+            expires_at: None,
+            session_id: None,
+            last_used: None,
+        };
+        let grants = vec![
+            grant("net:example.com", ApprovalScope::Always),
+            grant("env:HOME", ApprovalScope::Hour),
+        ];
+        let all = approval_lines(&grants, None);
+        assert!(all[0].starts_with("TOOL"));
+        assert!(
+            all[1].contains("net:example.com")
+                && all[1].contains("always")
+                && all[1].contains("web")
+        );
+        assert!(all[2].contains("env:HOME") && all[2].contains("hour"));
+        let env = approval_lines(&grants, Some("env"));
+        assert_eq!(env.iter().filter(|l| l.contains("netty")).count(), 1);
+        assert_eq!(
+            approval_lines(&grants, Some("fs")),
+            ["Nothing in the fs family is approved."]
+        );
     }
 
     #[test]

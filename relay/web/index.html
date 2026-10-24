@@ -40,6 +40,7 @@
       <button type="button" data-view="tools">Tools</button>
       <button type="button" data-view="metrics">Metrics</button>
       <button type="button" data-view="proposals">Proposals</button>
+      <button type="button" data-view="approvals">Approvals</button>
       <button type="button" data-view="settings">Settings</button>
     </nav>
     <div class="spacer"></div>
@@ -141,6 +142,22 @@
         </div>
         <p class="muted">A proposal can be applied only after it beats the current prompt on the eval suite by the promotion margin. Applied proposals roll back individually.</p>
         <div id="proposals" class="proposal-list"></div>
+      </section>
+
+      <!-- Approvals (SPEC §10.3) -->
+      <section id="view-approvals" class="view hidden" aria-label="Approvals">
+        <div class="view-head">
+          <h2>Approvals <span id="approvals-count" class="muted"></span></h2>
+          <div class="list-filter">
+            <select id="approvals-family" aria-label="Capability family"><option value="">All families</option></select>
+          </div>
+          <div class="actions">
+            <button class="btn small" id="revoke-selected" type="button">Revoke selected</button>
+            <button class="btn small danger" id="revoke-all" type="button">Revoke all shown</button>
+          </div>
+        </div>
+        <p class="muted">Everything a Tool has been allowed to do. Revoking makes its next call ask again.</p>
+        <div class="table-wrap"><table class="table" id="approvals-table"></table></div>
       </section>
 
       <!-- Settings -->

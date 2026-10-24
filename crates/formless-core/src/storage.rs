@@ -343,7 +343,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 44;
+pub const SCHEMA_VERSION: i64 = 45;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -428,7 +428,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 44] = [
+const MIGRATIONS: [(i64, MigrationStep); 45] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -569,6 +569,8 @@ const MIGRATIONS: [(i64, MigrationStep); 44] = [
         add_column(c, "invocations", "model_cost REAL NOT NULL DEFAULT 0")?;
         add_column(c, "invocations", "model_unpriced INTEGER NOT NULL DEFAULT 0")
     }),
+    // Which client answered each stored approval (SPEC §10.3).
+    (45, |c| add_column(c, "approvals", "granted_by TEXT NOT NULL DEFAULT ''")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -3535,6 +3537,57 @@ impl Store {
             }
             Err(_) => Ok(None),
         }
+    }
+
+    /// Store a grant and the client that answered it.
+    pub fn set_approval_by(
+        &self,
+        tool_id: &str,
+        caps: &Capabilities,
+        memory_mb: u32,
+        by: &str,
+    ) -> Result<()> {
+        self.set_approval(tool_id, caps, memory_mb)?;
+        self.ex(
+            "UPDATE approvals SET granted_by=?2 WHERE tool_id=?1",
+            params![tool_id, by],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored grant: (tool id, tool name, Capabilities, approved at,
+    /// granted by, last Invocation).
+    #[allow(clippy::type_complexity)]
+    pub fn list_approvals(
+        &self,
+    ) -> Result<Vec<(String, String, Vec<String>, String, String, Option<String>)>> {
+        let mut stmt = self.ps(
+            "SELECT a.tool_id, t.name, a.capabilities, a.approved_at, a.granted_by,
+                    (SELECT MAX(created_at) FROM invocations i WHERE i.tool_id=a.tool_id)
+             FROM approvals a JOIN tools t ON t.id=a.tool_id ORDER BY t.name_lower",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    serde_json::from_str::<Vec<String>>(&r.get::<_, String>(2)?).unwrap_or_default(),
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// A Tool's latest Invocation time.
+    pub fn tool_last_invocation(&self, tool_id: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT MAX(created_at) FROM invocations WHERE tool_id=?1",
+            params![tool_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn set_approval(&self, tool_id: &str, caps: &Capabilities, memory_mb: u32) -> Result<()> {

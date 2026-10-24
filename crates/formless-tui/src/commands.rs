@@ -268,8 +268,14 @@ pub const COMMANDS: &[Command] = &[
     cmd("propose", "", "generate a measured prompt proposal", Tools),
     cmd(
         "revoke",
-        "TOOL [CAPABILITY]",
-        "revoke a Tool's granted Capabilities",
+        "TOOL [CAPABILITY] | all [FAMILY]",
+        "revoke a Tool's granted Capabilities, or every grant (of a family)",
+        Tools,
+    ),
+    cmd(
+        "approvals",
+        "[FAMILY]",
+        "every approval: Tool, Capability, scope, when, by whom, last used",
         Tools,
     ),
     cmd("audit", "[FILTER]", "show the audit log", Tools),

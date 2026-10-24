@@ -363,6 +363,7 @@ async fn scripted_flow(
     Option<String>,
     usize,
     Vec<Option<formless_protocol::ApprovalBatch>>,
+    Vec<formless_protocol::GrantInfo>,
 ) {
     use formless_core::daemon::Daemon;
     use formless_core::Config;
@@ -499,6 +500,26 @@ async fn scripted_flow(
             summary = Some(s);
         }
     }
+    // The central approvals list, while the daemon still runs (SPEC §10.3).
+    let env = RequestEnvelope {
+        id: 9_999,
+        protocol: PROTOCOL_VERSION,
+        request: Request::ListApprovals,
+    };
+    write_half
+        .write_all(serde_json::to_string(&env).unwrap().as_bytes())
+        .await
+        .unwrap();
+    write_half.write_all(b"\n").await.unwrap();
+    let grants = loop {
+        let line = lines.next_line().await.unwrap().unwrap();
+        if let Ok(ServerMessage::Response {
+            id: 9_999, result, ..
+        }) = serde_json::from_str::<ServerMessage>(&line)
+        {
+            break serde_json::from_value(result.unwrap_or_default()).unwrap();
+        }
+    };
     server.abort();
     (
         final_text,
@@ -508,15 +529,23 @@ async fn scripted_flow(
         summary,
         prompts,
         batches,
+        grants,
     )
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_builds_and_uses_tool_with_approval() {
-    let (final_text, paths, workdir, changes, summary, prompts, _) =
+    let (final_text, paths, workdir, changes, summary, prompts, _, grants) =
         scripted_flow("m2a", true, formless_protocol::ApprovalScope::Always).await;
     assert_eq!(prompts, 1, "a stored approval covers the second call");
+    assert!(
+        grants
+            .iter()
+            .all(|g| g.scope == formless_protocol::ApprovalScope::Always),
+        "{grants:?}"
+    );
+    assert!(grants.iter().any(|g| g.capability.starts_with("fs:write:")));
     // The approval came with a plain-language summary (SPEC §10.3), and it
     // is kept for that Tool version.
     assert_eq!(
@@ -561,7 +590,7 @@ async fn daemon_builds_and_uses_tool_with_approval() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_once_runs_the_tool_without_storing_a_grant() {
-    let (final_text, paths, workdir, _, _, prompts, _) =
+    let (final_text, paths, workdir, _, _, prompts, _, _) =
         scripted_flow("m2o", true, formless_protocol::ApprovalScope::Once).await;
     assert_eq!(prompts, 2, "once means asking again on the next call");
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
@@ -577,13 +606,17 @@ async fn approve_once_runs_the_tool_without_storing_a_grant() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant() {
-    let (final_text, paths, _, _, _, prompts, _) =
+    let (final_text, paths, _, _, _, prompts, _, grants) =
         scripted_flow("m2s", true, formless_protocol::ApprovalScope::Session).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(
         prompts, 1,
         "the second call in the Session is covered (SPEC §10.3)"
     );
+    assert!(!grants.is_empty());
+    assert!(grants
+        .iter()
+        .all(|g| g.scope == formless_protocol::ApprovalScope::Session && g.session_id.is_some()));
     let store = Store::open(&paths.db_file()).unwrap();
     let (info, _) = store.get_tool_by_name("echo_write").unwrap().unwrap();
     assert!(
@@ -595,10 +628,18 @@ async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant(
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_for_an_hour_covers_later_calls_without_storing_a_grant() {
-    let (final_text, paths, _, _, _, prompts, _) =
+    let (final_text, paths, _, _, _, prompts, _, grants) =
         scripted_flow("m2h", true, formless_protocol::ApprovalScope::Hour).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(prompts, 1, "the hour covers the second call (SPEC §10.3)");
+    // The approvals list shows the hour grant and when it ends.
+    assert!(!grants.is_empty());
+    assert!(grants
+        .iter()
+        .all(|g| g.scope == formless_protocol::ApprovalScope::Hour
+            && g.expires_at.is_some()
+            && g.tool_name == "echo_write"
+            && g.last_used.is_some()));
     let store = Store::open(&paths.db_file()).unwrap();
     let (info, _) = store.get_tool_by_name("echo_write").unwrap().unwrap();
     assert!(
@@ -611,7 +652,7 @@ async fn approve_for_an_hour_covers_later_calls_without_storing_a_grant() {
 #[tokio::test]
 async fn a_batch_lists_each_held_call_and_asks_for_each() {
     // Two calls of the new Tool in one turn, each answered "once".
-    let (final_text, _, _, _, _, prompts, batches) =
+    let (final_text, _, _, _, _, prompts, batches, _) =
         scripted_flow("m2b", true, formless_protocol::ApprovalScope::Once).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(prompts, 2, "each held call is asked on its own");
@@ -629,7 +670,7 @@ async fn a_batch_lists_each_held_call_and_asks_for_each() {
 #[cfg(unix)]
 #[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
-    let (final_text, paths, workdir, _, _, _, _) =
+    let (final_text, paths, workdir, _, _, _, _, _) =
         scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;
     assert!(
         final_text.to_lowercase().contains("denied"),
