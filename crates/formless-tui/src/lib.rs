@@ -125,6 +125,8 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    GetModule,
+    UpdateModule,
     ListSessions,
     GetSession,
     CreateSession,
@@ -555,6 +557,8 @@ enum EditMode {
     Description,
     /// `{"input_schema": …, "output_schema": …}`.
     Schemas,
+    /// A shared module's code (`tool_id` holds the module id).
+    Module,
 }
 
 impl EditorState {
@@ -941,6 +945,10 @@ struct App {
     marked: HashSet<String>,
     bulk: Option<(BulkAction, Vec<String>)>,
     modules: Vec<ModuleInfo>,
+    /// The module opened with `/module NAME` (SPEC §7.7).
+    module_detail: Option<ModuleDetail>,
+    /// A module others load, waiting for a second delete.
+    module_delete_arm: Option<String>,
     model_stats: Vec<ModelStatInfo>,
     /// Run outcomes for the Metrics title (SPEC §8.7).
     run_summary: Option<formless_protocol::RunSummary>,
@@ -1137,6 +1145,8 @@ impl App {
             marked: HashSet::new(),
             bulk: None,
             modules: Vec::new(),
+            module_detail: None,
+            module_delete_arm: None,
             model_stats: Vec::new(),
             run_summary: None,
             builtin_stats: Vec::new(),
@@ -1391,6 +1401,23 @@ impl App {
                         Pending::ListModules => {
                             if let Ok(v) = serde_json::from_value::<Vec<ModuleInfo>>(result) {
                                 self.modules = v;
+                            }
+                        }
+                        Pending::GetModule => {
+                            if let Ok(d) = serde_json::from_value::<ModuleDetail>(result) {
+                                self.tool_detail = None;
+                                self.module_detail = Some(d);
+                            }
+                        }
+                        Pending::UpdateModule => {
+                            let name = result["created_module"].as_str().unwrap_or_default();
+                            let version = result["version"].as_i64().unwrap_or_default();
+                            self.notes.push(format!("saved module {name} v{version}"));
+                            self.editor = None;
+                            if let Some(id) =
+                                self.module_detail.as_ref().map(|d| d.module.id.clone())
+                            {
+                                self.request(Pending::GetModule, Request::GetModule { id });
                             }
                         }
                         Pending::UpdateTool => {
@@ -2555,6 +2582,16 @@ impl App {
                 }
                 self.request(Pending::ListModules, Request::ListModules);
             }
+            Event::ModuleDeleted { id } => {
+                self.modules.retain(|m| m.id != id);
+                if self
+                    .module_detail
+                    .as_ref()
+                    .is_some_and(|d| d.module.id == id)
+                {
+                    self.module_detail = None;
+                }
+            }
             Event::ToolDeleted { id } => self.tools.retain(|x| x.id != id),
             Event::OptimiserActivity { tool_name, text } => {
                 if tool_name == "prompt"
@@ -3392,6 +3429,20 @@ impl App {
             "propose" => self.generate_proposal(),
             "tools" => self.open_view(View::Tools),
             cmd if cmd.starts_with("tool ") => self.open_tool(cmd["tool ".len()..].trim()),
+            "modules" => {
+                self.open_view(View::Tools);
+                let names: Vec<String> = self
+                    .modules
+                    .iter()
+                    .map(|m| format!("{} v{}", m.name, m.current_version))
+                    .collect();
+                self.notes.push(if names.is_empty() {
+                    "No modules yet: the agent makes them with create_module.".into()
+                } else {
+                    format!("Modules: {} · /module NAME opens one", names.join(", "))
+                });
+            }
+            cmd if cmd.starts_with("module ") => self.module_cmd(cmd["module ".len()..].trim()),
             cmd if cmd.starts_with("tooloff ") => {
                 let name = cmd["tooloff ".len()..].trim();
                 match self.tools.iter().find(|t| t.name == name) {
@@ -4245,7 +4296,16 @@ impl App {
                 );
                 return;
             }
-            if let Some(ed) = &self.editor {
+            if let Some(ed) = self.editor.as_ref().filter(|e| e.mode == EditMode::Module) {
+                self.request(
+                    Pending::UpdateModule,
+                    Request::UpdateModuleCode {
+                        id: ed.tool_id.clone(),
+                        code: ed.text(),
+                    },
+                );
+                self.notes.push("saving module code...".into());
+            } else if let Some(ed) = &self.editor {
                 self.request(
                     Pending::UpdateTool,
                     Request::UpdateToolCode {
@@ -4890,6 +4950,77 @@ impl App {
 
     fn visible_proposals(&self) -> Vec<usize> {
         lists::proposals(&self.proposals, &self.proposal_filter)
+    }
+
+    /// `/module NAME [edit | rollback N | delete]` (SPEC §7.7).
+    fn module_cmd(&mut self, args: &str) {
+        let mut words = args.split_whitespace();
+        let name = words.next().unwrap_or_default().to_string();
+        let action = words.next().unwrap_or_default();
+        let Some(m) = self.modules.iter().find(|m| m.name == name).cloned() else {
+            self.notes
+                .push(format!("No module named {name}; /modules lists them."));
+            return;
+        };
+        let loaded = self.module_detail.clone().filter(|d| d.module.id == m.id);
+        match (action, loaded) {
+            ("", _) => {
+                self.open_view(View::Tools);
+                self.request(Pending::GetModule, Request::GetModule { id: m.id });
+            }
+            ("edit", Some(d)) => {
+                let code = d
+                    .versions
+                    .iter()
+                    .find(|v| v.version == d.module.current_version)
+                    .map(|v| v.code.clone())
+                    .unwrap_or_default();
+                let chars: Vec<char> = code.chars().collect();
+                self.editor = Some(EditorState {
+                    tool_id: m.id,
+                    name: m.name,
+                    cursor: chars.len(),
+                    chars,
+                    mode: EditMode::Module,
+                });
+            }
+            ("rollback", Some(_)) => match words
+                .next()
+                .and_then(|v| v.trim_start_matches('v').parse().ok())
+            {
+                Some(version) => {
+                    self.request(
+                        Pending::UpdateModule,
+                        Request::RollbackModule { id: m.id, version },
+                    );
+                }
+                None => self
+                    .notes
+                    .push(format!("/module {name} rollback N, with a version number")),
+            },
+            ("delete", Some(d)) => {
+                if !d.used_by.is_empty() && self.module_delete_arm.as_deref() != Some(&m.id) {
+                    self.notes.push(format!(
+                        "{name} is loaded by {}; they will fail. Repeat /module {name} delete to delete it.",
+                        d.used_by.join(", ")
+                    ));
+                    self.module_delete_arm = Some(m.id);
+                } else {
+                    self.module_delete_arm = None;
+                    self.fire(Request::DeleteModule { id: m.id });
+                    self.notes.push(format!("Deleted module {name}."));
+                }
+            }
+            (_, None) => {
+                self.open_view(View::Tools);
+                self.request(Pending::GetModule, Request::GetModule { id: m.id });
+                self.notes
+                    .push(format!("loading module {name}; repeat the command"));
+            }
+            (other, _) => self.notes.push(format!(
+                "/module NAME [edit | rollback N | delete], not {other}"
+            )),
+        }
     }
 
     /// Tools whose code calls this one, from its loaded detail.
@@ -10097,10 +10228,13 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
             }
             lines
         }
-        None => vec![Line::styled(
-            "Select a Tool and press Enter for detail.",
-            ui::dim(app.color),
-        )],
+        None => match &app.module_detail {
+            Some(d) => module_detail_lines(d, app.color),
+            None => vec![Line::styled(
+                "Select a Tool and press Enter for detail.",
+                ui::dim(app.color),
+            )],
+        },
     };
     if !app.modules.is_empty() {
         lines.push(Line::raw(""));
@@ -10112,6 +10246,49 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::raw(format!("  {} v{}  ", m.name, m.current_version)),
                 Span::styled(m.description.clone(), ui::dim(app.color)),
+            ]));
+        }
+    }
+    lines
+}
+
+/// A module's detail: versions, who loads it, its current code.
+fn module_detail_lines(d: &ModuleDetail, color: bool) -> Vec<Line<'static>> {
+    let m = &d.module;
+    let mut versions = vec![Span::styled("versions  ", ui::dim(color))];
+    for v in &d.versions {
+        let text = format!("v{} {}  ", v.version, v.author);
+        versions.push(if v.version == m.current_version {
+            Span::styled(text, bold_fg(color, Color::Yellow))
+        } else {
+            Span::styled(text, ui::dim(color))
+        });
+    }
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("module {}", m.name), bold_fg(color, Color::Yellow)),
+            Span::raw(format!("  {}", m.description)),
+        ]),
+        Line::from(versions),
+        Line::from(vec![
+            Span::styled("used by   ", ui::dim(color)),
+            Span::raw(if d.used_by.is_empty() {
+                "no Tool".to_string()
+            } else {
+                d.used_by.join(", ")
+            }),
+        ]),
+        Line::styled(
+            format!("/module {} edit · rollback N · delete", m.name),
+            ui::dim(color),
+        ),
+        Line::raw(""),
+    ];
+    if let Some(cur) = d.versions.iter().find(|v| v.version == m.current_version) {
+        for (i, l) in cur.code.lines().take(60).enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>4} ", i + 1), ui::dim(color)),
+                Span::raw(l.to_string()),
             ]));
         }
     }
@@ -10451,6 +10628,7 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
         EditMode::Description => format!(" {} · description ", ed.name),
         EditMode::Schemas => format!(" {} · schemas (JSON) ", ed.name),
         EditMode::Code => format!(" Edit {} ", ed.name),
+        EditMode::Module => format!(" Edit module {} ", ed.name),
     };
     let block = ui::panel(title, app.color, Color::Yellow);
     let inner = block.inner(parts[0]);
@@ -11075,6 +11253,8 @@ mod tests {
             marked: HashSet::new(),
             bulk: None,
             modules: Vec::new(),
+            module_detail: None,
+            module_delete_arm: None,
             model_stats: Vec::new(),
             run_summary: None,
             builtin_stats: Vec::new(),
@@ -12084,6 +12264,60 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.attachments.is_empty());
         assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+    }
+
+    #[test]
+    fn modules_open_with_detail_and_guarded_delete() {
+        let mut app = test_app();
+        let module = ModuleInfo {
+            id: "m1".into(),
+            name: "text_utils".into(),
+            description: "helpers".into(),
+            current_version: 2,
+            retired: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        app.modules = vec![module.clone()];
+        app.slash("module nope");
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .starts_with("No module named nope"));
+        app.slash("module text_utils");
+        assert_eq!(app.view, View::Tools);
+        let version = |v: i64, code: &str| ModuleVersionInfo {
+            version: v,
+            author: "agent".into(),
+            created_at: String::new(),
+            code: code.into(),
+        };
+        app.module_detail = Some(ModuleDetail {
+            module,
+            versions: vec![
+                version(1, "module.exports = 1;"),
+                version(2, "module.exports = 2;"),
+            ],
+            used_by: vec!["shout".into()],
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("module text_utils"), "{screen}");
+        assert!(screen.contains("used by   shout"), "{screen}");
+        assert!(screen.contains("module.exports = 2;"), "{screen}");
+        // Deleting a module others load takes a second command.
+        app.slash("module text_utils delete");
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("Repeat /module text_utils delete"));
+        app.slash("module text_utils delete");
+        assert_eq!(app.notes.last().unwrap(), "Deleted module text_utils.");
+        app.slash("module text_utils edit");
+        let ed = app.editor.as_ref().expect("module editor");
+        assert_eq!(ed.mode, EditMode::Module);
+        assert_eq!(ed.text(), "module.exports = 2;");
     }
 
     #[test]

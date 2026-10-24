@@ -233,6 +233,13 @@ pub const COMMANDS: &[Command] = &[
         "open a Tool's detail in the Tools view",
         Tools,
     ),
+    cmd("modules", "", "list shared modules", Tools),
+    cmd(
+        "module",
+        "NAME [edit|rollback N|delete]",
+        "open a shared module: code, versions, Tools using it",
+        Tools,
+    ),
     cmd(
         "tooloff",
         "NAME",
@@ -359,23 +366,36 @@ pub fn closest(typed: &str) -> Option<&'static str> {
         .map(|c| c.name.split(' ').next().unwrap_or(c.name))
         .map(|n| (edit_distance(word, n), n))
         .filter(|(d, n)| *d <= 2.max(n.len() / 3))
-        .min_by_key(|(d, _)| *d)
+        // Ties go to the command as long as what was typed ("modle" is
+        // "model", not "module").
+        .min_by_key(|(d, n)| (*d, n.chars().count().abs_diff(word.chars().count())))
         .map(|(_, n)| n)
 }
 
+/// Edit distance where swapping two adjacent letters counts as one edit
+/// (optimal string alignment).
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1];
-        for (j, cb) in b.iter().enumerate() {
-            let sub = prev[j] + usize::from(ca != cb);
-            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
-        }
-        prev = cur;
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
     }
-    prev[b.len()]
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
 }
 
 /// `/help`: commands grouped by area, then keys.
@@ -467,6 +487,7 @@ mod tests {
         assert_eq!(closest("sesions"), Some("sessions"));
         assert_eq!(closest("tols"), Some("tools"));
         assert_eq!(closest("modle gpt"), Some("model"));
+        assert_eq!(closest("modlue text_utils"), Some("module"));
         assert_eq!(closest("xyzzyplugh"), None);
     }
 

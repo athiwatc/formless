@@ -1619,6 +1619,69 @@ impl Daemon {
             Request::ListModules => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_modules())?,
             )?),
+            Request::GetModule { id } => {
+                let detail = self.with_reader(|st| {
+                    let Some(module) = st.find_module(&id)? else {
+                        return Ok(None);
+                    };
+                    let versions = st
+                        .module_versions(&module.id)?
+                        .into_iter()
+                        .map(|(version, code, author, created_at)| ModuleVersionInfo {
+                            version,
+                            author,
+                            created_at,
+                            code,
+                        })
+                        .collect();
+                    let mut used_by = st.module_dependents(&module.name)?;
+                    used_by.sort();
+                    Ok(Some(ModuleDetail {
+                        module,
+                        versions,
+                        used_by,
+                    }))
+                })?;
+                Ok(serde_json::to_value(detail.context("module not found")?)?)
+            }
+            Request::UpdateModuleCode { id, code } => {
+                let m = self
+                    .with_reader(|st| st.find_module(&id))?
+                    .context("module not found")?;
+                let args = json!({"name": m.name, "description": m.description, "implementation_js": code});
+                let cfg = self.config()?;
+                let out = self
+                    .create_module_as(&args, &cfg, "user", &Arc::new(AtomicBool::new(false)))
+                    .await?;
+                Ok(serde_json::from_str(&out)?)
+            }
+            Request::RollbackModule { id, version } => {
+                let (m, code) = self.with_reader(|st| {
+                    let m = st.find_module(&id)?.context("module not found")?;
+                    let code = st
+                        .module_versions(&m.id)?
+                        .into_iter()
+                        .find(|v| v.0 == version)
+                        .map(|v| v.1)
+                        .with_context(|| format!("{} has no version {version}", m.name))?;
+                    Ok((m, code))
+                })?;
+                let args = json!({"name": m.name, "description": m.description, "implementation_js": code});
+                let cfg = self.config()?;
+                let out = self
+                    .create_module_as(&args, &cfg, "user", &Arc::new(AtomicBool::new(false)))
+                    .await?;
+                Ok(serde_json::from_str(&out)?)
+            }
+            Request::DeleteModule { id } => {
+                let m = self
+                    .with_reader(|st| st.find_module(&id))?
+                    .context("module not found")?;
+                self.with_store(|st| st.delete_module(&m.id))?;
+                let _ = self.with_store(|st| st.audit("user", "module.delete", &m.name));
+                self.broadcast(Event::ModuleDeleted { id: m.id.clone() });
+                Ok(json!({"deleted": m.name}))
+            }
             Request::RunTool {
                 id,
                 input,
@@ -3176,7 +3239,10 @@ impl Daemon {
                 Err(e) => format!("error: run_script failed: {e}"),
             },
             toolreg::CREATE_MODULE => {
-                match self.create_module_impl(&args, cfg, cancel_flag).await {
+                match self
+                    .create_module_as(&args, cfg, "agent", cancel_flag)
+                    .await
+                {
                     Ok(text) => text,
                     Err(e) => format!("error: create_module failed: {e}"),
                 }
@@ -3938,10 +4004,13 @@ impl Daemon {
         code
     }
 
-    async fn create_module_impl(
+    /// Create a module version through the syntax and load gate (SPEC
+    /// §7.7); `author` is agent or user.
+    async fn create_module_as(
         self: &Arc<Self>,
         args: &Value,
         cfg: &Config,
+        author: &str,
         cancel: &Arc<AtomicBool>,
     ) -> Result<String> {
         let name = args["name"]
@@ -3953,8 +4022,11 @@ impl Daemon {
             .as_str()
             .context("implementation_js required")?
             .to_string();
-        formless_runtime::check_syntax(&format!("const module = {{exports:{{}}}};\n{code}"))
-            .map_err(|e| anyhow!("syntax check failed: {e}"))?;
+        // A module has no run(): the check's run() requirement is for Tools.
+        formless_runtime::check_syntax(&format!(
+            "const module = {{exports:{{}}}};\n{code}\n;function run() {{}}"
+        ))
+        .map_err(|e| anyhow!("syntax check failed: {e}"))?;
         // Smoke: actually load the candidate through requireModule.
         let mut modules = (*self.module_code()).clone();
         modules.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
@@ -3991,9 +4063,9 @@ impl Daemon {
             Bounded::Panicked(e) => return Err(anyhow!("module smoke test panicked: {e}")),
         }
         let (info, version) =
-            self.with_store(|st| st.create_module_version(name, &description, &code, "agent"))?;
+            self.with_store(|st| st.create_module_version(name, &description, &code, author))?;
         let _ =
-            self.with_store(|st| st.audit("agent", "module.create", &format!("{name} v{version}")));
+            self.with_store(|st| st.audit(author, "module.create", &format!("{name} v{version}")));
         self.broadcast(Event::ModuleUpdated { module: info });
         Ok(json!({"created_module": name, "version": version}).to_string())
     }

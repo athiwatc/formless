@@ -916,6 +916,23 @@ pattern (§4.4).
   current version with `requireModule(name)` (modules may require other
   modules; loading is smoke-tested at creation). LLM calls from inside
   Tools are §7.5's gated `llm` Capability.
+- Modules in the UIs: `GetModule {id|name}` returns a `ModuleDetail`: the
+  module, its versions oldest first with code and author, and `used_by`,
+  the active Tools whose current code loads it.
+  - **Editing:** `UpdateModuleCode` saves new code as a new version
+    (author `user`) through the same syntax and load check as
+    `create_module`. Module code needs no `run()`.
+  - **Rollback:** `RollbackModule {id, version}` makes an earlier
+    version's code current again, as a new version.
+  - **Deleting:** `DeleteModule` removes the module and its versions
+    (`ModuleDeleted`).
+  - **TUI:** `/modules` lists them. `/module NAME` shows the detail in the
+    Tools view, and adds `edit` (the code editor, Ctrl+S saves),
+    `rollback N` and `delete`. Deleting a module Tools load needs the
+    command twice.
+  - **Web:** each module under Tools opens to its versions (click one to
+    roll back), used by, code, "Edit code" and "Delete". Delete warns,
+    naming the Tools that load it.
 - Sub-agents (v2; v2.2 makes them a Capability only): a Tool with the
   `agent` Capability calls `agents.run(task, {system, model})` to run a
   sub-agent — its own provider loop over the same Tools, with no step
