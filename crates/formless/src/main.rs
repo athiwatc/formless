@@ -1759,6 +1759,18 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
             }
         }
     }
+    // A data dir too deep for a unix socket uses a short socket path
+    // instead; that folder must be usable (SPEC §9.1).
+    #[cfg(unix)]
+    if paths.socket_path().parent() != Some(paths.data_dir.as_path()) {
+        if let Err(e) = paths.prepare_socket_dir() {
+            out.push(Problem {
+                what: format!("{e:#}"),
+                next: Some("set a shorter FORMLESS_DATA_DIR".into()),
+                fix: None,
+            });
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2585,6 +2597,7 @@ fn run_headless(
                         }
                         // `--yes` approves for this Run only (SPEC §12): nothing persists.
                         client.send(Request::ApprovalDecision {
+                            paths: Default::default(),
                             approval_id,
                             approved: yes,
                             scope: ApprovalScope::Once,
@@ -4478,6 +4491,7 @@ fn tool_run(
                     }
                 );
                 client.send(Request::ApprovalDecision {
+                    paths: Default::default(),
                     approval_id,
                     approved: yes,
                     scope: ApprovalScope::Once,

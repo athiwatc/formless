@@ -142,3 +142,9 @@ fn prompt_and_evals_push_generic_tools() {
     assert!(SYSTEM_PROMPT.contains("fs:read:$input.path"));
     assert!(scenario_cases().iter().any(|c| c.name == "generic_tools"));
 }
+
+#[test]
+fn prompt_says_when_to_wrap_mcp_tools() {
+    assert!(SYSTEM_PROMPT.contains("mcp:<server>"));
+    assert!(SYSTEM_PROMPT.contains("only forwards one MCP call unchanged"));
+}

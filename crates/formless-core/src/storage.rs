@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 /// Token use for one key and model: (key, model, prompt, completion,
-/// cached).
-pub type GroupedUsage = (String, String, i64, i64, i64);
+/// cached, provider-reported USD when every request reported one).
+pub type GroupedUsage = (String, String, i64, i64, i64, Option<f64>);
 
 pub struct Store {
     conn: Connection,
@@ -283,8 +283,9 @@ INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
 pub const KV_MAX_VALUE: usize = 64 * 1024;
 pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
 
-/// Token use of one model: (model, prompt, completion, cached).
-pub type ModelUsage = (String, i64, i64, i64);
+/// Token use of one model: (model, prompt, completion, cached,
+/// provider-reported USD when every request reported one).
+pub type ModelUsage = (String, i64, i64, i64, Option<f64>);
 
 /// Scheduled jobs (SPEC §9.7).
 const SCHEMA_V22: &str = "
@@ -343,7 +344,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 45;
+pub const SCHEMA_VERSION: i64 = 46;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -428,7 +429,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 45] = [
+const MIGRATIONS: [(i64, MigrationStep); 46] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -555,22 +556,45 @@ const MIGRATIONS: [(i64, MigrationStep); 45] = [
     // Session summary denormalised onto the Session row (SPEC §9.4).
     (39, migrate_v39),
     // A short human title for each Tool (SPEC §7.2).
-    (40, |c| add_column(c, "tools", "title TEXT NOT NULL DEFAULT ''")),
+    (40, |c| {
+        add_column(c, "tools", "title TEXT NOT NULL DEFAULT ''")
+    }),
     // Topic tags on each Tool, a JSON array (SPEC §7.2).
-    (41, |c| add_column(c, "tools", "tags TEXT NOT NULL DEFAULT '[]'")),
+    (41, |c| {
+        add_column(c, "tools", "tags TEXT NOT NULL DEFAULT '[]'")
+    }),
     // Tools the user pinned for the agent (SPEC §7.1).
-    (42, |c| add_column(c, "tools", "user_pinned INTEGER NOT NULL DEFAULT 0")),
+    (42, |c| {
+        add_column(c, "tools", "user_pinned INTEGER NOT NULL DEFAULT 0")
+    }),
     // Tools the user switched off without retiring them (SPEC §7.2).
-    (43, |c| add_column(c, "tools", "disabled INTEGER NOT NULL DEFAULT 0")),
+    (43, |c| {
+        add_column(c, "tools", "disabled INTEGER NOT NULL DEFAULT 0")
+    }),
     // A Tool's own model use per Invocation: tokens, priced USD, and
     // whether any of it had no price (SPEC §10.4).
     (44, |c| {
         add_column(c, "invocations", "model_tokens INTEGER NOT NULL DEFAULT 0")?;
         add_column(c, "invocations", "model_cost REAL NOT NULL DEFAULT 0")?;
-        add_column(c, "invocations", "model_unpriced INTEGER NOT NULL DEFAULT 0")
+        add_column(
+            c,
+            "invocations",
+            "model_unpriced INTEGER NOT NULL DEFAULT 0",
+        )
     }),
     // Which client answered each stored approval (SPEC §10.3).
-    (45, |c| add_column(c, "approvals", "granted_by TEXT NOT NULL DEFAULT ''")),
+    (45, |c| {
+        add_column(c, "approvals", "granted_by TEXT NOT NULL DEFAULT ''")
+    }),
+    // Provider-reported cost and cache writes per request (SPEC §10.6).
+    (46, |c| {
+        add_column(c, "run_usage", "cost REAL")?;
+        add_column(
+            c,
+            "run_usage",
+            "cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+        )
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -1638,12 +1662,13 @@ impl Store {
         run_id: Option<&str>,
     ) -> Result<(Vec<ModelUsage>, i64)> {
         let mut stmt = self.ps(
-            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage
+            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens),
+               CASE WHEN COUNT(cost)=COUNT(*) THEN SUM(cost) END FROM run_usage
              WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR run_id=?2) GROUP BY model",
         )?;
         let rows = stmt
             .query_map(params![session_id, run_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
         let steps: i64 = self.conn.query_row(
@@ -2510,7 +2535,10 @@ impl Store {
 
     /// Delete a module with all its versions.
     pub fn delete_module(&self, id: &str) -> Result<()> {
-        self.ex("DELETE FROM module_versions WHERE module_id=?1", params![id])?;
+        self.ex(
+            "DELETE FROM module_versions WHERE module_id=?1",
+            params![id],
+        )?;
         self.ex("DELETE FROM modules WHERE id=?1", params![id])?;
         Ok(())
     }
@@ -2734,10 +2762,8 @@ impl Store {
 
     /// Model outcomes since `since` (from the event log, kept since v38).
     pub fn model_stats_since(&self, since: &str) -> Result<Vec<ModelStat>> {
-        let mut stmt = self.ps(
-            "SELECT model, SUM(ok), SUM(ok=0), SUM(ms) FROM model_events
-             WHERE created_at >= ?1 GROUP BY model ORDER BY model",
-        )?;
+        let mut stmt = self.ps("SELECT model, SUM(ok), SUM(ok=0), SUM(ms) FROM model_events
+             WHERE created_at >= ?1 GROUP BY model ORDER BY model")?;
         let rows = stmt
             .query_map(params![since], |r| {
                 Ok(ModelStat {
@@ -3183,10 +3209,8 @@ impl Store {
         tool_id: &str,
         limit: usize,
     ) -> Result<Vec<(i64, String, String, String)>> {
-        let mut stmt = self.ps(
-            "SELECT version, tag, input, error FROM invocations
-             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC LIMIT ?2",
-        )?;
+        let mut stmt = self.ps("SELECT version, tag, input, error FROM invocations
+             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC LIMIT ?2")?;
         let rows = stmt
             .query_map(params![tool_id, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -3197,10 +3221,7 @@ impl Store {
 
     /// A Tool's human title (SPEC §7.2); empty clears it.
     pub fn set_tool_title(&self, id: &str, title: &str) -> Result<Option<ToolInfo>> {
-        self.ex(
-            "UPDATE tools SET title=?2 WHERE id=?1",
-            params![id, title],
-        )?;
+        self.ex("UPDATE tools SET title=?2 WHERE id=?1", params![id, title])?;
         self.tool_info(id)
     }
 
@@ -3580,7 +3601,8 @@ impl Store {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    serde_json::from_str::<Vec<String>>(&r.get::<_, String>(2)?).unwrap_or_default(),
+                    serde_json::from_str::<Vec<String>>(&r.get::<_, String>(2)?)
+                        .unwrap_or_default(),
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, Option<String>>(5)?,
@@ -3951,6 +3973,78 @@ impl Store {
         Ok(())
     }
 
+    /// Pairs of raw MCP tools the agent called back to back (top-level
+    /// calls, nothing between them) since `since`, with the number of
+    /// Runs each pair occurred in, most frequent first.
+    pub fn mcp_call_pairs(&self, since: &str) -> Result<Vec<((String, String), i64)>> {
+        let mut stmt = self.ps(
+            "SELECT i.run_id, t.name FROM invocations i JOIN tools t ON t.id = i.tool_id
+             WHERE i.parent_id IS NULL AND i.run_id IS NOT NULL AND i.created_at >= ?1
+             ORDER BY i.run_id, i.created_at, i.rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut runs: std::collections::HashMap<(String, String), std::collections::HashSet<&str>> =
+            Default::default();
+        for w in rows.windows(2) {
+            let ((run_a, a), (run_b, b)) = (&w[0], &w[1]);
+            if run_a == run_b
+                && a != b
+                && a.starts_with(crate::mcp::PREFIX)
+                && b.starts_with(crate::mcp::PREFIX)
+            {
+                runs.entry((a.clone(), b.clone()))
+                    .or_default()
+                    .insert(run_a);
+            }
+        }
+        let mut out: Vec<_> = runs
+            .into_iter()
+            .map(|(pair, r)| (pair, r.len() as i64))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    /// The output of the latest successful Invocation of the Tool called
+    /// `name` with exactly this (redacted) input, if one was recorded.
+    pub fn recorded_output(&self, name: &str, input: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT i.output FROM invocations i JOIN tools t ON t.id = i.tool_id
+                 WHERE t.name = ?1 AND i.input = ?2 AND i.status = 'success'
+                 ORDER BY i.created_at DESC LIMIT 1",
+                params![name, input],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Raw MCP tools (`mcp__*`) that a live, non-MCP Tool has called, with
+    /// those wrapper Tools' names (sorted): known from nested Invocations,
+    /// nothing is declared (SPEC §7.1).
+    pub fn mcp_wrappers(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut stmt = self.ps("SELECT DISTINCT ct.name, pt.name FROM invocations c
+             JOIN invocations p ON p.id = c.parent_id
+             JOIN tools ct ON ct.id = c.tool_id
+             JOIN tools pt ON pt.id = p.tool_id
+             WHERE ct.name LIKE 'mcp\\_\\_%' ESCAPE '\\'
+               AND pt.name NOT LIKE 'mcp\\_\\_%' ESCAPE '\\'
+               AND pt.retired = 0 AND pt.disabled = 0
+             ORDER BY 1, 2")?;
+        let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (raw, wrapper) = row?;
+            out.entry(raw).or_default().push(wrapper);
+        }
+        Ok(out)
+    }
+
     /// Record one provider request's reported token usage (one Run step).
     pub fn record_usage(
         &self,
@@ -3960,7 +4054,7 @@ impl Store {
         usage: &crate::provider::Usage,
     ) -> Result<()> {
         self.ex(
-            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 session_id,
                 run_id,
@@ -3969,6 +4063,8 @@ impl Store {
                 usage.completion_tokens as i64,
                 usage.reasoning_tokens as i64,
                 usage.cached_tokens as i64,
+                usage.cache_write_tokens as i64,
+                usage.cost,
                 now()
             ],
         )?;
@@ -4003,14 +4099,22 @@ impl Store {
             _ => "substr(u.created_at, 1, 10)",
         };
         let mut stmt = self.ps(&format!(
-            "SELECT {key}, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens), SUM(u.cached_tokens)
+            "SELECT {key}, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens), SUM(u.cached_tokens),
+               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END
              FROM run_usage u LEFT JOIN sessions s ON s.id=u.session_id
              WHERE ?1 IS NULL OR u.created_at >= ?1
              GROUP BY 1, 2 ORDER BY 1"
         ))?;
         let rows = stmt
             .query_map(params![since], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -4027,6 +4131,7 @@ impl Store {
                     completion_tokens: r.get::<_, i64>(1)? as u64,
                     reasoning_tokens: r.get::<_, i64>(2)? as u64,
                     cached_tokens: r.get::<_, i64>(3)? as u64,
+                    ..Default::default()
                 })
             },
         )?)
@@ -4050,9 +4155,8 @@ impl Store {
 
     /// (id, path, bytes, created_at) of every artifact, oldest first.
     pub fn list_artifacts(&self) -> Result<Vec<(String, String, i64, String)>> {
-        let mut stmt = self.ps(
-            "SELECT id, path, bytes, created_at FROM artifacts ORDER BY created_at, rowid",
-        )?;
+        let mut stmt = self
+            .ps("SELECT id, path, bytes, created_at FROM artifacts ORDER BY created_at, rowid")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4297,11 +4401,9 @@ impl Store {
         action_prefix: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, String, String, String)>> {
-        let mut stmt = self.ps(
-            "SELECT actor, action, detail, created_at FROM audit
+        let mut stmt = self.ps("SELECT actor, action, detail, created_at FROM audit
              WHERE ?1 IS NULL OR substr(action,1,length(?1))=?1
-             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
-        )?;
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2")?;
         let rows = stmt
             .query_map(params![action_prefix, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -4568,8 +4670,12 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         return json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
     }
     if m.role == "assistant" && meta["tool_calls"].is_array() {
+        // Any preamble before the calls stays: it is the model's stated plan.
+        let content = Some(m.content.trim())
+            .filter(|t| !t.is_empty())
+            .map_or(Value::Null, |t| json!(t));
         let mut msg =
-            json!({"role": "assistant", "content": Value::Null, "tool_calls": meta["tool_calls"]});
+            json!({"role": "assistant", "content": content, "tool_calls": meta["tool_calls"]});
         // Echo reasoning back only when the provider emitted it (thinking
         // mode requires it on tool-call turns; other endpoints never see it).
         if let Some(r) = meta["reasoning_content"].as_str() {

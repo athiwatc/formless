@@ -2,6 +2,13 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use std::path::PathBuf;
 
+/// Longest unix socket path, NUL included (`sun_path`: 104 bytes on
+/// macOS and the BSDs, 108 on Linux).
+#[cfg(all(unix, target_os = "linux"))]
+const SUN_PATH_MAX: usize = 108;
+#[cfg(all(unix, not(target_os = "linux")))]
+const SUN_PATH_MAX: usize = 104;
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data_dir: PathBuf,
@@ -125,12 +132,110 @@ impl Paths {
         self.data_dir.join("daemon.log")
     }
 
+    /// `<data_dir>/daemon.sock`, unless that is too long for a unix
+    /// socket address (104 bytes on macOS, 108 on Linux, counting the
+    /// final NUL): then a short path every client computes the same way,
+    /// `<runtime dir>/<hash of data_dir>.sock` (see [`Self::socket_dir`]).
     #[cfg(unix)]
     pub fn socket_path(&self) -> PathBuf {
-        self.data_dir.join("daemon.sock")
+        let local = self.data_dir.join("daemon.sock");
+        if local.as_os_str().len() < SUN_PATH_MAX {
+            return local;
+        }
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(self.data_dir.as_os_str().as_encoded_bytes());
+        let hash: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        Self::socket_dir().join(format!("{hash}.sock"))
+    }
+
+    /// Where long-path sockets live: `$XDG_RUNTIME_DIR/formless` when that
+    /// is short enough, else `/tmp/formless-<user>`.
+    #[cfg(unix)]
+    pub fn socket_dir() -> PathBuf {
+        if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR").filter(|r| !r.is_empty()) {
+            let dir = PathBuf::from(run).join("formless");
+            // Room for "/<16 hex>.sock".
+            if dir.as_os_str().len() + 22 < SUN_PATH_MAX {
+                return dir;
+            }
+        }
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let user: String = user
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect();
+        PathBuf::from(format!("/tmp/formless-{user}"))
+    }
+
+    /// Make sure the socket's directory exists, belongs to this user and
+    /// is private (mode 0700): a shared `/tmp` folder someone else made
+    /// first must not receive the daemon's socket.
+    #[cfg(unix)]
+    pub fn prepare_socket_dir(&self) -> Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let sock = self.socket_path();
+        let Some(dir) = sock.parent() else {
+            return Ok(());
+        };
+        if dir == self.data_dir {
+            return Ok(());
+        }
+        if !dir.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+        }
+        let meta = std::fs::symlink_metadata(dir)?;
+        let mine = std::fs::metadata(&self.data_dir)
+            .map(|m| m.uid())
+            .unwrap_or_else(|_| meta.uid());
+        if !meta.is_dir() || meta.uid() != mine {
+            anyhow::bail!(
+                "{} is not a folder owned by you; the data dir path is too long for a unix \
+                 socket ({} bytes), so the socket goes there. Remove it, or use a shorter \
+                 FORMLESS_DATA_DIR",
+                dir.display(),
+                self.data_dir.join("daemon.sock").as_os_str().len()
+            );
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
     }
     #[cfg(windows)]
     pub fn pipe_name(&self) -> String {
         format!(r"\\.\pipe\formless-{}", self.profile)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_data_dir_gets_a_short_socket_path() {
+        let short = Paths::from_dirs("/tmp/fl-s/d".into(), "/tmp/fl-s/c".into()).unwrap();
+        assert_eq!(
+            short.socket_path(),
+            PathBuf::from("/tmp/fl-s/d/daemon.sock")
+        );
+        let deep = PathBuf::from(format!("/tmp/fl-long-{}/d", "x".repeat(120)));
+        let long = Paths {
+            data_dir: deep.clone(),
+            config_dir: deep.clone(),
+            profile: "default".into(),
+        };
+        let sock = long.socket_path();
+        assert!(sock.as_os_str().len() < SUN_PATH_MAX, "{}", sock.display());
+        assert_eq!(sock, long.clone().socket_path(), "every client agrees");
+        let other = Paths {
+            data_dir: deep.join("other"),
+            ..long
+        };
+        assert_ne!(sock, other.socket_path(), "one socket per data dir");
     }
 }

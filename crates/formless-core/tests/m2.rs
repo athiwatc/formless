@@ -467,6 +467,7 @@ async fn scripted_flow(
                         id: next_id,
                         protocol: PROTOCOL_VERSION,
                         request: Request::ApprovalDecision {
+                            paths: Default::default(),
                             approval_id,
                             approved: approve,
                             scope,

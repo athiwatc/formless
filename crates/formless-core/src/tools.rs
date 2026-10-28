@@ -107,7 +107,19 @@ pub fn validate_against(
 ) -> std::result::Result<(), String> {
     let errors: Vec<String> = validator
         .iter_errors(value)
-        .map(|e| e.to_string())
+        .map(|e| {
+            let holds_json = e.instance().as_str().is_some_and(|s| {
+                serde_json::from_str::<Value>(s.trim())
+                    .is_ok_and(|v| v.is_object() || v.is_array())
+            });
+            if holds_json {
+                format!(
+                    "{e} (you passed a string containing JSON; pass the object or array itself, not encoded as a string)"
+                )
+            } else {
+                e.to_string()
+            }
+        })
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -445,11 +457,11 @@ fn read_metrics_definition() -> Value {
         "type": "function",
         "function": {
             "name": READ_METRICS,
-            "description": "Registry-wide health, to clean up and explain: kind \"tools\" (filter: needs_attention | failing | unused | a name substring), \"audit\" (recent actions; filter: an action prefix such as tool., proposal., job.), \"models\" (measured model reliability and latency), \"runs\" (Run outcomes), \"builtins\" (built-in call stats), \"duplicates\" (near-duplicate Tool pairs to merge).",
+            "description": "Registry-wide health, to clean up and explain: kind \"tools\" (filter: needs_attention | failing | unused | a name substring), \"audit\" (recent actions; filter: an action prefix such as tool., proposal., job.), \"models\" (measured model reliability and latency), \"runs\" (Run outcomes), \"builtins\" (built-in call stats), \"duplicates\" (near-duplicate Tool pairs to merge), \"mcp_chains\" (raw MCP calls you keep making back to back, worth one Tool).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["tools", "audit", "models", "runs", "builtins", "duplicates"]},
+                    "kind": {"type": "string", "enum": ["tools", "audit", "models", "runs", "builtins", "duplicates", "mcp_chains"]},
                     "filter": {"type": "string"},
                     "limit": {"type": "integer", "description": "Default 50, max 200"}
                 },
@@ -881,6 +893,96 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
     })
 }
 
+/// The built-in tools' definitions, as listed to the model.
+pub fn builtin_definitions() -> Vec<Value> {
+    vec![
+        create_tool_definition(),
+        create_module_definition(),
+        retire_tool_definition(),
+        find_tools_definition(),
+        read_tool_definition(),
+        unload_tools_definition(),
+        read_module_definition(),
+        read_artifact_definition(),
+        add_mcp_server_definition(),
+        remove_mcp_server_definition(),
+        load_skill_definition(),
+        read_skill_file_definition(),
+        remember_definition(),
+        forget_definition(),
+        ask_user_definition(),
+        schedule_run_definition(),
+        read_metrics_definition(),
+        list_mcp_resources_definition(),
+        read_mcp_resource_definition(),
+        test_tool_definition(),
+        run_script_definition(),
+        pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
+        pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),
+        pending_definition(ABANDON_INVOCATION, "Abandon a Pending Invocation handle: it still finishes and is recorded, but its result will not be delivered."),
+    ]
+}
+
+/// A built-in tool's input schema (its `parameters`).
+pub fn builtin_schema(name: &str) -> Option<Value> {
+    builtin_definitions()
+        .into_iter()
+        .find(|d| d["function"]["name"] == name)
+        .map(|d| d["function"]["parameters"].clone())
+}
+
+/// Lenient input (some models, e.g. Qwen, send nested objects as JSON
+/// strings): where `schema` expects an object or array and `value` holds a
+/// string that parses as one, use the parsed value. Returns the paths it
+/// changed (`""` is the whole input).
+pub fn coerce_json_strings(schema: &Value, value: &mut Value) -> Vec<String> {
+    let mut changed = Vec::new();
+    coerce_at(schema, value, String::new(), &mut changed);
+    changed
+}
+
+fn coerce_at(schema: &Value, value: &mut Value, path: String, changed: &mut Vec<String>) {
+    let types: Vec<&str> = match &schema["type"] {
+        Value::String(t) => vec![t.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let wants = |t: &str| types.contains(&t) && !types.contains(&"string");
+    if let Value::String(s) = value {
+        if wants("object") || wants("array") {
+            if let Ok(parsed) = serde_json::from_str::<Value>(s.trim()) {
+                if (parsed.is_object() && wants("object")) || (parsed.is_array() && wants("array"))
+                {
+                    *value = parsed;
+                    changed.push(path.clone());
+                }
+            }
+        }
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(props) = schema["properties"].as_object() {
+                for (k, sub) in props {
+                    if let Some(v) = map.get_mut(k) {
+                        let p = if path.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{path}.{k}")
+                        };
+                        coerce_at(sub, v, p, changed);
+                    }
+                }
+            }
+        }
+        Value::Array(items) if schema["items"].is_object() => {
+            for (i, v) in items.iter_mut().enumerate() {
+                coerce_at(&schema["items"], v, format!("{path}[{i}]"), changed);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Provider tool definitions: the built-ins plus registry Tools, sorted by
 /// name. Small registries are listed whole. Past `inline_limit`, a Session
 /// sees the Tools it has loaded (found, created or called) plus the
@@ -947,32 +1049,7 @@ pub fn tool_definitions(
         .filter(|t| t.pinned)
         .map(|t| t.name.to_lowercase())
         .collect();
-    let mut defs = vec![
-        create_tool_definition(),
-        create_module_definition(),
-        retire_tool_definition(),
-        find_tools_definition(),
-        read_tool_definition(),
-        unload_tools_definition(),
-        read_module_definition(),
-        read_artifact_definition(),
-        add_mcp_server_definition(),
-        remove_mcp_server_definition(),
-        load_skill_definition(),
-        read_skill_file_definition(),
-        remember_definition(),
-        forget_definition(),
-        ask_user_definition(),
-        schedule_run_definition(),
-        read_metrics_definition(),
-        list_mcp_resources_definition(),
-        read_mcp_resource_definition(),
-        test_tool_definition(),
-        run_script_definition(),
-        pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
-        pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),
-        pending_definition(ABANDON_INVOCATION, "Abandon a Pending Invocation handle: it still finishes and is recorded, but its result will not be delivered."),
-    ];
+    let mut defs = builtin_definitions();
     for info in shown {
         // A Session keeps the definition it first listed (a promotion or
         // rollback elsewhere must not rewrite its cached prefix); it picks
@@ -1081,5 +1158,42 @@ mod skeleton_tests {
             json!({"url": "", "limit": 5, "mode": "fast", "tags": [], "deep": false, "opts": {"retry": 0}})
         );
         assert_eq!(input_skeleton(&json!({})), Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_string_arguments_are_parsed_where_objects_are_expected() {
+        let schema = json!({"type": "object", "properties": {
+            "input": {"type": "object"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "note": {"type": "string"},
+            "nested": {"type": "object", "properties": {"inner": {"type": "object"}}}
+        }});
+        let mut v = json!({"input": "{\"path\": \"/etc/hosts\"}", "tags": "[\"a\"]",
+            "note": "{\"stays\": 1}", "nested": {"inner": "{}"}});
+        let changed = coerce_json_strings(&schema, &mut v);
+        assert_eq!(v["input"]["path"], "/etc/hosts");
+        assert_eq!(v["tags"][0], "a");
+        assert!(v["note"].is_string(), "a string field stays a string");
+        assert!(v["nested"]["inner"].is_object());
+        assert_eq!(changed, ["input", "nested.inner", "tags"]);
+        let mut whole = json!("{\"a\": 1}");
+        coerce_json_strings(&json!({"type": "object"}), &mut whole);
+        assert_eq!(whole["a"], 1);
+    }
+
+    #[test]
+    fn a_json_string_in_place_of_an_object_gets_an_actionable_error() {
+        let v =
+            compile_schema(&json!({"type": "object", "properties": {"input": {"type": "object"}}}))
+                .unwrap();
+        let e = validate_against(&v, &json!({"input": "{not json"})).unwrap_err();
+        assert!(!e.contains("string containing JSON"), "{e}");
+        let e = validate_against(&v, &json!({"input": "{\"a\": 1}"})).unwrap_err();
+        assert!(e.contains("pass the object or array itself"), "{e}");
     }
 }

@@ -85,6 +85,26 @@ pub struct SearchHit {
     pub created_at: String,
 }
 
+/// The scopes a path Capability on an approval can be granted with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PathOption {
+    /// The requested spec (`fs:write:/home/me/proj/src/foo.rs`).
+    pub capability: String,
+    /// Narrowest first; the first is the path itself.
+    pub choices: Vec<PathChoice>,
+}
+
+/// One scope a path can be granted with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PathChoice {
+    pub path: String,
+    /// `file`, `folder`, `repo` or `project`.
+    pub kind: String,
+    /// The repository kind (`git`, `Mercurial`, …) or project file.
+    #[serde(default)]
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessageInfo {
     pub id: String,
@@ -1396,6 +1416,12 @@ pub enum Request {
         /// How long an approval lasts; older clients omit it (`Always`).
         #[serde(default)]
         scope: ApprovalScope,
+        /// A wider path to grant instead of a path Capability asked for:
+        /// requested `fs:read:`/`fs:write:` spec → a folder above its path
+        /// (one of the request's `path_options`). Older clients omit it
+        /// and grant exactly what was asked.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        paths: std::collections::BTreeMap<String, String>,
     },
     PromotionDecision {
         promotion_id: String,
@@ -1641,6 +1667,10 @@ pub enum Event {
         /// one stands and all of them, so clients list each (SPEC §5.2).
         #[serde(default)]
         batch: Option<ApprovalBatch>,
+        /// Wider scopes the user may grant for each new path Capability,
+        /// narrowest first (SPEC §10.3).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path_options: Vec<PathOption>,
     },
     /// A plain-language, AI-written summary of what the Tool behind an
     /// open approval does (SPEC §10.3), sent after `ApprovalRequested`.
@@ -1845,6 +1875,7 @@ mod tests {
     #[test]
     fn event_session_id_scopes_session_events() {
         let ev = Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a".into(),
             session_id: "s1".into(),
             tool_name: "t".into(),

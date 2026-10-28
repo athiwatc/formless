@@ -164,6 +164,7 @@ async fn agent_changes_are_approved_with_a_diff_logged_and_undoable() {
         id: 1,
         protocol: PROTOCOL_VERSION,
         request: Request::ApprovalDecision {
+            paths: Default::default(),
             approval_id,
             approved: true,
             scope: ApprovalScope::Once,

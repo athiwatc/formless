@@ -506,7 +506,8 @@ async fn real_token_usage_is_read_from_both_apis() {
             prompt_tokens: 120,
             completion_tokens: 7,
             reasoning_tokens: 3,
-            cached_tokens: 100
+            cached_tokens: 100,
+            ..Default::default()
         })
     );
 

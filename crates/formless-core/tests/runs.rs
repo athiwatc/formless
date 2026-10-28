@@ -344,9 +344,46 @@ async fn session_usage_totals_and_priced_cost() {
         .record_usage(&s, &r2, "unpriced", &usage(10, 10, 0))
         .unwrap();
     let r = daemon
+        .handle(Request::SessionUsage {
+            session_id: s.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(r["total"]["cost"].is_null());
+    // A provider-reported cost (OpenRouter `usage.cost`) prices a model
+    // with no `prices` entry, and wins over the table for one with.
+    let r3 = store.create_run(&s).unwrap();
+    store
+        .record_usage(
+            &s,
+            &r3,
+            "unpriced",
+            &formless_core::provider::Usage {
+                cost: Some(0.25),
+                ..usage(10, 10, 0)
+            },
+        )
+        .unwrap();
+    store
+        .record_usage(
+            &s,
+            &r3,
+            "m",
+            &formless_core::provider::Usage {
+                cost: Some(0.5),
+                ..usage(1_000_000, 0, 0)
+            },
+        )
+        .unwrap();
+    let r = daemon
         .handle(Request::SessionUsage { session_id: s })
         .await
         .unwrap();
+    assert!(
+        (r["last_run"]["cost"].as_f64().unwrap() - 0.75).abs() < 1e-9,
+        "{r}"
+    );
+    // The earlier unpriced request reported nothing: the total stays unknown.
     assert!(r["total"]["cost"].is_null());
 }
 

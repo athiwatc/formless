@@ -16,6 +16,7 @@ pub mod mcp_auth;
 pub mod memory;
 pub mod namer;
 pub mod optimiser;
+pub mod path_scope;
 pub mod paths;
 pub mod presets;
 pub mod provider;
