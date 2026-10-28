@@ -661,7 +661,9 @@ async fn create_tool_accepts_generic_tools_and_rejects_real_bugs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_calls_still_need_approval_for_sensitive_tools() {
     let paths = temp_paths("appr");
-    Config::default().save(&paths).unwrap();
+    let mut cfg = Config::default();
+    cfg.security.secure = true;
+    cfg.save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
     seed(
         &store,

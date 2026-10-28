@@ -9611,7 +9611,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     }
     // Only the lines on screen go to the paragraph: wrapping a long
     // transcript every frame is what made it slow.
-    let first = line_rows.partition_point(|&r| r <= scroll_top).saturating_sub(1);
+    let first = line_rows
+        .partition_point(|&r| r <= scroll_top)
+        .saturating_sub(1);
     let offset = scroll_top - line_rows.get(first).copied().unwrap_or(0);
     let visible: Vec<Line<'static>> = lines
         .into_iter()

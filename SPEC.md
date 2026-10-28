@@ -2038,7 +2038,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   Capabilities are remembered (`denials` table, logged
   `tool.deny_always`) and every later call of any Tool that needs access
   they cover (a denied `net:example.com` covers its subdomains, a bare
-  `net` all hosts) fails without a prompt, logged `tool.deny_remembered`.
+  `net` all hosts) fails without a prompt, logged `tool.deny_remembered`,
+  even with approvals off (`security.secure = false`).
   The agent's error says so ("the user always denies net:…; don't
   attempt this access with any Tool"). `formless approvals denials`
   lists them, and `--forget CAP` / `--all` (protocol `ListDenials`,

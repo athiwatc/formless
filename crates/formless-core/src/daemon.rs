@@ -6902,7 +6902,7 @@ impl Daemon {
         cancel: &CancellationToken,
     ) -> bool {
         let needs = caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb;
-        if !needs || !cfg.security.secure {
+        if !needs {
             return true;
         }
         self.denial_notes.lock().unwrap().remove(&info.name);
@@ -6924,6 +6924,10 @@ impl Daemon {
                 ),
             );
             return false;
+        }
+        // Approvals are opt-in (`security.secure`); denials apply anyway.
+        if !cfg.security.secure {
+            return true;
         }
         // Only file access inside trusted folders: approved, and logged.
         if trusted_only(&cfg.security, caps) && ver.memory_mb <= cfg.tools.default_memory_mb {
@@ -7260,8 +7264,13 @@ impl Daemon {
         self.broadcast(Event::Note {
             session_id: Some(session_id.to_string()),
             text: format!(
-                "The agent created {} with broad capabilities: {list}. You'll be asked before it uses them.",
-                info.name
+                "The agent created {} with broad capabilities: {list}.{}",
+                info.name,
+                if self.config().is_ok_and(|c| c.security.secure) {
+                    " You'll be asked before it uses them."
+                } else {
+                    " Approvals are off (formless --secure turns them on)."
+                }
             ),
         });
         let mut v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"result": text}));
