@@ -309,6 +309,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                         });
                     } else {
                         client.send(Request::ApprovalDecision {
+                            remember_denial: Default::default(),
                             paths: Default::default(),
                             approval_id: id.clone(),
                             approved,

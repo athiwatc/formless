@@ -64,6 +64,12 @@ enum Cmd {
         #[command(subcommand)]
         action: ApprovalsAction,
     },
+    /// What the daemon can reach: grants, denials, trusted folders, MCP
+    /// servers, trusted hooks, relay and web UI
+    Security {
+        #[command(subcommand)]
+        action: SecurityAction,
+    },
     /// List or remove profiles (isolated data dirs made with --profile)
     Profiles {
         #[command(subcommand)]
@@ -570,6 +576,15 @@ enum JobsAction {
 }
 
 #[derive(Subcommand)]
+enum SecurityAction {
+    /// One-screen audit of the attack surface
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum MemoryAction {
     /// List notes with id, scope and source
     List {
@@ -675,6 +690,15 @@ enum ApprovalsAction {
         #[arg(long)]
         family: Option<String>,
     },
+    /// Capabilities you always deny; --forget CAP (or --all) to ask again
+    Denials {
+        #[arg(long)]
+        forget: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// A Capability's family: "fs" for fs:read:/x, "net" for net:host.
@@ -700,6 +724,44 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
         _ => "always",
     };
     match action {
+        ApprovalsAction::Denials { forget, all, json } => {
+            if forget.is_some() || all {
+                let r = request_once(paths, Request::ForgetDenial { capability: forget })?;
+                println!(
+                    "forgot {} denial(s); the next use asks again",
+                    r["forgotten"]
+                );
+                return Ok(());
+            }
+            let list: Vec<formless_protocol::DenialInfo> =
+                serde_json::from_value(request_once(paths, Request::ListDenials)?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
+            if list.is_empty() {
+                println!("(nothing always denied)");
+                return Ok(());
+            }
+            let mut tbl = Table::new(&["CAPABILITY", "DENIED ON", "WHEN", "BY"]);
+            for d in &list {
+                tbl.row(vec![
+                    t(d.capability.clone(), Tone::Warn),
+                    c(d.tool_name.clone()),
+                    c(d.created_at
+                        .get(..16)
+                        .unwrap_or(&d.created_at)
+                        .replace('T', " ")),
+                    c(if d.denied_by.is_empty() {
+                        "-".to_string()
+                    } else {
+                        d.denied_by.clone()
+                    }),
+                ]);
+            }
+            tbl.print();
+            Ok(())
+        }
         ApprovalsAction::List { family, json } => {
             let list = grants(&family)?;
             if json {
@@ -1019,6 +1081,18 @@ fn main() -> Result<()> {
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs { limit, json }) => runs_cmd(paths, limit, json),
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
+        Some(Cmd::Security {
+            action: SecurityAction::Status { json },
+        }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            let v = formless_tui::client::request_once(&paths, Request::SecurityStatus)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("{}", formless_protocol::security_report(&v));
+            }
+            Ok(())
+        }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
@@ -2597,6 +2671,7 @@ fn run_headless(
                         }
                         // `--yes` approves for this Run only (SPEC §12): nothing persists.
                         client.send(Request::ApprovalDecision {
+                            remember_denial: Default::default(),
                             paths: Default::default(),
                             approval_id,
                             approved: yes,
@@ -4491,6 +4566,7 @@ fn tool_run(
                     }
                 );
                 client.send(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
                     paths: Default::default(),
                     approval_id,
                     approved: yes,

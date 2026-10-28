@@ -87,9 +87,13 @@ async fn run_once(model: &str, nudge: bool, answers: Vec<&'static str>) -> (Seen
     (seen, store, sid)
 }
 
+/// The system prompt's text, sent as a string or (with prompt-cache
+/// breakpoints, for Claude models) as content parts.
 fn system(body: &serde_json::Value) -> String {
-    body["messages"][0]["content"]
+    let content = &body["messages"][0]["content"];
+    content
         .as_str()
+        .or_else(|| content[0]["text"].as_str())
         .unwrap_or_default()
         .to_string()
 }

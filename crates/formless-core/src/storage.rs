@@ -344,7 +344,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 46;
+pub const SCHEMA_VERSION: i64 = 47;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -429,7 +429,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 46] = [
+const MIGRATIONS: [(i64, MigrationStep); 47] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -594,6 +594,14 @@ const MIGRATIONS: [(i64, MigrationStep); 46] = [
             "run_usage",
             "cache_write_tokens INTEGER NOT NULL DEFAULT 0",
         )
+    }),
+    // Capabilities the user always denies (SPEC §10.3).
+    (47, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS denials (
+               capability TEXT PRIMARY KEY, tool_name TEXT NOT NULL,
+               denied_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);",
+        )?)
     }),
 ];
 
@@ -3971,6 +3979,40 @@ impl Store {
             params![server, now()],
         )?;
         Ok(())
+    }
+
+    /// Always deny this Capability spec, for every Tool (SPEC §10.3).
+    pub fn add_denial(&self, capability: &str, tool_name: &str, by: &str) -> Result<()> {
+        self.ex(
+            "INSERT OR REPLACE INTO denials(capability,tool_name,denied_by,created_at) VALUES(?1,?2,?3,?4)",
+            params![capability, tool_name, by, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_denials(&self) -> Result<Vec<formless_protocol::DenialInfo>> {
+        let mut stmt = self.ps(
+            "SELECT capability, tool_name, denied_by, created_at FROM denials ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(formless_protocol::DenialInfo {
+                    capability: r.get(0)?,
+                    tool_name: r.get(1)?,
+                    denied_by: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Forget one remembered denial, or (None) all; returns how many.
+    pub fn forget_denial(&self, capability: Option<&str>) -> Result<usize> {
+        Ok(self.ex(
+            "DELETE FROM denials WHERE ?1 IS NULL OR capability = ?1",
+            params![capability],
+        )?)
     }
 
     /// Pairs of raw MCP tools the agent called back to back (top-level

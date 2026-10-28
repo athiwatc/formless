@@ -1095,8 +1095,8 @@ None ship by default (principle 1).
 - **Wrapped MCP tools.** A Tool wraps an MCP tool when it has called it
   (a nested Invocation under it). `find_tools` lists a wrapped raw tool
   right after its wrappers, with `wrapped_by: [...]`, adding a wrapper the
-  search missed; it is never hidden. A query that names the raw tool or
-  its server keeps it at its own rank. The bootstrap prompt says to call
+  search missed; it is never hidden. A query that names the raw tool (or
+  its `mcp__<server>` prefix) keeps it at its own rank. The bootstrap prompt says to call
   MCP tools directly for one-off use and to wrap repeated or combined
   calls in a Tool, never a 1:1 pass-through.
 - **HTTP transport** (`transport = "http"`, `url`, static `headers`):
@@ -2033,6 +2033,27 @@ run_tool = "network_policy"     # a registry Tool, or…
   - **Compatible:** clients that send no `paths` grant the exact path,
     and stored grants keep working (a folder grant already covers what
     lies beneath it).
+- **Always deny.** Besides deny (this call), a prompt offers "always
+  deny" (TUI `N`, web button or `N`): the call's new sensitive
+  Capabilities are remembered (`denials` table, logged
+  `tool.deny_always`) and every later call of any Tool that needs access
+  they cover (a denied `net:example.com` covers its subdomains, a bare
+  `net` all hosts) fails without a prompt, logged `tool.deny_remembered`.
+  The agent's error says so ("the user always denies net:…; don't
+  attempt this access with any Tool"). `formless approvals denials`
+  lists them, and `--forget CAP` / `--all` (protocol `ListDenials`,
+  `ForgetDenial`) makes them ask again.
+- **Broad Tools are named at creation.** When `create_tool` saves a Tool
+  that declares a broad Capability (bare `net` or `process`, writing
+  anywhere, a secret env key), the chat gets a note before any approval,
+  and the agent's result carries `least_privilege` hints with the
+  input-bound alternative (`net:$input.url`, `fs:write:$input.path`, …).
+- **Security overview.** `/security` (TUI pager) and
+  `formless security status [--json]` (protocol `SecurityStatus`) show
+  on one screen: grants by Capability family (broad ones flagged),
+  remembered denials, trusted folders, MCP servers (transport, target,
+  trusted, disabled), hooks that run without asking, the relay and
+  whether the web UI is running.
 - **Long prompts.** The answer keys and hint line are a footer pinned to
   the bottom of the prompt. The body is sized by its wrapped height; when
   it doesn't fit it is cut with "… more above the keys (v to see all)".

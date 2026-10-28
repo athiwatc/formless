@@ -924,6 +924,7 @@ async fn interrupt_releases_a_tool_waiting_on_llm_complete() {
         match ev {
             Event::ApprovalRequested { approval_id, .. } => {
                 c.send(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
                     paths: Default::default(),
                     approval_id,
                     approved: true,
@@ -1451,6 +1452,7 @@ async fn subagents_emit_events_and_keep_a_transcript() {
         match ev {
             Event::ApprovalRequested { approval_id, .. } => {
                 c.send(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
                     paths: Default::default(),
                     approval_id,
                     approved: true,
@@ -2142,6 +2144,7 @@ async fn agent_adds_an_mcp_server_after_approval() {
                     "{detail}"
                 );
                 c.send(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
                     paths: Default::default(),
                     approval_id,
                     approved: true,

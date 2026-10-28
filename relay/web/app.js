@@ -1879,6 +1879,7 @@
     $("modal-once").classList.toggle("hidden", promo);
     $("modal-session").classList.toggle("hidden", promo);
     $("modal-hour").classList.toggle("hidden", promo);
+    $("modal-deny-always").classList.toggle("hidden", promo);
     $("modal-approve").replaceChildren(h("kbd", { "aria-hidden": "true" }, "y"), promo ? " Approve" : " Always");
     rememberFocus("modal-backdrop");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
@@ -1939,7 +1940,7 @@
     else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
     else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   });
-  function decide(approved, scope) {
+  function decide(approved, scope, rememberDenial) {
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
     if (approved && head && head.kind !== "promotion" && scope !== "once") {
@@ -1959,7 +1960,7 @@
       answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
     }
     if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
-    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: pickedPaths(req) });
+    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: pickedPaths(req), remember_denial: !!rememberDenial });
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
     renderApproval();
@@ -1976,6 +1977,7 @@
   $("modal-session").onclick = () => decide(true, "session");
   $("modal-hour").onclick = () => decide(true, "hour");
   $("modal-deny").onclick = () => decide(false);
+  $("modal-deny-always").onclick = () => decide(false, "always", true);
 
   // ------------------------------------------------------------- tools
   function toolStatusDot(t) {
@@ -4321,6 +4323,7 @@
       if (e.key === "s" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "session"); return; }
       if (e.key === "1" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "hour"); return; }
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
+      if (e.key === "N" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(false, "always", true); return; }
     }
     const dialogOpen = modalOpen || !$("ask-backdrop").classList.contains("hidden");
     if (!dialogOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !typingIn(document.activeElement) && S.channel) {

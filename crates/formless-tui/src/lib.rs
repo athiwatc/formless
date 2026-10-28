@@ -176,6 +176,7 @@ enum Pending {
     SetArchive,
     SetTags,
     ContextReport,
+    Security,
     SuggestName,
     ToolMetrics,
     ProposalDiff,
@@ -1856,6 +1857,18 @@ impl App {
                                 }
                                 _ => self.notes.push("no name to suggest yet".into()),
                             }
+                        }
+                        Pending::Security => {
+                            self.pager = Some(Pager {
+                                title: "Security".into(),
+                                lines: security_report(&result)
+                                    .lines()
+                                    .map(str::to_string)
+                                    .collect(),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
                         }
                         Pending::ContextFill | Pending::ContextReport => {
                             let used = result["used_tokens"].as_i64().unwrap_or(0);
@@ -3952,6 +3965,7 @@ impl App {
             cmd if cmd == "rename" || cmd.starts_with("rename ") => {
                 self.rename_cmd(cmd[6..].trim())
             }
+            "security" => self.request(Pending::Security, Request::SecurityStatus),
             "context" => match self.current.clone() {
                 Some(session_id) => {
                     self.request(Pending::ContextReport, Request::ContextUsage { session_id })
@@ -4658,7 +4672,7 @@ impl App {
             // Typing anything else while the approval has focus moves
             // focus to the input (and types it).
             if modal_keys
-                && !matches!(c, 'y' | 'n' | 'o' | 's' | '1' | 'v' | '?' | 'p' | 'r')
+                && !matches!(c, 'y' | 'n' | 'N' | 'o' | 's' | '1' | 'v' | '?' | 'p' | 'r')
                 && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             {
                 self.input_focus = true;
@@ -4694,11 +4708,29 @@ impl App {
                 }
                 return;
             }
+            if c == 'N' && !self.approvals.is_empty() {
+                let req = self.approvals.pop_front().unwrap();
+                self.note_batch_answer(&req.approval_id, "always denied");
+                let _ = self.take_paths(&req.approval_id);
+                self.fire(Request::ApprovalDecision {
+                    approval_id: req.approval_id,
+                    approved: false,
+                    scope: ApprovalScope::Always,
+                    paths: Default::default(),
+                    remember_denial: true,
+                });
+                self.notes.push(format!(
+                    "denied {} and will always deny its new access (formless approvals denials to undo)",
+                    req.tool_name
+                ));
+                return;
+            }
             if c == 'o' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.note_batch_answer(&req.approval_id, "once");
                 let paths = self.take_paths(&req.approval_id);
                 self.fire(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
                     paths,
                     approval_id: req.approval_id,
                     approved: true,
@@ -4738,6 +4770,7 @@ impl App {
                 self.note_batch_answer(&req.approval_id, "for 1 hour");
                 let paths = self.take_paths(&req.approval_id);
                 self.fire(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
                     paths,
                     approval_id: req.approval_id,
                     approved: true,
@@ -4752,6 +4785,7 @@ impl App {
                 self.note_batch_answer(&req.approval_id, "this Session");
                 let paths = self.take_paths(&req.approval_id);
                 self.fire(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
                     paths,
                     approval_id: req.approval_id,
                     approved: true,
@@ -4770,6 +4804,7 @@ impl App {
                     );
                     let paths = self.take_paths(&req.approval_id);
                     self.fire(Request::ApprovalDecision {
+                        remember_denial: Default::default(),
                         paths,
                         approval_id: req.approval_id,
                         approved: c == 'y',
@@ -11188,8 +11223,17 @@ fn draw_approval(
             " n ",
             bold_fg(color, Color::Red).add_modifier(Modifier::REVERSED),
         ),
-        Span::raw(" deny"),
+        Span::raw(" deny  "),
     ]);
+    if !promotion {
+        keys.extend([
+            Span::styled(
+                " N ",
+                bold_fg(color, Color::Red).add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw(" always deny"),
+        ]);
+    }
     if more > 0 {
         keys.push(Span::styled(
             format!("      +{more} more waiting"),

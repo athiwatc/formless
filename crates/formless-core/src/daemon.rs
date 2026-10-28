@@ -217,6 +217,10 @@ pub struct Daemon {
     approval_by: StdMutex<HashMap<String, String>>,
     /// Wider path scopes chosen with an approval, until its call reads them.
     approval_paths: StdMutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
+    /// Denials answered "always deny", until their call reads them.
+    deny_always: StdMutex<std::collections::HashSet<String>>,
+    /// Why a Tool was last denied, by Tool name, for the agent's error.
+    denial_notes: StdMutex<HashMap<String, String>>,
     /// When and by whom Session and timed grants were given, by (scope,
     /// session id or "", tool id).
     grant_meta: StdMutex<HashMap<(ApprovalScope, String, String), (String, String)>>,
@@ -319,6 +323,8 @@ impl Daemon {
             approval_batches: StdMutex::new(Default::default()),
             approval_by: StdMutex::new(Default::default()),
             approval_paths: StdMutex::new(Default::default()),
+            deny_always: StdMutex::new(Default::default()),
+            denial_notes: StdMutex::new(Default::default()),
             grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
@@ -1052,6 +1058,76 @@ impl Daemon {
                 Ok(json!({"revoked": true}))
             }
             Request::ListApprovals => Ok(serde_json::to_value(self.list_grants()?)?),
+            Request::SecurityStatus => {
+                let cfg = self.config()?;
+                let grants = self.list_grants()?;
+                let mut families: std::collections::BTreeMap<String, usize> = Default::default();
+                for g in &grants {
+                    let f = g
+                        .capability
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    *families.entry(f).or_default() += 1;
+                }
+                let broad: Vec<String> = grants
+                    .iter()
+                    .filter(|g| formless_protocol::broad_capability(&g.capability).is_some())
+                    .map(|g| format!("{} {}", g.tool_name, g.capability))
+                    .collect();
+                let denials = self.with_reader(|st| st.list_denials())?.len();
+                let servers: Vec<Value> = cfg
+                    .mcp
+                    .servers
+                    .iter()
+                    .map(|(name, s)| {
+                        let target = if s.transport == "http" {
+                            s.url.clone()
+                        } else {
+                            std::iter::once(s.command.clone())
+                                .chain(s.args.iter().cloned())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        };
+                        json!({"name": name, "transport": if s.transport.is_empty() { "stdio" } else { s.transport.as_str() },
+                               "target": target, "trusted": s.trusted, "disabled": s.disabled})
+                    })
+                    .collect();
+                let hooks: Vec<Value> = cfg
+                    .hooks
+                    .iter()
+                    .filter(|h| h.trusted && !h.command.is_empty())
+                    .map(|h| json!({"event": h.event, "command": h.command.join(" ")}))
+                    .collect();
+                let web = self.web.lock().await.as_ref().map(|w| w.port);
+                Ok(json!({
+                    "grants_total": grants.len(),
+                    "grants": families,
+                    "broad_grants": broad,
+                    "denials": denials,
+                    "trusted_paths": cfg.security.roots(),
+                    "trust_writes": cfg.security.trust_writes,
+                    "mcp_servers": servers,
+                    "trusted_hooks": hooks,
+                    "relay": {"enabled": cfg.relay.enabled, "url": cfg.relay.url},
+                    "web_ui": {"port": web},
+                }))
+            }
+            Request::ListDenials => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_denials())?,
+            )?),
+            Request::ForgetDenial { capability } => {
+                let n = self.with_store(|st| st.forget_denial(capability.as_deref()))?;
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "user",
+                        "tool.denial_forget",
+                        capability.as_deref().unwrap_or("all"),
+                    )
+                });
+                Ok(json!({"forgotten": n}))
+            }
             Request::RevokeGrant {
                 tool_id,
                 capability,
@@ -2257,7 +2333,11 @@ impl Daemon {
                 approved,
                 scope,
                 paths,
+                remember_denial,
             } => {
+                if remember_denial && !approved {
+                    self.deny_always.lock().unwrap().insert(approval_id.clone());
+                }
                 if !paths.is_empty() {
                     self.approval_paths
                         .lock()
@@ -3592,7 +3672,7 @@ impl Daemon {
                     if self.near_duplicate_after_empty_find(run_id, &tool_id, &args) {
                         created_kind = "near-duplicate";
                     }
-                    text
+                    self.note_broad_tool(session_id, &tool_id, text)
                 }
                 Err(e) => format!("error: create_tool failed: {e}"),
             },
@@ -3799,7 +3879,7 @@ impl Daemon {
             name => {
                 // Denied in the approval pre-pass?
                 if denied.contains_key(&tc.id) {
-                    return format!("error: user denied approval for tool '{name}'");
+                    return format!("error: {}", self.denied_text(name));
                 }
                 self.dispatch_pending(
                     session_id,
@@ -5014,13 +5094,7 @@ impl Daemon {
         let wrapped_by = |name: &str| -> Option<&Vec<String>> {
             let (server, _) = crate::mcp::split_name(name)?;
             let named = q.contains(&name.to_lowercase())
-                || q.contains(&format!(
-                    "{}{}__",
-                    crate::mcp::PREFIX,
-                    server.to_lowercase()
-                ))
-                || q.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-                    .any(|w| w == server.to_lowercase());
+                || q.contains(&format!("{}{}", crate::mcp::PREFIX, server.to_lowercase()));
             wrappers.get(name).filter(|_| !named)
         };
         let mut i = 0;
@@ -6523,7 +6597,7 @@ impl Daemon {
                 .ensure_approval(cfg, session_id, &info, &ver, &caps.unbound(), None, cancel)
                 .await
             {
-                bail!("user denied approval for tool '{name}'");
+                bail!("{}", self.denied_text(&name));
             }
             if !caps.has_bindings() {
                 preapproved.insert(name.clone());
@@ -6831,6 +6905,26 @@ impl Daemon {
         if !needs || !cfg.security.secure {
             return true;
         }
+        self.denial_notes.lock().unwrap().remove(&info.name);
+        // Access the user always denies is refused without asking (§10.3).
+        let denied = self.remembered_denials(caps);
+        if !denied.is_empty() {
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "user",
+                    "tool.deny_remembered",
+                    &format!("{}: {}", info.name, denied.join(", ")),
+                )
+            });
+            self.denial_notes.lock().unwrap().insert(
+                info.name.clone(),
+                format!(
+                    "the user always denies {}; don't attempt this access with any Tool, do the task another way or ask them",
+                    denied.join(", ")
+                ),
+            );
+            return false;
+        }
         // Only file access inside trusted folders: approved, and logged.
         if trusted_only(&cfg.security, caps) && ver.memory_mb <= cfg.tools.default_memory_mb {
             let _ = self.with_store(|st| {
@@ -6997,10 +7091,67 @@ impl Daemon {
             };
             let _ = self.with_store(|st| st.set_approval_by(&info.id, &grant, mem, &by));
             let _ = self.with_store(|st| st.audit("user", "tool.approve", &info.name));
+        } else if self.deny_always.lock().unwrap().remove(&approval_id) {
+            // Always deny what was new on this prompt, for every Tool.
+            let held = prior.as_ref().map(|(p, _)| p.clone()).unwrap_or_default();
+            let new: Vec<String> = caps
+                .to_specs()
+                .into_iter()
+                .filter(|s| {
+                    Capabilities::parse(std::slice::from_ref(s))
+                        .is_ok_and(|one| one.is_sensitive() && !held.covers(&one))
+                })
+                .collect();
+            for spec in &new {
+                let _ = self.with_store(|st| st.add_denial(spec, &info.name, &by));
+            }
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "user",
+                    "tool.deny_always",
+                    &format!("{}: {}", info.name, new.join(", ")),
+                )
+            });
+            self.denial_notes.lock().unwrap().insert(
+                info.name.clone(),
+                format!(
+                    "the user always denies {}; don't attempt this access with any Tool, do the task another way or ask them",
+                    new.join(", ")
+                ),
+            );
         } else {
             let _ = self.with_store(|st| st.audit("user", "tool.deny", &info.name));
         }
         approved
+    }
+
+    /// Remembered denials that cover any sensitive Capability in `caps`.
+    fn remembered_denials(&self, caps: &Capabilities) -> Vec<String> {
+        let Ok(denials) = self.with_reader(|st| st.list_denials()) else {
+            return Vec::new();
+        };
+        caps.to_specs()
+            .into_iter()
+            .filter(|spec| {
+                let Ok(want) = Capabilities::parse(std::slice::from_ref(spec)) else {
+                    return false;
+                };
+                want.is_sensitive()
+                    && denials.iter().any(|d| {
+                        Capabilities::parse(std::slice::from_ref(&d.capability))
+                            .is_ok_and(|deny| deny.covers(&want))
+                    })
+            })
+            .collect()
+    }
+
+    /// The error a denied call returns to the agent, with the reason when
+    /// the user always denies that access.
+    fn denied_text(&self, name: &str) -> String {
+        match self.denial_notes.lock().unwrap().get(name) {
+            Some(note) => format!("user denied approval for tool '{name}': {note}"),
+            None => format!("user denied approval for tool '{name}'"),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7080,6 +7231,45 @@ impl Daemon {
                 })
             })
             .collect())
+    }
+
+    /// A new Tool that declares unscoped Capabilities (bare `net`,
+    /// `process`, writing anywhere, a secret env key) is pointed out in the
+    /// chat before any approval, and the agent is told the least-privilege
+    /// alternative (SPEC §10.3). Returns `text` with that hint added.
+    fn note_broad_tool(&self, session_id: &str, tool_id: &str, text: String) -> String {
+        let Ok(Some((info, _))) = self.with_reader(|st| st.get_tool_current(tool_id)) else {
+            return text;
+        };
+        let broad: Vec<(String, &str, &str)> = info
+            .capabilities
+            .iter()
+            .filter_map(|c| {
+                let why = formless_protocol::broad_capability(c)?;
+                Some((c.clone(), why, scoped_alternative(c)))
+            })
+            .collect();
+        if broad.is_empty() {
+            return text;
+        }
+        let list = broad
+            .iter()
+            .map(|(c, why, _)| format!("{c} ({why})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.broadcast(Event::Note {
+            session_id: Some(session_id.to_string()),
+            text: format!(
+                "The agent created {} with broad capabilities: {list}. You'll be asked before it uses them.",
+                info.name
+            ),
+        });
+        let mut v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"result": text}));
+        v["least_privilege"] = json!(broad
+            .iter()
+            .map(|(c, _, alt)| format!("{c} is broad; prefer {alt}"))
+            .collect::<Vec<_>>());
+        v.to_string()
     }
 
     /// Log arguments that arrived as JSON strings and were parsed (§7.3).
@@ -7334,7 +7524,7 @@ impl Daemon {
                     dur(&started),
                     &cfg,
                 );
-                return Err(format!("user denied approval for tool '{name}'"));
+                return Err(self.denied_text(&name));
             }
             self.broadcast(Event::ToolCallStarted {
                 session_id: session_id.clone(),
@@ -8288,6 +8478,17 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// The input-bound form to suggest instead of a broad Capability.
+fn scoped_alternative(spec: &str) -> &'static str {
+    match spec.split(':').next().unwrap_or_default() {
+        "net" => "net:$input.url or net:<the host>",
+        "process" => "process:<the one command>",
+        "fs" => "fs:write:$input.path",
+        "env" => "env:<only the key needed>, or ask the user",
+        _ => "a capability scoped to the input",
+    }
 }
 
 /// The wider scopes to offer for each path Capability in `caps` that the

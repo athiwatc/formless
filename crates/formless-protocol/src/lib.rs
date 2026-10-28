@@ -85,6 +85,110 @@ pub struct SearchHit {
     pub created_at: String,
 }
 
+/// [`Request::SecurityStatus`]'s answer as text, for the CLI and TUI.
+pub fn security_report(v: &serde_json::Value) -> String {
+    let mut out = Vec::new();
+    let list = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    };
+    out.push(format!(
+        "Approvals: {} grant(s){}",
+        v["grants_total"],
+        v["grants"]
+            .as_object()
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(
+                " ({})",
+                m.iter()
+                    .map(|(k, n)| format!("{k} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .unwrap_or_default()
+    ));
+    if v["broad_grants"].as_array().is_some_and(|a| !a.is_empty()) {
+        out.push(format!(
+            "  ⚠ broad: {}",
+            list(&v["broad_grants"]).join(", ")
+        ));
+    }
+    out.push(format!("Always denied: {}", v["denials"]));
+    let trusted = list(&v["trusted_paths"]);
+    out.push(if trusted.is_empty() {
+        "Trusted folders: none".into()
+    } else {
+        format!(
+            "Trusted folders{}: {}",
+            if v["trust_writes"] == false {
+                " (writes still ask)"
+            } else {
+                ""
+            },
+            trusted.join(", ")
+        )
+    });
+    let servers = v["mcp_servers"].as_array().cloned().unwrap_or_default();
+    out.push(format!("MCP servers: {}", servers.len()));
+    for s in &servers {
+        out.push(format!(
+            "  {} ({}) {}{}{}",
+            s["name"].as_str().unwrap_or_default(),
+            s["transport"].as_str().unwrap_or_default(),
+            s["target"].as_str().unwrap_or_default(),
+            if s["trusted"] == true {
+                " · trusted"
+            } else {
+                ""
+            },
+            if s["disabled"] == true {
+                " · disabled"
+            } else {
+                ""
+            },
+        ));
+    }
+    let hooks = v["trusted_hooks"].as_array().cloned().unwrap_or_default();
+    out.push(format!("Hooks run without asking: {}", hooks.len()));
+    for h in &hooks {
+        out.push(format!(
+            "  {}: {}",
+            h["event"].as_str().unwrap_or_default(),
+            h["command"].as_str().unwrap_or_default()
+        ));
+    }
+    out.push(format!(
+        "Relay: {}",
+        if v["relay"]["enabled"] == true {
+            format!("on ({})", v["relay"]["url"].as_str().unwrap_or_default())
+        } else {
+            "off".into()
+        }
+    ));
+    out.push(format!(
+        "Web UI: {}",
+        match v["web_ui"]["port"].as_u64() {
+            Some(p) => format!("running on 127.0.0.1:{p}"),
+            None => "off".into(),
+        }
+    ));
+    out.join("\n")
+}
+
+/// A Capability the user always denies (SPEC §10.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DenialInfo {
+    pub capability: String,
+    /// The Tool whose prompt it was denied on.
+    pub tool_name: String,
+    #[serde(default)]
+    pub denied_by: String,
+    pub created_at: String,
+}
+
 /// The scopes a path Capability on an approval can be granted with.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PathOption {
@@ -1422,6 +1526,21 @@ pub enum Request {
         /// and grant exactly what was asked.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         paths: std::collections::BTreeMap<String, String>,
+        /// With `approved = false`: always deny the call's new sensitive
+        /// Capabilities, for every Tool, until forgotten (SPEC §10.3).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remember_denial: bool,
+    },
+    /// Capabilities the user always denies (`Vec<DenialInfo>`).
+    ListDenials,
+    /// What the daemon can reach, in one report (SPEC §10.3): grants by
+    /// Capability family, denials, trusted folders, MCP servers, trusted
+    /// hooks, relay and web UI. Formatted by [`security_report`].
+    SecurityStatus,
+    /// Forget a remembered denial (`capability`), or all of them.
+    ForgetDenial {
+        #[serde(default)]
+        capability: Option<String>,
     },
     PromotionDecision {
         promotion_id: String,
