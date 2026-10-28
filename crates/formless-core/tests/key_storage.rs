@@ -70,3 +70,29 @@ fn paths_for_child() -> Paths {
         profile: std::env::var("FORMLESS_KEY_XPROC_PROFILE").unwrap(),
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn secret_files_are_private_from_the_start_and_loose_ones_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "fl-secret-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    ));
+    let file = dir.join("api_key");
+    formless_core::config::write_secret_file(&file, "sk-test").unwrap();
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert!(
+        std::fs::read_dir(&dir).unwrap().count() == 1,
+        "no temp file left"
+    );
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        formless_core::config::read_secret_file(&file).as_deref(),
+        Some("sk-test")
+    );
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "tightened on read");
+    let _ = std::fs::remove_dir_all(dir);
+}

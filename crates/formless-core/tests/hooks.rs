@@ -65,7 +65,7 @@ async fn pre_and_post_hooks_around_tool_calls() {
     std::fs::create_dir_all(&paths.data_dir).unwrap();
     std::fs::create_dir_all(&paths.config_dir).unwrap();
     let log = base.join("post.log");
-    let cfg = Config {
+    let mut cfg = Config {
         hooks: vec![
             HookCfg {
                 event: "pre_tool".into(),
@@ -104,6 +104,8 @@ async fn pre_and_post_hooks_around_tool_calls() {
         ],
         ..Default::default()
     };
+    // The fail-closed case below needs prompts on (§9.8).
+    cfg.security.secure = true;
     cfg.save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
     let sid = store.create_session(None).unwrap().id;

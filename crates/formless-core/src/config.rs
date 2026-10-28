@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -87,17 +87,85 @@ impl SecurityCfg {
 
     /// The trusted folders with `~` expanded and trailing slashes gone.
     pub fn roots(&self) -> Vec<String> {
-        let home = std::env::var("HOME").unwrap_or_default();
-        self.trusted_paths
-            .iter()
-            .map(|p| match p.strip_prefix('~') {
-                Some(rest) if !home.is_empty() => format!("{home}{rest}"),
-                _ => p.clone(),
-            })
-            .map(|p| p.trim_end_matches('/').to_string())
-            .filter(|p| p.starts_with('/') && p.len() > 1)
-            .collect()
+        self.roots_checked().0
     }
+
+    /// The usable trusted folders, and the entries dropped with why (not
+    /// absolute, a whole drive or `/`, `..`), for a warning (SPEC §10.3).
+    /// `~` is the home folder on every OS; `/` and `\` both separate.
+    pub fn roots_checked(&self) -> (Vec<String>, Vec<(String, &'static str)>) {
+        let home = directories::BaseDirs::new()
+            .map(|d| d.home_dir().to_string_lossy().into_owned())
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_default();
+        let mut ok = Vec::new();
+        let mut dropped = Vec::new();
+        for raw in &self.trusted_paths {
+            let p = match raw.strip_prefix('~') {
+                Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+                    if home.is_empty() {
+                        dropped.push((raw.clone(), "no home folder to expand ~"));
+                        continue;
+                    }
+                    format!("{home}{rest}")
+                }
+                _ => raw.clone(),
+            };
+            let parts = path_parts(&p);
+            if !is_absolute_any(&p) {
+                dropped.push((raw.clone(), "not an absolute path"));
+            } else if parts.iter().any(|s| s == "..") {
+                dropped.push((raw.clone(), "contains .."));
+            } else if parts.len() < 2 && !p.starts_with('/') || parts.is_empty() {
+                dropped.push((raw.clone(), "a whole drive or / is too broad"));
+            } else {
+                ok.push(p.trim_end_matches(['/', '\\']).to_string());
+            }
+        }
+        (ok, dropped)
+    }
+
+    /// Is `path` inside (or equal to) a trusted folder, by whole path
+    /// components on either separator, with no `..` anywhere?
+    pub fn path_trusted(&self, path: &str) -> bool {
+        let want = path_parts(path);
+        if want.iter().any(|s| s == "..") {
+            return false;
+        }
+        self.roots().iter().any(|r| {
+            let root = path_parts(r);
+            let windows = is_windows_path(r);
+            want.len() >= root.len()
+                && root.iter().zip(&want).all(|(a, b)| {
+                    if windows {
+                        a.eq_ignore_ascii_case(b)
+                    } else {
+                        a == b
+                    }
+                })
+        })
+    }
+}
+
+/// A path's components, split on `/` and `\` (a drive `C:` or UNC host
+/// is the first one).
+fn path_parts(p: &str) -> Vec<String> {
+    p.split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(str::to_string)
+        .collect()
+}
+
+/// `C:\…`, `C:/…` or a UNC `\\host\share` path.
+fn is_windows_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || p.starts_with("\\\\")
+}
+
+/// Absolute on some OS: `/…`, or a Windows drive or UNC path.
+fn is_absolute_any(p: &str) -> bool {
+    p.starts_with('/') || is_windows_path(p)
 }
 
 /// Opt-in spending limits (SPEC §5.2): unset means no limit. Dollar
@@ -265,6 +333,22 @@ impl ModelPrice {
         let fresh = (prompt - cached).max(0) as f64;
         let cached_rate = self.cached_input.unwrap_or(self.input);
         (fresh * self.input + cached as f64 * cached_rate + completion as f64 * self.output) / 1e6
+    }
+}
+
+/// A yes/no environment variable: `1/true/yes/on` or `0/false/no/off`
+/// (any case); unset or empty is `None`, anything else an error.
+pub fn env_flag(name: &str) -> Result<Option<bool>> {
+    let Ok(v) = std::env::var(name) else {
+        return Ok(None);
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        other => Err(anyhow!(
+            "{name}={other} is not a yes/no value (use 1/true/yes/on or 0/false/no/off)"
+        )),
     }
 }
 
@@ -1096,6 +1180,17 @@ impl Config {
             // What each key means and its default (SPEC §13).
             "docs": setting_docs_json(),
             "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
+            // The approval posture, read-only here (config.toml or --secure).
+            "security": {
+                "secure": self.security.secure,
+                "trusted_paths": self.security.roots().len(),
+                "trusted_hosts": self.security.trusted_hosts.len(),
+                "trust_writes": self.security.trust_writes,
+                "change": format!(
+                    "security.secure in {}, or start with `formless --secure`",
+                    paths.config_file().display()
+                ),
+            },
             "naming": {
                 "enabled": self.naming.enabled,
                 "model": self.naming.model,
@@ -1112,14 +1207,14 @@ impl Config {
         Self::load_from(&paths.config_file())
     }
     pub fn load_from(file: &Path) -> Result<Self> {
-        if !file.exists() {
-            return Ok(Self::default());
-        }
-        let text =
-            std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-        let mut cfg: Config =
-            toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?;
-        cfg.apply_env();
+        let mut cfg = if file.exists() {
+            let text = std::fs::read_to_string(file)
+                .with_context(|| format!("read {}", file.display()))?;
+            toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?
+        } else {
+            Self::default()
+        };
+        cfg.apply_env()?;
         Ok(cfg)
     }
     /// The config file alone, without `FORMLESS_*` environment overrides
@@ -1196,9 +1291,9 @@ impl Config {
         std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
         Ok(())
     }
-    fn apply_env(&mut self) {
-        if std::env::var_os("FORMLESS_SECURE").is_some_and(|v| !v.is_empty() && v != "0") {
-            self.security.secure = true;
+    fn apply_env(&mut self) -> Result<()> {
+        if let Some(secure) = env_flag("FORMLESS_SECURE")? {
+            self.security.secure = secure;
         }
         if let Ok(v) = std::env::var("FORMLESS_BASE_URL") {
             self.provider.base_url = v;
@@ -1211,10 +1306,59 @@ impl Config {
                 self.daemon.idle_grace_secs = n;
             }
         }
+        Ok(())
     }
 }
 
 // --- API key storage (SPEC §4.2): OS keychain, 0600 file fallback. ---
+
+/// Write a secret file atomically, private from the first byte: a temp
+/// file created with mode 0600 (never wider, whatever the umask), synced,
+/// then renamed over `file`.
+pub fn write_secret_file(file: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, file).with_context(|| format!("replace {}", file.display()))?;
+    Ok(())
+}
+
+/// Read a secret file; one that group or others can read is tightened
+/// to 0600 first, with a warning (SPEC §4.2).
+pub fn read_secret_file(file: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(file) {
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "{} was readable by others (mode {:o}); tightened to 0600",
+                    file.display(),
+                    mode & 0o777
+                );
+                let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    std::fs::read_to_string(file).ok()
+}
 
 const KEYRING_SERVICE: &str = "formless";
 
@@ -1228,18 +1372,7 @@ pub fn save_api_key(paths: &Paths, key: &str) -> Result<()> {
     // unreadable after a rebuild (ACL is tied to the binary identity),
     // which would otherwise force re-entering the key on every start.
     let file = paths.key_fallback_file();
-    let file_result = (|| -> Result<()> {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&file, key)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
-    })();
+    let file_result = (|| -> Result<()> { write_secret_file(&file, key) })();
     let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &keyring_user(paths))
         .map(|entry| entry.set_password(key).is_ok())
         .unwrap_or(false);
@@ -1256,8 +1389,7 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
             return Some(v);
         }
     }
-    if let Some(k) = std::fs::read_to_string(paths.key_fallback_file())
-        .ok()
+    if let Some(k) = read_secret_file(&paths.key_fallback_file())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
@@ -1338,18 +1470,7 @@ pub fn generate_relay_secret() -> String {
 
 pub fn save_relay_secret(paths: &Paths, secret: &str) -> Result<()> {
     let file = paths.relay_secret_file();
-    let file_result = (|| -> Result<()> {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&file, secret)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
-    })();
+    let file_result = (|| -> Result<()> { write_secret_file(&file, secret) })();
     let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &relay_keyring_user(paths))
         .map(|entry| entry.set_password(secret).is_ok())
         .unwrap_or(false);
@@ -1366,8 +1487,7 @@ pub fn load_relay_secret(paths: &Paths) -> Option<String> {
             return Some(v);
         }
     }
-    if let Some(k) = std::fs::read_to_string(paths.relay_secret_file())
-        .ok()
+    if let Some(k) = read_secret_file(&paths.relay_secret_file())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {

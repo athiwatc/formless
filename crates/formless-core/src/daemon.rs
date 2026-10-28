@@ -539,10 +539,17 @@ impl Daemon {
                 });
                 let mut running: Vec<String> = self.runs.lock().unwrap().keys().cloned().collect();
                 running.sort();
+                let on_disk = build_id();
+                let stale = !on_disk.is_empty() && on_disk != self.build;
+                let secure = self.config().map(|c| c.security.secure).unwrap_or(false);
                 Ok(json!({
                     "protocol": PROTOCOL_VERSION,
                     "version": env!("CARGO_PKG_VERSION"),
                     "build": self.build,
+                    // The binary on disk was replaced since start-up (§9.3).
+                    "stale": stale,
+                    // The approval mode this daemon enforces now (§10.3).
+                    "secure": secure,
                     "sessions": sessions,
                     "running_sessions": running,
                     "pid": std::process::id(),
@@ -1055,7 +1062,9 @@ impl Daemon {
                 if let Ok(Some((tool, _))) = self.with_store(|st| st.get_tool_current(&tool_id)) {
                     self.broadcast(Event::ToolUpdated { tool });
                 }
-                Ok(json!({"revoked": true}))
+                Ok(
+                    json!({"revoked": true, "still_trusted": self.still_trusted(&tool_id, capability.as_deref())}),
+                )
             }
             Request::ListApprovals => Ok(serde_json::to_value(self.list_grants()?)?),
             Request::SecurityStatus => {
@@ -1162,7 +1171,9 @@ impl Daemon {
                 if let Ok(Some((tool, _))) = self.with_store(|st| st.get_tool_current(&tool_id)) {
                     self.broadcast(Event::ToolUpdated { tool });
                 }
-                Ok(json!({"revoked": true}))
+                Ok(
+                    json!({"revoked": true, "still_trusted": self.still_trusted(&tool_id, capability.as_deref())}),
+                )
             }
             Request::CompactSession { session_id, focus } => {
                 if self.runs.lock().unwrap().contains_key(&session_id) {
@@ -3388,6 +3399,7 @@ impl Daemon {
                     expires_at: None,
                     session_id: None,
                     last_used: last.clone(),
+                    trusted: false,
                 });
             }
         }
@@ -3426,6 +3438,7 @@ impl Daemon {
                     expires_at: None,
                     session_id: Some(session_id.clone()),
                     last_used: last_used.clone(),
+                    trusted: false,
                 });
             }
         }
@@ -3454,7 +3467,14 @@ impl Daemon {
                     expires_at: Some(until.to_rfc3339()),
                     session_id: None,
                     last_used: last_used.clone(),
+                    trusted: false,
                 });
+            }
+        }
+        // Config trust still approves these, whatever the grant says.
+        if let Ok(cfg) = self.config() {
+            for g in &mut out {
+                g.trusted = spec_trusted(&cfg.security, &g.capability);
             }
         }
         Ok(out)
@@ -3533,6 +3553,13 @@ impl Daemon {
             .unwrap()
             .get(&info.id)
             .is_some_and(|(g, m, until)| *until > chrono::Utc::now() && covered(g, *m))
+        {
+            return None;
+        }
+        // Trusted by config, or always denied: either way nobody is asked
+        // (the same rules as `ensure_approval`).
+        if (trusted_only(&cfg.security, caps) && ver.memory_mb <= cfg.tools.default_memory_mb)
+            || !self.remembered_denials(caps).is_empty()
         {
             return None;
         }
@@ -4017,7 +4044,11 @@ impl Daemon {
             return (true, String::new());
         };
         let key = h.command.join(" ");
-        if !h.trusted && !self.hook_approvals.lock().unwrap().contains(&key) {
+        // With approvals off a hook command runs unasked like any Tool
+        // (logged); with them on, an untrusted one is asked about once.
+        if !h.trusted && !cfg.security.secure {
+            let _ = self.with_store(|st| st.audit("approvals-off", "hook.run_unasked", &key));
+        } else if !h.trusted && !self.hook_approvals.lock().unwrap().contains(&key) {
             let (ok, _) = self
                 .ask_user_approval(
                     session_id,
@@ -6926,15 +6957,12 @@ impl Daemon {
             return false;
         }
         // Approvals are opt-in (`security.secure`); denials apply anyway.
+        // Each call that runs unasked is still on record (SPEC §10.3).
         if !cfg.security.secure {
-            return true;
-        }
-        // Only file access inside trusted folders: approved, and logged.
-        if trusted_only(&cfg.security, caps) && ver.memory_mb <= cfg.tools.default_memory_mb {
             let _ = self.with_store(|st| {
                 st.audit(
-                    "trusted",
-                    "tool.approve_trusted",
+                    "approvals-off",
+                    "tool.run_unasked",
                     &format!("{}: {}", info.name, caps.to_specs().join(", ")),
                 )
             });
@@ -6987,6 +7015,18 @@ impl Daemon {
             if granted.covers(caps) && ver.memory_mb <= *mem {
                 return true;
             }
+        }
+        // Trusted folders and hosts (config) come after the user's own
+        // grants, so the audit names the real basis (SPEC §10.3).
+        if trusted_only(&cfg.security, caps) && ver.memory_mb <= cfg.tools.default_memory_mb {
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "trusted",
+                    "tool.approve_trusted",
+                    &format!("{}: {}", info.name, caps.to_specs().join(", ")),
+                )
+            });
+            return true;
         }
         // Fail closed when nobody can answer (SPEC §12 headless rule).
         if self.subscriber_count() == 0 {
@@ -7127,6 +7167,27 @@ impl Daemon {
             let _ = self.with_store(|st| st.audit("user", "tool.deny", &info.name));
         }
         approved
+    }
+
+    /// The revoked Capabilities that config trust (trusted folders/hosts)
+    /// will still approve without asking.
+    fn still_trusted(&self, tool_id: &str, capability: Option<&str>) -> Vec<String> {
+        let Ok(cfg) = self.config() else {
+            return Vec::new();
+        };
+        let specs: Vec<String> = match capability {
+            Some(c) => vec![c.to_string()],
+            None => self
+                .with_reader(|st| st.get_tool_current(tool_id))
+                .ok()
+                .flatten()
+                .map(|(t, _)| t.capabilities)
+                .unwrap_or_default(),
+        };
+        specs
+            .into_iter()
+            .filter(|s| spec_trusted(&cfg.security, s))
+            .collect()
     }
 
     /// Remembered denials that cover any sensitive Capability in `caps`.
@@ -8373,6 +8434,12 @@ impl Daemon {
 
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         std::fs::write(self.paths.lock_file(), std::process::id().to_string())?;
+        // Trusted folders that can't be used are said out loud (§10.3).
+        if let Ok(cfg) = self.config() {
+            for (p, why) in cfg.security.roots_checked().1 {
+                tracing::warn!("security.trusted_paths: ignoring {p:?}: {why}");
+            }
+        }
         // Deletes whose undo window passed while the daemon was down.
         let undo = self
             .config()
@@ -8489,6 +8556,12 @@ struct ToolDraft {
     memory_mb: u32,
 }
 
+/// Would trusted folders/hosts in config approve this one spec?
+fn spec_trusted(sec: &crate::config::SecurityCfg, spec: &str) -> bool {
+    Capabilities::parse(&[spec.to_string()])
+        .is_ok_and(|one| one.is_sensitive() && trusted_only(sec, &one))
+}
+
 /// The input-bound form to suggest instead of a broad Capability.
 fn scoped_alternative(spec: &str) -> &'static str {
     match spec.split(':').next().unwrap_or_default() {
@@ -8571,11 +8644,9 @@ fn trusted_only(sec: &crate::config::SecurityCfg, caps: &Capabilities) -> bool {
         return false;
     }
     let inside = |spec: &str, path: &str| {
-        !path.split('/').any(|s| s == "..")
+        !roots.is_empty()
             && !formless_protocol::path_note(spec, None).is_some_and(|(warn, _)| warn)
-            && roots
-                .iter()
-                .any(|r| path == r || path.starts_with(&format!("{r}/")))
+            && sec.path_trusted(path)
     };
     let mut trusted_any = false;
     let mut rest = Vec::new();
@@ -9479,5 +9550,84 @@ mod path_scope_tests {
             assert_eq!(widen_paths(&caps, &chosen), caps, "{bad}");
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod trust_precedence_tests {
+    use super::*;
+
+    /// A trusted write: never held in a batch, and a user's own grant is
+    /// the basis the audit names (SPEC §10.3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn trusted_calls_are_not_held_and_grants_come_first() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("fl-prec-{short}"));
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        let mut cfg = Config::default();
+        cfg.security.secure = true;
+        cfg.security.trusted_paths = vec![project.display().to_string()];
+        cfg.save(&paths).unwrap();
+        let target = project.join("out.txt");
+        let caps = Capabilities::parse(&[format!("fs:write:{}", target.display())]).unwrap();
+        let (info, sid) = {
+            let st = Store::open(&paths.db_file()).unwrap();
+            let (info, _) = st
+                .create_tool_version(
+                    "writer",
+                    "d",
+                    r#"{"type":"object"}"#,
+                    "{}",
+                    "function run(){}",
+                    &caps,
+                    64,
+                    "agent",
+                )
+                .unwrap();
+            (info, st.create_session(None).unwrap().id)
+        };
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "writer".into(),
+            arguments: "{}".into(),
+        };
+        assert!(
+            daemon.held_calls(&cfg, &sid, &[call]).unwrap().is_empty(),
+            "a trusted call is never listed as held"
+        );
+        // With a stored grant too, the grant is the basis: no trusted audit.
+        daemon
+            .with_store(|st| st.set_approval(&info.id, &caps, 64))
+            .unwrap();
+        let ver = daemon
+            .with_store(|st| st.get_tool_current(&info.id))
+            .unwrap()
+            .unwrap()
+            .1;
+        let ok = daemon
+            .ensure_approval(
+                &cfg,
+                &sid,
+                &info,
+                &ver,
+                &caps,
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(ok);
+        let trusted_rows = daemon
+            .with_store(|st| st.recent_audit(Some("tool.approve_trusted"), 5))
+            .unwrap();
+        assert!(trusted_rows.is_empty(), "{trusted_rows:?}");
+        let grants = daemon.list_grants().unwrap();
+        assert!(grants.iter().all(|g| g.trusted), "listed as still trusted");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

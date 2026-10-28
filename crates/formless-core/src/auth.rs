@@ -89,20 +89,7 @@ fn oauth_keyring_user(paths: &Paths) -> String {
 pub fn save_oauth_tokens(paths: &Paths, tokens: &OAuthTokens) -> Result<()> {
     let encoded = serde_json::to_string(tokens).context("encode OAuth tokens")?;
     let file = paths.oauth_tokens_file();
-    let file_result = (|| -> Result<()> {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = file.with_extension("json.tmp");
-        std::fs::write(&tmp, &encoded).with_context(|| format!("write {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
-        Ok(())
-    })();
+    let file_result = (|| -> Result<()> { crate::config::write_secret_file(&file, &encoded) })();
     let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths))
         .map(|entry| entry.set_password(&encoded).is_ok())
         .unwrap_or(false);
@@ -114,7 +101,7 @@ pub fn save_oauth_tokens(paths: &Paths, tokens: &OAuthTokens) -> Result<()> {
 }
 
 pub fn load_oauth_tokens(paths: &Paths) -> Option<OAuthTokens> {
-    if let Ok(text) = std::fs::read_to_string(paths.oauth_tokens_file()) {
+    if let Some(text) = crate::config::read_secret_file(&paths.oauth_tokens_file()) {
         if let Ok(tokens) = serde_json::from_str::<OAuthTokens>(&text) {
             if !tokens.access_token.is_empty() {
                 return Some(tokens);
@@ -138,18 +125,7 @@ pub fn load_oauth_tokens(paths: &Paths) -> Option<OAuthTokens> {
 pub fn save_named_secret(paths: &Paths, name: &str, value: &Value) -> Result<()> {
     let encoded = value.to_string();
     let file = paths.config_dir.join(format!("{name}.json"));
-    let file_result = (|| -> Result<()> {
-        std::fs::create_dir_all(&paths.config_dir)?;
-        let tmp = file.with_extension("json.tmp");
-        std::fs::write(&tmp, &encoded).with_context(|| format!("write {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
-        Ok(())
-    })();
+    let file_result = (|| -> Result<()> { crate::config::write_secret_file(&file, &encoded) })();
     let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &format!("{name}-{}", paths.profile))
         .map(|entry| entry.set_password(&encoded).is_ok())
         .unwrap_or(false);
@@ -162,9 +138,8 @@ pub fn save_named_secret(paths: &Paths, name: &str, value: &Value) -> Result<()>
 
 pub fn load_named_secret(paths: &Paths, name: &str) -> Option<Value> {
     let file = paths.config_dir.join(format!("{name}.json"));
-    if let Some(v) = std::fs::read_to_string(file)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+    if let Some(v) =
+        crate::config::read_secret_file(&file).and_then(|t| serde_json::from_str(&t).ok())
     {
         return Some(v);
     }
