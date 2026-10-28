@@ -41,23 +41,50 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SecurityCfg {
+    /// Ask for approval before sensitive Tool calls (SPEC §10.3). Off by
+    /// default: calls run without prompts. `formless --secure` (or
+    /// `FORMLESS_SECURE=1`) turns it on.
+    pub secure: bool,
     /// Absolute paths (or `~/…`).
     pub trusted_paths: Vec<String>,
     /// Approve writes inside them automatically (logged). False keeps
     /// writes asking, as if no folder were trusted.
     pub trust_writes: bool,
+    /// Hosts whose `net:` grants need no approval: `api.example.com`, or
+    /// `*.github.com` (the domain itself and every subdomain). A grant for
+    /// a host already covers its subdomains, as everywhere. Bare `net`
+    /// (any host) is never trusted.
+    pub trusted_hosts: Vec<String>,
 }
 
 impl Default for SecurityCfg {
     fn default() -> Self {
         Self {
+            secure: false,
             trusted_paths: Vec::new(),
             trust_writes: true,
+            trusted_hosts: Vec::new(),
         }
     }
 }
 
 impl SecurityCfg {
+    /// Is `host` (a `net:` grant's host) one of the trusted hosts?
+    pub fn host_trusted(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        self.trusted_hosts.iter().any(|t| {
+            let t = t.trim().trim_end_matches('.').to_lowercase();
+            let domain = t.strip_prefix("*.").unwrap_or(&t);
+            // `*` alone, or a bare TLD, would trust the internet.
+            !domain.is_empty()
+                && domain.contains('.')
+                && (host == domain || host.ends_with(&format!(".{domain}")))
+        })
+    }
+
     /// The trusted folders with `~` expanded and trailing slashes gone.
     pub fn roots(&self) -> Vec<String> {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -1128,6 +1155,9 @@ impl Config {
         Ok(())
     }
     fn apply_env(&mut self) {
+        if std::env::var_os("FORMLESS_SECURE").is_some_and(|v| !v.is_empty() && v != "0") {
+            self.security.secure = true;
+        }
         if let Ok(v) = std::env::var("FORMLESS_BASE_URL") {
             self.provider.base_url = v;
         }

@@ -386,6 +386,7 @@ async fn scripted_flow(
         ..Default::default()
     };
     cfg.daemon.idle_grace_secs = 3600;
+    cfg.security.secure = true;
     cfg.save(&paths).unwrap();
 
     let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());

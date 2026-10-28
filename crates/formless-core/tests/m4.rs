@@ -211,6 +211,7 @@ fn write_cfg(paths: &Paths, base: &str, pending_secs: u64, server_compact: bool,
         ..Default::default()
     };
     cfg.daemon.idle_grace_secs = 3600;
+    cfg.security.secure = true;
     cfg.tools.pending_threshold_secs = pending_secs;
     cfg.compaction.server_side = server_compact;
     // These tests assert exact event streams; keep the namer (and its

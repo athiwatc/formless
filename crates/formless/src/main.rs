@@ -27,6 +27,10 @@ struct Cli {
     /// spinners or borders); also `tui.screen_reader = true`
     #[arg(long)]
     plain: bool,
+    /// Ask for approval before sensitive Tool calls (default: run them
+    /// without asking); also `security.secure = true`
+    #[arg(long, global = true)]
+    secure: bool,
     /// Open the most recently active Session
     #[arg(short = 'c', long = "continue", conflicts_with = "new")]
     continue_last: bool,
@@ -976,6 +980,10 @@ fn main() -> Result<()> {
         use clap::CommandFactory;
         clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
         return Ok(());
+    }
+    if cli.secure {
+        // A daemon started from here inherits it (see `Config::apply_env`).
+        std::env::set_var("FORMLESS_SECURE", "1");
     }
     let paths = Paths::resolve(cli.profile.as_deref())?;
     match cli.cmd {

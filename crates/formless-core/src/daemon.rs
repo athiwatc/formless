@@ -258,6 +258,11 @@ pub struct Daemon {
     /// attempted once per daemon lifetime.
     model_download: Arc<AtomicBool>,
     pub(crate) shutdown: CancellationToken,
+    /// Identity of the binary this daemon was started from (mtime, size,
+    /// inode), captured once at start-up. A rebuild keeps `version`
+    /// unchanged, so this is how a client tells that the daemon is running
+    /// code that is no longer on disk (SPEC §9.3).
+    build: String,
 }
 
 impl Daemon {
@@ -328,6 +333,7 @@ impl Daemon {
             auto_skill: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
+            build: build_id(),
         })
     }
 
@@ -522,6 +528,7 @@ impl Daemon {
                 Ok(json!({
                     "protocol": PROTOCOL_VERSION,
                     "version": env!("CARGO_PKG_VERSION"),
+                    "build": self.build,
                     "sessions": sessions,
                     "running_sessions": running,
                     "pid": std::process::id(),
@@ -3391,7 +3398,8 @@ impl Daemon {
         ver: &ToolVersionInfo,
         caps: &Capabilities,
     ) -> Option<Vec<String>> {
-        if !(caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb)
+        if !cfg.security.secure
+            || !(caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb)
             || !caps.mcp.is_empty()
         {
             return None;
@@ -6726,7 +6734,7 @@ impl Daemon {
         cancel: &CancellationToken,
     ) -> bool {
         let needs = caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb;
-        if !needs {
+        if !needs || !cfg.security.secure {
             return true;
         }
         // Only file access inside trusted folders: approved, and logged.
@@ -7834,12 +7842,57 @@ impl Daemon {
         }
     }
 
+    /// Would shutting down now interrupt anything? A Run, a held Tool
+    /// call, or an attached client (which would see the connection drop).
+    fn nothing_in_flight(&self) -> bool {
+        let held = self
+            .pending
+            .lock()
+            .unwrap()
+            .values()
+            .any(|e| e.result.lock().unwrap().is_none());
+        !held && self.runs.lock().unwrap().is_empty() && self.subscriber_count() == 0
+    }
+
     async fn idle_watcher(self: Arc<Self>) {
         let mut idle_since: Option<tokio::time::Instant> = None;
+        let mut ticks: u64 = 0;
+        let mut build_noted = false;
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+            // A rebuild of `formless` (SPEC §9.3). The version string does
+            // not change, so this is the only way a long-running daemon
+            // notices it serves code that is no longer on disk: tell the
+            // clients once, then step aside as soon as nothing would be
+            // interrupted, so the next request starts the new build.
+            ticks = ticks.wrapping_add(1);
+            if ticks % 5 == 0 {
+                let on_disk = build_id();
+                if !on_disk.is_empty() && on_disk != self.build {
+                    if !build_noted {
+                        build_noted = true;
+                        tracing::info!(
+                            "the binary was replaced on disk (build {} → {on_disk}); this daemon \
+                             still runs the old one",
+                            self.build
+                        );
+                        self.broadcast(Event::Note {
+                            session_id: None,
+                            text: "formless was rebuilt since this daemon started, so it still \
+                                   runs the old code (approvals, settings and Tools behave as \
+                                   before the rebuild). /restart-daemon switches to the new build."
+                                .into(),
+                        });
+                    }
+                    if self.nothing_in_flight() {
+                        tracing::info!("shutting down so the next request starts the new build");
+                        self.shutdown.cancel();
+                        return;
+                    }
+                }
             }
             let grace = self
                 .config()
@@ -8023,13 +8076,17 @@ struct ToolDraft {
     memory_mb: u32,
 }
 
-/// Is everything sensitive these Capabilities ask for writing inside a
-/// trusted folder (SPEC §10.3)? (Reads never ask.) Not with
-/// `trust_writes = false`; paths with `..`, and folders that hold secrets
-/// (`.ssh`, …), are never trusted.
+/// Is everything sensitive these Capabilities ask for either writing
+/// inside a trusted folder or reaching a trusted host (SPEC §10.3)?
+/// (Reads never ask.) Not with `trust_writes = false`; paths with `..`,
+/// folders that hold secrets (`.ssh`, …) and bare `net` are never trusted.
 fn trusted_only(sec: &crate::config::SecurityCfg, caps: &Capabilities) -> bool {
-    let roots = sec.roots();
-    if roots.is_empty() || !sec.trust_writes || !caps.mcp.is_empty() {
+    let roots = if sec.trust_writes {
+        sec.roots()
+    } else {
+        Vec::new()
+    };
+    if !caps.mcp.is_empty() || (roots.is_empty() && sec.trusted_hosts.is_empty()) {
         return false;
     }
     let inside = |spec: &str, path: &str| {
@@ -8042,9 +8099,10 @@ fn trusted_only(sec: &crate::config::SecurityCfg, caps: &Capabilities) -> bool {
     let mut trusted_any = false;
     let mut rest = Vec::new();
     for spec in caps.to_specs() {
-        let ok = match spec.strip_prefix("fs:write:") {
-            Some(p) => inside(&spec, p),
-            None => spec.starts_with("fs:read:"),
+        let ok = match (spec.strip_prefix("fs:write:"), spec.strip_prefix("net:")) {
+            (Some(p), _) => inside(&spec, p),
+            (_, Some(host)) => sec.host_trusted(host),
+            _ => spec.starts_with("fs:read:"),
         };
         if ok {
             trusted_any = true;
@@ -8227,6 +8285,41 @@ pub fn explain_connect_error(paths: &Paths, err: &std::io::Error) -> String {
         ),
         _ => format!("could not connect to the daemon {place}: {err}"),
     }
+}
+
+/// Identity of the `formless` binary this process would start: its
+/// modification time, size and inode (SPEC §9.3).
+///
+/// A rebuild keeps `CARGO_PKG_VERSION`, so comparing versions cannot tell a
+/// daemon started before the rebuild from a fresh one; comparing this can.
+/// Reports the binary on disk *now*, which is exactly what a client wants
+/// to know and what a daemon compares its own recorded identity against.
+pub fn build_id() -> String {
+    match std::env::current_exe() {
+        Ok(exe) => build_id_of(&exe),
+        Err(_) => String::new(),
+    }
+}
+
+/// [`build_id`] of one path; empty when it cannot be read.
+pub fn build_id_of(exe: &std::path::Path) -> String {
+    let Ok(meta) = std::fs::metadata(exe) else {
+        return String::new();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    format!("{mtime:x}-{}-{ino:x}", meta.len())
 }
 
 /// Spawn `formless daemon serve` detached (client auto-start, SPEC §9.1).

@@ -2610,6 +2610,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// Drop a proposal that never got measured.
+    pub fn delete_proposal(&self, id: &str) -> Result<()> {
+        self.ex(
+            "DELETE FROM prompt_proposals WHERE id=?1 AND status='proposed'",
+            params![id],
+        )
+        .map(|_| ())
+    }
+
     pub fn applied_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
         Ok(self
             .list_proposals()?

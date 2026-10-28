@@ -369,6 +369,7 @@ async fn start_daemon_m3(
         ..Default::default()
     };
     cfg.daemon.idle_grace_secs = 3600;
+    cfg.security.secure = true;
     cfg.optimiser.cooldown_secs = 0;
     cfg.save(&paths).unwrap();
     let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());

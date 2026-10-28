@@ -292,6 +292,7 @@ async fn daemon_registers_and_runs_mcp_tools() {
         ..Default::default()
     };
     cfg.daemon.idle_grace_secs = 3600;
+    cfg.security.secure = true;
     cfg.save(&paths).unwrap();
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
     let server = tokio::spawn({

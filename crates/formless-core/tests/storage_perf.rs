@@ -58,12 +58,18 @@ fn session_summary_is_maintained_by_triggers() {
     assert_eq!(s.preview, None);
 
     // Appends count, the preview follows the newest user message.
-    let m1 = store.append_message(&sid, "user", "first question").unwrap();
-    store.append_message(&sid, "assistant", "an answer").unwrap();
+    let m1 = store
+        .append_message(&sid, "user", "first question")
+        .unwrap();
+    store
+        .append_message(&sid, "assistant", "an answer")
+        .unwrap();
     let s = store.get_session(&sid).unwrap().unwrap();
     assert_eq!(s.message_count, 2, "assistant message counted too");
     assert_eq!(s.preview.as_deref(), Some("first question"));
-    store.append_message(&sid, "user", "second question").unwrap();
+    store
+        .append_message(&sid, "user", "second question")
+        .unwrap();
     let s = store.get_session(&sid).unwrap().unwrap();
     assert_eq!(s.message_count, 3);
     assert_eq!(s.preview.as_deref(), Some("second question"));
@@ -168,11 +174,19 @@ fn migrates_a_real_database() {
         assert_eq!(row.message_count, count, "message_count for {id}");
         let want = preview
             .as_deref()
-            .map(|p| p.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().to_string())
-            .map(|p| if p.chars().count() > 80 {
-                p.chars().take(80).collect::<String>() + "…"
-            } else {
-                p
+            .map(|p| {
+                p.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            })
+            .map(|p| {
+                if p.chars().count() > 80 {
+                    p.chars().take(80).collect::<String>() + "…"
+                } else {
+                    p
+                }
             });
         assert_eq!(row.preview, want, "preview for {id}");
         assert_eq!(row.last_run_status, status, "last_run_status for {id}");
@@ -195,7 +209,9 @@ fn migrates_a_real_database() {
         .unwrap();
         let run = || {
             let mut stmt = c.prepare_cached(sql).unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().count()
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .count()
         };
         let _ = run();
         let t = std::time::Instant::now();
@@ -246,7 +262,11 @@ fn write_and_read_latency() {
     }
 
     time("append_message", 400, || {
-        std::hint::black_box(store.append_message(&sid, "user", "a typical message").unwrap());
+        std::hint::black_box(
+            store
+                .append_message(&sid, "user", "a typical message")
+                .unwrap(),
+        );
     });
     time("start_invocation+finish_invocation", 400, || {
         let id = store
