@@ -301,14 +301,23 @@ impl Daemon {
         let (base_score, cand_score, total) = match measured {
             Ok(m) => m,
             Err(e) => {
-                // An unmeasured proposal can never be applied: drop it.
-                let _ = self.with_store(|st| st.delete_proposal(&proposal.id));
-                self.broadcast(Event::ProposalUpdated {
-                    proposal: PromptProposalInfo {
-                        status: "rejected".into(),
-                        ..proposal
-                    },
+                // An unmeasured proposal can never be applied: it is kept as
+                // rejected (what clients are told, and what a fresh list
+                // shows), with the reason in the audit log (SPEC §8.6).
+                let rejected = self
+                    .with_store(|st| st.set_proposal_status(&proposal.id, "rejected"))
+                    .ok()
+                    .flatten();
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "optimiser",
+                        "proposal.discard_unmeasured",
+                        &format!("{}: {e:#}", proposal.id),
+                    )
                 });
+                if let Some(p) = rejected {
+                    self.broadcast(Event::ProposalUpdated { proposal: p });
+                }
                 return Err(anyhow!(
                     "measuring the proposal failed ({e}); it was discarded"
                 ));
@@ -1385,12 +1394,15 @@ async fn evaluate_prompt(
         messages.extend(case.messages.iter().cloned());
         let tools: Vec<Value> = builtins.iter().chain(&case.extra_tools).cloned().collect();
         for _ in 0..repeats.max(1) {
-            // One retry: a transient provider error must not void a whole suite.
+            // One retry, for a transient provider error only (429, 5xx, a
+            // dropped connection): it must not void a whole suite, and a
+            // determined failure (auth, bad request) must not cost twice.
             let r = match provider
                 .chat_stream(&messages, &tools, model, effort, &cancel, |_, _| {})
                 .await
             {
                 Ok(r) => r,
+                Err(e) if !crate::errors::is_transient(&format!("{e:#}")) => return Err(e),
                 Err(_) => {
                     provider
                         .chat_stream(&messages, &tools, model, effort, &cancel, |_, _| {})

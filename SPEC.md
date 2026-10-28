@@ -1515,6 +1515,11 @@ it says.
   `promotion_margin_points` **and** be significant (one-sided
   two-proportion z-test, p < 0.05). The one exception is when both arms
   are perfect.
+- **Measurement failures.** A model call in the eval is retried once
+  only when the error is transient (429, 408, 5xx, a dropped or timed-out
+  connection); an auth error or bad request fails at once. A proposal
+  whose measurement fails is kept as `rejected` (never applied, listed as
+  such) and the error is audit-logged as `proposal.discard_unmeasured`.
 
 ### 8.7 Run outcomes
 
@@ -1645,6 +1650,22 @@ such as `read_file`, `read_text_file` and `file_read`.
   running after an upgrade, they warn and suggest `formless daemon
   restart`; in the TUI, `/restart-daemon` restarts it and reconnects.
   `daemon status` warns too.
+- **Rebuilds.** A rebuild keeps the version, so the daemon records its
+  binary's identity at start (`build`: modification time, size and
+  inode) and `Status` reports it with `stale` (the binary on disk has
+  changed since). The TUI, `formless run` and `daemon status` warn the
+  same way when `stale` is set or `build` differs from their own binary,
+  so a client attaching late still hears it. Every 5 s the daemon checks
+  its binary; once replaced it posts one note to attached clients and
+  shuts down as soon as nothing would be interrupted (no Run, no held
+  call, no attached client), so the next request starts the new build.
+- **Approval mode.** `Status.secure` is the approval mode the daemon
+  enforces (§10.3). `security.secure` in `config.toml` is re-read per
+  call; `--secure` and `FORMLESS_SECURE` (`1/true/yes/on` or
+  `0/false/no/off`; anything else is a config error) apply to the daemon
+  started with them. A client run with `--secure` against a daemon whose
+  approvals are off warns and suggests `formless --secure daemon
+  restart`.
 - **Ordering and responsiveness:** on each connection, ordinary requests
   run one at a time and in order on a per-connection worker, so a
   client's fire-and-forget sequences keep their order. Control requests
@@ -1791,7 +1812,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   and never change the call.
 - **Trust:**
   - Hook Tools run through the normal approval rules.
-  - A command runs without asking only when `trusted = true`. Otherwise
+  - With approvals off (`security.secure = false`, the default) a hook
+    command runs without asking like any Tool, logged as
+    `hook.run_unasked`. With them on, a command runs without asking only
+    when `trusted = true`. Otherwise
     the user approves it once per daemon lifetime, and an unapproved
     pre_tool command fails closed by denying its call.
   - Hooks run outside model turns, so they never trigger themselves, and
@@ -1956,8 +1980,19 @@ run_tool = "network_policy"     # a registry Tool, or…
   - **Which approvals:** MCP and other non-Tool approvals get none.
   - **Turning it off:** `tools.approval_summaries = false`, so no model
     call is made.
-- First execution of a Tool whose Capabilities are sensitive (`fs:write`,
-  `net`, `process`, `env`, or any widening) requires approval. Approval is
+- **Approval mode.** Approvals are **opt-in**: `security.secure`
+  defaults to `false`, and then sensitive Tool calls run without asking.
+  Each such call is still audit-logged as `tool.run_unasked`, and so is a
+  hook command (`hook.run_unasked`). Remembered denials (below) apply in
+  either mode. `security.secure = true` (or `formless --secure` /
+  `FORMLESS_SECURE=1` when the daemon starts) turns prompts on; everything
+  below about prompts, grants and failing closed describes that mode.
+  The wizard says which mode is in effect when it finishes, and the
+  Settings views, `GetSettings` (`security`) and `formless doctor` show
+  it with the trusted folder and host counts.
+- With approvals on, the first execution of a Tool whose Capabilities are
+  sensitive (`fs:write`, `net`, `process`, `env`, or any widening)
+  requires approval. Approval is
   **per-Tool and survives version bumps; it re-prompts only when
   Capabilities/`memory_mb` widen**. Input-bound scopes (§7.4) are approved
   as their resolved values, per call: approving a path/host adds it to the
@@ -2713,8 +2748,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   checked first; a missing or too-large one is a usage error (exit 2)
   before anything runs. Streaming
   human-readable output on stdout; daemon logs on stderr; `--json` emits one
-  JSON event per line (the §9.3 event stream). **Approvals fail closed** in
-  headless mode: an unapproved sensitive Invocation fails with a clear error
+  JSON event per line (the §9.3 event stream). With approvals on
+  (`security.secure`, §10.3), **approvals fail closed** in headless mode:
+  an unapproved sensitive Invocation fails with a clear error
   (approve first in the TUI), unless `--yes` is passed (auto-approve for
   that Run only: each prompt is answered *once*, nothing is stored). Exit codes: `0` answered, `1` Run errored/paused, `2`
   usage/config error, `130` interrupted.
@@ -2871,8 +2907,10 @@ This table is also the help text clients show. The daemon parses it at
 build time (`config::setting_docs`) and serves `{key: {description,
 default}}` as `GetSettings.docs`, taking defaults from the config types
 when they have one. The web Settings rows and the TUI's selected row show
-the meaning and default. A test fails when a settable key, or one a
-Settings view shows, is missing here.
+the meaning and default. A test fails when a settable key, one a
+Settings view shows, or any key of the default config is missing here;
+the only exceptions are file-only blocks it lists (`provider.auth`,
+`provider.extra_headers`, `mcp.servers`, `hooks`, `providers`, `roles`).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -2919,6 +2957,7 @@ Settings view shows, is missing here.
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
 | `security.trusted_hosts` | [] | Hosts whose `net:` grants need no approval (`api.example.com`, `*.github.com`); config.toml only (§10.3) |
+| `security.secure` | false | Ask before sensitive Tool calls; off runs them unasked (logged). `--secure` / `FORMLESS_SECURE` turn it on at daemon start (§10.3) |
 | `security.trusted_paths` | [] | Folders where writes need no approval; config.toml only (§10.3) |
 | `security.trust_writes` | true | false keeps writes in trusted folders asking (§10.3) |
 | `tools.approval_summaries` | true | Ask the model, once per Tool version, for a plain-language summary shown on approval prompts (§10.3) |
@@ -2950,6 +2989,8 @@ Settings view shows, is missing here.
 | `[[hooks]]` | (none) | pre_tool / post_tool / run_end hooks (§9.8) |
 | `compaction.model` | (session) | Optional separate compaction model (§11) |
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
+| `compaction.trigger_fraction` | 0.8 | Fraction of the context window at which compaction starts (§11) |
+| `mcp.idle_secs` | 300 | Stop an MCP server process after this long without calls; it restarts on the next one (§7.9) |
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 | `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
@@ -2994,7 +3035,10 @@ Settings view shows, is missing here.
   scoped), http(s) only; redirects are followed but every hop is checked,
   so they may not escape a domain scope.
 - **Approvals** (§10.3) are the human gate for sensitive first use and for
-  any Capability widening (including Candidate/optimizer-originated changes).
+  any Capability widening (including Candidate/optimizer-originated
+  changes) when `security.secure` is on. They are opt-in: by default
+  sensitive calls run unasked and are audit-logged as `tool.run_unasked`;
+  Capabilities are still enforced at the host-call layer in both modes.
 - **Audit log:** every approval decision, promotion, rollback, discard,
   retirement, restore, purge, import, reset, and optimiser give-up is
   recorded (actor, time, Tool, capability diff). `ListAudit {filter,
@@ -3082,8 +3126,10 @@ metrics recording, Tools view.
 **Accept when:** from an empty registry the agent builds, validates, and
 reuses Tools across Sessions; a Tool exceeding its Capabilities is denied at
 the host-call layer (demonstrated for fs escape, unscoped process, env
-leak); unapproved sensitive first-run blocks on the modal and headless runs
-fail closed; per-version metrics match recorded Invocations exactly.
+leak); with approvals on (`security.secure`), unapproved sensitive first-run
+blocks on the modal and headless runs fail closed, and with them off (the
+default) the call runs and is logged `tool.run_unasked`; per-version
+metrics match recorded Invocations exactly.
 
 ### M3 — Self-optimisation
 

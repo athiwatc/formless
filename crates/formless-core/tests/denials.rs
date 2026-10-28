@@ -92,3 +92,48 @@ async fn creating_a_broad_tool_suggests_least_privilege() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The default mode, end to end: approvals off, a sensitive call runs with
+/// nobody to ask, and it is on record (SPEC §10.3).
+#[tokio::test(flavor = "multi_thread")]
+async fn by_default_sensitive_calls_run_unasked_and_are_logged() {
+    let (paths, dir) = setup("open");
+    let (id, session) = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let caps = Capabilities::parse(&["net:api.example.com".to_string()]).unwrap();
+        let (info, _) = store
+            .create_tool_version(
+                "caller",
+                "d",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(i){ return {ok: true}; }",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap();
+        (info.id, store.create_session(None).unwrap().id)
+    };
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let r = daemon
+        .handle(Request::RunTool {
+            id,
+            input: serde_json::json!({}),
+            session_id: session,
+        })
+        .await
+        .unwrap();
+    assert!(!r.to_string().contains("denied"), "{r}");
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(
+        store
+            .recent_audit(Some("tool.run_unasked"), 5)
+            .unwrap()
+            .len(),
+        1
+    );
+    let status = daemon.handle(Request::Status).await.unwrap();
+    assert_eq!(status["secure"], false);
+    let _ = std::fs::remove_dir_all(dir);
+}

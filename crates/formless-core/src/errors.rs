@@ -26,6 +26,28 @@ impl<'a> ErrorContext<'a> {
 }
 
 /// The HTTP status in a provider error (`provider error: 401 Unauthorized: …`).
+/// Worth one retry: a rate limit, a server error, or the connection
+/// failing; never an auth error, a bad request or a malformed reply.
+pub fn is_transient(raw: &str) -> bool {
+    match status(raw) {
+        Some(code) => code == 408 || code == 429 || code >= 500,
+        None => {
+            let t = raw.to_lowercase();
+            [
+                "timed out",
+                "timeout",
+                "connection",
+                "connect error",
+                "stream",
+                "overloaded",
+                "reset",
+            ]
+            .iter()
+            .any(|k| t.contains(k))
+        }
+    }
+}
+
 fn status(raw: &str) -> Option<u16> {
     raw.split(|c: char| !c.is_ascii_digit())
         .filter(|w| w.len() == 3)
@@ -239,5 +261,22 @@ mod tests {
         );
         assert_eq!(auth.message, "The API key was rejected by api.groq.com.");
         assert!(auth.details.contains("401"));
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::is_transient;
+
+    #[test]
+    fn only_transient_failures_are_retried() {
+        assert!(is_transient(
+            "POST /chat/completions failed: 429 Too Many Requests"
+        ));
+        assert!(is_transient("503 Service Unavailable"));
+        assert!(is_transient("error sending request: connection refused"));
+        assert!(!is_transient("401 Unauthorized: invalid api key"));
+        assert!(!is_transient("400 Bad Request: unknown parameter"));
+        assert!(!is_transient("parse response: expected value"));
     }
 }

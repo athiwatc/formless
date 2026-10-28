@@ -60,3 +60,56 @@ async fn nesting_and_sleep_limits_come_from_config() {
         "sleep capped at 1s"
     );
 }
+
+#[test]
+fn yes_no_env_vars_accept_the_usual_spellings_and_reject_others() {
+    use formless_core::config::env_flag;
+    let var = "FORMLESS_TEST_FLAG_7531";
+    for (v, want) in [("1", true), ("TRUE", true), ("yes", true), ("on", true)] {
+        std::env::set_var(var, v);
+        assert_eq!(env_flag(var).unwrap(), Some(want), "{v}");
+    }
+    for v in ["0", "false", "No", "off"] {
+        std::env::set_var(var, v);
+        assert_eq!(env_flag(var).unwrap(), Some(false), "{v}");
+    }
+    std::env::set_var(var, "");
+    assert_eq!(env_flag(var).unwrap(), None);
+    std::env::set_var(var, "maybe");
+    assert!(env_flag(var).is_err());
+    std::env::remove_var(var);
+    assert_eq!(env_flag(var).unwrap(), None);
+}
+
+#[test]
+fn trusted_folders_match_by_components_on_every_os_shape() {
+    let sec = formless_core::config::SecurityCfg {
+        trusted_paths: vec![
+            "/home/me/code/app/".into(),
+            r"C:\Code\App".into(),
+            r"\\server\share\proj".into(),
+            "relative/dir".into(),
+            "/".into(),
+            r"C:\".into(),
+            "/home/me/../etc".into(),
+        ],
+        ..Default::default()
+    };
+    let (ok, dropped) = sec.roots_checked();
+    assert_eq!(ok.len(), 3, "{ok:?}");
+    assert_eq!(dropped.len(), 4, "{dropped:?}");
+    assert!(sec.path_trusted("/home/me/code/app/src/main.rs"));
+    assert!(!sec.path_trusted("/home/me/code/app-secrets/x"));
+    assert!(!sec.path_trusted("/home/me/code/app/../../.ssh/id"));
+    assert!(
+        sec.path_trusted(r"c:\code\app\out.txt"),
+        "drive paths ignore case"
+    );
+    assert!(
+        sec.path_trusted("C:/Code/App/sub/out.txt"),
+        "either separator"
+    );
+    assert!(!sec.path_trusted(r"C:\Code\Apple\x"));
+    assert!(sec.path_trusted(r"\\server\share\proj\a.txt"));
+    assert!(!sec.path_trusted(r"\\server\share\other"));
+}

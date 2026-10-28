@@ -290,7 +290,7 @@ cat task.md | formless run -                               # `-` reads the task 
 
 Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
-Approvals are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
+Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
 
 ### Sessions from the command line
 
@@ -446,7 +446,7 @@ formless profiles rm sandbox     # stops its daemon, deletes its data, config an
 | `formless doctor` | Config validity, data dir, keychain reachability, endpoint + tool-calling probe |
 | `formless reset [--force]` | Full wipe of config, keychain entry and data dir |
 
-Global flag: `--profile <name>`. Headless approvals **fail closed**: an unapproved sensitive Invocation fails with a clear error unless `--yes` is passed.
+Global flags: `--profile <name>`, `--secure` (turn approval prompts on for the daemon this starts). Approvals are opt-in; with them on, headless approvals **fail closed**: an unapproved sensitive Invocation fails with a clear error unless `--yes` is passed.
 
 ### 3.12 Updating
 

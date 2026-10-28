@@ -62,3 +62,50 @@ fn defaults_come_from_the_config_types() {
         .unwrap()
         .contains("nest"));
 }
+
+/// Every key `Config::default()` has (Option fields included, as nulls)
+/// is in SPEC §13, apart from a reviewed list of file-only blocks.
+#[test]
+fn every_config_key_is_documented() {
+    fn flatten(prefix: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m)
+                if !m.is_empty() && !prefix.is_empty() || prefix.is_empty() =>
+            {
+                for (k, v) in m {
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    flatten(&key, v, out);
+                }
+            }
+            _ => out.push(prefix.to_string()),
+        }
+    }
+    let defaults = serde_json::to_value(formless_core::Config::default()).unwrap();
+    let mut keys = Vec::new();
+    flatten("", &defaults, &mut keys);
+    // File-only blocks: credentials and their mechanics, maps keyed by
+    // user-chosen names, and lists of user-written entries.
+    let allowed = |k: &str| {
+        [
+            "provider.auth.",
+            "provider.extra_headers",
+            "mcp.servers",
+            "hooks",
+            "providers",
+            "roles",
+        ]
+        .iter()
+        .any(|p| k == p.trim_end_matches('.') || k.starts_with(p))
+    };
+    let docs = setting_docs();
+    let missing: Vec<&String> = keys
+        .iter()
+        .filter(|k| !allowed(k))
+        .filter(|k| !docs.contains_key(k.as_str()))
+        .collect();
+    assert!(missing.is_empty(), "add these to SPEC §13: {missing:?}");
+}

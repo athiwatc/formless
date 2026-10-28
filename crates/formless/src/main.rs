@@ -807,6 +807,20 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                     c(when(&g.expires_at)),
                     c(when(&g.last_used)),
                 ]);
+                if g.trusted {
+                    tbl.row(vec![
+                        c(String::new()),
+                        t(
+                            "↳ also trusted in config.toml: revoking won't make it ask",
+                            Tone::Dim,
+                        ),
+                        c(String::new()),
+                        c(String::new()),
+                        c(String::new()),
+                        c(String::new()),
+                        c(String::new()),
+                    ]);
+                }
             }
             tbl.print();
             Ok(())
@@ -1600,9 +1614,7 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
             if daemon_reachable(&paths) {
                 let v = formless_tui::client::request_once(&paths, Request::Status)?;
                 println!("{}", serde_json::to_string_pretty(&v)?);
-                let ours = env!("CARGO_PKG_VERSION");
-                if let Some(w) = formless_tui::client::version_warning(ours, v["version"].as_str())
-                {
+                for w in formless_tui::client::status_warnings(&v) {
                     eprintln!("warning: {w}");
                 }
             } else if json {
@@ -1787,6 +1799,18 @@ fn formless_pid_alive(pid: u32) -> bool {
 /// The daemon and file checks `--fix` can act on.
 fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     let mut out = Vec::new();
+    if let Ok(cfg) = Config::load(paths) {
+        for (p, why) in cfg.security.roots_checked().1 {
+            out.push(Problem {
+                what: format!("security.trusted_paths entry {p:?} is ignored: {why}"),
+                next: Some(format!(
+                    "use an absolute folder in {}",
+                    paths.config_file().display()
+                )),
+                fix: None,
+            });
+        }
+    }
     #[cfg(unix)]
     if !daemon_reachable(paths) {
         let sock = paths.socket_path();
@@ -2122,6 +2146,17 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         formless_core::logs::log_usage(&paths) as f64 / 1e6,
         cfg.daemon.log_max_bytes as f64 / 1e6,
         cfg.daemon.log_keep
+    );
+    say!(
+        "approvals:  {} (trusted folders: {}, trusted hosts: {}; security.secure in {} or --secure)",
+        if cfg.security.secure {
+            "on: sensitive Tool calls ask first"
+        } else {
+            "OFF: Tools run without asking"
+        },
+        cfg.security.roots().len(),
+        cfg.security.trusted_hosts.len(),
+        paths.config_file().display()
     );
     say!(
         "base_url:   {}",

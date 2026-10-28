@@ -461,6 +461,10 @@ pub struct GrantInfo {
     /// The Tool's latest Invocation.
     #[serde(default)]
     pub last_used: Option<String>,
+    /// Trusted folders or hosts in config.toml approve this Capability
+    /// anyway, so revoking the grant won't make it ask (SPEC §10.3).
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 /// One call of a parallel batch that waits for approval.

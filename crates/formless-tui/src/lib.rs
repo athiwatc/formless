@@ -4320,6 +4320,14 @@ impl App {
         }
         cfg.save(&self.paths)?;
         save_api_key(&self.paths, &w.api_key)?;
+        // Say plainly how Tools are trusted (SPEC §10.3).
+        self.notes.push(if cfg.security.secure {
+            "Approvals are on: a Tool asks before it uses files, the network or programs.".into()
+        } else {
+            "Tools run without asking (approvals are off). To be asked first, set \
+             security.secure = true in config.toml or start with `formless --secure`."
+                .into()
+        });
         self.connect_daemon()
     }
 
@@ -7212,6 +7220,12 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
             when(&g.expires_at),
             when(&g.last_used),
         ));
+        if g.trusted {
+            out.push(format!(
+                "{:w$}  ↳ also trusted in config.toml: revoking won't make it ask",
+                ""
+            ));
+        }
     }
     out.push(String::new());
     out.push("/revoke TOOL [CAPABILITY] · /revoke all [FAMILY] · /approvals FAMILY filters".into());
@@ -13445,6 +13459,7 @@ mod tests {
     #[test]
     fn approvals_list_by_family() {
         let grant = |cap: &str, scope| GrantInfo {
+            trusted: Default::default(),
             tool_id: "t".into(),
             tool_name: "netty".into(),
             capability: cap.into(),

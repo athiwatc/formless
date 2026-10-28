@@ -256,6 +256,31 @@ pub fn rows(
             cfg.relay.url.clone(),
             ReadOnly("edit config.toml"),
         ),
+        Row::new(
+            "Security",
+            "security.secure",
+            "approvals",
+            if cfg.security.secure {
+                "on: sensitive calls ask".to_string()
+            } else {
+                "off: Tools run without asking".to_string()
+            },
+            ReadOnly("set security.secure in config.toml, or start with `formless --secure`"),
+        ),
+        Row::new(
+            "Security",
+            "security.trusted_paths",
+            "trusted folders",
+            cfg.security.roots().len().to_string(),
+            ReadOnly("edit config.toml; /security lists them"),
+        ),
+        Row::new(
+            "Security",
+            "security.trusted_hosts",
+            "trusted hosts",
+            cfg.security.trusted_hosts.len().to_string(),
+            ReadOnly("edit config.toml; /security lists them"),
+        ),
     ];
     for prov in providers["providers"].as_array().into_iter().flatten() {
         let name = prov["name"].as_str().unwrap_or_default();

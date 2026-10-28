@@ -127,10 +127,47 @@ pub fn check_daemon_version(paths: &Paths) -> Result<Option<String>> {
         }
         Err(e) => return Err(e),
     };
-    Ok(version_warning(
-        env!("CARGO_PKG_VERSION"),
-        status["version"].as_str(),
-    ))
+    let warnings = status_warnings(&status);
+    Ok((!warnings.is_empty()).then(|| warnings.join(" ")))
+}
+
+/// Everything about the running daemon that differs from what this
+/// client expects: another version, an older build of the same version
+/// (a rebuild since it started), or approvals off when this client asked
+/// for them (`--secure` / `FORMLESS_SECURE`) (SPEC §9.3, §10.3).
+pub fn status_warnings(status: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let ours = env!("CARGO_PKG_VERSION");
+    if let Some(w) = version_warning(ours, status["version"].as_str()) {
+        out.push(w);
+    } else if let Some(w) = build_warning(&formless_core::daemon::build_id(), status) {
+        out.push(w);
+    }
+    let wants_secure = formless_core::config::env_flag("FORMLESS_SECURE")
+        .ok()
+        .flatten()
+        == Some(true);
+    if wants_secure && status["secure"] == false {
+        out.push(
+            "approvals are off in the running daemon, though you asked for them (--secure / \
+             FORMLESS_SECURE). Run `formless --secure daemon restart`, or set security.secure = \
+             true in config.toml."
+                .into(),
+        );
+    }
+    out
+}
+
+/// The warning when the daemon runs an older build of this version: it
+/// says so itself (`stale`), or its build differs from this binary's.
+pub fn build_warning(ours: &str, status: &serde_json::Value) -> Option<String> {
+    let theirs = status["build"].as_str().unwrap_or_default();
+    let differs = !ours.is_empty() && !theirs.is_empty() && ours != theirs;
+    (status["stale"] == true || differs).then(|| {
+        "formless was rebuilt since the daemon started, so it still runs the old code. Run \
+         `formless daemon restart` to switch to the new build."
+            .to_string()
+    })
 }
 
 /// The mismatch warning, if the daemon runs another version (an older
@@ -252,5 +289,21 @@ mod tests {
         assert!(w.contains("formless daemon restart"));
         let w = version_warning("0.2.0", None).unwrap();
         assert!(w.starts_with("the daemon is an older version"), "{w}");
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_stale_or_different_build_is_reported() {
+        let ok = json!({"version": env!("CARGO_PKG_VERSION"), "build": "a", "stale": false});
+        assert!(build_warning("a", &ok).is_none());
+        assert!(build_warning("b", &ok).is_some(), "rebuilt client");
+        let stale = json!({"build": "a", "stale": true});
+        assert!(build_warning("a", &stale).is_some(), "the daemon says so");
+        assert!(build_warning("", &json!({})).is_none(), "unknown: quiet");
     }
 }
