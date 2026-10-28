@@ -290,10 +290,30 @@ impl Daemon {
             content.trim()
         );
         let repeats = cfg.optimiser.eval_repeats;
-        let (base_score, total) =
-            evaluate_prompt(&provider, &baseline_prompt, &model, effort, repeats).await?;
-        let (cand_score, _) =
-            evaluate_prompt(&provider, &candidate_prompt, &model, effort, repeats).await?;
+        let measured = async {
+            let (base_score, total) =
+                evaluate_prompt(&provider, &baseline_prompt, &model, effort, repeats).await?;
+            let (cand_score, _) =
+                evaluate_prompt(&provider, &candidate_prompt, &model, effort, repeats).await?;
+            Ok::<_, anyhow::Error>((base_score, cand_score, total))
+        }
+        .await;
+        let (base_score, cand_score, total) = match measured {
+            Ok(m) => m,
+            Err(e) => {
+                // An unmeasured proposal can never be applied: drop it.
+                let _ = self.with_store(|st| st.delete_proposal(&proposal.id));
+                self.broadcast(Event::ProposalUpdated {
+                    proposal: PromptProposalInfo {
+                        status: "rejected".into(),
+                        ..proposal
+                    },
+                });
+                return Err(anyhow!(
+                    "measuring the proposal failed ({e}); it was discarded"
+                ));
+            }
+        };
         if let Some(measured) = self
             .with_store(|st| st.update_proposal_eval(&proposal.id, base_score, cand_score, total))?
         {
@@ -1354,9 +1374,18 @@ async fn evaluate_prompt(
         messages.extend(case.messages.iter().cloned());
         let tools: Vec<Value> = builtins.iter().chain(&case.extra_tools).cloned().collect();
         for _ in 0..repeats.max(1) {
-            let r = provider
+            // One retry: a transient provider error must not void a whole suite.
+            let r = match provider
                 .chat_stream(&messages, &tools, model, effort, &cancel, |_, _| {})
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    provider
+                        .chat_stream(&messages, &tools, model, effort, &cancel, |_, _| {})
+                        .await?
+                }
+            };
             total += 1;
             if (case.check)(&r.tool_calls) {
                 passes += 1;

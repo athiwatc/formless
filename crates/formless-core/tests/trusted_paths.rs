@@ -15,6 +15,7 @@ async fn write_with(trust_writes: bool, target: &str) -> (bool, std::path::PathB
     let project = project.canonicalize().unwrap();
     let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
     let mut cfg = Config::default();
+    cfg.security.secure = true;
     cfg.provider.base_url = "http://127.0.0.1:9".into();
     cfg.provider.model = "m".into();
     cfg.naming.enabled = false;
@@ -75,5 +76,108 @@ async fn writes_inside_a_trusted_folder_need_no_approval() {
     assert!(
         !write_with(false, "project/out.txt").await.0,
         "trust_writes = false: asks"
+    );
+}
+
+#[test]
+fn trusted_hosts_match_exactly_or_by_wildcard_and_never_everything() {
+    let sec = formless_core::config::SecurityCfg {
+        trusted_hosts: vec![
+            "api.example.com".into(),
+            "*.github.com".into(),
+            "*".into(),
+            "com".into(),
+        ],
+        ..Default::default()
+    };
+    assert!(sec.host_trusted("api.example.com"));
+    assert!(
+        sec.host_trusted("v2.api.example.com"),
+        "a host grant covers its subdomains"
+    );
+    assert!(sec.host_trusted("GitHub.com"));
+    assert!(sec.host_trusted("raw.github.com"));
+    assert!(!sec.host_trusted("example.com"));
+    assert!(
+        !sec.host_trusted("evilgithub.com"),
+        "a look-alike isn't a subdomain"
+    );
+    assert!(
+        !sec.host_trusted("anything.com"),
+        "`*` and a bare TLD trust nothing"
+    );
+    assert!(!sec.host_trusted(""));
+}
+
+/// A Tool that declares `net:HOST` (and never calls it), run with no
+/// client connected: it runs only when the host is trusted.
+async fn net_with(trusted: &[&str], grant: &str) -> bool {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-host-{short}"));
+    let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.security.secure = true;
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.provider.model = "m".into();
+    cfg.naming.enabled = false;
+    cfg.security.trusted_hosts = trusted.iter().map(|s| s.to_string()).collect();
+    cfg.save(&paths).unwrap();
+    let (id, session) = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let caps = Capabilities::parse(&[grant.to_string()]).unwrap();
+        let (info, _) = store
+            .create_tool_version(
+                "caller",
+                "d",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(i){ return {ok: true}; }",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap();
+        (info.id, store.create_session(None).unwrap().id)
+    };
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let r = daemon
+        .handle(Request::RunTool {
+            id,
+            input: serde_json::json!({}),
+            session_id: session,
+        })
+        .await
+        .unwrap();
+    let ran = !r["result"].as_str().unwrap_or_default().contains("denied");
+    if ran {
+        let store = Store::open(&paths.db_file()).unwrap();
+        assert_eq!(
+            store
+                .recent_audit(Some("tool.approve_trusted"), 5)
+                .unwrap()
+                .len(),
+            1,
+            "logged"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    ran
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn net_grants_for_trusted_hosts_need_no_approval() {
+    assert!(net_with(&["api.example.com"], "net:api.example.com").await);
+    assert!(net_with(&["*.github.com"], "net:api.github.com").await);
+    assert!(
+        !net_with(&["api.example.com"], "net:example.com").await,
+        "wider than trusted: asks"
+    );
+    assert!(
+        !net_with(&["api.example.com"], "net").await,
+        "bare net never trusted"
+    );
+    assert!(
+        !net_with(&[], "net:api.example.com").await,
+        "nothing trusted: asks"
     );
 }

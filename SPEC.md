@@ -1959,6 +1959,18 @@ run_tool = "network_policy"     # a registry Tool, or…
     folder named.
   - **Inside it:** a quiet "inside the working folder".
   - **No working folder:** only the secret folders are flagged.
+- **Trusted hosts.** `[security] trusted_hosts = ["api.example.com",
+  "*.github.com"]` lists hosts whose `net:` grants need no approval. A
+  call runs unasked when everything sensitive it asks for is a trusted
+  write (below) or a `net:` host on the list, and is logged as
+  `tool.approve_trusted`.
+  - **Matching:** `api.example.com` matches that host and its subdomains
+    (as a `net:` grant does everywhere); `*.github.com` matches
+    `github.com` and every subdomain. Look-alikes (`evilgithub.com`) don't
+    match.
+  - **Never trusted:** bare `net` (any host), a grant wider than the
+    trusted host (`net:example.com` against `api.example.com`), `*` and a
+    bare TLD. Like trusted folders, it is set in `config.toml` only.
 - **Trusted folders.** `[security] trusted_paths = ["~/code/app", …]`
   lists folders whose file access needs no approval.
   - **What's covered:** reading files never asks. A call whose only
@@ -2813,6 +2825,7 @@ Settings view shows, is missing here.
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
+| `security.trusted_hosts` | [] | Hosts whose `net:` grants need no approval (`api.example.com`, `*.github.com`); config.toml only (§10.3) |
 | `security.trusted_paths` | [] | Folders where writes need no approval; config.toml only (§10.3) |
 | `security.trust_writes` | true | false keeps writes in trusted folders asking (§10.3) |
 | `tools.approval_summaries` | true | Ask the model, once per Tool version, for a plain-language summary shown on approval prompts (§10.3) |

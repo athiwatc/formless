@@ -179,6 +179,8 @@ enum Pending {
     SuggestName,
     ToolMetrics,
     ProposalDiff,
+    /// Apply, reject or roll back a Proposal: the answer is a note (errors already are).
+    ProposalDecision,
     Usage,
     RunToolInput,
     RunTool,
@@ -1821,6 +1823,11 @@ impl App {
                                 .collect();
                         }
                         Pending::ProposalDiff => self.show_proposal_diff(&result),
+                        Pending::ProposalDecision => {
+                            if let Ok(p) = serde_json::from_value::<PromptProposalInfo>(result) {
+                                self.notes.push(format!("proposal {}", p.status));
+                            }
+                        }
                         Pending::ToolMetrics => {
                             self.range_tools = result
                                 .as_array()
@@ -4546,7 +4553,10 @@ impl App {
                     _ => None,
                 };
                 if let Some(approved) = decision {
-                    self.fire(Request::ProposalDecision { id, approved });
+                    self.request(
+                        Pending::ProposalDecision,
+                        Request::ProposalDecision { id, approved },
+                    );
                     self.notes.push(
                         if approved {
                             "applying the proposal…"
@@ -4820,23 +4830,32 @@ impl App {
                 }
                 KeyCode::Char('a') => {
                     if let Some(p) = self.selected_proposal().cloned() {
-                        self.fire(Request::ProposalDecision {
-                            id: p.id,
-                            approved: true,
-                        });
+                        self.request(
+                            Pending::ProposalDecision,
+                            Request::ProposalDecision {
+                                id: p.id,
+                                approved: true,
+                            },
+                        );
                     }
                 }
                 KeyCode::Char('r') => {
                     if let Some(p) = self.selected_proposal().cloned() {
-                        self.fire(Request::ProposalDecision {
-                            id: p.id,
-                            approved: false,
-                        });
+                        self.request(
+                            Pending::ProposalDecision,
+                            Request::ProposalDecision {
+                                id: p.id,
+                                approved: false,
+                            },
+                        );
                     }
                 }
                 KeyCode::Char('b') => {
                     if let Some(p) = self.selected_proposal().cloned() {
-                        self.fire(Request::RollbackProposal { id: p.id });
+                        self.request(
+                            Pending::ProposalDecision,
+                            Request::RollbackProposal { id: p.id },
+                        );
                     }
                 }
                 KeyCode::Esc => self.view = View::Chat,
@@ -9365,11 +9384,17 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let mut row = 0;
     for l in &lines {
         line_rows.push(row);
-        row += Paragraph::new(l.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(width)
-            .max(1);
+        // Most lines fit in one row; only wrap-measure the long ones.
+        row += if l.width() <= width as usize {
+            1
+        } else {
+            Paragraph::new(l.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1)
+        };
     }
+    let rows = row;
     app.user_rows = user_lines.iter().map(|&i| line_rows[i]).collect();
     let image_rows: Vec<(usize, String)> = image_lines
         .into_iter()
@@ -9381,14 +9406,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // Bring a newly focused tool call into view (rows before it, wrapped).
     let focus_row = focus_line
         .filter(|_| std::mem::take(&mut app.scroll_to_focus))
-        .map(|i| {
-            Paragraph::new(lines[..i].to_vec())
-                .wrap(Wrap { trim: false })
-                .line_count(width)
-        });
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        .map(|i| line_rows[i]);
     // Scroll by rendered (wrapped) rows so the newest output stays visible.
-    let rows = paragraph.line_count(width);
     app.chat_view_height = height;
     app.chat_line_count = rows;
     let max_top = rows.saturating_sub(height);
@@ -9471,10 +9490,28 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             .right_aligned(),
         );
     }
+    // Only the lines on screen go to the paragraph: wrapping a long
+    // transcript every frame is what made it slow.
+    let first = line_rows.partition_point(|&r| r <= scroll_top).saturating_sub(1);
+    let offset = scroll_top - line_rows.get(first).copied().unwrap_or(0);
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(first)
+        .enumerate()
+        .scan(0usize, |acc, (k, l)| {
+            if *acc >= offset + height {
+                return None;
+            }
+            let next = line_rows.get(first + k + 1).copied().unwrap_or(rows);
+            *acc = next - line_rows[first];
+            Some(l)
+        })
+        .collect();
     f.render_widget(
-        paragraph
+        Paragraph::new(visible)
+            .wrap(Wrap { trim: false })
             .block(block)
-            .scroll((scroll_top.min(u16::MAX as usize) as u16, 0)),
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
         area,
     );
     // A click on a call's header toggles it.
@@ -11570,7 +11607,11 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     app.painted_links = found;
                 }
             }
-            if event::poll(Duration::from_millis(50))? {
+            // Handle everything queued before the next draw, so a burst of
+            // scroll events costs one frame, not one frame each.
+            let mut wait = Duration::from_millis(50);
+            let started = std::time::Instant::now();
+            while event::poll(wait)? {
                 match event::read()? {
                     CtEvent::Key(k) => app.key(k),
                     CtEvent::Mouse(m) => app.mouse(m),
@@ -11578,6 +11619,10 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     CtEvent::FocusGained => app.focused = true,
                     CtEvent::FocusLost => app.focused = false,
                     _ => {}
+                }
+                wait = Duration::ZERO;
+                if started.elapsed() > Duration::from_millis(100) {
+                    break;
                 }
             }
         }
