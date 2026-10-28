@@ -163,7 +163,9 @@ async fn a_script_that_forgets_await_fails() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scripts_ask_approval_for_their_uses_before_running() {
-    let (paths, store, session, daemon) = setup("approve", Config::default());
+    let mut cfg = Config::default();
+    cfg.security.secure = true;
+    let (paths, store, session, daemon) = setup("approve", cfg);
     seed(&store, "pinger", "function run(){ return 1; }", &["net"]);
     // No client is attached to answer, so the approval fails closed and
     // nothing runs: not even the Tool that needs no approval.

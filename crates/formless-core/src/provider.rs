@@ -20,7 +20,8 @@ pub(crate) use host_api_doc;
 /// Bootstrap system prompt (SPEC §7.7). Versioned; v2.1 adds generic-Tool
 /// guidance and input-bound Capability scopes; v2.2 adds the find/read/test
 /// built-ins, throw-on-failure and the extended host API; v2.3 adds
-/// `run_script` orchestration (SPEC §7.12).
+/// `run_script` orchestration (SPEC §7.12); v2.4 adds when to wrap MCP
+/// tools in a Tool.
 pub const SYSTEM_PROMPT: &str = concat!("You are Formless, a general-purpose agent.\n\
 You start with only built-ins: `create_tool`, `create_module`, `retire_tool`, `find_tools`, `read_tool`, `test_tool` and `run_script`. Everything else you build yourself: small, minimally-capabled Tools created with create_tool, persisted and reused across tasks and projects. Never expect a Tool to exist - find it or build it.\n\
 The registry can hold far more Tools than are listed to you as functions. Before creating a Tool, find_tools for it; matches become callable. To change a Tool, read_tool it first and create a new version (same name) from its real code. Test a draft with test_tool on real input before saving it, then call the saved Tool. Shared JS helpers (parsers, encoders, hashing, URL handling) belong in modules via create_module, loaded inside Tools with requireModule(name). To delegate a focused task to a sub-agent with the same Tools, build a Tool with the \"agent\" Capability, e.g. `function run(i){ return agents.run(i.task, {model: i.model}); }`; several such calls in one turn run in parallel.\n\
@@ -29,6 +30,7 @@ You have no abilities beyond your Tools, but you can always build one: when a ta
 Make Tools generic: a Tool does one kind of thing (read_text_file, http_get_json, csv_column_sum), and everything task- or project-specific - paths, URLs, hosts, queries, names, column/field names - comes in through its input. Never hardcode such values in implementation_js, the Tool name, or its description. If an existing Tool nearly fits, create a more general new version of it (existing input fields keep working, new ones optional) rather than a new narrow Tool. Specialise only when the logic itself is inherently specific to one project. Give every Tool a short human title for the user (\"Last git author\"); the name stays the machine identifier.\n\
 ", host_api_doc!(), "\n\
 Stream anything large (fs.readChunks / fetchChunks / fs.append / emit); never load it whole. Declare only the Capabilities a Tool needs, as strings like \"net\", \"net:example.com\", \"fs:read:/abs/path\", \"fs:write:/abs/path\", input-bound scopes \"fs:read:$input.path\", \"fs:write:$input.out\", \"net:$input.url\" (granted per call for exactly the path(s)/host named by that input field - string or array of strings - so a generic Tool stays least-privilege; prefer these over fixed project paths), \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"clipboard:write\", \"notify\", \"store\", \"store:<ns>\", \"harness:read\", \"harness:<mcp|skills|models|providers|roles|config>\", \"llm\", \"agent\" (or \"llm:model\"/\"agent:model\"). Prefer retiring a broken Tool and creating a new version over silent workarounds.\n\
+MCP tools (named mcp__<server>__<tool>) can be called directly: do that for one-off use. When the same MCP call or sequence of calls comes up again, or needs fixed arguments, trimmed output or several calls combined, create a Tool that makes them with tools.call and declares the \"mcp:<server>\" Capability: a Tool gets an editable description and schema, measured success and optimisation, which raw MCP tools never do. Never create a Tool that only forwards one MCP call unchanged.\n\
 When the user states a lasting preference or fact about themselves or their setup (tools they use, language, where projects live), save it with remember; never remember secrets or one-off details, and forget a note when asked or when it stops being true.");
 
 /// Extra guidance for model families that under-use Tools (#237): GPT
@@ -149,7 +151,7 @@ pub struct ChatResult {
 }
 
 /// Provider-reported token counts for one request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -157,6 +159,12 @@ pub struct Usage {
     pub reasoning_tokens: u64,
     /// Part of `prompt_tokens` served from the provider's prompt cache.
     pub cached_tokens: u64,
+    /// Part of `prompt_tokens` written to the prompt cache (billed above
+    /// plain input on Anthropic models).
+    pub cache_write_tokens: u64,
+    /// USD the provider billed for the request (OpenRouter's
+    /// `usage.cost`); preferred over `provider.prices` when present.
+    pub cost: Option<f64>,
 }
 
 impl Usage {
@@ -174,6 +182,10 @@ impl Usage {
                 .max(n(&u["output_tokens_details"]["reasoning_tokens"])),
             cached_tokens: n(&u["prompt_tokens_details"]["cached_tokens"])
                 .max(n(&u["input_tokens_details"]["cached_tokens"])),
+            cache_write_tokens: n(&u["prompt_tokens_details"]["cache_write_tokens"])
+                .max(n(&u["input_tokens_details"]["cache_write_tokens"]))
+                .max(n(&u["cache_creation_input_tokens"])),
+            cost: u["cost"].as_f64().filter(|c| c.is_finite() && *c >= 0.0),
         })
     }
 }
@@ -241,6 +253,11 @@ pub fn responses_input(messages: &[Value]) -> Vec<Value> {
             continue;
         }
         if let Some(calls) = m["tool_calls"].as_array() {
+            // A preamble written before the calls comes first, as in the turn.
+            let text = m["content"].as_str().unwrap_or_default();
+            if !text.is_empty() {
+                out.push(json!({"role": "assistant", "content": [{"type": "output_text", "text": text}]}));
+            }
             for c in calls {
                 out.push(json!({
                     "type": "function_call",
@@ -263,6 +280,46 @@ pub fn responses_input(messages: &[Value]) -> Vec<Value> {
         out.push(json!({"role": role, "content": [{"type": ctype, "text": text}]}));
     }
     out
+}
+
+/// Mark prompt-cache breakpoints (Anthropic `cache_control`) on Chat
+/// Completions messages: the system prompt, and the last user/assistant
+/// text before the newest message, so each step re-reads the history the
+/// previous one wrote. Messages become content parts only where marked.
+pub fn with_cache_breakpoints(messages: &[Value]) -> Vec<Value> {
+    let mark = |m: &mut Value| {
+        if let Some(text) = m["content"].as_str().filter(|t| !t.is_empty()) {
+            m["content"] = json!([{"type": "text", "text": text,
+                "cache_control": {"type": "ephemeral"}}]);
+            true
+        } else {
+            false
+        }
+    };
+    let mut out = messages.to_vec();
+    if let Some(first) = out.first_mut().filter(|m| m["role"] == "system") {
+        mark(first);
+    }
+    let last = out.len().saturating_sub(1);
+    for m in out[1.min(last)..last].iter_mut().rev() {
+        let role = m["role"].as_str().unwrap_or_default();
+        if (role == "user" || role == "assistant") && mark(m) {
+            break;
+        }
+    }
+    out
+}
+
+/// The Responses-API form of [`with_cache_breakpoints`]: the system
+/// prompt's text part carries the breakpoint.
+fn mark_responses_system(input: &mut [Value]) {
+    if let Some(part) = input
+        .first_mut()
+        .filter(|m| m["role"] == "system")
+        .and_then(|m| m["content"].get_mut(0))
+    {
+        part["cache_control"] = json!({"type": "ephemeral"});
+    }
 }
 
 /// Convert Chat-Completions tool definitions to Responses-API tools.
@@ -487,6 +544,13 @@ impl Provider {
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        Ok(self.list_models_with_windows().await?.0)
+    }
+
+    /// The endpoint's models, and the context window of those whose
+    /// listing reports one (OpenRouter `context_length`, vLLM
+    /// `max_model_len`, …).
+    pub async fn list_models_with_windows(&self) -> Result<(Vec<String>, HashMap<String, u32>)> {
         let credential = self.credential().await?;
         let req = apply_headers(
             self.http.get(url(&self.cfg.base_url, "models")),
@@ -502,7 +566,7 @@ impl Provider {
             ));
         }
         let body: Value = resp.json().await.context("parse /models")?;
-        Ok(parse_models(&body))
+        Ok((parse_models(&body), parse_model_windows(&body)))
     }
 
     /// Non-streaming completion (compaction, probe helpers).
@@ -748,8 +812,13 @@ impl Provider {
             messages
         };
         let effective_tools: &[Value] = if prompt_mode { &[] } else { tools };
+        let cache_breakpoints = self.cfg.cache_breakpoints(model);
         let mut body = if self.cfg.responses() {
-            let mut b = json!({"model": model, "input": responses_input(messages), "stream": true});
+            let mut input = responses_input(messages);
+            if cache_breakpoints {
+                mark_responses_system(&mut input);
+            }
+            let mut b = json!({"model": model, "input": input, "stream": true});
             if let Some(key) = &self.cache_key {
                 b["prompt_cache_key"] = json!(key);
             }
@@ -760,6 +829,13 @@ impl Provider {
         } else {
             // Ask for real token counts in the final chunk (dropped again if
             // the endpoint rejects the option).
+            let marked;
+            let messages = if cache_breakpoints {
+                marked = with_cache_breakpoints(messages);
+                &marked[..]
+            } else {
+                messages
+            };
             let mut b = json!({"model": model, "messages": messages, "stream": true,
                 "stream_options": {"include_usage": true}});
             if let Some(key) = &self.cache_key {
@@ -1089,6 +1165,32 @@ fn parse_models(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Context window per model id, from a `/models` listing's per-model
+/// `context_length` (OpenRouter, LM Studio), `top_provider.context_length`,
+/// `max_model_len` (vLLM) or `context_window`.
+pub fn parse_model_windows(body: &Value) -> HashMap<String, u32> {
+    let Some(models) = body["data"].as_array() else {
+        return HashMap::new();
+    };
+    models
+        .iter()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?;
+            let n = [
+                &m["context_length"],
+                &m["top_provider"]["context_length"],
+                &m["max_model_len"],
+                &m["context_window"],
+                &m["max_context_length"],
+            ]
+            .into_iter()
+            .find_map(Value::as_u64)
+            .filter(|n| *n >= 1024)?;
+            Some((id.to_string(), n.min(u64::from(u32::MAX)) as u32))
+        })
+        .collect()
+}
+
 fn is_model_error(status: u16, text: &str) -> bool {
     status == 404 || is_model_error_text(&text.to_lowercase())
 }
@@ -1374,6 +1476,94 @@ pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_reads_reported_cost_and_cache_writes() {
+        let u = Usage::parse(&json!({"prompt_tokens": 9213, "completion_tokens": 3,
+            "cost": 0.0020006,
+            "prompt_tokens_details": {"cached_tokens": 9203, "cache_write_tokens": 10}}))
+        .unwrap();
+        assert_eq!(u.cached_tokens, 9203);
+        assert_eq!(u.cache_write_tokens, 10);
+        assert_eq!(u.cost, Some(0.0020006));
+        assert_eq!(
+            Usage::parse(&json!({"prompt_tokens": 1})).unwrap().cost,
+            None
+        );
+    }
+
+    #[test]
+    fn responses_input_keeps_the_preamble_before_tool_calls() {
+        let items = responses_input(&[json!({"role": "assistant", "content": "Let me check.",
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]})]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["content"][0]["type"], "output_text");
+        assert_eq!(items[0]["content"][0]["text"], "Let me check.");
+        assert_eq!(items[1]["type"], "function_call");
+        let bare = responses_input(&[json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]})]);
+        assert_eq!(bare.len(), 1);
+    }
+
+    #[test]
+    fn cache_breakpoints_mark_the_system_prompt_and_last_stable_text() {
+        let msgs = [
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "content": null, "tool_calls": []}),
+            json!({"role": "tool", "tool_call_id": "c", "content": "out"}),
+        ];
+        let out = with_cache_breakpoints(&msgs);
+        assert_eq!(out[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(out[0]["content"][0]["text"], "sys");
+        assert_eq!(out[1]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(out[2], msgs[2]);
+        assert_eq!(out[3], msgs[3], "the newest message is never marked");
+        let mut cfg = ProviderCfg::default();
+        assert!(cfg.cache_breakpoints("anthropic/claude-opus-5.5"));
+        assert!(!cfg.cache_breakpoints("deepseek/deepseek-v4-pro"));
+        cfg.cache_control = "off".into();
+        assert!(!cfg.cache_breakpoints("anthropic/claude-opus-5.5"));
+    }
+
+    #[test]
+    fn model_windows_come_from_the_listing() {
+        let w = parse_model_windows(&json!({"data": [
+            {"id": "a", "context_length": 1_000_000},
+            {"id": "b", "max_model_len": 32768},
+            {"id": "c", "top_provider": {"context_length": 200_000}},
+            {"id": "d"},
+        ]}));
+        assert_eq!(w["a"], 1_000_000);
+        assert_eq!(w["b"], 32768);
+        assert_eq!(w["c"], 200_000);
+        assert!(!w.contains_key("d"));
+    }
+
+    #[test]
+    fn history_keeps_the_preamble_on_tool_call_turns() {
+        let m = formless_protocol::MessageInfo {
+            role: "assistant".into(),
+            content: "Let me check the file first.".into(),
+            meta: Some(
+                json!({"tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "f", "arguments": "{}"}}]})
+                .to_string(),
+            ),
+            id: String::new(),
+            session_id: String::new(),
+            seq: 1,
+            created_at: String::new(),
+        };
+        let v = crate::storage::provider_message(&m);
+        assert_eq!(v["content"], "Let me check the file first.");
+        assert!(v["tool_calls"].is_array());
+        let empty = formless_protocol::MessageInfo {
+            content: String::new(),
+            ..m
+        };
+        assert!(crate::storage::provider_message(&empty)["content"].is_null());
+    }
 
     #[test]
     fn gpt_family_gets_the_tool_use_addendum() {

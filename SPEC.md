@@ -62,6 +62,12 @@ without redesign.
 
 - macOS/Linux: Unix domain socket in the data dir (mode `0700` dir, socket
   accessible only to the owning user).
+  - A data dir too deep for a socket address (104 bytes on macOS, 108 on
+    Linux) uses `$XDG_RUNTIME_DIR/formless/<hash>.sock`, or
+    `/tmp/formless-<user>/<hash>.sock`, instead. The hash is of the data
+    dir, so every client finds the same path. The folder is created
+    `0700` and must belong to the user; `formless doctor` reports it when
+    it doesn't.
 - Windows: a named pipe with an ACL restricted to the owning user. It has
   a protected DACL granting access only to the current user's SID and
   SYSTEM, and remote clients are rejected. The auto-started daemon is
@@ -172,8 +178,26 @@ without redesign.
 - `reasoning_effort` is sent verbatim when set. If the endpoint rejects an
   unknown parameter (HTTP 400), the daemon retries **once** without the
   offending parameter and posts a visible note in the Session (never silent).
-- Per-model `context_tokens` (configurable, sensible default) drives
-  Compaction, because context size is not discoverable from the API.
+- Each model's context window drives Compaction. It is
+  `model_context_tokens[model]` when configured, else what the endpoint's
+  `GET /models` listing reports for it (`context_length`, vLLM's
+  `max_model_len`, …; fetched once per base URL and refreshed whenever
+  the model picker lists models), else `context_tokens`. `ContextUsage`
+  reports which (`context_source`: `configured`, `endpoint`, `default`).
+- An assistant turn's text before its tool calls (a preamble such as
+  "Let me check the file first") is kept in the history sent back to the
+  model, on both API styles.
+- Tool arguments the model sends as JSON-encoded strings where the
+  schema expects an object or array (some models do this for nested
+  values) are parsed before validation, for built-ins and registry Tools
+  alike, and logged as `tool.input_coerced`. A string that isn't valid
+  JSON still fails validation, with an error telling the model to pass
+  the value itself.
+- Anthropic models only use the prompt cache when the request marks
+  breakpoints. With `provider.cache_control` (`auto` for `claude` /
+  `anthropic/` model ids, `on`, `off`), the system prompt and the last
+  user/assistant text before the newest message are sent as content
+  parts with `cache_control: {type: ephemeral}`.
 - Sampling params (`temperature`, `max_tokens`) are **not** exposed in v1;
   provider defaults rule.
 - API key storage: OS keychain (macOS Keychain, Windows Credential Manager,
@@ -1068,6 +1092,13 @@ None ship by default (principle 1).
   or `mcp-tool-error` (the tool reported `isError`); `find_tools` warns
   about any Tool measured below 50% success over 5+ calls, so the agent can
   prefer another or build its own. The `mcp__` prefix is reserved.
+- **Wrapped MCP tools.** A Tool wraps an MCP tool when it has called it
+  (a nested Invocation under it). `find_tools` lists a wrapped raw tool
+  right after its wrappers, with `wrapped_by: [...]`, adding a wrapper the
+  search missed; it is never hidden. A query that names the raw tool (or
+  its `mcp__<server>` prefix) keeps it at its own rank. The bootstrap prompt says to call
+  MCP tools directly for one-off use and to wrap repeated or combined
+  calls in a Tool, never a 1:1 pass-through.
 - **HTTP transport** (`transport = "http"`, `url`, static `headers`):
   Streamable HTTP (every message POSTed; the answer comes back as the JSON
   body or an SSE body; `Mcp-Session-Id` carried; 429/5xx retried with
@@ -1389,6 +1420,13 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 
 ### 8.3 Trigger and generation
 
+- **MCP chains.** Two raw MCP calls the agent made back to back (top
+  level, nothing between) in at least `optimiser.mcp_chain_min_runs` (3)
+  Runs within `optimiser.mcp_chain_days` (14) are suggested as a Tool,
+  unless a live Tool already wraps both. The suggestion appears in
+  `find_tools` results that list either call (`suggested_tools`) and in
+  `read_metrics {kind: "mcp_chains"}`. Nothing is created automatically.
+
 - **Trigger:** success rate **< 90%** over the last **≥20** Invocations
   (rolling window: last 100). Only the primary metric triggers.
 - A **background optimiser job** in the daemon queues on trigger and executes
@@ -1433,9 +1471,15 @@ All thresholds in this section are **configurable** (§13); defaults stated.
   (recorded responses served where available); `process` denied; **no real
   secrets injected** (redacted recordings only). Nested `tools.call`s
   execute inside the same overlay under their own Capabilities.
+- Nested MCP calls never reach a server in replay: a call is answered
+  with the recorded output of a successful Invocation of that MCP tool
+  with the same redacted input; anything else fails that replay item with
+  `unrecorded MCP call in replay`.
 - A Tool that genuinely requires live network to replay is marked
   **replay-limited**; its Candidate can only be promoted with explicit user
-  approval in the TUI, never automatically.
+  approval in the TUI, never automatically. A Candidate with an `mcp:`
+  Capability is replay-limited too: what it sends a server can't be
+  checked offline.
 
 ### 8.5 Promotion
 
@@ -1971,6 +2015,51 @@ run_tool = "network_policy"     # a registry Tool, or…
   - **Never trusted:** bare `net` (any host), a grant wider than the
     trusted host (`net:example.com` against `api.example.com`), `*` and a
     bare TLD. Like trusted folders, it is set in `config.toml` only.
+- **Path scope.** Each new `fs:read:`/`fs:write:` path on a prompt can
+  be granted wider: the path itself (default), its folder, or the
+  repository it lies in (the nearest folder holding `.git` (a folder or
+  a file, so worktrees count), `.hg`, `.jj`, `.svn`, `.pijul`, `_darcs`
+  or `.fossil`), else the project (`Cargo.toml`, `package.json`,
+  `pyproject.toml`, `go.mod`). `ApprovalRequested.path_options` lists
+  them; the answer's `paths` maps a requested spec to the chosen folder.
+  - **Read and write apart:** each Capability has its own pick (TUI: `r`
+    cycles read paths, `p` write paths; the web shows a select).
+  - **Checked by the daemon:** the folder must contain the requested
+    path by whole components (`/proj` never covers `/proj-secrets`),
+    after resolving symlinks; `/` and the home folder (or above) are
+    never offered or accepted. Anything else is ignored and the exact
+    path is granted. A widened grant is logged as
+    `tool.approve_widened`.
+  - **Compatible:** clients that send no `paths` grant the exact path,
+    and stored grants keep working (a folder grant already covers what
+    lies beneath it).
+- **Always deny.** Besides deny (this call), a prompt offers "always
+  deny" (TUI `N`, web button or `N`): the call's new sensitive
+  Capabilities are remembered (`denials` table, logged
+  `tool.deny_always`) and every later call of any Tool that needs access
+  they cover (a denied `net:example.com` covers its subdomains, a bare
+  `net` all hosts) fails without a prompt, logged `tool.deny_remembered`,
+  even with approvals off (`security.secure = false`).
+  The agent's error says so ("the user always denies net:…; don't
+  attempt this access with any Tool"). `formless approvals denials`
+  lists them, and `--forget CAP` / `--all` (protocol `ListDenials`,
+  `ForgetDenial`) makes them ask again.
+- **Broad Tools are named at creation.** When `create_tool` saves a Tool
+  that declares a broad Capability (bare `net` or `process`, writing
+  anywhere, a secret env key), the chat gets a note before any approval,
+  and the agent's result carries `least_privilege` hints with the
+  input-bound alternative (`net:$input.url`, `fs:write:$input.path`, …).
+- **Security overview.** `/security` (TUI pager) and
+  `formless security status [--json]` (protocol `SecurityStatus`) show
+  on one screen: grants by Capability family (broad ones flagged),
+  remembered denials, trusted folders, MCP servers (transport, target,
+  trusted, disabled), hooks that run without asking, the relay and
+  whether the web UI is running.
+- **Long prompts.** The answer keys and hint line are a footer pinned to
+  the bottom of the prompt. The body is sized by its wrapped height; when
+  it doesn't fit it is cut with "… more above the keys (v to see all)".
+  A non-Tool approval's detail (an MCP call's input) shows at most 12
+  lines of 300 characters, and `v` opens it whole.
 - **Trusted folders.** `[security] trusted_paths = ["~/code/app", …]`
   lists folders whose file access needs no approval.
   - **What's covered:** reading files never asks. A call whose only
@@ -2398,9 +2487,12 @@ run_tool = "network_policy"     # a registry Tool, or…
     $0.021`.
   - `SessionUsage` returns the last Run and Session totals: TUI and web
     `/usage`, and the web status-bar tooltip.
-  - Cost comes from `provider.prices` (USD per million tokens, per model:
-    `input`, `output` and optional `cached_input`). It is shown only when
-    every model used has a price.
+  - Cost is what the provider billed when it reports it (OpenRouter's
+    `usage.cost`, stored per request), else it comes from
+    `provider.prices` (USD per million tokens, per model: `input`,
+    `output` and optional `cached_input`). It is shown only when every
+    request is reported or priced. Cache writes
+    (`cache_write_tokens`) are recorded too.
 - **Colour:** roles, statuses, list selections, borders, and approval
   prompts are colour-coded; the chat has a friendly empty state and
   `/help` lists the shortcuts. `NO_COLOR` disables all colour.
@@ -2798,8 +2890,9 @@ Settings view shows, is missing here.
 | `provider.extra_headers` | {} | Free-form headers per request (§4.1) |
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
-| `provider.model_context_tokens` | {} | Context size per model id, overriding `context_tokens` for that model (§4.2, §11) |
+| `provider.model_context_tokens` | {} | Context size per model id, overriding the endpoint-reported size and `context_tokens` for that model (§4.2, §11) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
+| `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off` (§4.2) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
 | `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
 | `provider.tool_use_nudge` | true | Push models to build Tools: a GPT-family system-prompt addendum, and one nudge per step when an answer refuses for lack of access before using any Tool (§5.2) |
@@ -2850,6 +2943,8 @@ Settings view shows, is missing here.
 | `optimiser.token_budget` | (none) | Optional daemon optimisation budget (§8.3) |
 | `optimiser.eval_repeats` | 3 | Runs per prompt-eval scenario per arm (§8.6) |
 | `optimiser.scan_interval_secs` | 10 | How often triggers and the queue are checked (§8.3) |
+| `optimiser.mcp_chain_min_runs` | 3 | Suggest a Tool for two raw MCP calls made back to back in this many Runs (0 = never) (§8.3) |
+| `optimiser.mcp_chain_days` | 14 | Window for counting those Runs (§8.3) |
 | `skills.auto_create` / `min_tool_calls` / `model` | true / 5 / (session) | Automatic skills (§7.10) |
 | `skills.auto_retire_days` / `min_success_rate` / `min_runs_for_rate` | 30 / 0.5 / 5 | Auto-skill retirement (§7.10) |
 | `[[hooks]]` | (none) | pre_tool / post_tool / run_end hooks (§9.8) |

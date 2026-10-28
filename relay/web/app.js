@@ -1808,6 +1808,32 @@
   }
 
   // -------------------------------------------------------- approvals
+  /** A path Capability's wider scopes (file, folder, repository), as a
+   * select; the pick is sent with the answer (SPEC §10.3). */
+  function scopePicker(req, cap) {
+    const opt = (req.pathOptions || []).find((o) => o.capability === cap);
+    if (!opt) return null;
+    const label = (c) => {
+      const name = c.path.split("/").filter(Boolean).pop() || c.path;
+      if (c.kind === "file") return "this file (" + name + ")";
+      if (c.kind === "folder") return "folder " + name + "/";
+      return (c.kind === "repo" ? "whole repo " : "project ") + c.path + (c.label ? " (" + c.label + ")" : "");
+    };
+    const sel = h("select", { "aria-label": "Grant scope for " + cap },
+      opt.choices.map((c, i) => h("option", { value: String(i) }, label(c))));
+    sel.value = String(req.picks[cap] || 0);
+    sel.onchange = () => { req.picks[cap] = Number(sel.value); };
+    return h("div", { class: "muted path-note" }, "Grant: ", sel);
+  }
+  /** The wider paths picked on an approval: requested spec → folder. */
+  function pickedPaths(req) {
+    const out = {};
+    for (const o of req.pathOptions || []) {
+      const i = (req.picks || {})[o.capability] || 0;
+      if (i > 0 && o.choices[i]) out[o.capability] = o.choices[i].path;
+    }
+    return out;
+  }
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
@@ -1843,7 +1869,8 @@
           (req.already || []).includes(c)
             ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
             : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
-              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + n[1]) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)))),
+              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + n[1]) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
+              scopePicker(req, c))),
         req.detail ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
       req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
       h("p", { class: "muted" }, promo
@@ -1852,6 +1879,7 @@
     $("modal-once").classList.toggle("hidden", promo);
     $("modal-session").classList.toggle("hidden", promo);
     $("modal-hour").classList.toggle("hidden", promo);
+    $("modal-deny-always").classList.toggle("hidden", promo);
     $("modal-approve").replaceChildren(h("kbd", { "aria-hidden": "true" }, "y"), promo ? " Approve" : " Always");
     rememberFocus("modal-backdrop");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
@@ -1912,7 +1940,7 @@
     else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
     else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   });
-  function decide(approved, scope) {
+  function decide(approved, scope, rememberDenial) {
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
     if (approved && head && head.kind !== "promotion" && scope !== "once") {
@@ -1932,7 +1960,7 @@
       answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
     }
     if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
-    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always" });
+    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: pickedPaths(req), remember_denial: !!rememberDenial });
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
     renderApproval();
@@ -1949,6 +1977,7 @@
   $("modal-session").onclick = () => decide(true, "session");
   $("modal-hour").onclick = () => decide(true, "hour");
   $("modal-deny").onclick = () => decide(false);
+  $("modal-deny-always").onclick = () => decide(false, "always", true);
 
   // ------------------------------------------------------------- tools
   function toolStatusDot(t) {
@@ -3788,7 +3817,8 @@
       }
       case "approval_requested":
         S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
-          already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id });
+          already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
+          pathOptions: ev.path_options || [], picks: {} });
         if (here) setActivity("awaiting your approval");
         renderApproval();
         break;
@@ -4293,6 +4323,7 @@
       if (e.key === "s" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "session"); return; }
       if (e.key === "1" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "hour"); return; }
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
+      if (e.key === "N" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(false, "always", true); return; }
     }
     const dialogOpen = modalOpen || !$("ask-backdrop").classList.contains("hidden");
     if (!dialogOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !typingIn(document.activeElement) && S.channel) {

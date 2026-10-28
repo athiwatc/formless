@@ -215,6 +215,12 @@ pub struct Daemon {
     /// Which client answered each approval, by approval id, until
     /// `ensure_approval` records it with the grant.
     approval_by: StdMutex<HashMap<String, String>>,
+    /// Wider path scopes chosen with an approval, until its call reads them.
+    approval_paths: StdMutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
+    /// Denials answered "always deny", until their call reads them.
+    deny_always: StdMutex<std::collections::HashSet<String>>,
+    /// Why a Tool was last denied, by Tool name, for the agent's error.
+    denial_notes: StdMutex<HashMap<String, String>>,
     /// When and by whom Session and timed grants were given, by (scope,
     /// session id or "", tool id).
     grant_meta: StdMutex<HashMap<(ApprovalScope, String, String), (String, String)>>,
@@ -257,6 +263,10 @@ pub struct Daemon {
     /// Set while (or after a failed) naming-model download, so it is
     /// attempted once per daemon lifetime.
     model_download: Arc<AtomicBool>,
+    /// Context windows the endpoints' `/models` listings report, per base
+    /// URL then model id; a base URL is listed once per daemon (or again
+    /// when the model picker lists it).
+    model_windows: StdMutex<HashMap<String, HashMap<String, u32>>>,
     pub(crate) shutdown: CancellationToken,
     /// Identity of the binary this daemon was started from (mtime, size,
     /// inode), captured once at start-up. A rebuild keeps `version`
@@ -312,6 +322,9 @@ impl Daemon {
             timed_grants: StdMutex::new(Default::default()),
             approval_batches: StdMutex::new(Default::default()),
             approval_by: StdMutex::new(Default::default()),
+            approval_paths: StdMutex::new(Default::default()),
+            deny_always: StdMutex::new(Default::default()),
+            denial_notes: StdMutex::new(Default::default()),
             grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
             attachments: StdMutex::new(HashMap::new()),
@@ -332,6 +345,7 @@ impl Daemon {
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             auto_skill: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
+            model_windows: StdMutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             build: build_id(),
         })
@@ -1044,6 +1058,76 @@ impl Daemon {
                 Ok(json!({"revoked": true}))
             }
             Request::ListApprovals => Ok(serde_json::to_value(self.list_grants()?)?),
+            Request::SecurityStatus => {
+                let cfg = self.config()?;
+                let grants = self.list_grants()?;
+                let mut families: std::collections::BTreeMap<String, usize> = Default::default();
+                for g in &grants {
+                    let f = g
+                        .capability
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    *families.entry(f).or_default() += 1;
+                }
+                let broad: Vec<String> = grants
+                    .iter()
+                    .filter(|g| formless_protocol::broad_capability(&g.capability).is_some())
+                    .map(|g| format!("{} {}", g.tool_name, g.capability))
+                    .collect();
+                let denials = self.with_reader(|st| st.list_denials())?.len();
+                let servers: Vec<Value> = cfg
+                    .mcp
+                    .servers
+                    .iter()
+                    .map(|(name, s)| {
+                        let target = if s.transport == "http" {
+                            s.url.clone()
+                        } else {
+                            std::iter::once(s.command.clone())
+                                .chain(s.args.iter().cloned())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        };
+                        json!({"name": name, "transport": if s.transport.is_empty() { "stdio" } else { s.transport.as_str() },
+                               "target": target, "trusted": s.trusted, "disabled": s.disabled})
+                    })
+                    .collect();
+                let hooks: Vec<Value> = cfg
+                    .hooks
+                    .iter()
+                    .filter(|h| h.trusted && !h.command.is_empty())
+                    .map(|h| json!({"event": h.event, "command": h.command.join(" ")}))
+                    .collect();
+                let web = self.web.lock().await.as_ref().map(|w| w.port);
+                Ok(json!({
+                    "grants_total": grants.len(),
+                    "grants": families,
+                    "broad_grants": broad,
+                    "denials": denials,
+                    "trusted_paths": cfg.security.roots(),
+                    "trust_writes": cfg.security.trust_writes,
+                    "mcp_servers": servers,
+                    "trusted_hooks": hooks,
+                    "relay": {"enabled": cfg.relay.enabled, "url": cfg.relay.url},
+                    "web_ui": {"port": web},
+                }))
+            }
+            Request::ListDenials => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_denials())?,
+            )?),
+            Request::ForgetDenial { capability } => {
+                let n = self.with_store(|st| st.forget_denial(capability.as_deref()))?;
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "user",
+                        "tool.denial_forget",
+                        capability.as_deref().unwrap_or("all"),
+                    )
+                });
+                Ok(json!({"forgotten": n}))
+            }
             Request::RevokeGrant {
                 tool_id,
                 capability,
@@ -1096,7 +1180,8 @@ impl Daemon {
                     return Err(anyhow!("nothing to compact yet"));
                 }
                 let target = self.target(&cfg, &session_id, None).await?;
-                let context_tokens = target.provider.settings().context_for(&target.model);
+                let (context_tokens, _) =
+                    self.context_window(&target.provider, &target.model).await;
                 let this = self.clone();
                 tokio::spawn(async move {
                     let r = this
@@ -1150,7 +1235,10 @@ impl Daemon {
             Request::ContextUsage { session_id } => {
                 let cfg = self.config()?;
                 let model = self.session_base_model(&session_id, &cfg);
-                let size = cfg.provider.context_for(&model);
+                let (size, source) = match self.provider(&cfg).await {
+                    Ok(p) => self.context_window(&p, &model).await,
+                    Err(_) => (cfg.provider.context_for(&model), "default"),
+                };
                 let prompt = self.session_prompt(&session_id)?;
                 let (tools, history, attachments, measured) = self.with_reader(|st| {
                     let defs =
@@ -1177,6 +1265,7 @@ impl Daemon {
                 Ok(json!({
                     "model": model,
                     "context_tokens": size,
+                    "context_source": source,
                     "used_tokens": measured.unwrap_or(estimate as u64),
                     "measured": measured.is_some(),
                     "breakdown": {
@@ -1238,9 +1327,18 @@ impl Daemon {
                 let cfg = self.config()?;
                 let listed = async {
                     let provider = self.provider(&cfg).await?;
-                    tokio::time::timeout(std::time::Duration::from_secs(15), provider.list_models())
-                        .await
-                        .map_err(|_| anyhow!("GET /models timed out"))?
+                    let (models, windows) = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        provider.list_models_with_windows(),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("GET /models timed out"))??;
+                    // Refreshes the context windows the compaction budget uses.
+                    self.model_windows
+                        .lock()
+                        .unwrap()
+                        .insert(provider.settings().base_url.clone(), windows);
+                    Ok::<_, anyhow::Error>(models)
                 };
                 let (models, error) = match listed.await {
                     Ok(m) => (m, None),
@@ -1428,12 +1526,8 @@ impl Daemon {
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
                 let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
-                for (key, model, p, c, cached) in rows {
-                    let price = cfg
-                        .provider
-                        .prices
-                        .get(&model)
-                        .map(|m| m.cost(p, c, cached));
+                for (key, model, p, c, cached, reported) in rows {
+                    let price = cfg.provider.cost_of(&model, p, c, cached, reported);
                     match out.last_mut().filter(|o| o.0 == key) {
                         Some(o) => {
                             o.1 += p;
@@ -2238,7 +2332,18 @@ impl Daemon {
                 approval_id,
                 approved,
                 scope,
+                paths,
+                remember_denial,
             } => {
+                if remember_denial && !approved {
+                    self.deny_always.lock().unwrap().insert(approval_id.clone());
+                }
+                if !paths.is_empty() {
+                    self.approval_paths
+                        .lock()
+                        .unwrap()
+                        .insert(approval_id.clone(), paths);
+                }
                 // First answer wins (SPEC §10.4): removing the sender resolves it.
                 if let Some((_, label)) = current_client() {
                     self.approval_by
@@ -2908,7 +3013,7 @@ impl Daemon {
             });
         }
         let effort = target.effort.clone();
-        let context_tokens = provider.settings().context_for(&model);
+        let (context_tokens, _) = self.context_window(&provider, &model).await;
 
         self.maybe_compact(&provider, &cfg, session_id, &model, context_tokens)
             .await?;
@@ -3514,7 +3619,7 @@ impl Daemon {
         denied: &HashMap<String, bool>,
         agent_depth: usize,
     ) -> String {
-        let args: Value = match serde_json::from_str(&tc.arguments) {
+        let mut args: Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(e) => {
                 // Malformed model tool-call: feed back for correction, never
@@ -3525,6 +3630,12 @@ impl Daemon {
                 );
             }
         };
+        // Nested objects sent as JSON strings (some models do this) are
+        // parsed; registry Tools get the same at validation.
+        if let Some(schema) = toolreg::builtin_schema(&tc.name) {
+            let changed = toolreg::coerce_json_strings(&schema, &mut args);
+            self.note_coerced(&tc.name, &changed);
+        }
         // pre_tool hooks (SPEC §9.8) may deny the call; the reason goes
         // back to the model.
         if let Some(reason) = self
@@ -3561,7 +3672,7 @@ impl Daemon {
                     if self.near_duplicate_after_empty_find(run_id, &tool_id, &args) {
                         created_kind = "near-duplicate";
                     }
-                    text
+                    self.note_broad_tool(session_id, &tool_id, text)
                 }
                 Err(e) => format!("error: create_tool failed: {e}"),
             },
@@ -3768,7 +3879,7 @@ impl Daemon {
             name => {
                 // Denied in the approval pre-pass?
                 if denied.contains_key(&tc.id) {
-                    return format!("error: user denied approval for tool '{name}'");
+                    return format!("error: {}", self.denied_text(name));
                 }
                 self.dispatch_pending(
                     session_id,
@@ -4745,16 +4856,15 @@ impl Daemon {
                     step += 1;
                     if let Some(u) = &result.usage {
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
-                        task_cost = match (task_cost, cfg.provider.prices.get(&model)) {
-                            (Some(sum), Some(p)) => Some(
-                                sum + p.cost(
-                                    u.prompt_tokens as i64,
-                                    u.completion_tokens as i64,
-                                    u.cached_tokens as i64,
-                                ),
-                            ),
-                            _ => None,
-                        };
+                        task_cost = task_cost
+                            .zip(cfg.provider.cost_of(
+                                &model,
+                                u.prompt_tokens as i64,
+                                u.completion_tokens as i64,
+                                u.cached_tokens as i64,
+                                u.cost,
+                            ))
+                            .map(|(sum, c)| sum + c);
                     }
                     let _ = self.with_store(|st| st.set_subagent_steps(&sub_id, step));
                     self.broadcast(Event::SubagentStep {
@@ -4775,7 +4885,12 @@ impl Daemon {
                                "function": {"name": c.name, "arguments": c.arguments}})
                         })
                         .collect();
-                    let mut assistant = json!({"role": "assistant", "content": Value::Null, "tool_calls": calls_json});
+                    // Keep any preamble ("Let me check…"): it is the model's own plan.
+                    let preamble = Some(result.content.trim())
+                        .filter(|t| !t.is_empty())
+                        .map_or(Value::Null, |t| json!(t));
+                    let mut assistant =
+                        json!({"role": "assistant", "content": preamble, "tool_calls": calls_json});
                     if !result.reasoning.is_empty() {
                         assistant["reasoning_content"] = json!(result.reasoning);
                     }
@@ -4969,7 +5084,44 @@ impl Daemon {
             .unwrap_or(8)
             .clamp(1, tools_cfg.find_tools_max.max(1) as u64) as usize;
         let method = tools_cfg.search;
-        let hits = self.with_store(|st| toolreg::search_tools_with(st, query, limit, &method))?;
+        let mut hits =
+            self.with_store(|st| toolreg::search_tools_with(st, query, limit, &method))?;
+        // A raw MCP tool that Tools already wrap is listed after them (they
+        // carry measurement and optimisation); still listed, so the agent
+        // can build on it. Searching for it by name or server keeps its rank.
+        let wrappers = self.with_reader(|st| st.mcp_wrappers())?;
+        let q = query.to_lowercase();
+        let wrapped_by = |name: &str| -> Option<&Vec<String>> {
+            let (server, _) = crate::mcp::split_name(name)?;
+            let named = q.contains(&name.to_lowercase())
+                || q.contains(&format!("{}{}", crate::mcp::PREFIX, server.to_lowercase()));
+            wrappers.get(name).filter(|_| !named)
+        };
+        let mut i = 0;
+        while i < hits.len() {
+            let Some(names) = wrapped_by(&hits[i].name).cloned() else {
+                i += 1;
+                continue;
+            };
+            // Wrappers the search missed join the list, ahead of the raw row.
+            for n in &names {
+                if !hits.iter().any(|t| &t.name == n) {
+                    if let Some((info, _)) = self.with_reader(|st| st.get_tool_by_name(n))? {
+                        hits.push(info);
+                    }
+                }
+            }
+            let last_wrapper = hits
+                .iter()
+                .rposition(|t| names.contains(&t.name))
+                .unwrap_or(i);
+            if last_wrapper > i {
+                let raw = hits.remove(i);
+                hits.insert(last_wrapper, raw);
+            } else {
+                i += 1;
+            }
+        }
         let ids: Vec<String> = hits.iter().map(|t| t.id.clone()).collect();
         self.with_store(|st| st.load_session_tools(session_id, &ids, "found"))?;
         let upgraded = self.refresh_pins(session_id, &ids)?;
@@ -5005,6 +5157,9 @@ impl Daemon {
                 // Measured unreliability is worth saying out loud: the agent
                 // may do better building its own Tool (e.g. for an MCP tool
                 // that keeps failing, which the optimiser cannot rewrite).
+                if let Some(names) = wrappers.get(&t.name) {
+                    v["wrapped_by"] = json!(names);
+                }
                 if let Some(rate) = t.success_rate.filter(|r| *r < 0.5 && t.invocations >= 5) {
                     v["warning"] = json!(format!(
                         "unreliable: {:.0}% success over {} calls; consider another Tool or creating one",
@@ -5044,11 +5199,23 @@ impl Daemon {
             .take(limit)
             .map(|s| json!({"name": s.name, "description": s.description, "load_with": "load_skill"}))
             .collect();
+        // Repeated raw MCP chains among the hits (SPEC §8.3).
+        let chains: Vec<Value> = self
+            .mcp_chain_suggestions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| {
+                c["calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.iter().any(|n| hits.iter().any(|t| *n == t.name)))
+            })
+            .collect();
         Ok(json!({
             "tools": tools,
             "modules": modules,
             "skills": skills,
             "upgraded": upgraded,
+            "suggested_tools": chains,
             "note": if tools.is_empty() {
                 "No matching Tool; create one."
             } else {
@@ -5523,11 +5690,8 @@ impl Daemon {
             let rows = self.with_reader(|st| st.usage_grouped(Some(&today), "model"))?;
             let day: Option<f64> = rows
                 .iter()
-                .map(|(_, model, p, c, cached)| {
-                    cfg.provider
-                        .prices
-                        .get(model)
-                        .map(|m| m.cost(*p, *c, *cached))
+                .map(|(_, model, p, c, cached, reported)| {
+                    cfg.provider.cost_of(model, *p, *c, *cached, *reported)
                 })
                 .sum();
             if let Some(cost) = day {
@@ -5574,14 +5738,13 @@ impl Daemon {
             ..Default::default()
         };
         let mut cost = Some(0.0);
-        for (model, p, c, cached) in rows {
+        for (model, p, c, cached, reported) in rows {
             u.prompt_tokens += p;
             u.completion_tokens += c;
             u.cached_tokens += cached;
-            cost = match (cost, cfg.provider.prices.get(&model)) {
-                (Some(sum), Some(price)) => Some(sum + price.cost(p, c, cached)),
-                _ => None,
-            };
+            cost = cost
+                .zip(cfg.provider.cost_of(&model, p, c, cached, reported))
+                .map(|(sum, c)| sum + c);
         }
         u.cost = cost.filter(|_| u.prompt_tokens + u.completion_tokens > 0);
         Ok(u)
@@ -5592,6 +5755,9 @@ impl Daemon {
         let kind = args["kind"].as_str().context("kind required")?;
         let filter = args["filter"].as_str().filter(|f| !f.trim().is_empty());
         let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+        if kind == "mcp_chains" {
+            return Ok(json!({"mcp_chains": self.mcp_chain_suggestions()?}));
+        }
         self.with_reader(|st| match kind {
             "tools" => {
                 let last = st.tool_last_used()?;
@@ -6431,7 +6597,7 @@ impl Daemon {
                 .ensure_approval(cfg, session_id, &info, &ver, &caps.unbound(), None, cancel)
                 .await
             {
-                bail!("user denied approval for tool '{name}'");
+                bail!("{}", self.denied_text(&name));
             }
             if !caps.has_bindings() {
                 preapproved.insert(name.clone());
@@ -6595,6 +6761,8 @@ impl Daemon {
             }
         };
         let mut input = input;
+        let coerced = toolreg::coerce_json_strings(&d.input_schema, &mut input);
+        self.note_coerced(&d.name, &coerced);
         if let Some(cwd) = self.session_cwd(session_id) {
             d.caps
                 .absolutize_inputs(&mut input, std::path::Path::new(&cwd));
@@ -6734,7 +6902,31 @@ impl Daemon {
         cancel: &CancellationToken,
     ) -> bool {
         let needs = caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb;
-        if !needs || !cfg.security.secure {
+        if !needs {
+            return true;
+        }
+        self.denial_notes.lock().unwrap().remove(&info.name);
+        // Access the user always denies is refused without asking (§10.3).
+        let denied = self.remembered_denials(caps);
+        if !denied.is_empty() {
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "user",
+                    "tool.deny_remembered",
+                    &format!("{}: {}", info.name, denied.join(", ")),
+                )
+            });
+            self.denial_notes.lock().unwrap().insert(
+                info.name.clone(),
+                format!(
+                    "the user always denies {}; don't attempt this access with any Tool, do the task another way or ask them",
+                    denied.join(", ")
+                ),
+            );
+            return false;
+        }
+        // Approvals are opt-in (`security.secure`); denials apply anyway.
+        if !cfg.security.secure {
             return true;
         }
         // Only file access inside trusted folders: approved, and logged.
@@ -6807,6 +6999,8 @@ impl Daemon {
             .unwrap()
             .insert(approval_id.clone(), tx);
         let preview: String = ver.code.lines().take(15).collect::<Vec<_>>().join("\n");
+        // New path grants can be widened to a folder or repository.
+        let path_options = path_options(caps, prior.as_ref().map(|(p, _)| p));
         self.broadcast(Event::ApprovalRequested {
             approval_id: approval_id.clone(),
             session_id: session_id.to_string(),
@@ -6822,6 +7016,7 @@ impl Daemon {
             code_preview: (!preview.is_empty()).then_some(preview),
             tool_id: Some(info.id.clone()),
             batch: self.batch_position(session_id, &info.name),
+            path_options,
         });
         if cfg.tools.approval_summaries && caps.mcp.is_empty() {
             self.send_approval_summary(cfg, session_id, &approval_id, info, ver);
@@ -6837,6 +7032,25 @@ impl Daemon {
             .unwrap()
             .remove(&approval_id)
             .unwrap_or_default();
+        let chosen = self
+            .approval_paths
+            .lock()
+            .unwrap()
+            .remove(&approval_id)
+            .unwrap_or_default();
+        // What a lasting grant covers: the call's Capabilities, with any
+        // path the user widened to a folder (checked here, never trusted).
+        let widened = widen_paths(caps, &chosen);
+        if widened != *caps {
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "user",
+                    "tool.approve_widened",
+                    &format!("{}: {}", info.name, widened.to_specs().join(", ")),
+                )
+            });
+        }
+        let caps = &widened;
         let now = chrono::Utc::now().to_rfc3339();
         if approved && matches!(scope, ApprovalScope::Hour | ApprovalScope::Session) {
             let session = if scope == ApprovalScope::Session {
@@ -6881,13 +7095,207 @@ impl Daemon {
             };
             let _ = self.with_store(|st| st.set_approval_by(&info.id, &grant, mem, &by));
             let _ = self.with_store(|st| st.audit("user", "tool.approve", &info.name));
+        } else if self.deny_always.lock().unwrap().remove(&approval_id) {
+            // Always deny what was new on this prompt, for every Tool.
+            let held = prior.as_ref().map(|(p, _)| p.clone()).unwrap_or_default();
+            let new: Vec<String> = caps
+                .to_specs()
+                .into_iter()
+                .filter(|s| {
+                    Capabilities::parse(std::slice::from_ref(s))
+                        .is_ok_and(|one| one.is_sensitive() && !held.covers(&one))
+                })
+                .collect();
+            for spec in &new {
+                let _ = self.with_store(|st| st.add_denial(spec, &info.name, &by));
+            }
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "user",
+                    "tool.deny_always",
+                    &format!("{}: {}", info.name, new.join(", ")),
+                )
+            });
+            self.denial_notes.lock().unwrap().insert(
+                info.name.clone(),
+                format!(
+                    "the user always denies {}; don't attempt this access with any Tool, do the task another way or ask them",
+                    new.join(", ")
+                ),
+            );
         } else {
             let _ = self.with_store(|st| st.audit("user", "tool.deny", &info.name));
         }
         approved
     }
 
+    /// Remembered denials that cover any sensitive Capability in `caps`.
+    fn remembered_denials(&self, caps: &Capabilities) -> Vec<String> {
+        let Ok(denials) = self.with_reader(|st| st.list_denials()) else {
+            return Vec::new();
+        };
+        caps.to_specs()
+            .into_iter()
+            .filter(|spec| {
+                let Ok(want) = Capabilities::parse(std::slice::from_ref(spec)) else {
+                    return false;
+                };
+                want.is_sensitive()
+                    && denials.iter().any(|d| {
+                        Capabilities::parse(std::slice::from_ref(&d.capability))
+                            .is_ok_and(|deny| deny.covers(&want))
+                    })
+            })
+            .collect()
+    }
+
+    /// The error a denied call returns to the agent, with the reason when
+    /// the user always denies that access.
+    fn denied_text(&self, name: &str) -> String {
+        match self.denial_notes.lock().unwrap().get(name) {
+            Some(note) => format!("user denied approval for tool '{name}': {note}"),
+            None => format!("user denied approval for tool '{name}'"),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
+    /// `model`'s context window and where it came from: `configured`
+    /// (`provider.model_context_tokens`), `endpoint` (its `/models`
+    /// listing, fetched once per base URL) or `default`
+    /// (`provider.context_tokens`) (SPEC §11).
+    async fn context_window(&self, provider: &Provider, model: &str) -> (u32, &'static str) {
+        let cfg = provider.settings();
+        if let Some(n) = cfg.model_context_tokens.get(model) {
+            return (*n, "configured");
+        }
+        let listed = self
+            .model_windows
+            .lock()
+            .unwrap()
+            .contains_key(&cfg.base_url);
+        if !listed {
+            let windows = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                provider.list_models_with_windows(),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|(_, w)| w)
+            .unwrap_or_default();
+            self.model_windows
+                .lock()
+                .unwrap()
+                .insert(cfg.base_url.clone(), windows);
+        }
+        match self
+            .model_windows
+            .lock()
+            .unwrap()
+            .get(&cfg.base_url)
+            .and_then(|w| w.get(model))
+        {
+            Some(n) => (*n, "endpoint"),
+            None => (cfg.context_tokens, "default"),
+        }
+    }
+
+    /// Pairs of raw MCP calls the agent keeps making back to back, which
+    /// no live Tool wraps together yet: worth a Tool (SPEC §8.3). Only a
+    /// suggestion; creating the Tool stays with the agent or the user.
+    pub fn mcp_chain_suggestions(&self) -> Result<Vec<Value>> {
+        let opt = self.config()?.optimiser;
+        if opt.mcp_chain_min_runs == 0 {
+            return Ok(Vec::new());
+        }
+        let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(opt.mcp_chain_days)))
+            .to_rfc3339();
+        let (pairs, wrappers) =
+            self.with_reader(|st| Ok((st.mcp_call_pairs(&since)?, st.mcp_wrappers()?)))?;
+        Ok(pairs
+            .into_iter()
+            .filter(|(_, runs)| *runs >= opt.mcp_chain_min_runs as i64)
+            .filter(|((a, b), _)| {
+                let (wa, wb) = (wrappers.get(a), wrappers.get(b));
+                !wa.zip(wb).is_some_and(|(wa, wb)| wa.iter().any(|w| wb.contains(w)))
+            })
+            .map(|((a, b), runs)| {
+                let servers: std::collections::BTreeSet<&str> = [&a, &b]
+                    .iter()
+                    .filter_map(|n| crate::mcp::split_name(n).map(|(s, _)| s))
+                    .collect();
+                let caps: Vec<String> = servers.iter().map(|s| format!("mcp:{s}")).collect();
+                json!({
+                    "calls": [a, b],
+                    "runs": runs,
+                    "suggestion": format!(
+                        "these MCP calls were made back to back in {runs} Runs: create a Tool that makes them together with tools.call and declares {}",
+                        caps.join(", ")
+                    ),
+                })
+            })
+            .collect())
+    }
+
+    /// A new Tool that declares unscoped Capabilities (bare `net`,
+    /// `process`, writing anywhere, a secret env key) is pointed out in the
+    /// chat before any approval, and the agent is told the least-privilege
+    /// alternative (SPEC §10.3). Returns `text` with that hint added.
+    fn note_broad_tool(&self, session_id: &str, tool_id: &str, text: String) -> String {
+        let Ok(Some((info, _))) = self.with_reader(|st| st.get_tool_current(tool_id)) else {
+            return text;
+        };
+        let broad: Vec<(String, &str, &str)> = info
+            .capabilities
+            .iter()
+            .filter_map(|c| {
+                let why = formless_protocol::broad_capability(c)?;
+                Some((c.clone(), why, scoped_alternative(c)))
+            })
+            .collect();
+        if broad.is_empty() {
+            return text;
+        }
+        let list = broad
+            .iter()
+            .map(|(c, why, _)| format!("{c} ({why})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.broadcast(Event::Note {
+            session_id: Some(session_id.to_string()),
+            text: format!(
+                "The agent created {} with broad capabilities: {list}.{}",
+                info.name,
+                if self.config().is_ok_and(|c| c.security.secure) {
+                    " You'll be asked before it uses them."
+                } else {
+                    " Approvals are off (formless --secure turns them on)."
+                }
+            ),
+        });
+        let mut v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"result": text}));
+        v["least_privilege"] = json!(broad
+            .iter()
+            .map(|(c, _, alt)| format!("{c} is broad; prefer {alt}"))
+            .collect::<Vec<_>>());
+        v.to_string()
+    }
+
+    /// Log arguments that arrived as JSON strings and were parsed (§7.3).
+    fn note_coerced(&self, tool: &str, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        let at = paths
+            .iter()
+            .map(|p| if p.is_empty() { "(input)" } else { p.as_str() })
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!("{tool}: parsed JSON-string arguments at {at}");
+        let _ =
+            self.with_store(|st| st.audit("model", "tool.input_coerced", &format!("{tool}: {at}")));
+    }
+
     fn record_inv(
         &self,
         info: &ToolInfo,
@@ -7054,13 +7462,16 @@ impl Daemon {
                 ));
             }
             let mut input = input;
+            // Input validation (SPEC §7.3), after parsing nested values the
+            // model sent as JSON strings.
+            let in_schema: Value =
+                serde_json::from_str(&ver.input_schema).unwrap_or(json!({"type": "object"}));
+            let coerced = toolreg::coerce_json_strings(&in_schema, &mut input);
+            self.note_coerced(&name, &coerced);
             self.localize_input(&session_id, &ver, &mut input);
             let input_text = toolreg::redact(&input).to_string();
             let started = std::time::Instant::now();
             let dur = |s: &std::time::Instant| s.elapsed().as_millis() as i64;
-            // Input validation (SPEC §7.3).
-            let in_schema: Value =
-                serde_json::from_str(&ver.input_schema).unwrap_or(json!({"type": "object"}));
             match toolreg::compile_schema(&in_schema) {
                 Ok(v) => {
                     if let Err(e) = toolreg::validate_against(&v, &input) {
@@ -7122,7 +7533,7 @@ impl Daemon {
                     dur(&started),
                     &cfg,
                 );
-                return Err(format!("user denied approval for tool '{name}'"));
+                return Err(self.denied_text(&name));
             }
             self.broadcast(Event::ToolCallStarted {
                 session_id: session_id.clone(),
@@ -7670,6 +8081,7 @@ impl Daemon {
             .unwrap()
             .insert(approval_id.clone(), tx);
         self.broadcast(Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: approval_id.clone(),
             session_id: session_id.to_string(),
             tool_name: what.to_string(),
@@ -8020,6 +8432,7 @@ impl Daemon {
         if daemon_reachable(&self.paths) {
             return Err(anyhow!("a daemon is already running for this data dir"));
         }
+        self.paths.prepare_socket_dir()?;
         let _ = std::fs::remove_file(&sock);
         let listener = tokio::net::UnixListener::bind(&sock)
             .with_context(|| format!("bind {}", sock.display()))?;
@@ -8074,6 +8487,74 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// The input-bound form to suggest instead of a broad Capability.
+fn scoped_alternative(spec: &str) -> &'static str {
+    match spec.split(':').next().unwrap_or_default() {
+        "net" => "net:$input.url or net:<the host>",
+        "process" => "process:<the one command>",
+        "fs" => "fs:write:$input.path",
+        "env" => "env:<only the key needed>, or ask the user",
+        _ => "a capability scoped to the input",
+    }
+}
+
+/// The wider scopes to offer for each path Capability in `caps` that the
+/// prior grant doesn't already cover (SPEC §10.3).
+fn path_options(
+    caps: &Capabilities,
+    prior: Option<&Capabilities>,
+) -> Vec<formless_protocol::PathOption> {
+    let covered = |spec: &str| {
+        prior.is_some_and(|p| {
+            Capabilities::parse(&[spec.to_string()]).is_ok_and(|one| p.covers(&one))
+        })
+    };
+    caps.to_specs()
+        .into_iter()
+        .filter(|s| s.starts_with("fs:read:") || s.starts_with("fs:write:"))
+        .filter(|s| !covered(s))
+        .filter_map(|spec| {
+            let path = spec.splitn(3, ':').nth(2)?.to_string();
+            let choices = crate::path_scope::choices(&path);
+            (choices.len() > 1).then_some(formless_protocol::PathOption {
+                capability: spec,
+                choices,
+            })
+        })
+        .collect()
+}
+
+/// `caps` with each chosen path Capability widened to its chosen folder.
+/// A choice that isn't a folder above the requested path is ignored.
+fn widen_paths(
+    caps: &Capabilities,
+    chosen: &std::collections::BTreeMap<String, String>,
+) -> Capabilities {
+    let mut out = caps.clone();
+    for (spec, dir) in chosen {
+        let (list, path) = if let Some(p) = spec.strip_prefix("fs:read:") {
+            (&mut out.fs_read, p)
+        } else if let Some(p) = spec.strip_prefix("fs:write:") {
+            (&mut out.fs_write, p)
+        } else {
+            continue;
+        };
+        if !list.iter().any(|p| p == path) {
+            continue;
+        }
+        match crate::path_scope::validate(path, dir) {
+            Ok(dir) => {
+                list.retain(|p| p != path);
+                if !list.contains(&dir) {
+                    list.push(dir);
+                }
+            }
+            Err(e) => tracing::warn!("ignored a widened approval path: {e}"),
+        }
+    }
+    out
 }
 
 /// Is everything sensitive these Capabilities ask for either writing
@@ -8664,13 +9145,13 @@ impl HostOps for NestedOps {
         // as its model use (§10.4).
         if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
             let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
-            let cost = self.cfg.provider.prices.get(&model).map(|p| {
-                p.cost(
-                    u.prompt_tokens as i64,
-                    u.completion_tokens as i64,
-                    u.cached_tokens as i64,
-                )
-            });
+            let cost = self.cfg.provider.cost_of(
+                &model,
+                u.prompt_tokens as i64,
+                u.completion_tokens as i64,
+                u.cached_tokens as i64,
+                u.cost,
+            );
             let _ = self.daemon.with_store(|st| {
                 st.add_invocation_tokens(inv, tokens)?;
                 st.add_invocation_model_use(inv, tokens, cost)
@@ -8951,5 +9432,52 @@ fn harness_target(op: &str, args: &Value) -> String {
         "models.set" | "config.set" => args["key"].as_str().unwrap_or_default().to_string(),
         "skills.add" => args["source"].as_str().unwrap_or_default().to_string(),
         _ => args["name"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod path_scope_tests {
+    use super::*;
+
+    #[test]
+    fn approvals_offer_and_apply_wider_path_grants() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "fl-widen-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/foo.rs");
+        let caps = Capabilities::parse(&[
+            format!("fs:write:{}", file.display()),
+            format!("fs:read:{}", file.display()),
+        ])
+        .unwrap();
+        let options = path_options(&caps, None);
+        assert_eq!(options.len(), 2, "read and write each get a pick");
+        let write = options
+            .iter()
+            .find(|o| o.capability.starts_with("fs:write:"))
+            .unwrap();
+        assert_eq!(write.choices.last().unwrap().kind, "repo");
+        // Already covered by the prior grant: nothing to offer.
+        assert!(path_options(&caps, Some(&caps)).is_empty());
+
+        let root_s = root.display().to_string();
+        let chosen = std::collections::BTreeMap::from([(write.capability.clone(), root_s.clone())]);
+        let widened = widen_paths(&caps, &chosen);
+        assert_eq!(widened.fs_write, vec![root_s.clone()]);
+        assert_eq!(widened.fs_read, caps.fs_read, "read stays the file");
+        let sibling = Capabilities::parse(&[format!("fs:write:{root_s}/README.md")]).unwrap();
+        assert!(widened.covers(&sibling));
+        let lookalike = Capabilities::parse(&[format!("fs:write:{root_s}-secrets/x")]).unwrap();
+        assert!(!widened.covers(&lookalike));
+        // A folder that doesn't contain the path, or `/`, is ignored.
+        for bad in ["/", "/tmp/elsewhere"] {
+            let chosen =
+                std::collections::BTreeMap::from([(write.capability.clone(), bad.to_string())]);
+            assert_eq!(widen_paths(&caps, &chosen), caps, "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }

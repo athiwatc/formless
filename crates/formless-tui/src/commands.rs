@@ -279,6 +279,12 @@ pub const COMMANDS: &[Command] = &[
         Tools,
     ),
     cmd("audit", "[FILTER]", "show the audit log", Tools),
+    cmd(
+        "security",
+        "",
+        "what the daemon can reach: grants, denials, trusted folders, MCP, hooks, relay, web",
+        Tools,
+    ),
     cmd("settings", "", "open the Settings view", Settings),
     cmd(
         "model",

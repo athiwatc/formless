@@ -700,8 +700,9 @@ impl Daemon {
             "candidate {cand_pass}/{total} baseline {base_pass}/{total} regressions {regressions}"
         );
         if wins_by_margin && regressions == 0 {
-            if cand_caps.net.is_some() {
-                // Replay-limited (§8.4): net tools can only promote by hand.
+            if cand_caps.net.is_some() || !cand_caps.mcp.is_empty() {
+                // Replay-limited (§8.4): net and MCP tools can only promote
+                // by hand (what a Candidate sends a server isn't checked).
                 let _ = self.with_store(|st| {
                     st.update_attempt(
                         &attempt_id,
@@ -987,6 +988,16 @@ struct ReplayOps {
 impl HostOps for ReplayOps {
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
         let daemon = self.daemon.clone();
+        // Replay never reaches a real MCP server (ADR 0004): a nested MCP
+        // call is answered from a recorded call with the same (redacted)
+        // input, as the live call's output was stored.
+        if name.starts_with(crate::mcp::PREFIX) {
+            let key = toolreg::redact(&input).to_string();
+            return match daemon.with_reader(|st| st.recorded_output(name, &key)) {
+                Ok(Some(out)) => Ok(serde_json::from_str(&out).unwrap_or(Value::String(out))),
+                _ => Err(format!("unrecorded MCP call in replay: {name}")),
+            };
+        }
         let (code, caps, memory_mb, tool_name) = if name == self.cand_name {
             match &self.override_cand {
                 Some(c) => (

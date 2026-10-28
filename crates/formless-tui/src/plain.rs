@@ -309,6 +309,8 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                         });
                     } else {
                         client.send(Request::ApprovalDecision {
+                            remember_denial: Default::default(),
+                            paths: Default::default(),
                             approval_id: id.clone(),
                             approved,
                             scope,
@@ -434,6 +436,7 @@ mod tests {
             "\nTool started: fetch."
         );
         let approval = Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a".into(),
             session_id: "s".into(),
             tool_name: "fetch".into(),

@@ -176,6 +176,7 @@ enum Pending {
     SetArchive,
     SetTags,
     ContextReport,
+    Security,
     SuggestName,
     ToolMetrics,
     ProposalDiff,
@@ -969,6 +970,9 @@ struct App {
     approval_summaries: HashMap<String, String>,
     /// Batch positions of held calls, by approval id (SPEC §5.2) …
     approval_batches: HashMap<String, ApprovalBatch>,
+    /// Path scopes an approval offers, each with the one picked (0 = the
+    /// path itself), by approval id (SPEC §10.3).
+    approval_scopes: HashMap<String, Vec<(PathOption, usize)>>,
     /// An approval with broad new Capabilities waiting for its second
     /// press: (approval id, the key pressed first) (SPEC §10.3).
     broad_arm: Option<(String, char)>,
@@ -1179,6 +1183,7 @@ impl App {
             module_delete_arm: None,
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
+            approval_scopes: HashMap::new(),
             grants_family: None,
             broad_arm: None,
             batch_answers: HashMap::new(),
@@ -1852,6 +1857,18 @@ impl App {
                                 }
                                 _ => self.notes.push("no name to suggest yet".into()),
                             }
+                        }
+                        Pending::Security => {
+                            self.pager = Some(Pager {
+                                title: "Security".into(),
+                                lines: security_report(&result)
+                                    .lines()
+                                    .map(str::to_string)
+                                    .collect(),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
                         }
                         Pending::ContextFill | Pending::ContextReport => {
                             let used = result["used_tokens"].as_i64().unwrap_or(0);
@@ -2663,9 +2680,16 @@ impl App {
                 code_preview,
                 tool_id,
                 batch,
+                path_options,
             } => {
                 if let Some(b) = batch {
                     self.approval_batches.insert(approval_id.clone(), b);
+                }
+                if !path_options.is_empty() {
+                    self.approval_scopes.insert(
+                        approval_id.clone(),
+                        path_options.into_iter().map(|o| (o, 0)).collect(),
+                    );
                 }
                 // Approvals stay global: a backgrounded Run still needs one.
                 if self.is_current(&session_id) {
@@ -3941,6 +3965,7 @@ impl App {
             cmd if cmd == "rename" || cmd.starts_with("rename ") => {
                 self.rename_cmd(cmd[6..].trim())
             }
+            "security" => self.request(Pending::Security, Request::SecurityStatus),
             "context" => match self.current.clone() {
                 Some(session_id) => {
                     self.request(Pending::ContextReport, Request::ContextUsage { session_id })
@@ -4647,7 +4672,7 @@ impl App {
             // Typing anything else while the approval has focus moves
             // focus to the input (and types it).
             if modal_keys
-                && !matches!(c, 'y' | 'n' | 'o' | 's' | '1' | 'v' | '?')
+                && !matches!(c, 'y' | 'n' | 'N' | 'o' | 's' | '1' | 'v' | '?' | 'p' | 'r')
                 && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             {
                 self.input_focus = true;
@@ -4659,21 +4684,54 @@ impl App {
                 self.approval_explain = !self.approval_explain;
                 return;
             }
+            if (c == 'p' || c == 'r') && !self.approvals.is_empty() {
+                self.cycle_scope(c == 'p');
+                return;
+            }
             if c == 'v' {
                 let req = self.approvals.front().or(self.promotions.front()).cloned();
-                match req.and_then(|r| r.tool_id.map(|id| (id, r.version))) {
-                    Some((id, version)) => {
-                        self.approval_code = Some(version);
+                match req {
+                    Some(r) if r.tool_id.is_some() => {
+                        self.approval_code = Some(r.version);
+                        let id = r.tool_id.unwrap_or_default();
                         self.request(Pending::ApprovalCode, Request::GetTool { id });
                     }
-                    None => self.notes.push("this approval has no code to show".into()),
+                    // A non-Tool approval (an MCP call): its whole detail.
+                    Some(ApprovalReq {
+                        detail: Some(detail),
+                        tool_name,
+                        ..
+                    }) => {
+                        self.pager = Some(code_pager(&tool_name, &detail, self.color));
+                    }
+                    _ => self.notes.push("this approval has no code to show".into()),
                 }
+                return;
+            }
+            if c == 'N' && !self.approvals.is_empty() {
+                let req = self.approvals.pop_front().unwrap();
+                self.note_batch_answer(&req.approval_id, "always denied");
+                let _ = self.take_paths(&req.approval_id);
+                self.fire(Request::ApprovalDecision {
+                    approval_id: req.approval_id,
+                    approved: false,
+                    scope: ApprovalScope::Always,
+                    paths: Default::default(),
+                    remember_denial: true,
+                });
+                self.notes.push(format!(
+                    "denied {} and will always deny its new access (formless approvals denials to undo)",
+                    req.tool_name
+                ));
                 return;
             }
             if c == 'o' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.note_batch_answer(&req.approval_id, "once");
+                let paths = self.take_paths(&req.approval_id);
                 self.fire(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
+                    paths,
                     approval_id: req.approval_id,
                     approved: true,
                     scope: ApprovalScope::Once,
@@ -4710,7 +4768,10 @@ impl App {
             if c == '1' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.note_batch_answer(&req.approval_id, "for 1 hour");
+                let paths = self.take_paths(&req.approval_id);
                 self.fire(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
+                    paths,
                     approval_id: req.approval_id,
                     approved: true,
                     scope: ApprovalScope::Hour,
@@ -4722,7 +4783,10 @@ impl App {
             if c == 's' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.note_batch_answer(&req.approval_id, "this Session");
+                let paths = self.take_paths(&req.approval_id);
                 self.fire(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
+                    paths,
                     approval_id: req.approval_id,
                     approved: true,
                     scope: ApprovalScope::Session,
@@ -4738,7 +4802,10 @@ impl App {
                         &req.approval_id,
                         if c == 'y' { "always" } else { "denied" },
                     );
+                    let paths = self.take_paths(&req.approval_id);
                     self.fire(Request::ApprovalDecision {
+                        remember_denial: Default::default(),
+                        paths,
                         approval_id: req.approval_id,
                         approved: c == 'y',
                         scope: ApprovalScope::Always,
@@ -5309,6 +5376,52 @@ impl App {
             (other, _) => self.notes.push(format!(
                 "/module NAME [edit | rollback N | delete], not {other}"
             )),
+        }
+    }
+
+    /// The wider paths picked for an approval, to send with its answer.
+    fn take_paths(&mut self, approval_id: &str) -> std::collections::BTreeMap<String, String> {
+        self.approval_scopes
+            .remove(approval_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, pick)| *pick > 0)
+            .filter_map(|(o, pick)| Some((o.capability.clone(), o.choices.get(pick)?.path.clone())))
+            .collect()
+    }
+
+    /// Cycle the scope of an approval's read (`r`) or write (`p`) paths.
+    fn cycle_scope(&mut self, write: bool) {
+        let Some(id) = self.approvals.front().map(|r| r.approval_id.clone()) else {
+            return;
+        };
+        let prefix = if write { "fs:write:" } else { "fs:read:" };
+        let Some(scopes) = self.approval_scopes.get_mut(&id) else {
+            self.notes
+                .push("this approval has no paths to widen".into());
+            return;
+        };
+        let mut changed = Vec::new();
+        for (o, pick) in scopes
+            .iter_mut()
+            .filter(|(o, _)| o.capability.starts_with(prefix))
+        {
+            *pick = (*pick + 1) % o.choices.len().max(1);
+            if let Some(c) = o.choices.get(*pick) {
+                changed.push(scope_label(c));
+            }
+        }
+        if changed.is_empty() {
+            self.notes.push(format!(
+                "no {} paths to widen",
+                if write { "write" } else { "read" }
+            ));
+        } else {
+            self.notes.push(format!(
+                "{} scope: {}",
+                if write { "write" } else { "read" },
+                changed.join(", ")
+            ));
         }
     }
 
@@ -6213,12 +6326,18 @@ fn draw(f: &mut Frame, app: &mut App) {
             .as_deref()
             .and_then(|id| app.sessions.iter().find(|s| s.id == id))
             .and_then(|s| s.cwd.as_deref());
+        let scopes = app
+            .approval_scopes
+            .get(&req.approval_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         draw_approval(
             f,
             req,
             title,
             summary,
             batch,
+            scopes,
             cwd,
             promotion,
             more,
@@ -9492,7 +9611,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     }
     // Only the lines on screen go to the paragraph: wrapping a long
     // transcript every frame is what made it slow.
-    let first = line_rows.partition_point(|&r| r <= scroll_top).saturating_sub(1);
+    let first = line_rows
+        .partition_point(|&r| r <= scroll_top)
+        .saturating_sub(1);
     let offset = scroll_top - line_rows.get(first).copied().unwrap_or(0);
     let visible: Vec<Line<'static>> = lines
         .into_iter()
@@ -10878,6 +10999,7 @@ fn draw_approval(
     title: &str,
     summary: Option<&str>,
     batch: Option<(&ApprovalBatch, &[(usize, String)])>,
+    scopes: &[(PathOption, usize)],
     cwd: Option<&str>,
     promotion: bool,
     more: usize,
@@ -10887,11 +11009,22 @@ fn draw_approval(
 ) {
     let mut lines = match &req.detail {
         // A non-Tool approval (e.g. the agent adding an MCP server).
+        // Long payloads (an MCP call's `input:` JSON) are cut short here;
+        // `v` shows them whole.
         Some(detail) => {
             let mut l: Vec<Line> = detail
                 .lines()
-                .map(|d| Line::styled(d.to_string(), bold_fg(color, Color::Yellow)))
+                .take(APPROVAL_DETAIL_LINES)
+                .map(|d| {
+                    Line::styled(
+                        truncate_chars(d, APPROVAL_DETAIL_CHARS),
+                        bold_fg(color, Color::Yellow),
+                    )
+                })
                 .collect();
+            if detail.lines().count() > APPROVAL_DETAIL_LINES {
+                l.push(Line::styled("  … (v to see all)", ui::dim(color)));
+            }
             l.push(Line::raw(""));
             l
         }
@@ -11008,6 +11141,25 @@ fn draw_approval(
                 },
             ));
         }
+        // Wider scopes on offer: the picked one is bracketed (§10.3).
+        if let Some((o, pick)) = scopes.iter().find(|(o, _)| &o.capability == cap) {
+            let key = if cap.starts_with("fs:write:") {
+                'p'
+            } else {
+                'r'
+            };
+            let mut spans = vec![Span::styled("      grant: ", ui::dim(color))];
+            for (i, c) in o.choices.iter().enumerate() {
+                let label = scope_label(c);
+                spans.push(if i == *pick {
+                    Span::styled(format!("[{label}]"), bold_fg(color, Color::Cyan))
+                } else {
+                    Span::styled(format!(" {label} "), ui::dim(color))
+                });
+            }
+            spans.push(Span::styled(format!("  ({key} to change)"), ui::dim(color)));
+            lines.push(Line::from(spans));
+        }
         if explain {
             lines.push(Line::styled(
                 format!("      {}", ui::explain_capability(cap)),
@@ -11037,7 +11189,9 @@ fn draw_approval(
         },
         ui::dim(color),
     ));
-    lines.push(Line::raw(""));
+    // The answer keys are a footer pinned under the body, so a body too
+    // tall for the screen can never push them out of the box.
+    let mut footer = vec![Line::raw("")];
     let mut keys = vec![
         Span::styled(
             " y ",
@@ -11071,16 +11225,25 @@ fn draw_approval(
             " n ",
             bold_fg(color, Color::Red).add_modifier(Modifier::REVERSED),
         ),
-        Span::raw(" deny"),
+        Span::raw(" deny  "),
     ]);
+    if !promotion {
+        keys.extend([
+            Span::styled(
+                " N ",
+                bold_fg(color, Color::Red).add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw(" always deny"),
+        ]);
+    }
     if more > 0 {
         keys.push(Span::styled(
             format!("      +{more} more waiting"),
             ui::dim(color),
         ));
     }
-    lines.push(Line::from(keys));
-    lines.push(Line::styled(
+    footer.push(Line::from(keys));
+    footer.push(Line::styled(
         if focused {
             "v full code · ? explain capabilities · Tab: keep typing your message"
         } else {
@@ -11090,9 +11253,26 @@ fn draw_approval(
     ));
 
     let area = f.area();
-    let content_w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 4;
+    let content_w = lines
+        .iter()
+        .chain(&footer)
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(0) as u16
+        + 4;
     let w = content_w.max(50).min(area.width.saturating_sub(2)).max(1);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    let inner_w = w.saturating_sub(2).max(1);
+    // Wrapped heights, not line counts: a long line takes several rows.
+    let rows = |l: &[Line<'static>]| {
+        Paragraph::new(l.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_w) as u16
+    };
+    let footer_h = rows(&footer).min(area.height.saturating_sub(2));
+    let body_room = area.height.saturating_sub(2 + footer_h);
+    let body_rows = rows(&lines);
+    let body_h = body_rows.min(body_room);
+    let h = (body_h + footer_h + 2).min(area.height);
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -11100,29 +11280,78 @@ fn draw_approval(
         height: h,
     };
     f.render_widget(Clear, rect);
+    let block = ui::panel(
+        match (promotion, focused) {
+            (true, true) => " Promotion approval ",
+            (false, true) => " Approval required ",
+            (true, false) => " Promotion approval · Tab to answer ",
+            (false, false) => " Approval required · Tab to answer ",
+        },
+        color,
+        Color::Red,
+    )
+    .border_style(if focused {
+        bold_fg(color, Color::Red)
+    } else {
+        ui::dim(color)
+    });
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let truncated = body_rows > body_h;
+    let shown_h = if truncated {
+        body_h.saturating_sub(1)
+    } else {
+        body_h
+    };
     f.render_widget(
-        Paragraph::new(lines)
-            .block(
-                ui::panel(
-                    match (promotion, focused) {
-                        (true, true) => " Promotion approval ",
-                        (false, true) => " Approval required ",
-                        (true, false) => " Promotion approval · Tab to answer ",
-                        (false, false) => " Approval required · Tab to answer ",
-                    },
-                    color,
-                    Color::Red,
-                )
-                .border_style(if focused {
-                    bold_fg(color, Color::Red)
-                } else {
-                    ui::dim(color)
-                }),
-            )
-            .wrap(Wrap { trim: false }),
-        rect,
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect {
+            height: shown_h.min(inner.height),
+            ..inner
+        },
+    );
+    if truncated && body_h > 0 {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                "… more above the keys (v to see all)",
+                ui::dim(color),
+            )),
+            Rect {
+                y: inner.y + shown_h,
+                height: 1,
+                ..inner
+            },
+        );
+    }
+    f.render_widget(
+        Paragraph::new(footer).wrap(Wrap { trim: false }),
+        Rect {
+            y: inner.y + body_h.min(inner.height),
+            height: inner.height.saturating_sub(body_h),
+            ..inner
+        },
     );
 }
+
+/// How a path scope reads on an approval: `file foo.rs`, `folder src/`,
+/// `repo /home/me/proj (git)`.
+fn scope_label(c: &PathChoice) -> String {
+    let name = std::path::Path::new(&c.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| c.path.clone());
+    match c.kind.as_str() {
+        "file" => format!("file {name}"),
+        "folder" => format!("folder {name}/"),
+        _ if c.label.is_empty() => format!("{} {}", c.kind, c.path),
+        _ => format!("{} {} ({})", c.kind, c.path, c.label),
+    }
+}
+
+/// An approval's free-form detail (an MCP call's input) is cut to this
+/// many lines of this many characters; `v` shows it all.
+const APPROVAL_DETAIL_LINES: usize = 12;
+const APPROVAL_DETAIL_CHARS: usize = 300;
 
 fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     let area = f.area();
@@ -11832,6 +12061,7 @@ mod tests {
             module_delete_arm: None,
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
+            approval_scopes: HashMap::new(),
             grants_family: None,
             broad_arm: None,
             batch_answers: HashMap::new(),
@@ -11955,6 +12185,7 @@ mod tests {
         assert_eq!(app.live_tools[0].elapsed_ms, Some(42));
 
         app.on_event(Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s1".into(),
             tool_name: "create_tool".into(),
@@ -12453,6 +12684,89 @@ mod tests {
     }
 
     #[test]
+    fn approvals_let_the_user_widen_a_path_grant() {
+        let mut app = test_app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let choice = |path: &str, kind: &str, label: &str| PathChoice {
+            path: path.into(),
+            kind: kind.into(),
+            label: label.into(),
+        };
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "a".into(),
+            session_id: "s".into(),
+            tool_name: "writer".into(),
+            version: 1,
+            capabilities: vec!["fs:write:/home/me/proj/src/foo.rs".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+            batch: None,
+            path_options: vec![PathOption {
+                capability: "fs:write:/home/me/proj/src/foo.rs".into(),
+                choices: vec![
+                    choice("/home/me/proj/src/foo.rs", "file", ""),
+                    choice("/home/me/proj/src", "folder", ""),
+                    choice("/home/me/proj", "repo", "git"),
+                ],
+            }],
+        });
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("[file foo.rs]"), "{screen}");
+        assert!(screen.contains("repo /home/me/proj (git)"), "{screen}");
+        app.key(key(KeyCode::Char('p')));
+        app.key(key(KeyCode::Char('p')));
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("[repo /home/me/proj (git)]"), "{screen}");
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.notes.iter().any(|n| n.contains("no read paths")));
+        let paths = app.take_paths("a");
+        assert_eq!(
+            paths
+                .get("fs:write:/home/me/proj/src/foo.rs")
+                .map(String::as_str),
+            Some("/home/me/proj")
+        );
+    }
+
+    #[test]
+    fn a_long_mcp_input_never_hides_the_approval_keys() {
+        let payload = format!(
+            "input: {{\"code_to_execute\": \"{}\"}}",
+            "import os\\nprint(os.listdir('.'))\\n".repeat(60)
+        );
+        let detail = format!(
+            "MCP tool COMPOSIO_REMOTE_WORKBENCH on server composio\n⚠ may be destructive\n{payload}\n{}",
+            "more\n".repeat(30)
+        );
+        let req = ApprovalReq {
+            approval_id: "a".into(),
+            tool_name: "mcp__composio__COMPOSIO_REMOTE_WORKBENCH".into(),
+            version: 0,
+            capabilities: vec!["mcp:composio".into()],
+            memory_mb: 0,
+            detail: Some(detail),
+            already_allowed: Vec::new(),
+            code_preview: Some("line\n".repeat(20)),
+            tool_id: None,
+            session_id: None,
+        };
+        for h in [40, 20] {
+            let mut app = test_app();
+            app.approvals.push_back(req.clone());
+            let screen = render(&mut app, 100, h);
+            assert!(
+                screen.contains("always") && screen.contains("once") && screen.contains("deny"),
+                "{h} rows: {screen}"
+            );
+            assert!(screen.contains("v full code"), "{h} rows: {screen}");
+            assert!(screen.contains("v to see all"), "{h} rows: {screen}");
+        }
+    }
+
+    #[test]
     fn chat_scroll_counts_wrapped_rows() {
         let mut app = test_app();
         app.messages = vec![
@@ -12739,6 +13053,7 @@ mod tests {
         };
         // Focused: nothing.
         app.on_event(Event::ApprovalRequested {
+            path_options: Default::default(),
             session_id: "s".into(),
             approval_id: "a".into(),
             tool_name: "fetch".into(),
@@ -12950,6 +13265,7 @@ mod tests {
             .enumerate()
         {
             app.on_event(Event::ApprovalRequested {
+                path_options: Default::default(),
                 approval_id: id.to_string(),
                 session_id: "s".into(),
                 tool_name: tool.to_string(),
@@ -12990,6 +13306,7 @@ mod tests {
     fn approvals_show_the_ai_summary_when_it_arrives() {
         let mut app = test_app();
         app.on_event(Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s".into(),
             tool_name: "echo_write".into(),
@@ -13028,6 +13345,7 @@ mod tests {
         );
         // `1` approves for an hour.
         app.on_event(Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a2".into(),
             session_id: "s".into(),
             tool_name: "echo_write".into(),
@@ -13066,6 +13384,7 @@ mod tests {
             instructions: None,
         }];
         app.on_event(Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s".into(),
             tool_name: "copier".into(),
@@ -13090,6 +13409,7 @@ mod tests {
     fn broad_grants_take_a_second_press() {
         let mut app = test_app();
         app.on_event(Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s".into(),
             tool_name: "sweeper".into(),
@@ -14647,6 +14967,7 @@ mod tests {
         assert!(render(&mut app, 100, 20).contains("sent from web"));
         // An approval answered in the web closes here.
         app.on_event(Event::ApprovalRequested {
+            path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s1".into(),
             tool_name: "create_tool".into(),

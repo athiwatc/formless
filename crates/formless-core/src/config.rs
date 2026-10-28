@@ -290,6 +290,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("provider.api_style", &["chat", "responses"]),
     ("provider.tool_mode", &["native", "prompt"]),
     ("provider.cache_key", &["session", "off"]),
+    ("provider.cache_control", &["auto", "on", "off"]),
     ("tui.notify", &["off", "bell", "desktop"]),
     ("tui.hyperlinks", &["auto", "on", "off"]),
     ("tui.theme", &["auto", "dark", "light", "high-contrast"]),
@@ -395,6 +396,7 @@ pub const SETTABLE: &[&str] = &[
     "provider.first_byte_timeout_secs",
     "provider.max_backoff_secs",
     "provider.cache_key",
+    "provider.cache_control",
     "provider.tool_use_nudge",
     "provider.api_style",
     "provider.tool_mode",
@@ -594,6 +596,11 @@ pub struct ProviderCfg {
     /// "session" (default): send a per-Session `prompt_cache_key` so the
     /// endpoint keeps one Session on one prompt cache; "off": never send it.
     pub cache_key: String,
+    /// Prompt-cache breakpoints (`cache_control: {type: ephemeral}`) on
+    /// the system prompt and the last stable message, which Anthropic
+    /// models need to cache at all: "auto" (default) sends them to
+    /// `claude`/`anthropic/` model ids, "on" to every model, "off" never.
+    pub cache_control: String,
     /// Push models to build Tools (#237): a per-family system-prompt
     /// addendum (GPT models) and one nudge per step when an answer refuses
     /// for lack of access before using any Tool.
@@ -673,11 +680,23 @@ impl Default for ProviderCfg {
             first_byte_timeout_secs: 0,
             max_backoff_secs: 30,
             cache_key: "session".into(),
+            cache_control: "auto".into(),
             tool_use_nudge: true,
         }
     }
 }
 impl ProviderCfg {
+    /// Send `cache_control` breakpoints to `model` (see `cache_control`)?
+    pub fn cache_breakpoints(&self, model: &str) -> bool {
+        match self.cache_control.to_ascii_lowercase().as_str() {
+            "on" => true,
+            "off" => false,
+            _ => {
+                let m = model.to_ascii_lowercase();
+                m.starts_with("anthropic/") || m.contains("claude")
+            }
+        }
+    }
     pub fn responses(&self) -> bool {
         self.api_style.eq_ignore_ascii_case("responses")
     }
@@ -705,6 +724,22 @@ impl ProviderCfg {
     pub fn is_auto_model(model: &str) -> bool {
         model.trim().eq_ignore_ascii_case("auto")
     }
+    /// USD for some of `model`'s use: what the provider reported when it
+    /// reported it, else priced from `prices`, else unknown.
+    pub fn cost_of(
+        &self,
+        model: &str,
+        prompt: i64,
+        completion: i64,
+        cached: i64,
+        reported: Option<f64>,
+    ) -> Option<f64> {
+        reported.or_else(|| {
+            self.prices
+                .get(model)
+                .map(|p| p.cost(prompt, completion, cached))
+        })
+    }
     pub fn context_for(&self, model: &str) -> u32 {
         self.model_context_tokens
             .get(model)
@@ -730,6 +765,11 @@ pub struct OptimiserCfg {
     pub eval_repeats: u32,
     /// How often the optimiser checks triggers and its queue.
     pub scan_interval_secs: u64,
+    /// Suggest a Tool for a pair of raw MCP calls the agent made back to
+    /// back in at least this many Runs (0 = never) …
+    pub mcp_chain_min_runs: usize,
+    /// … within this many days (SPEC §8.3).
+    pub mcp_chain_days: u32,
 }
 impl Default for OptimiserCfg {
     fn default() -> Self {
@@ -743,6 +783,8 @@ impl Default for OptimiserCfg {
             token_budget: None,
             eval_repeats: 3,
             scan_interval_secs: 10,
+            mcp_chain_min_runs: 3,
+            mcp_chain_days: 14,
         }
     }
 }

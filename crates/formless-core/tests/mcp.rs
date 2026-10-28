@@ -758,10 +758,11 @@ async fn trusted_read_only_mcp_tools_skip_per_tool_approval() {
     let paths = temp_paths("mcptrust");
     let (mut mcp, _) = fake_server(&paths);
     mcp.servers.get_mut("fake").unwrap().trusted = true;
-    let cfg = formless_core::Config {
+    let mut cfg = formless_core::Config {
         mcp,
         ..Default::default()
     };
+    cfg.security.secure = true;
     cfg.save(&paths).unwrap();
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
     daemon
