@@ -2103,6 +2103,60 @@ impl Store {
         Ok(())
     }
 
+    /// Roughly what fills the database, in bytes of stored text/blobs.
+    pub fn content_bytes(&self) -> Result<serde_json::Value> {
+        let sum = |sql: &str| -> Result<i64> {
+            Ok(self
+                .conn
+                .query_row(sql, [], |r| r.get::<_, Option<i64>>(0))?
+                .unwrap_or(0))
+        };
+        Ok(serde_json::json!({
+            "messages": sum("SELECT SUM(length(content) + COALESCE(length(meta),0)) FROM messages")?,
+            "invocations": sum("SELECT SUM(length(input) + length(output) + length(error)) FROM invocations")?,
+            "tool_versions": sum("SELECT SUM(length(code) + length(input_schema) + length(output_schema)) FROM tool_versions")?,
+            "run_files": sum("SELECT SUM(COALESCE(length(before),0)) FROM run_files")?,
+        }))
+    }
+
+    /// File snapshots older than `cutoff`: (count, bytes).
+    pub fn old_run_files(&self, cutoff: &str) -> Result<(usize, u64)> {
+        let (n, b): (i64, Option<i64>) = self.conn.query_row(
+            "SELECT count(*), SUM(COALESCE(length(before),0)) FROM run_files WHERE created_at < ?1",
+            params![cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((n as usize, b.unwrap_or(0) as u64))
+    }
+
+    pub fn delete_run_files_before(&self, cutoff: &str) -> Result<()> {
+        self.ex("DELETE FROM run_files WHERE created_at < ?1", params![cutoff])?;
+        Ok(())
+    }
+
+    /// Unused pages VACUUM would give back.
+    pub fn free_bytes(&self) -> Result<u64> {
+        let free: i64 = self.conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok((free * size).max(0) as u64)
+    }
+
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    /// A consistent copy of the whole database (WAL included) at `dest`.
+    pub fn backup_into(&self, dest: &Path) -> Result<()> {
+        if dest.exists() {
+            std::fs::remove_file(dest)?;
+        }
+        self.conn
+            .execute("VACUUM INTO ?1", params![dest.to_string_lossy()])
+            .with_context(|| format!("back up database to {}", dest.display()))?;
+        Ok(())
+    }
+
     /// Forget one recorded file (after it was reverted).
     pub fn forget_run_file(&self, run_id: &str, path: &str) -> Result<()> {
         self.ex(
