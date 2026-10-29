@@ -206,6 +206,10 @@ pub struct Daemon {
     step_limits: StdMutex<HashMap<String, u32>>,
     /// A model for a Session's next Run only (`RetryRun {model}`).
     next_run_model: StdMutex<HashMap<String, String>>,
+    /// The latest routing decisions (SPEC §4.6), newest last, at most 50.
+    routing_log: StdMutex<std::collections::VecDeque<Value>>,
+    /// Configured models the endpoints no longer list (SPEC §4.2).
+    missing_models: StdMutex<Vec<String>>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
     /// Sessions in step mode (`/step`), and the step decisions awaited.
@@ -323,6 +327,10 @@ impl Daemon {
         let readers = (0..READER_CONNECTIONS)
             .map(|_| Store::open_reader(&paths.db_file()).map(StdMutex::new))
             .collect::<Result<Vec<_>>>()?;
+        // `provider.proxy` applies from start-up (restart to change it).
+        let http = crate::provider::http_client(
+            &Config::load(&paths).map(|c| c.provider.proxy).unwrap_or_default(),
+        )?;
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -339,6 +347,8 @@ impl Daemon {
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
             comparisons: StdMutex::new(Default::default()),
+            routing_log: StdMutex::new(Default::default()),
+            missing_models: StdMutex::new(Vec::new()),
             step_sessions: StdMutex::new(Default::default()),
             step_waiters: StdMutex::new(Default::default()),
             run_tool_changes: StdMutex::new(Default::default()),
@@ -366,7 +376,8 @@ impl Daemon {
             config: StdMutex::new(None),
             mcp: Default::default(),
             modules: StdMutex::new(None),
-            http: reqwest::Client::builder().build()?,
+            // `provider.proxy` applies from start-up (restart to change it).
+            http,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             auto_skill: Arc::new(tokio::sync::Semaphore::new(1)),
             model_download: Arc::new(AtomicBool::new(false)),
@@ -468,9 +479,16 @@ impl Daemon {
         requested: Option<&str>,
     ) -> Result<Target> {
         let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
-        let wanted = requested.map(str::to_string).unwrap_or(session_model);
+        // Aliases (`provider.aliases`) resolve at use, so changing one moves
+        // every Session and Role that names it.
+        let wanted = cfg
+            .provider
+            .resolve_alias(&requested.map(str::to_string).unwrap_or(session_model));
         if let Some(role_name) = wanted.strip_prefix("role:") {
-            let role = cfg.role(role_name)?;
+            let mut role = cfg.role(role_name)?.clone();
+            let pcfg = cfg.provider_cfg(role.provider.as_deref())?;
+            role.model = pcfg.resolve_alias(&role.model);
+            role.candidates = role.candidates.iter().map(|c| pcfg.resolve_alias(c)).collect();
             let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
             let model = if role.model.is_empty() {
                 cfg.provider_cfg(role.provider.as_deref())?.model
@@ -478,14 +496,27 @@ impl Daemon {
                 // Per-task choice: quality gate, then cost (SPEC §4.6).
                 let stats = self.with_reader(|st| st.task_stats(role_name))?;
                 let explore = rand::random::<f64>() < cfg.tools.task_explore_rate;
-                crate::routing::select_task_model(
+                let picked = crate::routing::select_task_model(
                     &role.candidates,
                     &stats,
                     cfg.tools.task_min_samples,
                     cfg.tools.task_quality_bar,
                     explore,
                 )
-                .unwrap_or_else(|| role.model.clone())
+                .unwrap_or_else(|| role.model.clone());
+                let samples = |m: &str| stats.iter().find(|s| s.model == m).map_or(0, |s| s.samples);
+                let explored = explore && samples(&picked) < cfg.tools.task_min_samples;
+                let mut why = crate::routing::explain_task_choice(
+                    &role.candidates,
+                    &stats,
+                    cfg.tools.task_min_samples,
+                    cfg.tools.task_quality_bar,
+                    explored,
+                    &picked,
+                );
+                why["kind"] = json!(format!("role:{role_name}"));
+                self.note_routing(session_id, why);
+                picked
             } else {
                 role.model.clone()
             };
@@ -584,6 +615,9 @@ impl Daemon {
                     .count());
                 resources["uptime_secs"] = json!(self.started.elapsed().as_secs());
                 Ok(json!({
+                    "rate_limits": crate::provider::rate_limits(),
+                    "missing_models": *self.missing_models.lock().unwrap(),
+                    "proxy": self.config().ok().and_then(|c| crate::provider::proxy_in_use(&c.provider)),
                     "resources": resources,
                     "protocol": PROTOCOL_VERSION,
                     "version": env!("CARGO_PKG_VERSION"),
@@ -858,6 +892,9 @@ impl Daemon {
                     }
                     other => other,
                 };
+                if let Some(m) = &model {
+                    self.test_new_model(&id, m);
+                }
                 let s = self
                     .with_store(|st| st.set_session_model(&id, model, reasoning_effort))?
                     .context("session not found")?;
@@ -1597,6 +1634,9 @@ impl Daemon {
                 for (name, p) in &cfg.providers {
                     providers.push(json!({
                         "name": name, "base_url": p.base_url, "model": p.model,
+                        // Header values can be secrets: names only.
+                        "header_names": p.extra_headers.keys().collect::<Vec<_>>(),
+                        "query_params": p.query_params, "api_key_header": p.api_key_header,
                         "has_key": crate::config::provider_key(&self.paths, name).is_some(),
                     }));
                 }
@@ -1606,9 +1646,9 @@ impl Daemon {
                 let cfg = self.config()?;
                 let listed = async {
                     let provider = self.provider(&cfg).await?;
-                    let (models, windows) = tokio::time::timeout(
+                    let (models, windows, meta) = tokio::time::timeout(
                         std::time::Duration::from_secs(15),
-                        provider.list_models_with_windows(),
+                        provider.list_models_meta(),
                     )
                     .await
                     .map_err(|_| anyhow!("GET /models timed out"))??;
@@ -1617,12 +1657,22 @@ impl Daemon {
                         .lock()
                         .unwrap()
                         .insert(provider.settings().base_url.clone(), windows);
-                    Ok::<_, anyhow::Error>(models)
+                    Ok::<_, anyhow::Error>((models, meta))
                 };
-                let (models, error) = match listed.await {
+                let ((models, mut meta), error) = match listed.await {
                     Ok(m) => (m, None),
-                    Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+                    Err(e) => ((Vec::new(), HashMap::new()), Some(format!("{e:#}"))),
                 };
+                // Remembered tests for this endpoint's models (SPEC §4.3).
+                let prefix = format!("{} ", cfg.provider.base_url);
+                let tests: serde_json::Map<String, Value> = self
+                    .model_tests()
+                    .into_iter()
+                    .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|m| (m.to_string(), v)))
+                    .collect();
+                for m in &models {
+                    meta.entry(m.clone()).or_insert_with(|| crate::provider::known_model_meta(m));
+                }
                 let roles: Vec<_> = cfg
                     .roles
                     .iter()
@@ -1643,6 +1693,10 @@ impl Daemon {
                 }
                 Ok(json!({
                     "models": models,
+                    "meta": meta,
+                    "tests": tests,
+                    "aliases": cfg.provider.aliases,
+                    "missing": *self.missing_models.lock().unwrap(),
                     "roles": roles,
                     "recent": recent,
                     "current": {"model": cfg.provider.model,
@@ -1655,6 +1709,9 @@ impl Daemon {
                 base_url,
                 model,
                 api_key,
+                headers,
+                query_params,
+                api_key_header,
             } => {
                 if name == crate::config::DEFAULT_PROVIDER
                     || name.is_empty()
@@ -1669,6 +1726,15 @@ impl Daemon {
                 p.base_url = base_url.trim_end_matches('/').to_string();
                 if let Some(m) = model {
                     p.model = m;
+                }
+                if let Some(h) = headers {
+                    p.extra_headers = h.into_iter().collect();
+                }
+                if let Some(q) = query_params {
+                    p.query_params = q;
+                }
+                if let Some(h) = api_key_header {
+                    p.api_key_header = Some(h.trim().to_string()).filter(|h| !h.is_empty());
                 }
                 cfg.save(&self.paths)?;
                 if let Some(key) = api_key.filter(|k| !k.is_empty()) {
@@ -2644,6 +2710,27 @@ impl Daemon {
                 self.import_session_bundle(&bundle)?,
             )?),
             Request::ExportAll { sessions } => self.export_all(sessions),
+            Request::TestModel { model, provider } => {
+                let cfg = self.config()?;
+                Ok(json!(self.test_model(&cfg, provider.as_deref(), &model).await?))
+            }
+            Request::RoutingDecisions => Ok(json!(self
+                .routing_log
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>())),
+            Request::RateLimits => Ok(json!(crate::provider::rate_limits())),
+            Request::OllamaPull { model } => {
+                let cfg = self.config()?;
+                let base = cfg.provider.base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+                let this = self.clone();
+                let http = self.http.clone();
+                tokio::spawn(async move { this.ollama_pull(&http, &base, &model).await });
+                Ok(json!({"started": true}))
+            }
             Request::CompareModels {
                 session_id,
                 models,
@@ -3754,8 +3841,17 @@ impl Daemon {
                         }
                     }
                 }
-                let msg = self
-                    .with_store(|st| st.append_message(session_id, "assistant", &result.content))?;
+                // Which model answered, when not the one asked for: a
+                // fallback, or auto routing's pick (SPEC §4.5).
+                let served = (!result.model_used.is_empty() && result.model_used != requested_model)
+                    .then(|| {
+                        let via = if result.model_used == model { "routing" } else { "fallback" };
+                        json!({"model": {"name": result.model_used, "via": via, "requested": requested_model}})
+                            .to_string()
+                    });
+                let msg = self.with_store(|st| {
+                    st.append_message_meta(session_id, "assistant", &result.content, served)
+                })?;
                 self.broadcast(Event::MessageComplete {
                     session_id: session_id.to_string(),
                     run_id: run_id.to_string(),
@@ -3871,6 +3967,59 @@ impl Daemon {
                 });
             }
         }
+    }
+
+    /// Stream an Ollama `/api/pull` as `ModelPullProgress` (SPEC §4.2).
+    async fn ollama_pull(&self, http: &reqwest::Client, base: &str, model: &str) {
+        let send = |status: String, completed: Option<u64>, total: Option<u64>, done: bool, error: Option<String>| {
+            self.broadcast(Event::ModelPullProgress {
+                model: model.to_string(),
+                status,
+                completed,
+                total,
+                done,
+                error,
+            });
+        };
+        let resp = http
+            .post(format!("{base}/api/pull"))
+            .json(&json!({"model": model, "stream": true}))
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                return send("failed".into(), None, None, true, Some(format!("{status}: {text}")));
+            }
+            Err(e) => return send("failed".into(), None, None, true, Some(format!("{e:#}"))),
+        };
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let Ok(chunk) = chunk else { break };
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let Ok(v) = serde_json::from_slice::<Value>(&line) else { continue };
+                if let Some(e) = v["error"].as_str() {
+                    return send("failed".into(), None, None, true, Some(e.to_string()));
+                }
+                let status = v["status"].as_str().unwrap_or_default().to_string();
+                let done = status == "success";
+                // At most 4 updates a second, plus every status change at the end.
+                if done || last.elapsed() >= std::time::Duration::from_millis(250) {
+                    last = std::time::Instant::now();
+                    send(status, v["completed"].as_u64(), v["total"].as_u64(), done, None);
+                }
+                if done {
+                    return;
+                }
+            }
+        }
+        send("ended".into(), None, None, true, None);
     }
 
     /// `CompareModels` (SPEC §5.10): one fork per model, each asked the
@@ -5509,9 +5658,149 @@ impl Daemon {
         let stats = self
             .with_store(|st| st.list_model_stats())
             .unwrap_or_default();
-        crate::routing::select_model(&cfg.provider, &stats, complex).context(
+        let picked = crate::routing::select_model(&cfg.provider, &stats, complex).context(
             "provider.model is \"auto\" but no routing candidates are configured; set provider.routing_models (or fallback_models)",
-        )
+        )?;
+        let mut why = crate::routing::explain_model_choice(&cfg.provider, &stats, complex, &picked);
+        why["kind"] = json!(if complex { "auto (complex task)" } else { "auto (simple task)" });
+        self.note_routing("", why);
+        Ok(picked)
+    }
+
+    /// Keep a routing decision for `/routing` (at most the last 50).
+    fn note_routing(&self, session_id: &str, mut why: Value) {
+        why["at"] = json!(chrono::Utc::now().to_rfc3339());
+        if !session_id.is_empty() {
+            why["session_id"] = json!(session_id);
+        }
+        let mut log = self.routing_log.lock().unwrap();
+        log.push_back(why);
+        while log.len() > 50 {
+            log.pop_front();
+        }
+    }
+
+    /// Remembered model tests, keyed `"<base_url> <model>"` (SPEC §4.3).
+    fn model_tests(&self) -> serde_json::Map<String, Value> {
+        std::fs::read_to_string(self.paths.data_dir.join("model_tests.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn remember_model_test(&self, base_url: &str, test: &crate::provider::ModelTest) {
+        let mut all = self.model_tests();
+        all.insert(format!("{base_url} {}", test.model), json!(test));
+        let _ = std::fs::write(
+            self.paths.data_dir.join("model_tests.json"),
+            serde_json::to_string_pretty(&all).unwrap_or_default(),
+        );
+    }
+
+    /// Test a model on a provider and remember the result.
+    async fn test_model(
+        &self,
+        cfg: &Config,
+        provider: Option<&str>,
+        model: &str,
+    ) -> Result<crate::provider::ModelTest> {
+        let p = self.provider_named(cfg, provider).await?;
+        let model = p.settings().resolve_alias(model);
+        let t = p.test_model(&model).await;
+        self.remember_model_test(&p.settings().base_url, &t);
+        Ok(t)
+    }
+
+    /// A newly chosen model is tested once in the background; a failure is
+    /// a note now rather than a failed Run later (SPEC §4.3).
+    fn test_new_model(self: &Arc<Self>, session_id: &str, model: &str) {
+        let Ok(cfg) = self.config() else { return };
+        if model.starts_with("role:") || ProviderCfg::is_auto_model(model) || model.is_empty() {
+            return;
+        }
+        let model = cfg.provider.resolve_alias(model);
+        let key = format!("{} {model}", cfg.provider.base_url);
+        if self.model_tests().contains_key(&key) {
+            return;
+        }
+        let (this, sid) = (self.clone(), session_id.to_string());
+        tokio::spawn(async move {
+            if let Ok(t) = this.test_model(&cfg, None, &model).await {
+                if !t.ok {
+                    this.broadcast(Event::Note {
+                        session_id: Some(sid),
+                        text: format!(
+                            "{model} failed the model test: {}",
+                            t.error.unwrap_or_else(|| "it does not call tools".into())
+                        ),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Configured models (default, fallbacks, routing, Roles) missing from
+    /// their endpoint's `/models`, checked at start and daily (SPEC §4.2).
+    async fn check_models_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Ok(cfg) = self.config() {
+                let missing = self.missing_configured_models(&cfg).await;
+                if !missing.is_empty() && *self.missing_models.lock().unwrap() != missing {
+                    self.broadcast(Event::Note {
+                        session_id: None,
+                        text: format!(
+                            "These configured models are no longer offered by their endpoint: {}. Pick others with /model or in Settings.",
+                            missing.join(", ")
+                        ),
+                    });
+                }
+                *self.missing_models.lock().unwrap() = missing;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+        }
+    }
+
+    async fn missing_configured_models(&self, cfg: &Config) -> Vec<String> {
+        let mut wanted: Vec<(Option<String>, String)> = Vec::new();
+        let p = &cfg.provider;
+        for m in std::iter::once(&p.model)
+            .chain(&p.fallback_models)
+            .chain(&p.routing_models)
+            .chain(&p.routing_fast_models)
+            .chain(&p.routing_strong_models)
+        {
+            wanted.push((None, p.resolve_alias(m)));
+        }
+        for r in cfg.roles.values() {
+            let Ok(pc) = cfg.provider_cfg(r.provider.as_deref()) else { continue };
+            for m in std::iter::once(&r.model).chain(&r.candidates) {
+                wanted.push((r.provider.clone(), pc.resolve_alias(m)));
+            }
+        }
+        wanted.retain(|(_, m)| !m.is_empty() && !ProviderCfg::is_auto_model(m) && !m.starts_with("role:"));
+        let mut missing = Vec::new();
+        let mut listed: HashMap<Option<String>, Option<Vec<String>>> = HashMap::new();
+        for (prov, m) in wanted {
+            if !listed.contains_key(&prov) {
+                let models = match self.provider_named(cfg, prov.as_deref()).await {
+                    Ok(pv) => tokio::time::timeout(std::time::Duration::from_secs(15), pv.list_models())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .filter(|l| !l.is_empty()),
+                    Err(_) => None,
+                };
+                listed.insert(prov.clone(), models);
+            }
+            // An endpoint that lists nothing (or failed) proves nothing.
+            if let Some(Some(list)) = listed.get(&prov) {
+                if !list.iter().any(|x| x == &m) && !missing.contains(&m) {
+                    missing.push(m);
+                }
+            }
+        }
+        missing
     }
 
     pub(crate) fn record_model_outcome(&self, model: &str, ok: bool, started: std::time::Instant) {
@@ -9944,6 +10233,10 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.backup_loop().await })
         };
+        let model_check = {
+            let this = self.clone();
+            tokio::spawn(async move { this.check_models_loop().await })
+        };
         let mcp = {
             let this = self.clone();
             tokio::spawn(async move { this.mcp_loop().await })
@@ -9956,6 +10249,7 @@ impl Daemon {
         logs.abort();
         artifact_gc.abort();
         backups.abort();
+        model_check.abort();
         mcp.abort();
         jobs.abort();
         self.mcp.stop_all().await;

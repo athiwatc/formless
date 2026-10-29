@@ -660,6 +660,18 @@ impl RelayCfg {
 pub struct ProviderCfg {
     pub base_url: String,
     pub extra_headers: HashMap<String, String>,
+    /// Short names for model ids (`fast = "…"`), usable wherever a model
+    /// is accepted; changing one changes everything that uses it.
+    pub aliases: BTreeMap<String, String>,
+    /// Query parameters added to every request (`api-version` for Azure
+    /// OpenAI, gateway options).
+    pub query_params: BTreeMap<String, String>,
+    /// Send the API key in this header instead of `Authorization: Bearer`
+    /// (`api-key` for Azure OpenAI).
+    pub api_key_header: Option<String>,
+    /// HTTP(S) proxy for this provider's requests; empty uses
+    /// `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` from the environment.
+    pub proxy: String,
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub context_tokens: u32,
@@ -774,6 +786,10 @@ impl Default for ProviderCfg {
         Self {
             base_url: String::new(),
             extra_headers: HashMap::new(),
+            aliases: BTreeMap::new(),
+            query_params: BTreeMap::new(),
+            api_key_header: None,
+            proxy: String::new(),
             model: String::new(),
             reasoning_effort: None,
             context_tokens: 128_000,
@@ -834,6 +850,16 @@ impl ProviderCfg {
         }
         out
     }
+    /// The model id an alias stands for (one level; case-insensitive), or
+    /// `model` itself.
+    pub fn resolve_alias(&self, model: &str) -> String {
+        let m = model.trim();
+        self.aliases
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(m))
+            .map_or_else(|| m.to_string(), |(_, v)| v.trim().to_string())
+    }
+
     pub fn is_auto_model(model: &str) -> bool {
         model.trim().eq_ignore_ascii_case("auto")
     }

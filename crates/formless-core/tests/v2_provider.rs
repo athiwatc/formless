@@ -788,3 +788,74 @@ async fn rate_limit_retries_are_reported_to_the_hook() {
     assert_eq!(seen[0].wait.as_secs(), 1);
     assert_eq!((seen[0].attempt, seen[0].max_attempts), (1, 3));
 }
+
+/// Aliases, Azure-style auth (`api-key` header + `api-version` query),
+/// rate-limit headers and the model test (SPEC §4.2–§4.4).
+#[tokio::test]
+async fn aliases_key_header_query_rate_limits_and_model_test() {
+    use axum::extract::Query;
+    use axum::http::HeaderMap;
+    let app = Router::new().route(
+        "/chat/completions",
+        post(
+            |headers: HeaderMap, Query(q): Query<std::collections::HashMap<String, String>>, Json(body): Json<Value>| async move {
+                assert_eq!(headers.get("api-key").and_then(|v| v.to_str().ok()), Some("k"), "key in api-key");
+                assert!(headers.get("authorization").is_none(), "no Bearer");
+                assert_eq!(q.get("api-version").map(String::as_str), Some("2024-10-21"));
+                assert_eq!(body["model"], "real-model", "alias resolved");
+                let sse = if body.get("tools").is_some() {
+                    // The tool probe is a plain (non-streaming) request.
+                    json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "probe_ping", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]}).to_string()
+                } else {
+                    format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices": [{"delta": {"content": "o"}}]}),
+                        json!({"choices": [{"delta": {"content": "k"}}]})
+                    )
+                };
+                (
+                    [("x-ratelimit-remaining-requests", "41"), ("x-ratelimit-limit-requests", "50")],
+                    sse,
+                )
+                    .into_response()
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    c.api_key_header = Some("api-key".into());
+    c.query_params.insert("api-version".into(), "2024-10-21".into());
+    c.aliases.insert("smart".into(), "real-model".into());
+    let p = Provider::new(c, "k".into()).unwrap();
+    let t = p.test_model("smart").await;
+    assert_eq!(t.error, None);
+    assert!(t.ok && t.streaming && t.tool_calling && !t.prompt_fallback, "{t:?}");
+    assert!(t.first_token_ms.is_some());
+    let limits = formless_core::provider::rate_limits();
+    assert_eq!(limits[&base]["remaining-requests"], "41");
+}
+
+#[test]
+fn model_metadata_comes_from_the_listing_or_the_table() {
+    use formless_core::provider::{known_model_meta, parse_model_meta};
+    let body = json!({"data": [
+        {"id": "vendor/visionary", "context_length": 200000,
+         "pricing": {"prompt": "0.000003", "completion": "0.000015"},
+         "architecture": {"input_modalities": ["text", "image"]},
+         "supported_parameters": ["tools", "reasoning"]},
+        {"id": "plain", "supported_parameters": ["temperature"]},
+        {"id": "gpt-5-mini"}
+    ]});
+    let meta = parse_model_meta(&body);
+    let v = &meta["vendor/visionary"];
+    assert_eq!((v["context"].as_u64(), v["vision"].as_bool(), v["tools"].as_bool()), (Some(200000), Some(true), Some(true)));
+    assert_eq!((v["input_price"].as_f64(), v["output_price"].as_f64()), (Some(3.0), Some(15.0)));
+    assert_eq!(v["efforts"], json!(["low", "medium", "high"]));
+    assert_eq!(meta["plain"]["efforts"], json!([]), "no reasoning parameter: effort has no effect");
+    assert_eq!(meta["plain"]["tools"], false);
+    assert_eq!(meta["gpt-5-mini"]["efforts"], json!(["minimal", "low", "medium", "high"]));
+    assert!(known_model_meta("some-unknown").get("efforts").is_none(), "unknown: all offered");
+}

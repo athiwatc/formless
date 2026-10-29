@@ -377,6 +377,19 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("mcp", "", "list MCP servers", Integrations),
     cmd("mcp restart", "NAME", "restart an MCP server", Integrations),
+    cmd(
+        "test",
+        "[MODEL]",
+        "test a model: latency, streaming, reasoning, tool calls",
+        Settings,
+    ),
+    cmd(
+        "routing",
+        "",
+        "why routing picked each model lately",
+        Settings,
+    ),
+    cmd("pull", "MODEL", "Ollama: download a model", Settings),
     cmd("mcp log", "NAME", "an MCP server's stderr log", Integrations),
     cmd(
         "mcp tools",

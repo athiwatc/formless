@@ -127,6 +127,36 @@ pub fn resolve_base_url(value: &str) -> Option<String> {
     find(v).map(|p| p.base_url.to_string())
 }
 
+/// The latest Azure OpenAI data-plane API version this build knows.
+pub const AZURE_API_VERSION: &str = "2024-10-21";
+
+/// Azure OpenAI (SPEC §4.2): a deployment's base URL, its `api-version`
+/// query parameter and the `api-key` header, from the resource name (or
+/// its full `https://….openai.azure.com` endpoint) and deployment.
+pub fn azure(
+    resource: &str,
+    deployment: &str,
+    api_version: Option<&str>,
+) -> anyhow::Result<(String, std::collections::BTreeMap<String, String>, &'static str)> {
+    let resource = resource.trim().trim_end_matches('/');
+    let deployment = deployment.trim();
+    if resource.is_empty() || deployment.is_empty() {
+        anyhow::bail!("Azure OpenAI needs the resource name and the deployment name");
+    }
+    let host = if resource.starts_with("https://") {
+        resource.to_string()
+    } else {
+        format!("https://{resource}.openai.azure.com")
+    };
+    let base = format!("{host}/openai/deployments/{deployment}");
+    let mut q = std::collections::BTreeMap::new();
+    q.insert(
+        "api-version".to_string(),
+        api_version.map(str::trim).filter(|v| !v.is_empty()).unwrap_or(AZURE_API_VERSION).to_string(),
+    );
+    Ok((base, q, "api-key"))
+}
+
 /// The preset's key from its environment variable, when set.
 pub fn env_key(p: &Preset) -> Option<(&'static str, String)> {
     let var = p.key_env?;
@@ -134,6 +164,22 @@ pub fn env_key(p: &Preset) -> Option<(&'static str, String)> {
         .ok()
         .filter(|k| !k.trim().is_empty())
         .map(|k| (var, k.trim().to_string()))
+}
+
+#[cfg(test)]
+mod azure_tests {
+    #[test]
+    fn azure_builds_the_deployment_url_version_and_key_header() {
+        let (base, q, header) = super::azure("contoso", "gpt4o", None).unwrap();
+        assert_eq!(base, "https://contoso.openai.azure.com/openai/deployments/gpt4o");
+        assert_eq!(q["api-version"], super::AZURE_API_VERSION);
+        assert_eq!(header, "api-key");
+        let (base, q, _) =
+            super::azure("https://x.openai.azure.com/", "d", Some("2025-01-01")).unwrap();
+        assert_eq!(base, "https://x.openai.azure.com/openai/deployments/d");
+        assert_eq!(q["api-version"], "2025-01-01");
+        assert!(super::azure("", "d", None).is_err());
+    }
 }
 
 #[cfg(test)]
