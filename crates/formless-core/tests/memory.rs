@@ -207,3 +207,62 @@ async fn tool_output_is_never_remembered_verbatim() {
     assert!(out.contains("copied from a Tool result"), "{out}");
     assert!(store.list_memories().unwrap().is_empty());
 }
+
+#[test]
+fn personal_details_count_as_sensitive() {
+    use formless_core::memory::looks_sensitive;
+    assert!(looks_sensitive("Lives in Chiang Mai, near the old city"));
+    assert!(looks_sensitive("Takes medication every morning"));
+    assert!(looks_sensitive("Email is someone@example.com"));
+    assert!(!looks_sensitive("Uses pnpm, not npm"));
+    assert!(!looks_sensitive("Answers in Thai"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn confirm_writes_discards_a_note_nobody_approved() {
+    let paths = temp_paths("confirm");
+    let mut cfg = formless_core::Config::default();
+    cfg.memory.confirm_writes = "always".into();
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let out = daemon
+        .call_tool_direct(
+            &sid,
+            "remember",
+            serde_json::json!({"text": "Uses pnpm, not npm"}),
+        )
+        .await;
+    assert!(out.contains("\"saved\":false"), "{out}");
+    assert!(store.list_memories().unwrap().is_empty());
+    assert_eq!(
+        store.recent_audit(Some("memory.discard"), 5).unwrap().len(),
+        1
+    );
+    // "sensitive" lets an ordinary preference through.
+    cfg.memory.confirm_writes = "sensitive".into();
+    cfg.save(&paths).unwrap();
+    let out = daemon
+        .call_tool_direct(
+            &sid,
+            "remember",
+            serde_json::json!({"text": "Uses pnpm, not npm"}),
+        )
+        .await;
+    assert!(out.contains("\"saved\":\"new\""), "{out}");
+    // A Run records which notes its prompt carried.
+    let run = store.create_run(&sid).unwrap();
+    let m = store.list_memories().unwrap().remove(0);
+    store
+        .set_run_memories(&run, std::slice::from_ref(&m.id))
+        .unwrap();
+    let used = daemon
+        .handle(formless_protocol::Request::RunMemories {
+            run_id: None,
+            session_id: Some(sid.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(used[0]["id"], m.id.as_str());
+}

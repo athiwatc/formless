@@ -217,6 +217,10 @@ pub struct Daemon {
     approval_by: StdMutex<HashMap<String, String>>,
     /// Wider path scopes chosen with an approval, until its call reads them.
     approval_paths: StdMutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
+    /// Job firings waiting for their Run to end, by Session: (job_runs
+    /// row, job id, Runs to let pass first: the one in progress and the
+    /// messages queued ahead of it) (SPEC §9.7).
+    job_pending: StdMutex<HashMap<String, (String, String, usize)>>,
     /// Denials answered "always deny", until their call reads them.
     deny_always: StdMutex<std::collections::HashSet<String>>,
     /// Why a Tool was last denied, by Tool name, for the agent's error.
@@ -324,6 +328,7 @@ impl Daemon {
             approval_by: StdMutex::new(Default::default()),
             approval_paths: StdMutex::new(Default::default()),
             deny_always: StdMutex::new(Default::default()),
+            job_pending: StdMutex::new(Default::default()),
             denial_notes: StdMutex::new(Default::default()),
             grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
@@ -556,7 +561,11 @@ impl Daemon {
                     "auth": auth.ok(),
                 }))
             }
-            Request::GetSettings => Ok(self.config()?.settings_summary(&self.paths)),
+            Request::GetSettings => {
+                let mut v = self.config()?.settings_summary(&self.paths);
+                v["jobs_warning"] = json!(self.jobs_keep_alive_warning());
+                Ok(v)
+            }
             Request::Shutdown => {
                 let token = self.shutdown.clone();
                 tokio::spawn(async move {
@@ -934,6 +943,42 @@ impl Daemon {
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
             }
+            Request::LoadSkill {
+                session_id,
+                name,
+                args,
+            } => {
+                let loaded: Value = serde_json::from_str(&self.load_skill_impl(
+                    &session_id,
+                    "",
+                    &json!({"name": name}),
+                )?)?;
+                let mut note = format!(
+                    "The user loaded the skill \"{name}\". Follow its instructions:\n\n{}",
+                    loaded["instructions"].as_str().unwrap_or_default()
+                );
+                if let Some(files) = loaded["files"].as_array().filter(|f| !f.is_empty()) {
+                    note.push_str(&format!(
+                        "\n\nIts other files (read them with read_skill_file): {}",
+                        files
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if let Some(a) = args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                    note.push_str(&format!("\n\nArguments: {a}"));
+                }
+                let msg =
+                    self.with_store(|st| st.append_message(&session_id, "system-note", &note))?;
+                self.broadcast(Event::MessageAppended {
+                    session_id,
+                    message: msg,
+                });
+                let _ = self.with_store(|st| st.audit("user", "skill.load", &name));
+                Ok(json!({"loaded": name}))
+            }
             Request::ListRelayClients => {
                 let list: Vec<RelayClientInfo> = self
                     .relay_clients
@@ -1122,6 +1167,18 @@ impl Daemon {
                     "relay": {"enabled": cfg.relay.enabled, "url": cfg.relay.url},
                     "web_ui": {"port": web},
                 }))
+            }
+            Request::RunMemories { run_id, session_id } => {
+                let run = match (run_id, session_id) {
+                    (Some(r), _) => Some(r),
+                    (None, Some(s)) => self.with_reader(|st| st.last_run(&s))?.map(|(r, _)| r),
+                    _ => None,
+                };
+                let list = match run {
+                    Some(r) => self.with_reader(|st| st.run_memories(&r))?,
+                    None => Vec::new(),
+                };
+                Ok(serde_json::to_value(list)?)
             }
             Request::ListDenials => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_denials())?,
@@ -1483,22 +1540,72 @@ impl Daemon {
                 session_id,
                 cron,
                 at,
+                overlap,
+                deliver,
             } => {
+                // Plain English ("every weekday at 9am") is stored as cron.
+                let cron = cron.as_deref().map(crate::jobs::to_cron).transpose()?;
+                check_overlap(overlap.as_deref())?;
                 let next =
                     crate::jobs::first_run(cron.as_deref(), at.as_deref(), chrono::Local::now())?;
                 let job = self.with_store(|st| {
-                    st.create_job(
+                    let job = st.create_job(
                         &prompt,
                         session_id.as_deref(),
                         cron.as_deref(),
                         &next.to_rfc3339(),
                         true,
                         "user",
-                    )
+                    )?;
+                    st.set_job_options(&job.id, overlap.as_deref(), deliver.as_ref())?;
+                    Ok(st.get_job(&job.id)?.unwrap_or(job))
                 })?;
                 let _ = self.with_store(|st| st.audit("user", "job.add", &job.id));
                 self.broadcast(Event::JobsChanged);
-                Ok(serde_json::to_value(job)?)
+                let mut v = serde_json::to_value(job)?;
+                if let Some(w) = self.jobs_keep_alive_warning() {
+                    v["warning"] = json!(w);
+                }
+                Ok(v)
+            }
+            Request::PreviewSchedule { schedule } => {
+                let cron = crate::jobs::to_cron(&schedule)?;
+                let next: Vec<String> = crate::jobs::next_runs(&cron, chrono::Local::now(), 3)?
+                    .iter()
+                    .map(|t| t.to_rfc3339())
+                    .collect();
+                Ok(json!({"cron": cron, "next": next}))
+            }
+            Request::RunJobNow { id } => {
+                let job = self
+                    .with_store(|st| st.get_job(&id))?
+                    .with_context(|| format!("no job '{id}'"))?;
+                let status = self.fire_job(&job, "manual", 0).await;
+                let _ = self.with_store(|st| st.audit("user", "job.run_now", &id));
+                self.broadcast(Event::JobsChanged);
+                Ok(json!({"id": id, "status": status}))
+            }
+            Request::JobRuns { id, limit } => {
+                Ok(serde_json::to_value(self.with_reader(|st| {
+                    st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))
+                })?)?)
+            }
+            Request::SetJobOptions {
+                id,
+                overlap,
+                deliver,
+            } => {
+                check_overlap(overlap.as_deref())?;
+                self.with_store(|st| st.get_job(&id))?
+                    .with_context(|| format!("no job '{id}'"))?;
+                self.with_store(|st| {
+                    st.set_job_options(&id, overlap.as_deref(), deliver.as_ref())
+                })?;
+                let _ = self.with_store(|st| st.audit("user", "job.options", &id));
+                self.broadcast(Event::JobsChanged);
+                Ok(serde_json::to_value(
+                    self.with_store(|st| st.get_job(&id))?,
+                )?)
             }
             Request::SetJobEnabled { id, enabled } => {
                 if !self.with_store(|st| st.set_job_enabled(&id, enabled))? {
@@ -1507,7 +1614,8 @@ impl Daemon {
                 let action = if enabled { "job.enable" } else { "job.disable" };
                 let _ = self.with_store(|st| st.audit("user", action, &id));
                 self.broadcast(Event::JobsChanged);
-                Ok(json!({"id": id, "enabled": enabled}))
+                let warning = enabled.then(|| self.jobs_keep_alive_warning()).flatten();
+                Ok(json!({"id": id, "enabled": enabled, "warning": warning}))
             }
             Request::DeleteJob { id } => {
                 if !self.with_store(|st| st.delete_job(&id))? {
@@ -2701,6 +2809,7 @@ impl Daemon {
             status: final_status.to_string(),
         });
         self.maybe_name_session(&session_id);
+        self.job_run_ended(&session_id, &run_id, final_status);
         self.maybe_auto_skill(&session_id, &run_id, final_status);
         self.record_primary_task(&session_id, &run_id, final_status);
         // run_end hooks (SPEC §9.8): automation, results only logged.
@@ -3025,6 +3134,7 @@ impl Daemon {
         }
         let effort = target.effort.clone();
         let (context_tokens, _) = self.context_window(&provider, &model).await;
+        self.record_run_memories(session_id, run_id);
 
         self.maybe_compact(&provider, &cfg, session_id, &model, context_tokens)
             .await?;
@@ -3726,7 +3836,7 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => format!("error: ask_user failed: {e}"),
             },
-            toolreg::REMEMBER => match self.remember_impl(session_id, &args) {
+            toolreg::REMEMBER => match self.remember_impl(session_id, &args, cfg, cancel).await {
                 Ok(text) => text,
                 Err(e) => format!("error: remember failed: {e}"),
             },
@@ -5778,6 +5888,9 @@ impl Daemon {
                 .map(|(sum, c)| sum + c);
         }
         u.cost = cost.filter(|_| u.prompt_tokens + u.completion_tokens > 0);
+        if let Some(r) = run_id {
+            u.memories = self.with_reader(|st| st.run_memories(r))?.len() as i64;
+        }
         Ok(u)
     }
 
@@ -6104,43 +6217,223 @@ impl Daemon {
         let Ok(due) = self.with_store(|st| st.due_jobs(chrono::Utc::now())) else {
             return;
         };
+        let now = chrono::Local::now();
         for job in due {
+            // Firings that fell while the daemon was down or asleep run
+            // once, and say how many were coalesced (SPEC §9.7).
+            let missed = match (job.cron.as_deref(), job.next_run.as_deref()) {
+                (Some(c), Some(n)) => chrono::DateTime::parse_from_rfc3339(n)
+                    .map(|n| crate::jobs::missed_since(c, n.with_timezone(&chrono::Local), now))
+                    .unwrap_or(0),
+                _ => 0,
+            };
             let next = job
                 .cron
                 .as_deref()
                 .and_then(|c| crate::jobs::Cron::parse(c).ok())
-                .and_then(|c| c.next_after(chrono::Local::now()))
+                .and_then(|c| c.next_after(now))
                 .map(|t| t.to_rfc3339());
-            let session = match job.session_id.clone().filter(|s| {
-                self.with_store(|st| st.get_session(s))
-                    .ok()
-                    .flatten()
-                    .is_some()
-            }) {
-                Some(s) => Ok(s),
-                None => {
-                    let name: String = job.prompt.chars().take(40).collect();
-                    self.with_store(|st| st.create_session(Some(format!("Job: {name}"))))
-                        .map(|s| {
-                            self.broadcast(Event::SessionUpdated { session: s.clone() });
-                            s.id
-                        })
-                }
-            };
-            let status = match session {
-                Ok(sid) => match self
-                    .send_message(sid.clone(), job.prompt.clone(), SendMode::Queue)
-                    .await
-                {
-                    Ok(_) => format!("started in session {sid}"),
-                    Err(e) => format!("error: {e}"),
-                },
-                Err(e) => format!("error: {e}"),
-            };
+            let status = self.fire_job(&job, "schedule", missed).await;
             let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
-            let _ = self.with_store(|st| st.audit("daemon", "job.run", &job.id));
             self.broadcast(Event::JobsChanged);
         }
+    }
+
+    /// Most job prompts one Session's queue holds; later firings are
+    /// skipped (and audited) instead of piling up.
+    const MAX_QUEUED_JOB_MESSAGES: usize = 5;
+
+    /// Fire one job (on schedule or by hand): its Session, the overlap
+    /// policy, the history row. Returns the status line.
+    async fn fire_job(
+        self: &Arc<Self>,
+        job: &formless_protocol::JobInfo,
+        trigger: &str,
+        missed: usize,
+    ) -> String {
+        let late = if missed > 0 {
+            format!("ran late, {} firing(s) coalesced", missed + 1)
+        } else {
+            String::new()
+        };
+        // This job's previous firing, in whichever Session it went to.
+        let still_running = self
+            .job_pending
+            .lock()
+            .unwrap()
+            .values()
+            .any(|(_, j, _)| *j == job.id);
+        if job.overlap != "queue" && still_running {
+            let why = "skipped: the previous firing is still running".to_string();
+            let detail = if late.is_empty() {
+                why.clone()
+            } else {
+                format!("{late}; {why}")
+            };
+            let _ = self.with_store(|st| {
+                st.job_run_start(
+                    &job.id,
+                    job.session_id.as_deref(),
+                    trigger,
+                    "skipped",
+                    &detail,
+                )?;
+                st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
+            });
+            return why;
+        }
+        let session = match job.session_id.clone().filter(|s| {
+            self.with_store(|st| st.get_session(s))
+                .ok()
+                .flatten()
+                .is_some()
+        }) {
+            Some(s) => Ok(s),
+            None => {
+                let name: String = job.prompt.chars().take(40).collect();
+                self.with_store(|st| st.create_session(Some(format!("Job: {name}"))))
+                    .map(|s| {
+                        self.broadcast(Event::SessionUpdated { session: s.clone() });
+                        s.id
+                    })
+            }
+        };
+        let sid = match session {
+            Ok(sid) => sid,
+            Err(e) => {
+                let status = format!("error: {e}");
+                let _ = self
+                    .with_store(|st| st.job_run_start(&job.id, None, trigger, "failed", &status));
+                return status;
+            }
+        };
+        // Overlap: the previous firing still queued or running.
+        let busy = self.runs.lock().unwrap().contains_key(&sid);
+        let queued = self.with_reader(|st| st.queued_count(&sid)).unwrap_or(0);
+        let skip = if job.overlap != "queue" && busy && queued > 0 {
+            Some("skipped: the previous firing is still running".to_string())
+        } else if queued >= Self::MAX_QUEUED_JOB_MESSAGES {
+            Some(format!(
+                "skipped: {queued} messages already wait in its Session"
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = skip {
+            let detail = [late.as_str(), why.as_str()]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("; ");
+            let _ = self.with_store(|st| {
+                st.job_run_start(&job.id, Some(&sid), trigger, "skipped", &detail)?;
+                st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
+            });
+            return why;
+        }
+        let run_row = self
+            .with_store(|st| st.job_run_start(&job.id, Some(&sid), trigger, "running", &late))
+            .unwrap_or_default();
+        let status = match self
+            .send_message(sid.clone(), job.prompt.clone(), SendMode::Queue)
+            .await
+        {
+            Ok(_) => {
+                let ahead = usize::from(busy) + queued;
+                self.job_pending
+                    .lock()
+                    .unwrap()
+                    .insert(sid.clone(), (run_row, job.id.clone(), ahead));
+                if late.is_empty() {
+                    format!("started in session {sid}")
+                } else {
+                    format!("started in session {sid} ({late})")
+                }
+            }
+            Err(e) => {
+                let _ = self
+                    .with_store(|st| st.job_run_finish(&run_row, "failed", &e.to_string(), None));
+                format!("error: {e}")
+            }
+        };
+        let _ = self.with_store(|st| st.audit("daemon", "job.run", &job.id));
+        status
+    }
+
+    /// A job's Run ended: finish its history row (outcome, cost), tell
+    /// the user when it failed, and deliver the answer (SPEC §9.7).
+    fn job_run_ended(self: &Arc<Self>, session_id: &str, run_id: &str, status: &str) {
+        let (row, job_id) = {
+            let mut pending = self.job_pending.lock().unwrap();
+            match pending.get_mut(session_id) {
+                // A Run queued ahead of the job's own ended.
+                Some((_, _, ahead)) if *ahead > 0 => {
+                    *ahead -= 1;
+                    return;
+                }
+                Some(_) => {
+                    let (row, job, _) = pending.remove(session_id).unwrap();
+                    (row, job)
+                }
+                None => return,
+            }
+        };
+        let cfg = self.config().ok();
+        let cost = cfg
+            .as_ref()
+            .and_then(|c| self.usage_info(None, Some(run_id), c).ok())
+            .and_then(|u| u.cost);
+        let _ = self.with_store(|st| st.job_run_finish(&row, status, "", cost));
+        let Ok(Some(job)) = self.with_store(|st| st.get_job(&job_id)) else {
+            return;
+        };
+        let _ = self.with_store(|st| st.job_ran_status(&job_id, status));
+        if status != "completed" {
+            self.broadcast(Event::Note {
+                session_id: None,
+                text: format!(
+                    "Job {} ({}) ended {status}; see its Session or `formless jobs history {}`",
+                    job.id,
+                    job.prompt.chars().take(40).collect::<String>(),
+                    job.id
+                ),
+            });
+        }
+        self.broadcast(Event::JobsChanged);
+        let Some(target) = job.deliver.clone() else {
+            return;
+        };
+        let answer = self
+            .with_reader(|st| st.list_messages(session_id))
+            .ok()
+            .and_then(|m| m.into_iter().rev().find(|m| m.role == "assistant"))
+            .map(|m| m.content)
+            .unwrap_or_default();
+        let (this, status) = (self.clone(), status.to_string());
+        tokio::spawn(async move {
+            let lines = crate::jobs::deliver(&target, &this.http, &job, &status, &answer).await;
+            if !lines.is_empty() {
+                let detail = lines.join("; ");
+                let _ = this.with_store(|st| {
+                    st.job_run_finish(&row, &status, &detail, cost)?;
+                    st.audit("daemon", "job.deliver", &format!("{}: {detail}", job.id))
+                });
+                this.broadcast(Event::JobsChanged);
+            }
+        });
+    }
+
+    /// Jobs exist but the daemon stops when idle, so they fire only while
+    /// Formless runs (SPEC §9.7): the warning to show, if so.
+    fn jobs_keep_alive_warning(&self) -> Option<String> {
+        let cfg = self.config().ok()?;
+        let active = self.with_reader(|st| st.has_active_jobs()).ok()?;
+        (active && !cfg.daemon.keep_alive_for_jobs).then(|| {
+            "jobs run only while Formless is running (the daemon stops when idle). To run them \
+             on schedule, set daemon.keep_alive_for_jobs = true (/settings or config.toml)."
+                .to_string()
+        })
     }
 
     /// `ask_user` (SPEC §5.5): ask the user mid-Run and wait for the
@@ -6227,7 +6520,13 @@ impl Daemon {
     }
 
     /// `remember` (SPEC §7.11): save (or refresh) a user-memory note.
-    fn remember_impl(&self, session_id: &str, args: &Value) -> Result<String> {
+    async fn remember_impl(
+        &self,
+        session_id: &str,
+        args: &Value,
+        cfg: &Config,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
         let text = args["text"].as_str().context("text required")?;
         let scope = args["scope"].as_str().unwrap_or("global");
         // Never store Tool output verbatim (SPEC §7.11): it may carry data
@@ -6247,6 +6546,33 @@ impl Daemon {
                 return Err(anyhow!(
                     "refused: that text is copied from a Tool result; remember the user's preference in your own words instead"
                 ));
+            }
+        }
+        // The user may want to see a note before it is kept (SPEC §7.11).
+        let ask = match cfg.memory.confirm_writes.as_str() {
+            "always" => true,
+            "sensitive" => crate::memory::looks_sensitive(&cleaned),
+            _ => false,
+        };
+        if ask {
+            let (keep, _) = self
+                .ask_user_approval(
+                    session_id,
+                    "memory",
+                    vec![format!("memory: {cleaned}")],
+                    format!(
+                        "The agent wants to remember, for every future Session:\n\n  {cleaned}\n\nApprove to keep it (edit it later with /memory edit), deny to discard it."
+                    ),
+                    cancel,
+                )
+                .await;
+            if !keep {
+                let _ = self.with_store(|st| st.audit("user", "memory.discard", &cleaned));
+                return Ok(json!({
+                    "saved": false,
+                    "note": "The user chose not to keep this note; don't save it again.",
+                })
+                .to_string());
             }
         }
         let (m, created) =
@@ -7340,6 +7666,24 @@ impl Daemon {
             .map(|(c, _, alt)| format!("{c} is broad; prefer {alt}"))
             .collect::<Vec<_>>());
         v.to_string()
+    }
+
+    /// Record which saved memories this Run's prompt carries (SPEC §7.11),
+    /// so the Run can say so.
+    fn record_run_memories(&self, session_id: &str, run_id: &str) {
+        let Ok(prompt) = self.session_prompt(session_id) else {
+            return;
+        };
+        let ids: Vec<String> = self
+            .with_reader(|st| st.list_memories())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.enabled && prompt.contains(m.text.trim()))
+            .map(|m| m.id)
+            .collect();
+        if !ids.is_empty() {
+            let _ = self.with_store(|st| st.set_run_memories(run_id, &ids));
+        }
     }
 
     /// Log arguments that arrived as JSON strings and were parsed (§7.3).
@@ -8554,6 +8898,14 @@ struct ToolDraft {
     code: String,
     caps: Capabilities,
     memory_mb: u32,
+}
+
+/// A job overlap policy must be `skip` or `queue`.
+fn check_overlap(overlap: Option<&str>) -> Result<()> {
+    match overlap {
+        None | Some("skip") | Some("queue") => Ok(()),
+        Some(o) => Err(anyhow!("overlap must be skip or queue, not {o}")),
+    }
 }
 
 /// Would trusted folders/hosts in config approve this one spec?

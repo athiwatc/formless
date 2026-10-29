@@ -175,3 +175,100 @@ async fn schedule_run_and_the_scheduler() {
         .iter()
         .any(|s| s.name == "Job: say hi"));
 }
+
+/// A daemon over a fresh profile whose provider is unreachable (Runs
+/// fail fast), and the store.
+fn job_daemon(tag: &str) -> (Paths, Store, Arc<formless_core::daemon::Daemon>) {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-{tag}-{short}"));
+    let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+    let mut cfg = formless_core::Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.provider.model = "m".into();
+    cfg.provider.max_retries = 0;
+    cfg.naming.enabled = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    (paths, store, daemon)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_english_schedules_run_now_history_and_the_keep_alive_warning() {
+    use formless_protocol::Request;
+    let (_paths, store, daemon) = job_daemon("jobs2");
+    let preview = daemon
+        .handle(Request::PreviewSchedule {
+            schedule: "every weekday at 9am".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(preview["cron"], "0 9 * * 1-5");
+    assert_eq!(preview["next"].as_array().unwrap().len(), 3);
+
+    let out = std::env::temp_dir().join(format!("fl-deliver-{}.md", uuid::Uuid::new_v4()));
+    let job = daemon
+        .handle(Request::AddJob {
+            prompt: "say hi".into(),
+            session_id: None,
+            cron: Some("every 2 hours".into()),
+            at: None,
+            overlap: None,
+            deliver: Some(serde_json::json!({"file": out.display().to_string()})),
+        })
+        .await
+        .unwrap();
+    assert_eq!(job["cron"], "0 */2 * * *");
+    assert_eq!(job["overlap"], "skip");
+    assert!(job["warning"]
+        .as_str()
+        .unwrap()
+        .contains("keep_alive_for_jobs"));
+    let id = job["id"].as_str().unwrap().to_string();
+
+    // Run now: a firing in the history; the schedule is unchanged.
+    let before = store.get_job(&id).unwrap().unwrap().next_run;
+    let r = daemon
+        .handle(Request::RunJobNow { id: id.clone() })
+        .await
+        .unwrap();
+    assert!(r["status"].as_str().unwrap().starts_with("started"), "{r}");
+    assert_eq!(store.get_job(&id).unwrap().unwrap().next_run, before);
+    // Firing again while it still runs is skipped (overlap = skip).
+    let again = daemon
+        .handle(Request::RunJobNow { id: id.clone() })
+        .await
+        .unwrap();
+    assert!(
+        again["status"].as_str().unwrap().starts_with("skipped"),
+        "{again}"
+    );
+    // The Run fails (no provider): the history gets its outcome, and the
+    // answer-less result is still delivered to the file.
+    for _ in 0..600 {
+        let runs = store.job_runs(&id, 10).unwrap();
+        if runs.iter().any(|r| {
+            r.status != "running" && r.status != "skipped" && r.detail.contains("appended")
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let runs = store.job_runs(&id, 10).unwrap();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs.iter().any(|r| r.status == "skipped"));
+    let fired = runs.iter().find(|r| r.status != "skipped").unwrap();
+    assert_eq!(fired.trigger, "manual");
+    assert_ne!(fired.status, "running", "{fired:?}");
+    assert!(fired.detail.contains("appended"), "{fired:?}");
+    assert!(std::fs::read_to_string(&out).unwrap().contains("say hi"));
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn missed_firings_are_counted() {
+    let due = local(2026, 10, 21, 3, 0);
+    let now = local(2026, 10, 21, 9, 30);
+    assert_eq!(formless_core::jobs::missed_since("0 * * * *", due, now), 6);
+    assert_eq!(formless_core::jobs::missed_since("0 3 * * *", due, now), 0);
+}

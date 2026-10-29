@@ -344,7 +344,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 47;
+pub const SCHEMA_VERSION: i64 = 49;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -429,7 +429,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 47] = [
+const MIGRATIONS: [(i64, MigrationStep); 49] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -601,6 +601,29 @@ const MIGRATIONS: [(i64, MigrationStep); 47] = [
             "CREATE TABLE IF NOT EXISTS denials (
                capability TEXT PRIMARY KEY, tool_name TEXT NOT NULL,
                denied_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);",
+        )?)
+    }),
+    // Jobs: overlap policy, delivery targets and a run history (SPEC §9.7).
+    (48, |c| {
+        add_column(c, "jobs", "overlap TEXT NOT NULL DEFAULT 'skip'")?;
+        add_column(c, "jobs", "deliver TEXT")?;
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS job_runs (
+               id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+               session_id TEXT, trigger TEXT NOT NULL, status TEXT NOT NULL,
+               detail TEXT NOT NULL DEFAULT '', cost REAL,
+               started_at TEXT NOT NULL, finished_at TEXT);
+             CREATE INDEX IF NOT EXISTS idx_job_runs ON job_runs(job_id, started_at);",
+        )?)
+    }),
+    // Why a skill was retired; which memories a Run's prompt carried
+    // (SPEC §7.10, §7.11).
+    (49, |c| {
+        add_column(c, "skills", "retire_reason TEXT")?;
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_memories (
+               run_id TEXT NOT NULL, memory_id TEXT NOT NULL,
+               PRIMARY KEY (run_id, memory_id));",
         )?)
     }),
 ];
@@ -1533,7 +1556,99 @@ impl Store {
             approved: r.get::<_, i64>("approved")? != 0,
             author: r.get("author")?,
             created_at: r.get("created_at")?,
+            overlap: r.get("overlap")?,
+            deliver: r
+                .get::<_, Option<String>>("deliver")?
+                .and_then(|d| serde_json::from_str(&d).ok()),
         })
+    }
+
+    /// A job's overlap policy and delivery target (SPEC §9.7).
+    pub fn set_job_options(
+        &self,
+        id: &str,
+        overlap: Option<&str>,
+        deliver: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        if let Some(o) = overlap {
+            self.ex("UPDATE jobs SET overlap=?2 WHERE id=?1", params![id, o])?;
+        }
+        if let Some(d) = deliver {
+            // `{}` (or null) clears it.
+            let empty = d.is_null() || d.as_object().is_some_and(|o| o.is_empty());
+            let d = (!empty).then(|| d.to_string());
+            self.ex("UPDATE jobs SET deliver=?2 WHERE id=?1", params![id, d])?;
+        }
+        Ok(())
+    }
+
+    /// Start a row of a job's history; returns its id.
+    pub fn job_run_start(
+        &self,
+        job_id: &str,
+        session_id: Option<&str>,
+        trigger: &str,
+        status: &str,
+        detail: &str,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let finished = (status != "running").then(now);
+        self.ex(
+            "INSERT INTO job_runs(id,job_id,session_id,trigger,status,detail,started_at,finished_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, job_id, session_id, trigger, status, detail, now(), finished],
+        )?;
+        Ok(id)
+    }
+
+    pub fn job_run_finish(
+        &self,
+        id: &str,
+        status: &str,
+        detail: &str,
+        cost: Option<f64>,
+    ) -> Result<()> {
+        self.ex(
+            "UPDATE job_runs SET status=?2, detail=CASE WHEN ?3='' THEN detail ELSE ?3 END, cost=?4, finished_at=?5 WHERE id=?1",
+            params![id, status, detail, cost, now()],
+        )?;
+        Ok(())
+    }
+
+    /// A job's latest runs, newest first.
+    pub fn job_runs(
+        &self,
+        job_id: &str,
+        limit: usize,
+    ) -> Result<Vec<formless_protocol::JobRunInfo>> {
+        let mut stmt = self.ps(
+            "SELECT id, job_id, session_id, trigger, status, detail, cost, started_at, finished_at
+             FROM job_runs WHERE job_id=?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![job_id, limit as i64], |r| {
+                Ok(formless_protocol::JobRunInfo {
+                    id: r.get(0)?,
+                    job_id: r.get(1)?,
+                    session_id: r.get(2)?,
+                    trigger: r.get(3)?,
+                    status: r.get(4)?,
+                    detail: r.get(5)?,
+                    cost: r.get(6)?,
+                    started_at: r.get(7)?,
+                    finished_at: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// How many messages wait in a Session's queue.
+    pub fn queued_count(&self, session_id: &str) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM queued_messages WHERE session_id=?1",
+            params![session_id],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
     }
 
     pub fn create_job(
@@ -1602,6 +1717,15 @@ impl Store {
             "UPDATE jobs SET last_run=?2, last_status=?3, next_run=?4,
                enabled=CASE WHEN ?4 IS NULL THEN 0 ELSE enabled END WHERE id=?1",
             params![id, now(), status, next_run],
+        )?;
+        Ok(())
+    }
+
+    /// A firing's Run ended: its outcome becomes the job's last status.
+    pub fn job_ran_status(&self, id: &str, status: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET last_status=?2 WHERE id=?1",
+            params![id, status],
         )?;
         Ok(())
     }
@@ -3680,6 +3804,7 @@ impl Store {
             runs_completed: r.get("runs_completed")?,
             created_at: r.get("created_at")?,
             updated_at: r.get("updated_at")?,
+            retire_reason: r.get("retire_reason")?,
         })
     }
 
@@ -3719,7 +3844,8 @@ impl Store {
     /// Enabling also restores a retired skill.
     pub fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
         Ok(self.ex(
-            "UPDATE skills SET enabled=?2, retired=CASE WHEN ?2 THEN 0 ELSE retired END, updated_at=?3 WHERE name=?1",
+            "UPDATE skills SET enabled=?2, retired=CASE WHEN ?2 THEN 0 ELSE retired END,
+               retire_reason=CASE WHEN ?2 THEN NULL ELSE retire_reason END, updated_at=?3 WHERE name=?1",
             params![name, enabled, now()],
         )? > 0)
     }
@@ -3762,9 +3888,17 @@ impl Store {
             let unhelpful =
                 s.runs >= min_runs.max(1) && (s.runs_completed as f64) < min_rate * s.runs as f64;
             if idle || unhelpful {
+                let reason = if unhelpful {
+                    format!(
+                        "unhelpful: {} of {} Runs that loaded it completed",
+                        s.runs_completed, s.runs
+                    )
+                } else {
+                    "unused: not loaded since it was last changed".to_string()
+                };
                 self.ex(
-                    "UPDATE skills SET retired=1, enabled=0, updated_at=?2 WHERE name=?1",
-                    params![s.name, now()],
+                    "UPDATE skills SET retired=1, enabled=0, retire_reason=?3, updated_at=?2 WHERE name=?1",
+                    params![s.name, now(), reason],
                 )?;
                 retired.push(s.name);
             }
@@ -3944,6 +4078,33 @@ impl Store {
             .conn
             .execute("DELETE FROM memories WHERE id=?1", params![id])?
             > 0)
+    }
+
+    /// Which memories a Run's prompt carried.
+    pub fn set_run_memories(&self, run_id: &str, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.ex(
+                "INSERT OR IGNORE INTO run_memories(run_id, memory_id) VALUES(?1,?2)",
+                params![run_id, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn run_memories(&self, run_id: &str) -> Result<Vec<formless_protocol::MemoryInfo>> {
+        Ok(self
+            .list_memories()?
+            .into_iter()
+            .filter(|m| {
+                self.conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM run_memories WHERE run_id=?1 AND memory_id=?2)",
+                        params![run_id, m.id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false)
+            })
+            .collect())
     }
 
     /// Mark the enabled notes as used (a Session's prompt included them).

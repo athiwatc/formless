@@ -552,16 +552,40 @@ enum JobsAction {
         #[arg(long)]
         json: bool,
     },
-    /// Schedule a prompt: --cron "0 3 * * *" (recurring) or --at "in 30m"
+    /// Schedule a prompt: --every "weekday at 9am" or --cron "0 3 * * *"
+    /// (recurring), or --at "in 30m"
     Add {
         prompt: String,
-        #[arg(long)]
+        /// Cron expression, or plain English ("every 2 hours")
+        #[arg(long, visible_alias = "every")]
         cron: Option<String>,
         #[arg(long)]
         at: Option<String>,
         /// Run in this Session (default: a new Session each time)
         #[arg(long)]
         session: Option<String>,
+        /// When the previous firing is still running: skip (default) or queue
+        #[arg(long)]
+        overlap: Option<String>,
+        /// Deliver the answer as a desktop notification
+        #[arg(long)]
+        notify: bool,
+        /// Append the answer to this file
+        #[arg(long)]
+        to_file: Option<String>,
+        /// POST the answer (JSON) to this URL
+        #[arg(long)]
+        webhook: Option<String>,
+    },
+    /// Fire a job now (its schedule is unchanged)
+    Run {
+        id: String,
+    },
+    /// A job's recent firings: time, trigger, outcome, cost, Session
+    History {
+        id: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Enable (and approve) a job
     Enable {
@@ -1799,6 +1823,21 @@ fn formless_pid_alive(pid: u32) -> bool {
 /// The daemon and file checks `--fix` can act on.
 fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     let mut out = Vec::new();
+    // Jobs that will not fire on schedule (SPEC §9.7).
+    if let (Ok(cfg), true) = (Config::load(paths), paths.db_file().exists()) {
+        let active = formless_core::Store::open(&paths.db_file())
+            .and_then(|s| s.has_active_jobs())
+            .unwrap_or(false);
+        if active && !cfg.daemon.keep_alive_for_jobs {
+            out.push(Problem {
+                what:
+                    "scheduled jobs run only while Formless is running (the daemon stops when idle)"
+                        .into(),
+                next: Some("formless config set daemon.keep_alive_for_jobs true".into()),
+                fix: None,
+            });
+        }
+    }
     if let Ok(cfg) = Config::load(paths) {
         for (p, why) in cfg.security.roots_checked().1 {
             out.push(Problem {
@@ -3604,25 +3643,115 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             cron,
             at,
             session,
+            overlap,
+            notify,
+            to_file,
+            webhook,
         } => {
+            let mut deliver = serde_json::Map::new();
+            if notify {
+                deliver.insert("notify".into(), true.into());
+            }
+            if let Some(f) = to_file {
+                let f = std::path::absolute(&f).unwrap_or_else(|_| f.into());
+                deliver.insert("file".into(), f.display().to_string().into());
+            }
+            if let Some(w) = webhook {
+                deliver.insert("webhook".into(), w.into());
+            }
             let j = daemon(Request::AddJob {
                 prompt,
                 session_id: session,
                 cron,
                 at,
+                overlap,
+                deliver: (!deliver.is_empty()).then(|| deliver.into()),
             })?;
             println!(
-                "scheduled {} — next run {}",
+                "scheduled {} ({})",
                 j["id"].as_str().unwrap_or_default(),
-                j["next_run"].as_str().unwrap_or("-")
+                j["cron"].as_str().unwrap_or("once")
             );
+            // The next runs, to check the schedule reads as meant.
+            let next = match j["cron"].as_str() {
+                Some(c) => daemon(Request::PreviewSchedule {
+                    schedule: c.to_string(),
+                })?["next"]
+                    .clone(),
+                None => serde_json::json!([j["next_run"]]),
+            };
+            for t in next.as_array().into_iter().flatten() {
+                println!("  next: {}", t.as_str().unwrap_or("-"));
+            }
+            if let Some(w) = j["warning"].as_str() {
+                eprintln!("warning: {w}");
+            }
+        }
+        JobsAction::Run { id } => {
+            let r = daemon(Request::RunJobNow { id: id.clone() })?;
+            println!("{id}: {}", r["status"].as_str().unwrap_or_default());
+        }
+        JobsAction::History { id, json } => {
+            let runs = daemon(Request::JobRuns {
+                id: id.clone(),
+                limit: None,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&runs)?);
+                return Ok(());
+            }
+            let runs: Vec<formless_protocol::JobRunInfo> = serde_json::from_value(runs)?;
+            if runs.is_empty() {
+                println!("{id} has not run yet");
+            }
+            let mut tbl = Table::new(&[
+                "STARTED", "TRIGGER", "OUTCOME", "TOOK", "COST", "SESSION", "DETAIL",
+            ]);
+            for r in runs {
+                let took = r
+                    .finished_at
+                    .as_deref()
+                    .and_then(|f| {
+                        let a = chrono::DateTime::parse_from_rfc3339(&r.started_at).ok()?;
+                        let b = chrono::DateTime::parse_from_rfc3339(f).ok()?;
+                        Some(format!("{}s", (b - a).num_seconds()))
+                    })
+                    .unwrap_or_else(|| "-".into());
+                tbl.row(vec![
+                    c(r.started_at
+                        .get(..16)
+                        .unwrap_or(&r.started_at)
+                        .replace('T', " ")),
+                    c(r.trigger),
+                    t(
+                        r.status.clone(),
+                        if r.status == "completed" {
+                            Tone::Good
+                        } else if r.status == "running" {
+                            Tone::Plain
+                        } else {
+                            Tone::Warn
+                        },
+                    ),
+                    c(took),
+                    c(r.cost.map_or("-".into(), |c| format!("${c:.3}"))),
+                    c(r.session_id.unwrap_or_default()),
+                    t(r.detail, Tone::Dim),
+                ]);
+            }
+            if !tbl.is_empty() {
+                tbl.print();
+            }
         }
         JobsAction::Enable { id } => {
-            daemon(Request::SetJobEnabled {
+            let r = daemon(Request::SetJobEnabled {
                 id: id.clone(),
                 enabled: true,
             })?;
             println!("enabled {id}");
+            if let Some(w) = r["warning"].as_str() {
+                eprintln!("warning: {w}");
+            }
         }
         JobsAction::Disable { id } => {
             daemon(Request::SetJobEnabled {

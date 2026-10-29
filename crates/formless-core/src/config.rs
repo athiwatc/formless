@@ -22,6 +22,8 @@ pub struct Config {
     pub mcp: McpCfg,
     pub skills: SkillsCfg,
     pub limits: LimitsCfg,
+    /// User memory (SPEC §7.11).
+    pub memory: MemoryCfg,
     /// Trusted folders (SPEC §10.3). Set in config.toml only, never from
     /// a client or by the agent.
     pub security: SecurityCfg,
@@ -166,6 +168,24 @@ fn is_windows_path(p: &str) -> bool {
 /// Absolute on some OS: `/…`, or a Windows drive or UNC path.
 fn is_absolute_any(p: &str) -> bool {
     p.starts_with('/') || is_windows_path(p)
+}
+
+/// User memory (SPEC §7.11).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MemoryCfg {
+    /// Ask before keeping a note the agent writes: "never" (default),
+    /// "sensitive" (personal details: health, money, contacts, places,
+    /// family, beliefs) or "always".
+    pub confirm_writes: String,
+}
+
+impl Default for MemoryCfg {
+    fn default() -> Self {
+        Self {
+            confirm_writes: "never".into(),
+        }
+    }
 }
 
 /// Opt-in spending limits (SPEC §5.2): unset means no limit. Dollar
@@ -375,6 +395,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("provider.tool_mode", &["native", "prompt"]),
     ("provider.cache_key", &["session", "off"]),
     ("provider.cache_control", &["auto", "on", "off"]),
+    ("memory.confirm_writes", &["never", "sensitive", "always"]),
     ("tui.notify", &["off", "bell", "desktop"]),
     ("tui.hyperlinks", &["auto", "on", "off"]),
     ("tui.theme", &["auto", "dark", "light", "high-contrast"]),
@@ -482,6 +503,7 @@ pub const SETTABLE: &[&str] = &[
     "provider.cache_key",
     "provider.cache_control",
     "provider.tool_use_nudge",
+    "memory.confirm_writes",
     "provider.api_style",
     "provider.tool_mode",
     "provider.vision",
