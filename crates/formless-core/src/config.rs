@@ -605,6 +605,8 @@ pub struct DaemonCfg {
     pub keep_alive_for_jobs: bool,
     /// How long a deleted Session can be restored before it is gone.
     pub delete_undo_secs: u64,
+    /// Daily database backups kept in `<data>/backups`; 0 turns them off.
+    pub backups_keep: usize,
 }
 impl Default for DaemonCfg {
     fn default() -> Self {
@@ -616,6 +618,7 @@ impl Default for DaemonCfg {
             start_timeout_secs: 60,
             keep_alive_for_jobs: false,
             delete_undo_secs: 30,
+            backups_keep: 7,
         }
     }
 }
@@ -1181,6 +1184,59 @@ impl NamingCfg {
 }
 
 impl Config {
+    /// The config to carry to another machine (`export-all`, SPEC §15):
+    /// everything, with values that can hold credentials blanked —
+    /// providers' `extra_headers` and auth secrets/tokens, MCP servers'
+    /// `env` values and `headers`. Returns it with the blanked paths.
+    pub fn portable(&self) -> (serde_json::Value, Vec<String>) {
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        let mut blanked = Vec::new();
+        let mut blank_map = |obj: &mut serde_json::Value, at: String| {
+            if let Some(m) = obj.as_object_mut() {
+                for (k, val) in m.iter_mut() {
+                    if val.as_str().is_some_and(|s| !s.is_empty()) {
+                        *val = serde_json::json!("");
+                        blanked.push(format!("{at}.{k}"));
+                    }
+                }
+            }
+        };
+        let provider_secrets = |p: &mut serde_json::Value, at: &str, blank: &mut dyn FnMut(&mut serde_json::Value, String)| {
+            blank(&mut p["extra_headers"], format!("{at}.extra_headers"));
+            if let Some(auth) = p["auth"].as_object_mut() {
+                let mut secret = serde_json::Map::new();
+                for (k, val) in auth.iter_mut() {
+                    let lk = k.to_lowercase();
+                    if lk.contains("secret") || lk.contains("token") || lk.contains("password") {
+                        secret.insert(k.clone(), val.clone());
+                    }
+                }
+                let mut secret = serde_json::Value::Object(secret);
+                blank(&mut secret, format!("{at}.auth"));
+                for (k, val) in secret.as_object().unwrap() {
+                    auth.insert(k.clone(), val.clone());
+                }
+            }
+        };
+        provider_secrets(&mut v["provider"], "provider", &mut blank_map);
+        let names: Vec<String> = v["providers"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        for n in names {
+            provider_secrets(&mut v["providers"][&n], &format!("providers.{n}"), &mut blank_map);
+        }
+        let servers: Vec<String> = v["mcp"]["servers"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        for n in servers {
+            blank_map(&mut v["mcp"]["servers"][&n]["env"], format!("mcp.servers.{n}.env"));
+            blank_map(&mut v["mcp"]["servers"][&n]["headers"], format!("mcp.servers.{n}.headers"));
+        }
+        (v, blanked)
+    }
+
     /// Read-only settings for remote clients (the Web frontend's Settings
     /// view). Mirrors what the TUI shows; deliberately omits
     /// `extra_headers` and every other field that can carry credentials.

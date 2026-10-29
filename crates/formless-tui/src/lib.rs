@@ -137,6 +137,11 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/status`, `/storage`, `/gc [run]`, `/backup` (SPEC §9.6).
+    DaemonStatus,
+    Storage,
+    Gc,
+    Backup,
     /// `/mcp:SERVER:PROMPT`: the rendered prompt is sent as a message.
     SendMcpPrompt,
     McpLog,
@@ -1054,6 +1059,8 @@ struct App {
     plan: Vec<formless_protocol::PlanItem>,
     /// `/mcp import NAME`: the server to add once the candidates arrive.
     mcp_import_pick: Option<String>,
+    /// The daemon connection was lost: (since, last reconnect attempt).
+    offline: Option<(Instant, Instant)>,
     should_quit: bool,
     /// Rendered Markdown of settled messages, keyed by content and width.
     /// Rendered settled messages by (id, content length, width).
@@ -1267,6 +1274,7 @@ impl App {
             recap_open: false,
             plan: Vec::new(),
             mcp_import_pick: None,
+            offline: None,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -1324,6 +1332,51 @@ impl App {
         }
     }
 
+    /// The daemon went away (restart, crash): keep everything on screen,
+    /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
+    fn daemon_lost(&mut self) {
+        self.client = None;
+        self.inbox = None;
+        self.pending.clear();
+        self.activity = None;
+        self.running_sessions.clear();
+        let now = Instant::now();
+        self.offline = Some((now, now));
+        self.notes.push("lost the daemon; reconnecting…".into());
+    }
+
+    /// While offline: reconnect every 2 s, starting the daemon after 6 s
+    /// without one. The draft, scroll position and Session stay as they
+    /// were; the Session reloads once connected.
+    fn try_reconnect(&mut self) {
+        let Some((since, last)) = self.offline else {
+            return;
+        };
+        if last.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.offline = Some((since, Instant::now()));
+        let start = since.elapsed() >= Duration::from_secs(6);
+        let connected = if start {
+            ensure_daemon(&self.paths).and_then(|()| DaemonClient::connect(&self.paths))
+        } else {
+            DaemonClient::connect(&self.paths)
+        };
+        if let Ok((client, inbox)) = connected {
+            self.client = Some(client);
+            self.inbox = Some(inbox);
+            self.offline = None;
+            self.request(Pending::ListSessions, Request::ListSessions);
+            if let Some(id) = self.current.clone() {
+                self.switch_session(id);
+            }
+            self.notes.push(format!(
+                "reconnected to the daemon after {}",
+                format_elapsed(since.elapsed())
+            ));
+        }
+    }
+
     fn request(&mut self, kind: Pending, req: Request) {
         if let Some(c) = &self.client {
             let id = c.send(req);
@@ -1341,10 +1394,22 @@ impl App {
             return;
         };
         let mut msgs = Vec::new();
-        while let Ok(msg) = inbox.try_recv() {
-            msgs.push(msg);
+        let mut lost = false;
+        loop {
+            match inbox.try_recv() {
+                Ok(msg) => msgs.push(msg),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    lost = true;
+                    break;
+                }
+            }
         }
-        self.inbox = Some(inbox);
+        if lost {
+            self.daemon_lost();
+        } else {
+            self.inbox = Some(inbox);
+        }
         for msg in msgs {
             match msg {
                 ServerMessage::Response {
@@ -2330,6 +2395,35 @@ impl App {
                                 self.submit_chat(false);
                             }
                         }
+                        Pending::DaemonStatus => {
+                            self.pager = Some(Pager {
+                                title: "Daemon".into(),
+                                lines: status_lines(&result),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::Storage | Pending::Gc => {
+                            let gc = matches!(kind, Pending::Gc);
+                            let title = match (gc, result["dry_run"].as_bool()) {
+                                (false, _) => "Storage".to_string(),
+                                (true, Some(true)) => "Clean-up (dry run)".into(),
+                                _ => "Clean-up done".into(),
+                            };
+                            self.pager = Some(Pager {
+                                title,
+                                lines: storage_lines(&result, gc),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::Backup => self.notes.push(format!(
+                            "backed up the database to {} ({})",
+                            result["file"].as_str().unwrap_or_default(),
+                            formless_core::housekeeping::human_bytes(result["bytes"].as_u64().unwrap_or(0))
+                        )),
                         Pending::McpLog => {
                             let lines: Vec<String> = result["lines"]
                                 .as_array()
@@ -3501,6 +3595,12 @@ impl App {
     }
 
     fn submit_chat(&mut self, queued: bool) {
+        if self.offline.is_some() && !self.input.expanded().trim_start().starts_with('/') {
+            // Nothing can be sent: keep the draft until the daemon is back.
+            self.notes
+                .push("not connected to the daemon yet; your message is kept".into());
+            return;
+        }
         let text = self.input.take();
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -4839,6 +4939,14 @@ impl App {
                 }
             }
             "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
+            "status" => self.request(Pending::DaemonStatus, Request::Status),
+            "storage" => self.request(Pending::Storage, Request::StorageUsage),
+            "gc" => self.request(Pending::Gc, Request::Gc { dry_run: true }),
+            "gc run" => self.request(Pending::Gc, Request::Gc { dry_run: false }),
+            cmd if cmd.starts_with("gc ") => self
+                .notes
+                .push("usage: /gc shows what clean-up would free; /gc run frees it".into()),
+            "backup" => self.request(Pending::Backup, Request::Backup),
             cmd if cmd.starts_with("mcp add ") => {
                 let mut words = cmd["mcp add ".len()..].split_whitespace();
                 let id = words.next().unwrap_or_default().to_string();
@@ -7916,7 +8024,12 @@ fn input_height(app: &App, width: u16) -> u16 {
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let sep = || Span::styled(" │ ", ui::dim(app.color));
     let mut left: Vec<Span> = vec![Span::raw(" ")];
-    if let Some(activity) = app.activity_text() {
+    if let Some((since, _)) = app.offline {
+        left.push(Span::styled(
+            format!("⚠ reconnecting to the daemon… ({})", format_elapsed(since.elapsed())),
+            bold_fg(app.color, Color::Red),
+        ));
+    } else if let Some(activity) = app.activity_text() {
         left.push(Span::styled(activity, bold_fg(app.color, Color::Yellow)));
     } else if app.running() {
         left.push(Span::styled("● running", bold_fg(app.color, Color::Yellow)));
@@ -8450,6 +8563,69 @@ fn files_pager_lines(files: &[formless_protocol::RunFileInfo]) -> Vec<String> {
         out.push(String::new());
     }
     out.push("/rewind PATH reverts one file, /rewind all of them.".into());
+    out
+}
+
+/// The `/status` pager: the daemon and what it is using (SPEC §9.3).
+fn status_lines(v: &serde_json::Value) -> Vec<String> {
+    use formless_core::housekeeping::human_bytes;
+    let r = &v["resources"];
+    let b = |k: &str| human_bytes(r[k].as_u64().unwrap_or(0));
+    let mut out = vec![format!(
+        "pid {} · version {} · protocol {}",
+        v["pid"],
+        v["version"].as_str().unwrap_or_default(),
+        v["protocol"]
+    )];
+    if let Some(up) = r["uptime_secs"].as_u64() {
+        out.push(format!("uptime      {}", format_elapsed(Duration::from_secs(up))));
+    }
+    if r["memory_bytes"].is_u64() {
+        out.push(format!(
+            "memory      {} · cpu {}% (total {})",
+            b("memory_bytes"),
+            r["cpu_percent"].as_f64().map_or("?".into(), |c| format!("{c:.1}")),
+            r["cpu_time"].as_str().unwrap_or("?")
+        ));
+    }
+    out.push(format!("database    {} · artifacts {}", b("db_bytes"), b("artifacts_bytes")));
+    out.push(format!(
+        "work        {} Sessions · {} running Runs · {} pending Invocations",
+        v["sessions"],
+        v["running_sessions"].as_array().map_or(0, Vec::len),
+        r["running_invocations"]
+    ));
+    out.push(String::new());
+    out.push("/storage shows disk use; /gc frees space.".into());
+    out
+}
+
+/// The `/storage` and `/gc` pagers: one line per kind.
+fn storage_lines(v: &serde_json::Value, gc: bool) -> Vec<String> {
+    use formless_core::housekeeping::human_bytes;
+    let mut out: Vec<String> = v["kinds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|k| {
+            let inside = k["inside_db"] == true;
+            let items = if gc { format!("{:>5} items  ", k["items"]) } else { String::new() };
+            format!(
+                "{}{:<22} {items}{:>10}  {}",
+                if inside { "  " } else { "" },
+                k["kind"].as_str().unwrap_or_default(),
+                human_bytes(k["bytes"].as_u64().unwrap_or(0)),
+                k["detail"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    out.push(String::new());
+    let total = human_bytes(v["total_bytes"].as_u64().unwrap_or(0));
+    out.push(match (gc, v["dry_run"].as_bool()) {
+        (false, _) => format!("total {total} · /gc shows what clean-up would free"),
+        (true, Some(true)) => format!("would free about {total} · /gc run does it"),
+        _ => format!("freed about {total}"),
+    });
     out
 }
 
@@ -12845,6 +13021,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         while !app.should_quit {
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
+            app.try_reconnect();
             app.wizard_poll();
             if std::mem::take(&mut app.force_redraw) {
                 terminal.clear()?;
@@ -13160,6 +13337,7 @@ mod tests {
             recap_open: false,
             plan: Vec::new(),
             mcp_import_pick: None,
+            offline: None,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -13339,6 +13517,20 @@ mod tests {
         );
         let done = vec![item("Read", "completed")];
         assert_eq!(text(plan_lines(&done, false, 80, false)), ["", "  ✓ Plan done (1/1)"]);
+    }
+
+    #[test]
+    fn a_lost_daemon_keeps_the_draft_and_shows_reconnecting() {
+        let mut app = test_app();
+        let (tx, rx) = std::sync::mpsc::channel::<ServerMessage>();
+        app.inbox = Some(rx);
+        drop(tx);
+        app.input.set("half-typed message");
+        app.drain_daemon();
+        assert!(app.offline.is_some() && app.inbox.is_none());
+        app.submit_chat(false);
+        assert_eq!(app.input.expanded(), "half-typed message", "kept while offline");
+        assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
     }
 
     #[test]

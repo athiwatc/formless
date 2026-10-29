@@ -1256,6 +1256,29 @@ pub enum Request {
     RestartMcpServer {
         name: String,
     },
+    /// Everything for a new machine as one `formless.all/1` bundle (SPEC
+    /// §15): Tools, modules, Skills, memories, jobs, and the config with
+    /// credentials blanked; Sessions too when `sessions`.
+    ExportAll {
+        #[serde(default)]
+        sessions: bool,
+    },
+    /// Load a `formless.all/1` bundle. Tools and Skills import as usual
+    /// (renamed on collision; Skills disabled for review), memories and
+    /// modules are added, jobs come in paused, and providers, Roles and MCP
+    /// servers this machine lacks are added (blanked secrets to fill in).
+    ImportAll {
+        bundle: serde_json::Value,
+    },
+    /// Disk use by kind (SPEC §9.6).
+    StorageUsage,
+    /// What clean-up frees (`dry_run`) or freed.
+    Gc {
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// Take a database backup now (rotated like the daily one).
+    Backup,
     /// Prompts offered by the configured MCP servers.
     ListMcpPrompts,
     /// The last `lines` (default 50) of a stdio server's stderr log.

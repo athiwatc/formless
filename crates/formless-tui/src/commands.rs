@@ -434,6 +434,15 @@ pub const COMMANDS: &[Command] = &[
     cmd("jobs enable", "ID", "enable (approve) a job", Integrations),
     cmd("jobs disable", "ID", "pause a job", Integrations),
     cmd("jobs rm", "ID", "delete a job", Integrations),
+    cmd(
+        "status",
+        "",
+        "the daemon: memory, CPU, database, running work",
+        App,
+    ),
+    cmd("storage", "", "disk used by Sessions, artifacts, logs, backups", App),
+    cmd("gc", "[run]", "what clean-up would free; `run` frees it", App),
+    cmd("backup", "", "back up the database now", App),
     cmd("notes", "", "every note so far, in the pager", App),
     cmd(
         "help",

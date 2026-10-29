@@ -1765,6 +1765,27 @@ such as `read_file`, `read_text_file` and `file_read`.
   exited points to `formless daemon start` and `formless doctor`. A missing
   socket names the profile, since each profile has its own daemon
   (`--profile`).
+- **Start at login.** `formless daemon install-service` writes a launchd
+  agent (`~/Library/LaunchAgents/xyz.athiwat.formless.plist`), a systemd
+  user unit (`~/.config/systemd/user/formless.service`) or a Windows
+  logon task (running `<data>/formless-service.cmd`) for this profile
+  (`formless-<profile>` for others) and loads it; `--dry-run` prints the
+  file and commands. The service runs `formless daemon serve --stay`,
+  which never stops for being idle, so scheduled jobs (§9.7) fire on
+  time. `uninstall-service` unloads and removes it; `formless doctor`
+  shows whether it is installed, and the jobs warning suggests it.
+- **Reconnecting.** When the daemon goes away (restart, crash), the TUI
+  keeps the screen, Session, draft and scroll position, shows "⚠
+  reconnecting to the daemon… (Ns)" in the status bar, and tries again
+  every 2 s, starting a daemon itself after 6 s. Enter keeps the typed
+  message instead of sending it into nothing. Once connected it reloads
+  the Session and notes how long it was away. The web already reconnects
+  on its own.
+- **Resource use.** `Status.resources` has the daemon's memory (RSS),
+  CPU % and CPU time (from `ps`; absent on Windows), the database and
+  artifact sizes, pending Invocations and uptime. `formless daemon status`
+  prints them (`--json` for everything), the TUI's `/status` and the web's
+  `/status` show them.
 
 ### 9.2 Concurrency
 
@@ -1884,6 +1905,25 @@ such as `read_file`, `read_text_file` and `file_read`.
   `artifacts.max_age_days` (30) are removed, then the oldest beyond
   `artifacts.max_total_mb` (1024), at daemon start and hourly or on
   `formless gc`; deleting a Session deletes its artifact files.
+- **Disk use.** `StorageUsage` (`formless storage [--json]`, TUI
+  `/storage`, web Settings → Storage → Disk use) lists the database (and
+  roughly what fills it: messages, Invocation logs, Tool versions, file
+  snapshots), artifacts, daemon and MCP logs, skills and backups, with the
+  data folder's total.
+- **Clean-up.** `Gc {dry_run}` (`formless gc [--dry-run]`, TUI `/gc` then
+  `/gc run`, web Clean up… which shows the dry run before "Free"):
+  artifacts past their retention, `/rewind` snapshots older than 30
+  days, MCP logs cut to their last 1 MB, all but the two newest
+  pre-migration copies, and the database's free pages (VACUUM). Each row
+  says how many items and bytes; a real run is audit-logged.
+- **Backups.** The daemon copies the database (`VACUUM INTO`, consistent
+  under WAL) to `<data>/backups/formless-<UTC time>.db` when the newest is
+  a day old (checked hourly), keeping `daemon.backups_keep` (7; 0 = none).
+  `formless backup` / `Backup` / TUI `/backup` take one now. `formless
+  restore FILE` (daemon stopped) checks the file (SQLite, integrity
+  check, has Formless tables, schema not newer than this build), saves
+  the current database as `backups/before-restore-<time>.db`, copies it
+  in and migrates it. `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no
   filesystem path, because transcripts also reach remote web clients.
@@ -3101,6 +3141,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
 | `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
+| `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
 | `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |
@@ -3243,6 +3284,20 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
   Recorded payloads never leave the data dir except redacted, to the user's
   own endpoint, for optimisation.
+- **Moving to a new machine.** `formless export-all [--sessions] [-o
+  FILE]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600):
+  every active registry Tool (MCP tools come back with their server), the
+  shared modules, Skills, memories, recurring jobs and the config
+  (providers, Roles, MCP servers, settings) with every value that can
+  hold a credential blanked and listed in `blanked` (providers'
+  `extra_headers` and auth secrets/tokens, MCP `env` values and
+  `headers`); API keys never leave the keychain. `--sessions` adds every
+  Session's transcript. `formless import-all FILE` (`ImportAll`) only
+  adds: providers, Roles and MCP servers this machine lacks; modules
+  before Tools; Tools as imports (renamed on collision, §7.8); Skills
+  disabled for review; memories (duplicates skipped); jobs paused; and
+  Sessions as new ones. It reports counts, the values to fill in and
+  anything that failed.
 - **Deletion:** Session delete removes transcripts + Invocation payloads but
   keeps anonymised per-Tool tallies (payloads gone, counts stay). Tool purge
   removes everything incl. tallies. **Full reset** (Settings or

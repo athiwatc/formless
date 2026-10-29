@@ -2667,6 +2667,12 @@
         h("button", { class: "btn small", type: "button", onclick: () => addMcpServer() }, "Add MCP server"),
         h("button", { class: "btn small", type: "button", onclick: () => showMcpCatalog() }, "Catalog…"),
         h("button", { class: "btn small", type: "button", onclick: () => showMcpImport() }, "Import…"))));
+    grid.append(h("section", null, h("h3", null, "Storage"),
+      h("p", { class: "muted" }, "Disk used by Sessions, artifacts, Tool versions, logs and backups; clean-up shows what it frees before doing it."),
+      h("div", { class: "detail-actions" },
+        h("button", { class: "btn small", type: "button", onclick: () => showStorage() }, "Disk use"),
+        h("button", { class: "btn small", type: "button", onclick: () => showGc() }, "Clean up…"),
+        h("button", { class: "btn small", type: "button", onclick: () => act({ type: "backup" }).then((r) => r && note("backed up to " + r.file + " (" + humanBytes(r.bytes) + ")")) }, "Back up now"))));
     const skills = S.skills || [];
     grid.append(h("section", null, h("h3", null, "Skills"),
       skills.length ? h("table", { class: "table" },
@@ -2993,6 +2999,50 @@
     }
     return out;
   }
+  function humanBytes(b) {
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let v = b || 0, i = 0;
+    while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+    return i ? v.toFixed(1) + " " + u[i] : v + " B";
+  }
+  function kindsTable(r, gc) {
+    return h("table", { class: "table" }, h("tbody", null, (r.kinds || []).map((k) => h("tr", { class: k.inside_db ? "muted" : "" },
+      h("td", null, (k.inside_db ? "↳ " : "") + k.kind), gc ? h("td", { class: "num" }, String(k.items)) : null,
+      h("td", { class: "num" }, humanBytes(k.bytes)), h("td", { class: "muted" }, k.detail)))));
+  }
+  // Disk use by kind (SPEC §9.6).
+  async function showStorage() {
+    const r = await act({ type: "storage_usage" });
+    if (r) modal("Disk use", h("div", null, kindsTable(r, false), h("p", { class: "muted" }, "Total " + humanBytes(r.total_bytes) + " in " + r.data_dir + (r.last_backup ? " · last backup " + r.last_backup : ""))));
+  }
+  // Clean-up: the dry run first, then free it on request.
+  async function showGc() {
+    const r = await act({ type: "gc", dry_run: true });
+    if (!r) return;
+    let close = null;
+    const run = h("button", { class: "btn small danger", type: "button", onclick: async () => {
+      const done = await act({ type: "gc", dry_run: false }, null, 300000);
+      if (!done) return;
+      if (close) close();
+      note("freed about " + humanBytes(done.total_bytes));
+    } }, "Free " + humanBytes(r.total_bytes));
+    close = modal("Clean up", h("div", null, kindsTable(r, true), h("div", { class: "detail-actions" }, run)));
+  }
+  // The daemon and what it is using (SPEC §9.3).
+  async function showStatus() {
+    const v = await act({ type: "status" });
+    if (!v) return;
+    const r = v.resources || {};
+    const rows = [
+      ["daemon", "pid " + v.pid + " · " + v.version],
+      ["uptime", r.uptime_secs != null ? Math.floor(r.uptime_secs / 60) + " min" : "?"],
+      ["memory", r.memory_bytes != null ? humanBytes(r.memory_bytes) + " · cpu " + (r.cpu_percent != null ? r.cpu_percent.toFixed(1) : "?") + "%" : "n/a"],
+      ["database", humanBytes(r.db_bytes) + " · artifacts " + humanBytes(r.artifacts_bytes)],
+      ["work", v.sessions + " Sessions · " + (v.running_sessions || []).length + " running Runs · " + r.running_invocations + " pending Invocations"],
+    ];
+    modal("Daemon", h("table", { class: "table" }, h("tbody", null, rows.map(([k, val]) => h("tr", null, h("td", null, k), h("td", null, val))))));
+  }
+
   // A modal with a title, body and Close (Esc closes it).
   function modal(title, body) {
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
@@ -3663,6 +3713,9 @@
       if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
     } },
     { name: "retry", args: "[--model MODEL]", group: "Run control", desc: "re-run your last message, optionally on another model (the old answer stays in a fork)", run: (arg) => retryRun((arg || "").replace(/^--model\s*/, "").trim()) },
+    { name: "status", group: "Settings", desc: "the daemon: memory, CPU, database, running work", run: () => showStatus() },
+    { name: "storage", group: "Settings", desc: "disk used by Sessions, artifacts, logs, backups", run: () => showStorage() },
+    { name: "gc", group: "Settings", desc: "clean up: shows what it frees first", run: () => showGc() },
     { name: "files", group: "Run control", desc: "the files the last Run changed, with diffs", run: () => showRunFiles() },
     { name: "rewind", args: "[PATH]", group: "Run control", desc: "put the last Run's file changes back (one file, or all)", run: async (arg) => {
       const path = (arg || "").trim();

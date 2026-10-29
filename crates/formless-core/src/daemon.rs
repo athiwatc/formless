@@ -284,6 +284,8 @@ pub struct Daemon {
     /// unchanged, so this is how a client tells that the daemon is running
     /// code that is no longer on disk (SPEC §9.3).
     build: String,
+    /// When this daemon started (for `uptime_secs`).
+    started: std::time::Instant,
 }
 
 impl Daemon {
@@ -363,6 +365,7 @@ impl Daemon {
             model_windows: StdMutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             build: build_id(),
+            started: std::time::Instant::now(),
         })
     }
 
@@ -557,7 +560,23 @@ impl Daemon {
                 let on_disk = build_id();
                 let stale = !on_disk.is_empty() && on_disk != self.build;
                 let secure = self.config().map(|c| c.security.secure).unwrap_or(false);
+                // Why the machine might be busy (SPEC §9.3).
+                let mut resources = crate::housekeeping::process_usage(std::process::id());
+                resources["db_bytes"] = json!(crate::housekeeping::db_bytes(&self.paths));
+                resources["artifacts_bytes"] = json!(self
+                    .with_reader(|st| crate::artifacts::usage(st))
+                    .map(|(_, b)| b)
+                    .unwrap_or(0));
+                resources["running_invocations"] = json!(self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|e| e.result.lock().unwrap().is_none())
+                    .count());
+                resources["uptime_secs"] = json!(self.started.elapsed().as_secs());
                 Ok(json!({
+                    "resources": resources,
                     "protocol": PROTOCOL_VERSION,
                     "version": env!("CARGO_PKG_VERSION"),
                     "build": self.build,
@@ -1945,6 +1964,26 @@ impl Daemon {
                 self.broadcast(Event::SkillsChanged);
                 Ok(serde_json::to_value(imported)?)
             }
+            Request::StorageUsage => {
+                let mut u = self.with_reader(|st| crate::housekeeping::usage(&self.paths, st))?;
+                u["last_backup"] = json!(crate::housekeeping::last_backup(&self.paths).map(|(f, _)| f.display().to_string()));
+                Ok(u)
+            }
+            Request::Gc { dry_run } => {
+                let cfg = self.config()?;
+                let r = self.with_store(|st| crate::housekeeping::gc(&self.paths, st, &cfg, dry_run))?;
+                if !dry_run {
+                    let _ = self.with_store(|st| {
+                        st.audit("user", "gc", &format!("{} bytes", r["total_bytes"]))
+                    });
+                }
+                Ok(r)
+            }
+            Request::Backup => {
+                let keep = self.config()?.daemon.backups_keep.max(1);
+                let f = self.with_store(|st| crate::housekeeping::backup(&self.paths, st, keep))?;
+                Ok(json!({"file": f.display().to_string(), "bytes": crate::housekeeping::path_bytes(&f)}))
+            }
             Request::ListMcpPrompts => {
                 let cfg = self.config()?;
                 let mut out = Vec::new();
@@ -2591,59 +2630,13 @@ impl Daemon {
                     };
                     return Ok(json!({ "name": s.name, "format": format, "content": content }));
                 }
-                let bundle = self.with_reader(|st| {
-                    let s = st.get_session(&id)?.context("session not found")?;
-                    let msgs = st.list_messages(&id)?;
-                    let cps = st.list_checkpoints(&id)?;
-                    Ok(json!({
-                        "format": "formless.session/1",
-                        "name": s.name, "model": s.model, "reasoning_effort": s.reasoning_effort,
-                        "messages": msgs.iter().map(|m| json!({"role": m.role, "content": m.content, "meta": m.meta})).collect::<Vec<_>>(),
-                        "checkpoints": cps.iter().map(|(s2, u)| json!({"summary": s2, "up_to_seq": u})).collect::<Vec<_>>(),
-                    }))
-                })?;
-                Ok(bundle)
+                self.session_bundle(&id)
             }
-            Request::ImportSession { bundle } => {
-                if bundle["format"].as_str() != Some("formless.session/1") {
-                    return Err(anyhow!("unsupported session bundle format"));
-                }
-                let messages: Vec<(String, String, Option<String>)> = bundle["messages"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|m| {
-                        (
-                            m["role"].as_str().unwrap_or("user").to_string(),
-                            m["content"].as_str().unwrap_or_default().to_string(),
-                            m["meta"].as_str().map(str::to_string),
-                        )
-                    })
-                    .collect();
-                let checkpoints: Vec<(String, i64)> = bundle["checkpoints"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|c| {
-                        (
-                            c["summary"].as_str().unwrap_or_default().to_string(),
-                            c["up_to_seq"].as_i64().unwrap_or(0),
-                        )
-                    })
-                    .collect();
-                let s = self.with_store(|st| {
-                    st.import_session(
-                        bundle["name"].as_str().unwrap_or("Imported"),
-                        bundle["model"].as_str().map(str::to_string),
-                        bundle["reasoning_effort"].as_str().map(str::to_string),
-                        &messages,
-                        &checkpoints,
-                    )
-                })?;
-                Ok(serde_json::to_value(s)?)
-            }
+            Request::ImportSession { bundle } => Ok(serde_json::to_value(
+                self.import_session_bundle(&bundle)?,
+            )?),
+            Request::ExportAll { sessions } => self.export_all(sessions),
+            Request::ImportAll { bundle } => self.import_all(&bundle).await,
             Request::RunOptimiser { tool_id } => {
                 let this = self.clone();
                 tokio::spawn(async move {
@@ -5010,6 +5003,247 @@ impl Daemon {
         Ok(info)
     }
 
+    /// A Session as a `formless.session/1` bundle.
+    fn session_bundle(&self, id: &str) -> Result<Value> {
+        self.with_reader(|st| {
+            let s = st.get_session(id)?.context("session not found")?;
+            let msgs = st.list_messages(id)?;
+            let cps = st.list_checkpoints(id)?;
+            Ok(json!({
+                "format": "formless.session/1",
+                "name": s.name, "model": s.model, "reasoning_effort": s.reasoning_effort,
+                "messages": msgs.iter().map(|m| json!({"role": m.role, "content": m.content, "meta": m.meta})).collect::<Vec<_>>(),
+                "checkpoints": cps.iter().map(|(s2, u)| json!({"summary": s2, "up_to_seq": u})).collect::<Vec<_>>(),
+            }))
+        })
+    }
+
+    /// Load a `formless.session/1` bundle as a new Session.
+    fn import_session_bundle(&self, bundle: &Value) -> Result<SessionInfo> {
+        if bundle["format"].as_str() != Some("formless.session/1") {
+            return Err(anyhow!("unsupported session bundle format"));
+        }
+        let messages: Vec<(String, String, Option<String>)> = bundle["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or("user").to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                    m["meta"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        let checkpoints: Vec<(String, i64)> = bundle["checkpoints"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| {
+                (
+                    c["summary"].as_str().unwrap_or_default().to_string(),
+                    c["up_to_seq"].as_i64().unwrap_or(0),
+                )
+            })
+            .collect();
+        let s = self.with_store(|st| {
+            st.import_session(
+                bundle["name"].as_str().unwrap_or("Imported"),
+                bundle["model"].as_str().map(str::to_string),
+                bundle["reasoning_effort"].as_str().map(str::to_string),
+                &messages,
+                &checkpoints,
+            )
+        })?;
+        Ok(s)
+    }
+
+    /// `ExportAll` (SPEC §15): one bundle for a new machine.
+    fn export_all(&self, sessions: bool) -> Result<Value> {
+        let mut tools = Vec::new();
+        for info in self.with_store(|st| st.list_tools(false))? {
+            // MCP tools come back with their server.
+            if info.name.to_lowercase().starts_with(crate::mcp::PREFIX) {
+                continue;
+            }
+            if let Some(b) = self.export_tool_bundle(&info.id)? {
+                tools.push(b);
+            }
+        }
+        let modules = self.with_reader(|st| {
+            st.list_modules()?
+                .into_iter()
+                .filter(|m| !m.retired)
+                .filter_map(|m| st.get_module_by_name(&m.name).transpose())
+                .map(|r| r.map(|(m, code)| json!({"name": m.name, "description": m.description, "code": code})))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let skills = self.with_reader(|st| {
+            st.list_skills()?
+                .iter()
+                .map(|s| crate::skills::export(st, &s.name))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let memories: Vec<Value> = self
+            .with_reader(|st| st.list_memories())?
+            .into_iter()
+            .map(|m| json!({"text": m.text, "scope": m.scope, "enabled": m.enabled}))
+            .collect();
+        let jobs: Vec<Value> = self
+            .with_reader(|st| st.list_jobs())?
+            .into_iter()
+            .filter(|j| j.cron.is_some())
+            .map(|j| json!({"prompt": j.prompt, "cron": j.cron, "overlap": j.overlap, "deliver": j.deliver, "enabled": j.enabled}))
+            .collect();
+        let (config, blanked) = self.config()?.portable();
+        let mut out = json!({
+            "format": "formless.all/1",
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "tools": tools,
+            "modules": modules,
+            "skills": skills,
+            "memories": memories,
+            "jobs": jobs,
+            "config": config,
+            "blanked": blanked,
+        });
+        if sessions {
+            let ids: Vec<String> = self
+                .with_reader(|st| st.list_sessions())?
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            out["sessions"] = json!(ids
+                .iter()
+                .map(|id| self.session_bundle(id))
+                .collect::<Result<Vec<_>>>()?);
+        }
+        Ok(out)
+    }
+
+    /// `ImportAll`: what came in, by kind, with anything that failed.
+    async fn import_all(self: &Arc<Self>, bundle: &Value) -> Result<Value> {
+        if bundle["format"].as_str() != Some("formless.all/1") {
+            return Err(anyhow!("not a formless.all/1 bundle (from `formless export-all`)"));
+        }
+        let list = |k: &str| bundle[k].as_array().cloned().unwrap_or_default();
+        let mut failed: Vec<String> = Vec::new();
+        // Config first (providers and Roles the Tools may name), then
+        // modules (Tools load them), then the rest.
+        let mut cfg = self.config()?;
+        let incoming: Config = serde_json::from_value(bundle["config"].clone()).unwrap_or_default();
+        let (mut providers, mut roles, mut servers) = (0, 0, 0);
+        for (k, v) in incoming.providers {
+            if !cfg.providers.contains_key(&k) {
+                cfg.providers.insert(k, v);
+                providers += 1;
+            }
+        }
+        for (k, v) in incoming.roles {
+            if !cfg.roles.contains_key(&k) {
+                cfg.roles.insert(k, v);
+                roles += 1;
+            }
+        }
+        for (k, v) in incoming.mcp.servers {
+            if !cfg.mcp.servers.contains_key(&k) {
+                cfg.mcp.servers.insert(k, v);
+                servers += 1;
+            }
+        }
+        if providers + roles + servers > 0 {
+            cfg.save(&self.paths)?;
+            self.broadcast(Event::SettingsChanged);
+            self.broadcast(Event::McpServersChanged);
+        }
+        let mut modules = 0;
+        for m in list("modules") {
+            let (Some(name), Some(code)) = (m["name"].as_str(), m["code"].as_str()) else {
+                continue;
+            };
+            if self.with_reader(|st| st.get_module_by_name(name))?.is_some() {
+                continue;
+            }
+            match self.with_store(|st| {
+                st.create_module_version(name, m["description"].as_str().unwrap_or_default(), code, "import")
+            }) {
+                Ok(_) => modules += 1,
+                Err(e) => failed.push(format!("module {name}: {e}")),
+            }
+        }
+        let cfg = self.config()?;
+        let mut tools = 0;
+        for t in list("tools") {
+            match self.import_one_tool(&t, &cfg).await {
+                Ok(_) => tools += 1,
+                Err(e) => failed.push(format!("tool {}: {e}", t["name"].as_str().unwrap_or("?"))),
+            }
+        }
+        let mut skills = 0;
+        for b in list("skills") {
+            let res = crate::skills::prepare_bundle(&self.paths, &b).and_then(|staged| {
+                self.with_store(|st| crate::skills::commit(&self.paths, st, &staged, "import"))
+            });
+            match res {
+                Ok(_) => skills += 1,
+                Err(e) => failed.push(format!("skill {}: {e}", b["name"].as_str().unwrap_or("?"))),
+            }
+        }
+        let mut memories = 0;
+        for m in list("memories") {
+            let text = m["text"].as_str().unwrap_or_default();
+            let scope = m["scope"].as_str().unwrap_or("global");
+            match self.with_store(|st| st.add_memory(text, scope, "import", None)) {
+                Ok((_, true)) => memories += 1,
+                Ok(_) => {}
+                Err(e) => failed.push(format!("memory: {e}")),
+            }
+        }
+        let mut jobs = 0;
+        for j in list("jobs") {
+            let (Some(prompt), Some(cron)) = (j["prompt"].as_str(), j["cron"].as_str()) else {
+                continue;
+            };
+            let next = crate::jobs::first_run(Some(cron), None, chrono::Local::now())
+                .ok()
+                .map(|t| t.to_rfc3339());
+            let Some(next) = next else {
+                failed.push(format!("job {cron}: not a schedule"));
+                continue;
+            };
+            let made = self.with_store(|st| {
+                let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
+                st.set_job_options(&job.id, j["overlap"].as_str(), (!j["deliver"].is_null()).then_some(&j["deliver"]))?;
+                // Paused: review, then enable on this machine.
+                st.set_job_enabled(&job.id, false)?;
+                Ok(())
+            });
+            match made {
+                Ok(()) => jobs += 1,
+                Err(e) => failed.push(format!("job {cron}: {e}")),
+            }
+        }
+        let mut sessions = 0;
+        for b in list("sessions") {
+            match self.import_session_bundle(&b) {
+                Ok(_) => sessions += 1,
+                Err(e) => failed.push(format!("session {}: {e}", b["name"].as_str().unwrap_or("?"))),
+            }
+        }
+        let _ = self.with_store(|st| st.audit("user", "import_all", &format!("{tools} tools, {skills} skills")));
+        self.broadcast(Event::SkillsChanged);
+        self.broadcast(Event::MemoryUpdated);
+        self.broadcast(Event::JobsChanged);
+        Ok(json!({
+            "tools": tools, "modules": modules, "skills": skills, "memories": memories,
+            "jobs": jobs, "sessions": sessions, "providers": providers, "roles": roles,
+            "mcp_servers": servers, "blanked": bundle["blanked"], "failed": failed,
+        }))
+    }
+
     /// Resolve a requested model name, expanding "auto" via measured
     /// routing (recorded successes/failures/latency). Errors only when
     /// auto is requested without any configured candidates.
@@ -7028,9 +7262,11 @@ impl Daemon {
     fn jobs_keep_alive_warning(&self) -> Option<String> {
         let cfg = self.config().ok()?;
         let active = self.with_reader(|st| st.has_active_jobs()).ok()?;
-        (active && !cfg.daemon.keep_alive_for_jobs).then(|| {
+        let stays = cfg.daemon.keep_alive_for_jobs || std::env::var_os(STAY_ENV).is_some();
+        (active && !stays).then(|| {
             "jobs run only while Formless is running (the daemon stops when idle). To run them \
-             on schedule, set daemon.keep_alive_for_jobs = true (/settings or config.toml)."
+             on schedule, run `formless daemon install-service` (starts it at login) or set \
+             daemon.keep_alive_for_jobs = true (/settings or config.toml)."
                 .to_string()
         })
     }
@@ -9251,6 +9487,26 @@ impl Daemon {
         }
     }
 
+    /// A database backup when the newest is a day old (checked hourly),
+    /// keeping `daemon.backups_keep` (SPEC §9.6).
+    async fn backup_loop(self: Arc<Self>) {
+        loop {
+            if let Ok(cfg) = self.config() {
+                let keep = cfg.daemon.backups_keep;
+                let due = crate::housekeeping::last_backup(&self.paths).is_none_or(|(_, at)| {
+                    at.elapsed().unwrap_or_default() >= std::time::Duration::from_secs(86_400)
+                });
+                if keep > 0 && due {
+                    match self.with_store(|st| crate::housekeeping::backup(&self.paths, st, keep)) {
+                        Ok(f) => tracing::info!("database backed up to {}", f.display()),
+                        Err(e) => tracing::warn!("database backup failed: {e:#}"),
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    }
+
     async fn log_rotator(self: Arc<Self>) {
         if std::env::var_os(crate::logs::DAEMON_LOG_ENV).is_none() {
             return;
@@ -9374,7 +9630,10 @@ impl Daemon {
             }
             let jobs_waiting = self.config().is_ok_and(|c| c.daemon.keep_alive_for_jobs)
                 && self.with_store(|st| st.has_active_jobs()).unwrap_or(false);
+            // `daemon serve --stay` (the login service) never idles out.
+            let stay = std::env::var_os(STAY_ENV).is_some();
             let busy = pending_running
+                || stay
                 || jobs_waiting
                 || !self.runs.lock().unwrap().is_empty()
                 || self.subscriber_count() > 0;
@@ -9431,6 +9690,10 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.artifact_gc_loop().await })
         };
+        let backups = {
+            let this = self.clone();
+            tokio::spawn(async move { this.backup_loop().await })
+        };
         let mcp = {
             let this = self.clone();
             tokio::spawn(async move { this.mcp_loop().await })
@@ -9442,6 +9705,7 @@ impl Daemon {
         let result = self.accept_loop().await;
         logs.abort();
         artifact_gc.abort();
+        backups.abort();
         mcp.abort();
         jobs.abort();
         self.mcp.stop_all().await;
@@ -9842,6 +10106,9 @@ pub fn build_id_of(exe: &std::path::Path) -> String {
 }
 
 /// Spawn `formless daemon serve` detached (client auto-start, SPEC §9.1).
+/// Set by `formless daemon serve --stay`: no idle shutdown.
+pub const STAY_ENV: &str = "FORMLESS_DAEMON_STAY";
+
 pub fn spawn_daemon(paths: &Paths) -> Result<()> {
     spawn_daemon_child(paths).map(|_| ())
 }

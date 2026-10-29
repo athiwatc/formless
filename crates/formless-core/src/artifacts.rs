@@ -41,6 +41,27 @@ pub fn gc(store: &Store, cfg: &ArtifactsCfg) -> Result<Collected> {
     Ok(out)
 }
 
+/// What [`gc`] would remove now: (files, bytes); nothing is touched.
+pub fn gc_preview(store: &Store, cfg: &ArtifactsCfg) -> Result<(usize, u64)> {
+    let all = store.list_artifacts()?;
+    let cutoff = (cfg.max_age_days > 0).then(|| {
+        (chrono::Utc::now() - chrono::Duration::days(cfg.max_age_days as i64)).to_rfc3339()
+    });
+    let cap = cfg.max_total_mb.saturating_mul(1_000_000);
+    let mut total: u64 = all.iter().map(|a| a.2.max(0) as u64).sum();
+    let (mut files, mut bytes) = (0, 0);
+    for (_, _, b, created) in all {
+        let too_old = cutoff.as_deref().is_some_and(|c| created.as_str() < c);
+        if too_old || (cap > 0 && total > cap) {
+            let b = b.max(0) as u64;
+            total = total.saturating_sub(b);
+            files += 1;
+            bytes += b;
+        }
+    }
+    Ok((files, bytes))
+}
+
 /// Delete a Session's artifact files and rows (call before the Session).
 pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
     for path in store.session_artifact_paths(session_id)? {

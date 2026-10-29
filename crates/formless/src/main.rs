@@ -91,8 +91,6 @@ enum Cmd {
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
     },
-    /// Apply artifact retention now (artifacts.max_total_mb / max_age_days)
-    Gc,
     /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
     Skills {
         #[command(subcommand)]
@@ -207,6 +205,37 @@ enum Cmd {
     Naming {
         #[command(subcommand)]
         action: NamingAction,
+    },
+    /// Disk used by Sessions, artifacts, Tool versions, logs, backups
+    Storage {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Free disk space: old artifacts and snapshots, long MCP logs, old
+    /// migration copies, database free space
+    Gc {
+        /// List what would be freed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Back up the database now (kept with the daily ones in <data>/backups)
+    Backup,
+    /// Everything for a new machine in one file: Tools, modules, Skills,
+    /// memories, jobs, providers/Roles/MCP servers (no keys or secrets)
+    ExportAll {
+        /// Include every Session's transcript
+        #[arg(long)]
+        sessions: bool,
+        /// Where to write it (default: ./formless-export-<date>.json)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+    /// Load a file from `formless export-all` (adds; never overwrites)
+    ImportAll { file: std::path::PathBuf },
+    /// Replace the database with a backup (stop the daemon first); the
+    /// current one is saved next to the backups
+    Restore {
+        file: std::path::PathBuf,
     },
     /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
     Reset {
@@ -1059,7 +1088,20 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Run the daemon (used by client auto-start; blocks)
-    Serve,
+    Serve {
+        /// Never stop for being idle (how the login service runs it)
+        #[arg(long)]
+        stay: bool,
+    },
+    /// Start the daemon at login (launchd, systemd user unit or a Windows
+    /// logon task), so scheduled jobs run on time
+    InstallService {
+        /// Print the service file and commands without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the login service
+    UninstallService,
     /// Start the daemon if not running
     Start,
     Stop,
@@ -1084,7 +1126,7 @@ fn main() -> Result<()> {
     let serving = matches!(
         cli.cmd,
         Some(Cmd::Daemon {
-            action: DaemonAction::Serve
+            action: DaemonAction::Serve { .. }
         })
     );
     {
@@ -1183,19 +1225,6 @@ fn main() -> Result<()> {
             no_open,
             stop,
         }) => web_cmd(paths, port, no_open, stop),
-        Some(Cmd::Gc) => {
-            let cfg = Config::load(&paths)?;
-            let store = formless_core::Store::open(&paths.db_file())?;
-            let c = formless_core::artifacts::gc(&store, &cfg.artifacts)?;
-            let (left, bytes) = formless_core::artifacts::usage(&store)?;
-            println!(
-                "removed {} artifact(s), {:.1} MB; {left} left ({:.1} MB)",
-                c.files,
-                c.bytes as f64 / 1e6,
-                bytes as f64 / 1e6
-            );
-            Ok(())
-        }
         Some(Cmd::Auth { action }) => auth_cmd(paths, action),
         Some(Cmd::Relay { action }) => relay_cmd(paths, action),
         Some(Cmd::Prompts { action }) => prompts_cmd(paths, action),
@@ -1205,6 +1234,62 @@ fn main() -> Result<()> {
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
+        Some(Cmd::Storage { json }) => storage_cmd(&paths, json),
+        Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
+        Some(Cmd::Backup) => backup_cmd(&paths),
+        Some(Cmd::ExportAll { sessions, output }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            let bundle = formless_tui::client::request_once(&paths, Request::ExportAll { sessions })?;
+            let file = output.unwrap_or_else(|| {
+                std::path::PathBuf::from(format!(
+                    "formless-export-{}.json",
+                    chrono::Local::now().format("%Y%m%d-%H%M")
+                ))
+            });
+            formless_core::config::write_secret_file(&file, &serde_json::to_string_pretty(&bundle)?)?;
+            let n = |k: &str| bundle[k].as_array().map_or(0, Vec::len);
+            println!("exported:  {}", file.display());
+            println!(
+                "contains:  {} Tools, {} modules, {} Skills, {} memories, {} jobs{}",
+                n("tools"), n("modules"), n("skills"), n("memories"), n("jobs"),
+                if sessions { format!(", {} Sessions", n("sessions")) } else { String::new() }
+            );
+            if n("blanked") > 0 {
+                println!("left out:  {} secret value(s) (API keys never leave the keychain); fill them in after import", n("blanked"));
+            }
+            Ok(())
+        }
+        Some(Cmd::ImportAll { file }) => {
+            let text = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+            let bundle: serde_json::Value = serde_json::from_str(&text).context("not a JSON export")?;
+            formless_core::daemon::ensure_daemon(&paths)?;
+            let r = formless_tui::client::request_once(&paths, Request::ImportAll { bundle })?;
+            println!(
+                "imported:  {} Tools, {} modules, {} Skills (disabled until you enable them), {} memories, {} jobs (paused), {} Sessions",
+                r["tools"], r["modules"], r["skills"], r["memories"], r["jobs"], r["sessions"]
+            );
+            println!(
+                "config:    {} providers, {} Roles, {} MCP servers added",
+                r["providers"], r["roles"], r["mcp_servers"]
+            );
+            for b in r["blanked"].as_array().into_iter().flatten() {
+                println!("fill in:   {}", b.as_str().unwrap_or_default());
+            }
+            for f in r["failed"].as_array().into_iter().flatten() {
+                println!("failed:    {}", f.as_str().unwrap_or_default());
+            }
+            println!("next:      formless auth login / set API keys, then `formless jobs` to enable jobs");
+            Ok(())
+        }
+        Some(Cmd::Restore { file }) => {
+            if daemon_reachable(&paths) {
+                anyhow::bail!("stop the daemon first: formless daemon stop");
+            }
+            let saved = formless_core::housekeeping::restore(&paths, &file)?;
+            println!("restored:  {}", file.display());
+            println!("previous:  saved as {}", saved.display());
+            Ok(())
+        }
         Some(Cmd::Run {
             task,
             session,
@@ -1646,12 +1731,36 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
 
 fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Serve => {
+        DaemonAction::Serve { stay } => {
+            if stay {
+                std::env::set_var(formless_core::daemon::STAY_ENV, "1");
+            }
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let d = Arc::new(Daemon::new(paths)?);
                 d.serve().await
             })
+        }
+        DaemonAction::InstallService { dry_run } => {
+            let plan = formless_core::service::plan_here(&paths)?;
+            if dry_run {
+                println!("# {} ({})\n{}", plan.file.display(), plan.manager, plan.contents);
+                for c in &plan.enable {
+                    println!("$ {}", c.join(" "));
+                }
+                return Ok(());
+            }
+            formless_core::service::install(&plan)?;
+            println!("installed: {} ({})", plan.file.display(), plan.manager);
+            println!("the daemon now starts at login and stays up, so jobs run on schedule");
+            println!("remove it: formless daemon uninstall-service");
+            Ok(())
+        }
+        DaemonAction::UninstallService => {
+            let plan = formless_core::service::plan_here(&paths)?;
+            formless_core::service::uninstall(&plan)?;
+            println!("removed: {}", plan.file.display());
+            Ok(())
         }
         DaemonAction::Start => {
             formless_core::daemon::ensure_daemon(&paths)?;
@@ -1673,7 +1782,11 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         DaemonAction::Status { json } => {
             if daemon_reachable(&paths) {
                 let v = formless_tui::client::request_once(&paths, Request::Status)?;
-                println!("{}", serde_json::to_string_pretty(&v)?);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    print_daemon_status(&v);
+                }
                 for w in formless_tui::client::status_warnings(&v) {
                     eprintln!("warning: {w}");
                 }
@@ -1685,6 +1798,35 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `formless daemon status`: who it is and what it is using (SPEC §9.3).
+fn print_daemon_status(v: &serde_json::Value) {
+    use formless_core::housekeeping::human_bytes;
+    let r = &v["resources"];
+    let b = |k: &str| human_bytes(r[k].as_u64().unwrap_or(0));
+    println!(
+        "daemon:      running (pid {}, version {}, protocol {})",
+        v["pid"], v["version"].as_str().unwrap_or_default(), v["protocol"]
+    );
+    if let Some(up) = r["uptime_secs"].as_u64() {
+        println!("uptime:      {}", if up >= 3600 { format!("{}h {}m", up / 3600, up % 3600 / 60) } else { format!("{}m {}s", up / 60, up % 60) });
+    }
+    if r["memory_bytes"].is_u64() {
+        println!(
+            "memory:      {}  ·  cpu {}% (total {})",
+            b("memory_bytes"),
+            r["cpu_percent"].as_f64().map_or("?".into(), |c| format!("{c:.1}")),
+            r["cpu_time"].as_str().unwrap_or("?")
+        );
+    }
+    println!("database:    {}  ·  artifacts {}", b("db_bytes"), b("artifacts_bytes"));
+    let running = v["running_sessions"].as_array().map_or(0, Vec::len);
+    println!(
+        "work:        {} Session(s) · {running} running Run(s) · {} pending Invocation(s)",
+        v["sessions"], r["running_invocations"]
+    );
+    println!("approvals:   {}", if v["secure"] == true { "on (--secure)" } else { "off" });
 }
 
 #[cfg(target_os = "macos")]
@@ -2182,6 +2324,88 @@ fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
 }
 
 /// Print the doctor report and return the problems found.
+/// `formless storage`: disk use by kind (SPEC §9.6).
+fn storage_cmd(paths: &Paths, json: bool) -> Result<()> {
+    use formless_core::housekeeping::human_bytes;
+    let u = if daemon_reachable(paths) {
+        formless_tui::client::request_once(paths, Request::StorageUsage)?
+    } else {
+        let store = formless_core::Store::open(&paths.db_file())?;
+        formless_core::housekeeping::usage(paths, &store)?
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&u)?);
+        return Ok(());
+    }
+    let mut tbl = Table::new(&["KIND", "SIZE", "WHAT"]);
+    for k in u["kinds"].as_array().into_iter().flatten() {
+        let inside = k["inside_db"] == true;
+        tbl.row(vec![
+            t(
+                format!("{}{}", if inside { "  " } else { "" }, k["kind"].as_str().unwrap_or_default()),
+                if inside { Tone::Dim } else { Tone::Strong },
+            ),
+            c(human_bytes(k["bytes"].as_u64().unwrap_or(0))),
+            t(k["detail"].as_str().unwrap_or_default(), Tone::Dim),
+        ]);
+    }
+    tbl.print();
+    println!(
+        "total:     {} in {}",
+        human_bytes(u["total_bytes"].as_u64().unwrap_or(0)),
+        u["data_dir"].as_str().unwrap_or_default()
+    );
+    println!("free some: formless gc --dry-run");
+    Ok(())
+}
+
+/// `formless gc [--dry-run]`.
+fn gc_cmd(paths: &Paths, dry_run: bool) -> Result<()> {
+    use formless_core::housekeeping::human_bytes;
+    let r = if daemon_reachable(paths) {
+        formless_tui::client::request_once(paths, Request::Gc { dry_run })?
+    } else {
+        let store = formless_core::Store::open(&paths.db_file())?;
+        formless_core::housekeeping::gc(paths, &store, &Config::load(paths)?, dry_run)?
+    };
+    let mut tbl = Table::new(&["KIND", "ITEMS", "FREES", "WHAT"]);
+    for k in r["kinds"].as_array().into_iter().flatten() {
+        tbl.row(vec![
+            t(k["kind"].as_str().unwrap_or_default(), Tone::Strong),
+            c(k["items"].to_string()),
+            c(human_bytes(k["bytes"].as_u64().unwrap_or(0))),
+            t(k["detail"].as_str().unwrap_or_default(), Tone::Dim),
+        ]);
+    }
+    tbl.print();
+    let total = human_bytes(r["total_bytes"].as_u64().unwrap_or(0));
+    if dry_run {
+        println!("would free about {total} · run `formless gc` to do it");
+    } else {
+        println!("freed about {total}");
+    }
+    Ok(())
+}
+
+/// `formless backup`.
+fn backup_cmd(paths: &Paths) -> Result<()> {
+    let r = if daemon_reachable(paths) {
+        formless_tui::client::request_once(paths, Request::Backup)?
+    } else {
+        let store = formless_core::Store::open(&paths.db_file())?;
+        let keep = Config::load(paths)?.daemon.backups_keep.max(1);
+        let f = formless_core::housekeeping::backup(paths, &store, keep)?;
+        serde_json::json!({"file": f.display().to_string(), "bytes": formless_core::housekeeping::path_bytes(&f)})
+    };
+    println!(
+        "backed up: {} ({})",
+        r["file"].as_str().unwrap_or_default(),
+        formless_core::housekeeping::human_bytes(r["bytes"].as_u64().unwrap_or(0))
+    );
+    println!("restore:   formless daemon stop && formless restore FILE");
+    Ok(())
+}
+
 fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
     // `quiet`: only the problems (for --json and bug reports).
     macro_rules! say {
@@ -2215,6 +2439,27 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             cfg.artifacts.max_total_mb,
             cfg.artifacts.max_age_days
         );
+    }
+    match formless_core::service::installed(&paths) {
+        Some((manager, file)) => say!("service:    starts at login ({manager}: {})", file.display()),
+        None => say!("service:    not installed (formless daemon install-service starts it at login)"),
+    }
+    match formless_core::housekeeping::last_backup(&paths) {
+        Some((file, at)) => {
+            let age = at.elapsed().unwrap_or_default().as_secs();
+            say!(
+                "backups:    last {} ago ({}; keeps {})",
+                if age >= 86_400 {
+                    format!("{}d", age / 86_400)
+                } else {
+                    format!("{}h", age / 3600)
+                },
+                file.display(),
+                cfg.daemon.backups_keep
+            );
+        }
+        None if cfg.daemon.backups_keep == 0 => say!("backups:    off (daemon.backups_keep = 0)"),
+        None => say!("backups:    none yet (the daemon takes one daily; formless backup now)"),
     }
     say!(
         "logs:       {:.1} MB (rotates at {:.1} MB, keeps {})",
