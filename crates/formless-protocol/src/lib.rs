@@ -656,8 +656,11 @@ pub struct RunMetricsInfo {
     /// completed, interrupted, paused, resumed, running.
     pub status: String,
     /// The status, or `edited` / `corrected` when the user's next move
-    /// says the Run missed its goal.
+    /// says the Run missed its goal, or `rated_bad` after a 👎.
     pub outcome: String,
+    /// The user's own verdict: "good", "bad" or "".
+    #[serde(default)]
+    pub rating: String,
     /// Model calls.
     pub steps: i64,
     /// Registry Tool Invocations.
@@ -678,10 +681,22 @@ pub struct RunSummary {
     pub paused: f64,
     pub edited: f64,
     pub corrected: f64,
+    /// Shares of finished Runs the user rated 👍 / 👎.
+    #[serde(default)]
+    pub rated_good: f64,
+    #[serde(default)]
+    pub rated_bad: f64,
     pub avg_steps: f64,
     pub avg_tool_calls: f64,
     pub avg_tokens: f64,
     pub avg_duration_ms: f64,
+}
+
+/// A message waiting to start its own Run after the current one (§5.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueuedMessage {
+    pub id: i64,
+    pub content: String,
 }
 
 /// A user-memory note (SPEC §7.11).
@@ -1102,6 +1117,49 @@ pub enum Request {
     /// Give up on a Session's interrupted or paused Run.
     AbandonRun {
         session_id: String,
+    },
+    /// Change a queued message's text, or remove it (`content: None`).
+    EditQueued {
+        session_id: String,
+        id: i64,
+        #[serde(default)]
+        content: Option<String>,
+    },
+    /// Move a queued message one place earlier (`up`) or later.
+    MoveQueued {
+        session_id: String,
+        id: i64,
+        up: bool,
+    },
+    /// Re-run the Session's last user message (`/retry [--model X]`),
+    /// on `model` for that Run only when given. With `keep_original`
+    /// (default) the current answer is kept in a fork of the Session
+    /// named "… · original answer" before it is replaced.
+    RetryRun {
+        session_id: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default = "default_true")]
+        keep_original: bool,
+    },
+    /// The user's verdict on a Run's answer (👍/👎, SPEC §8.7): `rating`
+    /// "good", "bad" or "" to clear; `run_id` defaults to the Session's
+    /// latest finished Run.
+    RateRun {
+        session_id: String,
+        #[serde(default)]
+        run_id: Option<String>,
+        rating: String,
+        #[serde(default)]
+        comment: Option<String>,
+    },
+    /// Cap the Session's active Run (or, when idle, its next Run) at
+    /// `max_steps` steps; `None` removes the cap. Reaching it pauses the
+    /// Run like `limits.run_steps` (resume continues past it). Cleared
+    /// when that Run ends.
+    SetStepLimit {
+        session_id: String,
+        max_steps: Option<u32>,
     },
     /// Choose which events this connection receives. `sessions: None` =
     /// every Session; otherwise only those Sessions' transcript and live
@@ -1762,6 +1820,23 @@ pub enum Event {
         session_id: String,
         run_id: String,
     },
+    /// A Session's queue of messages waiting for the current Run changed
+    /// (queued, sent, edited, removed or reordered).
+    QueueChanged {
+        session_id: String,
+        queued: Vec<QueuedMessage>,
+    },
+    /// A provider request failed with a retryable error (429, 5xx, a
+    /// dropped connection) and is re-sent after `wait_secs`; `attempt` of
+    /// `max_attempts` retries. Esc (Interrupt) gives up.
+    ProviderRetrying {
+        session_id: String,
+        run_id: String,
+        reason: String,
+        wait_secs: u64,
+        attempt: u32,
+        max_attempts: u32,
+    },
     /// An open provider stream has sent nothing for `idle_secs` (sent once
     /// per stall; any later delta means it recovered).
     ProviderStalled {
@@ -1997,6 +2072,8 @@ impl Event {
             | Event::MessageComplete { session_id, .. }
             | Event::StreamRestarted { session_id, .. }
             | Event::ProviderStalled { session_id, .. }
+            | Event::ProviderRetrying { session_id, .. }
+            | Event::QueueChanged { session_id, .. }
             | Event::RunFinished { session_id, .. }
             | Event::RunPaused { session_id, .. }
             | Event::CompactionNotice { session_id, .. }

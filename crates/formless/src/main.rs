@@ -262,6 +262,10 @@ enum Cmd {
         /// image handling as /attach)
         #[arg(long = "attach", value_name = "FILE")]
         attach: Vec<std::path::PathBuf>,
+        /// Pause the Run after this many steps (as /limit; overrides
+        /// limits.run_steps for this Run)
+        #[arg(long, value_name = "N")]
+        max_steps: Option<u32>,
     },
 }
 
@@ -1186,6 +1190,7 @@ fn main() -> Result<()> {
             effort,
             role,
             attach,
+            max_steps,
         }) => {
             let output = if json { RunOutput::JsonlEvents } else { output };
             let session = if continue_last || session.as_deref() == Some("last") {
@@ -1277,6 +1282,7 @@ fn main() -> Result<()> {
                 output,
                 quiet,
                 timeout,
+                max_steps,
             );
             if let Some(s) = restore {
                 if pick_was_set {
@@ -2524,6 +2530,7 @@ fn run_headless(
     output: RunOutput,
     quiet: bool,
     timeout: Option<std::time::Duration>,
+    max_steps: Option<u32>,
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let json_out = output == RunOutput::JsonlEvents;
@@ -2608,6 +2615,12 @@ fn run_headless(
             name,
             data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
             mime: None,
+        });
+    }
+    if max_steps.is_some() {
+        client.send(Request::SetStepLimit {
+            session_id: session_id.clone(),
+            max_steps,
         });
     }
     client.send(Request::SendMessage {

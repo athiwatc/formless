@@ -38,6 +38,18 @@ use std::time::{Duration, Instant};
 
 use client::DaemonClient;
 
+/// Moving indicators, unless `tui.animations` is off or the environment
+/// asks for reduced motion (`REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION`
+/// set to anything but empty, `0`, `false` or `off`).
+fn animations_enabled(setting: bool) -> bool {
+    let reduced = ["FORMLESS_REDUCED_MOTION", "REDUCED_MOTION"].iter().any(|k| {
+        std::env::var(k).is_ok_and(|v| {
+            !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no")
+        })
+    });
+    setting && !reduced
+}
+
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Multi-pane layout is active only when persisted on and wide enough.
@@ -125,6 +137,12 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/retry [--model X]`: the last message is re-running.
+    RetryRun,
+    /// `/good` / `/bad`: the rating was stored.
+    RateRun,
+    /// `/limit N`: the step cap for the current or next Run.
+    StepLimit,
     /// `/approvals [family]`: the central list (SPEC §10.3).
     Approvals,
     /// `/revoke all [family]`: revoke what the list returns.
@@ -551,6 +569,8 @@ impl Wizard {
 struct Activity {
     label: String,
     since: Instant,
+    /// A provider retry: when the next attempt is sent, and "(2/5)".
+    retry: Option<(Instant, String)>,
 }
 
 struct EditorReview {
@@ -786,6 +806,8 @@ struct App {
     show_thinking: bool,
     /// Message times and day separators (`tui.timestamps`).
     show_timestamps: bool,
+    /// Moving spinners (`tui.animations`, off under `REDUCED_MOTION`).
+    animations: bool,
     color: bool,
     multi_pane: bool,
     /// Configured model, shown in the status bar.
@@ -1005,6 +1027,11 @@ struct App {
     search_idx: usize,
     search_mode: bool,
     editing_id: Option<String>,
+    /// Messages queued for after the current Run (Ctrl+J), shown under
+    /// the chat and editable with `/queue`.
+    queued: Vec<formless_protocol::QueuedMessage>,
+    /// `/queue edit N`: the queued message the input replaces.
+    editing_queued: Option<i64>,
     should_quit: bool,
     /// Rendered Markdown of settled messages, keyed by content and width.
     /// Rendered settled messages by (id, content length, width).
@@ -1093,6 +1120,7 @@ impl App {
             color: colors_enabled(),
             multi_pane: cfg.tui.multi_pane,
             show_timestamps: cfg.tui.timestamps,
+            animations: animations_enabled(cfg.tui.animations),
             hyperlinks: links::enabled(&cfg.tui.hyperlinks),
             model_label: cfg.provider.model.clone(),
             tick: 0,
@@ -1211,6 +1239,8 @@ impl App {
             search_idx: 0,
             search_mode: false,
             editing_id: None,
+            queued: Vec::new(),
+            editing_queued: None,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -2276,6 +2306,40 @@ impl App {
                                 .collect();
                             self.notes.extend(lines);
                         }
+                        Pending::RateRun => self.notes.push(
+                            match result["rating"].as_str() {
+                                Some("good") => "rated the last answer 👍 · /unrate clears it",
+                                Some("bad") => "rated the last answer 👎 · /unrate clears it",
+                                _ => "rating cleared",
+                            }
+                            .into(),
+                        ),
+                        Pending::RetryRun => {
+                            let on = result["model"]
+                                .as_str()
+                                .map(|m| format!(" on {m}"))
+                                .unwrap_or_default();
+                            self.notes.push(match result["original_session"].as_str() {
+                                Some(_) => format!(
+                                    "retrying{on}; the previous answer is kept in the Session \"… · original answer\" (/sessions)"
+                                ),
+                                None => format!("retrying{on}"),
+                            });
+                            self.request(Pending::ListSessions, Request::ListSessions);
+                        }
+                        Pending::StepLimit => {
+                            let which = if result["active_run"].as_bool() == Some(true) {
+                                "this Run"
+                            } else {
+                                "the next Run"
+                            };
+                            self.notes.push(match result["max_steps"].as_u64() {
+                                Some(n) => format!(
+                                    "{which} stops after {n} steps (pauses: /resume continues, /abandon stops)"
+                                ),
+                                None => format!("no step limit for {which}"),
+                            });
+                        }
                         Pending::RunControl => match result["abandoned"].as_bool() {
                             Some(true) => self.notes.push("abandoned the interrupted run".into()),
                             Some(false) => self.notes.push("nothing to abandon".into()),
@@ -2324,17 +2388,60 @@ impl App {
                                     r["error"].as_str().unwrap_or_default().to_string(),
                                 )
                             });
-                            let queued = result["queued"].as_array().map_or(0, Vec::len);
-                            if queued > 0 {
-                                self.notes.push(format!(
-                                    "{queued} queued message(s) start after the current run"
-                                ));
-                            }
+                            self.queued = serde_json::from_value(result["queued_items"].clone())
+                                .unwrap_or_default();
                         }
                     }
                 }
                 ServerMessage::Event(ev) => self.on_event(ev),
             }
+        }
+    }
+
+    /// `/queue [edit|rm|up|down N]`: the messages waiting for this Run.
+    fn queue_command(&mut self, cmd: &str) {
+        let Some(session_id) = self.current.clone() else {
+            return;
+        };
+        let mut words = cmd.split_whitespace().skip(1);
+        let (verb, n) = (words.next(), words.next().and_then(|n| n.parse::<usize>().ok()));
+        let Some(verb) = verb else {
+            if self.queued.is_empty() {
+                self.notes.push("nothing queued (Ctrl+J queues a message for after this Run)".into());
+            } else {
+                self.notes.push(format!(
+                    "{} queued · /queue edit|rm|up|down N",
+                    self.queued.len()
+                ));
+            }
+            return;
+        };
+        let Some(item) = n.and_then(|n| n.checked_sub(1)).and_then(|i| self.queued.get(i)).cloned()
+        else {
+            self.notes
+                .push("usage: /queue edit|rm|up|down N (N from the queued list)".into());
+            return;
+        };
+        match verb {
+            "edit" => {
+                self.editing_queued = Some(item.id);
+                self.input.set(&item.content);
+                self.notes
+                    .push("Editing the queued message — Enter saves, Esc cancels.".into());
+            }
+            "rm" | "remove" | "delete" => self.fire(Request::EditQueued {
+                session_id,
+                id: item.id,
+                content: None,
+            }),
+            "up" | "down" => self.fire(Request::MoveQueued {
+                session_id,
+                id: item.id,
+                up: verb == "up",
+            }),
+            _ => self
+                .notes
+                .push("usage: /queue edit|rm|up|down N".into()),
         }
     }
 
@@ -2414,18 +2521,35 @@ impl App {
                 *slot = Some(Activity {
                     label,
                     since: Instant::now(),
+                    retry: None,
                 })
             }
         }
     }
 
     fn spinner(&self) -> &'static str {
+        if !self.animations {
+            return "●";
+        }
         SPINNER[(self.tick / 2) as usize % SPINNER.len()]
     }
 
-    /// Always-visible working state, e.g. `⠙ thinking… (12s)`.
+    /// Always-visible working state, e.g. `⠙ thinking… (12s)`, or
+    /// `⠙ rate limited · retrying in 8s (2/5) · Esc to stop`.
     fn activity_text(&self) -> Option<String> {
         self.activity.as_ref().map(|a| {
+            if let Some((at, count)) = &a.retry {
+                let left = at.saturating_duration_since(Instant::now()).as_secs_f64().ceil();
+                return if left > 0.0 {
+                    format!(
+                        "{} {} · retrying in {left}s {count} · Esc to stop",
+                        self.spinner(),
+                        a.label
+                    )
+                } else {
+                    format!("{} {} · retrying {count} · Esc to stop", self.spinner(), a.label)
+                };
+            }
             format!(
                 "{} {}… ({})",
                 self.spinner(),
@@ -2513,6 +2637,8 @@ impl App {
         self.thinking.clear();
         self.live_tools.clear();
         self.editing_id = None;
+        self.editing_queued = None;
+        self.queued.clear();
         self.activity = None;
         if self.running() {
             self.set_activity("working");
@@ -2559,6 +2685,38 @@ impl App {
                     self.notes.push(format!(
                         "no data from the provider for {idle_secs}s; /resend re-sends the request"
                     ));
+                }
+            }
+            Event::QueueChanged { session_id, queued } => {
+                if self.is_current(&session_id) {
+                    if self
+                        .editing_queued
+                        .is_some_and(|id| !queued.iter().any(|q| q.id == id))
+                    {
+                        self.editing_queued = None;
+                        self.notes
+                            .push("the queued message you were editing was sent".into());
+                    }
+                    self.queued = queued;
+                }
+            }
+            Event::ProviderRetrying {
+                session_id,
+                reason,
+                wait_secs,
+                attempt,
+                max_attempts,
+                ..
+            } => {
+                if self.is_current(&session_id) {
+                    self.activity = Some(Activity {
+                        label: reason,
+                        since: Instant::now(),
+                        retry: Some((
+                            Instant::now() + Duration::from_secs(wait_secs),
+                            format!("({attempt}/{max_attempts})"),
+                        )),
+                    });
                 }
             }
             Event::StreamRestarted { session_id, .. } => {
@@ -2668,6 +2826,7 @@ impl App {
                     // Changed elsewhere (the web Settings): apply here too.
                     self.multi_pane = cfg.tui.multi_pane;
                     self.show_timestamps = cfg.tui.timestamps;
+                    self.animations = animations_enabled(cfg.tui.animations);
                     self.hyperlinks = links::enabled(&cfg.tui.hyperlinks);
                     self.pane_widths = pane_widths(&cfg.tui.pane_widths);
                     // Rendered answers carry the old colours and options.
@@ -3080,6 +3239,11 @@ impl App {
         let text = self.input.take();
         let text = text.trim().to_string();
         if text.is_empty() {
+            // Enter on an empty input retries a failed or paused Run
+            // from the banner, without retyping (SPEC §5.4).
+            if self.run_banner.is_some() && !self.running() && !queued {
+                self.slash("resume");
+            }
             return;
         }
         if let Some(kind) = self.import_mode.take() {
@@ -3125,6 +3289,16 @@ impl App {
                     limit: Some(50),
                 },
             );
+            return;
+        }
+        if let Some(id) = self.editing_queued.take() {
+            if let Some(session_id) = self.current.clone() {
+                self.fire(Request::EditQueued {
+                    session_id,
+                    id,
+                    content: Some(text),
+                });
+            }
             return;
         }
         if let Some(message_id) = self.editing_id.take() {
@@ -3713,7 +3887,7 @@ impl App {
                 self.notes
                     .push("Type a search query, then Enter (searches all sessions).".into());
             }
-            "edit" | "retry" => match self.messages.iter().rev().find(|m| m.role == "user") {
+            "edit" => match self.messages.iter().rev().find(|m| m.role == "user") {
                 Some(m) => {
                     self.editing_id = Some(m.id.clone());
                     self.input.set(&m.content);
@@ -3722,6 +3896,24 @@ impl App {
                 }
                 None => self.notes.push("no user message to edit".into()),
             },
+            cmd if cmd == "queue" || cmd.starts_with("queue ") => self.queue_command(cmd),
+            cmd if cmd == "retry" || cmd.starts_with("retry ") => {
+                let Some(session_id) = self.current.clone() else {
+                    self.notes.push("no session".into());
+                    return;
+                };
+                let arg = cmd.trim_start_matches("retry").trim();
+                let model = arg.strip_prefix("--model").unwrap_or(arg).trim();
+                self.run_banner = None;
+                self.request(
+                    Pending::RetryRun,
+                    Request::RetryRun {
+                        session_id,
+                        model: Some(model.to_string()).filter(|m| !m.is_empty()),
+                        keep_original: true,
+                    },
+                );
+            }
             "metrics" => self.open_view(View::Metrics),
             "proposals" => self.open_view(View::Proposals),
             "propose" => self.generate_proposal(),
@@ -4345,6 +4537,50 @@ impl App {
                         Request::RetryProviderRequest { session_id },
                     );
                 }
+            }
+            cmd if ["good", "bad", "unrate"]
+                .iter()
+                .any(|c| cmd == *c || cmd.starts_with(&format!("{c} "))) =>
+            {
+                let Some(session_id) = self.current.clone() else {
+                    self.notes.push("no session".into());
+                    return;
+                };
+                let (verb, comment) = cmd.split_once(' ').unwrap_or((cmd, ""));
+                let rating = if verb == "unrate" { "" } else { verb };
+                self.request(
+                    Pending::RateRun,
+                    Request::RateRun {
+                        session_id,
+                        run_id: None,
+                        rating: rating.into(),
+                        comment: Some(comment.trim().to_string()).filter(|c| !c.is_empty()),
+                    },
+                );
+            }
+            cmd if cmd == "limit" || cmd.starts_with("limit ") => {
+                let arg = cmd.trim_start_matches("limit");
+                let Some(session_id) = self.current.clone() else {
+                    self.notes.push("no session".into());
+                    return;
+                };
+                let max_steps = match arg.trim() {
+                    "off" | "none" | "0" => None,
+                    n => match n.parse::<u32>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            self.notes.push("usage: /limit N (steps) or /limit off".into());
+                            return;
+                        }
+                    },
+                };
+                self.request(
+                    Pending::StepLimit,
+                    Request::SetStepLimit {
+                        session_id,
+                        max_steps,
+                    },
+                );
             }
             "resume" | "abandon" => {
                 if let Some(session_id) = self.current.clone() {
@@ -6358,6 +6594,11 @@ impl App {
                 self.input.clear();
                 self.notes.push("cancelled".into());
             }
+            KeyCode::Esc if self.editing_queued.is_some() => {
+                self.editing_queued = None;
+                self.input.clear();
+                self.notes.push("edit cancelled".into());
+            }
             KeyCode::Esc if self.editing_id.is_some() => {
                 self.editing_id = None;
                 self.edit_armed = false;
@@ -7169,6 +7410,8 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         ("import path › ", Color::Magenta)
     } else if app.editing_id.is_some() {
         ("edit › ", Color::Magenta)
+    } else if app.editing_queued.is_some() {
+        ("queued › ", Color::Magenta)
     } else if app.running() {
         ("steer › ", Color::Yellow)
     } else {
@@ -7688,6 +7931,12 @@ fn sent_elsewhere(app: &App, m: &MessageInfo) -> Option<String> {
     let other_kind = !label.starts_with("TUI");
     let other_tui = conn != app.conn && app.others.iter().any(|o| Some(o.conn) == conn);
     (other_kind || other_tui).then(|| label.to_string())
+}
+
+/// The step a steering message (sent while a Run was active) arrived at.
+fn steer_step(m: &MessageInfo) -> Option<i64> {
+    let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+    meta["steer"]["step"].as_i64()
 }
 
 /// "web, TUI ×2" for the other clients on this Session.
@@ -9516,6 +9765,12 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                         ui::dim(app.color),
                     ));
                 }
+                if let Some(step) = steer_step(m) {
+                    lines.push(Line::styled(
+                        format!("  ↳ steer at step {step}"),
+                        fg(app.color, Color::Yellow),
+                    ));
+                }
                 let focused = app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
                 if focused {
                     focus_line = Some(lines.len());
@@ -9664,7 +9919,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             bold_fg(app.color, Color::Yellow),
         ));
         lines.push(Line::styled(
-            "    /resume continues it · /abandon closes it",
+            "    Enter (empty input) or /resume retries it · /abandon closes it",
             ui::dim(app.color),
         ));
     }
@@ -9675,6 +9930,34 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             lines.push(Line::styled(
                 format!("  {}", app.activity_text().unwrap_or_else(|| "…".into())),
                 bold_fg(app.color, Color::Yellow),
+            ));
+        }
+    }
+    // Messages waiting for this Run (Ctrl+J), oldest first (SPEC §5.3).
+    if !app.queued.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(
+                "  ⏳ Queued for after this Run ({}) · /queue edit|rm|up|down N",
+                app.queued.len()
+            ),
+            ui::dim(app.color),
+        ));
+        for (i, q) in app.queued.iter().enumerate() {
+            let editing = app.editing_queued == Some(q.id);
+            let first = q.content.lines().next().unwrap_or_default();
+            lines.push(Line::styled(
+                format!(
+                    "    {}. {}{}",
+                    i + 1,
+                    truncate_chars(first, width.saturating_sub(10).max(20)),
+                    if editing { "  (editing)" } else { "" }
+                ),
+                if editing {
+                    fg(app.color, Color::Magenta)
+                } else {
+                    ui::dim(app.color)
+                },
             ));
         }
     }
@@ -11992,6 +12275,10 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     let _ = out.execute(crossterm::event::EnableBracketedPaste);
     // Focus events: notify only while the user is elsewhere.
     let _ = out.execute(crossterm::event::EnableFocusChange);
+    // Reduced motion: a steady (non-blinking) cursor.
+    if !app.animations {
+        let _ = out.execute(crossterm::cursor::SetCursorStyle::SteadyBar);
+    }
     // Ctrl+Enter is only distinguishable with the kitty keyboard protocol.
     app.enhanced_keys = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
         && out
@@ -12088,6 +12375,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     disable_raw_mode()?;
     let _ = stdout().execute(crossterm::event::DisableBracketedPaste);
     let _ = stdout().execute(crossterm::event::DisableFocusChange);
+    let _ = stdout().execute(crossterm::cursor::SetCursorStyle::DefaultUserShape);
     let _ = stdout().execute(crossterm::event::DisableMouseCapture);
     stdout().execute(LeaveAlternateScreen)?;
     result
@@ -12190,6 +12478,7 @@ mod tests {
             streaming: String::new(),
             thinking: String::new(),
             show_timestamps: true,
+            animations: true,
             show_thinking: true,
             color: true,
             multi_pane: false,
@@ -12311,6 +12600,8 @@ mod tests {
             search_idx: 0,
             search_mode: false,
             editing_id: None,
+            queued: Vec::new(),
+            editing_queued: None,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -12372,6 +12663,87 @@ mod tests {
         assert!(!app.running());
         app.switch_session("s2".into());
         assert!(app.running() && app.activity.is_some());
+    }
+
+    #[test]
+    fn provider_retries_count_down_in_the_activity_line() {
+        let mut app = test_app();
+        app.on_event(Event::RunStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+        });
+        app.on_event(Event::ProviderRetrying {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            reason: "rate limited".into(),
+            wait_secs: 8,
+            attempt: 2,
+            max_attempts: 5,
+        });
+        let text = app.activity_text().unwrap();
+        assert!(text.contains("rate limited · retrying in 8s (2/5) · Esc to stop"), "{text}");
+        // The next delta replaces the countdown.
+        app.on_event(Event::MessageDelta {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            delta: "hi".into(),
+        });
+        assert!(app.activity_text().unwrap().contains("responding"));
+    }
+
+    #[test]
+    fn steering_messages_are_marked_with_their_step() {
+        let msg = |meta: Option<&str>| MessageInfo {
+            id: "m".into(),
+            session_id: "s1".into(),
+            seq: 1,
+            role: "user".into(),
+            content: "use rg instead".into(),
+            created_at: String::new(),
+            meta: meta.map(str::to_string),
+        };
+        assert_eq!(steer_step(&msg(Some(r#"{"steer":{"step":4}}"#))), Some(4));
+        assert_eq!(steer_step(&msg(Some(r#"{"client":{"label":"web"}}"#))), None);
+        assert_eq!(steer_step(&msg(None)), None);
+    }
+
+    #[test]
+    fn the_queue_follows_events_and_drops_a_sent_edit() {
+        use formless_protocol::QueuedMessage;
+        let mut app = test_app();
+        let q = |id: i64, t: &str| QueuedMessage {
+            id,
+            content: t.into(),
+        };
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![q(1, "first"), q(2, "second")],
+        });
+        assert_eq!(app.queued.len(), 2);
+        app.queue_command("queue edit 2");
+        assert_eq!(app.editing_queued, Some(2));
+        assert_eq!(app.input.expanded(), "second");
+        // It is sent meanwhile: the edit is dropped.
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![q(1, "first")],
+        });
+        assert_eq!(app.editing_queued, None);
+        // Another Session's queue is not shown here.
+        app.on_event(Event::QueueChanged {
+            session_id: "s2".into(),
+            queued: vec![],
+        });
+        assert_eq!(app.queued.len(), 1);
+    }
+
+    #[test]
+    fn reduced_motion_shows_a_static_indicator() {
+        let mut app = test_app();
+        app.animations = false;
+        app.tick = 7;
+        assert_eq!(app.spinner(), "●");
+        assert!(!animations_enabled(false));
     }
 
     #[test]
@@ -14626,6 +14998,7 @@ mod tests {
                 session_id: "s".into(),
                 status: status.into(),
                 outcome: status.into(),
+                rating: String::new(),
                 steps,
                 tool_calls: tools,
                 prompt_tokens: 0,

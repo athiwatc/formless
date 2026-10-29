@@ -385,6 +385,14 @@
   }
 
   // ------------------------------------------------------------ activity
+  // "thinking… 12s", or "rate limited · retrying in 8s (2/5) · Esc to stop".
+  function activityText(a) {
+    if (a.retryAt) {
+      const left = Math.ceil((a.retryAt - Date.now()) / 1000);
+      return a.label + " · " + (left > 0 ? "retrying in " + left + "s " : "retrying ") + a.count + " · Esc to stop";
+    }
+    return a.label + "… " + elapsed(a.since);
+  }
   function setActivity(label) {
     if (!label) S.activity = null;
     else if (!S.activity || S.activity.label !== label) S.activity = { label, since: Date.now() };
@@ -1524,6 +1532,7 @@
     if (!S.daemonOnline) box.append(h("div", { class: "banner" }, "The daemon is offline. Start formless on your machine; this page reconnects automatically."));
     if (!S.messages.length && !isRunning()) { box.append(welcome()); box.append(h("div", { id: "live" })); return; }
     const lastUser = [...S.messages].reverse().find((m) => m.role === "user");
+    const lastAnswer = [...S.messages].reverse().find((m) => m.role === "assistant" && m.content);
     let turn = null;
     let group = null;
     const open = (role, when, msg) => {
@@ -1545,7 +1554,8 @@
         group = null;
         const from = sentElsewhere(m);
         open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)),
-          ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []))));
+          ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
+          ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
       } else if (m.role === "tool") {
         open("assistant", m.created_at).append(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
       } else if (m.role === "system-note") {
@@ -1556,12 +1566,38 @@
           let calls = [];
           try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
           calls.forEach((c) => n.append(toolCallChip(c)));
+          if (m === lastAnswer && !isRunning()) n.append(rateButtons());
         }));
       }
     }
     box.append(h("div", { id: "live", class: "turn" }));
     renderLive();
     scrollToBottom();
+  }
+
+  // 👍/👎 on the last answer (SPEC §8.7), with an optional comment for 👎.
+  function rateButtons() {
+    const rate = async (rating) => {
+      const comment = rating === "bad" ? (prompt("What was wrong? (optional)") || "") : "";
+      const r = await act({ type: "rate_run", session_id: S.current, rating, comment: comment || null });
+      if (r) { S.rated = { session: S.current, rating: r.rating }; renderHistory(); note(r.rating ? "rated " + (r.rating === "good" ? "👍" : "👎") : "rating cleared"); }
+    };
+    const cur = S.rated && S.rated.session === S.current ? S.rated.rating : "";
+    const btn = (rating, label, title) => h("button", { class: "btn ghost small" + (cur === rating ? " active" : ""), type: "button", title, "aria-pressed": String(cur === rating),
+      onclick: () => rate(cur === rating ? "" : rating) }, label);
+    return h("div", { class: "rate" }, btn("good", "👍", "Good answer"), btn("bad", "👎", "Bad answer"),
+      h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message (/retry)", onclick: () => retryRun("") }, "Retry"),
+      h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message on another model; this answer stays in a fork", onclick: () => {
+        const m = prompt("Retry on which model?");
+        if (m && m.trim()) retryRun(m.trim());
+      } }, "Retry with…"));
+  }
+  // Re-run the last user message, on `model` for that Run when given.
+  async function retryRun(model) {
+    const r = await act({ type: "retry_run", session_id: S.current, model: model || null });
+    if (!r) return;
+    note("retrying" + (r.model ? " on " + r.model : "") + (r.original_session ? "; the previous answer is kept in \"… · original answer\"" : ""));
+    if (r.original_session) refreshSessions();
   }
 
   function welcome() {
@@ -1679,7 +1715,7 @@
         t.subagent ? null : payload(t.arguments || "")));
     }
     if (S.streaming) live.append(streamingNode(S.streaming));
-    else if (running && S.activity) live.append(h("div", { class: "activity" }, h("span", { class: "spinner" }), S.activity.label + "… " + elapsed(S.activity.since)));
+    else if (running && S.activity) live.append(h("div", { class: "activity" }, h("span", { class: "spinner" }), activityText(S.activity)));
     scrollToBottom();
   }
 
@@ -1722,6 +1758,27 @@
       } }, "Abandon"));
   }
 
+  /** Messages queued for after this Run (SPEC §5.3): edit, reorder, remove. */
+  function renderQueue() {
+    const box = $("queue");
+    const q = S.queued || [];
+    box.classList.toggle("hidden", !q.length);
+    if (!q.length) return box.replaceChildren();
+    const sid = S.current;
+    const btn = (label, title, fn) => h("button", { class: "btn ghost small", type: "button", title, "aria-label": title, onclick: fn }, label);
+    box.replaceChildren(
+      h("span", { class: "muted" }, "⏳ Queued for after this Run (" + q.length + ")"),
+      h("ol", null, q.map((m, i) => h("li", null,
+        h("span", { class: "text", title: m.content }, m.content),
+        btn("✎", "Edit", () => {
+          const text = prompt("Edit the queued message", m.content);
+          if (text != null && text.trim()) act({ type: "edit_queued", session_id: sid, id: m.id, content: text.trim() });
+        }),
+        i > 0 ? btn("↑", "Move up", () => act({ type: "move_queued", session_id: sid, id: m.id, up: true })) : null,
+        i < q.length - 1 ? btn("↓", "Move down", () => act({ type: "move_queued", session_id: sid, id: m.id, up: false })) : null,
+        btn("✕", "Remove", () => act({ type: "edit_queued", session_id: sid, id: m.id, content: null }))))));
+  }
+
   /** Chips for the Tools the last Run created, updated or retired (SPEC §10.6). */
   function renderRunTools() {
     const box = $("run-tools");
@@ -1760,7 +1817,7 @@
     state.replaceChildren();
     if (isRunning()) {
       state.className = "state busy";
-      state.append(h("span", { class: "spinner" }), S.activity ? S.activity.label + "… " + elapsed(S.activity.since) : "running");
+      state.append(h("span", { class: "spinner" }), S.activity ? activityText(S.activity) : "running");
     } else {
       state.className = "state";
       state.append("● ready");
@@ -2551,6 +2608,7 @@
           ["notify (off, bell, desktop)", c.tui.notify, "tui.notify", "text"],
           ["notify_min_secs", c.tui.notify_min_secs, "tui.notify_min_secs", "number"],
           ["timestamps", on(c.tui.timestamps), "tui.timestamps", "bool"],
+          ["animations", on(c.tui.animations), "tui.animations", "bool"],
           ["on_start (last, new, picker)", c.tui.on_start, "tui.on_start", "text"],
           ["screen_reader", on(c.tui.screen_reader), "tui.screen_reader", "bool"]]),
         section("Relay", [["enabled", on(c.relay.enabled)], ["url", c.relay.url]]),
@@ -3135,13 +3193,15 @@
     S.thinking = "";
     S.liveTools = [];
     S.editMessageId = null;
+    S.queued = []; renderQueue();
     S.follow = true;
     const r = await act({ type: "get_session", id });
     if (r && S.current === id) {
       S.messages = r.messages || [];
       S.unfinished = r.unfinished_run || null;
       renderRunBanner();
-      if (r.queued && r.queued.length) note(r.queued.length + " queued message(s) start after the current run");
+      S.queued = r.queued_items || [];
+      renderQueue();
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
     }
@@ -3165,6 +3225,10 @@
   }
   /** The client a user message came from, when it wasn't this one: another
    * kind of client, or another one still attached. */
+  // The step a steering message (sent mid-Run) arrived at, or null.
+  function steerStep(m) {
+    try { const s = JSON.parse(m.meta || "{}").steer; return s && typeof s.step === "number" ? s.step : null; } catch { return null; }
+  }
   function sentElsewhere(m) {
     let c;
     try { c = JSON.parse(m.meta || "{}").client; } catch (_) {}
@@ -3494,6 +3558,14 @@
     { name: "resend", group: "Run control", desc: "re-send a stalled provider request", run: async () => {
       if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
     } },
+    { name: "retry", args: "[--model MODEL]", group: "Run control", desc: "re-run your last message, optionally on another model (the old answer stays in a fork)", run: (arg) => retryRun((arg || "").replace(/^--model\s*/, "").trim()) },
+    { name: "limit", args: "N|off", group: "Run control", desc: "cap the current (or next) Run at N steps: /limit 20, /limit off", run: async (arg) => {
+      const n = (arg || "").trim();
+      const max = /^(off|none|0)$/.test(n) ? null : parseInt(n, 10);
+      if (max !== null && !(max > 0)) return note("usage: /limit N (steps) or /limit off", true);
+      const r = await act({ type: "set_step_limit", session_id: S.current, max_steps: max });
+      if (r) note(r.max_steps ? (r.active_run ? "this Run" : "the next Run") + " stops after " + r.max_steps + " steps (pauses: /resume continues)" : "no step limit");
+    } },
     { name: "resume", group: "Run control", desc: "continue an interrupted or paused Run", run: async () => {
       if (S.current) await act({ type: "resume_run", session_id: S.current });
     } },
@@ -3655,7 +3727,7 @@
     const r = await act({ type: "send_message", session_id: S.current, content: text, mode });
     // The attachments went with it.
     if (r) { delete S.chips[S.current]; delete mentionAttached[S.current]; renderChips(); }
-    if (r && mode !== "send") note(mode === "queue" ? "queued for after this run" : "steering the current run");
+    if (r && mode === "steer") note("steering the current run");
   }
   function stop() {
     if (S.current && isRunning()) act({ type: "interrupt_run", session_id: S.current });
@@ -3735,7 +3807,7 @@
     switch (ev.type) {
       case "run_started":
         S.running.add(ev.session_id);
-        if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); }
+        if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; }
         if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = []; setActivity("waiting for model"); }
         break;
       case "run_tool_changes":
@@ -3753,6 +3825,15 @@
         break;
       case "provider_stalled":
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
+        break;
+      case "queue_changed":
+        if (here) { S.queued = ev.queued || []; renderQueue(); }
+        break;
+      case "provider_retrying":
+        if (here) {
+          S.activity = { label: ev.reason, since: Date.now(), retryAt: Date.now() + ev.wait_secs * 1000, count: "(" + ev.attempt + "/" + ev.max_attempts + ")" };
+          renderLive();
+        }
         break;
       case "stream_restarted":
         if (here) { S.streaming = ""; S.thinking = ""; note("provider stream dropped; retrying"); renderLive(); }

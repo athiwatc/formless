@@ -46,6 +46,8 @@ pub fn summarize(runs: &[RunMetricsInfo]) -> RunSummary {
         paused: share("paused"),
         edited: share("edited"),
         corrected: share("corrected"),
+        rated_good: done.iter().filter(|r| r.rating == "good").count() as f64 / n,
+        rated_bad: share("rated_bad"),
         avg_steps: avg(|r| r.steps),
         avg_tool_calls: avg(|r| r.tool_calls),
         avg_tokens: avg(|r| r.prompt_tokens + r.completion_tokens),
@@ -56,13 +58,15 @@ pub fn summarize(runs: &[RunMetricsInfo]) -> RunSummary {
 /// One line for the optimiser's proposal signals and the Metrics title.
 pub fn summary_line(s: &RunSummary) -> String {
     format!(
-        "Runs: {} · {:.0}% completed · {:.0}% interrupted · {:.0}% paused · {:.0}% edited · {:.0}% corrected · {:.1} steps · {:.1} tool calls · {:.0} tokens avg",
+        "Runs: {} · {:.0}% completed · {:.0}% interrupted · {:.0}% paused · {:.0}% edited · {:.0}% corrected · {:.0}% 👍 · {:.0}% 👎 · {:.1} steps · {:.1} tool calls · {:.0} tokens avg",
         s.runs,
         s.completed * 100.0,
         s.interrupted * 100.0,
         s.paused * 100.0,
         s.edited * 100.0,
         s.corrected * 100.0,
+        s.rated_good * 100.0,
+        s.rated_bad * 100.0,
         s.avg_steps,
         s.avg_tool_calls,
         s.avg_tokens

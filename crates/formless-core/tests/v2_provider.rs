@@ -729,3 +729,62 @@ async fn prompt_cache_key_is_sent_and_dropped_when_rejected() {
     .unwrap();
     assert_eq!(seen.lock().unwrap().last().unwrap(), &Value::Null);
 }
+
+/// A 429 is retried after the server's `Retry-After`, and the retry hook
+/// hears why, how long and which attempt (the activity-line countdown).
+#[tokio::test]
+async fn rate_limit_retries_are_reported_to_the_hook() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let h = h.clone();
+            async move {
+                if h.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "1")],
+                        "slow down",
+                    )
+                        .into_response();
+                }
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices": [{"delta": {"content": "ok"}}]})
+                )
+                .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    c.max_retries = 3;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    let p = Provider::new(c, "k".into())
+        .unwrap()
+        .with_retry_hook(Arc::new(move |n| s.lock().unwrap().push(n)));
+    let out = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "x"})],
+            &[],
+            "good",
+            None,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.content, "ok");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].reason, "rate limited");
+    assert_eq!(seen[0].wait.as_secs(), 1);
+    assert_eq!((seen[0].attempt, seen[0].max_attempts), (1, 3));
+}

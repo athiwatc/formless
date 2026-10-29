@@ -201,6 +201,11 @@ pub struct Daemon {
     /// from a budget pause).
     budget_warned: StdMutex<std::collections::HashSet<String>>,
     budget_waived: StdMutex<std::collections::HashSet<String>>,
+    /// Per-Session step caps from `/limit` / `--max-steps`, for the active
+    /// or next Run (cleared when it ends).
+    step_limits: StdMutex<HashMap<String, u32>>,
+    /// A model for a Session's next Run only (`RetryRun {model}`).
+    next_run_model: StdMutex<HashMap<String, String>>,
     /// Registry changes made by each running Run, by run id.
     run_tool_changes: StdMutex<HashMap<String, Vec<ToolChange>>>,
     /// Approvals for one Session only, by (session id, tool id): the
@@ -321,6 +326,8 @@ impl Daemon {
             relay_kick: StdMutex::new(None),
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: StdMutex::new(Default::default()),
+            step_limits: StdMutex::new(Default::default()),
+            next_run_model: StdMutex::new(Default::default()),
             run_tool_changes: StdMutex::new(Default::default()),
             session_grants: StdMutex::new(Default::default()),
             timed_grants: StdMutex::new(Default::default()),
@@ -708,7 +715,7 @@ impl Daemon {
                         .filter(|_| !st.session_deleted(&id).unwrap_or(false))
                         .context("session not found")?;
                     let m = st.list_messages(&id)?;
-                    let q = st.list_queued_messages(&id)?;
+                    let q = st.queued_items(&id)?;
                     let l = st.unfinished_last_run(&id)?;
                     Ok((s, m, q, l))
                 })?;
@@ -718,8 +725,11 @@ impl Daemon {
                 let last_run = last.filter(|_| !running).map(|(run_id, status, error)| {
                     json!({"run_id": run_id, "status": status, "error": error})
                 });
+                // `queued`: the texts (as before); `queued_items` adds ids
+                // for editing.
+                let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
-                    json!({"session": session, "messages": messages, "queued": queued, "unfinished_run": last_run}),
+                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "unfinished_run": last_run}),
                 )
             }
             Request::ForkSession {
@@ -827,6 +837,117 @@ impl Daemon {
                 content,
                 mode,
             } => self.send_message(session_id, content, mode).await,
+            Request::EditQueued {
+                session_id,
+                id,
+                content,
+            } => {
+                let content = content.map(|c| c.trim().to_string());
+                if content.as_deref() == Some("") {
+                    return Err(anyhow!("a queued message cannot be empty; remove it instead"));
+                }
+                let found =
+                    self.with_store(|st| st.edit_queued(&session_id, id, content.as_deref()))?;
+                if !found {
+                    return Err(anyhow!("that message is no longer queued (it was sent)"));
+                }
+                self.queue_changed(&session_id);
+                Ok(json!({"ok": true}))
+            }
+            Request::MoveQueued { session_id, id, up } => {
+                let now = self.with_store(|st| st.move_queued(&session_id, id, up))?;
+                if now.is_some() {
+                    self.queue_changed(&session_id);
+                }
+                Ok(json!({"id": now}))
+            }
+            Request::RetryRun {
+                session_id,
+                model,
+                keep_original,
+            } => {
+                if self.runs.lock().unwrap().contains_key(&session_id) {
+                    return Err(anyhow!(
+                        "session has an active run; interrupt it before retrying"
+                    ));
+                }
+                let msgs = self.with_reader(|st| st.list_messages(&session_id))?;
+                let last_user = msgs
+                    .iter()
+                    .rposition(|m| m.role == "user")
+                    .context("nothing to retry: no message from you in this session")?;
+                let user = msgs[last_user].clone();
+                let answered = msgs[last_user + 1..]
+                    .iter()
+                    .any(|m| m.role == "assistant" || m.role == "tool");
+                let mut original = None;
+                if keep_original && answered {
+                    let name = self
+                        .with_reader(|st| st.get_session(&session_id))?
+                        .map(|s| s.name)
+                        .unwrap_or_default();
+                    let fork = self
+                        .with_store(|st| {
+                            st.fork_session(
+                                &session_id,
+                                Some(format!("{name} · original answer")),
+                                None,
+                            )
+                        })?
+                        .context("session not found")?;
+                    self.broadcast(Event::SessionUpdated {
+                        session: fork.clone(),
+                    });
+                    original = Some(fork.id);
+                }
+                let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+                if let Some(m) = &model {
+                    self.next_run_model
+                        .lock()
+                        .unwrap()
+                        .insert(session_id.clone(), m.clone());
+                }
+                self.with_store(|st| st.edit_message(&session_id, &user.id, &user.content))?
+                    .context("user message not found")?;
+                self.broadcast(Event::MessagesEdited {
+                    session_id: session_id.clone(),
+                });
+                if let Err(e) = self.start_run(session_id.clone()) {
+                    self.next_run_model.lock().unwrap().remove(&session_id);
+                    return Err(e);
+                }
+                Ok(json!({"model": model, "original_session": original}))
+            }
+            Request::RateRun {
+                session_id,
+                run_id,
+                rating,
+                comment,
+            } => {
+                if !matches!(rating.as_str(), "good" | "bad" | "") {
+                    return Err(anyhow!("rating must be \"good\", \"bad\" or \"\""));
+                }
+                let rated = self
+                    .with_store(|st| {
+                        st.rate_run(&session_id, run_id.as_deref(), &rating, comment.as_deref())
+                    })?
+                    .context("no finished Run to rate in this session")?;
+                Ok(json!({"run_id": rated, "rating": rating}))
+            }
+            Request::SetStepLimit {
+                session_id,
+                max_steps,
+            } => {
+                self.with_store(|st| st.get_session(&session_id))?
+                    .context("session not found")?;
+                let mut limits = self.step_limits.lock().unwrap();
+                match max_steps.filter(|n| *n > 0) {
+                    Some(n) => limits.insert(session_id.clone(), n),
+                    None => limits.remove(&session_id),
+                };
+                let active = self.runs.lock().unwrap().contains_key(&session_id);
+                Ok(json!({"max_steps": max_steps.filter(|n| *n > 0), "active_run": active}))
+            }
             Request::ResumeRun { session_id } => {
                 if self.runs.lock().unwrap().contains_key(&session_id) {
                     return Err(anyhow!("a run is already active in this session"));
@@ -2627,6 +2748,7 @@ impl Daemon {
             .unwrap()
             .retain(|(s, _), _| s != session_id);
         let _ = self.with_store(|st| st.clear_queued_messages(session_id));
+        self.queue_changed(session_id);
         if let Some(ctl) = self.runs.lock().unwrap().get(session_id) {
             ctl.cancel_flag.store(true, Ordering::SeqCst);
             ctl.cancel.cancel();
@@ -2681,11 +2803,27 @@ impl Daemon {
             (true, SendMode::Queue) => {
                 // Persisted, so a daemon restart does not lose it.
                 self.with_store(|st| st.enqueue_message(&session_id, &content))?;
+                self.queue_changed(&session_id);
                 Ok(json!({"queued": true}))
             }
             (true, _) => {
                 // Steer (Enter) or Send-while-busy: persist + notify run (SPEC §5.3).
-                let msg = self.append_user_message(&session_id, &content)?;
+                // Marked with the step it arrived at, so the transcript
+                // shows where the agent was redirected.
+                let run_id = self
+                    .runs
+                    .lock()
+                    .unwrap()
+                    .get(&session_id)
+                    .map(|c| c.run_id.clone());
+                let step = run_id
+                    .and_then(|r| self.with_reader(|st| st.run_steps(&r)).ok())
+                    .unwrap_or(0);
+                let msg = self.append_user_message_meta(
+                    &session_id,
+                    &content,
+                    Some(("steer", json!({"step": step}))),
+                )?;
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
@@ -2795,6 +2933,7 @@ impl Daemon {
         }
         self.runs.lock().unwrap().remove(&session_id);
         self.budget_waived.lock().unwrap().remove(&session_id);
+        self.step_limits.lock().unwrap().remove(&session_id);
         let changes = self.run_tool_changes.lock().unwrap().remove(&run_id);
         if let Some(changes) = changes.filter(|c| !c.is_empty()) {
             self.broadcast(Event::RunToolChanges {
@@ -2839,6 +2978,7 @@ impl Daemon {
             .ok()
             .flatten();
         if let Some(content) = next {
+            self.queue_changed(&session_id);
             if let Ok(msg) = self.append_user_message(&session_id, &content) {
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
@@ -3104,10 +3244,27 @@ impl Daemon {
         self.with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
         // The Session's model, or its role's provider + model (SPEC §4.5).
-        let target = self.target(&cfg, session_id, None).await?;
-        let provider = target
-            .provider
-            .with_cache_key(&format!("formless-{session_id}"));
+        let once = self.next_run_model.lock().unwrap().remove(session_id);
+        let target = self.target(&cfg, session_id, once.as_deref()).await?;
+        let provider = {
+            let (sid, rid, subs) = (session_id.to_string(), run_id.to_string(), self.subs.clone());
+            target
+                .provider
+                .with_cache_key(&format!("formless-{session_id}"))
+                .with_retry_hook(Arc::new(move |n: crate::provider::RetryNotice| {
+                    send_all(
+                        &subs,
+                        Event::ProviderRetrying {
+                            session_id: sid.clone(),
+                            run_id: rid.clone(),
+                            reason: n.reason,
+                            wait_secs: n.wait.as_secs_f64().ceil() as u64,
+                            attempt: n.attempt as u32,
+                            max_attempts: n.max_attempts as u32,
+                        },
+                    );
+                }))
+        };
         let requested_model = target.model.clone();
         let (context_chars, tool_count) = self.with_store(|st| {
             let chars = st.session_content_chars(session_id).unwrap_or(0);
@@ -5800,7 +5957,12 @@ impl Daemon {
     /// a note at 80%, and at 100% an error that pauses the Run ("budget:
     /// …"). Dollar limits apply only while every model used has a price.
     fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
-        let l = &cfg.limits;
+        let mut l = cfg.limits.clone();
+        // `/limit N` for this Run replaces `limits.run_steps`.
+        let per_run = self.step_limits.lock().unwrap().get(session_id).copied();
+        if let Some(n) = per_run {
+            l.run_steps = Some(n.into());
+        }
         if l.daily_usd.is_none() && l.run_usd.is_none() && l.run_steps.is_none() {
             return Ok(());
         }
@@ -5816,7 +5978,11 @@ impl Daemon {
                 "run_steps".into(),
                 steps as f64,
                 max as f64,
-                format!("this Run took {steps} of {max} steps"),
+                if per_run.is_some() {
+                    format!("this Run took {steps} of the {max} steps set with /limit")
+                } else {
+                    format!("this Run took {steps} of {max} steps")
+                },
             ));
         }
         if let (Some(max), Some(cost)) = (l.run_usd, run.cost) {
@@ -5845,9 +6011,14 @@ impl Daemon {
             }
         }
         for (name, used, max, what) in checks {
+            let source = if per_run.is_some() && name == "run_steps" {
+                String::new()
+            } else {
+                format!(" (limits.{name})")
+            };
             if max > 0.0 && used >= max {
                 return Err(anyhow!(
-                    "budget: {what} (limits.{name}). The Run is paused."
+                    "budget: {what}{source}. The Run is paused: /resume continues, /abandon stops."
                 ));
             }
             let key = if name == "daily_usd" {
@@ -5858,7 +6029,11 @@ impl Daemon {
             if used >= max * 0.8 && self.budget_warned.lock().unwrap().insert(key) {
                 self.broadcast(Event::Note {
                     session_id: Some(session_id.to_string()),
-                    text: format!("Spending: {what} (80% of limits.{name})."),
+                    text: if source.is_empty() {
+                        format!("Spending: {what} (80%).")
+                    } else {
+                        format!("Spending: {what} (80% of limits.{name}).")
+                    },
                 });
             }
         }
@@ -6085,7 +6260,27 @@ impl Daemon {
     }
 
     /// Append a user message, carrying the Session's pending attachments.
+    /// Tell clients the Session's queue changed.
+    fn queue_changed(&self, session_id: &str) {
+        if let Ok(queued) = self.with_reader(|st| st.queued_items(session_id)) {
+            self.broadcast(Event::QueueChanged {
+                session_id: session_id.to_string(),
+                queued,
+            });
+        }
+    }
+
     fn append_user_message(&self, session_id: &str, content: &str) -> Result<MessageInfo> {
+        self.append_user_message_meta(session_id, content, None)
+    }
+
+    /// A user message with one extra meta entry (e.g. `steer`).
+    fn append_user_message_meta(
+        &self,
+        session_id: &str,
+        content: &str,
+        extra: Option<(&str, serde_json::Value)>,
+    ) -> Result<MessageInfo> {
         let atts = self
             .attachments
             .lock()
@@ -6099,6 +6294,9 @@ impl Daemon {
         // Who sent it, so other clients on the Session can tell (§10.4).
         if let Some((conn, label)) = current_client() {
             meta["client"] = json!({"conn": conn, "label": label});
+        }
+        if let Some((k, v)) = extra {
+            meta[k] = v;
         }
         let meta = (meta != json!({})).then(|| meta.to_string());
         self.with_store(|st| st.append_message_meta(session_id, "user", content, meta))
