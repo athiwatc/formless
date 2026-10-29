@@ -159,6 +159,9 @@ enum Pending {
     RunMetrics,
     ListBuiltinStats,
     ListJobs,
+    JobRuns,
+    SkillPreview,
+    Forget,
     ListAudit,
     SessionUsage,
     ListInvocations,
@@ -970,6 +973,12 @@ struct App {
     approval_summaries: HashMap<String, String>,
     /// Batch positions of held calls, by approval id (SPEC §5.2) …
     approval_batches: HashMap<String, ApprovalBatch>,
+    /// `/forget`: the query whose matches were just listed (the same
+    /// command again deletes them), the current query, and whether this
+    /// answer deletes.
+    forget_arm: Option<String>,
+    forget_query: String,
+    forget_confirm: bool,
     /// Path scopes an approval offers, each with the one picked (0 = the
     /// path itself), by approval id (SPEC §10.3).
     approval_scopes: HashMap<String, Vec<(PathOption, usize)>>,
@@ -1184,6 +1193,9 @@ impl App {
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
             approval_scopes: HashMap::new(),
+            forget_arm: None,
+            forget_query: String::new(),
+            forget_confirm: false,
             grants_family: None,
             broad_arm: None,
             batch_answers: HashMap::new(),
@@ -2032,6 +2044,16 @@ impl App {
                             if list.is_empty() {
                                 self.notes.push("no scheduled jobs".into());
                             }
+                            // Jobs fire only while the daemon runs (§9.7).
+                            let keep_alive = Config::load(&self.paths)
+                                .map(|c| c.daemon.keep_alive_for_jobs)
+                                .unwrap_or(false);
+                            if !keep_alive && list.iter().any(|j| j.enabled && j.approved) {
+                                self.notes.push(
+                                    "Jobs run only while Formless is running; set daemon.keep_alive_for_jobs = true to run them on schedule."
+                                        .into(),
+                                );
+                            }
                             for j in list {
                                 self.notes.push(format!(
                                     "job {} [{}] {} · next {} · last {} · {}",
@@ -2054,6 +2076,114 @@ impl App {
                                         &j.last_status
                                     },
                                     truncate_chars(&j.prompt, 60)
+                                ));
+                            }
+                        }
+                        Pending::SkillPreview => {
+                            let name = result["skill"]["name"].as_str().unwrap_or_default();
+                            let mut lines = vec![
+                                format!(
+                                    "{} v{} · {} · {}",
+                                    name,
+                                    result["skill"]["version"],
+                                    if result["skill"]["enabled"] == true {
+                                        "enabled"
+                                    } else {
+                                        "disabled"
+                                    },
+                                    result["skill"]["source"].as_str().unwrap_or_default()
+                                ),
+                                String::new(),
+                            ];
+                            lines.extend(
+                                result["body"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .lines()
+                                    .map(str::to_string),
+                            );
+                            lines.push(String::new());
+                            lines.push("Files:".into());
+                            for f in result["files"].as_array().into_iter().flatten() {
+                                lines.push(format!("  {}", f.as_str().unwrap_or_default()));
+                            }
+                            let scripts: Vec<&str> = result["scripts"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|s| s.as_str())
+                                .collect();
+                            if !scripts.is_empty() {
+                                lines.push(String::new());
+                                lines.push(format!("Scripts: {}", scripts.join(", ")));
+                                lines.push(
+                                    "  Never run on the host: the agent can only port one into a Tool, whose Capabilities you approve."
+                                        .into(),
+                                );
+                            }
+                            lines.push(String::new());
+                            lines.push(format!("/skill:{name} loads it into this Session"));
+                            self.pager = Some(Pager {
+                                title: format!("Skill {name}"),
+                                lines,
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::Forget => {
+                            let list: Vec<MemoryInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            let q = self.forget_query.to_lowercase();
+                            let hits: Vec<MemoryInfo> = list
+                                .into_iter()
+                                .filter(|m| m.text.to_lowercase().contains(&q))
+                                .collect();
+                            if hits.is_empty() {
+                                self.notes
+                                    .push(format!("no memory mentions \"{}\"", self.forget_query));
+                            } else if self.forget_confirm {
+                                for m in &hits {
+                                    self.fire(Request::DeleteMemory { id: m.id.clone() });
+                                }
+                                self.notes.push(format!("forgot {} memories", hits.len()));
+                            } else {
+                                for m in &hits {
+                                    self.notes.push(format!(
+                                        "  {}: {}",
+                                        m.id,
+                                        truncate_chars(&m.text, 90)
+                                    ));
+                                }
+                                self.notes.push(format!(
+                                    "/forget {} again deletes these {}",
+                                    self.forget_query,
+                                    hits.len()
+                                ));
+                                self.forget_arm = Some(self.forget_query.clone());
+                            }
+                        }
+                        Pending::JobRuns => {
+                            let runs: Vec<formless_protocol::JobRunInfo> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            if runs.is_empty() {
+                                self.notes.push("that job has not run yet".into());
+                            }
+                            for r in runs {
+                                self.notes.push(format!(
+                                    "{} · {} · {}{}{}{}",
+                                    truncate_chars(&r.started_at.replace('T', " "), 16),
+                                    r.trigger,
+                                    r.status,
+                                    r.cost.map(|c| format!(" · ${c:.3}")).unwrap_or_default(),
+                                    r.session_id
+                                        .map(|s| format!(" · session {s}"))
+                                        .unwrap_or_default(),
+                                    if r.detail.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" · {}", r.detail)
+                                    }
                                 ));
                             }
                         }
@@ -2105,6 +2235,10 @@ impl App {
                                     if s.has_scripts { " · scripts" } else { "" },
                                     if s.author == "auto" { " · auto" } else { "" }
                                 ));
+                                if let Some(why) = s.retire_reason.as_deref().filter(|_| s.retired)
+                                {
+                                    self.notes.push(format!("  retired: {why}"));
+                                }
                             }
                         }
                         Pending::ListMcpPrompts => {
@@ -3724,6 +3858,61 @@ impl App {
             "mcp" => self.request(Pending::ListMcpServers, Request::ListMcpServers),
             "prompts" => self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts),
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
+            // Preview a skill before enabling it: SKILL.md, files, scripts.
+            cmd if cmd.starts_with("skills ") => {
+                let name = cmd["skills ".len()..].trim().to_string();
+                self.request(Pending::SkillPreview, Request::GetSkill { name });
+            }
+            // Load a skill into this Session by hand.
+            cmd if cmd.starts_with("skill:") => {
+                let rest = cmd["skill:".len()..].trim();
+                let (name, args) = rest.split_once(' ').unwrap_or((rest, ""));
+                match (self.current.clone(), name.is_empty()) {
+                    (Some(session_id), false) => {
+                        self.request(
+                            Pending::RunControl,
+                            Request::LoadSkill {
+                                session_id,
+                                name: name.to_string(),
+                                args: (!args.trim().is_empty()).then(|| args.trim().to_string()),
+                            },
+                        );
+                        self.notes.push(format!("loaded skill {name}"));
+                    }
+                    (None, _) => self.notes.push("no current session".into()),
+                    _ => self.notes.push("usage: /skill:NAME [arguments]".into()),
+                }
+            }
+            // Save a preference directly, as the user.
+            cmd if cmd == "remember" || cmd.starts_with("remember ") => {
+                let text = cmd["remember".len()..].trim().to_string();
+                if text.is_empty() {
+                    self.notes.push("usage: /remember TEXT".into());
+                } else {
+                    self.request(
+                        Pending::RunControl,
+                        Request::UpsertMemory {
+                            id: None,
+                            text: Some(text.clone()),
+                            scope: None,
+                            enabled: None,
+                        },
+                    );
+                    self.notes.push(format!("remembered: {text}"));
+                }
+            }
+            // Find memories; the same command again deletes them.
+            cmd if cmd == "forget" || cmd.starts_with("forget ") => {
+                let query = cmd["forget".len()..].trim().to_string();
+                if query.is_empty() {
+                    self.notes.push("usage: /forget TEXT (then the same again to delete)".into());
+                } else {
+                    let confirm = self.forget_arm.take().is_some_and(|q| q == query);
+                    self.forget_confirm = confirm;
+                    self.forget_query = query;
+                    self.request(Pending::Forget, Request::ListMemories);
+                }
+            }
             "memory" => self.request(Pending::ListMemories, Request::ListMemories),
             "jobs" => self.request(Pending::ListJobs, Request::ListJobs),
             "roles" | "providers" => self.request(Pending::ListProviders, Request::ListProviders),
@@ -4000,6 +4189,17 @@ impl App {
                         enabled: false,
                     }),
                     "rm" | "delete" => Some(Request::DeleteJob { id: id.clone() }),
+                    "run" => Some(Request::RunJobNow { id: id.clone() }),
+                    "history" if !id.is_empty() => {
+                        self.request(
+                            Pending::JobRuns,
+                            Request::JobRuns {
+                                id: id.clone(),
+                                limit: Some(20),
+                            },
+                        );
+                        return;
+                    }
                     _ => None,
                 };
                 match req {
@@ -4009,9 +4209,19 @@ impl App {
                     }
                     _ => self
                         .notes
-                        .push("usage: /jobs [enable|disable|rm ID]".into()),
+                        .push("usage: /jobs [enable|disable|run|history|rm ID]".into()),
                 }
             }
+            "memory used" => match self.current.clone() {
+                Some(session_id) => self.request(
+                    Pending::ListMemories,
+                    Request::RunMemories {
+                        run_id: None,
+                        session_id: Some(session_id),
+                    },
+                ),
+                None => self.notes.push("no current session".into()),
+            },
             cmd if cmd.starts_with("memory ") => {
                 let mut words = cmd.split_whitespace().skip(1);
                 let (verb, id) = (
@@ -11908,6 +12118,13 @@ fn usage_text(u: &formless_protocol::UsageInfo) -> String {
     if let Some(c) = u.cost {
         s.push_str(&format!(" · ${c:.3}"));
     }
+    if u.memories > 0 {
+        s.push_str(&format!(
+            " · used {} memor{} (/memory used)",
+            u.memories,
+            if u.memories == 1 { "y" } else { "ies" }
+        ));
+    }
     s
 }
 
@@ -12076,6 +12293,9 @@ mod tests {
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
             approval_scopes: HashMap::new(),
+            forget_arm: None,
+            forget_query: String::new(),
+            forget_confirm: false,
             grants_family: None,
             broad_arm: None,
             batch_answers: HashMap::new(),

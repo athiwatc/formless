@@ -1197,6 +1197,16 @@ Tools fill capability gaps; skills say how to use them well.
   (`/skills enable|disable NAME`); the web Settings view (review, enable,
   remove). Changes are audit-logged.
 
+- **By hand.** `/skills NAME` previews a skill in the pager (SKILL.md,
+  its files, and its scripts, which never run on the host) before it is
+  enabled; the web "Review" does the same. `/skill:NAME [args]`
+  (`LoadSkill {session_id, name, args}`) loads an enabled skill into the
+  Session: its instructions and arguments join the chat as a note, and
+  the load counts like the agent's.
+- **Retired skills say why.** An auto-retired skill keeps
+  `retire_reason` ("unused: …" or "unhelpful: N of M Runs that loaded it
+  completed"), shown by `/skills` and the web; enabling it clears it.
+
 ### 7.11 User memory
 
 Short notes about stable user preferences and facts ("uses pnpm",
@@ -1224,8 +1234,21 @@ suite cannot measure preferences.
   `UpsertMemory` (add with no `id`, author `user`; or edit the text,
   scope or enabled flag) and `DeleteMemory`. Clients are:
   - CLI: `formless memory list [--json]|add|rm|edit`
-  - TUI: `/memory`, `/memory rm|on|off ID`, `/memory edit ID TEXT`
+  - TUI: `/memory`, `/memory rm|on|off ID`, `/memory edit ID TEXT`,
+    `/remember TEXT` (saved as the user), `/forget TEXT` (lists the
+    notes that mention it; the same command again deletes them) and
+    `/memory used` (the notes the latest Run carried)
   - web: the Settings "Memory" section.
+- **Confirm writes.** `memory.confirm_writes` (`never` by default,
+  `sensitive`, `always`) asks the user before an agent note is kept.
+  `sensitive` asks only for personal details (health, money, contacts,
+  where they live, family, beliefs; a word-list heuristic). Approve keeps
+  it; deny (or nobody connected) discards it, is logged
+  `memory.discard`, and tells the agent not to save it again.
+- **Used by a Run.** When a Run starts, the notes its prompt carries are
+  recorded (`run_memories`). `RunUsage`/`SessionUsage` report
+  `memories`, the status line says "used N memories", and
+  `RunMemories {run_id | session_id}` lists them.
   Memory is never part of Tool or skill bundles, and `formless reset`
   wipes it with the rest of the data.
 - **No secrets.** Memory is sent to the provider every Session, so every
@@ -1763,7 +1786,12 @@ refresh a cache, nightly cleanup.
     `/step`, `@hourly`/`@daily`/`@weekly`/`@monthly`; when both day fields
     are restricted, either may match). `at` is RFC 3339,
     `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
-  - The user uses `AddJob` or `formless jobs add PROMPT --cron … | --at …`.
+  - The user uses `AddJob` or `formless jobs add PROMPT --every … |
+    --cron … | --at …`. A user's schedule may be plain English: "every
+    weekday at 9am", "every 2 hours", "every 15 minutes", "daily at
+    18:30", "hourly", "every monday and friday at noon", "every weekend
+    at 8pm"; it is stored as cron. `PreviewSchedule {schedule}` returns
+    the cron and the next 3 runs, which `jobs add` prints to confirm.
 - **Trust:** one-shot jobs from the agent are scheduled at once.
   Recurring ones need the user's approval: asked immediately, or, with
   nobody connected, saved as "awaiting approval" until the user enables
@@ -1771,16 +1799,41 @@ refresh a cache, nightly cleanup.
 - **Running:** the daemon checks every 20 s. A due job sends its prompt to
   its Session (queued if that Session is busy), or to a new Session named
   `Job: …`. A one-shot job then ends; a recurring one moves to its next
-  match after now. A job missed while the daemon was down runs once on
-  the next start, so there are no catch-up storms. Everything is
-  audit-logged and broadcasts `JobsChanged`.
+  match after now. Firings missed while the daemon was down or the
+  machine slept run once, and its history says "ran late, N firings
+  coalesced". Everything is audit-logged and broadcasts `JobsChanged`.
+- **Overlap:** each job has `overlap`: `skip` (default) skips a firing
+  while the previous one is still queued or running; `queue` queues it.
+  Either way a Session never holds more than 5 queued messages: further
+  firings are skipped. Skips are recorded in the history and audit-logged
+  `job.skip`.
+- **History:** every firing is a `job_runs` row: trigger (`schedule` or
+  `manual`), outcome (the Run's final status, or `skipped`), duration,
+  cost, Session and details. `JobRuns {id}`, `formless jobs history ID`,
+  `/jobs history ID` and the web "History" button show it. A firing whose
+  Run doesn't complete posts a note to every client.
+- **Run now:** `RunJobNow {id}` (`formless jobs run ID`, `/jobs run ID`,
+  web "Run now") fires a job at once under the same overlap rules; its
+  schedule is unchanged.
+- **Delivery:** `deliver` (`AddJob`, `SetJobOptions`; `jobs add --notify
+  --to-file PATH --webhook URL`) sends the answer when the firing's Run
+  ends: a desktop notification, a Markdown entry appended to a file,
+  and/or a JSON POST (`job_id, prompt, status, answer, session_id`).
+  These are targets the user configured, so they need no approval; the
+  results go in the history and the audit log (`job.deliver`). For other
+  channels (email, chat) point a webhook at them, or have the prompt use
+  an MCP Tool.
 - **Idle rule:** the daemon still idle-closes (§9.1) unless the user sets
   `daemon.keep_alive_for_jobs = true`, which keeps it up while enabled
-  jobs wait. Otherwise due jobs run at the next start.
+  jobs wait. Otherwise due jobs run at the next start. Creating or
+  enabling a job with it off answers with a `warning`, which the CLI
+  prints; `GetSettings.jobs_warning`, `/jobs`, the web Jobs section and
+  `formless doctor` say it too.
 - **Clients:**
-  - CLI: `formless jobs list|add|enable|disable|rm`
-  - TUI: `/jobs`, `/jobs enable|disable|rm ID`
-  - web: the Settings "Jobs" section (approve, enable, delete).
+  - CLI: `formless jobs list|add|run|history|enable|disable|rm`
+  - TUI: `/jobs`, `/jobs enable|disable|run|history|rm ID`
+  - web: the Settings "Jobs" section (approve, enable, run now, history,
+    delete).
 
 ### 9.8 Hooks
 
@@ -2990,6 +3043,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `compaction.model` | (session) | Optional separate compaction model (§11) |
 | `compaction.server_side` | false | Prefer `POST {base_url}/compact` when supported (§11) |
 | `compaction.trigger_fraction` | 0.8 | Fraction of the context window at which compaction starts (§11) |
+| `memory.confirm_writes` | `never` | Ask before keeping a note the agent writes: `never`, `sensitive` (personal details) or `always` (§7.11) |
 | `mcp.idle_secs` | 300 | Stop an MCP server process after this long without calls; it restarts on the next one (§7.9) |
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |

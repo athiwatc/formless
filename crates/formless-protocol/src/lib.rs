@@ -565,6 +565,40 @@ pub struct JobInfo {
     /// "user" or "agent".
     pub author: String,
     pub created_at: String,
+    /// When a firing comes while the previous one is still queued or
+    /// running: `skip` (default) or `queue` (SPEC §9.7).
+    #[serde(default = "default_overlap")]
+    pub overlap: String,
+    /// Where the answer goes when a firing's Run ends: `{"notify": true}`,
+    /// `{"file": "/abs/path"}` and/or `{"webhook": "https://…"}`.
+    #[serde(default)]
+    pub deliver: Option<serde_json::Value>,
+}
+
+fn default_overlap() -> String {
+    "skip".into()
+}
+
+/// One firing of a job (SPEC §9.7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct JobRunInfo {
+    pub id: String,
+    pub job_id: String,
+    pub session_id: Option<String>,
+    /// `schedule` or `manual`.
+    pub trigger: String,
+    /// `running`, then the Run's outcome (`completed`, `failed`, …), or
+    /// `skipped`.
+    pub status: String,
+    /// Late firings coalesced, why it was skipped, delivery results.
+    #[serde(default)]
+    pub detail: String,
+    /// USD, when known.
+    #[serde(default)]
+    pub cost: Option<f64>,
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: Option<String>,
 }
 
 /// A built-in's measured use (SPEC §8.8).
@@ -609,6 +643,9 @@ pub struct UsageInfo {
     pub context_used: i64,
     #[serde(default)]
     pub context_tokens: i64,
+    /// Saved memories the Run's prompt carried (SPEC §7.11).
+    #[serde(default)]
+    pub memories: i64,
 }
 
 /// One Run's metrics (SPEC §8.7).
@@ -688,6 +725,10 @@ pub struct SkillInfo {
     pub runs_completed: i64,
     pub created_at: String,
     pub updated_at: String,
+    /// Why it was retired automatically (unused, or unhelpful with its
+    /// completion rate).
+    #[serde(default)]
+    pub retire_reason: Option<String>,
 }
 
 /// A configured MCP server and its state (SPEC §7.9).
@@ -1119,6 +1160,15 @@ pub enum Request {
     GetSkill {
         name: String,
     },
+    /// The user loads an enabled skill into a Session (`/skill:NAME
+    /// [args]`): its instructions join the conversation as a note, with
+    /// the arguments, and the load is counted (SPEC §7.10).
+    LoadSkill {
+        session_id: String,
+        name: String,
+        #[serde(default)]
+        args: Option<String>,
+    },
     /// Recent Runs' metrics and their summary (SPEC §8.7):
     /// `{"runs": [RunMetricsInfo], "summary": RunSummary}`.
     RunMetrics {
@@ -1325,7 +1375,8 @@ pub enum Request {
     },
     /// Scheduled jobs (SPEC §9.7).
     ListJobs,
-    /// Add a job as the user (approved): `cron` for recurring, else `at`.
+    /// Add a job as the user (approved): `cron` for recurring (a cron
+    /// expression or plain English, "every weekday at 9am"), else `at`.
     AddJob {
         prompt: String,
         #[serde(default)]
@@ -1334,6 +1385,33 @@ pub enum Request {
         cron: Option<String>,
         #[serde(default)]
         at: Option<String>,
+        #[serde(default)]
+        overlap: Option<String>,
+        #[serde(default)]
+        deliver: Option<serde_json::Value>,
+    },
+    /// A schedule (cron or plain English) as cron, with its next runs:
+    /// `{cron, next: [RFC 3339; 3]}`.
+    PreviewSchedule {
+        schedule: String,
+    },
+    /// Fire a job now, outside its schedule (its next run is unchanged).
+    RunJobNow {
+        id: String,
+    },
+    /// A job's latest firings (`Vec<JobRunInfo>`), newest first.
+    JobRuns {
+        id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Change a job's overlap policy or delivery (`deliver: null` clears).
+    SetJobOptions {
+        id: String,
+        #[serde(default)]
+        overlap: Option<String>,
+        #[serde(default)]
+        deliver: Option<serde_json::Value>,
     },
     /// Enabling also approves an agent-created recurring job.
     SetJobEnabled {
@@ -1355,6 +1433,14 @@ pub enum Request {
     },
     /// User-memory notes (SPEC §7.11).
     ListMemories,
+    /// The memories a Run's prompt carried (`Vec<MemoryInfo>`): that Run,
+    /// or the Session's latest one.
+    RunMemories {
+        #[serde(default)]
+        run_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     /// Add a note (no `id`, author `user`) or edit one: text, scope,
     /// enabled. Unset fields keep their value.
     UpsertMemory {

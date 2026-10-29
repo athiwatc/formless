@@ -1808,6 +1808,22 @@
   }
 
   // -------------------------------------------------------- approvals
+  /** A job's recent firings: when, trigger, outcome, time, cost, Session. */
+  async function showJobHistory(j) {
+    const runs = (await request({ type: "job_runs", id: j.id }).catch(() => null)) || [];
+    const secs = (r) => r.finished_at ? Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000) + "s" : "…";
+    const body = runs.length
+      ? h("table", { class: "table" }, h("tbody", null, runs.map((r) => h("tr", null,
+          h("td", { class: "muted" }, new Date(r.started_at).toLocaleString()),
+          h("td", null, r.trigger),
+          h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
+          h("td", { class: "muted" }, secs(r)),
+          h("td", { class: "muted" }, r.cost != null ? "$" + r.cost.toFixed(3) : "—"),
+          h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
+          h("td", { class: "muted" }, r.detail || "")))))
+      : h("p", { class: "muted" }, "It has not run yet.");
+    ask({ title: "Job history", body, ok: "Close" });
+  }
   /** A path Capability's wider scopes (file, folder, repository), as a
    * select; the pick is sent with the answer (SPEC §10.3). */
   function scopePicker(req, cap) {
@@ -2574,7 +2590,8 @@
         h("tbody", null, skills.map((sk) => h("tr", null,
           h("td", null, h("strong", null, sk.name + " v" + sk.version), h("div", { class: "muted" }, sk.description),
             sk.has_scripts ? h("div", { class: "muted" }, "bundles scripts (never run on the host)") : null,
-            sk.author === "auto" ? h("div", { class: "muted" }, sk.retired ? "auto-created · retired (enable to restore)" : "auto-created from a successful Run") : null),
+            sk.author === "auto" ? h("div", { class: "muted" }, sk.retired ? "auto-created · retired (enable to restore)" : "auto-created from a successful Run") : null,
+            sk.retired && sk.retire_reason ? h("div", { class: "muted" }, "Retired: " + sk.retire_reason) : null),
           h("td", { class: "num" }, sk.loads + " loads" + (sk.runs ? " · " + Math.round(100 * sk.runs_completed / sk.runs) + "% of " + sk.runs + " Runs completed" : "")),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: () => reviewSkill(sk.name) }, "Review"),
@@ -2600,6 +2617,7 @@
         h("button", { class: "btn small", type: "button", onclick: () => loadAudit(true) }, "Older")) : null));
     const jobs = S.jobs || [];
     grid.append(h("section", null, h("h3", null, "Jobs"),
+      (S.settings || {}).jobs_warning ? h("p", { class: "error" }, S.settings.jobs_warning) : null,
       jobs.length ? h("table", { class: "table" },
         h("tbody", null, jobs.map((j) => h("tr", null,
           h("td", null, h("div", null, j.prompt),
@@ -2607,6 +2625,8 @@
           h("td", null,
             h("button", { class: "btn small" + (j.enabled && j.approved ? "" : " primary"), type: "button", onclick: () => act({ type: "set_job_enabled", id: j.id, enabled: !(j.enabled && j.approved) }, "Updated").then(refreshSettings) },
               !j.approved ? "Approve" : j.enabled ? "Disable" : "Enable"),
+            h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_job_now", id: j.id }, "Started").then(refreshSettings) }, "Run now"),
+            h("button", { class: "btn small", type: "button", onclick: () => showJobHistory(j) }, "History"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               if (await ask({ title: "Delete this job?", text: j.prompt, ok: "Delete", danger: true })) { await act({ type: "delete_job", id: j.id }, "Deleted"); refreshSettings(); }
             } }, "Delete"))))))
@@ -2973,11 +2993,11 @@
     const time = h("input", { type: "time", value: "09:00" });
     const day = h("select", null, DAYS.map((d, i) => h("option", { value: String(i), selected: i === 1 }, d)));
     const at = h("input", { type: "datetime-local" });
-    const cron = h("input", { type: "text", placeholder: "0 9 * * 1-5", spellcheck: "false" });
+    const cron = h("input", { type: "text", placeholder: "every weekday at 9am, or 0 9 * * 1-5", spellcheck: "false" });
     const session = h("select", null, h("option", { value: "" }, "A new Session each time"),
       S.sessions.filter((s) => !s.archived).map((s) => h("option", { value: s.id }, s.name)));
     const preview = h("div", { class: "muted" });
-    const fields = { time: field("Time", time), day: field("Day", day), at: field("When", at), cron: field("Cron (minute hour day month weekday)", cron) };
+    const fields = { time: field("Time", time), day: field("Day", day), at: field("When", at), cron: field("Schedule: plain English or cron (minute hour day month weekday)", cron) };
     const schedule = () => {
       const [hh, mm] = (time.value || "09:00").split(":").map(Number);
       switch (when.value) {
@@ -3067,6 +3087,7 @@
     let s = u.steps + " step" + (u.steps === 1 ? "" : "s") + " · " + k(u.prompt_tokens) + " in / " + k(u.completion_tokens) + " out";
     if (u.prompt_tokens > 0 && u.cached_tokens > 0) s += " · " + Math.round((100 * u.cached_tokens) / u.prompt_tokens) + "% cached";
     if (u.cost != null) s += " · $" + u.cost.toFixed(3);
+    if (u.memories > 0) s += " · used " + u.memories + (u.memories === 1 ? " memory" : " memories");
     return s;
   }
   async function revokeApproval(t, capability) {

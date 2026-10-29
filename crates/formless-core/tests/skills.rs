@@ -251,6 +251,27 @@ async fn the_agent_loads_enabled_skills() {
     )
     .unwrap();
     assert_eq!(found["skills"][0]["name"], "report-writer");
+    // The user loads it by hand: a note in the chat, counted as a load.
+    daemon
+        .handle(formless_protocol::Request::LoadSkill {
+            session_id: session.clone(),
+            name: "report-writer".into(),
+            args: Some("Q3 sheet".into()),
+        })
+        .await
+        .unwrap();
+    let note = store
+        .list_messages(&session)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|m| m.role == "system-note")
+        .unwrap();
+    assert!(
+        note.content.contains("Step 1: read the sheet.")
+            && note.content.contains("Arguments: Q3 sheet")
+    );
+    assert_eq!(store.get_skill("report-writer").unwrap().unwrap().loads, 2);
 }
 
 #[test]
@@ -347,6 +368,11 @@ fn auto_skills_are_measured_and_retired() {
         .retire_auto_skills(Some("2000-01-01T00:00:00+00:00"), 0.6, 2)
         .unwrap();
     assert_eq!(retired, vec!["bad-skill".to_string()]);
+    let bad = store.get_skill("bad-skill").unwrap().unwrap();
+    assert_eq!(
+        bad.retire_reason.as_deref(),
+        Some("unhelpful: 1 of 2 Runs that loaded it completed")
+    );
     // A cutoff in the future: idle-skill was never loaded; user skills are
     // never auto-retired.
     let retired = store
@@ -355,9 +381,11 @@ fn auto_skills_are_measured_and_retired() {
     assert_eq!(retired, vec!["idle-skill".to_string()]);
     let idle = store.get_skill("idle-skill").unwrap().unwrap();
     assert!(idle.retired && !idle.enabled);
+    assert!(idle.retire_reason.as_deref().unwrap().starts_with("unused"));
     // Retired skills are restorable.
     store.set_skill_enabled("idle-skill", true).unwrap();
-    assert!(!store.get_skill("idle-skill").unwrap().unwrap().retired);
+    let restored = store.get_skill("idle-skill").unwrap().unwrap();
+    assert!(!restored.retired && restored.retire_reason.is_none());
 }
 
 #[test]

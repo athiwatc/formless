@@ -153,3 +153,292 @@ pub fn first_run(
         (None, None) => bail!("give cron (recurring) or at (one-shot)"),
     }
 }
+
+/// A schedule as the user wrote it: a cron expression (or `@daily`, …),
+/// or plain English such as "every weekday at 9am", "every 2 hours",
+/// "daily at 18:30", "every monday and friday at noon" (SPEC §9.7).
+/// Returns the cron expression to store.
+pub fn to_cron(schedule: &str) -> Result<String> {
+    let s = schedule.trim();
+    if Cron::parse(s).is_ok() {
+        return Ok(s.to_string());
+    }
+    natural_to_cron(s).with_context(|| {
+        format!(
+            "not a cron expression or a schedule like \"every weekday at 9am\", \"every 2 hours\", \"daily at 18:30\": {schedule}"
+        )
+    })
+}
+
+/// The next `n` run times of a cron expression after `now`.
+pub fn next_runs(cron: &str, now: DateTime<Local>, n: usize) -> Result<Vec<DateTime<Local>>> {
+    let c = Cron::parse(cron)?;
+    let mut out = Vec::new();
+    let mut t = now;
+    while out.len() < n {
+        match c.next_after(t) {
+            Some(next) => {
+                out.push(next);
+                t = next;
+            }
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+const DAYS: [(&str, u32); 7] = [
+    ("sunday", 0),
+    ("monday", 1),
+    ("tuesday", 2),
+    ("wednesday", 3),
+    ("thursday", 4),
+    ("friday", 5),
+    ("saturday", 6),
+];
+
+/// "9am", "9:30 pm", "18:30", "noon", "midnight" → (hour, minute).
+fn parse_time(t: &str) -> Option<(u32, u32)> {
+    let t = t.trim().replace(' ', "");
+    match t.as_str() {
+        "noon" | "midday" => return Some((12, 0)),
+        "midnight" => return Some((0, 0)),
+        _ => {}
+    }
+    let (body, pm) = if let Some(b) = t.strip_suffix("pm") {
+        (b, Some(true))
+    } else if let Some(b) = t.strip_suffix("am") {
+        (b, Some(false))
+    } else {
+        (t.as_str(), None)
+    };
+    let (h, m) = match body.split_once(':') {
+        Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?),
+        None => (body.parse::<u32>().ok()?, 0),
+    };
+    let h = match pm {
+        Some(true) if h < 12 => h + 12,
+        Some(false) if h == 12 => 0,
+        Some(_) if h > 12 => return None,
+        _ => h,
+    };
+    (h < 24 && m < 60).then_some((h, m))
+}
+
+fn natural_to_cron(s: &str) -> Option<String> {
+    let lower = s.to_lowercase();
+    let lower = lower.trim().trim_end_matches('.');
+    // "… at TIME" (default midnight for day-based schedules).
+    let (head, time) = match lower.rsplit_once(" at ") {
+        Some((h, t)) => (h.trim(), Some(parse_time(t)?)),
+        None => (lower, None),
+    };
+    let head = head.strip_prefix("every ").unwrap_or(head).trim();
+    let (h, m) = time.unwrap_or((0, 0));
+    // Interval schedules: "every 15 minutes", "every 2 hours", "hourly".
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let interval = |n: u32, unit: &str| -> Option<String> {
+        match unit.trim_end_matches('s') {
+            "minute" | "min" if (1..60).contains(&n) && time.is_none() => Some(if n == 1 {
+                "* * * * *".into()
+            } else {
+                format!("*/{n} * * * *")
+            }),
+            "hour" if (1..24).contains(&n) && time.is_none() => Some(if n == 1 {
+                "0 * * * *".into()
+            } else {
+                format!("0 */{n} * * *")
+            }),
+            "day" if n == 1 => Some(format!("{m} {h} * * *")),
+            _ => None,
+        }
+    };
+    match words.as_slice() {
+        ["hourly"] | ["hour"] => return interval(1, "hour"),
+        ["minute"] => return interval(1, "minute"),
+        ["daily"] | ["day"] | ["night"] | ["morning"] => {
+            let (h, m) = time.unwrap_or(if head == "morning" { (9, 0) } else { (0, 0) });
+            return Some(format!("{m} {h} * * *"));
+        }
+        [n, unit] if n.parse::<u32>().is_ok() => return interval(n.parse().ok()?, unit),
+        ["weekday"] | ["weekdays"] => return Some(format!("{m} {h} * * 1-5")),
+        ["weekend"] | ["weekends"] => return Some(format!("{m} {h} * * 0,6")),
+        ["week"] | ["weekly"] => return Some(format!("{m} {h} * * 1")),
+        ["month"] | ["monthly"] => return Some(format!("{m} {h} 1 * *")),
+        _ => {}
+    }
+    // Named days: "monday", "monday and friday", "mon, wed, fri".
+    let mut days = Vec::new();
+    for w in head
+        .replace(" and ", ",")
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|w| !w.is_empty() && *w != "on")
+    {
+        let w = w.trim_end_matches('s');
+        let (_, d) = DAYS
+            .iter()
+            .find(|(name, _)| w.len() >= 3 && name.starts_with(w))?;
+        if !days.contains(d) {
+            days.push(*d);
+        }
+    }
+    if days.is_empty() {
+        return None;
+    }
+    days.sort_unstable();
+    let list: Vec<String> = days.iter().map(u32::to_string).collect();
+    Some(format!("{m} {h} * * {}", list.join(",")))
+}
+
+/// How many occurrences of `cron` fell after `due` and up to `now`
+/// besides the one being run now (capped): firings missed while the
+/// daemon was down or the machine slept.
+pub fn missed_since(cron: &str, due: DateTime<Local>, now: DateTime<Local>) -> usize {
+    let Ok(c) = Cron::parse(cron) else {
+        return 0;
+    };
+    let mut n = 0;
+    let mut t = due;
+    while let Some(next) = c.next_after(t) {
+        if next > now || n >= 10_000 {
+            break;
+        }
+        n += 1;
+        t = next;
+    }
+    n
+}
+
+/// Deliver a finished firing's answer (SPEC §9.7): a desktop
+/// notification, an appended file, and/or a webhook POST. Returns one
+/// line per target saying how it went.
+pub async fn deliver(
+    target: &serde_json::Value,
+    http: &reqwest::Client,
+    job: &formless_protocol::JobInfo,
+    status: &str,
+    answer: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let title = format!("Job {}: {status}", job.id);
+    if target["notify"] == true {
+        let body: String = answer.chars().take(200).collect();
+        out.push(match notify(&title, &body) {
+            Ok(()) => "notified".into(),
+            Err(e) => format!("notify failed: {e}"),
+        });
+    }
+    if let Some(path) = target["file"].as_str() {
+        let entry = format!(
+            "\n## {} — {} ({status})\n\n{}\n",
+            Local::now().format("%Y-%m-%d %H:%M"),
+            job.prompt,
+            answer.trim()
+        );
+        let wrote = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            if let Some(dir) = std::path::Path::new(path).parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?
+                .write_all(entry.as_bytes())
+        })();
+        out.push(match wrote {
+            Ok(()) => format!("appended to {path}"),
+            Err(e) => format!("writing {path} failed: {e}"),
+        });
+    }
+    if let Some(url) = target["webhook"].as_str() {
+        let body = serde_json::json!({
+            "job_id": job.id, "prompt": job.prompt, "status": status,
+            "answer": answer, "session_id": job.session_id,
+        });
+        let sent = http
+            .post(url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+        out.push(match sent {
+            Ok(r) if r.status().is_success() => format!("posted to {url}"),
+            Ok(r) => format!("webhook {url} answered {}", r.status()),
+            Err(e) => format!("webhook {url} failed: {e}"),
+        });
+    }
+    out
+}
+
+fn notify(title: &str, body: &str) -> std::result::Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let (cmd, args) = {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        (
+            "osascript",
+            vec![
+                "-e".to_string(),
+                format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    esc(body),
+                    esc(title)
+                ),
+            ],
+        )
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (cmd, args) = ("notify-send", vec![title.to_string(), body.to_string()]);
+    #[cfg(not(unix))]
+    {
+        let _ = (title, body);
+        return Err("desktop notifications are not supported here".into());
+    }
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new(cmd)
+            .args(&args)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited with {status}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn plain_english_schedules_become_cron() {
+        for (text, cron) in [
+            ("every weekday at 9am", "0 9 * * 1-5"),
+            ("Every 2 hours", "0 */2 * * *"),
+            ("every 15 minutes", "*/15 * * * *"),
+            ("daily at 18:30", "30 18 * * *"),
+            ("hourly", "0 * * * *"),
+            ("every monday and friday at noon", "0 12 * * 1,5"),
+            ("every weekend at 8:15 pm", "15 20 * * 0,6"),
+            ("0 3 * * *", "0 3 * * *"),
+            ("@daily", "@daily"),
+        ] {
+            assert_eq!(to_cron(text).unwrap(), cron, "{text}");
+        }
+        assert!(to_cron("whenever you feel like it").is_err());
+        assert!(to_cron("every day at 25:00").is_err());
+    }
+
+    #[test]
+    fn next_runs_and_missed_firings() {
+        let now = Local.with_ymd_and_hms(2026, 10, 29, 8, 0, 0).unwrap();
+        let next = next_runs("0 9 * * 1-5", now, 3).unwrap();
+        assert_eq!(next.len(), 3);
+        assert_eq!(next[0].format("%a %H:%M").to_string(), "Thu 09:00");
+        assert_eq!(next[2].format("%a %H:%M").to_string(), "Mon 09:00");
+        let due = Local.with_ymd_and_hms(2026, 10, 29, 3, 0, 0).unwrap();
+        assert_eq!(missed_since("0 * * * *", due, now), 5);
+    }
+}

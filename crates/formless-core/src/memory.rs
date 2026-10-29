@@ -20,6 +20,55 @@ pub fn dedup_key(text: &str) -> String {
     clean(text).to_lowercase()
 }
 
+/// Does a note hold a personal detail the user may not want kept
+/// (`memory.confirm_writes = "sensitive"`): health, money, contacts,
+/// where they live, family, beliefs? A word-list heuristic.
+pub fn looks_sensitive(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const WORDS: &[&str] = &[
+        "health",
+        "medical",
+        "diagnos",
+        "medication",
+        "doctor",
+        "therapy",
+        "pregnan",
+        "salary",
+        "income",
+        "debt",
+        "bank",
+        "account number",
+        "credit card",
+        "tax",
+        "address",
+        "lives in",
+        "live in",
+        "home is",
+        "phone",
+        "email",
+        "birthday",
+        "date of birth",
+        "wife",
+        "husband",
+        "partner",
+        "child",
+        "kids",
+        "daughter",
+        "son ",
+        "religio",
+        "church",
+        "politic",
+        "vote",
+        "sexual",
+        "ethnic",
+        "passport",
+        "ssn",
+    ];
+    WORDS.iter().any(|w| t.contains(w))
+        || t.contains('@')
+        || t.chars().filter(char::is_ascii_digit).count() >= 7
+}
+
 /// Validate a note and its scope: `global` or `project:<absolute path>`.
 pub fn validate(text: &str, scope: &str) -> Result<()> {
     validate_len(text, MAX_CHARS)?;
