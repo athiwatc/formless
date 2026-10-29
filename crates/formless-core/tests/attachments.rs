@@ -95,6 +95,7 @@ async fn attachments_ride_on_the_next_message() {
             session_id: sid.clone(),
             content: "what is this?".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await
         .unwrap();

@@ -38,7 +38,29 @@ struct Subscriber {
 const CLIENT_QUEUE: usize = 4096;
 /// Largest request line (an attachment's base64 plus room), enforced while
 /// reading.
-const MAX_FRAME: usize = 32 * 1024 * 1024;
+const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
+
+/// A failed request's reply, with a code clients can branch on when the
+/// error is one of the kinds they handle (#885).
+fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
+    let msg = e.to_string();
+    let lower = msg.to_ascii_lowercase();
+    let code = if msg.starts_with("budget:") {
+        Some(codes::BUDGET)
+    } else if lower.contains("not found") || lower.starts_with("no session") {
+        Some(codes::NOT_FOUND)
+    } else if lower.contains("already running") || lower.contains("is busy") {
+        Some(codes::BUSY)
+    } else if lower.starts_with("internal error") || lower.contains("panicked") {
+        Some(codes::INTERNAL)
+    } else {
+        None
+    };
+    match code {
+        Some(c) => ServerMessage::err_code(id, c, msg),
+        None => ServerMessage::err(id, msg),
+    }
+}
 
 /// Live output a slow client can miss without losing anything that
 /// matters: the settled message, the result and the state come later.
@@ -55,7 +77,7 @@ fn droppable(ev: &Event) -> bool {
 }
 
 /// Read one `\n`-terminated line of at most `max` bytes (None at EOF).
-async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
+pub(crate) async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
     max: usize,
 ) -> std::io::Result<Option<String>> {
@@ -422,6 +444,8 @@ pub struct Daemon {
     /// Held while a request edits `config.toml`, so two edits never lose
     /// each other's change.
     config_edit: StdMutex<()>,
+    /// `SendMessage` keys seen in the last 10 minutes and their outcome.
+    sent_keys: StdMutex<HashMap<String, (std::time::Instant, Value)>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -526,6 +550,7 @@ impl Daemon {
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
             config_edit: StdMutex::new(()),
+            sent_keys: StdMutex::new(HashMap::new()),
             mcp: Default::default(),
             modules: StdMutex::new(None),
             // `provider.proxy` applies from start-up (restart to change it).
@@ -1083,7 +1108,26 @@ impl Daemon {
                 session_id,
                 content,
                 mode,
-            } => self.send_message(session_id, content, mode).await,
+                client_msg_id,
+            } => {
+                // A retried send (same key) gets the first outcome (#891).
+                let key = client_msg_id.map(|k| format!("{session_id}\u{0}{k}"));
+                if let Some(k) = &key {
+                    let mut sent = self.sent_keys.lock().unwrap();
+                    sent.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(600));
+                    if let Some((_, first)) = sent.get(k) {
+                        return Ok(first.clone());
+                    }
+                }
+                let out = self.send_message(session_id, content, mode).await?;
+                if let Some(k) = key {
+                    self.sent_keys
+                        .lock()
+                        .unwrap()
+                        .insert(k, (std::time::Instant::now(), out.clone()));
+                }
+                Ok(out)
+            }
             Request::RunFiles { session_id, run_id } => {
                 let run_id = self.files_run(&session_id, run_id)?;
                 let files = self.run_file_infos(&run_id, true)?;
@@ -7736,6 +7780,13 @@ impl Daemon {
         use base64::Engine;
         self.with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
+        // Judged on the encoded size first, before decoding a copy (#888).
+        if data_b64.trim().len() / 4 * 3 > MAX_ATTACHMENT_BYTES + 3 {
+            return Err(anyhow!(
+                "attachment is larger than {} MB",
+                MAX_ATTACHMENT_BYTES / 1024 / 1024
+            ));
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data_b64.trim())
             .context("attachment is not valid base64")?;
@@ -10322,17 +10373,40 @@ impl Daemon {
         // Requests run in order on one worker per connection, so a slow one
         // (a smoke test, a big export) never holds up reading: control
         // requests (Esc, approvals, answers, Ping) skip the queue (SPEC §9.3).
-        let (work_tx, mut work_rx) = mpsc::channel::<RequestEnvelope>(256);
+        // Each queued request carries its arrival number; an InterruptRun
+        // (which skips the queue) cancels a SendMessage for that Session
+        // that arrived before it and hasn't started (#891).
+        let (work_tx, mut work_rx) = mpsc::channel::<(RequestEnvelope, u64)>(256);
+        let interrupted: Arc<StdMutex<HashMap<String, u64>>> = Arc::default();
+        let mut arrivals: u64 = 0;
         let worker = {
             let (this, tx, client, kick) = (self.clone(), tx.clone(), client.clone(), kick.clone());
+            let interrupted = interrupted.clone();
             tokio::spawn(async move {
-                while let Some(env) = work_rx.recv().await {
+                while let Some((env, arrived)) = work_rx.recv().await {
+                    if let Request::SendMessage { session_id, .. } = &env.request {
+                        let cut = interrupted.lock().unwrap().get(session_id).copied();
+                        if cut.is_some_and(|at| at > arrived) {
+                            let resp = ServerMessage::err(
+                                env.id,
+                                "interrupted before it started: the message was not sent".into(),
+                            );
+                            let sent = tokio::select! {
+                                _ = kick.cancelled() => false,
+                                r = tx.send(resp) => r.is_ok(),
+                            };
+                            if !sent {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     let resp = match CLIENT
                         .scope(client(), handle_safely(&this, env.request))
                         .await
                     {
                         Ok(v) => ServerMessage::ok(env.id, v),
-                        Err(e) => ServerMessage::err(env.id, e.to_string()),
+                        Err(e) => error_reply(env.id, &e),
                     };
                     let sent = tokio::select! {
                         _ = kick.cancelled() => false,
@@ -10361,11 +10435,13 @@ impl Daemon {
             if line.trim().is_empty() {
                 continue;
             }
+            arrivals += 1;
             let resp = match serde_json::from_str::<RequestEnvelope>(&line) {
                 Ok(env) => {
                     if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&env.protocol) {
-                        ServerMessage::err(
+                        ServerMessage::err_code(
                             env.id,
+                            codes::PROTOCOL_MISMATCH,
                             format!(
                                 "protocol mismatch: client {} daemon {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}",
                                 env.protocol
@@ -10393,13 +10469,19 @@ impl Daemon {
                         self.broadcast_clients(before.union(&now));
                         ServerMessage::ok(env.id, json!({"subscribed": true, "conn": conn}))
                     } else if is_control(&env.request) {
+                        if let Request::InterruptRun { session_id } = &env.request {
+                            interrupted
+                                .lock()
+                                .unwrap()
+                                .insert(session_id.clone(), arrivals);
+                        }
                         let (this, tx, who, kick) =
                             (self.clone(), tx.clone(), client(), kick.clone());
                         tokio::spawn(async move {
                             let resp =
                                 match CLIENT.scope(who, handle_safely(&this, env.request)).await {
                                     Ok(v) => ServerMessage::ok(env.id, v),
-                                    Err(e) => ServerMessage::err(env.id, e.to_string()),
+                                    Err(e) => error_reply(env.id, &e),
                                 };
                             tokio::select! {
                                 _ = kick.cancelled() => {}
@@ -10410,7 +10492,7 @@ impl Daemon {
                     } else {
                         let queued = tokio::select! {
                             _ = kick.cancelled() => false,
-                            r = work_tx.send(env) => r.is_ok(),
+                            r = work_tx.send((env, arrivals)) => r.is_ok(),
                         };
                         if !queued {
                             break;
@@ -10422,7 +10504,14 @@ impl Daemon {
                     let id = formless_protocol::lenient_id(&line);
                     match formless_protocol::unknown_request_type(&line) {
                         Some(kind) => formless_protocol::unsupported(id, &kind),
-                        None => ServerMessage::err(id, format!("bad request: {e}")),
+                        None => {
+                            tracing::warn!("client {conn} sent a bad request (id {id}): {e}");
+                            ServerMessage::err_code(
+                                id,
+                                codes::BAD_REQUEST,
+                                format!("bad request: {e}"),
+                            )
+                        }
                     }
                 }
             };
@@ -12007,6 +12096,8 @@ fn is_control(req: &Request) -> bool {
         Request::Ping
             | Request::Status
             | Request::InterruptRun { .. }
+            // Un-sticking a stalled Run can't wait behind a slow request (#891).
+            | Request::RetryProviderRequest { .. }
             | Request::CancelInvocation { .. }
             | Request::AbandonInvocation { .. }
             | Request::ApprovalDecision { .. }

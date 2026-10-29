@@ -365,6 +365,7 @@ async fn pending_await_path_with_remind_once() {
             session_id: sid,
             content: "sleep please".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await;
     let text = client.run_to_finish().await;
@@ -447,6 +448,7 @@ async fn pending_push_delivery_reaches_agent() {
             session_id: sid,
             content: "sleep then echo".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await;
     let text = client.run_to_finish().await;
@@ -636,6 +638,7 @@ async fn server_side_compaction_uses_compact_endpoint() {
             session_id: session_id.clone(),
             content: "continue".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await;
     let text = client.run_to_finish().await;
@@ -714,6 +717,7 @@ async fn untitled_session_is_auto_named_after_first_run_but_user_names_stick() {
             session_id: s.id.clone(),
             content: "Convert my CSV exports into JSON files please\nthanks".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await;
     client.run_to_finish().await;
@@ -735,6 +739,7 @@ async fn untitled_session_is_auto_named_after_first_run_but_user_names_stick() {
             session_id: mine.id.clone(),
             content: "hello there".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await;
     client.run_to_finish().await;
@@ -780,6 +785,7 @@ async fn deleting_a_session_interrupts_its_run_first() {
         session_id: sid.clone(),
         content: "hello".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut deleted_sent = false;
@@ -860,6 +866,7 @@ async fn length_truncated_tool_call_is_explained_not_run() {
         session_id: sid.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let (mut started, mut noted) = (false, false);
@@ -948,6 +955,7 @@ async fn interrupt_releases_a_tool_waiting_on_llm_complete() {
         session_id: sid.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let (mut interrupted_at, mut run_done, mut tool_done) = (None, false, false);
@@ -1156,6 +1164,7 @@ async fn stalled_stream_is_flagged_and_can_be_resent() {
         session_id: sid.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let (mut stalled, mut restarted) = (false, false);
@@ -1232,6 +1241,7 @@ async fn queued_message_is_persisted_and_runs_next() {
         session_id: sid.clone(),
         content: "one".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let r = c
@@ -1239,6 +1249,7 @@ async fn queued_message_is_persisted_and_runs_next() {
             session_id: sid.clone(),
             content: "two".into(),
             mode: SendMode::Queue,
+            client_msg_id: None,
         })
         .await;
     assert_eq!(r["queued"], true);
@@ -1323,6 +1334,7 @@ async fn pending_handle_survives_restart_as_interrupted() {
         session_id: sid.clone(),
         content: "how did it go?".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let answer = c.run_to_finish().await;
@@ -1380,6 +1392,7 @@ async fn stalled_invocation_is_flagged_and_can_be_cancelled_alone() {
         session_id: sid.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut stalled_at = None;
@@ -1476,6 +1489,7 @@ async fn subagents_emit_events_and_keep_a_transcript() {
         session_id: sid.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut seen = Vec::new();
@@ -1618,6 +1632,7 @@ async fn provider_connections_are_reused_across_runs() {
             session_id: sid.clone(),
             content: text.into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await;
         c.run_to_finish().await;
@@ -1673,6 +1688,7 @@ async fn subscriptions_scope_live_events_per_client() {
         session_id: two.clone(),
         content: "hi".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     assert_eq!(
@@ -1778,6 +1794,7 @@ async fn clients_on_a_session_see_each_other() {
         session_id: id.clone(),
         content: "from the browser".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let ev = until(
@@ -1843,6 +1860,7 @@ async fn sessions_keep_their_system_prompt_when_guidance_changes() {
         session_id: sid,
         content: "hi".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     };
     let s1 = c.rpc(Request::CreateSession { name: None }).await["id"]
         .as_str()
@@ -1922,6 +1940,7 @@ async fn model_stats_include_token_and_cache_totals() {
             session_id: sid.clone(),
             content: "hi".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         })
         .await;
         c.run_to_finish().await;
@@ -1998,6 +2017,7 @@ async fn compaction_appends_to_the_previous_summary() {
         session_id: sid.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     c.run_to_finish().await;
@@ -2073,6 +2093,7 @@ async fn pending_results_are_delivered_in_one_ordered_note() {
         session_id: sid,
         content: "two sleeps".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     assert_eq!(c.run_to_finish().await, "done");
@@ -2157,6 +2178,7 @@ async fn agent_adds_an_mcp_server_after_approval() {
         session_id: sid,
         content: "add a lookup server".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut answer = String::new();
@@ -2269,6 +2291,7 @@ async fn enabled_skills_are_indexed_in_the_system_prompt() {
         session_id: sid,
         content: "hi".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     c.run_to_finish().await;
@@ -2332,6 +2355,7 @@ async fn a_step_limit_warns_then_pauses_and_resume_goes_past_it() {
         session_id: id.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut warned = false;
@@ -2429,6 +2453,7 @@ async fn a_per_run_step_limit_pauses_and_is_cleared_after() {
         session_id: id.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut explained = None;
@@ -2514,6 +2539,7 @@ async fn retry_reruns_the_last_message_on_another_model() {
         session_id: id.clone(),
         content: "question".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let first = c.run_to_finish().await;
@@ -2631,6 +2657,7 @@ async fn run_file_changes_are_listed_and_rewound() {
         session_id: id.clone(),
         content: "edit".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let (mut files, mut recap) = (None, None);
@@ -2795,6 +2822,7 @@ async fn update_plan_is_stored_and_broadcast() {
         session_id: id.clone(),
         content: "fix it".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut updates = Vec::new();
@@ -2876,6 +2904,7 @@ async fn step_mode_pauses_edits_and_skips_calls() {
         session_id: id.clone(),
         content: "go".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut steps = 0;
@@ -3054,6 +3083,7 @@ async fn a_panicking_run_frees_its_session() {
         session_id: id.clone(),
         content: "please panic-now-7c1".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     let mut paused = None;
@@ -3078,6 +3108,7 @@ async fn a_panicking_run_frees_its_session() {
         session_id: id.clone(),
         content: "hello again".into(),
         mode: SendMode::Send,
+        client_msg_id: None,
     })
     .await;
     assert_eq!(c.run_to_finish().await, "fine", "the Session works again");

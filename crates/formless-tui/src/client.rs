@@ -1,6 +1,6 @@
 use anyhow::Result;
 use formless_protocol::*;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
@@ -39,8 +39,9 @@ impl DaemonClient {
         let (reader, mut writer) = connect_stream(paths)?;
         let (msg_tx, msg_rx) = mpsc::channel::<ServerMessage>();
         std::thread::spawn(move || {
-            let mut lines = BufReader::new(reader).lines();
-            while let Some(Ok(line)) = lines.next() {
+            let mut reader = BufReader::new(reader);
+            // Bounded per line (#888); an oversized one ends the connection.
+            while let Ok(Some(line)) = read_line_capped(&mut reader, MAX_FRAME_BYTES) {
                 if let Ok(msg) = serde_json::from_str::<ServerMessage>(&line) {
                     if msg_tx.send(msg).is_err() {
                         break;
@@ -84,28 +85,79 @@ impl DaemonClient {
     }
 }
 
+/// A failed daemon response: its text, and its machine-readable code
+/// when it has one (`formless_protocol::codes`, #885).
+#[derive(Debug)]
+pub struct DaemonError {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
+/// Whether `e` is a failed response with `code` (or, from a daemon that
+/// predates codes, text starting with `fallback`).
+pub fn has_code(e: &anyhow::Error, code: &str, fallback: &str) -> bool {
+    match e.downcast_ref::<DaemonError>() {
+        Some(d) => d.code.as_deref() == Some(code) || d.message.starts_with(fallback),
+        None => e.to_string().starts_with(fallback),
+    }
+}
+
+/// How long [`request_once`] waits for its answer: long enough for an
+/// export or a smoke-tested save, never forever (#884).
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// One-shot request against the daemon (CLI/doctor use). Blocks for the
-/// matching response, discarding interleaved events.
+/// matching response, discarding interleaved events, up to
+/// [`REQUEST_TIMEOUT`].
 pub fn request_once(paths: &Paths, request: Request) -> Result<serde_json::Value> {
+    request_once_within(paths, request, REQUEST_TIMEOUT)
+}
+
+/// [`request_once`] with its own deadline.
+pub fn request_once_within(
+    paths: &Paths,
+    request: Request,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value> {
     let (client, rx) = DaemonClient::connect(paths)?;
     let id = client.send(request);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
-        match rx.recv() {
-            Ok(ServerMessage::Response {
-                id: rid,
-                ok,
-                result,
-                error,
-            }) if rid == id => {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(msg @ ServerMessage::Response { id: rid, .. }) if rid == id => {
+                let code = msg.error_code().map(str::to_string);
+                let ServerMessage::Response {
+                    ok, result, error, ..
+                } = msg
+                else {
+                    unreachable!("matched a response")
+                };
                 return if ok {
                     Ok(result.unwrap_or(serde_json::Value::Null))
                 } else {
-                    Err(anyhow::anyhow!(
-                        error.unwrap_or_else(|| "daemon error".into())
-                    ))
+                    Err(DaemonError {
+                        code,
+                        message: error.unwrap_or_else(|| "daemon error".into()),
+                    }
+                    .into())
                 };
             }
             Ok(_) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(anyhow::anyhow!(
+                    "the daemon did not answer within {}s",
+                    timeout.as_secs()
+                ))
+            }
             Err(e) => return Err(anyhow::anyhow!("daemon closed: {e}")),
         }
     }
@@ -118,7 +170,7 @@ pub fn request_once(paths: &Paths, request: Request) -> Result<serde_json::Value
 pub fn check_daemon_version(paths: &Paths) -> Result<Option<String>> {
     let status = match request_once(paths, Request::Status) {
         Ok(v) => v,
-        Err(e) if e.to_string().starts_with("protocol mismatch") => {
+        Err(e) if has_code(&e, codes::PROTOCOL_MISMATCH, "protocol mismatch") => {
             anyhow::bail!(
                 "the running daemon speaks a different protocol than this formless \
                  ({e}), so they cannot work together. Run `formless daemon restart` \
@@ -231,7 +283,9 @@ pub fn restart_daemon(paths: &Paths, force: bool, mut say: impl FnMut(&str)) -> 
                 let _ = request_once(paths, Request::Shutdown);
             }
             // A daemon on another protocol cannot be asked to stop: signal it.
-            Err(e) if e.to_string().starts_with("protocol mismatch") => terminate_daemon(paths)?,
+            Err(e) if has_code(&e, codes::PROTOCOL_MISMATCH, "protocol mismatch") => {
+                terminate_daemon(paths)?
+            }
             Err(e) => return Err(e),
         }
         // Gone means not accepting and done flushing (it removes its lock last).
@@ -305,5 +359,58 @@ mod status_tests {
         let stale = json!({"build": "a", "stale": true});
         assert!(build_warning("a", &stale).is_some(), "the daemon says so");
         assert!(build_warning("", &json!({})).is_none(), "unknown: quiet");
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    /// A daemon that never answers can't hang a caller (#884), and errors
+    /// are told apart by code, not wording (#885).
+    #[cfg(unix)]
+    #[test]
+    fn an_unanswered_request_times_out_and_codes_beat_wording() {
+        let dir = std::env::temp_dir().join(format!("fl-rq-{}", std::process::id()));
+        let paths = Paths {
+            data_dir: dir.join("d"),
+            config_dir: dir.join("c"),
+            profile: "rq".into(),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(paths.socket_path()).unwrap();
+        // Accepts, reads, never replies.
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).flatten().collect();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let e = request_once_within(&paths, Request::Ping, std::time::Duration::from_millis(300))
+            .unwrap_err();
+        assert!(e.to_string().contains("did not answer"), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(dir);
+
+        let reworded: anyhow::Error = DaemonError {
+            code: Some(codes::PROTOCOL_MISMATCH.into()),
+            message: "versions differ".into(),
+        }
+        .into();
+        assert!(has_code(
+            &reworded,
+            codes::PROTOCOL_MISMATCH,
+            "protocol mismatch"
+        ));
+        let old_daemon: anyhow::Error = DaemonError {
+            code: None,
+            message: "protocol mismatch: client 2 daemon 1".into(),
+        }
+        .into();
+        assert!(has_code(
+            &old_daemon,
+            codes::PROTOCOL_MISMATCH,
+            "protocol mismatch"
+        ));
     }
 }

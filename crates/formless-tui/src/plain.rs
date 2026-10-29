@@ -110,6 +110,35 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             "{}Promotion of {tool_name} needs approval: {reason}. Type y to approve or n to deny.",
             end_stream(streaming)
         ),
+        // The partial answer printed so far is void: say so on its own
+        // line, so the re-sent answer never reads as its continuation (#890).
+        Event::StreamRestarted { .. } => format!(
+            "{}[The provider connection dropped; the answer starts again below.]",
+            end_stream(streaming)
+        ),
+        Event::ProviderStalled { idle_secs, .. } => format!(
+            "{}Note: the model has sent nothing for {idle_secs} s. /stop stops the Run.",
+            end_stream(streaming)
+        ),
+        Event::InvocationStalled {
+            tool_name,
+            silent_secs,
+            ..
+        } => format!(
+            "{}Note: Tool {tool_name} has shown no activity for {silent_secs} s; it keeps running.",
+            end_stream(streaming)
+        ),
+        Event::InvocationCompleted { tool_name, ok, .. } => format!(
+            "{}Background Tool {tool_name} {}.",
+            end_stream(streaming),
+            if *ok { "finished" } else { "failed" }
+        ),
+        // Left out on purpose: live detail a screen reader would drown in
+        // (reasoning, usage, progress, activity), state the plain client
+        // doesn't show (lists, plans, settings, subscriptions), and
+        // events already told another way (MessageAppended for our own
+        // input, RunStarted's "Working…", RunRecap after "Run completed").
+        // A new event lands here by default: decide whether it belongs.
         _ => return None,
     })
 }
@@ -418,6 +447,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     session_id: session.id.clone(),
                     content: msg.to_string(),
                     mode: if running { SendMode::Steer } else { SendMode::Send },
+                    client_msg_id: None,
                 });
             }
         }
@@ -431,6 +461,33 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restarted stream never prints as one run-on answer (#890).
+    #[test]
+    fn a_restarted_stream_is_marked() {
+        let mut streaming = false;
+        let delta = |d: &str| Event::MessageDelta {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            delta: d.into(),
+        };
+        let mut out = String::new();
+        for ev in [
+            delta("Hello wor"),
+            Event::StreamRestarted {
+                session_id: "s".into(),
+                run_id: "r".into(),
+            },
+            delta("Hello world"),
+        ] {
+            if let Some(t) = format_event(&ev, &mut streaming) {
+                out.push_str(&t);
+            }
+        }
+        assert!(!out.contains("worHello"), "{out}");
+        assert!(out.contains("starts again"), "{out}");
+        assert!(out.ends_with("Formless: Hello world"), "{out}");
+    }
 
     #[test]
     fn events_print_as_plain_sentences() {

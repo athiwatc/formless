@@ -2986,7 +2986,14 @@ fn run_headless(
     let (client, rx) = formless_tui::client::DaemonClient::connect(&paths)?;
     // Resolve/create session.
     let session_id = match session {
-        Some(id) => id,
+        // An id, an id prefix or a name, confirmed to exist (#893).
+        Some(id) => match find_session(&paths, &id) {
+            Ok(s) => s.id,
+            Err(e) => {
+                eprintln!("{e}");
+                return Ok(2);
+            }
+        },
         None => {
             let id = client.send(Request::CreateSession {
                 name: Some("headless".into()),
@@ -3024,23 +3031,25 @@ fn run_headless(
             cwd: Some(d.to_string_lossy().into_owned()),
         });
     }
+    // Requests whose failure means the Run can't go as asked (#893).
+    let mut critical = std::collections::HashSet::new();
     if let Some((model, effort)) = pick {
-        client.send(Request::SetSessionModel {
+        critical.insert(client.send(Request::SetSessionModel {
             id: session_id.clone(),
             model,
             reasoning_effort: effort,
-        });
+        }));
     }
     for (name, bytes) in files {
         use base64::Engine;
         // The daemon guesses the type from the name (images go to vision
         // models inline), as for /attach.
-        client.send(Request::AttachFile {
+        critical.insert(client.send(Request::AttachFile {
             session_id: session_id.clone(),
             name,
             data_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
             mime: None,
-        });
+        }));
     }
     if max_steps.is_some() {
         client.send(Request::SetStepLimit {
@@ -3048,11 +3057,12 @@ fn run_headless(
             max_steps,
         });
     }
-    client.send(Request::SendMessage {
+    critical.insert(client.send(Request::SendMessage {
         session_id: session_id.clone(),
         content: task,
         mode: SendMode::Send,
-    });
+        client_msg_id: None,
+    }));
     let sigints = count_sigints();
     let mut interrupting = false;
     let mut code = 1;
@@ -3221,6 +3231,20 @@ fn run_headless(
                     }
                     _ => {}
                 }
+            }
+            // A failed send, attachment or model choice: the Run won't
+            // happen as asked, so say so and stop instead of waiting.
+            Ok(ServerMessage::Response {
+                id,
+                ok: false,
+                error,
+                ..
+            }) if critical.contains(&id) => {
+                let e = error.unwrap_or_else(|| "daemon error".into());
+                eprintln!("error: {e}");
+                run_error = Some(e);
+                code = 2;
+                break;
             }
             Ok(_) => {}
             Err(_) => break,
@@ -3844,7 +3868,21 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
         paths,
         Request::ListSessions,
     )?)?;
-    let mut matches: Vec<SessionInfo> = list.into_iter().filter(|s| s.id.starts_with(id)).collect();
+    // An exact id, else an id prefix, else a name (SPEC §10.7).
+    if let Some(s) = list.iter().find(|s| s.id == id) {
+        return Ok(s.clone());
+    }
+    let mut matches: Vec<SessionInfo> = list
+        .iter()
+        .filter(|s| s.id.starts_with(id))
+        .cloned()
+        .collect();
+    if matches.is_empty() {
+        matches = list
+            .into_iter()
+            .filter(|s| s.name.eq_ignore_ascii_case(id.trim()))
+            .collect();
+    }
     match matches.len() {
         1 => Ok(matches.remove(0)),
         0 => anyhow::bail!("no Session '{id}' (formless sessions list)"),

@@ -439,6 +439,7 @@ async fn scripted_flow(
             }
             .into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         },
     };
     write_half

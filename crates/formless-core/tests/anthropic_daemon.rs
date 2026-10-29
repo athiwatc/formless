@@ -94,6 +94,7 @@ async fn failed_tool_results_are_sent_with_is_error() {
             session_id: sid.clone(),
             content: "go".into(),
             mode: formless_protocol::SendMode::Send,
+            client_msg_id: None,
         })
         .await
         .unwrap();
@@ -233,6 +234,7 @@ async fn run_turns(base: String, tag: &str, turns: &[&str]) -> (Store, String) {
                 session_id: sid.clone(),
                 content: turn.to_string(),
                 mode: formless_protocol::SendMode::Send,
+                client_msg_id: None,
             })
             .await
             .unwrap();
