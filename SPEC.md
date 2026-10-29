@@ -143,18 +143,49 @@ without redesign.
   overrides the key header). Chat-Completions-shaped context is converted
   (`anthropic.rs`): system messages join the top-level `system` blocks,
   tool calls become `tool_use` blocks and results `tool_result` blocks on
-  a user turn, images become base64 image blocks, and consecutive turns of
-  one role merge. Unless `provider.cache_control = "off"`, `cache_control`
-  breakpoints go on the end of the system prompt and of the last message
-  (the cache-stable prefix), and cache reads and writes are counted.
+  a user turn (always first in that turn, ahead of a steer or note stored
+  between the call and its result; a failed call's result carries
+  `is_error: true`, recorded when the failure is produced, never guessed
+  from the text), and consecutive turns of one role merge. Images become
+  image blocks: inline JPEG, PNG, GIF or WebP up to 5 MB, and http(s)
+  URLs as `url` sources; any other image becomes a one-line text note
+  (and the user is told), never a rejected request. `cache_control`
+  breakpoints follow the same `provider.cache_control` gate as Chat
+  Completions (`auto` = Claude model ids): on the end of the system
+  prompt and of the last message (the cache-stable prefix), and cache
+  reads and writes are counted.
   `reasoning_effort` becomes an extended-thinking budget (minimal 1k, low
-  4k, medium 12k, high 32k tokens, with `max_tokens` raised above it);
-  thinking streams as reasoning, and the signed `thinking` blocks are
-  stored with a tool-call turn (`meta.thinking_blocks`) and sent back on
-  the next request, as the API requires (other APIs drop them). Tools are
-  native; the probe forces a call with `tool_choice: {type: "any"}`.
-  Overloaded or dropped streams are retried before anything streamed;
-  `stop_reason: "max_tokens"` marks the answer truncated.
+  4k, medium 12k, high 32k tokens, with `max_tokens` raised above it),
+  only for models that support thinking (not Claude before 3.7, whose
+  pickers offer no effort). `max_tokens` never exceeds the model's output
+  cap: the `/models` listing's `max_tokens`, else a built-in table per
+  family; the thinking budget shrinks to fit under it, or thinking is
+  left off. Thinking streams as reasoning, and the signed `thinking`
+  blocks are stored with a tool-call turn (`meta.thinking_blocks`) and
+  sent back on the next request, as the API requires (other APIs drop
+  them). A 400 that names one of these parts is answered by exactly one
+  resend without it, with a note to the user: rejected replayed thinking
+  (the Session's stored blocks are then dropped), thinking, an output
+  limit (lowered to the one the error names), `cache_control` (also on
+  Chat Completions) or an image. Tools are native, or with
+  `tool_mode = "prompt"` described in the `system` prompt and parsed from
+  the text; the probe forces a call with `tool_choice: {type: "any"}`.
+  The listing is read page by page (`has_more` / `after_id`), and its
+  `max_input_tokens` is the model's context window.
+  An answer is complete only at `message_stop` with no content block
+  open; anything else is a dropped stream, re-sent like the other APIs'
+  (clients are told to clear partial output); overloaded and rate-limit
+  error events are retried before anything streamed.
+  `stop_reason: "max_tokens"` marks the answer truncated; `refusal` ends
+  the Run with a note naming the category (never an empty answer);
+  `model_context_window_exceeded` compacts the Session and asks once
+  more; `pause_turn` sends the turn back to continue (up to three times).
+  A non-streamed completion that stops for a refusal, the output limit or
+  the context window is an error, so no cut-off summary is checkpointed.
+  Changing a provider's `base_url` to another preset's endpoint (any
+  path: the CLI, clients, or the agent's `providers.upsert`) takes that
+  preset's `api_style`; moving off a preset back to an unknown endpoint
+  returns to `chat` unless the style was set explicitly.
 - **Gemini** is used through its OpenAI-compatible endpoint (the `gemini`
   preset). What works there: chat, streaming, native tool calls, images,
   and `reasoning_effort` (low/medium/high) as Gemini's thinking level.

@@ -233,6 +233,24 @@ pub struct ChatResult {
     pub truncated: bool,
     /// Token usage as reported by the provider (None when it sends none).
     pub usage: Option<Usage>,
+    /// Why generation stopped, when the API says more than "done"
+    /// (Anthropic `refusal`, `pause_turn`, `model_context_window_exceeded`).
+    pub stop_reason: Option<String>,
+    /// A refusal's category, when the API gives one.
+    pub stop_detail: Option<String>,
+    /// What was changed to get the request accepted, for the user.
+    pub notes: Vec<String>,
+    /// Replayed thinking was rejected and left out: the stored blocks
+    /// should not be sent again.
+    pub dropped_replayed_thinking: bool,
+}
+
+/// What [`Provider::post_provider`] changed to get a request accepted.
+#[derive(Debug, Clone, Default)]
+struct Recovered {
+    dropped_effort: bool,
+    notes: Vec<String>,
+    dropped_replayed_thinking: bool,
 }
 
 /// Provider-reported token counts for one request.
@@ -753,22 +771,53 @@ impl Provider {
         Ok((parse_models(&body), parse_model_windows(&body), parse_model_meta(&body)))
     }
 
+    /// `GET /models`; on the Messages API every page of it
+    /// (`has_more` / `after_id`), joined into one `data` list.
     async fn models_body(&self) -> Result<Value> {
+        const MAX_PAGES: usize = 20;
         let credential = self.credential().await?;
-        let req = apply_headers(
-            self.http.get(url(&self.cfg.base_url, "models")),
-            &self.cfg,
-            &credential,
-        );
-        let resp = req.send().await.context("GET /models")?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(anyhow!(
-                "GET /models failed: {status}: {}",
-                resp.text().await.unwrap_or_default()
-            ));
+        let mut all: Option<Value> = None;
+        let mut after: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut req = self.http.get(url(&self.cfg.base_url, "models"));
+            if self.cfg.anthropic() {
+                req = req.query(&[("limit", "1000")]);
+                if let Some(id) = &after {
+                    req = req.query(&[("after_id", id.as_str())]);
+                }
+            }
+            let resp = apply_headers(req, &self.cfg, &credential)
+                .send()
+                .await
+                .context("GET /models")?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "GET /models failed: {status}: {}",
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+            let page: Value = resp.json().await.context("parse /models")?;
+            let more = self.cfg.anthropic() && page["has_more"] == true;
+            after = page["last_id"].as_str().map(str::to_string);
+            match &mut all {
+                None => all = Some(page),
+                Some(a) => {
+                    let rows = page["data"].as_array().cloned().unwrap_or_default();
+                    if let Some(d) = a["data"].as_array_mut() {
+                        d.extend(rows);
+                    }
+                }
+            }
+            if !more || after.is_none() {
+                break;
+            }
         }
-        resp.json().await.context("parse /models")
+        let body = all.unwrap_or_default();
+        crate::anthropic::note_output_caps(body["data"].as_array().into_iter().flatten().filter_map(|m| {
+            Some((m["id"].as_str()?.to_string(), m["max_tokens"].as_u64()?))
+        }));
+        Ok(body)
     }
 
     pub async fn list_models_with_windows(&self) -> Result<(Vec<String>, HashMap<String, u32>)> {
@@ -792,8 +841,10 @@ impl Provider {
     /// line in the text remains. The marker never reaches the endpoint.
     pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
         use base64::Engine;
+        // Prompt-mode tools ride on Chat Completions text; the native
+        // Messages path keeps image blocks either way.
         let vision = !self.cfg.responses()
-            && !self.cfg.prompt_tools()
+            && (!self.cfg.prompt_tools() || self.cfg.anthropic())
             && self.cfg.vision.unwrap_or_else(|| is_vision_model(model));
         messages
             .iter()
@@ -836,6 +887,9 @@ impl Provider {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
             let (resp, _, _) = self.post_provider(&mut body, None, true).await?;
             let v: Value = resp.json().await.context("parse Messages response")?;
+            if let Some(why) = crate::anthropic::unusable_stop(&v) {
+                return Err(anyhow!("provider error: {why}"));
+            }
             let usage = Usage::parse(&v["usage"]);
             return Ok((crate::anthropic::response_parts(&v).0, usage));
         }
@@ -864,17 +918,7 @@ impl Provider {
     /// rejection and reasoning_effort was set, retries once without it and
     /// flags `dropped` via the returned marker in ChatResult paths.
     async fn post_chat(&self, body: &mut Value, effort: Option<&str>) -> Result<reqwest::Response> {
-        self.post_chat_flagged(body, effort)
-            .await
-            .map(|(r, _, _)| r)
-    }
-
-    async fn post_chat_flagged(
-        &self,
-        body: &mut Value,
-        effort: Option<&str>,
-    ) -> Result<(reqwest::Response, bool, String)> {
-        self.post_provider(body, effort, true).await
+        self.post_provider(body, effort, true).await.map(|(r, _, _)| r)
     }
 
     async fn post_provider(
@@ -882,7 +926,7 @@ impl Provider {
         body: &mut Value,
         effort: Option<&str>,
         allow_failover: bool,
-    ) -> Result<(reqwest::Response, bool, String)> {
+    ) -> Result<(reqwest::Response, Recovered, String)> {
         let endpoint = if self.cfg.anthropic() {
             "messages"
         } else if self.cfg.responses() {
@@ -900,7 +944,7 @@ impl Provider {
                 }
             }
         }
-        let mut dropped = false;
+        let mut recovered = Recovered::default();
         let mut last_err = String::new();
         for model in &models {
             let mut with_effort = effort.is_some();
@@ -928,7 +972,7 @@ impl Provider {
                         let status = resp.status();
                         note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
-                            return Ok((resp, dropped, model.clone()));
+                            return Ok((resp, recovered, model.clone()));
                         }
                         server_wait = retry_after(resp.headers());
                         let text = resp.text().await.unwrap_or_default();
@@ -947,8 +991,29 @@ impl Provider {
                         }
                         if status.as_u16() == 400 && with_effort && is_unknown_param(&text) {
                             with_effort = false;
-                            dropped = true;
+                            recovered.dropped_effort = true;
                             continue;
+                        }
+                        // Nested parts a 400 can name (thinking, output
+                        // cap, cache breakpoints, images): each fixed once,
+                        // so a rejected history never bricks the Session.
+                        if status.as_u16() == 400 {
+                            let fix = if self.cfg.anthropic() {
+                                crate::anthropic::recover(body, &text)
+                            } else if lower.contains("cache_control")
+                                && crate::anthropic::strip_cache_control(body)
+                            {
+                                Some(crate::anthropic::Recovery::CacheControl)
+                            } else {
+                                None
+                            };
+                            if let Some(fix) = fix {
+                                tracing::info!("provider rejected the request ({fix:?}); resending");
+                                recovered.notes.push(fix.note().to_string());
+                                recovered.dropped_replayed_thinking |=
+                                    fix == crate::anthropic::Recovery::ReplayedThinking;
+                                continue;
+                            }
                         }
                         last_err = match server_wait {
                             Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
@@ -1012,17 +1077,39 @@ impl Provider {
         mut on_delta: F,
     ) -> Result<ChatResult> {
         let prepared = self.prepare_attachments(messages, model);
-        if self.cfg.anthropic() && !self.cfg.prompt_tools() {
-            return self
-                .chat_stream_anthropic(&prepared, tools, model, effort, cancel, on_delta)
-                .await;
+        if self.cfg.anthropic() {
+            if !self.cfg.prompt_tools() || tools.is_empty() {
+                return self
+                    .chat_stream_anthropic(&prepared, tools, model, effort, cancel, on_delta)
+                    .await;
+            }
+            // Prompt-based tools on the Messages API: the instruction joins
+            // the system prompt, no native tools are sent, and the content
+            // is held back so tool-call JSON never streams to the user.
+            let msgs = with_prompt_tools(&prepared, tools);
+            let mut result = self
+                .chat_stream_anthropic(&msgs, &[], model, effort, cancel, |kind, d| {
+                    if kind != DeltaKind::Content {
+                        on_delta(kind, d)
+                    }
+                })
+                .await?;
+            let (clean, calls) = parse_prompt_tool_calls(&result.content);
+            if !clean.is_empty() {
+                on_delta(DeltaKind::Content, &clean);
+            }
+            result.content = clean;
+            result.tool_calls = calls;
+            return Ok(result);
         }
-        // Anthropic thinking blocks mean nothing to other APIs.
+        // Anthropic thinking blocks and result markers mean nothing to
+        // other APIs.
         let prepared: Vec<Value> = prepared
             .into_iter()
             .map(|mut m| {
                 if let Some(o) = m.as_object_mut() {
                     o.remove("thinking_blocks");
+                    o.remove("_is_error");
                 }
                 m
             })
@@ -1033,23 +1120,8 @@ impl Provider {
         let prompt_mode = self.cfg.prompt_tools() && !tools.is_empty();
         let augmented: Vec<Value>;
         let messages: &[Value] = if prompt_mode {
-            let instr = prompt_tool_instruction(tools);
-            let mut msgs: Vec<Value> = messages.to_vec();
-            if let Some(first) = msgs.first_mut() {
-                if first["role"].as_str() == Some("system") {
-                    let cur = first["content"].as_str().unwrap_or_default().to_string();
-                    first["content"] = json!(format!("{cur}{instr}"));
-                    augmented = msgs;
-                    &augmented
-                } else {
-                    msgs.insert(0, json!({"role": "system", "content": instr.trim_start()}));
-                    augmented = msgs;
-                    &augmented
-                }
-            } else {
-                augmented = vec![json!({"role": "system", "content": instr.trim_start()})];
-                &augmented
-            }
+            augmented = with_prompt_tools(messages, tools);
+            &augmented
         } else {
             messages
         };
@@ -1096,12 +1168,12 @@ impl Provider {
         let mut truncated = false;
         let mut usage = None;
         let mut attempt = 0;
-        let (dropped, model_used) = 'request: loop {
+        let (recovered, model_used) = 'request: loop {
             // Waiting for the response headers is cancellable too (a slow or
             // stuck endpoint must not outlive an interrupt).
-            let (resp, dropped, model_used) = tokio::select! {
+            let (resp, recovered, model_used) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                r = self.post_chat_flagged(&mut body, effort) => r?,
+                r = self.post_provider(&mut body, effort, true) => r?,
             };
             let mut stream = resp.bytes_stream();
             // Raw bytes: a chunk boundary can split a multibyte character, so
@@ -1291,7 +1363,7 @@ impl Provider {
                     }
                 }
             }
-            break (dropped, model_used);
+            break (recovered, model_used);
         };
         if prompt_mode {
             let (clean, calls) = parse_prompt_tool_calls(&content);
@@ -1323,10 +1395,14 @@ impl Provider {
             reasoning,
             tool_calls,
             thinking_blocks: Vec::new(),
-            dropped_reasoning_effort: dropped,
+            dropped_reasoning_effort: recovered.dropped_effort,
             model_used,
             truncated,
             usage,
+            stop_reason: None,
+            stop_detail: None,
+            notes: recovered.notes,
+            dropped_replayed_thinking: false,
         })
     }
 
@@ -1342,23 +1418,50 @@ impl Provider {
         cancel: &CancellationToken,
         mut on_delta: F,
     ) -> Result<ChatResult> {
-        let cache = !self.cfg.cache_control.eq_ignore_ascii_case("off");
+        // The same model gate as Chat's breakpoints (`auto` = Claude ids).
+        let cache = self.cfg.cache_breakpoints(model);
         let mut body = crate::anthropic::body(model, messages, tools, cache, effort, true);
+        let mut notes = crate::anthropic::skipped_images(messages);
+        let mut dropped_replayed_thinking = false;
         let mut attempt = 0;
+        let mut shown = false;
         loop {
-            let (resp, _, model_used) = tokio::select! {
+            let (resp, recovered, model_used) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 r = self.post_provider(&mut body, None, true) => r?,
             };
+            for n in recovered.notes {
+                if !notes.contains(&n) {
+                    notes.push(n);
+                }
+            }
+            dropped_replayed_thinking |= recovered.dropped_replayed_thinking;
             let mut stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             let mut f = crate::anthropic::Folded::default();
             let mut failed: Option<String> = None;
+            let fold = |f: &mut crate::anthropic::Folded, raw: &[u8], on_delta: &mut F| {
+                let line = String::from_utf8_lossy(raw);
+                let Some(data) = line.trim().strip_prefix("data:") else { return };
+                let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { return };
+                match f.event(&v) {
+                    crate::anthropic::Delta::Text(t) => on_delta(DeltaKind::Content, t),
+                    crate::anthropic::Delta::Thinking(t) => on_delta(DeltaKind::Reasoning, t),
+                    crate::anthropic::Delta::None => {}
+                }
+            };
             'read: loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                     next = stream.next() => {
-                        let Some(chunk) = next else { break 'read };
+                        let Some(chunk) = next else {
+                            // A last event without its newline still counts.
+                            if !buf.is_empty() {
+                                let rest = std::mem::take(&mut buf);
+                                fold(&mut f, &rest, &mut on_delta);
+                            }
+                            break 'read;
+                        };
                         let chunk = match chunk {
                             Ok(c) => c,
                             Err(e) => {
@@ -1370,29 +1473,47 @@ impl Provider {
                         buf.extend_from_slice(&chunk);
                         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                             let raw: Vec<u8> = buf.drain(..=pos).collect();
-                            let line = String::from_utf8_lossy(&raw);
-                            let Some(data) = line.trim().strip_prefix("data:") else { continue };
-                            let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { continue };
-                            match f.event(&v) {
-                                crate::anthropic::Delta::Text(t) => on_delta(DeltaKind::Content, t),
-                                crate::anthropic::Delta::Thinking(t) => on_delta(DeltaKind::Reasoning, t),
-                                crate::anthropic::Delta::None => {}
-                            }
-                            if let Some((kind, msg)) = &f.error {
-                                failed = Some(format!("{kind}: {msg}"));
+                            fold(&mut f, &raw, &mut on_delta);
+                            if f.error.is_some() {
                                 break 'read;
                             }
                         }
                     }
                 }
             }
+            shown |= !f.nothing_streamed();
+            if let Some((kind, msg)) = &f.error {
+                failed = Some(format!("{kind}: {msg}"));
+            } else if failed.is_none() {
+                // An answer is finished only at `message_stop`: anything
+                // else is a dropped stream, never a final answer.
+                failed = f.incomplete().map(|why| format!("stream dropped: {why}"));
+            }
             if let Some(why) = failed {
-                // Overloaded / dropped before any output: re-send (§4.4).
-                let retryable = why.contains("overloaded") || why.contains("api_error") || why.starts_with("stream dropped");
-                if retryable && f.nothing_streamed() && attempt < self.cfg.max_retries {
+                let dropped = why.starts_with("stream dropped");
+                let reason = if dropped {
+                    Some("stream dropped")
+                } else if why.contains("overloaded") {
+                    Some("overloaded")
+                } else if why.contains("rate_limit") {
+                    Some("rate limited")
+                } else if why.contains("api_error") {
+                    Some("server error")
+                } else {
+                    None
+                };
+                // A dropped stream is re-sent even after partial output (as
+                // on the other APIs); an error event only before any.
+                let retry = reason.filter(|_| dropped || f.nothing_streamed());
+                if let Some(reason) = retry.filter(|_| attempt < self.cfg.max_retries) {
+                    if shown {
+                        // Clients clear what they showed of the lost attempt.
+                        on_delta(DeltaKind::Restart, "");
+                        shown = false;
+                    }
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                        _ = self.retry_wait(attempt, None, "provider error".into()) => {}
+                        _ = self.retry_wait(attempt, None, reason.to_string()) => {}
                     }
                     attempt += 1;
                     continue;
@@ -1425,6 +1546,10 @@ impl Provider {
                 model_used,
                 truncated: f.truncated,
                 usage: Some(usage),
+                stop_reason: f.stop_reason.filter(|r| !matches!(r.as_str(), "end_turn" | "tool_use" | "stop_sequence" | "max_tokens")),
+                stop_detail: f.stop_detail,
+                notes,
+                dropped_replayed_thinking,
             });
         }
     }
@@ -1470,6 +1595,21 @@ impl Provider {
         )
         .await
     }
+}
+
+/// `messages` with the prompt-based tool instruction appended to the
+/// system prompt (one is added when there is none).
+fn with_prompt_tools(messages: &[Value], tools: &[Value]) -> Vec<Value> {
+    let instr = prompt_tool_instruction(tools);
+    let mut msgs = messages.to_vec();
+    match msgs.first_mut() {
+        Some(first) if first["role"].as_str() == Some("system") => {
+            let cur = first["content"].as_str().unwrap_or_default().to_string();
+            first["content"] = json!(format!("{cur}{instr}"));
+        }
+        _ => msgs.insert(0, json!({"role": "system", "content": instr.trim_start()})),
+    }
+    msgs
 }
 
 /// Largest image sent inline to a vision model.
@@ -1532,6 +1672,10 @@ pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
             if let Some(p) = per_m(&m["pricing"]["completion"]) {
                 meta["output_price"] = json!(p);
             }
+            // Anthropic's listing: the output cap per model.
+            if let Some(cap) = m["max_tokens"].as_u64() {
+                meta["max_output"] = json!(cap);
+            }
             if let Some(mods) = m["architecture"]["input_modalities"].as_array() {
                 meta["vision"] = json!(mods.iter().any(|x| x == "image"));
             }
@@ -1570,7 +1714,12 @@ pub fn known_model_meta(id: &str) -> Value {
     } else if name.starts_with("gpt-4o") || name.starts_with("gpt-4.1") {
         set(&mut meta, true, true, Some(&[]));
     } else if name.contains("claude") {
-        set(&mut meta, true, true, None);
+        // Claude before 3.7 rejects extended thinking.
+        let efforts: Option<&[&str]> = if crate::anthropic::supports_thinking(name) { None } else { Some(&[]) };
+        set(&mut meta, true, true, efforts);
+        if let Some(cap) = crate::anthropic::output_cap(name) {
+            meta["max_output"] = json!(cap);
+        }
     } else if name.contains("gemini") {
         // The compatible endpoint maps these onto its thinking levels.
         set(&mut meta, true, true, Some(&["low", "medium", "high"]));
@@ -1608,6 +1757,7 @@ pub fn parse_model_windows(body: &Value) -> HashMap<String, u32> {
                 &m["max_model_len"],
                 &m["context_window"],
                 &m["max_context_length"],
+                &m["max_input_tokens"],
             ]
             .into_iter()
             .find_map(Value::as_u64)
