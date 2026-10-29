@@ -1455,7 +1455,22 @@ impl Config {
         }
         let fresh = toml::to_string_pretty(self)?;
         let text = match std::fs::read_to_string(&file) {
-            Ok(old) => merge_toml(&old, &fresh).unwrap_or(fresh),
+            Ok(old) => match merge_toml(&old, &fresh) {
+                Some(merged) => merged,
+                // Can't merge into it (it doesn't parse for this build):
+                // keep a copy before replacing it, never lose it (#1100).
+                None => {
+                    let bak = file.with_extension("toml.bak");
+                    write_atomic(&bak, old.as_bytes())
+                        .with_context(|| format!("back up {}", file.display()))?;
+                    tracing::warn!(
+                        "{} could not be merged; saved a copy as {}",
+                        file.display(),
+                        bak.display()
+                    );
+                    fresh
+                }
+            },
             Err(_) => fresh,
         };
         write_atomic(&file, text.as_bytes()).with_context(|| format!("write {}", file.display()))
@@ -1638,9 +1653,10 @@ fn merge_toml(old: &str, fresh: &str) -> Option<String> {
     let mut doc: toml_edit::DocumentMut = old.parse().ok()?;
     let new: toml_edit::DocumentMut = fresh.parse().ok()?;
     // What `old` means to this build, to tell ignored keys from settings.
-    let meaning = |d: &toml_edit::DocumentMut| -> Option<String> {
+    // Compared as parsed values, so map order never matters (#1100).
+    let meaning = |d: &toml_edit::DocumentMut| -> Option<serde_json::Value> {
         let c: Config = toml::from_str(&d.to_string()).ok()?;
-        toml::to_string(&c).ok()
+        serde_json::to_value(&c).ok()
     };
     let base = meaning(&doc)?;
     let target = meaning(&new)?;
@@ -1663,7 +1679,7 @@ fn merge_toml(old: &str, fresh: &str) -> Option<String> {
     for p in inserted.iter().rev() {
         let mut probe = doc.clone();
         if remove_path(probe.as_item_mut(), p).is_some()
-            && meaning(&probe).as_deref() == Some(target.as_str())
+            && meaning(&probe).as_ref() == Some(&target)
         {
             doc = probe;
         }
@@ -1671,12 +1687,63 @@ fn merge_toml(old: &str, fresh: &str) -> Option<String> {
     Some(doc.to_string())
 }
 
-/// Remove the key at `path` (table names, then the key).
+/// Remove the key at `path` (table names or array-of-tables indexes,
+/// then the key).
 fn remove_path(item: &mut toml_edit::Item, path: &[String]) -> Option<()> {
     match path {
         [] => None,
         [last] => item.as_table_like_mut()?.remove(last).map(|_| ()),
-        [first, rest @ ..] => remove_path(item.get_mut(first)?, rest),
+        [first, rest @ ..] => {
+            if let toml_edit::Item::ArrayOfTables(a) = item {
+                let entry = a.get_mut(first.parse().ok()?)?;
+                return match rest {
+                    [last] => entry.remove(last).map(|_| ()),
+                    [next, more @ ..] => remove_path(entry.get_mut(next)?, more),
+                    [] => None,
+                };
+            }
+            remove_path(item.get_mut(first)?, rest)
+        }
+    }
+}
+
+/// [`merge_table`] for an inline table (`provider = { … }`), which a
+/// fresh serialization writes as a plain table.
+fn merge_inline(
+    old: &mut toml_edit::InlineTable,
+    new: &toml_edit::InlineTable,
+    path: &mut Vec<String>,
+    known: &mut dyn FnMut(&[String]) -> Option<bool>,
+) {
+    for (k, nv) in new.iter() {
+        path.push(k.to_string());
+        match old.get_mut(k) {
+            Some(toml_edit::Value::InlineTable(oi)) if nv.is_inline_table() => {
+                merge_inline(oi, nv.as_inline_table().expect("checked"), path, known);
+            }
+            Some(ov) if ov.to_string().trim() != nv.to_string().trim() => {
+                let decor = ov.decor().clone();
+                *ov = nv.clone();
+                *ov.decor_mut() = decor;
+            }
+            Some(_) => {}
+            None => {
+                old.insert(k, nv.clone());
+            }
+        }
+        path.pop();
+    }
+    let gone: Vec<String> = old
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .filter(|k| !new.contains_key(k))
+        .collect();
+    for k in gone {
+        path.push(k.clone());
+        if known(path).unwrap_or(true) {
+            old.remove(&k);
+        }
+        path.pop();
     }
 }
 
@@ -1692,6 +1759,31 @@ fn merge_table(
         match (old.get_mut(k), nv) {
             (Some(toml_edit::Item::Table(ot)), toml_edit::Item::Table(nt)) => {
                 merge_table(ot, nt, path, inserted, known);
+            }
+            // `[[hooks]]`: entry by entry, keeping each one's comments and
+            // unknown keys (#1100).
+            (Some(toml_edit::Item::ArrayOfTables(oa)), toml_edit::Item::ArrayOfTables(na)) => {
+                for (i, nt) in na.iter().enumerate() {
+                    path.push(i.to_string());
+                    match oa.get_mut(i) {
+                        Some(ot) => merge_table(ot, nt, path, inserted, known),
+                        None => oa.push(nt.clone()),
+                    }
+                    path.pop();
+                }
+                while oa.len() > na.len() {
+                    oa.remove(oa.len() - 1);
+                }
+            }
+            (Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(oi))), _)
+                if nv.is_table_like() =>
+            {
+                let ni = match nv {
+                    toml_edit::Item::Table(t) => t.clone().into_inline_table(),
+                    toml_edit::Item::Value(toml_edit::Value::InlineTable(t)) => t.clone(),
+                    _ => unreachable!("table-like"),
+                };
+                merge_inline(oi, &ni, path, known);
             }
             (Some(ov), _) => {
                 // Same value: leave the old item (and its decor) alone.
@@ -1733,13 +1825,26 @@ fn merge_table(
 /// crash leaves the old file or the new one, never half of either.
 pub fn write_atomic(file: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    // A symlinked config (dotfiles) is written where it points, never
+    // replaced by a plain file (#1101).
+    let target;
+    let file = if std::fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink()) {
+        target = std::fs::canonicalize(file)
+            .with_context(|| format!("{} is a symlink that doesn't resolve", file.display()))?;
+        target.as_path()
+    } else {
+        file
+    };
     let dir = file.parent().context("no parent folder")?;
+    // Unique per save, so two saves never share a temporary file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = dir.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         file.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("config"),
-        std::process::id()
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -1854,6 +1959,62 @@ pub fn delete_api_key(paths: &Paths) {
 #[cfg(test)]
 mod save_tests {
     use super::*;
+
+    /// `[[hooks]]` entries and inline tables keep their comments and
+    /// unknown keys through an unrelated change; a symlinked config is
+    /// written through the link; an unmergeable file is backed up (#1100, #1101).
+    #[test]
+    fn hooks_inline_tables_and_symlinks_survive_saves() {
+        let base = std::env::temp_dir().join(format!("fl-cfghooks-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        let original = "[provider]\n\
+model = \"m\"\n\
+\n\
+[providers]\n\
+# my local box\n\
+local = { base_url = \"http://localhost:11434/v1\", model = \"llama\", someday = 1 }\n\
+\n\
+# audit every net call\n\
+[[hooks]]\n\
+event = \"pre_tool\"\n\
+# only net Tools\n\
+capability = \"net\"\n\
+command = [\"logger\"]\n\
+later_key = \"kept\"\n";
+        // The real file lives elsewhere; config.toml links to it.
+        let real = base.join("dotfiles.toml");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&real, original).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, paths.config_file()).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&real, paths.config_file()).unwrap();
+        let mut cfg = Config::load_file_only(&paths).unwrap();
+        cfg.provider.model = "other".into();
+        cfg.save(&paths).unwrap();
+        #[cfg(unix)]
+        assert!(std::fs::symlink_metadata(paths.config_file())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        for kept in [
+            "# my local box",
+            "someday = 1",
+            "# audit every net call",
+            "# only net Tools",
+            "later_key = \"kept\"",
+            "model = \"other\"",
+        ] {
+            assert!(text.contains(kept), "{kept} missing:\n{text}");
+        }
+        // A file this build can't read is backed up before it's replaced.
+        std::fs::write(paths.config_file(), "[provider\nbroken").unwrap();
+        cfg.save(&paths).unwrap();
+        let bak = paths.config_file().with_extension("toml.bak");
+        assert!(std::fs::read_to_string(bak).unwrap().contains("broken"));
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn saving_keeps_comments_order_and_unknown_keys() {

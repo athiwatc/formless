@@ -130,6 +130,37 @@ fn over_limit(what: &str, size: u64, setting: &str, instead: &str) -> String {
     )
 }
 
+fn check_read_size(len: u64) -> Result<(), String> {
+    if len > MAX_READ_BYTES.load(Ordering::Relaxed) {
+        return Err(over_limit(
+            "fs.read",
+            len,
+            "tools.max_read_bytes",
+            "read it with fs.readChunks or fs.readLines",
+        ));
+    }
+    Ok(())
+}
+
+/// A whole file, refused past `tools.max_read_bytes` by construction: at
+/// most cap + 1 bytes are read, whatever its size claims or becomes
+/// between a stat and the read (#1103).
+fn read_capped(p: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
+    // Fast early error for files that already say they're too big.
+    if let Ok(m) = std::fs::metadata(p) {
+        check_read_size(m.len())?;
+    }
+    let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let mut out = Vec::new();
+    f.take(cap + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("{}: {e}", p.display()))?;
+    check_read_size(out.len() as u64)?;
+    Ok(out)
+}
+
 /// Set how many `tools.call` Invocations one sandbox may have in
 /// flight at once; the rest queue (SPEC §7.12, `scripts.max_parallel`).
 pub fn set_max_parallel_calls(n: u64) {
@@ -739,6 +770,47 @@ fn kill_tree(child: &mut std::process::Child) {
 
 /// Variables a `process.run` child inherits without an `env:` grant: what
 /// ordinary programs need to locate binaries, temp dirs and the locale.
+/// An environment variable that changes which program runs or what it
+/// loads: a Tool sets one for a child only with that `env:` grant (#1098).
+fn steers_execution(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    const EXACT: &[&str] = &[
+        "PATH",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "ZDOTDIR",
+        "PAGER",
+        "MANPAGER",
+        "EDITOR",
+        "VISUAL",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "SSH_ASKPASS",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PERL5LIB",
+        "PERL5OPT",
+        "PERLLIB",
+        "RUBYLIB",
+        "RUBYOPT",
+        "NODE_PATH",
+        "TMPDIR",
+        "HOME",
+    ];
+    EXACT.contains(&k.as_str())
+        || ["LD_", "DYLD_", "GIT_", "NPM_CONFIG_"]
+            .iter()
+            .any(|p| k.starts_with(p))
+        || k.ends_with("_OPTIONS")
+        || k.ends_with("_OPTS")
+}
+
 const PROCESS_BASE_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -1131,24 +1203,14 @@ impl State {
                 let enc = enc_of(&a["encoding"])?;
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
                 match self.overlay_get(&p) {
-                    Some(Some(bytes)) => return Ok(encode(&bytes, enc)),
+                    Some(Some(bytes)) => {
+                        check_read_size(bytes.len() as u64)?;
+                        return Ok(encode(&bytes, enc));
+                    }
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {}
                 }
-                let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
-                if let Ok(m) = std::fs::metadata(&p) {
-                    if m.len() > cap {
-                        return Err(over_limit(
-                            "fs.read",
-                            m.len(),
-                            "tools.max_read_bytes",
-                            "read it with fs.readChunks or fs.readLines",
-                        ));
-                    }
-                }
-                std::fs::read(&p)
-                    .map(|b| encode(&b, enc))
-                    .map_err(|e| format!("{}: {e}", p.display()))
+                read_capped(&p).map(|b| encode(&b, enc))
             }
             "fs_write" => {
                 let enc = enc_of(&a["encoding"])?;
@@ -1161,12 +1223,14 @@ impl State {
                     let mut full = if append {
                         match self.overlay_get(&p) {
                             Some(prev) => prev.unwrap_or_default(),
-                            None => std::fs::read(&p).unwrap_or_default(),
+                            None if p.exists() => read_capped(&p)?,
+                            None => Vec::new(),
                         }
                     } else {
                         Vec::new()
                     };
                     full.extend_from_slice(&data);
+                    check_read_size(full.len() as u64)?;
                     if self.mode == HostMode::DryRun {
                         self.would(format!(
                             "{} {} bytes to {}",
@@ -1721,6 +1785,18 @@ impl State {
                 first_arg.map(|f| format!(" {f}")).unwrap_or_default()
             )));
         }
+        // Variables that change what the program loads or runs need their
+        // own env grant (#1098): `PATH`, loader and interpreter hooks, git's.
+        if let Some(env) = a["env"].as_object() {
+            if let Some(k) = env
+                .keys()
+                .find(|k| steers_execution(k) && !self.caps.env.iter().any(|g| g == *k))
+            {
+                return Err(denied(format!(
+                    "process.run env {k} changes what the program loads or runs; declare env:{k} to set it"
+                )));
+            }
+        }
         // A working folder is a place the Tool may read (#608): inside
         // its fs grants, never anywhere on disk.
         if let Some(cwd) = a["cwd"].as_str() {
@@ -1767,6 +1843,31 @@ impl State {
             None => None,
         };
         let mut command = std::process::Command::new(cmd);
+        // Git under a sub-command grant (`process:git:status|log`) runs
+        // without the repository settings that start programs: fsmonitor,
+        // pager, credential helpers, external diff (#1099).
+        let base = std::path::Path::new(cmd)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(cmd);
+        if base == "git"
+            && allowed
+                .iter()
+                .any(|g| g.starts_with("git:") || g.contains("/git:"))
+        {
+            command.args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.pager=cat",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "diff.external=",
+                "-c",
+                "core.sshCommand=false",
+            ]);
+        }
         command
             .args(&args)
             .stdin(if stdin.is_some() {
@@ -2464,6 +2565,45 @@ mod tests {
             "{}",
             e.message
         );
+    }
+
+    /// A call's own env can't steer what runs without its env grant (#1098).
+    #[test]
+    fn execution_steering_env_needs_its_grant() {
+        for (grant, code) in [
+            (
+                "process:git:log",
+                "process.run('git', ['log'], {env: {GIT_SSH_COMMAND: 'touch /tmp/x'}})",
+            ),
+            ("process:ls", "process.run('ls', [], {env: {PATH: '/tmp'}})"),
+            (
+                "process:ls",
+                "process.run('ls', [], {env: {LD_PRELOAD: '/tmp/x.so'}})",
+            ),
+            (
+                "process:ls",
+                "process.run('ls', [], {env: {NODE_OPTIONS: '--require x'}})",
+            ),
+        ] {
+            let mut req = live(&format!("function run() {{ return {code}; }}"));
+            req.caps = Capabilities::parse(&[grant.to_string()]).unwrap();
+            let e = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+            assert!(
+                e.message.contains("changes what the program loads or runs"),
+                "{}",
+                e.message
+            );
+        }
+        assert!(steers_execution("dyld_insert_libraries") && !steers_execution("LANG"));
+        #[cfg(unix)]
+        {
+            let mut req = live(
+                "function run() { return process.run('ls', [], {env: {PATH: '/bin:/usr/bin', LANG: 'C'}}).code; }",
+            );
+            req.caps =
+                Capabilities::parse(&["process:ls".to_string(), "env:PATH".to_string()]).unwrap();
+            assert_eq!(execute(&req, Arc::new(NoHostOps)).unwrap().output, json!(0));
+        }
     }
 
     #[test]

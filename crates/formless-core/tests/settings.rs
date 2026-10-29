@@ -261,3 +261,43 @@ async fn session_delete_has_an_undo_window() {
     );
     assert!(daemon.handle(Request::RestoreSession { id }).await.is_err());
 }
+
+/// Settings changed at the same time all survive: edits are serialised
+/// (#1101).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_settings_changes_all_survive() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-setc-{short}"));
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-setc-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    Config::default().save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let keys = [
+        ("tui.multi_pane", serde_json::json!(true)),
+        ("limits.daily_usd", serde_json::json!(3.0)),
+        ("limits.run_usd", serde_json::json!(1.0)),
+        ("tui.on_start", serde_json::json!("new")),
+    ];
+    for _ in 0..5 {
+        let tasks: Vec<_> = keys
+            .iter()
+            .map(|(k, v)| {
+                let (d, key, value) = (daemon.clone(), k.to_string(), v.clone());
+                tokio::spawn(async move { d.handle(Request::SetSetting { key, value }).await })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+    }
+    let saved = Config::load_file_only(&paths).unwrap();
+    assert!(saved.tui.multi_pane);
+    assert_eq!(saved.limits.daily_usd, Some(3.0));
+    assert_eq!(saved.limits.run_usd, Some(1.0));
+    assert_eq!(saved.tui.on_start, "new");
+}

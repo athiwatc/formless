@@ -29,6 +29,9 @@ struct Subscriber {
     filter: Arc<StdMutex<EventFilter>>,
     /// Cancelled to disconnect a client whose queue overflowed.
     kick: CancellationToken,
+    /// (session, run) whose answer deltas this client missed, until it
+    /// has been told with `DeltasDropped`.
+    gap: Option<(String, String)>,
 }
 
 /// Messages queued per client before it counts as stuck.
@@ -205,7 +208,7 @@ pub(crate) struct PendingEntry {
 fn send_all(subs: &Subs, ev: Event) {
     subs.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|sub| {
+        .retain_mut(|sub| {
             if !sub
                 .filter
                 .lock()
@@ -214,9 +217,25 @@ fn send_all(subs: &Subs, ev: Event) {
             {
                 return true;
             }
+            // A gap is told before anything else, once there is room.
+            if let Some((session_id, run_id)) = sub.gap.clone() {
+                let told = ServerMessage::Event(Event::DeltasDropped { session_id, run_id });
+                if sub.tx.try_send(told).is_ok() {
+                    sub.gap = None;
+                }
+            }
             match sub.tx.try_send(ServerMessage::Event(ev.clone())) {
                 Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) if droppable(&ev) => true,
+                Err(mpsc::error::TrySendError::Full(_)) if droppable(&ev) => {
+                    if let Event::MessageDelta {
+                        session_id, run_id, ..
+                    } = &ev
+                    {
+                        sub.gap
+                            .get_or_insert_with(|| (session_id.clone(), run_id.clone()));
+                    }
+                    true
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     tracing::warn!(
                     "client {} stopped reading ({CLIENT_QUEUE} messages queued); disconnecting it",
@@ -400,6 +419,9 @@ pub struct Daemon {
     pub(crate) mcp: crate::mcp::Manager,
     /// Parsed config.toml, re-read only when the file changes.
     config: StdMutex<Option<(ConfigStamp, Config)>>,
+    /// Held while a request edits `config.toml`, so two edits never lose
+    /// each other's change.
+    config_edit: StdMutex<()>,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -503,6 +525,7 @@ impl Daemon {
             subs: Arc::new(StdMutex::new(Vec::new())),
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
+            config_edit: StdMutex::new(()),
             mcp: Default::default(),
             modules: StdMutex::new(None),
             // `provider.proxy` applies from start-up (restart to change it).
@@ -1486,9 +1509,12 @@ impl Daemon {
                 )
             })?)?),
             Request::SetSetting { key, value } => {
+                // One config edit at a time: load, change and save together (#1101).
+                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = Config::load_file_only(&self.paths)?;
                 cfg.set_key(&key, value.clone())?;
                 cfg.save(&self.paths)?;
+                drop(edit);
                 let _ = self
                     .with_store(|st| st.audit("user", "setting.set", &format!("{key} = {value}")));
                 // Hot: the next config() read sees the new file and
@@ -1884,6 +1910,8 @@ impl Daemon {
                 {
                     return Err(anyhow!("provider names use letters, digits, '-' and '_' (and 'default' is [provider])"));
                 }
+                // One config edit at a time: load, change and save together (#1101).
+                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = Config::load_file_only(&self.paths)?;
                 let old_url = cfg.providers.get(&name).map(|p| p.base_url.clone());
                 let p = cfg.providers.entry(name.clone()).or_default();
@@ -1908,6 +1936,7 @@ impl Daemon {
                     p.api_key_header = Some(h.trim().to_string()).filter(|h| !h.is_empty());
                 }
                 cfg.save(&self.paths)?;
+                drop(edit);
                 if let Some(key) = api_key.filter(|k| !k.is_empty()) {
                     crate::config::save_provider_key(&self.paths, &name, &key)?;
                 }
@@ -1916,6 +1945,8 @@ impl Daemon {
                 Ok(json!({"provider": name}))
             }
             Request::RemoveProvider { name } => {
+                // One config edit at a time: load, change and save together (#1101).
+                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = Config::load_file_only(&self.paths)?;
                 let users: Vec<&String> = cfg
                     .roles
@@ -1937,6 +1968,7 @@ impl Daemon {
                     return Err(anyhow!("no provider '{name}'"));
                 }
                 cfg.save(&self.paths)?;
+                drop(edit);
                 crate::config::delete_provider_key(&self.paths, &name);
                 let _ = self.with_store(|st| st.audit("user", "provider.remove", &name));
                 let _ = self.config();
@@ -1958,20 +1990,26 @@ impl Daemon {
                 }
                 let role: crate::config::RoleCfg =
                     serde_json::from_value(role).context("invalid role")?;
+                // One config edit at a time: load, change and save together (#1101).
+                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = Config::load_file_only(&self.paths)?;
                 cfg.provider_cfg(role.provider.as_deref())?;
                 cfg.roles.insert(name.clone(), role);
                 cfg.save(&self.paths)?;
+                drop(edit);
                 let _ = self.with_store(|st| st.audit("user", "role.upsert", &name));
                 let _ = self.config();
                 Ok(json!({"role": name}))
             }
             Request::DeleteRole { name } => {
+                // One config edit at a time: load, change and save together (#1101).
+                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = Config::load_file_only(&self.paths)?;
                 if cfg.roles.remove(&name).is_none() {
                     return Err(anyhow!("no role '{name}'"));
                 }
                 cfg.save(&self.paths)?;
+                drop(edit);
                 let _ = self.with_store(|st| st.audit("user", "role.delete", &name));
                 let _ = self.config();
                 Ok(json!({"deleted": name}))
@@ -2367,6 +2405,8 @@ impl Daemon {
                 tool,
                 enabled,
             } => {
+                // One config edit at a time: load, change and save together (#1101).
+                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = self.config()?;
                 let server = cfg
                     .mcp
@@ -2379,6 +2419,7 @@ impl Daemon {
                     server.disabled_tools.sort();
                 }
                 cfg.save(&self.paths)?;
+                drop(edit);
                 let action = if enabled {
                     "mcp.tool_enable"
                 } else {
@@ -3398,7 +3439,8 @@ impl Daemon {
                 steer_rx,
             ));
             if let Err(p) = run.catch_unwind().await {
-                this.run_panicked(&session_id, &run_id, &panic_text(&p));
+                this.run_panicked(&session_id, &run_id, &panic_text(&p))
+                    .await;
             }
         });
         Ok(())
@@ -3408,34 +3450,19 @@ impl Daemon {
     /// is left paused with the reason, as if it had failed, so the next
     /// message works without a restart. Locks a panic may have poisoned
     /// are still taken.
-    fn run_panicked(&self, session_id: &str, run_id: &str, why: &str) {
+    async fn run_panicked(self: &Arc<Self>, session_id: &str, run_id: &str, why: &str) {
         tracing::error!("run {run_id} in session {session_id} panicked: {why}");
         let error = format!("internal error: {why}");
-        let _ = self.with_store(|st| st.set_run_status(run_id, "paused"));
+        self.record_run_status(session_id, run_id, "paused");
         let _ = self.with_store(|st| st.set_run_error(run_id, &error));
-        self.runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
-        self.budget_waived
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
-        self.step_limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
         self.broadcast(Event::RunPaused {
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
             error,
             explained: None,
         });
-        self.broadcast(Event::RunFinished {
-            session_id: session_id.to_string(),
-            run_id: run_id.to_string(),
-            status: "paused".into(),
-        });
+        self.finish_run(session_id.to_string(), run_id.to_string(), "paused")
+            .await;
     }
 
     async fn run_loop(
@@ -3470,7 +3497,7 @@ impl Daemon {
                 }
                 Err(e) => {
                     final_status = "paused";
-                    let _ = self.with_store(|st| st.set_run_status(&run_id, "paused"));
+                    self.record_run_status(&session_id, &run_id, "paused");
                     let _ = self.with_store(|st| st.set_run_error(&run_id, &e.to_string()));
                     let explained = self.config().ok().map(|cfg| {
                         let (model, _) = self.session_model_effort(&session_id, &cfg);
@@ -3489,13 +3516,46 @@ impl Daemon {
                 }
             }
         }
-        if final_status != "paused" {
-            let _ = self.with_store(|st| st.set_run_status(&run_id, final_status));
+        self.finish_run(session_id, run_id, final_status).await;
+    }
+
+    /// Record a Run's final status; a failed write is logged and told,
+    /// never hidden behind a status clients would believe (#1097).
+    fn record_run_status(&self, session_id: &str, run_id: &str, status: &str) {
+        if let Err(e) = self.with_store(|st| st.set_run_status(run_id, status)) {
+            tracing::error!("could not record run {run_id} as {status}: {e:#}");
+            self.broadcast(Event::Note {
+                session_id: Some(session_id.to_string()),
+                text: format!("Could not record that this Run is {status}: {e:#}"),
+            });
         }
-        self.runs.lock().unwrap().remove(&session_id);
-        self.budget_waived.lock().unwrap().remove(&session_id);
-        self.step_limits.lock().unwrap().remove(&session_id);
-        let changes = self.run_tool_changes.lock().unwrap().remove(&run_id);
+    }
+
+    /// Everything after a Run ends, however it ended (a panic too, #1097):
+    /// free the Session, report what changed, resolve comparisons and jobs,
+    /// run `run_end` hooks, and start the next queued message.
+    async fn finish_run(self: &Arc<Self>, session_id: String, run_id: String, final_status: &str) {
+        if final_status != "paused" {
+            self.record_run_status(&session_id, &run_id, final_status);
+        }
+        // Locks a panicking Run may have poisoned are still taken.
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
+        self.budget_waived
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
+        self.step_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
+        let changes = self
+            .run_tool_changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
         let files = self.run_file_infos(&run_id, false).unwrap_or_default();
         if let Some(recap) = self.run_recap(&session_id, &run_id, changes.as_deref(), &files) {
             self.broadcast(Event::RunRecap {
@@ -6007,6 +6067,8 @@ impl Daemon {
         let mut failed: Vec<String> = Vec::new();
         // Config first (providers and Roles the Tools may name), then
         // modules (Tools load them), then the rest.
+        // One config edit at a time: load, change and save together (#1101).
+        let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = self.config()?;
         let incoming: Config = serde_json::from_value(bundle["config"].clone()).unwrap_or_default();
         let (mut providers, mut roles, mut servers) = (0, 0, 0);
@@ -6033,6 +6095,7 @@ impl Daemon {
             self.broadcast(Event::SettingsChanged);
             self.broadcast(Event::McpServersChanged);
         }
+        drop(edit);
         let mut modules = 0;
         for m in list("modules") {
             let (Some(name), Some(code)) = (m["name"].as_str(), m["code"].as_str()) else {
@@ -7248,9 +7311,12 @@ impl Daemon {
     async fn harness_apply(&self, op: &str, args: &Value) -> Result<Value> {
         let name = args["name"].as_str().unwrap_or_default().to_string();
         let edit_config = |f: &dyn Fn(&mut Config) -> Result<()>| -> Result<()> {
+            // One config edit at a time: load, change and save together (#1101).
+            let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
             let mut cfg = Config::load_file_only(&self.paths)?;
             f(&mut cfg)?;
             cfg.save(&self.paths)?;
+            drop(edit);
             let _ = self.config();
             Ok(())
         };
@@ -7452,6 +7518,8 @@ impl Daemon {
         if inv_op == "providers.upsert" {
             // Re-adding a provider the agent removed: no reachability check.
             let n = inv_args["name"].as_str().unwrap_or_default().to_string();
+            // One config edit at a time: load, change and save together (#1101).
+            let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
             let mut cfg = Config::load_file_only(&self.paths)?;
             let p = cfg.providers.entry(n).or_default();
             p.base_url = inv_args["base_url"]
@@ -7463,6 +7531,7 @@ impl Daemon {
                 p.api_style = style.to_string();
             }
             cfg.save(&self.paths)?;
+            drop(edit);
             let _ = self.config();
         } else {
             self.harness_apply(inv_op, &inv_args).await?;
@@ -9124,7 +9193,12 @@ impl Daemon {
             .await
             .map_err(|e| anyhow!("test run panicked: {e}"))?;
         let elapsed_ms = started.elapsed().as_millis() as i64;
-        let emitted = ops.emitted.lock().unwrap().take();
+        let emitted = ops
+            .emitted
+            .lock()
+            .unwrap()
+            .take()
+            .map(|(p, b)| (crate::artifacts::settle_emit(&ops.artifact_dir, &p), b));
         Ok(match outcome {
             Ok(out) => {
                 let schema_error = toolreg::compile_schema(&d.output_schema)
@@ -9960,6 +10034,7 @@ impl Daemon {
                 Ok(Ok(mut out)) => {
                     // Emitted artifact reference (streamed output, §7.5).
                     if let Some((path, bytes)) = ops.emitted.lock().unwrap().take() {
+                        let path = crate::artifacts::settle_emit(&ops.artifact_dir, &path);
                         let preview: String = out.output.to_string().chars().take(200).collect();
                         if let Ok(id) = self.with_store(|st| {
                             st.save_artifact(
@@ -10201,6 +10276,7 @@ impl Daemon {
             tx: tx.clone(),
             filter: filter.clone(),
             kick: kick.clone(),
+            gap: None,
         });
         // Requests run as this client, for attribution (SPEC §10.4).
         let client = {
@@ -10417,9 +10493,12 @@ impl Daemon {
                 "MCP server names use letters, digits, '-' and '_' (no '__')"
             ));
         }
+        // One config edit at a time: load, change and save together (#1101).
+        let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = self.config()?;
         cfg.mcp.servers.insert(name.to_string(), server);
         cfg.save(&self.paths)?;
+        drop(edit);
         let _ = self.with_store(|st| st.audit(actor, "mcp.add", name));
         self.mcp.stop(name).await;
         let tools = self.sync_mcp_server(&cfg, name).await;
@@ -10431,11 +10510,14 @@ impl Daemon {
 
     /// Remove an MCP server; its tools are retired (metrics kept).
     pub(crate) async fn remove_mcp_server(&self, name: &str, actor: &str) -> Result<Value> {
+        // One config edit at a time: load, change and save together (#1101).
+        let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = self.config()?;
         if cfg.mcp.servers.remove(name).is_none() {
             return Err(anyhow!("no MCP server '{name}'"));
         }
         cfg.save(&self.paths)?;
+        drop(edit);
         self.mcp.stop(name).await;
         let retired = self.with_store(|st| crate::mcp::sync_registry(st, name, &[]))?;
         let _ = self.with_store(|st| st.audit(actor, "mcp.remove", name));
@@ -11740,12 +11822,12 @@ impl HostOps for NestedOps {
     }
     fn emit(&self, chunk: &str) -> std::result::Result<(), String> {
         use std::io::Write;
-        std::fs::create_dir_all(&self.artifact_dir).map_err(|e| e.to_string())?;
+        // Written aside until registered, so reconcile never takes it (#1105).
+        let emitting = crate::artifacts::emitting_dir(&self.artifact_dir);
+        std::fs::create_dir_all(&emitting).map_err(|e| e.to_string())?;
         let mut guard = self.emitted.lock().unwrap();
         if guard.is_none() {
-            let path = self
-                .artifact_dir
-                .join(format!("emit-{}.txt", uuid::Uuid::new_v4()));
+            let path = emitting.join(format!("emit-{}.txt", uuid::Uuid::new_v4()));
             *guard = Some((path, 0));
         }
         let (path, bytes) = guard.as_mut().unwrap();
@@ -12156,6 +12238,7 @@ mod backpressure_tests {
             tx,
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: kick.clone(),
+            gap: None,
         }]));
         let delta = || Event::MessageDelta {
             session_id: "s".into(),
@@ -12178,6 +12261,42 @@ mod backpressure_tests {
             "can't take what matters: gone"
         );
         assert!(kick.is_cancelled(), "and its connection closes");
+    }
+
+    /// A dropped delta is told once there is room, before what follows (#1096).
+    #[test]
+    fn a_dropped_delta_is_announced() {
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(3);
+        let subs: Subs = Arc::new(StdMutex::new(vec![Subscriber {
+            conn: 1,
+            tx,
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gap: None,
+        }]));
+        let delta = |d: &str| Event::MessageDelta {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            delta: d.into(),
+        };
+        for d in ["a", "b", "c"] {
+            send_all(&subs, delta(d)); // fills the queue
+        }
+        send_all(&subs, delta("d")); // dropped
+        for _ in 0..3 {
+            assert!(rx.try_recv().is_ok());
+        }
+        send_all(&subs, delta("e"));
+        let told = rx.try_recv().unwrap();
+        assert!(
+            matches!(told, ServerMessage::Event(Event::DeltasDropped { ref run_id, .. }) if run_id == "r"),
+            "{told:?}"
+        );
+        assert!(subs.lock().unwrap()[0].gap.is_none(), "told once");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerMessage::Event(Event::MessageDelta { .. })
+        ));
     }
 
     /// A client that never reads is kicked once its queue fills, and its

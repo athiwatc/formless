@@ -72,9 +72,32 @@ pub struct Reconciled {
     pub missing_rows: usize,
 }
 
+/// Where `emit` writes while its Invocation runs; the file moves into the
+/// artifacts folder when it is registered (#1105).
+pub fn emitting_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("emitting")
+}
+
+/// Move a finished emit file out of [`emitting_dir`] into `dir`.
+pub fn settle_emit(dir: &std::path::Path, path: &std::path::Path) -> std::path::PathBuf {
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let dest = dir.join(name);
+    match std::fs::rename(path, &dest) {
+        Ok(()) => dest,
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// An unregistered emit file this old belongs to no live Invocation.
+const EMIT_ABANDONED: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
 /// Make disk and database agree (#609): a file in `dir` with no row and
-/// older than `grace` (so an `emit` still writing is left alone) is
-/// removed, and a row whose file is gone is dropped.
+/// older than `grace` is removed, and a row whose file is gone, and was
+/// made longer than `grace` ago, is dropped. Files an `emit` is still
+/// writing live in [`emitting_dir`] and are left alone unless abandoned
+/// for a week (#1105).
 pub fn reconcile(
     store: &Store,
     dir: &std::path::Path,
@@ -105,9 +128,33 @@ pub fn reconcile(
             out.orphan_bytes += meta.len();
         }
     }
+    for entry in std::fs::read_dir(emitting_dir(dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let Ok(meta) = entry.metadata() else { continue };
+        let abandoned = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > EMIT_ABANDONED.max(grace));
+        if meta.is_file() && abandoned && std::fs::remove_file(entry.path()).is_ok() {
+            out.orphan_files += 1;
+            out.orphan_bytes += meta.len();
+        }
+    }
+    // A row is only dropped once its file has had time to appear (another
+    // process may be replacing it right now).
+    let cutoff = chrono::Duration::from_std(grace)
+        .ok()
+        .map(|g| (chrono::Utc::now() - g).to_rfc3339());
     let gone: Vec<String> = rows
         .into_iter()
-        .filter(|(_, p, _, _)| !std::path::Path::new(p).exists())
+        .filter(|(_, p, _, created)| {
+            !std::path::Path::new(p).exists()
+                && cutoff.as_deref().is_none_or(|c| created.as_str() < c)
+        })
         .map(|(id, ..)| id)
         .collect();
     out.missing_rows = gone.len();
@@ -147,14 +194,34 @@ mod tests {
             .save_artifact(None, &dir.join("gone.txt").display().to_string(), "", 9)
             .unwrap();
         std::fs::write(dir.join("orphan.txt"), "12345").unwrap();
-        // Too young to touch: an emit may still be writing it.
+        // Too young to touch: a file or row may still be on its way.
         let r = reconcile(&store, &dir, std::time::Duration::from_secs(3600)).unwrap();
-        assert_eq!((r.orphan_files, r.missing_rows), (0, 1));
+        assert_eq!((r.orphan_files, r.missing_rows), (0, 0));
         let r = reconcile(&store, &dir, std::time::Duration::ZERO).unwrap();
-        assert_eq!((r.orphan_files, r.orphan_bytes), (1, 5));
+        assert_eq!((r.orphan_files, r.orphan_bytes, r.missing_rows), (1, 5, 1));
         assert!(kept.exists() && !dir.join("orphan.txt").exists());
         let (n, bytes) = usage(&store).unwrap();
         assert_eq!((n, bytes), (1, 4), "usage matches the disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An emit idle for over the grace keeps its early output: it is
+    /// written outside the reconciled folder until registered (#1105).
+    #[test]
+    fn a_live_emit_file_survives_reconcile() {
+        let dir = std::env::temp_dir().join(format!("fl-emit-{}", uuid::Uuid::new_v4()));
+        let emitting = emitting_dir(&dir);
+        std::fs::create_dir_all(&emitting).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let file = emitting.join("emit-x.txt");
+        std::fs::write(&file, "early ").unwrap();
+        // An hour quiet (simulated by a zero grace), then reconcile.
+        reconcile(&store, &dir, std::time::Duration::ZERO).unwrap();
+        assert!(file.exists(), "a live emit is left alone");
+        std::fs::write(&file, "early late").unwrap();
+        let settled = settle_emit(&dir, &file);
+        assert_eq!(settled.parent(), Some(dir.as_path()));
+        assert_eq!(std::fs::read_to_string(settled).unwrap(), "early late");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
