@@ -5287,7 +5287,12 @@ pub fn provider_message(m: &MessageInfo) -> Value {
             return msg;
         }
     }
-    json!({"role": m.role, "content": m.content})
+    let mut msg = json!({"role": m.role, "content": m.content});
+    // A paused turn's thinking goes back when it is resumed (#1090).
+    if m.role == "assistant" && meta["thinking_blocks"].is_array() {
+        msg["thinking_blocks"] = meta["thinking_blocks"].clone();
+    }
+    msg
 }
 
 /// An FTS5 query from free text: each word quoted as a prefix term, all

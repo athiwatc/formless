@@ -4081,36 +4081,73 @@ impl Daemon {
                         text: "The model's context window is full; compacting and asking again."
                             .into(),
                     });
-                    self.compact(
-                        &provider,
-                        &cfg,
-                        session_id,
-                        &model,
-                        context_tokens,
-                        up_to,
-                        None,
-                    )
-                    .await?;
-                    continue;
+                    match self
+                        .compact(
+                            &provider,
+                            &cfg,
+                            session_id,
+                            &model,
+                            context_tokens,
+                            up_to,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => continue,
+                        // Keep the partial answer (stored below with its
+                        // stop reason) rather than fail the Run (#1091).
+                        Err(e) => self.broadcast(Event::Note {
+                            session_id: Some(session_id.to_string()),
+                            text: format!("Compacting failed, so the answer stays partial: {e:#}"),
+                        }),
+                    }
+                } else {
+                    self.broadcast(Event::Note {
+                        session_id: Some(session_id.to_string()),
+                        text: "Nothing earlier can be compacted, so the answer stays partial."
+                            .into(),
+                    });
                 }
             }
-            // Anthropic `pause_turn`: the turn is resumed by sending it back.
-            if result.stop_reason.as_deref() == Some("pause_turn")
-                && result.tool_calls.is_empty()
-                && paused_turns < 3
-            {
-                paused_turns += 1;
-                if !result.content.is_empty() {
+            // Anthropic `pause_turn`: the turn is resumed by sending it back,
+            // with its thinking (#1090). An empty pause would resend the same
+            // request, so it ends the Run with the pause note instead.
+            if result.stop_reason.as_deref() == Some("pause_turn") && result.tool_calls.is_empty() {
+                if result.content.is_empty() && result.thinking_blocks.is_empty() {
+                    if let Some(text) = stop_note(&result) {
+                        self.broadcast(Event::Note {
+                            session_id: Some(session_id.to_string()),
+                            text,
+                        });
+                    }
+                    return Ok(());
+                }
+                if paused_turns < 3 {
+                    paused_turns += 1;
+                    let mut meta = json!({"stop_reason": "pause_turn"});
+                    if !result.reasoning.is_empty() {
+                        meta["reasoning_content"] = json!(result.reasoning);
+                    }
+                    if !result.thinking_blocks.is_empty() {
+                        meta["thinking_blocks"] = json!(result.thinking_blocks);
+                    }
                     let msg = self.with_store(|st| {
-                        st.append_message(session_id, "assistant", &result.content)
+                        st.append_message_meta(
+                            session_id,
+                            "assistant",
+                            &result.content,
+                            Some(meta.to_string()),
+                        )
                     })?;
                     self.broadcast(Event::MessageAppended {
                         session_id: session_id.to_string(),
                         message: msg,
                     });
+                    continue;
                 }
-                continue;
             }
+            // The resume limit is per paused turn, not per Run.
+            paused_turns = 0;
             if result.tool_calls.is_empty()
                 && cfg.provider.tool_use_nudge
                 && !used_tools
@@ -10179,14 +10216,29 @@ impl Daemon {
                 text: w.clone(),
             }));
         }
-        let writer = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Ok(line) = serde_json::to_string(&msg) {
-                    if write_half.write_all(line.as_bytes()).await.is_err() {
-                        break;
-                    }
-                    if write_half.write_all(b"\n").await.is_err() {
-                        break;
+        // Every await on this connection's path also watches `kick`, so a
+        // client that stopped reading is torn down rather than parking
+        // tasks forever (#1095). The queue bounds messages, not bytes:
+        // events are small, and the large replies (exports, snapshots) are
+        // one message each, answered only to the client that asked.
+        let writer = tokio::spawn({
+            let kick = kick.clone();
+            async move {
+                loop {
+                    let msg = tokio::select! {
+                        _ = kick.cancelled() => break,
+                        m = rx.recv() => match m {
+                            Some(m) => m,
+                            None => break,
+                        },
+                    };
+                    let Ok(mut line) = serde_json::to_string(&msg) else {
+                        continue;
+                    };
+                    line.push('\n');
+                    tokio::select! {
+                        _ = kick.cancelled() => break,
+                        r = write_half.write_all(line.as_bytes()) => if r.is_err() { break },
                     }
                 }
             }
@@ -10196,7 +10248,7 @@ impl Daemon {
         // requests (Esc, approvals, answers, Ping) skip the queue (SPEC §9.3).
         let (work_tx, mut work_rx) = mpsc::channel::<RequestEnvelope>(256);
         let worker = {
-            let (this, tx, client) = (self.clone(), tx.clone(), client.clone());
+            let (this, tx, client, kick) = (self.clone(), tx.clone(), client.clone(), kick.clone());
             tokio::spawn(async move {
                 while let Some(env) = work_rx.recv().await {
                     let resp = match CLIENT
@@ -10206,7 +10258,11 @@ impl Daemon {
                         Ok(v) => ServerMessage::ok(env.id, v),
                         Err(e) => ServerMessage::err(env.id, e.to_string()),
                     };
-                    if tx.send(resp).await.is_err() {
+                    let sent = tokio::select! {
+                        _ = kick.cancelled() => false,
+                        r = tx.send(resp) => r.is_ok(),
+                    };
+                    if !sent {
                         break;
                     }
                 }
@@ -10261,18 +10317,26 @@ impl Daemon {
                         self.broadcast_clients(before.union(&now));
                         ServerMessage::ok(env.id, json!({"subscribed": true, "conn": conn}))
                     } else if is_control(&env.request) {
-                        let (this, tx, who) = (self.clone(), tx.clone(), client());
+                        let (this, tx, who, kick) =
+                            (self.clone(), tx.clone(), client(), kick.clone());
                         tokio::spawn(async move {
                             let resp =
                                 match CLIENT.scope(who, handle_safely(&this, env.request)).await {
                                     Ok(v) => ServerMessage::ok(env.id, v),
                                     Err(e) => ServerMessage::err(env.id, e.to_string()),
                                 };
-                            let _ = tx.send(resp).await;
+                            tokio::select! {
+                                _ = kick.cancelled() => {}
+                                _ = tx.send(resp) => {}
+                            }
                         });
                         continue;
                     } else {
-                        if work_tx.send(env).await.is_err() {
+                        let queued = tokio::select! {
+                            _ = kick.cancelled() => false,
+                            r = work_tx.send(env) => r.is_ok(),
+                        };
+                        if !queued {
                             break;
                         }
                         continue;
@@ -10286,7 +10350,11 @@ impl Daemon {
                     }
                 }
             };
-            if tx.send(resp).await.is_err() {
+            let sent = tokio::select! {
+                _ = kick.cancelled() => false,
+                r = tx.send(resp) => r.is_ok(),
+            };
+            if !sent {
                 break;
             }
         }
@@ -10295,10 +10363,15 @@ impl Daemon {
         self.subs.lock().unwrap().retain(|sub| sub.conn != conn);
         let left = filter.lock().unwrap().sessions.take().unwrap_or_default();
         self.broadcast_clients(&left);
-        // Let queued requests finish (their replies are dropped if the
+        // A kicked client gets nothing more: stop its work now. Otherwise
+        // let queued requests finish (their replies are dropped if the
         // client is gone), then stop writing.
+        if kick.is_cancelled() {
+            worker.abort();
+        }
         let _ = worker.await;
         writer.abort();
+        let _ = writer.await;
     }
 
     /// A detached daemon writes its stdout/stderr to `daemon.log`; keep
@@ -12105,5 +12178,59 @@ mod backpressure_tests {
             "can't take what matters: gone"
         );
         assert!(kick.is_cancelled(), "and its connection closes");
+    }
+
+    /// A client that never reads is kicked once its queue fills, and its
+    /// connection's tasks all end (#1095).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kicked_connection_ends_all_its_tasks() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("fl-kick-{short}"));
+        let paths = crate::Paths {
+            data_dir: dir.join("d"),
+            config_dir: dir.join("c"),
+            profile: format!("test-kick-{short}"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        // A tiny pipe the client never reads: the writer blocks at once.
+        let (mut client, server) = tokio::io::duplex(64);
+        let conn = tokio::spawn(daemon.clone().handle_conn(server));
+        // Control requests (spawned) and queued ones (the worker) both end
+        // up waiting on the full queue.
+        for id in 1..=20u64 {
+            let request = if id % 2 == 0 {
+                Request::Ping
+            } else {
+                Request::ListSessions
+            };
+            let line = serde_json::to_string(&RequestEnvelope {
+                id,
+                protocol: PROTOCOL_VERSION,
+                request,
+            })
+            .unwrap();
+            client
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        while daemon.subs.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for _ in 0..=CLIENT_QUEUE + 1 {
+            daemon.broadcast(Event::Note {
+                session_id: None,
+                text: "x".into(),
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), conn)
+            .await
+            .expect("the kicked connection ended")
+            .unwrap();
+        assert!(daemon.subs.lock().unwrap().is_empty());
+        drop(client);
     }
 }

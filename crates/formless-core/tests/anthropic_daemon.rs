@@ -154,3 +154,154 @@ async fn repointing_a_provider_rederives_its_api_style() {
         .unwrap();
     assert_eq!(style(), "chat");
 }
+
+/// A mock `/messages` answering each request with the next scripted
+/// (status, body); the last one repeats. Records the request bodies.
+async fn scripted(script: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let app = axum::Router::new().route(
+        "/messages",
+        post({
+            let seen = seen.clone();
+            move |axum::Json(body): axum::Json<Value>| {
+                let seen = seen.clone();
+                let script = script.clone();
+                async move {
+                    let n = {
+                        let mut s = seen.lock().unwrap();
+                        s.push(body);
+                        s.len() - 1
+                    };
+                    let (status, body) = script[n.min(script.len() - 1)].clone();
+                    let kind = if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", kind)
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, seen)
+}
+
+/// One streamed answer: optional signed thinking, then text, then `stop`.
+fn answer(thinking: bool, text: &str, stop: &str) -> (u16, String) {
+    let mut ev = vec![json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}})];
+    let mut i = 0;
+    if thinking {
+        ev.push(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}));
+        ev.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hm"}}));
+        ev.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-1"}}));
+        ev.push(json!({"type": "content_block_stop", "index": 0}));
+        i = 1;
+    }
+    ev.push(json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}));
+    ev.push(json!({"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": text}}));
+    ev.push(json!({"type": "content_block_stop", "index": i}));
+    ev.push(json!({"type": "message_delta", "delta": {"stop_reason": stop}, "usage": {"output_tokens": 1}}));
+    ev.push(json!({"type": "message_stop"}));
+    (200, sse(&ev))
+}
+
+async fn run_turns(base: String, tag: &str, turns: &[&str]) -> (Store, String) {
+    std::env::set_var("FORMLESS_API_KEY", "k");
+    let paths = temp(tag);
+    let mut cfg = Config::default();
+    cfg.provider.base_url = base;
+    cfg.provider.api_style = "anthropic".into();
+    cfg.provider.model = "claude-x".into();
+    cfg.provider.max_retries = 0;
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    for turn in turns {
+        let before = store.last_run(&sid).unwrap().map(|r| r.0);
+        daemon
+            .handle(Request::SendMessage {
+                session_id: sid.clone(),
+                content: turn.to_string(),
+                mode: formless_protocol::SendMode::Send,
+            })
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            let last = store.last_run(&sid).unwrap();
+            if last
+                .as_ref()
+                .is_some_and(|(id, s)| Some(id) != before.as_ref() && s != "running")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    (store, sid)
+}
+
+/// A paused turn keeps its signed thinking for the resume; an empty pause
+/// is not resent (#1090).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_turn_resumes_with_its_thinking() {
+    let (base, seen) = scripted(vec![
+        answer(true, "part", "pause_turn"),
+        answer(false, " rest", "end_turn"),
+    ])
+    .await;
+    let (store, sid) = run_turns(base, "anth-pause", &["go"]).await;
+    assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2);
+    let resent = bodies[1]["messages"].to_string();
+    assert!(resent.contains("sig-1"), "{resent}");
+
+    let (base, seen) = scripted(vec![answer(false, "", "pause_turn")]).await;
+    let (store, sid) = run_turns(base, "anth-pause-empty", &["go"]).await;
+    assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "an empty pause is not resent"
+    );
+}
+
+/// A full context window whose compaction fails keeps the partial answer
+/// and says why, instead of failing the Run (#1091).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_context_compaction_keeps_the_partial_answer() {
+    let fail = (
+        400,
+        json!({"type": "error", "error": {"type": "invalid_request_error", "message": "nope"}})
+            .to_string(),
+    );
+    let (base, seen) = scripted(vec![
+        answer(false, "first answer", "end_turn"),
+        answer(false, "second answer", "end_turn"),
+        answer(false, "third answer", "end_turn"),
+        answer(false, "partial", "model_context_window_exceeded"),
+        fail,
+    ])
+    .await;
+    let (store, sid) = run_turns(base, "anth-ctx", &["one", "two", "three", "four"]).await;
+    assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
+    let msgs = store.list_messages(&sid).unwrap();
+    let last = msgs.iter().rev().find(|m| m.role == "assistant").unwrap();
+    assert_eq!(last.content, "partial");
+    assert!(seen.lock().unwrap().len() >= 5, "compaction was tried");
+    assert!(last
+        .meta
+        .as_deref()
+        .unwrap_or_default()
+        .contains("model_context_window_exceeded"));
+}

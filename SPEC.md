@@ -1117,12 +1117,17 @@ pattern (§4.4).
   baked in at creation.
 - **Private addresses (#603).** Every `fetch` hop resolves the host once
   and refuses loopback, private, link-local, CGNAT, unique-local,
-  multicast and unspecified addresses (IPv4-mapped too), unless a grant
-  names that host or IP exactly: `net:localhost` / `net:127.0.0.1` reach a
-  local model, while `net:example.com` never reaches a subdomain that
-  resolves inside your network, and bare `net` reaches public hosts only.
-  The connection is pinned to the checked address, so DNS can't change in
-  between. Denials name it: `denied: net:x resolves to 10.0.0.5, a private
+  multicast, unspecified, reserved (`240/4`), benchmarking, documentation,
+  Teredo and discard addresses; IPv6 forms that carry an IPv4 address
+  (mapped, compatible, NAT64 `64:ff9b::/96`, 6to4) are judged by that
+  address. The exception is a grant that names that host or IP exactly
+  (and its port, if the grant has one): `net:localhost` /
+  `net:127.0.0.1` reach a local model, while `net:example.com` never
+  reaches a subdomain that resolves inside your network, and bare `net`
+  reaches public hosts only. The connection is pinned to the checked
+  addresses (tried in order), so DNS can't change in between, and Tool
+  fetches ignore proxy settings (a proxy would resolve the name itself).
+  IPv6 grants with a port use brackets: `net:[::1]:8080`. Denials name it: `denied: net:x resolves to 10.0.0.5, a private
   or local address; grant net:x itself to reach it`.
 - **Ports.** A `net` grant may carry a port (`net:api.example.com:8443`)
   and then allows that port only; a portless grant allows any. An

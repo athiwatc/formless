@@ -607,6 +607,10 @@ mod scope_tests {
             "host.example:9000"
         );
         assert!(bound_host("host:notaport").is_err());
+        // IPv6: one bracketed host:port form, from a URL or a bare value (#1094).
+        assert_eq!(bound_host("http://[::1]:8080/x").unwrap(), "[::1]:8080");
+        assert_eq!(bound_host("[::1]:8080").unwrap(), "[::1]:8080");
+        assert_eq!(bound_host("http://[::1]/x").unwrap(), "[::1]");
         let wide = Capabilities::parse(&["process:git".to_string()]).unwrap();
         let narrow = Capabilities::parse(&["process:git:status".to_string()]).unwrap();
         assert!(wide.covers(&narrow));
