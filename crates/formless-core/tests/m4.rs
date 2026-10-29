@@ -2332,3 +2332,182 @@ async fn a_step_limit_warns_then_pauses_and_resume_goes_past_it() {
     assert_eq!(c.run_to_finish().await, "done");
     server.abort();
 }
+
+/// `/limit N` (SetStepLimit) caps the next Run without any configured
+/// limit, pauses it there, and is cleared when that Run ends.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_per_run_step_limit_pauses_and_is_cleared_after() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4limit");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n < 6 {
+                            sse_tool(&format!("c{n}"), "no_such_tool", json!({}))
+                        } else {
+                            sse_text("done")
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = c
+        .rpc(Request::SetStepLimit {
+            session_id: id.clone(),
+            max_steps: Some(3),
+        })
+        .await;
+    assert_eq!(r["max_steps"], 3);
+    assert_eq!(r["active_run"], false);
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut explained = None;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(&line) {
+            Ok(ServerMessage::Event(Event::RunPaused { explained: e, .. })) => explained = e,
+            Ok(ServerMessage::Event(Event::RunFinished { status, .. })) => {
+                assert_eq!(status, "paused");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let explained = explained.unwrap();
+    assert_eq!(explained.category, "budget");
+    assert!(
+        explained.message.contains("3 of the 3 steps set with /limit"),
+        "{}",
+        explained.message
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // Resume continues; the limit went with the paused Run.
+    c.send(Request::ResumeRun {
+        session_id: id.clone(),
+    })
+    .await;
+    assert_eq!(c.run_to_finish().await, "done");
+    server.abort();
+}
+
+/// `/retry --model X` (RetryRun) re-runs the last message on another
+/// model for that Run only, keeping the original answer in a fork.
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_reruns_the_last_message_on_another_model() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Request, SendMode};
+    use std::sync::Mutex;
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4retry");
+    let models = Arc::new(Mutex::new(Vec::<String>::new()));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}, {"id": "other"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let models = models.clone();
+                move |Json(body): Json<Value>| {
+                    let m = body["model"].as_str().unwrap_or_default().to_string();
+                    models.lock().unwrap().push(m.clone());
+                    async move { sse_text(&format!("answer from {m}")) }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: Some("Q".into()) }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "question".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let first = c.run_to_finish().await;
+    c.send(Request::RetryRun {
+        session_id: id.clone(),
+        model: Some("other".into()),
+        keep_original: true,
+    })
+    .await;
+    assert_eq!(c.run_to_finish().await, "answer from other");
+    let used = models.lock().unwrap().clone();
+    assert_eq!(used.last().map(String::as_str), Some("other"), "{used:?}");
+    assert_ne!(used[0], "other");
+    // The Session's own model is unchanged: the next Run uses it again.
+    c.send(Request::RetryRun {
+        session_id: id.clone(),
+        model: None,
+        keep_original: false,
+    })
+    .await;
+    assert_eq!(c.run_to_finish().await, first);
+    // One user message, one answer: the retry replaced, not appended.
+    let msgs = c.rpc(Request::GetSession { id: id.clone() }).await["messages"].clone();
+    let roles: Vec<&str> = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant"], "{msgs}");
+    // The first retry kept the original answer in a fork.
+    let sessions = c.rpc(Request::ListSessions).await;
+    assert!(
+        sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "Q · original answer"),
+        "{sessions}"
+    );
+    server.abort();
+}

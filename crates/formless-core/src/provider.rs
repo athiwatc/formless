@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -120,7 +121,24 @@ pub struct Provider {
     /// Sent as `prompt_cache_key` so the endpoint routes one Session's
     /// requests to the same cache (see `provider.cache_key`).
     cache_key: Option<String>,
+    /// Told before each retry wait, so clients can show "rate limited ·
+    /// retrying in 8s (2/5)" instead of a plain wait (SPEC §4.4).
+    on_retry: Option<RetryHook>,
 }
+
+/// A provider request is about to be retried after `wait`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryNotice {
+    /// Short reason: "rate limited", "server error 503", "connection
+    /// failed", "stream dropped".
+    pub reason: String,
+    pub wait: Duration,
+    /// 1-based number of the retry about to be made.
+    pub attempt: usize,
+    pub max_attempts: usize,
+}
+
+pub type RetryHook = Arc<dyn Fn(RetryNotice) + Send + Sync>;
 
 /// Optional request parameters an endpoint may not know: dropped (once)
 /// when a 400 names them, so they never cost a working setup anything.
@@ -477,6 +495,7 @@ impl Provider {
             api_key,
             credential_paths: None,
             cache_key: None,
+            on_retry: None,
             http,
         })
     }
@@ -494,6 +513,7 @@ impl Provider {
             api_key,
             credential_paths: None,
             cache_key: None,
+            on_retry: None,
             http,
         }
     }
@@ -519,6 +539,7 @@ impl Provider {
             api_key,
             credential_paths: Some(paths),
             cache_key: None,
+            on_retry: None,
             http,
         })
     }
@@ -537,6 +558,26 @@ impl Provider {
             self.cache_key = Some(key.to_string());
         }
         self
+    }
+
+    /// Report each retry wait to `hook` (see [`RetryNotice`]).
+    pub fn with_retry_hook(mut self, hook: RetryHook) -> Self {
+        self.on_retry = Some(hook);
+        self
+    }
+
+    /// Tell the hook, then wait before retry `attempt` (0-based).
+    async fn retry_wait(&self, attempt: usize, server_wait: Option<Duration>, reason: String) {
+        let wait = self.backoff(attempt, server_wait);
+        if let Some(hook) = &self.on_retry {
+            hook(RetryNotice {
+                reason,
+                wait,
+                attempt: attempt + 1,
+                max_attempts: self.cfg.max_retries,
+            });
+        }
+        tokio::time::sleep(wait).await;
     }
 
     pub fn model(&self) -> &str {
@@ -705,6 +746,7 @@ impl Provider {
                 )
                 .json(&b);
                 let mut server_wait = None;
+                let reason;
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
@@ -741,11 +783,19 @@ impl Provider {
                         if !(status.as_u16() == 429 || status.is_server_error()) {
                             return Err(anyhow!("provider error: {last_err}"));
                         }
+                        reason = if status.as_u16() == 429 {
+                            "rate limited".to_string()
+                        } else {
+                            format!("server error {}", status.as_u16())
+                        };
                     }
-                    Err(e) => last_err = e.to_string(),
+                    Err(e) => {
+                        last_err = e.to_string();
+                        reason = "connection failed".to_string();
+                    }
                 }
                 if attempt < self.cfg.max_retries {
-                    tokio::time::sleep(self.backoff(attempt, server_wait)).await;
+                    self.retry_wait(attempt, server_wait, reason).await;
                 }
             }
             // Retryable failures exhausted for this model: fail over.
@@ -886,7 +936,10 @@ impl Provider {
                                 call_slots.clear();
                                 truncated = false;
                                 usage = None;
-                                tokio::time::sleep(self.backoff(attempt, None)).await;
+                                tokio::select! {
+                                    _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+                                    _ = self.retry_wait(attempt, None, "stream dropped".into()) => {}
+                                }
                                 attempt += 1;
                                 continue 'request;
                             }
@@ -919,7 +972,10 @@ impl Provider {
                                         let nothing_streamed =
                                             content.is_empty() && reasoning.is_empty() && tool_calls.is_empty();
                                         if retryable && nothing_streamed && attempt < self.cfg.max_retries {
-                                            tokio::time::sleep(self.backoff(attempt, None)).await;
+                                            tokio::select! {
+                                                _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+                                                _ = self.retry_wait(attempt, None, "provider error".into()) => {}
+                                            }
                                             attempt += 1;
                                             continue 'request;
                                         }

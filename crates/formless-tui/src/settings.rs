@@ -195,6 +195,13 @@ pub fn rows(
         ),
         Row::new(
             "Interface",
+            "tui.animations",
+            "animations",
+            on(cfg.tui.animations),
+            Bool,
+        ),
+        Row::new(
+            "Interface",
             "tui.notify",
             "notify",
             cfg.tui.notify.clone(),

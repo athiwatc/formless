@@ -1119,6 +1119,10 @@ pub struct TuiCfg {
     /// What the TUI opens on launch: "last" (the most recently active
     /// Session), "new" (a fresh one) or "picker" (the Sessions view).
     pub on_start: String,
+    /// Spinners and other moving indicators; false (or the
+    /// `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` env var) shows static
+    /// ones instead.
+    pub animations: bool,
 }
 impl Default for TuiCfg {
     fn default() -> Self {
@@ -1136,6 +1140,7 @@ impl Default for TuiCfg {
             pane_widths: vec![22, 26],
             screen_reader: false,
             on_start: "last".into(),
+            animations: true,
         }
     }
 }
@@ -1196,6 +1201,7 @@ impl Config {
                 "timestamps": self.tui.timestamps,
                 "on_start": self.tui.on_start,
                 "screen_reader": self.tui.screen_reader,
+                "animations": self.tui.animations,
             },
             // Keys that apply only when the TUI next starts.
             "on_tui_start": ON_TUI_START,

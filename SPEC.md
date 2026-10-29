@@ -246,6 +246,10 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
 - 429 / 5xx / dropped stream: automatic retry with exponential backoff,
   bounded (default 5 attempts). Exhaustion ⇒ the Run **pauses** and the error
   is surfaced in the TUI; a Run never silently fails.
+  Before each wait the daemon sends `ProviderRetrying {reason, wait_secs,
+  attempt, max_attempts}`, and the TUI and web activity line count it down
+  (`rate limited · retrying in 8s (2/5) · Esc to stop`); Esc interrupts
+  the Run, including a wait in progress.
 - Hung request: after 300s the agent is told the request is still pending
   (same philosophy as Pending Invocations, §6.4); nothing is killed.
 - Malformed tool-calls from the model are fed back to the model as a
@@ -470,8 +474,17 @@ task, with quality as a gate**.
   the next step boundary without killing in-flight work. **Ctrl+Enter =
   queue** for after the Run ends (Ctrl+J or Alt+Enter in any terminal, §10.5); queued messages
   are stored in the database, so a daemon restart does not lose them, and
-  `GetSession` lists them. When idle, Enter
-  simply starts a new Run.
+  `GetSession` lists them (`queued` texts, and `queued_items` with ids).
+  When idle, Enter simply starts a new Run.
+- **The queue is visible and editable.** `QueueChanged {session_id,
+  queued}` is broadcast whenever it changes (queued, sent, edited,
+  removed, reordered). The TUI lists queued messages at the end of the
+  chat with `/queue edit|rm|up|down N`; `/queue edit N` loads one into
+  the input (`queued ›`), Enter saves, Esc cancels. The web lists them
+  above the composer with edit, ↑/↓ and remove buttons. Requests:
+  `EditQueued {session_id, id, content?}` (no content removes it) and
+  `MoveQueued {session_id, id, up}`. Editing a message that was already
+  sent fails with "no longer queued".
 - `Esc` interrupts the current Run (in-flight Invocations are cancelled and
   recorded as user-cancelled, §8.2). `Ctrl+C` clears a typed message, and a second `Ctrl+C` within 2 s detaches the TUI client only.
 
@@ -487,9 +500,18 @@ task, with quality as a gate**.
   by you". When a Session's last Run is interrupted or paused, and no Run
   is active, `GetSession` includes `unfinished_run {run_id, status,
   error}`. Clients show a banner with the reason and **Resume / Abandon**:
-  the TUI shows it at the end of the chat with `/resume` and `/abandon`,
-  and the web shows it above the composer with buttons. The banner clears
-  when a Run starts or the Run is abandoned.
+  the TUI shows it at the end of the chat with `/resume` and `/abandon`
+  (Enter on an empty input retries, like `/resume`), and the web shows it
+  above the composer with buttons. The banner clears when a Run starts or
+  the Run is abandoned.
+- **Step limit.** `/limit N` (`SetStepLimit`, `formless run --max-steps
+  N`) caps the active Run, or the next one when idle, at N steps; it
+  replaces `limits.run_steps` for that Run and is cleared when the Run
+  ends. Reaching it pauses the Run with the budget banner: `/resume`
+  continues past it, `/abandon` stops. `/limit off` removes it.
+- **Steering is marked.** A message sent while a Run is active is stored
+  with `meta.steer = {step}` (the Run's step count when it arrived), and
+  clients show it as `↳ steer at step N` under the message.
 
 ### 5.5 Asking the user mid-Run
 
@@ -1559,9 +1581,19 @@ wanted. Each Run therefore records:
   - `corrected`: the next message opens like "that's wrong", "not what I
     asked" or "it didn't work".
   The first follow-up wins.
+- the user's own **rating** (schema v50, `runs.rating` /
+  `rating_comment`): `RateRun {session_id, run_id?, rating, comment?}`
+  with `good`, `bad` or `""` to clear, on the latest finished Run by
+  default. The TUI has `/good [comment]`, `/bad [comment]` and `/unrate`;
+  the web shows 👍/👎 under the last answer (👎 asks for an optional
+  comment).
 
-A Run's **outcome** is its follow-up when it has one, otherwise its
-status. The outcomes are used in three places:
+A Run's **outcome** is `rated_bad` after a 👎 (an explicit verdict
+outranks inferred ones), else its follow-up when it has one, otherwise
+its status. A 👎 also marks the primary role's `task_stats` row
+`rated_bad`, so routing stops counting it as a success (§4.6); clearing
+it restores `completed`. The summary includes the 👍 / 👎 shares. The
+outcomes are used in three places:
 
 - `RunMetrics` returns the recent Runs and a summary: outcome shares and
   averages. `formless runs [--json]` prints them, and the TUI Metrics
@@ -2471,7 +2503,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   `/model`, `/settings`, `/stop`, `/resend`, `/resume`, `/abandon`, `/approve`,
   `/thinking`, `/help`
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
-  `/propose`, `/panes`). Plain text is always chat.
+  `/propose`, `/panes`; later `/retry [--model X]`, `/limit N|off`,
+  `/good`, `/bad`, `/unrate`). Plain text is always chat.
+- **Retry.** `/retry` re-runs your last message without retyping it
+  (`RetryRun`); `/retry --model X` runs it on X for that Run only. The
+  answer being replaced is kept first in a fork of the Session named
+  "… · original answer", so you can switch back from `/sessions`. The web
+  shows Retry and "Retry with…" under the last answer, and `/edit` still
+  puts the message in the input to change it before re-running.
 - **Session switcher.** Ctrl+K (⌘/Ctrl+K on the web) opens a fuzzy
   switcher over Session names, tags and last messages from any view,
   newest first until you type. Enter opens the Session; Ctrl+N (Ctrl/⌘+
@@ -3048,6 +3087,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 | `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
+| `tui.animations` | true | Spinners and other moving indicators in the TUI; false (or `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` set to anything but empty, `0`, `false`, `no` or `off`) shows a static `●` and a steady cursor (§10.2) |
 | `tui.hyperlinks` | auto | Clickable OSC 8 links for URLs in the TUI chat: `on`, `off`, or `auto` (on except Terminal.app and the Linux console) (§10.2) |
 | `tui.theme` | auto | `dark`, `light` (deeper hues for white backgrounds), `high-contrast` (bright variants), or `auto` (light when `COLORFGBG` reports a light background) (§10.6) |
 | `tui.colors` | {} | Per-role colour overrides: `user`, `assistant`, `tool`, `note`, `error`, `accent` → a name (`light-cyan`) or `#rrggbb` (§10.6) |

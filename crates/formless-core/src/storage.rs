@@ -344,7 +344,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 50;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -429,7 +429,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 49] = [
+const MIGRATIONS: [(i64, MigrationStep); 50] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -625,6 +625,11 @@ const MIGRATIONS: [(i64, MigrationStep); 49] = [
                run_id TEXT NOT NULL, memory_id TEXT NOT NULL,
                PRIMARY KEY (run_id, memory_id));",
         )?)
+    }),
+    // The user's own verdict on a Run's answer (👍/👎, SPEC §8.7).
+    (50, |c| {
+        add_column(c, "runs", "rating TEXT NOT NULL DEFAULT ''")?;
+        add_column(c, "runs", "rating_comment TEXT")
     }),
 ];
 
@@ -1980,6 +1985,54 @@ impl Store {
         Ok(())
     }
 
+    /// Rate a Session's latest finished Run (or `run_id`): "good", "bad"
+    /// or "" to clear, with an optional comment. A bad rating counts as
+    /// the `rated_bad` outcome for Run metrics and the primary role's
+    /// routing stats (SPEC §8.7, §4.6). Returns the rated Run's id.
+    pub fn rate_run(
+        &self,
+        session_id: &str,
+        run_id: Option<&str>,
+        rating: &str,
+        comment: Option<&str>,
+    ) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let run_id: Option<String> = match run_id {
+            Some(r) => Some(r.to_string()),
+            None => self
+                .conn
+                .query_row(
+                    "SELECT id FROM runs WHERE session_id=?1 AND status!='running'
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    params![session_id],
+                    |r| r.get(0),
+                )
+                .optional()?,
+        };
+        let Some(run_id) = run_id else {
+            return Ok(None);
+        };
+        let n = self.ex(
+            "UPDATE runs SET rating=?3, rating_comment=?4 WHERE id=?1 AND session_id=?2",
+            params![run_id, session_id, rating, comment.filter(|c| !c.trim().is_empty())],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if rating == "bad" {
+            self.ex(
+                "UPDATE task_stats SET outcome='rated_bad' WHERE run_id=?1 AND outcome='completed'",
+                params![run_id],
+            )?;
+        } else {
+            self.ex(
+                "UPDATE task_stats SET outcome='completed' WHERE run_id=?1 AND outcome='rated_bad'",
+                params![run_id],
+            )?;
+        }
+        Ok(Some(run_id))
+    }
+
     /// Per-Run metrics, newest first.
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         self.run_metrics_for(None, limit, None)
@@ -1997,7 +2050,7 @@ impl Store {
                (SELECT COUNT(*) FROM invocations i WHERE i.run_id=r.id),
                (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
                (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
-               r.created_at, r.updated_at
+               r.created_at, r.updated_at, r.rating
              FROM runs r WHERE (?2 IS NULL OR r.session_id=?2) AND (?3 IS NULL OR r.created_at >= ?3)
              ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?1",
         )?;
@@ -2013,14 +2066,19 @@ impl Store {
                 };
                 let status: String = r.get(2)?;
                 let followup: String = r.get(3)?;
+                let rating: String = r.get(10)?;
                 Ok(formless_protocol::RunMetricsInfo {
                     run_id: r.get(0)?,
                     session_id: r.get(1)?,
-                    outcome: if followup.is_empty() {
+                    // The user's explicit 👎 outranks inferred follow-ups.
+                    outcome: if rating == "bad" {
+                        "rated_bad".into()
+                    } else if followup.is_empty() {
                         status.clone()
                     } else {
                         followup
                     },
+                    rating,
                     status,
                     steps: r.get(4)?,
                     tool_calls: r.get(5)?,
@@ -2214,6 +2272,61 @@ impl Store {
             .query_map(params![session_id], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(rows)
+    }
+
+    /// The Session's queued messages with their ids, in send order.
+    pub fn queued_items(&self, session_id: &str) -> Result<Vec<formless_protocol::QueuedMessage>> {
+        let mut stmt = self.ps(
+            "SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |r| {
+                Ok(formless_protocol::QueuedMessage {
+                    id: r.get(0)?,
+                    content: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Replace a queued message's text, or remove it (`None`). False when
+    /// it is no longer queued (already sent).
+    pub fn edit_queued(&self, session_id: &str, id: i64, content: Option<&str>) -> Result<bool> {
+        let n = match content {
+            Some(c) => self.ex(
+                "UPDATE queued_messages SET content=?3 WHERE id=?1 AND session_id=?2",
+                params![id, session_id, c],
+            )?,
+            None => self.ex(
+                "DELETE FROM queued_messages WHERE id=?1 AND session_id=?2",
+                params![id, session_id],
+            )?,
+        };
+        Ok(n > 0)
+    }
+
+    /// Move a queued message one place earlier (`up`) or later, by
+    /// swapping its text with its neighbour's. Returns the id that now
+    /// holds it, or None when it is not queued or already at that end.
+    pub fn move_queued(&self, session_id: &str, id: i64, up: bool) -> Result<Option<i64>> {
+        let items = self.queued_items(session_id)?;
+        let Some(i) = items.iter().position(|q| q.id == id) else {
+            return Ok(None);
+        };
+        let j = if up { i.checked_sub(1) } else { Some(i + 1) };
+        let Some(other) = j.and_then(|j| items.get(j)) else {
+            return Ok(None);
+        };
+        self.ex(
+            "UPDATE queued_messages SET content=?2 WHERE id=?1",
+            params![items[i].id, other.content],
+        )?;
+        self.ex(
+            "UPDATE queued_messages SET content=?2 WHERE id=?1",
+            params![other.id, items[i].content],
+        )?;
+        Ok(Some(other.id))
     }
 
     pub fn clear_queued_messages(&self, session_id: &str) -> Result<()> {

@@ -644,3 +644,74 @@ fn stats_can_be_limited_to_a_time_range() {
         .is_empty());
     assert!(store.builtin_stats(Some(future)).unwrap().is_empty());
 }
+
+/// 👍/👎 on a Run (SPEC §8.7): a 👎 outranks inferred follow-ups, shows in
+/// the summary, and can be cleared.
+#[test]
+fn ratings_set_the_outcome_and_summary() {
+    let store = Store::open_in_memory().unwrap();
+    let s = store.create_session(None).unwrap().id;
+    // Nothing finished yet: nothing to rate.
+    let r1 = store.create_run(&s).unwrap();
+    assert_eq!(store.rate_run(&s, None, "good", None).unwrap(), None);
+    store.set_run_status(&r1, "completed").unwrap();
+    let r2 = store.create_run(&s).unwrap();
+    store.set_run_status(&r2, "completed").unwrap();
+    store.mark_last_run_followup(&s, "corrected").unwrap();
+    // The latest finished Run by default.
+    assert_eq!(
+        store.rate_run(&s, None, "bad", Some("wrong file")).unwrap(),
+        Some(r2.clone())
+    );
+    assert_eq!(
+        store.rate_run(&s, Some(&r1), "good", None).unwrap(),
+        Some(r1.clone())
+    );
+    let runs = store.run_metrics_for(Some(&s), 10, None).unwrap();
+    let get = |id: &str| runs.iter().find(|r| r.run_id == id).unwrap().clone();
+    assert_eq!(get(&r2).outcome, "rated_bad");
+    assert_eq!(get(&r1).outcome, "completed");
+    assert_eq!(get(&r1).rating, "good");
+    let sum = summarize(&runs);
+    assert_eq!((sum.rated_good, sum.rated_bad), (0.5, 0.5));
+    // Cleared: back to the inferred follow-up.
+    store.rate_run(&s, Some(&r2), "", None).unwrap();
+    let runs = store.run_metrics_for(Some(&s), 10, None).unwrap();
+    assert_eq!(
+        runs.iter().find(|r| r.run_id == r2).unwrap().outcome,
+        "corrected"
+    );
+    // Another Session's Run cannot be rated from here.
+    let other = store.create_session(None).unwrap().id;
+    assert_eq!(store.rate_run(&other, Some(&r1), "bad", None).unwrap(), None);
+}
+
+/// The queue can be edited, reordered and pruned before it is sent
+/// (SPEC §5.3).
+#[test]
+fn queued_messages_can_be_edited_moved_and_removed() {
+    let store = Store::open_in_memory().unwrap();
+    let s = store.create_session(None).unwrap().id;
+    for t in ["a", "b", "c"] {
+        store.enqueue_message(&s, t).unwrap();
+    }
+    let texts = |st: &Store| st.list_queued_messages(&s).unwrap();
+    let items = store.queued_items(&s).unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(store.edit_queued(&s, items[1].id, Some("B")).unwrap());
+    assert_eq!(texts(&store), ["a", "B", "c"]);
+    // Moving swaps with the neighbour; the ends do not move further.
+    assert_eq!(store.move_queued(&s, items[2].id, true).unwrap(), Some(items[1].id));
+    assert_eq!(texts(&store), ["a", "c", "B"]);
+    assert_eq!(store.move_queued(&s, items[0].id, true).unwrap(), None);
+    assert_eq!(store.move_queued(&s, items[2].id, false).unwrap(), None);
+    assert!(store.edit_queued(&s, items[0].id, None).unwrap());
+    assert_eq!(texts(&store), ["c", "B"]);
+    // Sent (popped) messages are no longer editable; other Sessions' ids
+    // do not match.
+    store.pop_queued_message(&s).unwrap();
+    assert!(!store.edit_queued(&s, items[1].id, Some("x")).unwrap());
+    let other = store.create_session(None).unwrap().id;
+    assert!(!store.edit_queued(&other, items[2].id, None).unwrap());
+    assert_eq!(texts(&store), ["B"]);
+}
