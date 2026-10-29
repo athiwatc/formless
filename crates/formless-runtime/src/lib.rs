@@ -437,10 +437,83 @@ fn utf8_cut(b: &[u8]) -> usize {
     n
 }
 
-fn host_in_scope(domains: &[String], host: &str) -> bool {
+fn host_in_scope(domains: &[String], host: &str, port: Option<u16>) -> bool {
+    domains.iter().any(|d| {
+        // `host:port` grants (input-bound URLs with a port) match that port only.
+        let (dh, dp) = match d.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok() => (h, p.parse().ok()),
+            _ => (d.as_str(), None),
+        };
+        (host == dh || host.ends_with(&format!(".{dh}"))) && dp.is_none_or(|p| Some(p) == port)
+    })
+}
+
+/// A grant names `host` itself (not a parent domain): only then may it
+/// reach a private address (`net:localhost` for a local model).
+fn names_host_exactly(domains: &[String], host: &str) -> bool {
     domains
         .iter()
-        .any(|d| host == d || host.ends_with(&format!(".{d}")))
+        .any(|d| d == host || d.rsplit_once(':').is_some_and(|(h, _)| h == host))
+}
+
+/// Loopback, private, link-local, CGNAT, multicast, unspecified or
+/// otherwise not public (SPEC §7.4).
+fn non_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (o[0] == 100 && (64..128).contains(&o[1])) // CGNAT
+                || o[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return non_public(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00 // unique local
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local
+        }
+    }
+}
+
+/// Resolve the URL's host once and check every address (SPEC §7.4): a
+/// private one is refused unless a grant names this host exactly. The
+/// address returned is the one the request is then pinned to, so DNS
+/// can't change between the check and the connection.
+fn checked_address(url: &reqwest::Url, scope: &[String]) -> Result<Option<std::net::SocketAddr>, String> {
+    use std::net::ToSocketAddrs;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']).to_lowercase();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let literal = host.parse::<std::net::IpAddr>().ok();
+    let addrs: Vec<std::net::SocketAddr> = match literal {
+        Some(ip) => vec![std::net::SocketAddr::new(ip, port)],
+        None => (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| format!("cannot resolve {host}: {e}"))?
+            .collect(),
+    };
+    let exact = names_host_exactly(scope, &host);
+    if let Some(bad) = addrs.iter().find(|a| non_public(a.ip())) {
+        if !exact {
+            return Err(denied(format!(
+                "net:{host} resolves to {}, a private or local address; grant net:{host} itself to reach it",
+                bad.ip()
+            )));
+        }
+    }
+    // An IP literal needs no pinning; a name is pinned to what was checked.
+    Ok(if literal.is_some() { None } else { addrs.first().copied() })
 }
 
 /// Is `cmd` covered by a `process:<name>` grant? A bare grant matches the
@@ -479,7 +552,19 @@ fn http_client() -> &'static reqwest::blocking::Client {
 fn send_request(mut req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
     use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION};
     for _ in 0..=10 {
-        let mut builder = http_client().request(req.method.clone(), req.url.clone());
+        let pinned = checked_address(&req.url, &req.scope)?;
+        let client = match (pinned, req.url.host_str()) {
+            // A client that connects only to the checked address (TLS still
+            // checks the name).
+            (Some(addr), Some(host)) => reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(None)
+                .resolve(host, addr)
+                .build()
+                .map_err(|e| e.to_string())?,
+            _ => http_client().clone(),
+        };
+        let mut builder = client.request(req.method.clone(), req.url.clone());
         for (k, v) in &req.headers {
             builder = builder.header(k, v);
         }
@@ -513,7 +598,7 @@ fn send_request(mut req: FetchRequest) -> Result<reqwest::blocking::Response, St
             )));
         }
         let host = next.host_str().unwrap_or_default().to_lowercase();
-        if !req.scope.is_empty() && !host_in_scope(&req.scope, &host) {
+        if !req.scope.is_empty() && !host_in_scope(&req.scope, &host, next.port_or_known_default()) {
             return Err(denied(format!("redirect to {host} not in net scope")));
         }
         if status == 303 || (matches!(status, 301 | 302) && req.method == reqwest::Method::POST) {
@@ -575,13 +660,35 @@ const PROCESS_BASE_ENV: &[&str] = &[
     "LOCALAPPDATA",
 ];
 
-fn process_allowed(allowed: &[String], cmd: &str) -> bool {
+/// A `process:` grant's command and, for `process:git:status|log`, the
+/// first arguments it allows (None = any).
+pub fn process_grant(grant: &str) -> (&str, Option<Vec<&str>>) {
+    match grant.rsplit_once(':') {
+        // `C:\…` is a Windows path, not a command with sub-commands.
+        Some((cmd, subs))
+            if cmd.len() > 1 && !subs.is_empty() && !subs.contains(['/', '\\']) =>
+        {
+            (cmd, Some(subs.split('|').collect()))
+        }
+        _ => (grant, None),
+    }
+}
+
+fn process_allowed(allowed: &[String], cmd: &str, first_arg: Option<&str>) -> bool {
     let is_path = |s: &str| s.contains('/') || s.contains('\\');
     let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
     };
-    allowed.iter().any(|a| {
+    allowed.iter().any(|grant| {
+        let (a, subs) = process_grant(grant);
+        // Argument scoping: the first argument must be one it names.
+        if let Some(subs) = subs {
+            if !first_arg.is_some_and(|f| subs.contains(&f)) {
+                return false;
+            }
+        }
+        let a = &a.to_string();
         if a == cmd {
             return true;
         }
@@ -1194,8 +1301,12 @@ impl State {
         }
         let host = parsed.host_str().unwrap_or_default().to_lowercase();
         let smoke_stub = templated && self.mode == HostMode::Smoke;
-        if !domains.is_empty() && !host_in_scope(&fixed, &host) && !smoke_stub {
-            return Err(denied(format!("net:{host} not in scope")));
+        if !domains.is_empty()
+            && !host_in_scope(&fixed, &host, parsed.port_or_known_default())
+            && !smoke_stub
+        {
+            let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+            return Err(denied(format!("net:{host}{port} not in scope")));
         }
         if self.mode == HostMode::Replay {
             return Err(denied("net denied in replay"));
@@ -1456,8 +1567,24 @@ impl State {
             .process
             .as_ref()
             .ok_or_else(|| denied("process not declared"))?;
-        if !allowed.is_empty() && !process_allowed(allowed, cmd) {
-            return Err(denied(format!("process:{cmd} not in scope")));
+        let first_arg = a["args"].as_array().and_then(|v| v.first()).and_then(|x| x.as_str());
+        if !allowed.is_empty() && !process_allowed(allowed, cmd, first_arg) {
+            return Err(denied(format!(
+                "process:{cmd}{} not in scope",
+                first_arg.map(|f| format!(" {f}")).unwrap_or_default()
+            )));
+        }
+        // A working folder is a place the Tool may read (#608): inside
+        // its fs grants, never anywhere on disk.
+        if let Some(cwd) = a["cwd"].as_str() {
+            if self.mode == HostMode::Live
+                && self.resolve(cwd, false).is_err()
+                && self.resolve(cwd, true).is_err()
+            {
+                return Err(denied(format!(
+                    "cwd {cwd} is outside this Tool's fs grants; declare fs:read:{cwd} to run there"
+                )));
+            }
         }
         if self.mode == HostMode::Replay {
             return Err(denied("process denied in replay"));
@@ -2044,6 +2171,47 @@ mod tests {
             *ops.0.lock().unwrap(),
             [(Some(0.5), "half".into()), (Some(1.0), String::new()), (None, String::new())]
         );
+    }
+
+    #[test]
+    fn private_addresses_need_an_exact_grant() {
+        use std::net::IpAddr;
+        for ip in ["127.0.0.1", "10.1.2.3", "192.168.0.9", "169.254.169.254", "100.64.0.1", "::1", "fe80::1", "fd00::5", "::ffff:10.0.0.1", "0.0.0.0"] {
+            assert!(non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        for ip in ["1.1.1.1", "8.8.8.8", "2606:4700::1111"] {
+            assert!(!non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        let err = checked_address(&url("http://169.254.169.254/latest"), &[]).unwrap_err();
+        assert!(err.starts_with("denied:") && err.contains("169.254.169.254"), "{err}");
+        assert!(checked_address(&url("http://127.0.0.1:11434/v1"), &["127.0.0.1".into()]).is_ok());
+        // A parent-domain grant doesn't reach a private address.
+        assert!(checked_address(&url("http://localhost/"), &["host".into()]).is_err());
+        assert!(checked_address(&url("http://localhost/"), &["localhost".into()]).is_ok());
+    }
+
+    #[test]
+    fn ports_in_grants_are_kept_and_enforced() {
+        let g = vec!["api.example.com:8443".to_string(), "example.org".to_string()];
+        assert!(host_in_scope(&g, "api.example.com", Some(8443)));
+        assert!(!host_in_scope(&g, "api.example.com", Some(443)), "not every port");
+        assert!(host_in_scope(&g, "www.example.org", Some(8080)), "portless grants keep any port");
+    }
+
+    #[test]
+    fn process_grants_scope_sub_commands_and_cwd() {
+        assert_eq!(process_grant("git:status|log"), ("git", Some(vec!["status", "log"])));
+        assert_eq!(process_grant("C:\\tools\\x.exe"), ("C:\\tools\\x.exe", None));
+        let allowed = vec!["git:status|log".to_string()];
+        assert!(process_allowed(&allowed, "git", Some("log")));
+        assert!(!process_allowed(&allowed, "git", Some("push")));
+        assert!(!process_allowed(&allowed, "git", None));
+        // A working folder outside the fs grants is refused.
+        let mut req = live("function run() { return process.run('ls', [], {cwd: '/'}); }");
+        req.caps = Capabilities::parse(&["process:ls".to_string()]).unwrap();
+        let e = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+        assert!(e.message.contains("outside this Tool's fs grants"), "{}", e.message);
     }
 
     #[test]

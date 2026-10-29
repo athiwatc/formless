@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -23,8 +23,93 @@ type Subs = Arc<StdMutex<Vec<Subscriber>>>;
 /// A connected client and the events it asked for (`Request::Subscribe`).
 struct Subscriber {
     conn: u64,
-    tx: mpsc::UnboundedSender<ServerMessage>,
+    /// Bounded (SPEC §9.3): a client that stops reading can't grow the
+    /// daemon's memory.
+    tx: mpsc::Sender<ServerMessage>,
     filter: Arc<StdMutex<EventFilter>>,
+    /// Cancelled to disconnect a client whose queue overflowed.
+    kick: CancellationToken,
+}
+
+/// Messages queued per client before it counts as stuck.
+const CLIENT_QUEUE: usize = 4096;
+/// Largest request line (an attachment's base64 plus room), enforced while
+/// reading.
+const MAX_FRAME: usize = 32 * 1024 * 1024;
+
+/// Live output a slow client can miss without losing anything that
+/// matters: the settled message, the result and the state come later.
+fn droppable(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::MessageDelta { .. }
+            | Event::ReasoningDelta { .. }
+            | Event::ToolProgress { .. }
+            | Event::RunUsage { .. }
+            | Event::InvocationActivity { .. }
+            | Event::ModelPullProgress { .. }
+    )
+}
+
+/// Read one `\n`-terminated line of at most `max` bytes (None at EOF).
+async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = r.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok((!buf.is_empty()).then(|| String::from_utf8_lossy(&buf).into_owned()));
+        }
+        let (take, done) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if buf.len() + take > max + 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("request over {} MB", max / (1024 * 1024)),
+            ));
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        r.consume(take);
+        if done {
+            buf.pop();
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+    }
+}
+
+/// The request's kind, for logs ("send_message").
+fn request_kind(req: &Request) -> String {
+    serde_json::to_value(req)
+        .ok()
+        .and_then(|v| v["type"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "request".into())
+}
+
+/// Handle one request, turning a panic into an error reply (and a log
+/// line) instead of a dead connection (SPEC §9.3).
+async fn handle_safely(this: &Arc<Daemon>, req: Request) -> Result<Value> {
+    use futures_util::FutureExt;
+    let kind = request_kind(&req);
+    match std::panic::AssertUnwindSafe(this.handle(req)).catch_unwind().await {
+        Ok(r) => r,
+        Err(p) => {
+            let why = panic_text(&p);
+            tracing::error!("panic while handling {kind}: {why}");
+            Err(anyhow!("internal error while handling {kind}: {why}"))
+        }
+    }
+}
+
+fn panic_text(p: &Box<dyn std::any::Any + Send>) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".into())
 }
 
 struct EventFilter {
@@ -111,10 +196,26 @@ pub(crate) struct PendingEntry {
 }
 
 /// Fan an event out to every live subscriber, dropping disconnected ones.
+/// Never waits: a full queue drops live deltas, and disconnects the client
+/// for anything else (SPEC §9.3).
 fn send_all(subs: &Subs, ev: Event) {
-    subs.lock().unwrap().retain(|sub| {
-        !sub.filter.lock().unwrap().wants(&ev)
-            || sub.tx.send(ServerMessage::Event(ev.clone())).is_ok()
+    subs.lock().unwrap_or_else(|e| e.into_inner()).retain(|sub| {
+        if !sub.filter.lock().unwrap_or_else(|e| e.into_inner()).wants(&ev) {
+            return true;
+        }
+        match sub.tx.try_send(ServerMessage::Event(ev.clone())) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) if droppable(&ev) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "client {} stopped reading ({CLIENT_QUEUE} messages queued); disconnecting it",
+                    sub.conn
+                );
+                sub.kick.cancel();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     });
 }
 
@@ -629,6 +730,14 @@ impl Daemon {
                     .filter(|e| e.result.lock().unwrap().is_none())
                     .count());
                 resources["uptime_secs"] = json!(self.started.elapsed().as_secs());
+                // How full each client's queue is (SPEC §9.3).
+                resources["client_queues"] = json!(self
+                    .subs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|s| json!({"conn": s.conn, "queued": CLIENT_QUEUE - s.tx.capacity()}))
+                    .collect::<Vec<_>>());
                 Ok(json!({
                     "rate_limits": crate::provider::rate_limits(),
                     "missing_models": *self.missing_models.lock().unwrap(),
@@ -3223,10 +3332,44 @@ impl Daemon {
         });
         let this = self.clone();
         tokio::spawn(async move {
-            this.run_loop(session_id, run_id, cancel, cancel_flag, steer_rx)
-                .await;
+            use futures_util::FutureExt;
+            let run = std::panic::AssertUnwindSafe(this.clone().run_loop(
+                session_id.clone(),
+                run_id.clone(),
+                cancel,
+                cancel_flag,
+                steer_rx,
+            ));
+            if let Err(p) = run.catch_unwind().await {
+                this.run_panicked(&session_id, &run_id, &panic_text(&p));
+            }
         });
         Ok(())
+    }
+
+    /// A Run that panicked (SPEC §9.5): the Session is freed and the Run
+    /// is left paused with the reason, as if it had failed, so the next
+    /// message works without a restart. Locks a panic may have poisoned
+    /// are still taken.
+    fn run_panicked(&self, session_id: &str, run_id: &str, why: &str) {
+        tracing::error!("run {run_id} in session {session_id} panicked: {why}");
+        let error = format!("internal error: {why}");
+        let _ = self.with_store(|st| st.set_run_status(run_id, "paused"));
+        let _ = self.with_store(|st| st.set_run_error(run_id, &error));
+        self.runs.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+        self.budget_waived.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+        self.step_limits.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+        self.broadcast(Event::RunPaused {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            error,
+            explained: None,
+        });
+        self.broadcast(Event::RunFinished {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            status: "paused".into(),
+        });
     }
 
     async fn run_loop(
@@ -3611,6 +3754,19 @@ impl Daemon {
         }
         self.with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
+        // Tests inject a panic here (debug builds only) to prove a Run that
+        // panics frees its Session (#607).
+        #[cfg(debug_assertions)]
+        if let Ok(marker) = std::env::var("FORMLESS_TEST_PANIC_MARKER") {
+            let last = self
+                .with_reader(|st| st.list_messages(session_id))?
+                .into_iter()
+                .rev()
+                .find(|m| m.role == "user");
+            if last.is_some_and(|m| m.content.contains(&marker)) {
+                panic!("injected test panic");
+            }
+        }
         // The Session's model, or its role's provider + model (SPEC §4.5).
         let once = self.next_run_model.lock().unwrap().remove(session_id);
         let target = self.target(&cfg, session_id, once.as_deref()).await?;
@@ -9784,13 +9940,15 @@ impl Daemon {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(CLIENT_QUEUE);
         let filter = Arc::new(StdMutex::new(EventFilter::default()));
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let kick = CancellationToken::new();
         self.subs.lock().unwrap().push(Subscriber {
             conn,
             tx: tx.clone(),
             filter: filter.clone(),
+            kick: kick.clone(),
         });
         // Requests run as this client, for attribution (SPEC §10.4).
         let client = {
@@ -9801,7 +9959,7 @@ impl Daemon {
             }
         };
         for w in &self.startup_warnings {
-            let _ = tx.send(ServerMessage::Event(Event::Note {
+            let _ = tx.try_send(ServerMessage::Event(Event::Note {
                 session_id: None,
                 text: w.clone(),
             }));
@@ -9821,23 +9979,35 @@ impl Daemon {
         // Requests run in order on one worker per connection, so a slow one
         // (a smoke test, a big export) never holds up reading: control
         // requests (Esc, approvals, answers, Ping) skip the queue (SPEC §9.3).
-        let (work_tx, mut work_rx) = mpsc::unbounded_channel::<RequestEnvelope>();
+        let (work_tx, mut work_rx) = mpsc::channel::<RequestEnvelope>(256);
         let worker = {
             let (this, tx, client) = (self.clone(), tx.clone(), client.clone());
             tokio::spawn(async move {
                 while let Some(env) = work_rx.recv().await {
-                    let resp = match CLIENT.scope(client(), this.handle(env.request)).await {
+                    let resp = match CLIENT.scope(client(), handle_safely(&this, env.request)).await {
                         Ok(v) => ServerMessage::ok(env.id, v),
                         Err(e) => ServerMessage::err(env.id, e.to_string()),
                     };
-                    if tx.send(resp).is_err() {
+                    if tx.send(resp).await.is_err() {
                         break;
                     }
                 }
             })
         };
-        let mut lines = BufReader::new(read_half).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(read_half);
+        loop {
+            let line = tokio::select! {
+                _ = kick.cancelled() => break,
+                r = read_frame(&mut reader, MAX_FRAME) => match r {
+                    Ok(Some(l)) => l,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("closing client {conn}: {e}");
+                        let _ = tx.try_send(ServerMessage::err(0, format!("connection closed: {e}")));
+                        break;
+                    }
+                },
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -9875,15 +10045,15 @@ impl Daemon {
                     } else if is_control(&env.request) {
                         let (this, tx, who) = (self.clone(), tx.clone(), client());
                         tokio::spawn(async move {
-                            let resp = match CLIENT.scope(who, this.handle(env.request)).await {
+                            let resp = match CLIENT.scope(who, handle_safely(&this, env.request)).await {
                                 Ok(v) => ServerMessage::ok(env.id, v),
                                 Err(e) => ServerMessage::err(env.id, e.to_string()),
                             };
-                            let _ = tx.send(resp);
+                            let _ = tx.send(resp).await;
                         });
                         continue;
                     } else {
-                        if work_tx.send(env).is_err() {
+                        if work_tx.send(env).await.is_err() {
                             break;
                         }
                         continue;
@@ -9891,7 +10061,7 @@ impl Daemon {
                 }
                 Err(e) => ServerMessage::err(0, format!("bad request: {e}")),
             };
-            if tx.send(resp).is_err() {
+            if tx.send(resp).await.is_err() {
                 break;
             }
         }
@@ -11616,5 +11786,45 @@ mod trust_precedence_tests {
         let grants = daemon.list_grants().unwrap();
         assert!(grants.iter().all(|g| g.trusted), "listed as still trusted");
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frames_are_capped_while_reading() {
+        let data = b"short\nxxxxxxxxxxxxxxxxxxxx\n".to_vec();
+        let mut r = BufReader::new(&data[..]);
+        assert_eq!(read_frame(&mut r, 10).await.unwrap().as_deref(), Some("short"));
+        assert!(read_frame(&mut r, 10).await.is_err(), "20 bytes > 10");
+        let mut r = BufReader::new(&b"last"[..]);
+        assert_eq!(read_frame(&mut r, 10).await.unwrap().as_deref(), Some("last"));
+        assert_eq!(read_frame(&mut r, 10).await.unwrap(), None);
+    }
+
+    #[test]
+    fn a_stuck_client_loses_deltas_then_is_disconnected() {
+        let (tx, _rx) = mpsc::channel::<ServerMessage>(1);
+        let kick = CancellationToken::new();
+        let subs: Subs = Arc::new(StdMutex::new(vec![Subscriber {
+            conn: 1,
+            tx,
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: kick.clone(),
+        }]));
+        let delta = || Event::MessageDelta {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            delta: "x".into(),
+        };
+        send_all(&subs, delta()); // fills the queue
+        send_all(&subs, delta()); // dropped, client kept
+        assert_eq!(subs.lock().unwrap().len(), 1);
+        assert!(!kick.is_cancelled());
+        send_all(&subs, Event::Note { session_id: None, text: "important".into() });
+        assert!(subs.lock().unwrap().is_empty(), "can't take what matters: gone");
+        assert!(kick.is_cancelled(), "and its connection closes");
     }
 }

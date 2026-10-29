@@ -1404,14 +1404,20 @@ impl Config {
         Ok(())
     }
 
+    /// Write the config (SPEC §13): merged into the existing file so its
+    /// comments, order and keys this build doesn't know survive, and
+    /// replaced atomically so a crash mid-save leaves the old file.
     pub fn save(&self, paths: &Paths) -> Result<()> {
         let file = paths.config_file();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = toml::to_string_pretty(self)?;
-        std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
-        Ok(())
+        let fresh = toml::to_string_pretty(self)?;
+        let text = match std::fs::read_to_string(&file) {
+            Ok(old) => merge_toml(&old, &fresh).unwrap_or(fresh),
+            Err(_) => fresh,
+        };
+        write_atomic(&file, text.as_bytes()).with_context(|| format!("write {}", file.display()))
     }
     fn apply_env(&mut self) -> Result<()> {
         if let Some(secure) = env_flag("FORMLESS_SECURE")? {
@@ -1582,6 +1588,128 @@ pub fn reset_all(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+/// `fresh` (a whole serialized config) merged into the `old` file text:
+/// changed values are replaced in place (keeping their comments), new keys
+/// added, removed settings deleted, and keys the config type ignores
+/// (comments' neighbours, a newer build's keys) kept. None when `old`
+/// doesn't parse, so the caller writes `fresh`.
+fn merge_toml(old: &str, fresh: &str) -> Option<String> {
+    let mut doc: toml_edit::DocumentMut = old.parse().ok()?;
+    let new: toml_edit::DocumentMut = fresh.parse().ok()?;
+    // What `old` means to this build, to tell ignored keys from settings.
+    let meaning = |d: &toml_edit::DocumentMut| -> Option<String> {
+        let c: Config = toml::from_str(&d.to_string()).ok()?;
+        toml::to_string(&c).ok()
+    };
+    let base = meaning(&doc)?;
+    let target = meaning(&new)?;
+    let mut path: Vec<String> = Vec::new();
+    let mut inserted: Vec<Vec<String>> = Vec::new();
+    merge_table(doc.as_table_mut(), new.as_table(), &mut path, &mut inserted, &mut |p: &[String]| {
+        // Would dropping this old-only key change the parsed config?
+        let mut probe: toml_edit::DocumentMut = old.parse().ok()?;
+        remove_path(probe.as_item_mut(), p)?;
+        Some(meaning(&probe)? != base)
+    });
+    // Keys added only because the serializer writes every default are
+    // left out again, so a hand-written file stays as short as it was.
+    for p in inserted.iter().rev() {
+        let mut probe = doc.clone();
+        if remove_path(probe.as_item_mut(), p).is_some()
+            && meaning(&probe).as_deref() == Some(target.as_str())
+        {
+            doc = probe;
+        }
+    }
+    Some(doc.to_string())
+}
+
+/// Remove the key at `path` (table names, then the key).
+fn remove_path(item: &mut toml_edit::Item, path: &[String]) -> Option<()> {
+    match path {
+        [] => None,
+        [last] => item.as_table_like_mut()?.remove(last).map(|_| ()),
+        [first, rest @ ..] => remove_path(item.get_mut(first)?, rest),
+    }
+}
+
+fn merge_table(
+    old: &mut toml_edit::Table,
+    new: &toml_edit::Table,
+    path: &mut Vec<String>,
+    inserted: &mut Vec<Vec<String>>,
+    known: &mut dyn FnMut(&[String]) -> Option<bool>,
+) {
+    for (k, nv) in new.iter() {
+        path.push(k.to_string());
+        match (old.get_mut(k), nv) {
+            (Some(toml_edit::Item::Table(ot)), toml_edit::Item::Table(nt)) => {
+                merge_table(ot, nt, path, inserted, known);
+            }
+            (Some(ov), _) => {
+                // Same value: leave the old item (and its decor) alone.
+                if ov.to_string().trim() != nv.to_string().trim() {
+                    match (ov.as_value_mut(), nv.as_value()) {
+                        (Some(o), Some(n)) => {
+                            let decor = o.decor().clone();
+                            *o = n.clone();
+                            *o.decor_mut() = decor;
+                        }
+                        _ => *ov = nv.clone(),
+                    }
+                }
+            }
+            (None, _) => {
+                old.insert(k, nv.clone());
+                inserted.push(path.clone());
+            }
+        }
+        path.pop();
+    }
+    let gone: Vec<String> = old
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .filter(|k| !new.contains_key(k))
+        .collect();
+    for k in gone {
+        path.push(k.clone());
+        // Removed settings go; keys this build ignores stay.
+        if known(path).unwrap_or(true) {
+            old.remove(&k);
+        }
+        path.pop();
+    }
+}
+
+/// Replace `file` with `bytes` all at once: a temporary file next to it,
+/// flushed to disk, renamed over it, and the folder flushed (unix), so a
+/// crash leaves the old file or the new one, never half of either.
+pub fn write_atomic(file: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let dir = file.parent().context("no parent folder")?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        file.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    if let Ok(meta) = std::fs::metadata(file) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 /// Every credential a profile keeps outside its folders (keychain and
 /// secret files): the API key, OAuth tokens, the relay secret, named
 /// providers' keys and MCP servers' logins.
@@ -1671,4 +1799,51 @@ pub fn delete_api_key(paths: &Paths) {
         let _ = entry.delete_credential();
     }
     let _ = std::fs::remove_file(paths.key_fallback_file());
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    #[test]
+    fn saving_keeps_comments_order_and_unknown_keys() {
+        let base = std::env::temp_dir().join(format!("fl-cfgsave-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        let original = "# My Formless setup — keep this note\n\
+[provider]\n\
+# the endpoint I use\n\
+base_url = \"https://openrouter.ai/api/v1\"\n\
+model = \"old-model\"\n\
+reasoning_effort = \"high\"\n\
+future_option = \"from a newer build\"\n\
+\n\
+[providers.local]\n\
+base_url = \"http://localhost:11434/v1\"\n";
+        std::fs::write(paths.config_file(), original).unwrap();
+        let mut cfg = Config::load_file_only(&paths).unwrap();
+        cfg.provider.model = "new-model".into();
+        cfg.provider.reasoning_effort = None;
+        cfg.providers.remove("local");
+        cfg.save(&paths).unwrap();
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(text.starts_with("# My Formless setup — keep this note"), "{text}");
+        assert!(text.contains("# the endpoint I use\nbase_url"), "comment stays with its key:\n{text}");
+        assert!(text.contains("model = \"new-model\""));
+        assert!(text.contains("future_option = \"from a newer build\""), "unknown key kept");
+        assert!(!text.contains("reasoning_effort"), "a cleared setting is removed");
+        assert!(!text.contains("localhost:11434"), "a removed provider is removed");
+        // It still loads, and an unchanged save changes nothing.
+        let again = Config::load_file_only(&paths).unwrap();
+        assert_eq!(again.provider.model, "new-model");
+        again.save(&paths).unwrap();
+        assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), text);
+        // No temporary file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&paths.config_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

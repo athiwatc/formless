@@ -374,6 +374,30 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             return Some("writing anywhere in your files");
         }
     }
+    // Programs that are broader than they look (#608): interpreters and
+    // shells run anything; downloaders and remote shells reach the network
+    // and write files. Argument scoping (`process:git:status`) narrows the
+    // others, not these.
+    if let Some(cmd) = spec.strip_prefix("process:") {
+        let name = cmd.split(':').next().unwrap_or(cmd);
+        let base = name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(name)
+            .trim_end_matches(".exe")
+            .to_ascii_lowercase();
+        if matches!(
+            base.as_str(),
+            "sh" | "bash" | "zsh" | "fish" | "dash" | "cmd" | "powershell" | "pwsh"
+                | "python" | "python3" | "node" | "deno" | "bun" | "perl" | "ruby" | "php"
+                | "osascript" | "env" | "xargs" | "sudo"
+        ) {
+            return Some("an interpreter or shell: it can run any program, like bare process");
+        }
+        if matches!(base.as_str(), "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat") {
+            return Some("it can reach any host and write files, like net plus fs:write");
+        }
+    }
     if let Some(key) = spec.strip_prefix("env:") {
         let k = key.to_uppercase();
         let secret = [

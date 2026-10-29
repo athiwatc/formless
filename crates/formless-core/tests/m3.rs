@@ -573,7 +573,8 @@ fn cancel_stops_a_fetch_that_never_answers() {
     });
     let (err, took) = run_cancelled(
         &format!("function run(i){{ return fetch('http://{addr}/'); }}"),
-        &["net"],
+        // A local address needs a grant that names it (SPEC §7.4).
+        &["net:127.0.0.1"],
         std::time::Duration::from_millis(200),
     );
     assert_eq!(err.kind, ExecErrorKind::Cancelled, "{}", err.message);
