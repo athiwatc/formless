@@ -60,7 +60,7 @@ pub fn unsupported(id: u64, kind: &str) -> ServerMessage {
     ServerMessage::Response {
         id,
         ok: false,
-        result: Some(serde_json::json!({"code": "unsupported", "type": kind})),
+        result: Some(serde_json::json!({"code": codes::UNSUPPORTED, "type": kind})),
         error: Some(format!(
             "unsupported: this daemon does not know the request type '{kind}'"
         )),
@@ -1283,6 +1283,10 @@ pub enum Request {
         session_id: String,
         content: String,
         mode: SendMode,
+        /// One per user action: a retry with the same key (after a lost
+        /// reply) returns the first outcome instead of sending twice (#891).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
     },
     InterruptRun {
         session_id: String,
@@ -2505,7 +2509,80 @@ impl Event {
     }
 }
 
+/// Largest NDJSON line either side reads (a 20 MB attachment's base64 plus
+/// room); a longer one is refused while reading, never buffered (#888).
+pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+/// Read one `\n`-terminated line of at most `max` bytes, without the
+/// newline (None at EOF). Longer lines are an `InvalidData` error after
+/// reading at most `max + 1` bytes of them.
+pub fn read_line_capped<R: std::io::BufRead>(
+    r: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use std::io::{BufRead as _, Read};
+    let mut buf = Vec::new();
+    let n = r
+        .by_ref()
+        .take(max as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    } else if buf.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a message over {max} bytes"),
+        ));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Machine-readable error codes (#885). A failed response carries one as
+/// `result: {"code": …}`; the `error` text is for people only, so clients
+/// branch on [`ServerMessage::error_code`], never on the wording.
+///
+/// One rule for partial failure: a request that did what was asked but
+/// with a degraded part (`ListModels` when the listing call failed, an
+/// MCP server added but not yet started) succeeds and names the problem
+/// in its result's `error` field; a request that did not do what was
+/// asked fails.
+pub mod codes {
+    pub const PROTOCOL_MISMATCH: &str = "protocol_mismatch";
+    pub const UNSUPPORTED: &str = "unsupported";
+    pub const BAD_REQUEST: &str = "bad_request";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const BUSY: &str = "busy";
+    pub const BUDGET: &str = "budget";
+    pub const INVALID: &str = "invalid";
+    pub const INTERNAL: &str = "internal";
+}
+
 impl ServerMessage {
+    /// A failed response with a machine-readable `code` (see [`codes`]).
+    pub fn err_code(id: u64, code: &str, error: String) -> Self {
+        ServerMessage::Response {
+            id,
+            ok: false,
+            result: Some(serde_json::json!({ "code": code })),
+            error: Some(error),
+        }
+    }
+
+    /// The `code` of a failed response, if it has one.
+    pub fn error_code(&self) -> Option<&str> {
+        match self {
+            ServerMessage::Response {
+                ok: false, result, ..
+            } => result.as_ref()?.get("code")?.as_str(),
+            _ => None,
+        }
+    }
+
     pub fn ok(id: u64, result: serde_json::Value) -> Self {
         ServerMessage::Response {
             id,
@@ -2563,6 +2640,28 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn lines_are_capped_while_reading() {
+        let mut r = std::io::BufReader::new(&b"short\nxxxxxxxxxxxxxxxxxxxx"[..]);
+        assert_eq!(
+            read_line_capped(&mut r, 10).unwrap().as_deref(),
+            Some("short")
+        );
+        assert!(
+            read_line_capped(&mut r, 10).is_err(),
+            "20 bytes, no newline"
+        );
+        let mut r = std::io::BufReader::new(&b"last"[..]);
+        assert_eq!(
+            read_line_capped(&mut r, 10).unwrap().as_deref(),
+            Some("last")
+        );
+        assert_eq!(read_line_capped(&mut r, 10).unwrap(), None);
+        let coded = ServerMessage::err_code(3, codes::NOT_FOUND, "no such Tool".into());
+        assert_eq!(coded.error_code(), Some("not_found"));
+        assert_eq!(ServerMessage::err(3, "x".into()).error_code(), None);
     }
 
     #[test]

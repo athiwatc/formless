@@ -4107,7 +4107,14 @@
         if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
       }
     }
-    const r = await act({ type: "send_message", session_id: S.current, content: text, mode });
+    // One key per user action (#891): pressing Send again after a reply
+    // was lost reuses it, so the daemon doesn't send the message twice.
+    const same = S.unsent && S.unsent.session === S.current && S.unsent.text === text;
+    const key = same ? S.unsent.key
+      : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+    S.unsent = { session: S.current, text, key };
+    const r = await act({ type: "send_message", session_id: S.current, content: text, mode, client_msg_id: key });
+    if (r) S.unsent = null;
     // The attachments went with it.
     if (r) { delete S.chips[S.current]; delete mentionAttached[S.current]; renderChips(); }
     if (r && mode === "steer") note("steering the current run");
@@ -4588,7 +4595,13 @@
       const p = S.pending.get(msg.id);
       if (!p) return; // timed out already
       S.pending.delete(msg.id);
-      if (msg.ok) p.resolve(msg.result); else p.reject(new Error(msg.error || "daemon error"));
+      if (msg.ok) p.resolve(msg.result);
+      else {
+        // The code (formless_protocol::codes) is what to branch on; the text is for people.
+        const err = new Error(msg.error || "daemon error");
+        err.code = (msg.result && msg.result.code) || null;
+        p.reject(err);
+      }
     } else if (msg.kind === "event") onEvent(msg);
   }
 

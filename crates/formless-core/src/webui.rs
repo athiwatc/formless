@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::daemon::Daemon;
 
@@ -257,8 +257,11 @@ async fn bridge(paths: crate::Paths, socket: WebSocket) {
     let (read, mut write) = tokio::io::split(conn);
     let (mut tx, mut rx) = socket.split();
     let to_browser = async {
-        let mut lines = BufReader::new(read).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        // Bounded per line, like every NDJSON reader (#888).
+        let mut reader = BufReader::new(read);
+        while let Ok(Some(line)) =
+            crate::daemon::read_frame(&mut reader, formless_protocol::MAX_FRAME_BYTES).await
+        {
             if tx.send(Message::Text(line.into())).await.is_err() {
                 break;
             }

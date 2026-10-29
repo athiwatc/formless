@@ -2018,6 +2018,20 @@ such as `read_file`, `read_text_file` and `file_read`.
   Sessions, settings, export/import) and daemon→client streamed events
   (model content and reasoning deltas, tool-call lifecycle, pending/stall
   notices, approval requests, compaction notices, optimiser activity).
+- **Errors and limits.** A failed response may carry `result: {"code":
+  …}` (`protocol_mismatch`, `unsupported`, `bad_request`, `not_found`,
+  `busy`, `budget`, `invalid`, `internal`); clients branch on the code,
+  the `error` text is for people. A request that did what was asked with
+  a degraded part (a model listing that failed) succeeds and names it in
+  its result's `error`. Every reader (daemon, TUI, relay pump, web
+  bridge) refuses a line over `MAX_FRAME_BYTES` (32 MB) while reading;
+  `AttachFile` is judged on its encoded size before decoding. The CLI
+  gives up on an unanswered request after 5 minutes, the TUI after 2.
+- **Ordering.** `InterruptRun` and `RetryProviderRequest` skip the
+  per-connection queue; an interrupt cancels a `SendMessage` for that
+  Session still queued behind a slow request (it fails with "interrupted
+  before it started"). `SendMessage.client_msg_id` makes a retried send
+  return the first outcome instead of sending twice (kept 10 minutes).
 - A client that falls behind loses live deltas first; it is told with
   `DeltasDropped {session_id, run_id}` once there is room, and the
   answer's `MessageComplete` carries the whole text (plain mode notes the

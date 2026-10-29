@@ -1040,6 +1040,9 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Render persisted assistant tool-call metadata as display lines.
+/// How long the TUI waits for a request's answer before giving up on it.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
+
 struct App {
     paths: Paths,
     view: View,
@@ -1088,6 +1091,9 @@ struct App {
     notes_seen: usize,
     toasts: Vec<(String, Instant, bool)>,
     pending: HashMap<u64, Pending>,
+    /// When each pending request was sent: one unanswered for
+    /// [`REQUEST_DEADLINE`] is given up on with a note (#884).
+    pending_since: HashMap<u64, Instant>,
     tools: Vec<ToolInfo>,
     /// What the last Run on screen did to the registry (`/tool NAME`).
     run_tool_changes: Vec<ToolChange>,
@@ -1415,6 +1421,7 @@ impl App {
             notes_seen: 0,
             toasts: Vec::new(),
             pending: HashMap::new(),
+            pending_since: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
             run_tool_changes: Vec::new(),
@@ -1571,6 +1578,10 @@ impl App {
         }
         self.client = None;
         self.inbox = None;
+        // A new connection numbers its requests from 1 again: nothing from
+        // the old one may resolve against them (#884).
+        self.pending.clear();
+        self.pending_since.clear();
         let result =
             client::restart_daemon(&self.paths, false, |_| {}).and_then(|()| self.connect_daemon());
         match result {
@@ -1607,6 +1618,7 @@ impl App {
         self.client = None;
         self.inbox = None;
         self.pending.clear();
+        self.pending_since.clear();
         self.activity = None;
         self.running_sessions.clear();
         let now = Instant::now();
@@ -1650,6 +1662,32 @@ impl App {
         if let Some(c) = &self.client {
             let id = c.send(req);
             self.pending.insert(id, kind);
+            self.pending_since.insert(id, Instant::now());
+        }
+    }
+
+    /// Give up on requests the daemon never answered.
+    fn expire_pending(&mut self) {
+        let late: Vec<u64> = self
+            .pending_since
+            .iter()
+            .filter(|(_, at)| at.elapsed() > REQUEST_DEADLINE)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            self.pending_since.remove(&id);
+            let Some(kind) = self.pending.remove(&id) else {
+                continue;
+            };
+            self.notes.push(format!(
+                "the daemon did not answer within {}s; try again",
+                REQUEST_DEADLINE.as_secs()
+            ));
+            if matches!(kind, Pending::SaveSetting) {
+                if let Some(key) = self.settings_saving.take() {
+                    self.settings_error = Some((key, "no answer from the daemon".into()));
+                }
+            }
         }
     }
     fn fire(&mut self, req: Request) {
@@ -1659,6 +1697,7 @@ impl App {
     }
 
     fn drain_daemon(&mut self) {
+        self.expire_pending();
         let Some(inbox) = self.inbox.take() else {
             return;
         };
@@ -1687,6 +1726,7 @@ impl App {
                     result,
                     error,
                 } => {
+                    self.pending_since.remove(&id);
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
@@ -4216,6 +4256,7 @@ impl App {
                 session_id,
                 content: text,
                 mode,
+                client_msg_id: None,
             });
             return;
         }
@@ -4332,6 +4373,7 @@ impl App {
                 session_id: p.session_id,
                 content: p.content,
                 mode: p.mode,
+                client_msg_id: None,
             });
         }
     }
@@ -14239,6 +14281,7 @@ mod tests {
             notes_seen: 0,
             toasts: Vec::new(),
             pending: HashMap::new(),
+            pending_since: HashMap::new(),
             tools: Vec::new(),
             tool_idx: 0,
             run_tool_changes: Vec::new(),

@@ -71,6 +71,7 @@ async fn run_once(model: &str, nudge: bool, answers: Vec<&'static str>) -> (Seen
             session_id: sid.clone(),
             content: "count the TODOs in ~/project".into(),
             mode: formless_protocol::SendMode::Send,
+            client_msg_id: None,
         })
         .await
         .unwrap();

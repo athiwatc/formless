@@ -435,6 +435,7 @@ async fn daemon_end_to_end_run_persists_and_two_clients_share() {
             session_id: session_id.clone(),
             content: "ping".into(),
             mode: SendMode::Send,
+            client_msg_id: None,
         },
     };
     write_half

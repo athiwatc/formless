@@ -177,6 +177,7 @@ async fn a_role_on_a_second_provider_serves_llm_calls_and_the_session() {
             session_id: sid.clone(),
             content: "hello".into(),
             mode: formless_protocol::SendMode::Send,
+            client_msg_id: None,
         })
         .await
         .unwrap();
@@ -418,6 +419,7 @@ async fn old_auto_configs_migrate_on_start_and_primary_runs_feed_routing() {
             session_id: sid.clone(),
             content: "hi".into(),
             mode: formless_protocol::SendMode::Send,
+            client_msg_id: None,
         })
         .await
         .unwrap();
@@ -569,6 +571,7 @@ async fn a_refusal_placeholder_is_never_sent_back_as_the_models_words() {
                 session_id: sid.clone(),
                 content: text.to_string(),
                 mode: formless_protocol::SendMode::Send,
+                client_msg_id: None,
             })
             .await
             .unwrap();

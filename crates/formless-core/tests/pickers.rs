@@ -192,6 +192,7 @@ async fn mentions_list_attach_and_reference_files() {
             session_id: sid.clone(),
             content: "explain @src/main.rs @big.log @src".into(),
             mode: formless_protocol::SendMode::Send,
+            client_msg_id: None,
         })
         .await
         .unwrap();

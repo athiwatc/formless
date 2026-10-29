@@ -23,7 +23,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -226,8 +226,11 @@ impl RelayClient {
         tokio::spawn(daemon.clone().handle_conn(daemon_side));
         let (read_half, write) = tokio::io::split(relay_side);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(read_half).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            // Bounded per line, like every NDJSON reader (#888).
+            let mut reader = BufReader::new(read_half);
+            while let Ok(Some(line)) =
+                crate::daemon::read_frame(&mut reader, formless_protocol::MAX_FRAME_BYTES).await
+            {
                 if out.send((cid.clone(), generation, line)).is_err() {
                     break;
                 }
