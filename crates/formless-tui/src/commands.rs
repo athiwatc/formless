@@ -365,6 +365,28 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("mcp", "", "list MCP servers", Integrations),
     cmd("mcp restart", "NAME", "restart an MCP server", Integrations),
+    cmd("mcp log", "NAME", "an MCP server's stderr log", Integrations),
+    cmd(
+        "mcp tools",
+        "NAME",
+        "an MCP server's tools, on or off, with token cost",
+        Integrations,
+    ),
+    cmd("mcp tool", "NAME TOOL on|off", "turn one MCP tool on or off", Integrations),
+    cmd("mcp catalog", "", "popular MCP servers you can add", Integrations),
+    cmd("mcp add", "ID [key=value]", "add a server from the catalog", Integrations),
+    cmd(
+        "mcp import",
+        "[NAME]",
+        "servers configured in Claude Desktop, Cursor or VS Code",
+        Integrations,
+    ),
+    cmd(
+        "mcp:",
+        "SERVER:PROMPT [ARGS]",
+        "send an MCP prompt as your message",
+        Integrations,
+    ),
     cmd("prompts", "", "list MCP prompts", Integrations),
     cmd(
         "prompt",

@@ -645,9 +645,13 @@ enum MemoryAction {
 
 #[derive(Subcommand)]
 enum McpAction {
-    /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio) or `add NAME --url URL` (http)
+    /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio), `add NAME --url
+    /// URL` (http), or `add ID` for a catalog server (`mcp catalog`)
     Add {
         name: String,
+        /// A catalog server's setting, `key=value` (e.g. `path=~/notes`)
+        #[arg(long = "param")]
+        params: Vec<String>,
         /// Remote server URL (Streamable HTTP or HTTP+SSE)
         #[arg(long)]
         url: Option<String>,
@@ -675,6 +679,32 @@ enum McpAction {
     Login { server: String },
     /// Delete a server's stored OAuth tokens
     Logout { server: String },
+    /// Popular servers you can add by name (`formless mcp add ID`)
+    Catalog,
+    /// Find servers configured in Claude Desktop, Cursor or VS Code and
+    /// add them (each command is shown and asked about first)
+    Import {
+        /// Add every server found without asking
+        #[arg(long)]
+        yes: bool,
+    },
+    /// The end of a stdio server's stderr log
+    Log {
+        name: String,
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// A server's tools, on or off, with their token cost
+    Tools { name: String },
+    /// Turn one of a server's tools on or off
+    Tool {
+        name: String,
+        tool: String,
+        #[arg(long, conflicts_with = "off")]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3885,11 +3915,36 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
     match action {
         McpAction::Add {
             name,
+            params,
             url,
             headers,
             env_keys,
             command,
         } => {
+            if url.is_none() && command.is_empty() {
+                // A catalog server by id.
+                let params: serde_json::Map<String, serde_json::Value> = params
+                    .iter()
+                    .map(|p| {
+                        let (k, v) = p.split_once('=').context("--param takes key=value")?;
+                        Ok((k.trim().to_string(), serde_json::json!(v.trim())))
+                    })
+                    .collect::<Result<_>>()?;
+                let r = daemon(Request::AddMcpFromCatalog {
+                    id: name.clone(),
+                    name: None,
+                    params,
+                })?;
+                println!("added:   {}", r["added"].as_str().unwrap_or(&name));
+                report(&r);
+                for k in r["env_keys"].as_array().into_iter().flatten() {
+                    println!("needs:   {} in the daemon's environment", k.as_str().unwrap_or_default());
+                }
+                if r["needs_login"] == true {
+                    println!("next:    formless mcp login {name}");
+                }
+                return Ok(());
+            }
             let server = match url {
                 Some(url) => {
                     let headers: serde_json::Map<String, serde_json::Value> = headers
@@ -3938,12 +3993,11 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                 "LAST ERROR",
             ]);
             for s in servers {
-                let state = if s["disabled"] == true {
-                    t("disabled", Tone::Dim)
-                } else if s["running"] == true {
-                    t("running", Tone::Good)
-                } else {
-                    c("idle")
+                let state = match s["state"].as_str().unwrap_or("idle") {
+                    "disabled" => t("disabled", Tone::Dim),
+                    "ready" => t("ready", Tone::Good),
+                    st @ ("failed" | "auth needed") => t(st, Tone::Bad),
+                    st => c(st),
                 };
                 tbl.row(vec![
                     t(s["name"].as_str().unwrap_or_default(), Tone::Strong),
@@ -3957,6 +4011,133 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             if !tbl.is_empty() {
                 tbl.print();
             }
+        }
+        McpAction::Catalog => {
+            let list = daemon(Request::McpCatalog)?;
+            let mut tbl = Table::new(&["ID", "SERVER", "WHAT IT DOES", "NEEDS"]);
+            for e in list.as_array().into_iter().flatten() {
+                let mut needs: Vec<String> = e["params"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| p["name"].as_str().map(|n| format!("--param {n}=…")))
+                    .collect();
+                needs.extend(
+                    e["env_keys"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|k| k.as_str().map(|k| format!("${k}"))),
+                );
+                if e["transport"] == "http" {
+                    needs.push("login".into());
+                }
+                let id = e["id"].as_str().unwrap_or_default();
+                tbl.row(vec![
+                    t(id, if e["added"] == true { Tone::Dim } else { Tone::Strong }),
+                    c(e["title"].as_str().unwrap_or_default()),
+                    t(e["description"].as_str().unwrap_or_default(), Tone::Dim),
+                    c(needs.join(" ")),
+                ]);
+            }
+            tbl.print();
+            println!("add one with: formless mcp add ID [--param key=value]");
+        }
+        McpAction::Import { yes } => {
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|d| d.to_string_lossy().into_owned());
+            let list = daemon(Request::McpImportCandidates { cwd })?;
+            let found = list.as_array().cloned().unwrap_or_default();
+            if found.is_empty() {
+                println!("no MCP servers found in Claude Desktop, Cursor or VS Code configs");
+                return Ok(());
+            }
+            use std::io::{BufRead, IsTerminal, Write};
+            let interactive = std::io::stdin().is_terminal();
+            for cand in found {
+                let name = cand["name"].as_str().unwrap_or_default().to_string();
+                println!(
+                    "\n{name}  (from {})\n  {}",
+                    cand["source"].as_str().unwrap_or_default(),
+                    cand["target"].as_str().unwrap_or_default()
+                );
+                let env: Vec<&str> = cand["env"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.as_str())
+                    .collect();
+                if !env.is_empty() {
+                    println!("  env: {}", env.join(", "));
+                }
+                for m in cand["missing_env"].as_array().into_iter().flatten() {
+                    println!("  not imported: {} (a placeholder; set it yourself)", m.as_str().unwrap_or_default());
+                }
+                if cand["exists"] == true {
+                    println!("  skipped: a server named {name} is already configured");
+                    continue;
+                }
+                let add = if yes {
+                    true
+                } else if interactive {
+                    print!("  add it? [y/N] ");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().lock().read_line(&mut line)?;
+                    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+                } else {
+                    println!("  (rerun with --yes to add, or from a terminal to choose)");
+                    false
+                };
+                if add {
+                    let r = daemon(Request::AddMcpServer {
+                        name: name.clone(),
+                        server: cand["server"].clone(),
+                    })?;
+                    println!("  added:   {name}");
+                    report(&r);
+                }
+            }
+        }
+        McpAction::Log { name, lines } => {
+            let r = daemon(Request::McpServerLog {
+                name,
+                lines: Some(lines),
+            })?;
+            let tail = r["lines"].as_array().cloned().unwrap_or_default();
+            if tail.is_empty() {
+                println!("(no output in {})", r["file"].as_str().unwrap_or_default());
+            }
+            for l in tail {
+                println!("{}", l.as_str().unwrap_or_default());
+            }
+        }
+        McpAction::Tools { name } => {
+            let r = daemon(Request::ListMcpTools { name: name.clone() })?;
+            let mut tbl = Table::new(&["TOOL", "ON", "TOKENS", "DESCRIPTION"]);
+            for tool in r["tools"].as_array().into_iter().flatten() {
+                let on = tool["enabled"] == true;
+                tbl.row(vec![
+                    t(tool["name"].as_str().unwrap_or_default(), if on { Tone::Strong } else { Tone::Dim }),
+                    if on { t("on", Tone::Good) } else { t("off", Tone::Dim) },
+                    c(tool["tokens"].to_string()),
+                    t(tool["description"].as_str().unwrap_or_default().lines().next().unwrap_or_default(), Tone::Dim),
+                ]);
+            }
+            tbl.print();
+            println!("tool list cost: ~{} tokens per request (enabled tools)", r["enabled_tokens"]);
+        }
+        McpAction::Tool { name, tool, on, off } => {
+            if on == off {
+                anyhow::bail!("pass --on or --off");
+            }
+            daemon(Request::SetMcpToolEnabled {
+                name: name.clone(),
+                tool: tool.clone(),
+                enabled: on,
+            })?;
+            println!("{name}: {tool} is {}", if on { "on" } else { "off" });
         }
         McpAction::Test { name } => {
             let r = daemon(Request::RestartMcpServer { name: name.clone() })?;

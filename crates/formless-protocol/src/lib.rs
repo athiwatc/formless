@@ -799,6 +799,13 @@ pub struct McpServerInfo {
     pub last_error: Option<String>,
     /// http: whether OAuth tokens are stored.
     pub logged_in: bool,
+    /// "disabled", "ready" (running), "idle" (starts on first use),
+    /// "failed" or "auth needed".
+    #[serde(default)]
+    pub state: String,
+    /// The server's own tool names left out (`disabled_tools`).
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 /// A sub-agent started by `agents.run` (its transcript is stored apart
@@ -1251,6 +1258,40 @@ pub enum Request {
     },
     /// Prompts offered by the configured MCP servers.
     ListMcpPrompts,
+    /// The last `lines` (default 50) of a stdio server's stderr log.
+    McpServerLog {
+        name: String,
+        #[serde(default)]
+        lines: Option<usize>,
+    },
+    /// A server's tools with whether each is enabled and its approximate
+    /// token cost in the tool list (starts the server).
+    ListMcpTools {
+        name: String,
+    },
+    /// Turn one of a server's tools on or off (`disabled_tools`).
+    SetMcpToolEnabled {
+        name: String,
+        tool: String,
+        enabled: bool,
+    },
+    /// The curated catalog of popular MCP servers.
+    McpCatalog,
+    /// Add a catalog server: `params` fill its placeholders (e.g. `path`);
+    /// `name` defaults to the catalog id.
+    AddMcpFromCatalog {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        params: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Servers configured in Claude Desktop, Cursor or VS Code (`cwd` adds
+    /// that project's `.cursor` / `.vscode`), to review and add.
+    McpImportCandidates {
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     ListSkills,
     /// Install a skill from a folder, a git URL (`git_ref`, `subdir`) or a
     /// `.zip`. New installs start disabled: review, then enable.
@@ -1585,6 +1626,10 @@ pub enum Request {
         name: String,
         #[serde(default)]
         arguments: serde_json::Map<String, serde_json::Value>,
+        /// Values for the prompt's arguments in their declared order
+        /// (`/mcp:server:prompt 123 main`); named `arguments` win.
+        #[serde(default)]
+        positional: Vec<String>,
     },
     /// What changed between two versions of a Tool, as diff text.
     DiffToolVersions {

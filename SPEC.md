@@ -1142,7 +1142,8 @@ None ship by default (principle 1).
 
 - **Config:** `[mcp.servers.<name>]` in `config.toml`: `command`, `args`,
   `cwd`, `env` (literal values), `env_keys` (daemon variables passed
-  through; never `FORMLESS_*`), `disabled`; `mcp.idle_secs` (300).
+  through; never `FORMLESS_*`), `disabled`, `disabled_tools` (the
+  server's own names of tools to leave out); `mcp.idle_secs` (300).
 - **stdio transport:** the daemon spawns the server in its own process
   group with a minimal environment (as `process.run`, §7.4), speaks
   newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`),
@@ -1197,6 +1198,38 @@ None ship by default (principle 1).
   [--header K=V]`, `remove`, `list` (state, tool count, last error),
   `test`, `login`, `logout`; TUI `/mcp` (and `/mcp restart NAME`); the web
   Settings view lists servers with Restart/Remove.
+- **State and logs.** `McpServerInfo.state` is `disabled`, `ready`
+  (running), `idle` (starts on first use), `failed` (the last start or
+  call failed) or `auth needed` (the error is a 401 / missing login).
+  `McpServerLog {name, lines?}` returns the end of the server's stderr
+  log (`formless mcp log NAME`, TUI `/mcp log NAME` in the pager, web Log
+  button); the web shows Login (the `formless mcp login` command) for
+  `auth needed`.
+- **Turning tools off.** `ListMcpTools {name}` lists a server's tools with
+  whether each is on and its approximate token cost in the tool list
+  (definition JSON ÷ 4), plus the total for the enabled ones.
+  `SetMcpToolEnabled {name, tool, enabled}` edits `disabled_tools`, and the
+  re-sync retires (or brings back) the registry Tool. CLI `formless mcp
+  tools NAME` / `mcp tool NAME TOOL --on|--off`; TUI `/mcp tools NAME`,
+  `/mcp tool NAME TOOL on|off`; web Tools dialog with checkboxes.
+- **Catalog.** A small curated list of popular servers ships in the binary
+  (`mcp_catalog.rs`: filesystem, GitHub, git, fetch, Playwright,
+  PostgreSQL, Slack, memory, time, Sentry, Linear, Notion): `McpCatalog`,
+  and `AddMcpFromCatalog {id, name?, params}` fills an entry's
+  placeholders (e.g. `path`) and adds it like `AddMcpServer`, reporting the
+  environment variables it needs and whether it needs `formless mcp
+  login`. CLI `formless mcp catalog` and `formless mcp add ID [--param
+  k=v]` (no command or URL means a catalog id); TUI `/mcp catalog`, `/mcp
+  add ID [k=v]`; web Catalog dialog. Nothing is added without the user
+  choosing it.
+- **Import.** `McpImportCandidates {cwd?}` reads Claude Desktop's
+  `claude_desktop_config.json`, Cursor's `~/.cursor/mcp.json` and the
+  project's `.cursor/mcp.json` and `.vscode/mcp.json` (comments allowed),
+  and returns each server with its source, command or URL, env names and
+  any `${…}` placeholder values it could not import, flagged when a
+  server of that name exists. Adding goes through `AddMcpServer`. CLI
+  `formless mcp import [--yes]` shows each command and asks; TUI `/mcp
+  import` lists them and `/mcp import NAME` adds one; web Import dialog.
 - **The agent** may extend itself with the built-ins `add_mcp_server
   {name, transport, command?, args?, url?, env_keys?, reason}` and
   `remove_mcp_server {name, reason}`. Each raises an approval modal that
@@ -1209,9 +1242,12 @@ None ship by default (principle 1).
   `read_mcp_resource {server, uri}` (server approval applies; large
   contents become an artifact with a preview; contents are labelled as
   untrusted data). Prompts are for the user: `ListMcpPrompts` /
-  `GetMcpPrompt {server, name, arguments}`, surfaced as `/prompts` and
-  `/prompt SERVER:NAME key=value …` in the TUI and web, which load the
-  rendered prompt into the composer.
+  `GetMcpPrompt {server, name, arguments, positional?}`, surfaced as
+  `/prompts` and `/prompt SERVER:NAME key=value …` in the TUI and web,
+  which load the rendered prompt into the composer, and as slash commands
+  `/mcp:SERVER:PROMPT [ARG …] [key=value …]`, which send it as the user's
+  message. `positional` values fill the prompt's declared arguments in
+  order (named ones first); too many is an error that lists them.
 - **Approval** (MCP tools are not sandboxed, so approval is the gate):
   each server is approved once on first use (the modal shows its command
   or URL; "Always" remembers it); then each tool is approved like a Tool,

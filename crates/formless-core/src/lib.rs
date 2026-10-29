@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod logs;
 pub mod mcp;
 pub mod mcp_auth;
+pub mod mcp_catalog;
 pub mod memory;
 pub mod namer;
 pub mod optimiser;

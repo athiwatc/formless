@@ -715,6 +715,53 @@ async fn mcp_servers_are_managed_through_the_daemon() {
     assert_eq!(list[0]["name"], "fake");
     assert_eq!(list[0]["running"], true);
     assert_eq!(list[0]["tool_count"], 4);
+    assert_eq!(list[0]["state"], "ready");
+    // Per-tool on/off (SPEC §7.9): an off tool leaves the registry.
+    let tools = daemon
+        .handle(Request::ListMcpTools {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    let all = tools["tools"].as_array().unwrap();
+    assert_eq!(all.len(), 4);
+    assert!(all.iter().all(|t| t["enabled"] == true && t["tokens"].as_u64().unwrap() > 0));
+    let before = tools["enabled_tokens"].as_u64().unwrap();
+    daemon
+        .handle(Request::SetMcpToolEnabled {
+            name: "fake".into(),
+            tool: "echo".into(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    let list = daemon.handle(Request::ListMcpServers).await.unwrap();
+    assert_eq!(list[0]["tool_count"], 3);
+    assert_eq!(list[0]["disabled_tools"], json!(["echo"]));
+    let tools = daemon
+        .handle(Request::ListMcpTools {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    assert!(tools["enabled_tokens"].as_u64().unwrap() < before);
+    daemon
+        .handle(Request::SetMcpToolEnabled {
+            name: "fake".into(),
+            tool: "echo".into(),
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    // The stderr log is readable (empty is fine for this server).
+    let log = daemon
+        .handle(Request::McpServerLog {
+            name: "fake".into(),
+            lines: Some(10),
+        })
+        .await
+        .unwrap();
+    assert!(log["lines"].is_array());
     let restarted = daemon
         .handle(Request::RestartMcpServer {
             name: "fake".into(),
@@ -858,10 +905,31 @@ async fn mcp_resources_and_prompts() {
             arguments: [("path".to_string(), json!("src/main.rs"))]
                 .into_iter()
                 .collect(),
+            positional: vec![],
         })
         .await
         .unwrap();
     assert_eq!(text["text"], "Please review src/main.rs");
+    // `/mcp:fake:review lib.rs`: positional values fill declared arguments.
+    let text = daemon
+        .handle(Request::GetMcpPrompt {
+            server: "fake".into(),
+            name: "review".into(),
+            arguments: Default::default(),
+            positional: vec!["lib.rs".into()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(text["text"], "Please review lib.rs");
+    let too_many = daemon
+        .handle(Request::GetMcpPrompt {
+            server: "fake".into(),
+            name: "review".into(),
+            arguments: Default::default(),
+            positional: vec!["a".into(), "b".into()],
+        })
+        .await;
+    assert!(too_many.is_err());
 }
 
 /// When a server drops a tool, the registry retires it at once, but a
