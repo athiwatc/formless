@@ -353,7 +353,19 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
         match text.as_str() {
             "" => {}
             "/quit" | "/exit" => break,
-            "/help" => say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /quit exits (Runs keep going in the daemon). Anything else is sent as a message."),
+            "/help" => say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /docs [topic] gives the guides' addresses, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //."),
+            cmd if cmd == "/docs" || cmd.starts_with("/docs ") => {
+                let topic = cmd["/docs".len()..].trim();
+                match formless_core::docs::url(Some(topic).filter(|t| !t.is_empty())) {
+                    Some(url) => say(&format!("The guide is at {url}")),
+                    None => say(&format!("No guide called {topic}.")),
+                }
+                let topics: Vec<String> = formless_core::docs::TOPICS
+                    .iter()
+                    .map(|(name, _, what)| format!("{name} ({what})"))
+                    .collect();
+                say(&format!("Topics: {}.", topics.join(", ")));
+            }
             "/stop" => {
                 client.send(Request::InterruptRun {
                     session_id: session.id.clone(),
@@ -395,7 +407,13 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     None => say("No Session with that number; /sessions lists them."),
                 }
             }
+            // An unknown command is never sent to the model by mistake.
+            cmd if cmd.starts_with('/') && !cmd.starts_with("//") => {
+                let name = cmd.split_whitespace().next().unwrap_or(cmd);
+                say(&format!("{name} is not a command here; /help lists them. To send it as a message, begin it with //."));
+            }
             msg => {
+                let msg = msg.strip_prefix('/').filter(|m| m.starts_with('/')).unwrap_or(msg);
                 client.send(Request::SendMessage {
                     session_id: session.id.clone(),
                     content: msg.to_string(),

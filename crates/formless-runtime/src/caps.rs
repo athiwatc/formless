@@ -616,4 +616,38 @@ mod scope_tests {
         assert!(wide.covers(&narrow));
         assert!(!narrow.covers(&wide));
     }
+
+    /// docs/capabilities.md says exactly which Capabilities are asked
+    /// about under `--secure` (#1084).
+    #[test]
+    fn the_docs_list_what_is_asked() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/capabilities.md"),
+        )
+        .unwrap();
+        let listed = |prefix: &str| -> Vec<String> {
+            let line = doc
+                .lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no '{prefix}' line"));
+            let items = line.rsplit_once(": ").map_or(line, |(_, rest)| rest);
+            items
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        let asked = listed("- Asked before first use:");
+        let never = listed("- Never asked");
+        assert!(!asked.is_empty() && !never.is_empty());
+        for spec in &asked {
+            let c = Capabilities::parse(std::slice::from_ref(spec)).unwrap();
+            assert!(c.is_sensitive(), "{spec} is listed as asked but never is");
+        }
+        for spec in &never {
+            let c = Capabilities::parse(std::slice::from_ref(spec)).unwrap();
+            assert!(!c.is_sensitive(), "{spec} is listed as never asked but is");
+        }
+    }
 }

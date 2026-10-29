@@ -12,7 +12,19 @@ The full technical definition is in [SPEC §7.4](../SPEC.md#74-capabilities-clos
 By default approvals are **off**: Tools run without asking, and every
 sensitive call is recorded in the audit log (`formless approvals list`,
 `/audit`). Start with `formless --secure` (or set `security.secure = true`)
-to be asked before a Tool first uses a Capability. Either way:
+to be asked before a Tool first uses a sensitive Capability. Not every
+Capability is asked about:
+
+<!-- Checked against the code by caps.rs `the_docs_list_what_is_asked`. -->
+- Asked before first use: `net`, `process`, `fs:write:~`, `env:HOME`, `clipboard:read`, `clipboard:write`, `notify`, `llm`, `agent`, `mcp:github`, `harness:mcp`
+- Never asked, even with `--secure`: `fs:read:~`, `store`, `harness:read`
+
+So **reading files is never approval-gated**: a Tool that declares
+`fs:read:~` can read anything in your home folder, including `~/.ssh`,
+without a prompt. It still can't send what it reads anywhere without `net`,
+`process` or another Capability you are asked about.
+
+Either way:
 
 - **Remembered denials** always apply (`N` in the TUI, "Always deny" on the
   web).
@@ -53,10 +65,12 @@ host it was called with, nothing more. This is how one general Tool (say,
   then.
 - **Your everyday machine:** turn approvals on (`formless --secure`), and
   add your project folders to `security.trusted_paths` so routine writes
-  there don't ask.
+  there don't ask. Reads are not asked about, so check the `fs:read`
+  paths when you approve a Tool's other Capabilities.
 - **Shared or work machines:** approvals on, no trusted folders outside
-  projects, deny bare `net` and bare `process`, and never allow
-  `fs:read` on your home folder.
+  projects, deny bare `net` and bare `process`, and deny any Tool whose
+  `fs:read` covers your home folder (reads are never asked about on their
+  own, so do it when its other Capabilities are).
 - **Headless (`formless run`):** approvals fail closed unless you pass
   `--yes`, which approves for that Run only.
 

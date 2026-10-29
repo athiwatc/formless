@@ -53,8 +53,13 @@ Daily database backups land in `/data/backups` (`daemon.backups_keep`).
   secrets, Kubernetes secrets). Preferred.
 - `FORMLESS_API_KEY=…`: the key itself, in the environment (visible to
   `docker inspect`).
-- Named providers: `FORMLESS_API_KEY_<NAME>` (e.g.
-  `FORMLESS_API_KEY_LOCAL`).
+- Named providers: `FORMLESS_API_KEY_<NAME>_FILE` (preferred) or
+  `FORMLESS_API_KEY_<NAME>` (e.g. `FORMLESS_API_KEY_LOCAL_FILE`).
+
+A file that is set but can't be used (missing, empty, not text) is named
+in the daemon log and in `formless doctor`, which also says where the key
+comes from (env, file, fallback file or keychain) without showing it. A
+leading BOM and surrounding whitespace are ignored.
 
 There is no keychain in the container; the key is never written to the
 volumes.

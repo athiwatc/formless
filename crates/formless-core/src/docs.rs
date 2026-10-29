@@ -21,7 +21,7 @@ pub const TOPICS: &[(&str, &str, &str)] = &[
         "docs/capabilities.md#are-you-asked",
         "when you are asked, and how to undo",
     ),
-    ("keys", "docs/keys.md", "every key and command"),
+    ("keys", "docs/keys.md", "the main keys and every command"),
     (
         "troubleshooting",
         "docs/troubleshooting.md",
@@ -84,5 +84,59 @@ mod tests {
             let file = path.split('#').next().unwrap();
             assert!(root.join(file).exists(), "{file}");
         }
+    }
+
+    /// GitHub's heading anchor: lower-case, punctuation dropped, spaces
+    /// as hyphens.
+    fn slug(heading: &str) -> String {
+        heading
+            .trim_start_matches('#')
+            .trim()
+            .chars()
+            .filter_map(|c| match c {
+                ' ' | '-' => Some('-'),
+                c if c.is_alphanumeric() || c == '_' => Some(c.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `#anchor` lands on a heading (renumbering SPEC breaks them),
+    /// and the web UI's topic table is this one (#1082).
+    #[test]
+    fn anchors_resolve_and_the_web_topics_match() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (_, path, _) in super::TOPICS {
+            let Some((file, anchor)) = path.split_once('#') else {
+                continue;
+            };
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            let found = text
+                .lines()
+                .filter(|l| l.starts_with('#'))
+                .any(|l| slug(l) == anchor);
+            assert!(found, "{path}: no heading for #{anchor}");
+        }
+        let app = std::fs::read_to_string(root.join("relay/web/app.js")).unwrap();
+        let line = app
+            .lines()
+            .find(|l| l.trim_start().starts_with("const topics = {"))
+            .expect("the web /docs topic table");
+        let body = &line[line.find('{').unwrap() + 1..line.rfind('}').unwrap()];
+        let web: Vec<(String, String)> = body
+            .split(", ")
+            .map(|pair| {
+                let (k, v) = pair.split_once(": ").unwrap();
+                (k.trim().to_string(), v.trim().trim_matches('"').to_string())
+            })
+            .collect();
+        let ours: Vec<(String, String)> = super::TOPICS
+            .iter()
+            .map(|(n, p, _)| (n.to_string(), p.to_string()))
+            .collect();
+        assert_eq!(
+            web, ours,
+            "relay/web/app.js /docs topics differ from docs::TOPICS"
+        );
     }
 }
