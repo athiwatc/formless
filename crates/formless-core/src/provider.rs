@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -533,15 +533,20 @@ fn responses_slot(
     tool_calls: &mut Vec<ToolCall>,
     slots: &mut HashMap<u64, usize>,
     event: &Value,
-) -> usize {
-    let mut new_slot = || {
-        tool_calls.push(ToolCall::default());
-        tool_calls.len() - 1
-    };
-    match event["output_index"].as_u64() {
-        Some(i) => *slots.entry(i).or_insert_with(new_slot),
-        None => new_slot(),
+) -> Result<usize> {
+    let index = event["output_index"].as_u64();
+    if let Some(&slot) = index.and_then(|i| slots.get(&i)) {
+        return Ok(slot);
     }
+    if tool_calls.len() >= MAX_TOOL_CALLS {
+        bail!("provider sent more than {MAX_TOOL_CALLS} tool calls in one response");
+    }
+    tool_calls.push(ToolCall::default());
+    let slot = tool_calls.len() - 1;
+    if let Some(i) = index {
+        slots.insert(i, slot);
+    }
+    Ok(slot)
 }
 
 fn responses_tool_calls(v: &Value) -> Vec<ToolCall> {
@@ -1061,7 +1066,12 @@ impl Provider {
             }
             let mut with_effort = effort.is_some();
             let mut reauthed = false;
-            'attempts: for attempt in 0..=self.cfg.max_retries {
+            // Retries count transient failures only; a resend after fixing a
+            // rejected request (each fix happens at most once) is not one
+            // (#1088), so `sends` just bounds the total.
+            let (mut attempt, mut sends) = (0, 0);
+            'attempts: while attempt <= self.cfg.max_retries && sends <= attempt + MAX_RESENDS {
+                sends += 1;
                 let mut b = body.clone();
                 b["model"] = json!(model);
                 if with_effort {
@@ -1183,6 +1193,7 @@ impl Provider {
                 if attempt < self.cfg.max_retries {
                     self.retry_wait(attempt, server_wait, reason).await;
                 }
+                attempt += 1;
             }
             // Retryable failures exhausted for this model: fail over.
             if !last_err.is_empty() && models.len() > 1 {
@@ -1309,6 +1320,8 @@ impl Provider {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         // Responses `output_index` → position in `tool_calls`.
         let mut call_slots: HashMap<u64, usize> = HashMap::new();
+        // Chat tool-call slots seen streaming incrementally (#1106).
+        let mut incremental: Vec<bool> = Vec::new();
         let mut truncated = false;
         // Why it stopped (#615), and refusal text the model sent instead
         // of an answer.
@@ -1485,7 +1498,7 @@ impl Provider {
                                             "response.output_item.added" | "response.output_item.done" => {
                                                 let item = &v["item"];
                                                 if item["type"].as_str() == Some("function_call") {
-                                                    let idx = responses_slot(&mut tool_calls, &mut call_slots, &v);
+                                                    let idx = responses_slot(&mut tool_calls, &mut call_slots, &v)?;
                                                     let slot = &mut tool_calls[idx];
                                                     if let Some(id) = item["call_id"].as_str().or_else(|| item["id"].as_str()) {
                                                         slot.id = id.to_string();
@@ -1501,7 +1514,7 @@ impl Provider {
                                                 }
                                             }
                                             "response.function_call_arguments.delta" => {
-                                                let idx = responses_slot(&mut tool_calls, &mut call_slots, &v);
+                                                let idx = responses_slot(&mut tool_calls, &mut call_slots, &v)?;
                                                 if let Some(d) = v["delta"].as_str() {
                                                     tool_calls[idx].arguments.push_str(d);
                                                 }
@@ -1567,25 +1580,37 @@ impl Provider {
                                     }
                                     if let Some(tcs) = delta["tool_calls"].as_array() {
                                         for tc in tcs {
-                                            merge_tool_fragment(&mut tool_calls, tc);
+                                            merge_tool_fragment(&mut tool_calls, &mut incremental, tc)?;
                                         }
                                     }
                                     // Non-streaming-shaped servers may put message.tool_calls in
                                     // one chunk; a call already streamed as deltas isn't added twice.
+                                    // Id-less calls match by name and arguments, each earlier
+                                    // call at most once, so parallel calls all survive (#1108).
                                     if let Some(tcs) = v["choices"][0]["message"]["tool_calls"].as_array() {
+                                        let mut matched = vec![false; tool_calls.len()];
                                         for tc in tcs {
                                             let id = tc["id"].as_str().unwrap_or_default();
-                                            let seen = if id.is_empty() {
-                                                !tool_calls.is_empty()
-                                            } else {
-                                                tool_calls.iter().any(|c| c.id == id)
-                                            };
-                                            if !seen {
-                                                tool_calls.push(ToolCall {
+                                            let name = tc["function"]["name"].as_str().unwrap_or_default();
+                                            let args = tc["function"]["arguments"].as_str().unwrap_or_default();
+                                            let seen = (0..matched.len()).find(|&i| {
+                                                !matched[i]
+                                                    && if id.is_empty() {
+                                                        tool_calls[i].name == name && tool_calls[i].arguments == args
+                                                    } else {
+                                                        tool_calls[i].id == id
+                                                    }
+                                            });
+                                            match seen {
+                                                Some(i) => matched[i] = true,
+                                                None if tool_calls.len() >= MAX_TOOL_CALLS => {
+                                                    bail!("provider sent more than {MAX_TOOL_CALLS} tool calls in one response")
+                                                }
+                                                None => tool_calls.push(ToolCall {
                                                     id: id.to_string(),
-                                                    name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
-                                                    arguments: tc["function"]["arguments"].as_str().unwrap_or_default().to_string(),
-                                                });
+                                                    name: name.to_string(),
+                                                    arguments: args.to_string(),
+                                                }),
                                             }
                                         }
                                     }
@@ -1984,30 +2009,65 @@ pub fn known_model_meta(id: &str) -> Value {
 /// Longest stream line (or split event) accepted before failing (#614).
 const MAX_SSE_LINE: usize = 16 * 1024 * 1024;
 
+/// Most resends of one request after fixing what the provider rejected
+/// (optional parameters, effort, Anthropic strips, an OAuth refresh).
+const MAX_RESENDS: usize = 8;
+
+/// Most tool calls one response may carry; a larger streamed index is a
+/// provider protocol error, never an allocation (#1107).
+const MAX_TOOL_CALLS: usize = 128;
+
 /// Fold one streamed Chat tool-call fragment into the calls so far
-/// (#614): by `index`, else by `id`, else onto the last call; a server
+/// (#614): by `index`, else by `id`, else onto the last call. A server
 /// that resends the whole name or arguments so far (cumulative style)
-/// replaces rather than doubles them.
-fn merge_tool_fragment(calls: &mut Vec<ToolCall>, tc: &Value) {
+/// replaces rather than doubles them; `incremental[i]` records that slot
+/// `i` has been seen appending, after which nothing is replaced (#1106).
+fn merge_tool_fragment(
+    calls: &mut Vec<ToolCall>,
+    incremental: &mut Vec<bool>,
+    tc: &Value,
+) -> Result<()> {
     let id = tc["id"].as_str().filter(|i| !i.is_empty());
+    let name = tc["function"]["name"].as_str().filter(|n| !n.is_empty());
     let idx = match (tc["index"].as_u64(), id) {
-        (Some(i), _) => i as usize,
+        (Some(i), _) => usize::try_from(i).unwrap_or(usize::MAX),
         (None, Some(id)) => calls.iter().position(|c| c.id == id).unwrap_or(calls.len()),
-        (None, None) => calls.len().saturating_sub(1),
+        (None, None) => match (calls.last(), name) {
+            // A name after the last call's arguments starts another call.
+            (Some(last), Some(n))
+                if !last.arguments.is_empty() && n != last.name && !n.starts_with(&last.name) =>
+            {
+                calls.len()
+            }
+            _ => calls.len().saturating_sub(1),
+        },
     };
+    if idx >= MAX_TOOL_CALLS {
+        bail!("provider sent tool call index {idx} (at most {MAX_TOOL_CALLS} calls per response)");
+    }
     while calls.len() <= idx {
         calls.push(ToolCall::default());
     }
+    incremental.resize(calls.len(), false);
     let slot = &mut calls[idx];
     if let Some(id) = id {
         slot.id = id.to_string();
     }
-    let grow = |have: &mut String, frag: &str| {
-        if have.is_empty() || !frag.starts_with(have.as_str()) {
-            have.push_str(frag);
-        } else {
-            // The fragment repeats what came before: cumulative.
+    let appending = &mut incremental[idx];
+    let mut grow = |have: &mut String, frag: &str| {
+        // Cumulative only when strictly longer and the slot never appended:
+        // an incremental "aaa" + "aaa" is "aaaaaa", not "aaa".
+        if !*appending
+            && frag.len() > have.len()
+            && frag.starts_with(have.as_str())
+            && !have.is_empty()
+        {
             *have = frag.to_string();
+        } else {
+            if !have.is_empty() {
+                *appending = true;
+            }
+            have.push_str(frag);
         }
     };
     if let Some(n) = tc["function"]["name"].as_str() {
@@ -2016,6 +2076,7 @@ fn merge_tool_fragment(calls: &mut Vec<ToolCall>, tc: &Value) {
     if let Some(a) = tc["function"]["arguments"].as_str() {
         grow(&mut slot.arguments, a);
     }
+    Ok(())
 }
 
 fn parse_models(body: &Value) -> Vec<String> {

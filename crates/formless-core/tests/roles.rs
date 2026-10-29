@@ -510,3 +510,89 @@ async fn nested_llm_spend_counts_toward_the_run_budget() {
     assert_eq!(seen.lock().unwrap().len() - before, 3);
     assert_eq!(store.run_usage("direct").unwrap().prompt_tokens, 30);
 }
+
+/// An empty refusal is stored as a marked placeholder: the transcript says
+/// why, and the next request never hands it back as the model's words (#1104).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_placeholder_is_never_sent_back_as_the_models_words() {
+    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let seen: Seen = Arc::default();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        post({
+            let seen = seen.clone();
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    let first = {
+                        let mut s = seen.lock().unwrap();
+                        s.push(body);
+                        s.len() == 1
+                    };
+                    let chunk = if first {
+                        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "refusal"}]})
+                    } else {
+                        serde_json::json!({"choices": [{"delta": {"content": "fine"}, "finish_reason": "stop"}]})
+                    };
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")))
+                        .unwrap()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-refuse-{short}"));
+    let paths = Paths {
+        data_dir: dir.join("d"),
+        config_dir: dir.join("c"),
+        profile: format!("test-refuse-{short}"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = base;
+    cfg.provider.model = "m".into();
+    cfg.provider.max_retries = 1;
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    for (n, text) in ["first", "second"].iter().enumerate() {
+        daemon
+            .handle(Request::SendMessage {
+                session_id: sid.clone(),
+                content: text.to_string(),
+                mode: formless_protocol::SendMode::Send,
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if seen.lock().unwrap().len() > n
+                && store
+                    .last_run(&sid)
+                    .unwrap()
+                    .is_some_and(|(_, s)| s == "completed")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    let msgs = store.list_messages(&sid).unwrap();
+    let refused = msgs
+        .iter()
+        .find(|m| m.content.contains("declined"))
+        .expect("placeholder stored");
+    let meta: serde_json::Value = serde_json::from_str(refused.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["stop_reason"], "refusal");
+    assert_eq!(meta["placeholder"], true);
+    let second = seen.lock().unwrap()[1].to_string();
+    assert!(!second.contains("declined to answer"), "{second}");
+    assert!(second.contains("No answer was given (refusal)"), "{second}");
+}

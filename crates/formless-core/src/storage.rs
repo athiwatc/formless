@@ -5213,6 +5213,12 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         // rejected by many OpenAI-compatible servers.
         return json!({"role": "user", "content": format!("[harness note] {}", m.content)});
     }
+    if m.role == "assistant" && meta["placeholder"] == true {
+        // Text the daemon wrote for an empty refusal/filter stop (#1104):
+        // never handed back as words the model said.
+        let why = meta["stop_reason"].as_str().unwrap_or("stopped");
+        return json!({"role": "assistant", "content": format!("[harness note] No answer was given ({why}).")});
+    }
     if m.role == "tool" {
         let mut msg = json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
         // A failed call: Anthropic's `tool_result.is_error` (a marker the
