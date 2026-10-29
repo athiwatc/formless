@@ -2651,16 +2651,22 @@
         h("tbody", null, mcp.map((m) => h("tr", null,
           h("td", null, h("strong", null, m.name), h("div", { class: "muted" }, m.transport + " · " + m.target),
             m.last_error ? h("div", { class: "error" }, m.last_error) : null),
-          h("td", null, m.disabled ? "disabled" : m.running ? "running" : "idle"),
-          h("td", { class: "num" }, m.tool_count + " tools"),
+          h("td", null, h("span", { class: "mcp-state " + (m.state || "").replace(" ", "-") }, m.state || (m.disabled ? "disabled" : m.running ? "ready" : "idle"))),
+          h("td", { class: "num" }, m.tool_count + " tools" + (m.disabled_tools && m.disabled_tools.length ? " (" + m.disabled_tools.length + " off)" : "")),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: () => act({ type: "restart_mcp_server", name: m.name }, "Restarted " + m.name).then(refreshSettings) }, "Restart"),
+            m.state === "auth needed" ? h("button", { class: "btn small", type: "button", onclick: () => note("log in from a terminal: formless mcp login " + m.name) }, "Login") : null,
+            m.transport === "stdio" ? h("button", { class: "btn small", type: "button", onclick: () => showMcpLog(m.name) }, "Log") : null,
+            m.disabled ? null : h("button", { class: "btn small", type: "button", onclick: () => showMcpTools(m.name) }, "Tools"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               const ok = await ask({ title: "Remove MCP server " + m.name + "?", text: "Its tools are retired (metrics kept).", ok: "Remove", danger: true });
               if (ok) { await act({ type: "remove_mcp_server", name: m.name }, "Removed " + m.name); refreshSettings(); }
             } }, "Remove"))))))
         : h("p", { class: "muted" }, "None yet."),
-      h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => addMcpServer() }, "Add MCP server"))));
+      h("div", { class: "detail-actions" },
+        h("button", { class: "btn small", type: "button", onclick: () => addMcpServer() }, "Add MCP server"),
+        h("button", { class: "btn small", type: "button", onclick: () => showMcpCatalog() }, "Catalog…"),
+        h("button", { class: "btn small", type: "button", onclick: () => showMcpImport() }, "Import…"))));
     const skills = S.skills || [];
     grid.append(h("section", null, h("h3", null, "Skills"),
       skills.length ? h("table", { class: "table" },
@@ -2987,6 +2993,81 @@
     }
     return out;
   }
+  // A modal with a title, body and Close (Esc closes it).
+  function modal(title, body) {
+    const close = h("button", { class: "btn small primary", type: "button" }, "Close");
+    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
+      h("div", { class: "modal help" }, h("h2", null, title), h("div", { class: "files-body" }, body),
+        h("div", { class: "modal-actions" }, h("span", { class: "spacer" }), close)));
+    const done = () => dialog.remove();
+    close.onclick = done;
+    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
+    document.body.append(dialog);
+    close.focus();
+    return done;
+  }
+  // An MCP server's stderr tail (SPEC §7.9).
+  async function showMcpLog(name) {
+    const r = await act({ type: "mcp_server_log", name, lines: 200 });
+    if (r) modal("MCP " + name + " log", h("pre", { class: "diff" }, r.lines.length ? r.lines.join("\n") : "(no output yet)"));
+  }
+  // Turn an MCP server's tools on or off, with each one's token cost.
+  async function showMcpTools(name) {
+    const r = await act({ type: "list_mcp_tools", name }, null, 60000);
+    if (!r) return;
+    const total = h("p", { class: "muted" }, "Enabled tools cost ~" + r.enabled_tokens + " tokens per request.");
+    const rows = r.tools.map((t) => {
+      const box = h("input", { type: "checkbox", "aria-label": "Enable " + t.name });
+      box.checked = t.enabled;
+      box.onchange = async () => {
+        if (!(await act({ type: "set_mcp_tool_enabled", name, tool: t.name, enabled: box.checked }))) box.checked = !box.checked;
+        else refreshSettings();
+      };
+      return h("tr", null, h("td", null, box), h("td", null, h("code", null, t.name), h("div", { class: "muted" }, (t.description || "").split("\n")[0])), h("td", { class: "num" }, "~" + t.tokens));
+    });
+    modal("MCP " + name + " tools", h("div", null, total, h("table", { class: "table" }, h("tbody", null, rows))));
+  }
+  // The curated catalog of popular servers (SPEC §7.9).
+  async function showMcpCatalog() {
+    const list = await act({ type: "mcp_catalog" });
+    if (!list) return;
+    let close = null;
+    const rows = list.map((e) => h("tr", null,
+      h("td", null, h("strong", null, e.title), h("div", { class: "muted" }, e.description), h("div", { class: "muted" }, h("code", null, e.target))),
+      h("td", null, e.added ? h("span", { class: "muted" }, "added") : h("button", { class: "btn small", type: "button", onclick: async () => {
+        const params = {};
+        for (const p of e.params) {
+          const v = await ask({ title: e.title + ": " + p.name, text: p.description, input: true });
+          if (v == null || !v.trim()) return;
+          params[p.name] = v.trim();
+        }
+        const r = await act({ type: "add_mcp_from_catalog", id: e.id, params }, null, 120000);
+        if (!r) return;
+        note("added " + r.added + (r.error ? " — failed to start: " + r.error : " · " + r.tools + " tools"), !!r.error);
+        (r.env_keys || []).forEach((k) => note(r.added + " needs " + k + " in the daemon's environment"));
+        if (r.needs_login) note("log in from a terminal: formless mcp login " + r.added);
+        if (close) close();
+        refreshSettings();
+      } }, "Add"))));
+    close = modal("MCP server catalog", h("table", { class: "table" }, h("tbody", null, rows)));
+  }
+  // Servers configured in Claude Desktop, Cursor or VS Code (SPEC §7.9).
+  async function showMcpImport() {
+    const list = await act({ type: "mcp_import_candidates", cwd: null });
+    if (!list) return;
+    if (!list.length) return note("no MCP servers found in Claude Desktop, Cursor or VS Code configs");
+    const rows = list.map((c) => h("tr", null,
+      h("td", null, h("strong", null, c.name), h("div", { class: "muted" }, "from " + c.source), h("div", null, h("code", null, c.target)),
+        c.missing_env.length ? h("div", { class: "error" }, "not imported (placeholders): " + c.missing_env.join(", ")) : null),
+      h("td", null, c.exists ? h("span", { class: "muted" }, "added") : h("button", { class: "btn small", type: "button", onclick: async (ev) => {
+        const r = await act({ type: "add_mcp_server", name: c.name, server: c.server }, null, 120000);
+        if (!r) return;
+        ev.target.replaceWith(h("span", { class: "muted" }, r.error ? "added (failed to start)" : "added"));
+        refreshSettings();
+      } }, "Add"))));
+    modal("Import MCP servers", h("div", null, h("p", { class: "muted" }, "Check each command before adding it: it runs on the daemon's machine."), h("table", { class: "table" }, h("tbody", null, rows))));
+  }
+
   /** Settings → Add MCP server: a stdio command or an HTTP URL. Adding
    * lists its tools at once, which doubles as the connection test. */
   async function addMcpServer() {
@@ -3632,8 +3713,9 @@
     { name: "prompts", group: "Integrations", desc: "list MCP prompts", run: async () => {
       const list = (await act({ type: "list_mcp_prompts" })) || [];
       if (!list.length) return note("no MCP prompts available");
-      for (const p of list) note("/prompt " + p.server + ":" + p.name + " " + (p.arguments || []).map((a) => a.name + "=…").join(" ") + " — " + (p.description || ""));
+      for (const p of list) note("/mcp:" + p.server + ":" + p.name + " " + (p.arguments || []).map((a) => a.name.toUpperCase()).join(" ") + " — " + (p.description || ""));
     } },
+    { name: "mcp:", args: "SERVER:PROMPT [ARGS]", group: "Integrations", desc: "send an MCP prompt as your message (/prompts lists them)", run: () => note("usage: /mcp:SERVER:PROMPT [ARGS] — /prompts lists them") },
     { name: "prompt", args: "SERVER:NAME [KEY=VALUE …]", group: "Integrations", desc: "load an MCP prompt into the composer", run: async (arg) => {
       const [target, ...pairs] = arg.split(/\s+/);
       const [server, name] = (target || "").split(":");
@@ -3746,6 +3828,20 @@
     note("≈ system prompt " + b.system_prompt + " · Tool schemas " + b.tool_schemas + " · history " + b.history + " tokens · " + b.attachments + " attachment(s)");
   }
   async function slash(cmd) {
+    // `/mcp:SERVER:PROMPT [ARGS]`: send the rendered MCP prompt (SPEC §7.9).
+    const mp = /^mcp:([^:\s]+):(\S+)\s*(.*)$/s.exec(cmd);
+    if (mp) {
+      const words = mp[3].match(/"[^"]*"|'[^']*'|\S+/g) || [];
+      const args = {}, positional = [];
+      for (let w of words) {
+        w = w.replace(/^["']|["']$/g, "");
+        const eq = /^([A-Za-z_][\w-]*)=(.*)$/s.exec(w);
+        if (eq) args[eq[1]] = eq[2]; else positional.push(w);
+      }
+      const r = await act({ type: "get_mcp_prompt", server: mp[1], name: mp[2], arguments: args, positional }, null, 60000);
+      if (r && r.text && r.text.trim()) { $("input").value = r.text; autosize(); return submit(false); }
+      return;
+    }
     const [first, ...rest] = cmd.split(/\s+/);
     const name = ALIASES[first] !== undefined ? ALIASES[first] : first;
     const c = COMMANDS.find((x) => x.name === name);

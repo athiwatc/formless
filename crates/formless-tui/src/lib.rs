@@ -137,6 +137,14 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/mcp:SERVER:PROMPT`: the rendered prompt is sent as a message.
+    SendMcpPrompt,
+    McpLog,
+    McpTools,
+    McpCatalog,
+    McpAdded,
+    /// `/mcp import [NAME]`: list the candidates, or add `mcp_import_pick`.
+    McpImport,
     /// `/files`: the last Run's changed files, shown in the pager.
     RunFiles,
     /// `/rewind`: files put back.
@@ -1044,6 +1052,8 @@ struct App {
     recap_open: bool,
     /// The agent's checklist (`update_plan`), pinned under the chat.
     plan: Vec<formless_protocol::PlanItem>,
+    /// `/mcp import NAME`: the server to add once the candidates arrive.
+    mcp_import_pick: Option<String>,
     should_quit: bool,
     /// Rendered Markdown of settled messages, keyed by content and width.
     /// Rendered settled messages by (id, content length, width).
@@ -1256,6 +1266,7 @@ impl App {
             recap: None,
             recap_open: false,
             plan: Vec::new(),
+            mcp_import_pick: None,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -1683,15 +1694,18 @@ impl App {
                                 );
                             }
                             for s in list {
-                                let state = if s.disabled {
-                                    "disabled"
-                                } else if s.running {
-                                    "running"
+                                let state = if s.state.is_empty() {
+                                    if s.disabled { "disabled" } else if s.running { "ready" } else { "idle" }
                                 } else {
-                                    "idle"
+                                    s.state.as_str()
+                                };
+                                let off = if s.disabled_tools.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({} off)", s.disabled_tools.len())
                                 };
                                 self.notes.push(format!(
-                                    "mcp {} [{}] {} · {} tools · {}{}",
+                                    "mcp {} [{}] {} · {} tools{off} · {}{}",
                                     s.name,
                                     s.transport,
                                     state,
@@ -2296,15 +2310,173 @@ impl App {
                                     .as_array()
                                     .into_iter()
                                     .flatten()
-                                    .filter_map(|a| a["name"].as_str().map(|n| format!("{n}=…")))
+                                    .filter_map(|a| a["name"].as_str().map(str::to_uppercase))
                                     .collect();
                                 self.notes.push(format!(
-                                    "/prompt {}:{} {} — {}",
+                                    "/mcp:{}:{} {} — {}",
                                     p["server"].as_str().unwrap_or_default(),
                                     p["name"].as_str().unwrap_or_default(),
                                     args.join(" "),
                                     p["description"].as_str().unwrap_or_default()
                                 ));
+                            }
+                        }
+                        Pending::SendMcpPrompt => {
+                            let text = result["text"].as_str().unwrap_or_default().to_string();
+                            if text.trim().is_empty() {
+                                self.notes.push("the prompt came back empty".into());
+                            } else {
+                                self.input.set(&text);
+                                self.submit_chat(false);
+                            }
+                        }
+                        Pending::McpLog => {
+                            let lines: Vec<String> = result["lines"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|l| l.as_str().map(str::to_string))
+                                .collect();
+                            self.pager = Some(Pager {
+                                title: format!(
+                                    "MCP {} · {}",
+                                    result["name"].as_str().unwrap_or_default(),
+                                    result["file"].as_str().unwrap_or_default()
+                                ),
+                                lines: if lines.is_empty() {
+                                    vec!["(no output yet)".into()]
+                                } else {
+                                    lines
+                                },
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::McpTools => {
+                            let name = result["name"].as_str().unwrap_or_default().to_string();
+                            let mut lines: Vec<String> = result["tools"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|t| {
+                                    format!(
+                                        "{} {:<32} ~{:>5} tokens  {}",
+                                        if t["enabled"] == true { "●" } else { "○" },
+                                        t["name"].as_str().unwrap_or_default(),
+                                        t["tokens"],
+                                        t["description"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .lines()
+                                            .next()
+                                            .unwrap_or_default()
+                                    )
+                                })
+                                .collect();
+                            lines.push(String::new());
+                            lines.push(format!(
+                                "Enabled tools cost ~{} tokens per request. /mcp tool {name} TOOL on|off",
+                                result["enabled_tokens"]
+                            ));
+                            self.pager = Some(Pager {
+                                title: format!("MCP {name} tools"),
+                                lines,
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::McpCatalog => {
+                            let mut lines = Vec::new();
+                            for e in result.as_array().into_iter().flatten() {
+                                let params: Vec<String> = e["params"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|p| p["name"].as_str().map(|n| format!("{n}=…")))
+                                    .collect();
+                                lines.push(format!(
+                                    "{} {:<12} {} — {}{}",
+                                    if e["added"] == true { "✓" } else { " " },
+                                    e["id"].as_str().unwrap_or_default(),
+                                    e["title"].as_str().unwrap_or_default(),
+                                    e["description"].as_str().unwrap_or_default(),
+                                    if params.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("  [/mcp add {} {}]", e["id"].as_str().unwrap_or_default(), params.join(" "))
+                                    }
+                                ));
+                            }
+                            lines.push(String::new());
+                            lines.push("/mcp add ID [key=value] adds one; ✓ = already added.".into());
+                            self.pager = Some(Pager {
+                                title: "MCP server catalog".into(),
+                                lines,
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::McpAdded => {
+                            let name = result["added"].as_str().unwrap_or_default();
+                            match result["error"].as_str() {
+                                Some(e) => self.notes.push(format!("added {name}, but it failed to start: {e}")),
+                                None => self.notes.push(format!("added {name} · {} tools", result["tools"])),
+                            }
+                            for k in result["env_keys"].as_array().into_iter().flatten() {
+                                self.notes.push(format!(
+                                    "{name} needs {} in the daemon's environment",
+                                    k.as_str().unwrap_or_default()
+                                ));
+                            }
+                            if result["needs_login"] == true {
+                                self.notes.push(format!("log in with: formless mcp login {name}"));
+                            }
+                        }
+                        Pending::McpImport => {
+                            let found = result.as_array().cloned().unwrap_or_default();
+                            match self.mcp_import_pick.take() {
+                                None => {
+                                    if found.is_empty() {
+                                        self.notes.push(
+                                            "no MCP servers found in Claude Desktop, Cursor or VS Code configs".into(),
+                                        );
+                                    }
+                                    for c in &found {
+                                        self.notes.push(format!(
+                                            "{} {} (from {}): {}{}",
+                                            if c["exists"] == true { "✓" } else { "+" },
+                                            c["name"].as_str().unwrap_or_default(),
+                                            c["source"].as_str().unwrap_or_default(),
+                                            truncate_chars(c["target"].as_str().unwrap_or_default(), 80),
+                                            if c["exists"] == true { " · already added" } else { "" }
+                                        ));
+                                    }
+                                    if found.iter().any(|c| c["exists"] != true) {
+                                        self.notes.push("/mcp import NAME adds one (check its command first)".into());
+                                    }
+                                }
+                                Some(name) => match found.iter().find(|c| c["name"] == name.as_str()) {
+                                    Some(c) if c["exists"] == true => {
+                                        self.notes.push(format!("{name} is already configured"))
+                                    }
+                                    Some(c) => {
+                                        self.notes.push(format!(
+                                            "adding {name}: {}",
+                                            c["target"].as_str().unwrap_or_default()
+                                        ));
+                                        self.request(
+                                            Pending::McpAdded,
+                                            Request::AddMcpServer {
+                                                name: name.clone(),
+                                                server: c["server"].clone(),
+                                            },
+                                        );
+                                    }
+                                    None => self.notes.push(format!("no importable server named {name} (see /mcp import)")),
+                                },
                             }
                         }
                         Pending::GetMcpPrompt => {
@@ -4599,6 +4771,7 @@ impl App {
                                 server: server.into(),
                                 name: name.into(),
                                 arguments,
+                                positional: Vec::new(),
                             },
                         );
                     }
@@ -4606,6 +4779,93 @@ impl App {
                         .notes
                         .push("usage: /prompt SERVER:NAME [key=value …] (see /prompts)".into()),
                 }
+            }
+            cmd if cmd.starts_with("mcp:") => {
+                // `/mcp:SERVER:PROMPT [ARG …] [key=value …]`: the rendered
+                // prompt is sent as your message (SPEC §7.9).
+                let rest = &cmd["mcp:".len()..];
+                let (target, args) = rest.split_once(' ').unwrap_or((rest, ""));
+                let Some((server, name)) = target.split_once(':').filter(|(s, n)| !s.is_empty() && !n.is_empty())
+                else {
+                    self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts);
+                    self.notes.push("usage: /mcp:SERVER:PROMPT [ARGS] — prompts:".into());
+                    return;
+                };
+                let (mut arguments, mut positional) = (serde_json::Map::new(), Vec::new());
+                for w in shell_words(args) {
+                    match w.split_once('=') {
+                        Some((k, v)) if !k.is_empty() && !k.contains(' ') => {
+                            arguments.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                        }
+                        _ => positional.push(w),
+                    }
+                }
+                self.request(
+                    Pending::SendMcpPrompt,
+                    Request::GetMcpPrompt {
+                        server: server.into(),
+                        name: name.into(),
+                        arguments,
+                        positional,
+                    },
+                );
+            }
+            cmd if cmd.starts_with("mcp log ") => {
+                let name = cmd["mcp log ".len()..].trim().to_string();
+                self.request(
+                    Pending::McpLog,
+                    Request::McpServerLog {
+                        name,
+                        lines: Some(200),
+                    },
+                );
+            }
+            cmd if cmd.starts_with("mcp tools ") => {
+                let name = cmd["mcp tools ".len()..].trim().to_string();
+                self.request(Pending::McpTools, Request::ListMcpTools { name });
+            }
+            cmd if cmd.starts_with("mcp tool ") => {
+                let words: Vec<&str> = cmd["mcp tool ".len()..].split_whitespace().collect();
+                match words.as_slice() {
+                    [name, tool, state @ ("on" | "off")] => {
+                        self.fire(Request::SetMcpToolEnabled {
+                            name: name.to_string(),
+                            tool: tool.to_string(),
+                            enabled: *state == "on",
+                        });
+                        self.notes.push(format!("{name}: {tool} turned {state}"));
+                    }
+                    _ => self.notes.push("usage: /mcp tool SERVER TOOL on|off".into()),
+                }
+            }
+            "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
+            cmd if cmd.starts_with("mcp add ") => {
+                let mut words = cmd["mcp add ".len()..].split_whitespace();
+                let id = words.next().unwrap_or_default().to_string();
+                let params = words
+                    .filter_map(|w| w.split_once('='))
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                    .collect();
+                self.notes.push(format!("adding MCP server {id}…"));
+                self.request(
+                    Pending::McpAdded,
+                    Request::AddMcpFromCatalog {
+                        id,
+                        name: None,
+                        params,
+                    },
+                );
+            }
+            "mcp import" => {
+                let cwd = Some(self.work_dir().to_string_lossy().into_owned());
+                self.mcp_import_pick = None;
+                self.request(Pending::McpImport, Request::McpImportCandidates { cwd });
+            }
+            cmd if cmd.starts_with("mcp import ") => {
+                let name = cmd["mcp import ".len()..].trim().to_string();
+                let cwd = Some(self.work_dir().to_string_lossy().into_owned());
+                self.mcp_import_pick = Some(name);
+                self.request(Pending::McpImport, Request::McpImportCandidates { cwd });
             }
             cmd if cmd.starts_with("mcp restart ") => {
                 let name = cmd["mcp restart ".len()..].trim().to_string();
@@ -8190,6 +8450,28 @@ fn files_pager_lines(files: &[formless_protocol::RunFileInfo]) -> Vec<String> {
         out.push(String::new());
     }
     out.push("/rewind PATH reverts one file, /rewind all of them.".into());
+    out
+}
+
+/// Words with simple quoting: `a "b c" d` → [a, b c, d].
+fn shell_words(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quote) = (Vec::new(), String::new(), None);
+    for c in s.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') => quote = Some(c),
+            (None, c) if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
 }
 
@@ -12877,6 +13159,7 @@ mod tests {
             recap: None,
             recap_open: false,
             plan: Vec::new(),
+            mcp_import_pick: None,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),

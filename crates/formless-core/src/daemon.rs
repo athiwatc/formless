@@ -1974,10 +1974,36 @@ impl Daemon {
             Request::GetMcpPrompt {
                 server,
                 name,
-                arguments,
+                mut arguments,
+                positional,
             } => {
                 let cfg = self.config()?;
                 let conn = self.mcp.connection(&self.paths, &cfg.mcp, &server).await?;
+                if !positional.is_empty() {
+                    let prompts = conn.list_all("prompts/list", "prompts").await?;
+                    let prompt = prompts
+                        .iter()
+                        .find(|p| p["name"] == name.as_str())
+                        .with_context(|| format!("{server} has no prompt '{name}'"))?;
+                    let declared: Vec<String> = prompt["arguments"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| a["name"].as_str().map(str::to_string))
+                        .collect();
+                    let free: Vec<&String> =
+                        declared.iter().filter(|d| !arguments.contains_key(*d)).collect();
+                    if positional.len() > free.len() {
+                        return Err(anyhow!(
+                            "{server}:{name} takes {} argument(s): {}",
+                            declared.len(),
+                            declared.join(", ")
+                        ));
+                    }
+                    for (k, v) in free.into_iter().zip(positional) {
+                        arguments.insert(k.clone(), json!(v));
+                    }
+                }
                 let r = conn
                     .request("prompts/get", json!({"name": name, "arguments": arguments}))
                     .await?;
@@ -1999,6 +2025,119 @@ impl Daemon {
                 Ok(
                     json!({"restarted": name, "tools": tools.ok(), "error": self.mcp.last_error(&name)}),
                 )
+            }
+            Request::McpServerLog { name, lines } => {
+                let cfg = self.config()?;
+                if !cfg.mcp.servers.contains_key(&name) {
+                    return Err(anyhow!("no MCP server '{name}'"));
+                }
+                let file = self.paths.data_dir.join("mcp").join(format!("{name}.log"));
+                let text = std::fs::read(&file)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                let all: Vec<&str> = text.lines().collect();
+                let n = lines.unwrap_or(50).clamp(1, 1000);
+                let tail = all[all.len().saturating_sub(n)..].to_vec();
+                Ok(json!({"name": name, "file": file.display().to_string(), "lines": tail}))
+            }
+            Request::ListMcpTools { name } => {
+                let cfg = self.config()?;
+                let server = cfg
+                    .mcp
+                    .servers
+                    .get(&name)
+                    .with_context(|| format!("no MCP server '{name}'"))?;
+                if server.disabled {
+                    return Err(anyhow!("MCP server '{name}' is disabled"));
+                }
+                let conn = self.mcp.connection(&self.paths, &cfg.mcp, &name).await?;
+                let tools = conn.list_tools().await?;
+                let list: Vec<Value> = tools
+                    .iter()
+                    .map(|t| {
+                        // What the tool costs in every request's tool list.
+                        let def = json!({"name": t.name, "description": t.description, "parameters": t.input_schema});
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "enabled": !server.disabled_tools.contains(&t.name),
+                            "tokens": def.to_string().len().div_ceil(4),
+                        })
+                    })
+                    .collect();
+                let enabled_tokens: usize = list
+                    .iter()
+                    .filter(|t| t["enabled"] == true)
+                    .map(|t| t["tokens"].as_u64().unwrap_or(0) as usize)
+                    .sum();
+                Ok(json!({"name": name, "tools": list, "enabled_tokens": enabled_tokens}))
+            }
+            Request::SetMcpToolEnabled {
+                name,
+                tool,
+                enabled,
+            } => {
+                let mut cfg = self.config()?;
+                let server = cfg
+                    .mcp
+                    .servers
+                    .get_mut(&name)
+                    .with_context(|| format!("no MCP server '{name}'"))?;
+                server.disabled_tools.retain(|t| t != &tool);
+                if !enabled {
+                    server.disabled_tools.push(tool.clone());
+                    server.disabled_tools.sort();
+                }
+                cfg.save(&self.paths)?;
+                let action = if enabled { "mcp.tool_enable" } else { "mcp.tool_disable" };
+                let _ = self.with_store(|st| st.audit("user", action, &format!("{name}: {tool}")));
+                let tools = self.sync_mcp_server(&cfg, &name).await;
+                self.mcp
+                    .set_error(&name, tools.as_ref().err().map(|e| format!("{e:#}")));
+                self.broadcast(Event::McpServersChanged);
+                Ok(json!({"name": name, "tool": tool, "enabled": enabled}))
+            }
+            Request::McpCatalog => {
+                let cfg = self.config()?;
+                let mut list = crate::mcp_catalog::catalog_json();
+                for e in list.as_array_mut().into_iter().flatten() {
+                    let id = e["id"].as_str().unwrap_or_default().to_string();
+                    e["added"] = json!(cfg.mcp.servers.contains_key(&id));
+                }
+                Ok(list)
+            }
+            Request::AddMcpFromCatalog { id, name, params } => {
+                let entry = crate::mcp_catalog::find(&id)
+                    .with_context(|| format!("no catalog server '{id}' (see `formless mcp catalog`)"))?;
+                let server = crate::mcp_catalog::server_config(entry, &params)?;
+                let name = name
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| entry.id.to_string());
+                if self.config()?.mcp.servers.contains_key(&name) {
+                    return Err(anyhow!("an MCP server named '{name}' already exists"));
+                }
+                let mut out = self.add_mcp_server(&name, server, "user").await?;
+                out["env_keys"] = json!(entry.env_keys);
+                out["needs_login"] = json!(!entry.url.is_empty());
+                Ok(out)
+            }
+            Request::McpImportCandidates { cwd } => {
+                let cfg = self.config()?;
+                let home = directories::BaseDirs::new()
+                    .map(|b| b.home_dir().to_path_buf())
+                    .context("no home directory")?;
+                let project = cwd.map(std::path::PathBuf::from);
+                let files = crate::mcp_catalog::sources(&home, project.as_deref());
+                let list: Vec<Value> = crate::mcp_catalog::candidates(&files)
+                    .iter()
+                    .map(|c| {
+                        let mut v = c.to_json();
+                        v["exists"] = json!(cfg.mcp.servers.contains_key(&c.name));
+                        v
+                    })
+                    .collect();
+                Ok(json!(list))
             }
             Request::ListSubagents { session_id } => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_subagents(&session_id))?,
@@ -9071,18 +9210,27 @@ impl Daemon {
                     .count(),
                 last_error: self.mcp.last_error(name),
                 logged_in: http && crate::mcp_auth::has_login(&self.paths, name),
+                state: String::new(),
+                disabled_tools: s.disabled_tools.clone(),
             });
+            let info = out.last_mut().unwrap();
+            info.state = mcp_state(info).to_string();
         }
         Ok(out)
     }
 
-    /// Fetch one server's tool list and mirror it into the registry.
+    /// Fetch one server's tool list and mirror it into the registry
+    /// (without the tools the user turned off).
     pub(crate) async fn sync_mcp_server(&self, cfg: &Config, name: &str) -> Result<usize> {
         if cfg.mcp.servers.get(name).is_none_or(|s| s.disabled) {
             return Ok(0);
         }
         let conn = self.mcp.connection(&self.paths, &cfg.mcp, name).await?;
-        let tools = conn.list_tools().await?;
+        let mut tools = conn.list_tools().await?;
+        // Tools the user turned off are left out (and so retired).
+        if let Some(s) = cfg.mcp.servers.get(name) {
+            tools.retain(|t| !s.disabled_tools.contains(&t.name));
+        }
         self.with_store(|st| crate::mcp::sync_registry(st, name, &tools))?;
         Ok(tools.len())
     }
@@ -9848,6 +9996,25 @@ struct ScriptScope {
     /// Approved before the script ran; others (input-bound scopes) are
     /// approved per call, for the paths or hosts it binds.
     preapproved: std::collections::HashSet<String>,
+}
+
+/// A server's state for the MCP view (SPEC §7.9).
+fn mcp_state(s: &McpServerInfo) -> &'static str {
+    let auth = |e: &str| {
+        let e = e.to_lowercase();
+        e.contains("401") || e.contains("unauthorized") || e.contains("login") || e.contains("oauth")
+    };
+    if s.disabled {
+        "disabled"
+    } else if s.running {
+        "ready"
+    } else if s.last_error.as_deref().is_some_and(auth) {
+        "auth needed"
+    } else if s.last_error.is_some() {
+        "failed"
+    } else {
+        "idle"
+    }
 }
 
 /// HostOps for nested `tools.call` + `emit` (SPEC §7.6). Runs on the

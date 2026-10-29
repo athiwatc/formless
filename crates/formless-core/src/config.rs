@@ -567,6 +567,9 @@ pub struct McpServerCfg {
     /// Trusted servers' tools annotated `readOnlyHint` run without a
     /// per-tool approval (the server itself is still approved once).
     pub trusted: bool,
+    /// The server's own names of tools to leave out of the registry.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
 }
 
 /// Retention for stored Tool outputs (SPEC §9.6). 0 disables a limit.
