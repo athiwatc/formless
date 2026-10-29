@@ -365,6 +365,20 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   correction prompt and counted in a **separate** malformed-call counter —
   they never pollute Tool Success Rate.
 
+- **Stream parsing (#614).** A last event without its trailing newline
+  is still parsed (often the usage / finish chunk); a JSON field split
+  over several `data:` lines is joined; a line over 16 MB fails clearly.
+  Chat tool-call fragments are matched by `index`, else by `id`, else
+  continue the last call; a server that resends the whole name or
+  arguments so far replaces instead of doubling them; a call already
+  streamed as deltas isn't added again from `message.tool_calls`.
+- **Stops that aren't answers (#615).** A refusal (`delta.refusal`,
+  `response.refusal.delta`, refusal content parts) is the answer text and
+  `stop_reason = "refusal"`; a `content_filter` finish sets `stop_reason`.
+  Neither is ever stored as an empty answer: the note says why, and an
+  empty one becomes "(The provider's content filter stopped this
+  answer.)". A Responses answer stopped by `max_output_tokens` keeps its
+  partial text with `truncated`, like Chat's `length`.
 - **Rate limits.** The `x-ratelimit-*` (and `anthropic-ratelimit-*`)
   headers of each endpoint's latest response are kept: `RateLimits`,
   `Status.rate_limits`; `/usage` adds "41/50 requests left, resets …".
@@ -1137,6 +1151,13 @@ pattern (§4.4).
     `fetchChunks(url, opts, size, cb)` (a truly streamed body in bounded
     memory) — gated by `net`. http(s) only; redirects are followed, each hop
     scope-checked; no request timeout.
+  - **Native caps (#604).** Outside the JS heap limit, whole-value reads
+    stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
+    `fetch`: by `Content-Length` and while reading), process output at
+    `tools.max_process_output_bytes` per stream (the pipe keeps draining,
+    so the child never blocks), logs at `tools.max_log_bytes`, and `emit`
+    at `tools.max_emit_bytes`. Over a cap is a `resource` failure naming
+    the setting and the streaming alternative.
   - `fs.read/write/append` (whole-value), `fs.exists`, `fs.stat` (`{type,
     size, modified_ms}` or null), `fs.list(dir, {details})`, and
     `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines` (streaming)
@@ -2085,6 +2106,11 @@ such as `read_file`, `read_text_file` and `file_read`.
   `artifacts.max_age_days` (30) are removed, then the oldest beyond
   `artifacts.max_total_mb` (1024), at daemon start and hourly or on
   `formless gc`; deleting a Session deletes its artifact files.
+- **Reconciling (#609).** Hourly and on `formless gc`, the artifacts
+  folder is compared with the database: a file with no row (a crash
+  between writing and recording it) older than an hour is removed, and a
+  row whose file is gone is dropped, so usage and retention see the real
+  disk. Changes are logged and audited (`artifact.reconcile`).
 - **Disk use.** `StorageUsage` (`formless storage [--json]`, TUI
   `/storage`, web Settings → Storage → Disk use) lists the database (and
   roughly what fills it: messages, Invocation logs, Tool versions, file
@@ -3426,6 +3452,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.max_tool_depth` | 8 | How deep `tools.call` composition may nest (cycle guard, §7.6) |
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
+| `tools.max_read_bytes` | 67108864 | Largest `fs.read` or `fetch` body (64 MB): larger fails as a resource error pointing to `fs.readChunks` / `fetchChunks` (§7.5) |
+| `tools.max_process_output_bytes` | 16777216 | `process.run` keeps this much of stdout and of stderr (16 MB); the rest is read and dropped, and the result says `truncated: true` |
+| `tools.max_log_bytes` | 1048576 | All `log` lines of one Invocation (1 MB); later lines are dropped after one marker line |
+| `tools.max_emit_bytes` | 1073741824 | Everything one Invocation `emit`s to its artifact (1 GB) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
 | `security.trusted_hosts` | [] | Hosts whose `net:` grants need no approval (`api.example.com`, `*.github.com`); config.toml only (§10.3) |
 | `security.secure` | false | Ask before sensitive Tool calls; off runs them unasked (logged). `--secure` / `FORMLESS_SECURE` turn it on at daemon start (§10.3) |

@@ -106,6 +106,30 @@ pub fn set_limits(max_sleep_ms: u64, max_random_bytes: u64) {
     MAX_RANDOM_BYTES.store(max_random_bytes, Ordering::Relaxed);
 }
 
+/// Native buffers outside the JS heap (#604): one `fs.read` / `fetch`
+/// body, one `process.run`'s stdout and stderr each, all `log` lines.
+static MAX_READ_BYTES: AtomicU64 = AtomicU64::new(64 << 20);
+static MAX_PROCESS_OUTPUT: AtomicU64 = AtomicU64::new(16 << 20);
+static MAX_LOG_BYTES: AtomicU64 = AtomicU64::new(1 << 20);
+
+/// Set the native caps: `tools.max_read_bytes`,
+/// `tools.max_process_output_bytes`, `tools.max_log_bytes`.
+pub fn set_io_limits(read: u64, process_output: u64, log: u64) {
+    MAX_READ_BYTES.store(read.max(1), Ordering::Relaxed);
+    MAX_PROCESS_OUTPUT.store(process_output.max(1), Ordering::Relaxed);
+    MAX_LOG_BYTES.store(log.max(1), Ordering::Relaxed);
+}
+
+/// "fs.read: 80 MB is over the 64 MB resource limit (tools.max_read_bytes); use fs.readChunks".
+fn over_limit(what: &str, size: u64, setting: &str, instead: &str) -> String {
+    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
+    format!(
+        "{what}: {} is over the {} resource limit ({setting}); {instead}",
+        mb(size),
+        mb(MAX_READ_BYTES.load(Ordering::Relaxed))
+    )
+}
+
 /// Set how many `tools.call` Invocations one sandbox may have in
 /// flight at once; the rest queue (SPEC §7.12, `scripts.max_parallel`).
 pub fn set_max_parallel_calls(n: u64) {
@@ -758,7 +782,14 @@ impl State {
             "log" => {
                 if let Some(m) = a["msg"].as_str() {
                     if let Ok(mut g) = self.logs.lock() {
-                        g.push(m.to_string());
+                        // Past the cap, lines are dropped, once said (#604).
+                        let used: usize = g.iter().map(String::len).sum();
+                        let cap = MAX_LOG_BYTES.load(Ordering::Relaxed) as usize;
+                        if used + m.len() <= cap {
+                            g.push(m.to_string());
+                        } else if g.last().is_none_or(|l| !l.starts_with("[log limit")) {
+                            g.push(format!("[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"));
+                        }
                     }
                 }
                 Ok(Value::Null)
@@ -1023,6 +1054,12 @@ impl State {
                     Some(Some(bytes)) => return Ok(encode(&bytes, enc)),
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {}
+                }
+                let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
+                if let Ok(m) = std::fs::metadata(&p) {
+                    if m.len() > cap {
+                        return Err(over_limit("fs.read", m.len(), "tools.max_read_bytes", "read it with fs.readChunks or fs.readLines"));
+                    }
                 }
                 std::fs::read(&p)
                     .map(|b| encode(&b, enc))
@@ -1481,9 +1518,18 @@ impl State {
         }
         let req = self.build_request(a, parsed, scope)?;
         let (mut meta, bytes) = self.cancellable(move || {
-            let resp = send_request(req)?;
+            let mut resp = send_request(req)?;
             let meta = Self::response_meta(&resp);
-            let bytes = resp.bytes().map_err(|e| e.to_string())?;
+            // The body is read up to the cap and no further (#604).
+            let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
+            if let Some(len) = resp.content_length().filter(|l| *l > cap) {
+                return Err(over_limit("fetch", len, "tools.max_read_bytes", "stream it with fetchChunks"));
+            }
+            let mut bytes = Vec::new();
+            (&mut resp).take(cap + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > cap {
+                return Err(over_limit("fetch", bytes.len() as u64, "tools.max_read_bytes", "stream it with fetchChunks"));
+            }
             Ok((meta, bytes))
         })?;
         meta["body"] = encode(&bytes, enc);
@@ -1674,13 +1720,24 @@ impl State {
             })),
             _ => None,
         };
-        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        // Keep up to the cap, but keep reading past it (and discard) so the
+        // child never blocks on a full pipe (#604).
+        let cap = MAX_PROCESS_OUTPUT.load(Ordering::Relaxed) as usize;
+        let drain = move |pipe: Option<Box<dyn Read + Send>>| {
             std::thread::spawn(move || {
-                let mut out = Vec::new();
+                let (mut out, mut cut) = (Vec::new(), false);
                 if let Some(mut p) = pipe {
-                    let _ = p.read_to_end(&mut out);
+                    let mut chunk = [0u8; 64 * 1024];
+                    while let Ok(n) = p.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        let room = cap.saturating_sub(out.len());
+                        out.extend_from_slice(&chunk[..n.min(room)]);
+                        cut |= n > room;
+                    }
                 }
-                out
+                (out, cut)
             })
         };
         let stdout = drain(
@@ -1706,8 +1763,8 @@ impl State {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        let stdout = stdout.join().unwrap_or_default();
-        let stderr = stderr.join().unwrap_or_default();
+        let (stdout, cut_out) = stdout.join().unwrap_or_default();
+        let (stderr, cut_err) = stderr.join().unwrap_or_default();
         if let Some(f) = feeder {
             let _ = f.join();
         }
@@ -1720,6 +1777,8 @@ impl State {
             "signal": signal,
             "stdout": encode(&stdout, enc),
             "stderr": encode(&stderr, Enc::Text),
+            // Output past tools.max_process_output_bytes was dropped.
+            "truncated": cut_out || cut_err,
         }))
     }
 
@@ -1901,7 +1960,7 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
     let low = msg.to_lowercase();
     let kind = if msg.starts_with("denied:") {
         ExecErrorKind::Denied
-    } else if low.contains("out of memory")
+    } else if low.contains("resource limit") || low.contains("out of memory")
         || low.contains("allocation")
         || low.contains("memory") && low.contains("limit")
     {

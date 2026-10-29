@@ -988,6 +988,17 @@ pub struct ToolsCfg {
     /// Largest `randomBytes(n)` a Tool may ask for.
     #[serde(default = "default_max_random_bytes")]
     pub max_random_bytes: usize,
+    /// Native caps outside the JS heap (#604): one `fs.read` or `fetch`
+    /// body, each stream of one `process.run`, all `log` lines of an
+    /// Invocation, and everything one Invocation `emit`s.
+    #[serde(default = "default_max_read_bytes")]
+    pub max_read_bytes: u64,
+    #[serde(default = "default_max_process_output_bytes")]
+    pub max_process_output_bytes: u64,
+    #[serde(default = "default_max_log_bytes")]
+    pub max_log_bytes: u64,
+    #[serde(default = "default_max_emit_bytes")]
+    pub max_emit_bytes: u64,
     /// Most results one `find_tools` call may return.
     #[serde(default = "default_find_tools_max")]
     pub find_tools_max: usize,
@@ -1027,6 +1038,18 @@ fn default_max_tool_depth() -> usize {
 fn default_max_sleep_secs() -> u64 {
     60
 }
+fn default_max_read_bytes() -> u64 {
+    64 << 20
+}
+fn default_max_process_output_bytes() -> u64 {
+    16 << 20
+}
+fn default_max_log_bytes() -> u64 {
+    1 << 20
+}
+fn default_max_emit_bytes() -> u64 {
+    1 << 30
+}
 fn default_max_random_bytes() -> usize {
     1 << 20
 }
@@ -1063,6 +1086,10 @@ impl Default for ToolsCfg {
             max_tool_depth: default_max_tool_depth(),
             max_sleep_secs: default_max_sleep_secs(),
             max_random_bytes: default_max_random_bytes(),
+            max_read_bytes: default_max_read_bytes(),
+            max_process_output_bytes: default_max_process_output_bytes(),
+            max_log_bytes: default_max_log_bytes(),
+            max_emit_bytes: default_max_emit_bytes(),
             find_tools_max: default_find_tools_max(),
             subagent_max_turns: default_subagent_max_turns(),
             task_min_samples: default_task_min_samples(),

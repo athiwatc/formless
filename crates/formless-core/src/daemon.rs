@@ -141,6 +141,7 @@ fn stop_note(result: &crate::provider::ChatResult) -> Option<String> {
             Some("The answer stopped because the model's context window is full.".into())
         }
         "pause_turn" => Some("The model paused its turn; ask it to continue.".into()),
+        "content_filter" => Some("The provider's content filter stopped this answer.".into()),
         other => Some(format!("The answer ended early ({other}).")),
     }
 }
@@ -556,6 +557,11 @@ impl Daemon {
             cfg.tools.max_random_bytes as u64,
         );
         formless_runtime::set_max_parallel_calls(cfg.scripts.max_parallel as u64);
+        formless_runtime::set_io_limits(
+            cfg.tools.max_read_bytes,
+            cfg.tools.max_process_output_bytes,
+            cfg.tools.max_log_bytes,
+        );
         let changed = slot.is_some();
         *slot = Some((stamp, cfg.clone()));
         drop(slot);
@@ -4073,12 +4079,15 @@ impl Daemon {
                         json!({"model": {"name": result.model_used, "via": via, "requested": requested_model}})
                             .to_string()
                     });
-                let content = if result.content.trim().is_empty()
-                    && result.stop_reason.as_deref() == Some("refusal")
-                {
-                    "(The model declined to answer this request.)".to_string()
-                } else {
-                    result.content.clone()
+                // Never an empty answer for a refusal or a filter stop (#615).
+                let content = match result.stop_reason.as_deref() {
+                    Some("refusal") if result.content.trim().is_empty() => {
+                        "(The model declined to answer this request.)".to_string()
+                    }
+                    Some("content_filter") if result.content.trim().is_empty() => {
+                        "(The provider's content filter stopped this answer.)".to_string()
+                    }
+                    _ => result.content.clone(),
                 };
                 let msg = self.with_store(|st| {
                     st.append_message_meta(session_id, "assistant", &content, served)
@@ -10320,6 +10329,24 @@ impl Daemon {
                     Ok(_) => {}
                     Err(e) => tracing::warn!("artifact retention: {e}"),
                 }
+                // Files without rows (a crash between write and insert) and
+                // rows without files (#609); anything under an hour old is
+                // left for a writer that may still be going.
+                let dir = self.paths.data_dir.join("artifacts");
+                match self.with_store(|st| {
+                    crate::artifacts::reconcile(st, &dir, std::time::Duration::from_secs(3600))
+                }) {
+                    Ok(r) if r.orphan_files + r.missing_rows > 0 => {
+                        let what = format!(
+                            "{} orphan file(s), {} bytes; {} row(s) without a file",
+                            r.orphan_files, r.orphan_bytes, r.missing_rows
+                        );
+                        tracing::info!("artifact reconcile: {what}");
+                        let _ = self.with_store(|st| st.audit("daemon", "artifact.reconcile", &what));
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("artifact reconcile: {e}"),
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
@@ -11420,6 +11447,14 @@ impl HostOps for NestedOps {
             *guard = Some((path, 0));
         }
         let (path, bytes) = guard.as_mut().unwrap();
+        // One Invocation can't fill the disk (#604).
+        let cap = self.cfg.tools.max_emit_bytes;
+        if (*bytes as u64).saturating_add(chunk.len() as u64) > cap {
+            return Err(format!(
+                "emit: over the {} MB resource limit (tools.max_emit_bytes)",
+                cap >> 20
+            ));
+        }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -11431,9 +11466,6 @@ impl HostOps for NestedOps {
     }
 }
 
-/// Outcome of a built-in call from its result text (no payload kept):
-/// whether it succeeded and a short kind for the failure or notable
-/// success (an empty `find_tools`, a failed `test_tool`).
 tokio::task_local! {
     /// Set by [`call_failed`] while one tool call is dispatched.
     static CALL_FAILED: std::cell::Cell<bool>;
@@ -11456,6 +11488,9 @@ fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
     meta.to_string()
 }
 
+/// Outcome of a built-in call from its result text (no payload kept):
+/// whether it succeeded and a short kind for the failure or notable
+/// success (an empty `find_tools`, a failed `test_tool`).
 pub fn builtin_outcome(name: &str, text: &str) -> (bool, &'static str) {
     if let Some(err) = text.strip_prefix("error:") {
         let kind = if err.contains("syntax check failed") {

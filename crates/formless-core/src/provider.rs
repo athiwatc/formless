@@ -451,7 +451,8 @@ pub fn responses_text(v: &Value) -> String {
         for item in items {
             if let Some(content) = item["content"].as_array() {
                 for c in content {
-                    if let Some(t) = c["text"].as_str() {
+                    // A refusal part is the answer too (#615).
+                    if let Some(t) = c["text"].as_str().or_else(|| c["refusal"].as_str()) {
                         out.push_str(t);
                     }
                 }
@@ -1166,6 +1167,11 @@ impl Provider {
         // Responses `output_index` → position in `tool_calls`.
         let mut call_slots: HashMap<u64, usize> = HashMap::new();
         let mut truncated = false;
+        // Why it stopped (#615), and refusal text the model sent instead
+        // of an answer.
+        let mut finish: Option<String> = None;
+        // A `data:` field whose JSON spans several lines (#614).
+        let mut pending = String::new();
         let mut usage = None;
         let mut attempt = 0;
         let (recovered, model_used) = 'request: loop {
@@ -1179,10 +1185,25 @@ impl Provider {
             // Raw bytes: a chunk boundary can split a multibyte character, so
             // only complete lines are decoded.
             let mut buf: Vec<u8> = Vec::new();
+            pending.clear();
+            let mut eof = false;
             loop {
+                if eof {
+                    break;
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                     next = stream.next() => {
+                        // At the end, a last event without its newline still
+                        // counts (often the usage / finish chunk, #614).
+                        let next = match next {
+                            Some(c) => Some(c),
+                            None if buf.is_empty() && pending.is_empty() => break,
+                            None => {
+                                eof = true;
+                                Some(Ok(tokio_util::bytes::Bytes::from_static(b"\n\n")))
+                            }
+                        };
                         let Some(chunk) = next else { break };
                         let chunk = match chunk {
                             Ok(chunk) => chunk,
@@ -1211,18 +1232,65 @@ impl Provider {
                         };
                         on_delta(DeltaKind::Bytes, "");
                         buf.extend_from_slice(&chunk);
+                        if buf.len() > MAX_SSE_LINE && !buf.contains(&b'\n') {
+                            return Err(anyhow!(
+                                "provider stream line over {} MB without a newline",
+                                MAX_SSE_LINE / (1024 * 1024)
+                            ));
+                        }
                         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                             let raw: Vec<u8> = buf.drain(..=pos).collect();
                             let line = String::from_utf8_lossy(&raw);
                             let line = line.trim();
+                            if line.is_empty() {
+                                // End of an event: a split field that never
+                                // became JSON is dropped, and said so.
+                                if !pending.is_empty() {
+                                    tracing::warn!("dropped an SSE event that is not JSON ({} bytes)", pending.len());
+                                    pending.clear();
+                                }
+                                continue;
+                            }
                             if let Some(data) = line.strip_prefix("data:") {
                                 let data = data.trim();
                                 if data == "[DONE]" { continue; }
-                                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                // Several `data:` lines make one field (SSE): a
+                                // line that isn't JSON alone waits for the next.
+                                let joined = if pending.is_empty() {
+                                    data.to_string()
+                                } else {
+                                    format!("{pending}\n{data}")
+                                };
+                                let parsed = serde_json::from_str::<Value>(&joined);
+                                if parsed.is_err() {
+                                    if joined.len() > MAX_SSE_LINE {
+                                        return Err(anyhow!("provider stream event over {} MB", MAX_SSE_LINE / (1024 * 1024)));
+                                    }
+                                    pending = joined;
+                                    continue;
+                                }
+                                pending.clear();
+                                if let Ok(v) = parsed {
                                     // Mid-stream failures: Responses `error` / `response.failed` /
                                     // `response.incomplete` events, or a Chat Completions `{"error": ...}`
                                     // chunk. Retry only before anything streamed, so the user never sees
                                     // duplicated output; otherwise the Run fails loudly (SPEC §4.4).
+                                    // Responses stopped early for length or a filter:
+                                    // the partial answer stands, marked (#615).
+                                    if self.cfg.responses() && v["type"] == "response.incomplete" {
+                                        match v["response"]["incomplete_details"]["reason"].as_str() {
+                                            Some("max_output_tokens") => {
+                                                truncated = true;
+                                                finish = Some("length".into());
+                                                continue;
+                                            }
+                                            Some("content_filter") => {
+                                                finish = Some("content_filter".into());
+                                                continue;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                     let failed = if self.cfg.responses() {
                                         matches!(
                                             v["type"].as_str(),
@@ -1250,6 +1318,16 @@ impl Provider {
                                             "response.output_text.delta" => {
                                                 if let Some(d) = v["delta"].as_str() {
                                                     content.push_str(d);
+                                                    if !prompt_mode {
+                                                        on_delta(DeltaKind::Content, d);
+                                                    }
+                                                }
+                                            }
+                                            // A refusal is the answer, never an empty one (#615).
+                                            "response.refusal.delta" => {
+                                                if let Some(d) = v["delta"].as_str() {
+                                                    content.push_str(d);
+                                                    finish = Some("refusal".into());
                                                     if !prompt_mode {
                                                         on_delta(DeltaKind::Content, d);
                                                     }
@@ -1307,10 +1385,25 @@ impl Provider {
                                     // With include_usage the last chunk carries usage
                                     // (and usually no choices).
                                     usage = Usage::parse(&v["usage"]).or(usage);
-                                    if v["choices"][0]["finish_reason"].as_str() == Some("length") {
-                                        truncated = true;
+                                    if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+                                        if fr == "length" {
+                                            truncated = true;
+                                        }
+                                        if finish.as_deref() != Some("refusal") {
+                                            finish = Some(fr.to_string());
+                                        }
                                     }
                                     let delta = &v["choices"][0]["delta"];
+                                    // A refusal is the answer, never an empty one (#615).
+                                    if let Some(d) = delta["refusal"].as_str() {
+                                        if !d.is_empty() {
+                                            content.push_str(d);
+                                            finish = Some("refusal".into());
+                                            if !prompt_mode {
+                                                on_delta(DeltaKind::Content, d);
+                                            }
+                                        }
+                                    }
                                     if let Some(d) = delta["content"].as_str() {
                                         if !d.is_empty() {
                                             content.push_str(d);
@@ -1331,30 +1424,26 @@ impl Provider {
                                     }
                                     if let Some(tcs) = delta["tool_calls"].as_array() {
                                         for tc in tcs {
-                                            let idx = tc["index"].as_u64().unwrap_or(tool_calls.len() as u64) as usize;
-                                            while tool_calls.len() <= idx {
-                                                tool_calls.push(ToolCall::default());
-                                            }
-                                            let slot = &mut tool_calls[idx];
-                                            if let Some(id) = tc["id"].as_str() {
-                                                if !id.is_empty() { slot.id = id.to_string(); }
-                                            }
-                                            if let Some(n) = tc["function"]["name"].as_str() {
-                                                slot.name.push_str(n);
-                                            }
-                                            if let Some(a) = tc["function"]["arguments"].as_str() {
-                                                slot.arguments.push_str(a);
-                                            }
+                                            merge_tool_fragment(&mut tool_calls, tc);
                                         }
                                     }
-                                    // Non-streaming-shaped servers may put message.tool_calls in one chunk.
+                                    // Non-streaming-shaped servers may put message.tool_calls in
+                                    // one chunk; a call already streamed as deltas isn't added twice.
                                     if let Some(tcs) = v["choices"][0]["message"]["tool_calls"].as_array() {
                                         for tc in tcs {
-                                            tool_calls.push(ToolCall {
-                                                id: tc["id"].as_str().unwrap_or_default().to_string(),
-                                                name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
-                                                arguments: tc["function"]["arguments"].as_str().unwrap_or_default().to_string(),
-                                            });
+                                            let id = tc["id"].as_str().unwrap_or_default();
+                                            let seen = if id.is_empty() {
+                                                !tool_calls.is_empty()
+                                            } else {
+                                                tool_calls.iter().any(|c| c.id == id)
+                                            };
+                                            if !seen {
+                                                tool_calls.push(ToolCall {
+                                                    id: id.to_string(),
+                                                    name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
+                                                    arguments: tc["function"]["arguments"].as_str().unwrap_or_default().to_string(),
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -1399,7 +1488,9 @@ impl Provider {
             model_used,
             truncated,
             usage,
-            stop_reason: None,
+            // Chat / Responses: a filter or refusal stop is said (#615);
+            // a normal or length stop is not (length is `truncated`).
+            stop_reason: finish.filter(|f| matches!(f.as_str(), "content_filter" | "refusal")),
             stop_detail: None,
             notes: recovered.notes,
             dropped_replayed_thinking: false,
@@ -1727,6 +1818,46 @@ pub fn known_model_meta(id: &str) -> Value {
         set(&mut meta, false, false, Some(&[]));
     }
     meta
+}
+
+/// Longest stream line (or split event) accepted before failing (#614).
+const MAX_SSE_LINE: usize = 16 * 1024 * 1024;
+
+/// Fold one streamed Chat tool-call fragment into the calls so far
+/// (#614): by `index`, else by `id`, else onto the last call; a server
+/// that resends the whole name or arguments so far (cumulative style)
+/// replaces rather than doubles them.
+fn merge_tool_fragment(calls: &mut Vec<ToolCall>, tc: &Value) {
+    let id = tc["id"].as_str().filter(|i| !i.is_empty());
+    let idx = match (tc["index"].as_u64(), id) {
+        (Some(i), _) => i as usize,
+        (None, Some(id)) => calls
+            .iter()
+            .position(|c| c.id == id)
+            .unwrap_or(calls.len()),
+        (None, None) => calls.len().saturating_sub(1),
+    };
+    while calls.len() <= idx {
+        calls.push(ToolCall::default());
+    }
+    let slot = &mut calls[idx];
+    if let Some(id) = id {
+        slot.id = id.to_string();
+    }
+    let grow = |have: &mut String, frag: &str| {
+        if have.is_empty() || !frag.starts_with(have.as_str()) {
+            have.push_str(frag);
+        } else {
+            // The fragment repeats what came before: cumulative.
+            *have = frag.to_string();
+        }
+    };
+    if let Some(n) = tc["function"]["name"].as_str() {
+        grow(&mut slot.name, n);
+    }
+    if let Some(a) = tc["function"]["arguments"].as_str() {
+        grow(&mut slot.arguments, a);
+    }
 }
 
 fn parse_models(body: &Value) -> Vec<String> {

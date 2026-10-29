@@ -382,12 +382,19 @@ async fn stream_failure_events_fail_loudly_or_retry() {
         "{err}"
     );
 
-    // Incomplete responses surface their reason.
-    let incomplete = ev(json!({"type": "response.incomplete", "response":
+    // Cut at max_output_tokens: the partial answer stands, marked
+    // truncated (#615), rather than an error.
+    let incomplete = ev(json!({"type": "response.output_text.delta", "delta": "par"}))
+        + &ev(json!({"type": "response.incomplete", "response":
         {"incomplete_details": {"reason": "max_output_tokens"}}}));
     let base = scripted_sse("/responses", vec![incomplete]).await;
+    assert_eq!(stream_once(responses(&base)).await.unwrap(), "par");
+    // Any other incomplete reason still fails loudly.
+    let other = ev(json!({"type": "response.incomplete", "response":
+        {"incomplete_details": {"reason": "something_else"}}}));
+    let base = scripted_sse("/responses", vec![other]).await;
     let err = stream_once(responses(&base)).await.unwrap_err().to_string();
-    assert!(err.contains("max_output_tokens"), "{err}");
+    assert!(err.contains("something_else"), "{err}");
 
     // A rate-limit `error` before any output is retried.
     let limited =
@@ -1150,4 +1157,84 @@ async fn anthropic_model_listing_pages_and_windows() {
     assert_eq!(models, ["claude-a", "claude-b"]);
     assert_eq!((windows["claude-a"], windows["claude-b"]), (200_000, 1_000_000));
     assert_eq!(meta["claude-a"]["max_output"], 64000);
+}
+
+async fn stream_full(base: String, responses: bool) -> formless_core::provider::ChatResult {
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    c.max_retries = 0;
+    if responses {
+        c.api_style = "responses".into();
+    }
+    let p = Provider::new(c, "k".into()).unwrap();
+    p.chat_stream(
+        &[json!({"role": "user", "content": "hi"})],
+        &[],
+        "good",
+        None,
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .unwrap()
+}
+
+/// The stream's last event without a trailing newline, a JSON field split
+/// over several `data:` lines, and tool calls sent without `index`, as
+/// cumulative resends, or in both delta and message form (#614).
+#[tokio::test]
+async fn stream_edges_lose_and_duplicate_nothing() {
+    let last = format!(
+        "data: {}\n\ndata: {}",
+        json!({"choices": [{"delta": {"content": "hi"}}]}),
+        json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 7, "completion_tokens": 2}})
+    );
+    let r = stream_full(scripted_sse("/chat/completions", vec![last]).await, false).await;
+    assert_eq!(r.content, "hi");
+    assert_eq!(r.usage.map(|u| u.prompt_tokens), Some(7), "the unterminated last event counts");
+
+    let split = "data: {\"choices\": [{\"delta\":\ndata: {\"content\": \"joined\"}}]}\n\ndata: [DONE]\n\n".to_string();
+    let r = stream_full(scripted_sse("/chat/completions", vec![split]).await, false).await;
+    assert_eq!(r.content, "joined");
+
+    let ev = |v: Value| format!("data: {v}\n\n");
+    let calls = [
+        // No index: matched by id; then cumulative name/arguments resends.
+        ev(json!({"choices": [{"delta": {"tool_calls": [{"id": "a", "function": {"name": "re", "arguments": "{\"x\""}}]}}]})),
+        ev(json!({"choices": [{"delta": {"tool_calls": [{"id": "a", "function": {"name": "read", "arguments": "{\"x\":1}"}}]}}]})),
+        // The same call again as a whole message: not added twice.
+        ev(json!({"choices": [{"message": {"tool_calls": [{"id": "a", "type": "function", "function": {"name": "read", "arguments": "{\"x\":1}"}}]}, "finish_reason": "tool_calls"}]})),
+    ]
+    .concat();
+    let r = stream_full(scripted_sse("/chat/completions", vec![calls]).await, false).await;
+    assert_eq!(r.tool_calls.len(), 1, "{:?}", r.tool_calls);
+    assert_eq!((r.tool_calls[0].name.as_str(), r.tool_calls[0].arguments.as_str()), ("read", "{\"x\":1}"));
+}
+
+/// Refusals and filter stops are never silent empty answers, and a
+/// Responses answer cut at max_output_tokens is kept as truncated (#615).
+#[tokio::test]
+async fn refusals_filters_and_responses_truncation_are_told() {
+    let ev = |v: Value| format!("data: {v}\n\n");
+    let refusal = [
+        ev(json!({"choices": [{"delta": {"refusal": "I can't help with that."}}]})),
+        ev(json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})),
+    ]
+    .concat();
+    let r = stream_full(scripted_sse("/chat/completions", vec![refusal]).await, false).await;
+    assert_eq!(r.content, "I can't help with that.");
+    assert_eq!(r.stop_reason.as_deref(), Some("refusal"));
+
+    let filtered = ev(json!({"choices": [{"delta": {}, "finish_reason": "content_filter"}]}));
+    let r = stream_full(scripted_sse("/chat/completions", vec![filtered]).await, false).await;
+    assert_eq!(r.stop_reason.as_deref(), Some("content_filter"));
+
+    let partial = [
+        ev(json!({"type": "response.output_text.delta", "delta": "part"})),
+        ev(json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "max_output_tokens"}}})),
+    ]
+    .concat();
+    let r = stream_full(scripted_sse("/responses", vec![partial]).await, true).await;
+    assert_eq!(r.content, "part");
+    assert!(r.truncated, "kept and marked, not an error");
 }
