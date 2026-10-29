@@ -931,3 +931,223 @@ async fn native_anthropic_messages_stream_and_complete() {
     assert_eq!((u.cached_tokens, u.completion_tokens, u.prompt_tokens), (100, 12, 103));
     assert_eq!(p.complete(&msgs, "claude-x", None).await.unwrap(), "summary");
 }
+
+/// Serves each scripted (status, body) on POST /messages in turn (the
+/// last repeats) and records every request body.
+async fn scripted_messages(
+    replies: Vec<(u16, String)>,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let seen2 = seen.clone();
+    let app = Router::new().route(
+        "/messages",
+        post(move |Json(body): Json<Value>| {
+            let n = {
+                let mut s = seen2.lock().unwrap();
+                s.push(body);
+                s.len() - 1
+            };
+            let (status, text) = replies[n.min(replies.len() - 1)].clone();
+            async move {
+                axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", if status == 200 { "text/event-stream" } else { "application/json" })
+                    .body(axum::body::Body::from(text))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, seen)
+}
+
+/// A complete Messages stream answering `text` (and stopping for `stop`).
+fn messages_sse(text: &str, stop: &str) -> String {
+    [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": stop}, "usage": {"output_tokens": 1}}),
+        json!({"type": "message_stop"}),
+    ]
+    .iter()
+    .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
+    .collect()
+}
+
+fn anthropic_cfg(base: &str) -> ProviderCfg {
+    let mut c = cfg(base);
+    c.fallback_models.clear();
+    c.api_style = "anthropic".into();
+    c.max_retries = 2;
+    c.max_backoff_secs = 1;
+    c
+}
+
+async fn anthropic_turn(
+    c: ProviderCfg,
+    msgs: &[Value],
+    tools: &[Value],
+    effort: Option<&str>,
+) -> (anyhow::Result<formless_core::provider::ChatResult>, Vec<DeltaKind>) {
+    let p = Provider::new(c, "k".into()).unwrap();
+    let mut kinds = Vec::new();
+    let r = p
+        .chat_stream(msgs, tools, "claude-x", effort, &CancellationToken::new(), |k, _| {
+            if k != DeltaKind::Bytes {
+                kinds.push(k)
+            }
+        })
+        .await;
+    (r, kinds)
+}
+
+/// #1055, #1064, #1058: a steer stored between a call and its result
+/// still sends `tool_result` first; failed results carry `is_error`;
+/// unsupported images never reach the API.
+#[tokio::test]
+async fn anthropic_turn_shape_results_first_errors_flagged_images_checked() {
+    let (base, seen) = scripted_messages(vec![(200, messages_sse("ok", "end_turn"))]).await;
+    let msgs = [
+        json!({"role": "user", "content": [{"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/heic;base64,AAAA"}}]}),
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+            {"id": "b", "type": "function", "function": {"name": "read", "arguments": "{}"}}]}),
+        json!({"role": "user", "content": "actually, stop"}),
+        json!({"role": "tool", "tool_call_id": "a", "content": "error: nope", "_is_error": true}),
+        json!({"role": "tool", "tool_call_id": "b", "content": "error-free output"}),
+    ];
+    let (r, _) = anthropic_turn(anthropic_cfg(&base), &msgs, &[], None).await;
+    let r = r.unwrap();
+    assert!(r.notes.iter().any(|n| n.contains("image/heic")), "{:?}", r.notes);
+    let body = seen.lock().unwrap()[0].clone();
+    let first = body["messages"][0]["content"].as_array().unwrap();
+    assert!(first.iter().all(|b| b["type"] != "image"), "no image/heic block: {first:?}");
+    let turn = &body["messages"][2]["content"];
+    assert_eq!(turn[0]["tool_use_id"], "a");
+    assert_eq!(turn[0]["is_error"], true);
+    assert_eq!(turn[1]["tool_use_id"], "b");
+    assert!(turn[1].get("is_error").is_none(), "unflagged result");
+    assert_eq!(turn[2]["text"], "actually, stop");
+}
+
+/// #1057, #1059: a 400 naming thinking, a replayed signature or
+/// cache_control is answered by exactly one resend without it.
+#[tokio::test]
+async fn anthropic_400s_are_stripped_and_resent_once() {
+    let err = |m: &str| (400, json!({"type": "error", "error": {"type": "invalid_request_error", "message": m}}).to_string());
+    let ok = (200, messages_sse("fine", "end_turn"));
+    let history = [
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": null,
+               "thinking_blocks": [{"type": "thinking", "thinking": "x", "signature": "bad"}],
+               "tool_calls": [{"id": "t", "type": "function", "function": {"name": "read", "arguments": "{}"}}]}),
+        json!({"role": "tool", "tool_call_id": "t", "content": "1"}),
+    ];
+
+    let (base, seen) = scripted_messages(vec![err("thinking is not supported by this model"), ok.clone()]).await;
+    let (r, _) = anthropic_turn(anthropic_cfg(&base), &history[..2], &[], Some("high")).await;
+    let r = r.unwrap();
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0].get("thinking").is_some() && bodies[1].get("thinking").is_none());
+    assert!(r.notes.iter().any(|n| n.contains("extended thinking")));
+
+    let (base, seen) = scripted_messages(vec![err("messages.1.content.0: Invalid `signature` in `thinking` block"), ok.clone()]).await;
+    let (r, _) = anthropic_turn(anthropic_cfg(&base), &history, &[], None).await;
+    let r = r.unwrap();
+    assert!(r.dropped_replayed_thinking);
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies[0].to_string().contains("\"signature\""));
+    assert!(!bodies[1].to_string().contains("\"signature\""));
+
+    let (base, seen) = scripted_messages(vec![err("cache_control: unsupported here"), err("cache_control: unsupported here")]).await;
+    let (r, _) = anthropic_turn(anthropic_cfg(&base), &history[..2], &[], None).await;
+    assert!(r.is_err(), "the second rejection is final");
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "exactly one resend");
+    assert!(bodies[0].to_string().contains("cache_control"));
+    assert!(!bodies[1].to_string().contains("cache_control"));
+}
+
+/// #1060, #1061: a stream without `message_stop` is a dropped stream
+/// (re-sent, clients told to clear), and stop reasons come back.
+#[tokio::test]
+async fn anthropic_incomplete_streams_retry_and_stop_reasons_surface() {
+    let cut: String = messages_sse("partial", "end_turn")
+        .split("event: message_delta")
+        .next()
+        .unwrap()
+        .to_string();
+    let (base, seen) = scripted_messages(vec![(200, cut), (200, messages_sse("whole", "end_turn"))]).await;
+    let (r, kinds) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+    assert_eq!(r.unwrap().content, "whole");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(kinds.contains(&DeltaKind::Restart), "{kinds:?}");
+
+    // A last event without its trailing newline still counts.
+    let sse = messages_sse("done", "end_turn");
+    let (base, _) = scripted_messages(vec![(200, sse.trim_end().to_string())]).await;
+    let (r, _) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+    assert_eq!(r.unwrap().content, "done");
+
+    for stop in ["refusal", "model_context_window_exceeded", "pause_turn"] {
+        let (base, _) = scripted_messages(vec![(200, messages_sse("", stop))]).await;
+        let (r, _) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+        assert_eq!(r.unwrap().stop_reason.as_deref(), Some(stop));
+    }
+    let (base, _) = scripted_messages(vec![(200, messages_sse("cut", "max_tokens"))]).await;
+    let (r, _) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+    assert!(r.unwrap().truncated);
+}
+
+/// #1056: prompt-based tools on the Messages API send a valid Messages
+/// body (no native tools, instruction in `system`) and parse the call.
+#[tokio::test]
+async fn anthropic_prompt_tool_mode_sends_messages_bodies() {
+    let call = "```json\n{\"tool_calls\": [{\"name\": \"writer\", \"arguments\": {\"x\": 1}}]}\n```";
+    let (base, seen) = scripted_messages(vec![(200, messages_sse(call, "end_turn"))]).await;
+    let mut c = anthropic_cfg(&base);
+    c.tool_mode = "prompt".into();
+    let (r, _) = anthropic_turn(c, &[json!({"role": "user", "content": "write"})], &[writer_tool()], None).await;
+    let r = r.unwrap();
+    assert_eq!(r.tool_calls.len(), 1, "{r:?}");
+    assert_eq!(r.tool_calls[0].name, "writer");
+    let body = seen.lock().unwrap()[0].clone();
+    assert!(body.get("tools").is_none());
+    assert!(body.get("stream_options").is_none() && body.get("reasoning_effort").is_none());
+    assert!(body["system"][0]["text"].as_str().unwrap().contains("writer"));
+    assert!(body["messages"].as_array().unwrap().iter().all(|m| m["role"] != "system"));
+}
+
+/// #1062: the native listing's `max_input_tokens` is the context window,
+/// and `has_more` pages are followed.
+#[tokio::test]
+async fn anthropic_model_listing_pages_and_windows() {
+    let app = Router::new().route(
+        "/models",
+        get(|q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+            Json(match q.get("after_id").map(String::as_str) {
+                None => json!({"data": [{"id": "claude-a", "max_input_tokens": 200000, "max_tokens": 64000}],
+                               "has_more": true, "last_id": "claude-a"}),
+                Some("claude-a") => json!({"data": [{"id": "claude-b", "max_input_tokens": 1000000}],
+                               "has_more": false, "last_id": "claude-b"}),
+                Some(other) => panic!("unexpected after_id {other}"),
+            })
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let p = Provider::new(anthropic_cfg(&base), "k".into()).unwrap();
+    let (models, windows, meta) = p.list_models_meta().await.unwrap();
+    assert_eq!(models, ["claude-a", "claude-b"]);
+    assert_eq!((windows["claude-a"], windows["claude-b"]), (200_000, 1_000_000));
+    assert_eq!(meta["claude-a"]["max_output"], 64000);
+}

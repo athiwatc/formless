@@ -45,6 +45,21 @@ impl Default for EventFilter {
     }
 }
 
+/// What the user is told about how an answer ended, beyond "done".
+fn stop_note(result: &crate::provider::ChatResult) -> Option<String> {
+    match result.stop_reason.as_deref()? {
+        "refusal" => Some(match &result.stop_detail {
+            Some(c) => format!("The model refused this request ({c})."),
+            None => "The model refused this request.".to_string(),
+        }),
+        "model_context_window_exceeded" => {
+            Some("The answer stopped because the model's context window is full.".into())
+        }
+        "pause_turn" => Some("The model paused its turn; ask it to continue.".into()),
+        other => Some(format!("The answer ended early ({other}).")),
+    }
+}
+
 tokio::task_local! {
     /// The connection (id, label) a request came from, for attribution.
     static CLIENT: (u64, String);
@@ -1722,14 +1737,15 @@ impl Daemon {
                     return Err(anyhow!("provider names use letters, digits, '-' and '_' (and 'default' is [provider])"));
                 }
                 let mut cfg = Config::load_file_only(&self.paths)?;
-                let new = !cfg.providers.contains_key(&name);
+                let old_url = cfg.providers.get(&name).map(|p| p.base_url.clone());
                 let p = cfg.providers.entry(name.clone()).or_default();
                 p.base_url = base_url.trim_end_matches('/').to_string();
-                // A preset's endpoint gets its API style (Anthropic: native).
-                if new {
-                    if let Some(preset) = crate::presets::for_url(&p.base_url) {
-                        p.api_style = preset.api_style.to_string();
-                    }
+                // A preset's endpoint gets its API style (Anthropic: native),
+                // also when an existing provider moves to another one.
+                if let Some(style) =
+                    crate::presets::restyle(old_url.as_deref(), &p.base_url, &p.api_style)
+                {
+                    p.api_style = style.to_string();
                 }
                 if let Some(m) = model {
                     p.model = m;
@@ -3115,7 +3131,7 @@ impl Daemon {
                     "tool",
                     "error: the run stopped before this call finished; it was not retried. \
                      Run it again if it is still needed.",
-                    Some(json!({"tool_call_id": call_id, "name": name}).to_string()),
+                    Some(tool_result_meta(&call_id, &name, true)),
                 )
             })?;
             self.broadcast(Event::MessageAppended {
@@ -3656,6 +3672,8 @@ impl Daemon {
         // any Tool was used, is sent back with a nudge to build the Tool.
         let mut nudged_refusal = false;
         let mut used_tools = false;
+        let mut context_retried = false;
+        let mut paused_turns = 0;
         loop {
             if cancel.is_cancelled() {
                 return Err(anyhow!("interrupted"));
@@ -3803,6 +3821,49 @@ impl Daemon {
                     text: "Provider rejected reasoning_effort; retried without it.".into(),
                 });
             }
+            for text in &result.notes {
+                self.broadcast(Event::Note {
+                    session_id: Some(session_id.to_string()),
+                    text: text.clone(),
+                });
+            }
+            if result.dropped_replayed_thinking {
+                let _ = self.with_store(|st| st.drop_thinking_blocks(session_id));
+            }
+            // Anthropic: the answer stopped because the context is full.
+            // Compact and ask again once, rather than accept a partial answer.
+            if result.stop_reason.as_deref() == Some("model_context_window_exceeded")
+                && !context_retried
+            {
+                context_retried = true;
+                let up_to = self.session_context(session_id, context_tokens, 0.0)?.2;
+                if up_to > 0 {
+                    self.broadcast(Event::Note {
+                        session_id: Some(session_id.to_string()),
+                        text: "The model's context window is full; compacting and asking again.".into(),
+                    });
+                    self.compact(&provider, &cfg, session_id, &model, context_tokens, up_to, None)
+                        .await?;
+                    continue;
+                }
+            }
+            // Anthropic `pause_turn`: the turn is resumed by sending it back.
+            if result.stop_reason.as_deref() == Some("pause_turn")
+                && result.tool_calls.is_empty()
+                && paused_turns < 3
+            {
+                paused_turns += 1;
+                if !result.content.is_empty() {
+                    let msg = self.with_store(|st| {
+                        st.append_message(session_id, "assistant", &result.content)
+                    })?;
+                    self.broadcast(Event::MessageAppended {
+                        session_id: session_id.to_string(),
+                        message: msg,
+                    });
+                }
+                continue;
+            }
             if result.tool_calls.is_empty()
                 && cfg.provider.tool_use_nudge
                 && !used_tools
@@ -3856,8 +3917,15 @@ impl Daemon {
                         json!({"model": {"name": result.model_used, "via": via, "requested": requested_model}})
                             .to_string()
                     });
+                let content = if result.content.trim().is_empty()
+                    && result.stop_reason.as_deref() == Some("refusal")
+                {
+                    "(The model declined to answer this request.)".to_string()
+                } else {
+                    result.content.clone()
+                };
                 let msg = self.with_store(|st| {
-                    st.append_message_meta(session_id, "assistant", &result.content, served)
+                    st.append_message_meta(session_id, "assistant", &content, served)
                 })?;
                 self.broadcast(Event::MessageComplete {
                     session_id: session_id.to_string(),
@@ -3868,6 +3936,12 @@ impl Daemon {
                     self.broadcast(Event::Note {
                         session_id: Some(session_id.to_string()),
                         text: "The answer was cut off at the model's output token limit.".into(),
+                    });
+                }
+                if let Some(text) = stop_note(&result) {
+                    self.broadcast(Event::Note {
+                        session_id: Some(session_id.to_string()),
+                        text,
                     });
                 }
                 return Ok(());
@@ -3918,7 +3992,7 @@ impl Daemon {
                             session_id,
                             "tool",
                             &truncated_call_message(&tc.name),
-                            Some(json!({"tool_call_id": tc.id, "name": tc.name}).to_string()),
+                            Some(tool_result_meta(&tc.id, &tc.name, true)),
                         )
                     })?;
                     self.broadcast(Event::MessageAppended {
@@ -3944,15 +4018,18 @@ impl Daemon {
                 let denied = denied.clone();
                 let skip = skipped.contains(&tc.id);
                 futs.push(async move {
-                    let text = if skip {
-                        "skipped: the user chose not to run this call (step mode). \
-                         Continue without its result, or ask them."
-                            .to_string()
+                    let (text, is_error) = if skip {
+                        (
+                            "skipped: the user chose not to run this call (step mode). \
+                             Continue without its result, or ask them."
+                                .to_string(),
+                            true,
+                        )
                     } else {
                         this.dispatch_call(&sid, &rid, &tc, &cfg2, &flag, &tok, &denied)
                             .await
                     };
-                    (tc, text)
+                    (tc, text, is_error)
                 });
             }
             let results = futures_util::future::join_all(futs).await;
@@ -3963,13 +4040,13 @@ impl Daemon {
                     st.attribute_step_tokens(run_id, &step_started, tokens, result.tool_calls.len())
                 });
             }
-            for (tc, text) in results {
+            for (tc, text, is_error) in results {
                 let msg = self.with_store(|st| {
                     st.append_message_meta(
                         session_id,
                         "tool",
                         &text,
-                        Some(json!({"tool_call_id": tc.id, "name": tc.name}).to_string()),
+                        Some(tool_result_meta(&tc.id, &tc.name, is_error)),
                     )
                 })?;
                 self.broadcast(Event::MessageAppended {
@@ -4516,8 +4593,34 @@ impl Daemon {
         cancel_flag: &Arc<AtomicBool>,
         cancel: &CancellationToken,
         denied: &HashMap<String, bool>,
-    ) -> String {
-        self.dispatch_call_inner(session_id, run_id, tc, cfg, cancel_flag, cancel, denied, 0)
+    ) -> (String, bool) {
+        self.dispatch_call_checked(session_id, run_id, tc, cfg, cancel_flag, cancel, denied, 0)
+            .await
+    }
+
+    /// [`Self::dispatch_call_inner`] plus whether the call failed, as
+    /// recorded by [`call_failed`] where the failure was produced (never
+    /// guessed from the text, which a Tool's own output may resemble).
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_call_checked(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+        tc: &ToolCall,
+        cfg: &Config,
+        cancel_flag: &Arc<AtomicBool>,
+        cancel: &CancellationToken,
+        denied: &HashMap<String, bool>,
+        agent_depth: usize,
+    ) -> (String, bool) {
+        CALL_FAILED
+            .scope(std::cell::Cell::new(false), async {
+                let text = Box::pin(self.dispatch_call_inner(
+                    session_id, run_id, tc, cfg, cancel_flag, cancel, denied, agent_depth,
+                ))
+                .await;
+                (text, CALL_FAILED.with(std::cell::Cell::get))
+            })
             .await
     }
 
@@ -4538,10 +4641,10 @@ impl Daemon {
             Err(e) => {
                 // Malformed model tool-call: feed back for correction, never
                 // counted against any Tool (SPEC §4.4).
-                return format!(
+                return call_failed(format!(
                     "error: invalid JSON arguments for {}: {e}. Retry with valid JSON.",
                     tc.name
-                );
+                ));
             }
         };
         // Nested objects sent as JSON strings (some models do this) are
@@ -4558,7 +4661,7 @@ impl Daemon {
             )
             .await
         {
-            return format!("error: denied by a pre_tool hook: {reason}");
+            return call_failed(format!("error: denied by a pre_tool hook: {reason}"));
         }
         // Bootstrap/meta tools don't pass through execute_tool_value, so
         // broadcast their lifecycle here (registry Tools broadcast there).
@@ -4588,57 +4691,57 @@ impl Daemon {
                     }
                     self.note_broad_tool(session_id, &tool_id, text)
                 }
-                Err(e) => format!("error: create_tool failed: {e}"),
+                Err(e) => call_failed(format!("error: create_tool failed: {e}")),
             },
             toolreg::FIND_TOOLS => match self.find_tools_impl(session_id, &args) {
                 Ok(text) => text,
-                Err(e) => format!("error: find_tools failed: {e}"),
+                Err(e) => call_failed(format!("error: find_tools failed: {e}")),
             },
             toolreg::ADD_MCP_SERVER => self.agent_add_mcp_server(session_id, &args, cancel).await,
             toolreg::LOAD_SKILL => match self.load_skill_impl(session_id, run_id, &args) {
                 Ok(text) => text,
-                Err(e) => format!("error: load_skill failed: {e}"),
+                Err(e) => call_failed(format!("error: load_skill failed: {e}")),
             },
             toolreg::READ_METRICS => match self.read_metrics_impl(&args) {
                 Ok(v) => v.to_string(),
-                Err(e) => format!("error: read_metrics failed: {e}"),
+                Err(e) => call_failed(format!("error: read_metrics failed: {e}")),
             },
             toolreg::SCHEDULE_RUN => {
                 match self.schedule_run_impl(session_id, &args, cancel).await {
                     Ok(text) => text,
-                    Err(e) => format!("error: schedule_run failed: {e}"),
+                    Err(e) => call_failed(format!("error: schedule_run failed: {e}")),
                 }
             }
             toolreg::ASK_USER => match self.ask_user_impl(session_id, &args, cancel).await {
                 Ok(text) => text,
-                Err(e) => format!("error: ask_user failed: {e}"),
+                Err(e) => call_failed(format!("error: ask_user failed: {e}")),
             },
             toolreg::REMEMBER => match self.remember_impl(session_id, &args, cfg, cancel).await {
                 Ok(text) => text,
-                Err(e) => format!("error: remember failed: {e}"),
+                Err(e) => call_failed(format!("error: remember failed: {e}")),
             },
             toolreg::UPDATE_PLAN => match self.update_plan_impl(session_id, &args) {
                 Ok(text) => text,
-                Err(e) => format!("error: update_plan failed: {e}"),
+                Err(e) => call_failed(format!("error: update_plan failed: {e}")),
             },
             toolreg::FORGET => match self.forget_impl(session_id, &args) {
                 Ok(text) => text,
-                Err(e) => format!("error: forget failed: {e}"),
+                Err(e) => call_failed(format!("error: forget failed: {e}")),
             },
             toolreg::READ_SKILL_FILE => match self.read_skill_file_impl(&args) {
                 Ok(text) => self.model_text(session_id, &json!(text), cfg),
-                Err(e) => format!("error: read_skill_file failed: {e}"),
+                Err(e) => call_failed(format!("error: read_skill_file failed: {e}")),
             },
             toolreg::LIST_MCP_RESOURCES => {
                 match self.list_mcp_resources(session_id, &args, cancel).await {
                     Ok(v) => v.to_string(),
-                    Err(e) => format!("error: list_mcp_resources failed: {e}"),
+                    Err(e) => call_failed(format!("error: list_mcp_resources failed: {e}")),
                 }
             }
             toolreg::READ_MCP_RESOURCE => {
                 match self.read_mcp_resource(session_id, &args, cfg, cancel).await {
                     Ok(text) => text,
-                    Err(e) => format!("error: read_mcp_resource failed: {e}"),
+                    Err(e) => call_failed(format!("error: read_mcp_resource failed: {e}")),
                 }
             }
             toolreg::REMOVE_MCP_SERVER => {
@@ -4657,21 +4760,21 @@ impl Daemon {
                     .await;
                 if !approved {
                     let _ = self.with_store(|st| st.audit("agent", "mcp.remove.denied", &name));
-                    "error: the user did not approve removing this MCP server".to_string()
+                    call_failed("error: the user did not approve removing this MCP server".to_string())
                 } else {
                     match self.remove_mcp_server(&name, "agent").await {
                         Ok(v) => v.to_string(),
-                        Err(e) => format!("error: {e}"),
+                        Err(e) => call_failed(format!("error: {e}")),
                     }
                 }
             }
             toolreg::READ_ARTIFACT => match self.read_artifact_impl(session_id, &args) {
                 Ok(text) => text,
-                Err(e) => format!("error: read_artifact failed: {e}"),
+                Err(e) => call_failed(format!("error: read_artifact failed: {e}")),
             },
             toolreg::READ_MODULE => match self.read_module_impl(&args) {
                 Ok(text) => text,
-                Err(e) => format!("error: read_module failed: {e}"),
+                Err(e) => call_failed(format!("error: read_module failed: {e}")),
             },
             toolreg::UNLOAD_TOOLS => {
                 let names: Vec<String> = args["names"]
@@ -4688,12 +4791,12 @@ impl Daemon {
                 match self.with_store(|st| st.request_unload(session_id, &ids)) {
                     Ok(n) => json!({"will_unload": n, "when": "at the next context compaction"})
                         .to_string(),
-                    Err(e) => format!("error: unload_tools failed: {e}"),
+                    Err(e) => call_failed(format!("error: unload_tools failed: {e}")),
                 }
             }
             toolreg::READ_TOOL => match self.read_tool_impl(session_id, &args) {
                 Ok(text) => text,
-                Err(e) => format!("error: read_tool failed: {e}"),
+                Err(e) => call_failed(format!("error: read_tool failed: {e}")),
             },
             toolreg::TEST_TOOL => match self
                 .test_tool_impl(
@@ -4708,14 +4811,14 @@ impl Daemon {
                 .await
             {
                 Ok(text) => text,
-                Err(e) => format!("error: test_tool failed: {e}"),
+                Err(e) => call_failed(format!("error: test_tool failed: {e}")),
             },
             toolreg::RUN_SCRIPT => match self
                 .run_script_impl(session_id, run_id, &args, cfg, cancel, agent_depth)
                 .await
             {
                 Ok(text) => text,
-                Err(e) => format!("error: run_script failed: {e}"),
+                Err(e) => call_failed(format!("error: run_script failed: {e}")),
             },
             toolreg::CREATE_MODULE => {
                 match self
@@ -4723,7 +4826,7 @@ impl Daemon {
                     .await
                 {
                     Ok(text) => text,
-                    Err(e) => format!("error: create_module failed: {e}"),
+                    Err(e) => call_failed(format!("error: create_module failed: {e}")),
                 }
             }
             toolreg::RETIRE_TOOL => {
@@ -4748,19 +4851,19 @@ impl Daemon {
                         }
                         json!({"retired": name, "reason": reason}).to_string()
                     }
-                    _ => format!("error: no tool named '{name}'"),
+                    _ => call_failed(format!("error: no tool named '{name}'")),
                 }
             }
             toolreg::AWAIT_INVOCATION => {
                 let handle = args["invocation_id"].as_str().unwrap_or_default();
                 match self.pending_get(handle) {
                     Some(entry) => match self.wait_pending(&entry, None, cancel).await {
-                        Some((_ok, text)) => {
+                        Some((ok, text)) => {
                             entry.delivered.store(true, Ordering::SeqCst);
                             self.forget_pending(handle);
-                            text
+                            if ok { text } else { call_failed(text) }
                         }
-                        None => "error: interrupted while awaiting invocation".to_string(),
+                        None => call_failed("error: interrupted while awaiting invocation".to_string()),
                     },
                     None => self.stale_handle_answer(handle),
                 }
@@ -4797,7 +4900,7 @@ impl Daemon {
             name => {
                 // Denied in the approval pre-pass?
                 if denied.contains_key(&tc.id) {
-                    return format!("error: {}", self.denied_text(name));
+                    return call_failed(format!("error: {}", self.denied_text(name)));
                 }
                 self.dispatch_pending(
                     session_id,
@@ -5153,7 +5256,7 @@ impl Daemon {
                 })
                 .to_string()
             }
-            _ => format!("error: unknown invocation handle '{handle}'"),
+            _ => call_failed(format!("error: unknown invocation handle '{handle}'")),
         }
     }
 
@@ -5281,10 +5384,10 @@ impl Daemon {
         }
         let threshold = std::time::Duration::from_secs(cfg.tools.pending_threshold_secs);
         match self.wait_pending(&entry, Some(threshold), cancel).await {
-            Some((_ok, text)) => {
+            Some((ok, text)) => {
                 entry.delivered.store(true, Ordering::SeqCst);
                 self.forget_pending(&handle);
-                text
+                if ok { text } else { call_failed(text) }
             }
             None => {
                 let _ = self.with_store(|st| st.add_pending_handle(&handle, session_id, name));
@@ -6206,8 +6309,8 @@ impl Daemon {
                         .approve_calls(cfg, session_id, run_id, &result.tool_calls, cancel)
                         .await?;
                     for tc in &result.tool_calls {
-                        let text = self
-                            .dispatch_call_inner(
+                        let (text, is_error) = self
+                            .dispatch_call_checked(
                                 session_id,
                                 run_id,
                                 tc,
@@ -6218,7 +6321,10 @@ impl Daemon {
                                 agent_depth,
                             )
                             .await;
-                        let msg = json!({"role": "tool", "tool_call_id": tc.id, "content": text});
+                        let mut msg = json!({"role": "tool", "tool_call_id": tc.id, "content": text});
+                        if is_error {
+                            msg["_is_error"] = json!(true);
+                        }
                         record(&msg);
                         messages.push(msg);
                     }
@@ -6851,8 +6957,14 @@ impl Daemon {
                     .with_context(|| format!("{base_url} is not reachable; nothing changed"))?;
                 let model = args["model"].as_str().map(str::to_string);
                 edit_config(&|cfg| {
+                    let old_url = cfg.providers.get(&name).map(|p| p.base_url.clone());
                     let p = cfg.providers.entry(name.clone()).or_default();
                     p.base_url = base_url.clone();
+                    if let Some(style) =
+                        crate::presets::restyle(old_url.as_deref(), &base_url, &p.api_style)
+                    {
+                        p.api_style = style.to_string();
+                    }
                     if let Some(m) = &model {
                         p.model = m.clone();
                     }
@@ -6950,6 +7062,9 @@ impl Daemon {
                 .unwrap_or_default()
                 .to_string();
             p.model = inv_args["model"].as_str().unwrap_or_default().to_string();
+            if let Some(style) = inv_args["api_style"].as_str() {
+                p.api_style = style.to_string();
+            }
             cfg.save(&self.paths)?;
             let _ = self.config();
         } else {
@@ -8163,11 +8278,11 @@ impl Daemon {
             .await;
         if !approved {
             let _ = self.with_store(|st| st.audit("agent", "mcp.add.denied", &name));
-            return "error: the user did not approve adding this MCP server".into();
+            return call_failed("error: the user did not approve adding this MCP server".into());
         }
         match self.add_mcp_server(&name, server, "agent").await {
             Ok(v) => v.to_string(),
-            Err(e) => format!("error: {e}"),
+            Err(e) => call_failed(format!("error: {e}")),
         }
     }
 
@@ -11149,6 +11264,28 @@ impl HostOps for NestedOps {
 /// Outcome of a built-in call from its result text (no payload kept):
 /// whether it succeeded and a short kind for the failure or notable
 /// success (an empty `find_tools`, a failed `test_tool`).
+tokio::task_local! {
+    /// Set by [`call_failed`] while one tool call is dispatched.
+    static CALL_FAILED: std::cell::Cell<bool>;
+}
+
+/// Mark the tool call being dispatched as failed (`is_error` on its
+/// result) and pass its text through.
+fn call_failed(text: String) -> String {
+    let _ = CALL_FAILED.try_with(|f| f.set(true));
+    text
+}
+
+/// A stored tool message's meta: which call it answers, and whether it
+/// reports a failure (Anthropic `tool_result.is_error`).
+fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
+    let mut meta = json!({"tool_call_id": call_id, "name": name});
+    if is_error {
+        meta["is_error"] = json!(true);
+    }
+    meta.to_string()
+}
+
 pub fn builtin_outcome(name: &str, text: &str) -> (bool, &'static str) {
     if let Some(err) = text.strip_prefix("error:") {
         let kind = if err.contains("syntax check failed") {

@@ -2530,6 +2530,31 @@ impl Store {
             .ok())
     }
 
+    /// Forget the Anthropic thinking stored on a Session's tool-call turns
+    /// (the endpoint rejected it): it is not replayed again.
+    pub fn drop_thinking_blocks(&self, session_id: &str) -> Result<usize> {
+        let mut changed = 0;
+        for m in self.list_messages(session_id)? {
+            let Some(mut meta) = m
+                .meta
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            else {
+                continue;
+            };
+            if meta.as_object_mut().and_then(|o| o.remove("thinking_blocks")).is_some() {
+                changed += self.ex(
+                    "UPDATE messages SET meta=?3 WHERE session_id=?1 AND id=?2",
+                    params![session_id, m.id, meta.to_string()],
+                )?;
+            }
+        }
+        if changed > 0 {
+            self.note_rewrite();
+        }
+        Ok(changed)
+    }
+
     /// Tool calls of the latest assistant tool-call turn that never got a
     /// result (the Run stopped mid-batch), as (call id, tool name).
     pub fn dangling_tool_calls(&self, session_id: &str) -> Result<Vec<(String, String)>> {
@@ -5155,7 +5180,13 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         return json!({"role": "user", "content": format!("[harness note] {}", m.content)});
     }
     if m.role == "tool" {
-        return json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
+        let mut msg = json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
+        // A failed call: Anthropic's `tool_result.is_error` (a marker the
+        // other APIs strip before sending).
+        if meta["is_error"] == true {
+            msg["_is_error"] = json!(true);
+        }
+        return msg;
     }
     if m.role == "assistant" && meta["tool_calls"].is_array() {
         // Any preamble before the calls stays: it is the model's stated plan.

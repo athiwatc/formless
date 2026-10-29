@@ -115,10 +115,40 @@ pub fn find(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)
 }
 
+/// A URL compared loosely: case, trailing `/` and a trailing `/v1`
+/// don't matter (`https://api.anthropic.com` is the Anthropic preset).
+fn url_key(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    u.strip_suffix("/v1").unwrap_or(&u).to_string()
+}
+
 /// The preset whose endpoint is `base_url`, if any.
 pub fn for_url(base_url: &str) -> Option<&'static Preset> {
-    let url = base_url.trim().trim_end_matches('/');
-    PRESETS.iter().find(|p| p.base_url == url)
+    let url = url_key(base_url);
+    PRESETS.iter().find(|p| url_key(p.base_url) == url)
+}
+
+/// The API style a provider should have after its base URL changes from
+/// `old_url` (None: a new provider) to `new_url`, when it should change.
+/// A new provider, or one moved to another preset's endpoint, takes that
+/// preset's style; one moved off a preset back to an unknown endpoint
+/// returns to `chat` only if its style was the old preset's (an explicit
+/// choice is kept). None = keep `current`.
+pub fn restyle(old_url: Option<&str>, new_url: &str, current: &str) -> Option<&'static str> {
+    let new = for_url(new_url);
+    let Some(old_url) = old_url else {
+        return new.map(|p| p.api_style);
+    };
+    if url_key(old_url) == url_key(new_url) {
+        return None;
+    }
+    let old = for_url(old_url);
+    let style = match (old, new) {
+        (_, Some(n)) => n.api_style,
+        (Some(o), None) if o.api_style.eq_ignore_ascii_case(current) => "chat",
+        _ => return None,
+    };
+    (!style.eq_ignore_ascii_case(current)).then_some(style)
 }
 
 /// A base URL from either a URL or a preset id.
@@ -210,5 +240,18 @@ mod tests {
             assert!(p.local == p.key_env.is_none(), "{}", p.id);
             assert!(p.base_url.starts_with("http"));
         }
+    }
+
+    #[test]
+    fn restyle_follows_the_endpoint_family() {
+        let (oa, an) = ("https://api.openai.com/v1", "https://api.anthropic.com/v1");
+        assert_eq!(restyle(None, "https://api.anthropic.com", "chat"), Some("anthropic"));
+        assert_eq!(restyle(Some(oa), an, "chat"), Some("anthropic"));
+        assert_eq!(restyle(Some(an), oa, "anthropic"), Some("chat"));
+        assert_eq!(restyle(Some(an), "http://my-proxy:8080/v1", "anthropic"), Some("chat"));
+        // Unrelated edits and explicit choices are kept.
+        assert_eq!(restyle(Some(an), "https://api.anthropic.com/v1/", "anthropic"), None);
+        assert_eq!(restyle(Some("http://a/v1"), "http://b/v1", "responses"), None);
+        assert_eq!(restyle(Some(an), "http://my-proxy/v1", "responses"), None);
     }
 }
