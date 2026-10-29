@@ -1272,6 +1272,24 @@ pub enum Request {
     RestartMcpServer {
         name: String,
     },
+    /// Probe a model: latency, streaming, reasoning and tool calling,
+    /// remembered per (endpoint, model) (`provider` names a non-default
+    /// provider). The picker's Test and `formless providers test --model`.
+    TestModel {
+        model: String,
+        #[serde(default)]
+        provider: Option<String>,
+    },
+    /// The latest routing decisions with each candidate's figures and the
+    /// reason for the pick (`/routing`, SPEC §4.6).
+    RoutingDecisions,
+    /// The rate limits each endpoint last reported (`x-ratelimit-*`).
+    RateLimits,
+    /// Ollama: download a model (`POST /api/pull`), streaming
+    /// `ModelPullProgress`.
+    OllamaPull {
+        model: String,
+    },
     /// Run the same prompt on two or more models, each in a fork of the
     /// Session (`/compare A B [prompt]`, SPEC §5.10): `prompt`, or the
     /// Session's last message re-asked. `ComparisonReady` reports back.
@@ -1565,6 +1583,16 @@ pub enum Request {
         model: Option<String>,
         #[serde(default)]
         api_key: Option<String>,
+        /// Extra request headers and query parameters (gateways, Azure's
+        /// `api-version`); None leaves them as they are.
+        #[serde(default)]
+        headers: Option<std::collections::BTreeMap<String, String>>,
+        #[serde(default)]
+        query_params: Option<std::collections::BTreeMap<String, String>>,
+        /// Header carrying the key instead of `Authorization: Bearer`
+        /// (`api-key` for Azure); Some("") restores Bearer.
+        #[serde(default)]
+        api_key_header: Option<String>,
     },
     /// Remove a named provider (refused while a role uses it).
     RemoveProvider {
@@ -2002,6 +2030,20 @@ pub enum Event {
         run_id: String,
         files: Vec<RunFileInfo>,
     },
+    /// Ollama download progress for `model` (status text, bytes so far
+    /// and in total when known); `done` ends it.
+    ModelPullProgress {
+        model: String,
+        status: String,
+        #[serde(default)]
+        completed: Option<u64>,
+        #[serde(default)]
+        total: Option<u64>,
+        #[serde(default)]
+        done: bool,
+        #[serde(default)]
+        error: Option<String>,
+    },
     /// Every Run of a `CompareModels` finished: the answers side by side.
     ComparisonReady {
         session_id: String,
@@ -2319,6 +2361,7 @@ impl Event {
             Event::SessionDeleted { id } => Some(id),
             Event::SettingsChanged
             | Event::McpServersChanged
+            | Event::ModelPullProgress { .. }
             | Event::SkillsChanged
             | Event::MemoryUpdated
             | Event::JobsChanged

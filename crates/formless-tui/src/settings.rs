@@ -431,6 +431,24 @@ fn field(label: &'static str, value: &str, masked: bool, hint: &'static str) -> 
     }
 }
 
+/// `Key=Value, Key2=Value2` → a map; blank → None (keep what is set).
+fn pairs(text: &str) -> Result<Option<std::collections::BTreeMap<String, String>>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .ok_or_else(|| format!("'{p}': write key=value"))
+        })
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
 impl Form {
     pub fn provider(existing: Option<&Value>) -> Self {
         let get = |k: &str| {
@@ -464,6 +482,32 @@ impl Form {
                     } else {
                         "stored in the keychain"
                     },
+                ),
+                field(
+                    "headers",
+                    "",
+                    true,
+                    "advanced: extra headers, Key=Value, … (blank keeps the current ones)",
+                ),
+                field(
+                    "query",
+                    &existing
+                        .and_then(|p| p["query_params"].as_object())
+                        .map(|q| {
+                            q.iter()
+                                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default(),
+                    false,
+                    "advanced: query parameters, key=value, … (Azure: api-version=…)",
+                ),
+                field(
+                    "key_header",
+                    &get("api_key_header"),
+                    false,
+                    "advanced: send the key in this header instead of Bearer (Azure: api-key)",
                 ),
             ],
             idx: if existing.is_some() { 1 } else { 0 },
@@ -532,6 +576,9 @@ impl Form {
                     base_url,
                     model: Some(self.value(2)).filter(|m| !m.is_empty()),
                     api_key: Some(self.fields[3].input.to_string()).filter(|k| !k.is_empty()),
+                    headers: pairs(&self.fields[4].input.to_string())?,
+                    query_params: pairs(&self.value(5))?.or_else(|| Some(Default::default())),
+                    api_key_header: Some(self.value(6)),
                 })
             }
             FormKind::Role => {

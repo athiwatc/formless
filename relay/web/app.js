@@ -1416,6 +1416,25 @@
 
   /** `/model`: filter models as you type; Enter sets this Session's model,
    * Ctrl/⌘+Enter the global default. */
+  // "200k ctx · $3/$15 per M · vision · tools · ✗ test failed" (SPEC §4.2).
+  function modelDetail(m, t) {
+    const parts = [];
+    m = m || {};
+    if (m.context) parts.push(m.context >= 1e6 ? Math.floor(m.context / 1e6) + "M ctx" : Math.floor(m.context / 1000) + "k ctx");
+    if (m.input_price != null && m.output_price != null) parts.push("$" + m.input_price + "/$" + m.output_price + " per M");
+    if (m.vision) parts.push("vision");
+    if (m.tools === true) parts.push("tools");
+    if (m.tools === false) parts.push("no tools");
+    if (t) parts.push(t.ok ? "✓ tested" : "✗ test failed");
+    return parts.join(" · ");
+  }
+  function modelTestText(t) {
+    const ms = (v) => (v == null ? "-" : v + " ms");
+    return (t.ok ? "✓ " : "✗ ") + t.model + ": first token " + ms(t.first_token_ms) + ", total " + ms(t.total_ms)
+      + " · streaming " + (t.streaming ? "yes" : "no") + " · reasoning " + (t.reasoning ? "yes" : "no")
+      + " · tool calls " + (t.tool_calling ? "yes" : "no") + (t.prompt_fallback ? " (prompt fallback)" : "")
+      + (t.error ? " · " + t.error : "");
+  }
   async function openModelPicker() {
     const session = S.sessions.find((x) => x.id === S.current);
     const efforts = ["", "low", "medium", "high"];
@@ -1428,12 +1447,14 @@
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
     const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, "Use in this Session");
+    const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
+    let meta = {}, tests = {};
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Model" },
       h("div", { class: "modal picker" },
         h("h2", null, "Model"),
         input, list,
         h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
-        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), cancel, asDefault, apply)));
+        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), test, cancel, asDefault, apply)));
     let items = [], matches = [], sel = 0;
     const close = () => { dialog.remove(); $("input").focus(); };
     const choice = () => (matches[sel] && matches[sel].item.id) || input.value.trim();
@@ -1454,13 +1475,22 @@
         const li = h("li", { role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null },
           h("span", { class: "picker-id" }, id),
           x.item.recent ? h("span", { class: "picker-tag" }, "recent") : null,
-          sources && x.item.source ? h("span", { class: "muted" }, x.item.source) : null);
+          sources && x.item.source ? h("span", { class: "muted" }, x.item.source) : null,
+          modelDetail(meta[x.item.id], tests[x.item.id]) ? h("span", { class: "muted" }, modelDetail(meta[x.item.id], tests[x.item.id])) : null);
         li.onclick = () => { sel = i; draw(); };
         li.ondblclick = () => { sel = i; finish(false); };
         return li;
       }));
       const selNode = list.children[sel - first];
       if (selNode) selNode.scrollIntoView({ block: "nearest" });
+      // Only the efforts the highlighted model accepts (SPEC §4.2).
+      const accepted = (meta[choice()] || {}).efforts;
+      const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
+      const was = effort.value;
+      effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
+      effort.value = offer.includes(was) ? was : "";
+      effort.disabled = offer.length <= 1;
+      effort.title = offer.length <= 1 ? "Effort has no effect for this model" : "";
       if (!items.length) return;
       status.textContent = matches.length
         ? matches.length + " of " + items.length
@@ -1487,14 +1517,27 @@
     cancel.onclick = close;
     apply.onclick = () => finish(false);
     asDefault.onclick = () => finish(true);
+    test.onclick = async () => {
+      const model = choice();
+      if (!model) return;
+      status.textContent = "testing " + model + "…";
+      const t = await act({ type: "test_model", model }, null, 120000);
+      if (!t) return;
+      tests[model] = t;
+      status.textContent = modelTestText(t);
+      draw();
+    };
     document.body.append(dialog);
     input.focus();
     const r = await act({ type: "list_models" }, null, 30000);
     if (!r || !dialog.isConnected) return;
     const recent = r.recent || [];
+    meta = r.meta || {};
+    tests = r.tests || {};
     const push = (id, source) => {
       if (!items.some((i) => i.id === id)) items.push({ id, source, recent: recent.includes(id) });
     };
+    for (const [alias, target] of Object.entries(r.aliases || {})) push(alias, "alias → " + target);
     for (const role of r.roles || [])
       push("role:" + role.name, "role · " + (role.provider || "default") + " · " + (role.model || "its default model"));
     for (const m of r.models || []) push(m, "default provider");
@@ -1604,6 +1647,9 @@
         open("system-note", m.created_at).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
       } else {
         open("assistant", m.created_at).append(messageBody(m, (n) => {
+          let served = null;
+          try { served = JSON.parse(m.meta || "{}").model; } catch (_) {}
+          if (served && served.name) n.append(h("div", { class: "muted sent-from", title: "The Session asked for " + (served.requested || "another model") }, "via " + served.name + " (" + (served.via || "fallback") + ")"));
           if (m.content) n.append(markdown(m.content));
           let calls = [];
           try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
@@ -3780,6 +3826,31 @@
       if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
     } },
     { name: "retry", args: "[--model MODEL]", group: "Run control", desc: "re-run your last message, optionally on another model (the old answer stays in a fork)", run: (arg) => retryRun((arg || "").replace(/^--model\s*/, "").trim()) },
+    { name: "test", args: "[MODEL]", group: "Settings", desc: "test a model: latency, streaming, reasoning, tool calls", run: async (arg) => {
+      const s = S.sessions.find((x) => x.id === S.current);
+      const model = (arg || "").trim() || (s && s.model) || (S.settings && S.settings.provider && S.settings.provider.model);
+      if (!model) return note("usage: /test MODEL", true);
+      note("testing " + model + "…");
+      const t = await act({ type: "test_model", model }, null, 120000);
+      if (t) note(modelTestText(t), !t.ok);
+    } },
+    { name: "routing", group: "Settings", desc: "why routing picked each model lately", run: async () => {
+      const list = await act({ type: "routing_decisions" });
+      if (!list) return;
+      if (!list.length) return note("no routing decisions yet (provider.model = \"auto\" or Roles with candidates)");
+      modal("Routing decisions", h("div", null, list.map((d) => h("section", null,
+        h("h3", null, (d.kind || "") + " → " + d.picked), h("p", { class: "muted" }, relTime(d.at) + " · " + d.reason),
+        h("table", { class: "table" }, h("tbody", null, (d.candidates || []).map((c) => h("tr", { class: c.model === d.picked ? "" : "muted" },
+          h("td", null, (c.model === d.picked ? "▸ " : "") + c.model), h("td", { class: "num" }, c.samples + " samples"),
+          h("td", { class: "num" }, c.good_rate != null ? Math.round(c.good_rate * 100) + "% good" : c.score != null ? "score " + c.score.toFixed(2) : ""),
+          h("td", { class: "num" }, c.avg_ms != null ? (c.avg_ms / 1000).toFixed(1) + "s" : ""),
+          h("td", null, c.qualified === false ? "below the quality gate" : "")))))))));
+    } },
+    { name: "pull", args: "MODEL", group: "Settings", desc: "Ollama: download a model", run: async (arg) => {
+      const model = (arg || "").trim();
+      if (!model) return note("usage: /pull MODEL", true);
+      if (await act({ type: "ollama_pull", model })) note("pulling " + model + " with Ollama…");
+    } },
     { name: "status", group: "Settings", desc: "the daemon: memory, CPU, database, running work", run: () => showStatus() },
     { name: "storage", group: "Settings", desc: "disk used by Sessions, artifacts, logs, backups", run: () => showStorage() },
     { name: "gc", group: "Settings", desc: "clean up: shows what it frees first", run: () => showGc() },
@@ -4131,6 +4202,10 @@
       case "provider_stalled":
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
         break;
+      case "model_pull_progress":
+        if (ev.done) note(ev.error ? "could not pull " + ev.model + ": " + ev.error : "pulled " + ev.model + "; pick it with /model", !!ev.error);
+        else setActivity("pulling " + ev.model + ": " + ev.status + (ev.total ? " " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : ""));
+        return;
       case "comparison_ready":
         if (here) {
           const cols = ev.results.map((r) => h("div", { class: "compare-col" },

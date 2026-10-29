@@ -103,12 +103,67 @@ fn apply_headers(
     api_key: &str,
 ) -> reqwest::RequestBuilder {
     if !api_key.is_empty() {
-        req = req.bearer_auth(api_key);
+        req = match cfg.api_key_header.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+            Some(h) => req.header(h, api_key),
+            None => req.bearer_auth(api_key),
+        };
     }
     for (k, v) in &cfg.extra_headers {
         req = req.header(k, v);
     }
+    if !cfg.query_params.is_empty() {
+        req = req.query(&cfg.query_params);
+    }
     req
+}
+
+/// The latest rate-limit headers per endpoint (SPEC §4.4), from any
+/// response that carried them: `x-ratelimit-*` / `anthropic-ratelimit-*`.
+static RATE_LIMITS: std::sync::Mutex<Option<HashMap<String, Value>>> = std::sync::Mutex::new(None);
+
+/// What the endpoint's last response said about its rate limits.
+pub fn rate_limits() -> HashMap<String, Value> {
+    RATE_LIMITS.lock().unwrap().clone().unwrap_or_default()
+}
+
+fn note_rate_limits(base_url: &str, headers: &reqwest::header::HeaderMap) {
+    let mut found = serde_json::Map::new();
+    for (k, v) in headers {
+        let k = k.as_str().to_ascii_lowercase();
+        let short = k
+            .strip_prefix("x-ratelimit-")
+            .or_else(|| k.strip_prefix("anthropic-ratelimit-"));
+        if let (Some(short), Ok(v)) = (short, v.to_str()) {
+            found.insert(short.to_string(), json!(v));
+        }
+    }
+    if !found.is_empty() {
+        found.insert("at".into(), json!(chrono::Utc::now().to_rfc3339()));
+        RATE_LIMITS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(base_url.to_string(), Value::Object(found));
+    }
+}
+
+/// What `TestModel` found (SPEC §4.3).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ModelTest {
+    pub model: String,
+    pub ok: bool,
+    /// Time to the first streamed token, and to the end of the answer.
+    pub first_token_ms: Option<u64>,
+    pub total_ms: Option<u64>,
+    /// The answer arrived in more than one delta.
+    pub streaming: bool,
+    /// Reasoning came as its own stream.
+    pub reasoning: bool,
+    pub tool_calling: bool,
+    /// Tool calls work only through the prompt-based fallback.
+    pub prompt_fallback: bool,
+    pub error: Option<String>,
+    pub tested_at: String,
 }
 
 pub struct Provider {
@@ -487,9 +542,29 @@ pub fn parse_prompt_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
     )
 }
 
+/// An HTTP client through `proxy` when set; otherwise reqwest's own
+/// handling of `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (SPEC §4.1).
+pub fn http_client(proxy: &str) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder();
+    if !proxy.trim().is_empty() {
+        b = b.proxy(reqwest::Proxy::all(proxy.trim()).context("provider.proxy")?);
+    }
+    Ok(b.build()?)
+}
+
+/// The proxy requests go through: `provider.proxy`, else the environment.
+pub fn proxy_in_use(cfg: &ProviderCfg) -> Option<String> {
+    if !cfg.proxy.trim().is_empty() {
+        return Some(cfg.proxy.trim().to_string());
+    }
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+}
+
 impl Provider {
     pub fn new(cfg: ProviderCfg, api_key: String) -> Result<Self> {
-        let http = reqwest::Client::builder().build()?;
+        let http = http_client(&cfg.proxy)?;
         Ok(Self {
             cfg,
             api_key,
@@ -522,7 +597,8 @@ impl Provider {
     /// before every request. The initial resolution also fails fast for a
     /// missing OAuth login rather than deferring that to the first POST.
     pub async fn for_profile(cfg: ProviderCfg, paths: Paths) -> Result<Self> {
-        Self::for_profile_with(cfg, paths, reqwest::Client::builder().build()?).await
+        let http = http_client(&cfg.proxy)?;
+        Self::for_profile_with(cfg, paths, http).await
     }
 
     /// [`Provider::for_profile`] on an existing HTTP client, so long-lived
@@ -591,7 +667,80 @@ impl Provider {
     /// The endpoint's models, and the context window of those whose
     /// listing reports one (OpenRouter `context_length`, vLLM
     /// `max_model_len`, …).
-    pub async fn list_models_with_windows(&self) -> Result<(Vec<String>, HashMap<String, u32>)> {
+    /// A short prompt and a tool call on `model`: latency, streaming,
+    /// reasoning and tool support (`TestModel`, the picker's Test).
+    pub async fn test_model(&self, model: &str) -> ModelTest {
+        let mut t = ModelTest {
+            model: model.to_string(),
+            tested_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let (mut first, mut deltas, mut reasoning) = (None, 0usize, false);
+        let answer = self
+            .chat_stream(
+                &[json!({"role": "user", "content": "Reply with the single word: ok"})],
+                &[],
+                model,
+                None,
+                &CancellationToken::new(),
+                |kind, _| match kind {
+                    DeltaKind::Content => {
+                        deltas += 1;
+                        first.get_or_insert(started.elapsed().as_millis() as u64);
+                    }
+                    DeltaKind::Reasoning => {
+                        reasoning = true;
+                        first.get_or_insert(started.elapsed().as_millis() as u64);
+                    }
+                    _ => {}
+                },
+            )
+            .await;
+        if let Err(e) = answer {
+            t.error = Some(format!("{e:#}"));
+            return t;
+        }
+        t.first_token_ms = first;
+        t.total_ms = Some(started.elapsed().as_millis() as u64);
+        t.streaming = deltas > 1;
+        t.reasoning = reasoning;
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "probe_ping",
+                "description": "Connectivity probe. Call this.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let native = match probe_tool_call(self, model, &tool, true).await {
+            Err(e) if is_tool_choice_rejection(&e.to_string()) => {
+                probe_tool_call(self, model, &tool, false).await
+            }
+            r => r,
+        };
+        match native {
+            Ok(true) => t.tool_calling = true,
+            other => {
+                if probe_prompt_tool_call(self, model, &tool).await.unwrap_or(false) {
+                    t.tool_calling = true;
+                    t.prompt_fallback = true;
+                } else if let Err(e) = other {
+                    t.error = Some(format!("tool call: {e:#}"));
+                }
+            }
+        }
+        t.ok = t.tool_calling && t.error.is_none();
+        t
+    }
+
+    /// `/models` with each model's metadata (SPEC §4.2).
+    pub async fn list_models_meta(&self) -> Result<(Vec<String>, HashMap<String, u32>, HashMap<String, Value>)> {
+        let body = self.models_body().await?;
+        Ok((parse_models(&body), parse_model_windows(&body), parse_model_meta(&body)))
+    }
+
+    async fn models_body(&self) -> Result<Value> {
         let credential = self.credential().await?;
         let req = apply_headers(
             self.http.get(url(&self.cfg.base_url, "models")),
@@ -606,7 +755,11 @@ impl Provider {
                 resp.text().await.unwrap_or_default()
             ));
         }
-        let body: Value = resp.json().await.context("parse /models")?;
+        resp.json().await.context("parse /models")
+    }
+
+    pub async fn list_models_with_windows(&self) -> Result<(Vec<String>, HashMap<String, u32>)> {
+        let body = self.models_body().await?;
         Ok((parse_models(&body), parse_model_windows(&body)))
     }
 
@@ -715,12 +868,13 @@ impl Provider {
         } else {
             "chat/completions"
         };
-        let requested = body["model"].as_str().unwrap_or_default().to_string();
+        let requested = self.cfg.resolve_alias(body["model"].as_str().unwrap_or_default());
         let mut models = vec![requested.clone()];
         if allow_failover {
             for m in &self.cfg.fallback_models {
-                if !m.trim().is_empty() && !models.contains(m) {
-                    models.push(m.clone());
+                let m = self.cfg.resolve_alias(m);
+                if !m.is_empty() && !models.contains(&m) {
+                    models.push(m);
                 }
             }
         }
@@ -750,6 +904,7 @@ impl Provider {
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
+                        note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
                             return Ok((resp, dropped, model.clone()));
                         }
@@ -1208,6 +1363,83 @@ pub fn is_vision_model(model: &str) -> bool {
     ]
     .iter()
     .any(|k| m.contains(k))
+}
+
+/// What a model can do and costs, per id (SPEC §4.2): from the
+/// listing's own fields (OpenRouter: `pricing`, `context_length`,
+/// `architecture.input_modalities`, `supported_parameters`), else the
+/// built-in table for well-known families. Prices are USD per million
+/// tokens; `efforts` lists the reasoning efforts it accepts ([] = effort
+/// has no effect; absent = unknown).
+pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
+    let windows = parse_model_windows(body);
+    body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?;
+            let mut meta = known_model_meta(id);
+            if let Some(c) = windows.get(id) {
+                meta["context"] = json!(c);
+            }
+            let per_m = |v: &Value| {
+                v.as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| v.as_f64())
+                    .map(|p| (p * 1_000_000.0 * 1000.0).round() / 1000.0)
+            };
+            if let Some(p) = per_m(&m["pricing"]["prompt"]) {
+                meta["input_price"] = json!(p);
+            }
+            if let Some(p) = per_m(&m["pricing"]["completion"]) {
+                meta["output_price"] = json!(p);
+            }
+            if let Some(mods) = m["architecture"]["input_modalities"].as_array() {
+                meta["vision"] = json!(mods.iter().any(|x| x == "image"));
+            }
+            if let Some(params) = m["supported_parameters"].as_array() {
+                let has = |p: &str| params.iter().any(|x| x == p);
+                meta["tools"] = json!(has("tools"));
+                if has("reasoning") || has("reasoning_effort") {
+                    if meta["efforts"].is_null() {
+                        meta["efforts"] = json!(["low", "medium", "high"]);
+                    }
+                } else {
+                    meta["efforts"] = json!([]);
+                }
+            }
+            Some((id.to_string(), meta))
+        })
+        .collect()
+}
+
+/// The built-in table: what well-known model families support, by id.
+pub fn known_model_meta(id: &str) -> Value {
+    let m = id.to_ascii_lowercase();
+    let name = m.rsplit('/').next().unwrap_or(&m);
+    let mut meta = json!({});
+    let set = |meta: &mut Value, vision: bool, tools: bool, efforts: Option<&[&str]>| {
+        meta["vision"] = json!(vision);
+        meta["tools"] = json!(tools);
+        if let Some(e) = efforts {
+            meta["efforts"] = json!(e);
+        }
+    };
+    if name.starts_with("gpt-5") {
+        set(&mut meta, true, true, Some(&["minimal", "low", "medium", "high"]));
+    } else if name.starts_with("o1") || name.starts_with("o3") || name.starts_with("o4") {
+        set(&mut meta, true, true, Some(&["low", "medium", "high"]));
+    } else if name.starts_with("gpt-4o") || name.starts_with("gpt-4.1") {
+        set(&mut meta, true, true, Some(&[]));
+    } else if name.contains("claude") {
+        set(&mut meta, true, true, None);
+    } else if name.contains("gemini") {
+        set(&mut meta, true, true, None);
+    } else if name.contains("deepseek-r1") || name.contains("qwq") {
+        set(&mut meta, false, false, Some(&[]));
+    }
+    meta
 }
 
 fn parse_models(body: &Value) -> Vec<String> {

@@ -231,6 +231,44 @@ without redesign.
   for localhost test/provider deployments. Only bearer-style access
   tokens are supported. An OAuth-configured but not-yet-logged-in profile skips the
   TUI API-key wizard and shows the login command instead.
+- **Model metadata.** `ListModels` adds `meta` per id: `context`,
+  `input_price` / `output_price` (USD per million tokens), `vision`,
+  `tools` and `efforts`, from the listing's own fields (OpenRouter's
+  `pricing`, `context_length`, `architecture.input_modalities`,
+  `supported_parameters`), else a built-in table for well-known families
+  (GPT-5, o-series, GPT-4o/4.1, Claude, Gemini, reasoning-only models).
+  The TUI and web pickers show it on each row (`200k ctx · $3/$15 per M ·
+  vision · tools`). `efforts` limits the effort choices to what the model
+  accepts (`[]` hides the picker: effort has no effect; absent offers all).
+- **Aliases.** `[provider.aliases] fast = "…"` names models; an alias is
+  accepted wherever a model id is (`/model fast`, `--model`, Roles,
+  candidates, fallbacks) and resolved at use, so changing it moves
+  everything that names it. The pickers list aliases first.
+- **Missing models.** At start and then daily the daemon checks the
+  configured models (default, fallbacks, routing lists, Roles and their
+  candidates) against each endpoint's `/models` and notes the ones no
+  longer offered ("pick others with /model"); `ListModels.missing` and
+  `Status.missing_models` carry them. An endpoint that lists nothing is
+  not counted against.
+- **Which model answered.** When another model than the requested one
+  produced an answer (a fallback, or auto routing's pick), the message is
+  stored with `meta.model {name, via, requested}` and clients show "via
+  gpt-4.1-mini (fallback)" under its header.
+- **Gateways and Azure.** `provider.query_params` are added to every
+  request, `provider.api_key_header` sends the key in that header instead
+  of `Authorization: Bearer`, and `extra_headers` as before. The provider
+  form (TUI Settings → Providers) has these as advanced fields and
+  `formless providers add` takes `--header K=V`, `--query k=v`,
+  `--key-header H`. `--azure-resource R --azure-deployment D
+  [--api-version V]` builds Azure OpenAI's deployment URL, `api-version`
+  and the `api-key` header.
+- **Proxy.** `provider.proxy` sends the daemon's HTTP traffic (provider,
+  relay, fetch) through that proxy, from daemon start; otherwise
+  `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` apply as usual. `formless
+  doctor` and `Status.proxy` show which.
+- **Ollama.** `/pull MODEL` (`OllamaPull`) downloads a model through the
+  Ollama server behind `provider.base_url`, streaming `ModelPullProgress
+  {status, completed, total, done, error}` to the status bar.
 
 ### 4.3 Endpoint probe (onboarding gate)
 
@@ -240,6 +278,17 @@ start is refused with a clear explanation. Native tool-calling is required
 in v1; a prompt-based (text/JSON) fallback is explicitly out (§17).
 Thinking-mode endpoints that reject a forced `tool_choice` are re-probed
 with `tool_choice` omitted; a voluntary test tool-call still passes.
+
+- **Testing any model.** `TestModel {model, provider?}` (TUI `/test
+  [MODEL]` and Ctrl+T in the picker, the web picker's Test, `formless
+  providers test NAME --model M`) sends a short prompt and the probe tool
+  call, and reports the time to the first token and to the end, whether
+  the answer streamed, whether reasoning streamed, and whether tool calls
+  work (natively, or only through the prompt-based fallback). Results are
+  kept per (endpoint, model) in `<data>/model_tests.json` and shown in the
+  pickers (`✓ tested` / `✗ test failed`). Choosing a model that has none
+  tests it in the background and notes a failure, so a model without tool
+  calls is caught before a Run rather than in it.
 
 ### 4.4 Provider failure handling
 
@@ -256,6 +305,9 @@ with `tool_choice` omitted; a voluntary test tool-call still passes.
   correction prompt and counted in a **separate** malformed-call counter —
   they never pollute Tool Success Rate.
 
+- **Rate limits.** The `x-ratelimit-*` (and `anthropic-ratelimit-*`)
+  headers of each endpoint's latest response are kept: `RateLimits`,
+  `Status.rate_limits`; `/usage` adds "41/50 requests left, resets …".
 - **Explained errors.** When a Run pauses on a provider failure,
   `RunPaused.explained` sorts it into a category with a short message and
   the next step (`errors.rs`):
@@ -354,6 +406,12 @@ task, with quality as a gate**.
 - Per-call outcomes stay as they were, for failover and the Models
   metrics view.
 - Pinned roles (a concrete `model`) are unaffected.
+- **Explained.** Every routing decision (per-role candidates, and
+  `provider.model = "auto"`) is kept (the last 50, in memory) with each
+  candidate's samples, good rate, average time, score or relative cost,
+  whether it passed the quality gate, and the rule that decided
+  (exploring, nothing qualified yet, or the cheapest qualified).
+  `RoutingDecisions`; TUI `/routing` (pager), web `/routing` (dialog).
 
 ## 5. Agent loop, Sessions, and Runs
 
@@ -3209,6 +3267,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.api_style` | `chat` | `chat` or `responses` (§4.1) |
 | `provider.tool_mode` | `native` | `native` or prompt-based fallback (§4.1) |
 | `provider.fallback_models` | [] | Failover models, in order (§4.1) |
+| `provider.aliases` | {} | Short names for model ids (`fast = "…"`), accepted wherever a model is (§4.2) |
+| `provider.query_params` | {} | Query parameters added to every request, e.g. Azure's `api-version` (§4.2) |
+| `provider.api_key_header` | (Bearer) | Header that carries the API key instead of `Authorization: Bearer`, e.g. `api-key` (§4.2) |
+| `provider.proxy` | "" | HTTP(S) proxy for the daemon's requests, from start; empty uses `HTTPS_PROXY` / `NO_PROXY` (§4.2) |
 | `provider.routing_models` | [] | Candidates for `model="auto"` measured routing |
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |

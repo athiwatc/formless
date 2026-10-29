@@ -138,6 +138,12 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
+    TestModel,
+    /// `/routing`: the latest routing decisions.
+    Routing,
+    /// `/usage` adds the endpoint's rate limits.
+    RateLimits,
     /// `/compare A B [prompt]`: the forks were started.
     Compare,
     /// A step-mode decision (errors keep the step waiting).
@@ -259,10 +265,40 @@ struct RollbackPick {
 /// or (Ctrl+Enter / Alt+Enter / Ctrl+D) as the global default.
 struct ModelOverlay {
     picker: picker::ModelPicker,
+    /// `ListModels` metadata per id (efforts, context, prices).
+    meta: serde_json::Value,
     effort_idx: usize,
     /// Opened from Settings: Enter sets the global default.
     default_only: bool,
 }
+
+impl ModelOverlay {
+    /// The efforts the highlighted model accepts (SPEC §4.2): its listed
+    /// ones, none when effort has no effect, else all of them.
+    fn efforts(&self) -> Vec<Option<&'static str>> {
+        let id = self.picker.choice().unwrap_or_default();
+        let listed = &self.meta[&id]["efforts"];
+        match listed.as_array() {
+            Some(a) if a.is_empty() => vec![None],
+            Some(a) => {
+                let names: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
+                std::iter::once(None)
+                    .chain(ALL_EFFORTS.iter().copied().filter(|e| names.contains(e)).map(Some))
+                    .collect()
+            }
+            None => EFFORTS.to_vec(),
+        }
+    }
+
+    /// The chosen effort, if the highlighted model accepts it.
+    fn effort(&self) -> Option<&'static str> {
+        let all = self.efforts();
+        all.get(self.effort_idx % all.len().max(1)).copied().flatten()
+    }
+}
+
+/// Every effort level a model may accept, lowest first.
+const ALL_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 /// A Session's unsent input and attachments.
 #[derive(Default)]
@@ -1074,6 +1110,8 @@ struct App {
     plan: Vec<formless_protocol::PlanItem>,
     /// `/mcp import NAME`: the server to add once the candidates arrive.
     mcp_import_pick: Option<String>,
+    /// An Ollama download in progress (`/pull`), for the status bar.
+    pull_status: Option<String>,
     /// The daemon connection was lost: (since, last reconnect attempt).
     offline: Option<(Instant, Instant)>,
     /// Step mode (`/step`) for the Session on screen, the call waiting
@@ -1298,6 +1336,7 @@ impl App {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            pull_status: None,
             step_mode: false,
             step: None,
             editing_step: false,
@@ -1885,6 +1924,13 @@ impl App {
                                     .unwrap_or_default();
                                 let items = picker::items_from_list(&result);
                                 o.picker.set_items(items, &current);
+                                o.meta = result["meta"].clone();
+                                for m in result["missing"].as_array().into_iter().flatten() {
+                                    self.notes.push(format!(
+                                        "{} is no longer offered by its endpoint",
+                                        m.as_str().unwrap_or_default()
+                                    ));
+                                }
                                 o.picker.error = result["error"].as_str().map(str::to_string);
                             }
                         }
@@ -2630,6 +2676,34 @@ impl App {
                         }
                         // StepResolved clears the waiting call.
                         Pending::StepDecision => {}
+                        Pending::TestModel => self.notes.push(model_test_note(&result)),
+                        Pending::Routing => {
+                            self.pager = Some(Pager {
+                                title: "Routing decisions (newest first)".into(),
+                                lines: routing_lines(&result),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::RateLimits => {
+                            for (endpoint, l) in result.as_object().into_iter().flatten() {
+                                let mut parts = Vec::new();
+                                for kind in ["requests", "tokens"] {
+                                    if let Some(rem) = l[format!("remaining-{kind}")].as_str() {
+                                        let limit = l[format!("limit-{kind}")].as_str().unwrap_or("?");
+                                        let reset = l[format!("reset-{kind}")]
+                                            .as_str()
+                                            .map(|r| format!(", resets {r}"))
+                                            .unwrap_or_default();
+                                        parts.push(format!("{rem}/{limit} {kind} left{reset}"));
+                                    }
+                                }
+                                if !parts.is_empty() {
+                                    self.notes.push(format!("rate limit at {endpoint}: {}", parts.join(" · ")));
+                                }
+                            }
+                        }
                         Pending::Compare => {
                             let models: Vec<&str> = result["forks"]
                                 .as_array()
@@ -3082,6 +3156,28 @@ impl App {
                     .find(|c| c.status == "running" && c.name == tool_name && c.depth == depth)
                 {
                     call.progress = Some((fraction, label));
+                }
+            }
+            Event::ModelPullProgress {
+                model,
+                status,
+                completed,
+                total,
+                done,
+                error,
+            } => {
+                if done {
+                    self.pull_status = None;
+                    self.notes.push(match error {
+                        Some(e) => format!("could not pull {model}: {e}"),
+                        None => format!("pulled {model}; pick it with /model"),
+                    });
+                } else {
+                    let pct = match (completed, total) {
+                        (Some(c), Some(t)) if t > 0 => format!(" {}%", c * 100 / t),
+                        _ => String::new(),
+                    };
+                    self.pull_status = Some(format!("pulling {model}: {status}{pct}"));
                 }
             }
             Event::ComparisonReady {
@@ -4729,7 +4825,8 @@ impl App {
             }
             "usage" => match self.current.clone() {
                 Some(session_id) => {
-                    self.request(Pending::SessionUsage, Request::SessionUsage { session_id })
+                    self.request(Pending::SessionUsage, Request::SessionUsage { session_id });
+                    self.request(Pending::RateLimits, Request::RateLimits);
                 }
                 None => self.notes.push("open a session first".into()),
             },
@@ -5062,6 +5159,30 @@ impl App {
             }
             "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
             "status" => self.request(Pending::DaemonStatus, Request::Status),
+            "routing" => self.request(Pending::Routing, Request::RoutingDecisions),
+            cmd if cmd == "test" || cmd.starts_with("test ") => {
+                let model = cmd["test".len()..].trim().to_string();
+                let model = if model.is_empty() {
+                    self.current
+                        .as_ref()
+                        .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+                        .and_then(|s| s.model.clone())
+                        .unwrap_or_else(|| self.model_label.clone())
+                } else {
+                    model
+                };
+                self.notes.push(format!("testing {model}…"));
+                self.request(Pending::TestModel, Request::TestModel { model, provider: None });
+            }
+            cmd if cmd == "pull" || cmd.starts_with("pull ") => {
+                let model = cmd["pull".len()..].trim().to_string();
+                if model.is_empty() {
+                    self.notes.push("usage: /pull MODEL (Ollama: download a model)".into());
+                } else {
+                    self.fire(Request::OllamaPull { model: model.clone() });
+                    self.notes.push(format!("pulling {model} with Ollama…"));
+                }
+            }
             cmd if cmd == "compare" || cmd.starts_with("compare ") => {
                 let Some(session_id) = self.current.clone() else {
                     return;
@@ -5275,6 +5396,7 @@ impl App {
             .unwrap_or(0);
         self.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::loading(),
+            meta: serde_json::Value::Null,
             effort_idx,
             default_only: self.view == View::Settings,
         });
@@ -5310,7 +5432,7 @@ impl App {
             let Some(model) = o.picker.choice() else {
                 return;
             };
-            let effort = EFFORTS[o.effort_idx].map(str::to_string);
+            let effort = o.effort().map(str::to_string);
             self.model_overlay = None;
             if global {
                 // Settings go through the daemon (principle 6).
@@ -5335,8 +5457,17 @@ impl App {
             KeyCode::Esc => self.model_overlay = None,
             KeyCode::Up => o.picker.up(),
             KeyCode::Down => o.picker.down(),
-            KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % EFFORTS.len(),
-            KeyCode::BackTab => o.effort_idx = (o.effort_idx + EFFORTS.len() - 1) % EFFORTS.len(),
+            KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % o.efforts().len().max(1),
+            KeyCode::BackTab => {
+                let n = o.efforts().len().max(1);
+                o.effort_idx = (o.effort_idx % n + n - 1) % n;
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(model) = o.picker.choice() {
+                    self.notes.push(format!("testing {model}…"));
+                    self.request(Pending::TestModel, Request::TestModel { model, provider: None });
+                }
+            }
             KeyCode::Backspace => o.picker.backspace(),
             KeyCode::Char(c) => o.picker.type_char(c),
             _ => {}
@@ -5355,6 +5486,7 @@ impl App {
                                 recent: id == w.saved_model,
                                 id,
                                 source: None,
+                                detail: None,
                             })
                             .collect();
                         w.picker.set_items(items, &w.saved_model.clone());
@@ -7644,6 +7776,9 @@ fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<L
         if item.recent {
             spans.push(Span::styled("  recent", ui::dim(color)));
         }
+        if let Some(d) = &item.detail {
+            spans.push(Span::styled(format!("  {d}"), ui::dim(color)));
+        }
         if sources {
             if let Some(src) = &item.source {
                 spans.push(Span::styled(format!("  {src}"), ui::dim(color)));
@@ -7934,13 +8069,20 @@ fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     let max_items = (area.height as usize).saturating_sub(10).clamp(3, 20);
     let mut lines = picker_lines(&o.picker, max_items, color);
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("Effort   ", ui::dim(color)),
-        Span::raw(EFFORTS[o.effort_idx].unwrap_or("default (provider)")),
-        Span::styled("  (Tab to change)", ui::dim(color)),
-    ]));
+    if o.efforts().len() <= 1 {
+        lines.push(Line::styled(
+            "Effort   has no effect for this model",
+            ui::dim(color),
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Effort   ", ui::dim(color)),
+            Span::raw(o.effort().unwrap_or("default (provider)")),
+            Span::styled("  (Tab to change)", ui::dim(color)),
+        ]));
+    }
     lines.push(Line::styled(
-        "Enter this Session · Ctrl+Enter/Alt+Enter/Ctrl+D global default · Esc cancel",
+        "Enter this Session · Ctrl+Enter/Alt+Enter/Ctrl+D global default · Ctrl+T test · Esc cancel",
         ui::dim(color),
     ));
     let w = 84.min(area.width.saturating_sub(2)).max(1);
@@ -8215,6 +8357,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ),
             bold_fg(app.color, Color::Red),
         ));
+    } else if let Some(pull) = &app.pull_status {
+        left.push(Span::styled(format!("⇣ {pull}"), bold_fg(app.color, Color::Cyan)));
     } else if let Some(activity) = app.activity_text() {
         left.push(Span::styled(activity, bold_fg(app.color, Color::Yellow)));
     } else if app.running() {
@@ -8822,6 +8966,66 @@ fn storage_lines(v: &serde_json::Value, gc: bool) -> Vec<String> {
     out
 }
 
+/// One line for a `TestModel` result (SPEC §4.3).
+fn model_test_note(t: &serde_json::Value) -> String {
+    let ms = |k: &str| t[k].as_u64().map_or("-".into(), |v| format!("{v} ms"));
+    let yn = |k: &str| if t[k] == true { "yes" } else { "no" };
+    let mut out = format!(
+        "{} {}: first token {}, total {} · streaming {} · reasoning {} · tool calls {}{}",
+        if t["ok"] == true { "✓" } else { "✗" },
+        t["model"].as_str().unwrap_or_default(),
+        ms("first_token_ms"),
+        ms("total_ms"),
+        yn("streaming"),
+        yn("reasoning"),
+        yn("tool_calling"),
+        if t["prompt_fallback"] == true { " (prompt fallback)" } else { "" }
+    );
+    if let Some(e) = t["error"].as_str() {
+        out.push_str(&format!(" · {}", truncate_chars(e, 160)));
+    }
+    out
+}
+
+/// The `/routing` pager: each decision, its candidates and the reason.
+fn routing_lines(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in v.as_array().into_iter().flatten() {
+        out.push(format!(
+            "{} · {} → {}",
+            d["at"].as_str().map(|t| ui::relative_time(t, chrono::Utc::now())).unwrap_or_default(),
+            d["kind"].as_str().unwrap_or_default(),
+            d["picked"].as_str().unwrap_or_default()
+        ));
+        out.push(format!("  why: {}", d["reason"].as_str().unwrap_or_default()));
+        for c in d["candidates"].as_array().into_iter().flatten() {
+            let mut fig = vec![format!("{} samples", c["samples"])];
+            if let Some(r) = c["good_rate"].as_f64() {
+                fig.push(format!("{:.0}% good", r * 100.0));
+            }
+            if let Some(ms) = c["avg_ms"].as_f64() {
+                fig.push(format!("{:.1}s avg", ms / 1000.0));
+            }
+            if let Some(sc) = c["score"].as_f64() {
+                fig.push(format!("score {sc:.2}"));
+            }
+            if let Some(cost) = c["cost"].as_f64() {
+                fig.push(format!("cost {cost:.2}"));
+            }
+            if c["qualified"] == false {
+                fig.push("below the quality gate".into());
+            }
+            let mark = if c["model"] == d["picked"] { "▸" } else { " " };
+            out.push(format!("  {mark} {} · {}", c["model"].as_str().unwrap_or_default(), fig.join(" · ")));
+        }
+        out.push(String::new());
+    }
+    if out.is_empty() {
+        out.push("No routing decisions yet: they come from provider.model = \"auto\" and Roles with candidates.".into());
+    }
+    out
+}
+
 /// Text wrapped to `width` columns (display width), line by line.
 fn wrap_rows(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
@@ -8928,6 +9132,15 @@ fn shell_words(s: &str) -> Vec<String> {
 fn steer_step(m: &MessageInfo) -> Option<i64> {
     let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
     meta["steer"]["step"].as_i64()
+}
+
+/// "via gpt-4.1-mini (fallback)" when another model than the Session's
+/// answered (SPEC §4.5).
+fn served_by(m: &MessageInfo) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+    let name = meta["model"]["name"].as_str()?;
+    let via = meta["model"]["via"].as_str().unwrap_or("fallback");
+    Some(format!("via {name} ({via})"))
 }
 
 /// "web, TUI ×2" for the other clients on this Session.
@@ -10798,6 +11011,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             }
             _ => {
                 open_group(&mut lines, &mut group, "assistant", when);
+                if let Some(via) = served_by(m) {
+                    lines.push(Line::styled(format!("  {via}"), ui::dim(app.color)));
+                }
                 let focused = app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
                 if focused {
                     focus_line = Some(lines.len());
@@ -13639,6 +13855,7 @@ mod tests {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            pull_status: None,
             step_mode: false,
             step: None,
             editing_step: false,
@@ -14690,7 +14907,10 @@ mod tests {
         }
         let screen = render(&mut app, 100, 40);
         assert!(!screen.contains("sk-secret") && screen.contains("•••••••••"));
-        app.key(key(KeyCode::Enter));
+        // Past the advanced fields (headers, query, key header) to submit.
+        for _ in 0..4 {
+            app.key(key(KeyCode::Enter));
+        }
         assert!(app
             .settings_form
             .as_ref()
@@ -17363,6 +17583,7 @@ mod tests {
             id: id.to_string(),
             source: None,
             recent: false,
+            detail: None,
         })
         .collect();
         app.model_overlay

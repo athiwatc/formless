@@ -8,6 +8,42 @@ pub struct ModelItem {
     /// Where it comes from, shown when there is more than one source.
     pub source: Option<String>,
     pub recent: bool,
+    /// What it is and can do: "→ claude-sonnet" for an alias; context,
+    /// price per million tokens, vision, tools, and a failed test.
+    pub detail: Option<String>,
+}
+
+/// "200k · $3/$15 · vision · tools · ✗ test failed" from a model's
+/// `ListModels` metadata and remembered test (SPEC §4.2, §4.3).
+pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = meta["context"].as_u64() {
+        parts.push(if c >= 1_000_000 {
+            format!("{}M ctx", c / 1_000_000)
+        } else {
+            format!("{}k ctx", c / 1000)
+        });
+    }
+    if let (Some(i), Some(o)) = (meta["input_price"].as_f64(), meta["output_price"].as_f64()) {
+        let fmt = |v: f64| if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v:.2}") };
+        parts.push(format!("${}/${} per M", fmt(i), fmt(o)));
+    }
+    if meta["vision"] == true {
+        parts.push("vision".into());
+    }
+    match meta["tools"].as_bool() {
+        Some(true) => parts.push("tools".into()),
+        Some(false) => parts.push("no tools".into()),
+        None => {}
+    }
+    if test.is_object() {
+        parts.push(if test["ok"] == true {
+            "✓ tested".into()
+        } else {
+            "✗ test failed".into()
+        });
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 pub use formless_core::fuzzy::fuzzy_match;
@@ -26,13 +62,20 @@ pub fn items_from_list(result: &serde_json::Value) -> Vec<ModelItem> {
     let mut items: Vec<ModelItem> = Vec::new();
     let mut push = |id: String, source: String| {
         if !items.iter().any(|i| i.id == id) {
+            let detail = model_detail(&result["meta"][&id], &result["tests"][&id]);
             items.push(ModelItem {
                 recent: recent.contains(&id),
                 id,
                 source: Some(source),
+                detail,
             });
         }
     };
+    // Aliases first: short names for the models people use most.
+    for (alias, target) in result["aliases"].as_object().into_iter().flatten() {
+        let target = target.as_str().unwrap_or_default();
+        push(alias.clone(), format!("alias → {target}"));
+    }
     for r in result["roles"].as_array().into_iter().flatten() {
         let name = r["name"].as_str().unwrap_or_default();
         let provider = r["provider"].as_str().unwrap_or("default");
@@ -153,6 +196,7 @@ mod tests {
                 id: id.to_string(),
                 source: None,
                 recent: false,
+                detail: None,
             })
             .collect()
     }

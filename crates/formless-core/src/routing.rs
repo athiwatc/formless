@@ -157,3 +157,105 @@ pub fn select_task_model(
         })
         .map(|s| s.model.clone())
 }
+
+/// Why [`select_task_model`] picked `picked` (SPEC §4.6, `/routing`):
+/// each candidate's figures, whether it passed the quality gate, its
+/// time+tokens cost relative to the best, and the rule that decided.
+pub fn explain_task_choice(
+    candidates: &[String],
+    stats: &[TaskStat],
+    min_samples: i64,
+    quality_bar: f64,
+    explored: bool,
+    picked: &str,
+) -> serde_json::Value {
+    let stat = |m: &str| stats.iter().find(|s| s.model == m);
+    let qualified = |s: &TaskStat| s.samples >= min_samples && s.good_rate() >= quality_bar;
+    let q: Vec<&TaskStat> = candidates.iter().filter_map(|m| stat(m)).filter(|s| qualified(s)).collect();
+    let best_ms = q.iter().map(|s| s.avg_ms).fold(f64::MAX, f64::min).max(1.0);
+    let best_tok = q.iter().map(|s| s.avg_tokens).fold(f64::MAX, f64::min).max(1.0);
+    let rows: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|m| match stat(m) {
+            Some(s) => serde_json::json!({
+                "model": m, "samples": s.samples, "good_rate": s.good_rate(),
+                "avg_ms": s.avg_ms, "avg_tokens": s.avg_tokens, "qualified": qualified(s),
+                "cost": qualified(s).then(|| s.avg_ms / best_ms + s.avg_tokens / best_tok),
+            }),
+            None => serde_json::json!({"model": m, "samples": 0, "qualified": false}),
+        })
+        .collect();
+    let reason = if explored {
+        format!("exploring: {picked} has the fewest samples (under {min_samples})")
+    } else if q.is_empty() {
+        format!("no candidate has {min_samples}+ samples at {:.0}%+ good yet: the first one", quality_bar * 100.0)
+    } else {
+        "the quickest and cheapest (time + tokens) of those passing the quality gate".to_string()
+    };
+    serde_json::json!({"candidates": rows, "picked": picked, "reason": reason})
+}
+
+/// Why [`select_model`] picked `picked` for `provider.model = "auto"`.
+pub fn explain_model_choice(
+    cfg: &ProviderCfg,
+    stats: &[ModelStat],
+    complex: bool,
+    picked: &str,
+) -> serde_json::Value {
+    let candidates = cfg.routing_candidates();
+    let by_model: HashMap<&str, &ModelStat> = stats.iter().map(|s| (s.model.as_str(), s)).collect();
+    let total: i64 = candidates
+        .iter()
+        .map(|c| by_model.get(c.as_str()).map_or(0, |s| s.samples()))
+        .sum();
+    let max_ms = candidates
+        .iter()
+        .filter_map(|c| by_model.get(c.as_str()).and_then(|s| s.avg_ms()))
+        .fold(0.0f64, f64::max);
+    let rows: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|c| {
+            let s = by_model.get(c.as_str()).copied();
+            serde_json::json!({
+                "model": c,
+                "samples": s.map_or(0, |s| s.samples()),
+                "avg_ms": s.and_then(|s| s.avg_ms()),
+                "score": model_score(s, total, max_ms),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "candidates": rows,
+        "picked": picked,
+        "reason": format!(
+            "highest score (success rate, speed, exploration bonus) among the {} candidates",
+            if complex { "strong (complex task)" } else { "fast (simple task)" }
+        ),
+    })
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    #[test]
+    fn task_choices_say_why() {
+        let st = |m: &str, samples, good, ms| TaskStat {
+            model: m.into(),
+            samples,
+            good,
+            avg_ms: ms,
+            avg_tokens: 1000.0,
+        };
+        let stats = vec![st("a", 10, 9, 2000.0), st("b", 10, 9, 1000.0), st("c", 10, 2, 500.0)];
+        let cands: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let picked = select_task_model(&cands, &stats, 5, 0.7, false).unwrap();
+        assert_eq!(picked, "b");
+        let why = explain_task_choice(&cands, &stats, 5, 0.7, false, &picked);
+        assert!(why["reason"].as_str().unwrap().contains("quickest"));
+        let c = why["candidates"].as_array().unwrap();
+        assert_eq!(c[2]["qualified"], false, "c is below the quality gate");
+        let none = explain_task_choice(&cands, &[], 5, 0.7, false, "a");
+        assert!(none["reason"].as_str().unwrap().contains("first one"));
+    }
+}

@@ -527,8 +527,26 @@ enum ProvidersAction {
     /// Add or update a provider; the API key is read from stdin (not argv)
     Add {
         name: String,
-        #[arg(long, required_unless_present = "preset")]
+        #[arg(long, required_unless_present_any = ["preset", "azure_resource"])]
         base_url: Option<String>,
+        /// Azure OpenAI: the resource name (or its https://… endpoint)
+        #[arg(long, requires = "azure_deployment", conflicts_with_all = ["base_url", "preset"])]
+        azure_resource: Option<String>,
+        /// Azure OpenAI: the deployment name
+        #[arg(long, requires = "azure_resource")]
+        azure_deployment: Option<String>,
+        /// Azure OpenAI: the API version (default: the latest known)
+        #[arg(long, requires = "azure_resource")]
+        api_version: Option<String>,
+        /// Extra request header, `Key=Value` (repeatable)
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Extra query parameter, `key=value` (repeatable)
+        #[arg(long = "query")]
+        query: Vec<String>,
+        /// Send the key in this header instead of Authorization: Bearer
+        #[arg(long)]
+        key_header: Option<String>,
         /// A known endpoint instead of --base-url: openai, anthropic,
         /// openrouter, gemini, groq, ollama, lmstudio
         #[arg(long, conflicts_with = "base_url")]
@@ -543,9 +561,12 @@ enum ProvidersAction {
     Remove {
         name: String,
     },
-    /// Fetch the provider's /models list
+    /// Fetch the provider's /models list; with --model, test that model:
+    /// latency, streaming, reasoning and tool calls
     Test {
         name: String,
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -2440,6 +2461,10 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             cfg.artifacts.max_age_days
         );
     }
+    match formless_core::provider::proxy_in_use(&cfg.provider) {
+        Some(p) => say!("proxy:      {p} (provider.proxy or HTTPS_PROXY; NO_PROXY is honoured)"),
+        None => say!("proxy:      none"),
+    }
     match formless_core::service::installed(&paths) {
         Some((manager, file)) => say!("service:    starts at login ({manager}: {})", file.display()),
         None => say!("service:    not installed (formless daemon install-service starts it at login)"),
@@ -3748,10 +3773,40 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
         ProvidersAction::Add {
             name,
             base_url,
+            azure_resource,
+            azure_deployment,
+            api_version,
+            headers,
+            query,
+            key_header,
             preset,
             model,
             no_key,
         } => {
+            let pairs = |items: &[String], what: &str| -> Result<std::collections::BTreeMap<String, String>> {
+                items
+                    .iter()
+                    .map(|h| {
+                        let (k, v) = h.split_once('=').with_context(|| format!("{what} takes key=value"))?;
+                        Ok((k.trim().to_string(), v.trim().to_string()))
+                    })
+                    .collect()
+            };
+            let mut header_map = pairs(&headers, "--header")?;
+            let mut query_map = pairs(&query, "--query")?;
+            let mut key_header = key_header;
+            // Azure OpenAI: deployment URL, api-version and the api-key header.
+            let azure_base = match (&azure_resource, &azure_deployment) {
+                (Some(r), Some(d)) => {
+                    let (base, q, header) =
+                        formless_core::presets::azure(r, d, api_version.as_deref())?;
+                    query_map.extend(q);
+                    key_header.get_or_insert(header.to_string());
+                    Some(base)
+                }
+                _ => None,
+            };
+            header_map.retain(|k, _| !k.is_empty());
             let preset = match preset.as_deref() {
                 Some(id) => Some(formless_core::presets::find(id).with_context(|| {
                     let ids: Vec<_> = formless_core::presets::PRESETS
@@ -3762,10 +3817,10 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
                 })?),
                 None => None,
             };
-            let base_url = match (base_url, preset) {
-                (Some(url), _) => url,
-                (None, Some(p)) => p.base_url.to_string(),
-                (None, None) => unreachable!("clap requires one"),
+            let base_url = match (azure_base, base_url, preset) {
+                (Some(url), _, _) | (None, Some(url), _) => url,
+                (None, None, Some(p)) => p.base_url.to_string(),
+                (None, None, None) => unreachable!("clap requires one"),
             };
             let read_line = || -> Result<String> {
                 let mut line = String::new();
@@ -3800,6 +3855,9 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
                 base_url,
                 model,
                 api_key,
+                headers: (!header_map.is_empty()).then_some(header_map),
+                query_params: (!query_map.is_empty()).then_some(query_map),
+                api_key_header: key_header,
             })?;
             println!("provider {name} saved; check it with `formless providers test {name}`");
         }
@@ -3807,7 +3865,29 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             daemon(Request::RemoveProvider { name: name.clone() })?;
             println!("removed {name}");
         }
-        ProvidersAction::Test { name } => {
+        ProvidersAction::Test {
+            name,
+            model: Some(model),
+        } => {
+            let provider = (name != formless_core::config::DEFAULT_PROVIDER).then_some(name);
+            let t = daemon(Request::TestModel { model, provider })?;
+            let ms = |k: &str| t[k].as_u64().map_or("-".into(), |v| format!("{v} ms"));
+            let yes = |k: &str| if t[k] == true { "yes" } else { "no" };
+            println!("model:       {}", t["model"].as_str().unwrap_or_default());
+            println!("result:      {}", if t["ok"] == true { "ok" } else { "problems" });
+            println!("first token: {}  ·  total {}", ms("first_token_ms"), ms("total_ms"));
+            println!("streaming:   {}", yes("streaming"));
+            println!("reasoning:   {}", yes("reasoning"));
+            println!(
+                "tool calls:  {}{}",
+                yes("tool_calling"),
+                if t["prompt_fallback"] == true { " (prompt-based fallback only)" } else { "" }
+            );
+            if let Some(e) = t["error"].as_str() {
+                println!("error:       {e}");
+            }
+        }
+        ProvidersAction::Test { name, model: None } => {
             let r = daemon(Request::TestProvider { name })?;
             let models = r["models"].as_array().cloned().unwrap_or_default();
             println!("{} model(s):", models.len());
