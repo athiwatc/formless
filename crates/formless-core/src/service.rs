@@ -45,7 +45,9 @@ pub fn plan(paths: &Paths, exe: &Path, home: &Path) -> Result<Plan> {
     let exe_s = exe.display().to_string();
     if cfg!(target_os = "macos") {
         let label = format!("xyz.athiwat.{name}");
-        let file = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
+        let file = home
+            .join("Library/LaunchAgents")
+            .join(format!("{label}.plist"));
         let contents = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -83,7 +85,12 @@ pub fn plan(paths: &Paths, exe: &Path, home: &Path) -> Result<Plan> {
             manager: "launchd",
             file,
             contents,
-            enable: vec![vec!["launchctl".into(), "load".into(), "-w".into(), f.clone()]],
+            enable: vec![vec![
+                "launchctl".into(),
+                "load".into(),
+                "-w".into(),
+                f.clone(),
+            ]],
             disable: vec![vec!["launchctl".into(), "unload".into(), "-w".into(), f]],
         })
     } else if cfg!(windows) {
@@ -179,7 +186,10 @@ pub fn install(plan: &Plan) -> Result<()> {
 /// Unload the service and remove its file.
 pub fn uninstall(plan: &Plan) -> Result<()> {
     if !plan.file.exists() {
-        return Err(anyhow!("not installed ({} is missing)", plan.file.display()));
+        return Err(anyhow!(
+            "not installed ({} is missing)",
+            plan.file.display()
+        ));
     }
     let unloaded = run_all(&plan.disable);
     std::fs::remove_file(&plan.file)?;
@@ -210,7 +220,12 @@ mod tests {
         let base = std::env::temp_dir().join(format!("fl-svc-{}", uuid::Uuid::new_v4()));
         let mut paths = Paths::from_dirs(base.join("data/work"), base.join("conf/work")).unwrap();
         paths.profile = "work".into();
-        let p = plan(&paths, Path::new("/usr/local/bin/formless"), Path::new("/home/u")).unwrap();
+        let p = plan(
+            &paths,
+            Path::new("/usr/local/bin/formless"),
+            Path::new("/home/u"),
+        )
+        .unwrap();
         assert!(p.contents.contains("serve"), "{}", p.contents);
         assert!(p.contents.contains("--stay"));
         assert!(p.contents.contains(&paths.data_dir.display().to_string()));

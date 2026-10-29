@@ -82,15 +82,49 @@ pub struct AuthStatus {
     pub scope: Option<String>,
 }
 
-fn oauth_keyring_user(paths: &Paths) -> String {
+/// Which token set a provider's OAuth config owns: its token endpoint and
+/// client id, so two OAuth providers never share (or cross-refresh) tokens.
+fn token_slot(auth: &AuthCfg) -> String {
+    let digest = Sha256::digest(format!("{}\n{}", auth.token_url, auth.client_id));
+    digest[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The `0600` file holding the token set of the provider with `auth`.
+pub fn oauth_tokens_file(paths: &Paths, auth: &AuthCfg) -> std::path::PathBuf {
+    paths
+        .config_dir
+        .join(format!("oauth_tokens-{}.json", token_slot(auth)))
+}
+
+fn oauth_keyring_user(paths: &Paths, auth: &AuthCfg) -> String {
+    format!("oauth-tokens-{}-{}", paths.profile, token_slot(auth))
+}
+
+/// Before tokens were keyed by provider, one set per profile.
+fn legacy_keyring_user(paths: &Paths) -> String {
     format!("oauth-tokens-{}", paths.profile)
 }
 
-pub fn save_oauth_tokens(paths: &Paths, tokens: &OAuthTokens) -> Result<()> {
-    let encoded = serde_json::to_string(tokens).context("encode OAuth tokens")?;
-    let file = paths.oauth_tokens_file();
-    let file_result = (|| -> Result<()> { crate::config::write_secret_file(&file, &encoded) })();
-    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths))
+/// Stored form: the token set plus the endpoint it was issued by.
+fn encode_tokens(auth: &AuthCfg, tokens: &OAuthTokens) -> Result<String> {
+    let mut v = serde_json::to_value(tokens).context("encode OAuth tokens")?;
+    v["token_url"] = Value::String(auth.token_url.clone());
+    Ok(v.to_string())
+}
+
+/// (tokens, the token endpoint that issued them if recorded).
+fn decode_tokens(text: &str) -> Option<(OAuthTokens, Option<String>)> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let issuer = v["token_url"].as_str().map(str::to_string);
+    let tokens: OAuthTokens = serde_json::from_value(v).ok()?;
+    (!tokens.access_token.is_empty()).then_some((tokens, issuer))
+}
+
+pub fn save_oauth_tokens(paths: &Paths, auth: &AuthCfg, tokens: &OAuthTokens) -> Result<()> {
+    let encoded = encode_tokens(auth, tokens)?;
+    let file = oauth_tokens_file(paths, auth);
+    let file_result = crate::config::write_secret_file(&file, &encoded);
+    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths, auth))
         .map(|entry| entry.set_password(&encoded).is_ok())
         .unwrap_or(false);
     if file_result.is_ok() || keyring_ok {
@@ -100,24 +134,39 @@ pub fn save_oauth_tokens(paths: &Paths, tokens: &OAuthTokens) -> Result<()> {
     }
 }
 
-pub fn load_oauth_tokens(paths: &Paths) -> Option<OAuthTokens> {
-    if let Some(text) = crate::config::read_secret_file(&paths.oauth_tokens_file()) {
-        if let Ok(tokens) = serde_json::from_str::<OAuthTokens>(&text) {
-            if !tokens.access_token.is_empty() {
-                return Some(tokens);
-            }
-        }
+fn read_stored(file: &std::path::Path, user: &str) -> Option<(OAuthTokens, Option<String>)> {
+    if let Some(found) = crate::config::read_secret_file(file).and_then(|t| decode_tokens(&t)) {
+        return Some(found);
     }
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths)) {
-        if let Ok(text) = entry.get_password() {
-            if let Ok(tokens) = serde_json::from_str::<OAuthTokens>(&text) {
-                if !tokens.access_token.is_empty() {
-                    return Some(tokens);
-                }
-            }
-        }
+    let text = keyring::Entry::new(KEYRING_SERVICE, user)
+        .ok()?
+        .get_password()
+        .ok()?;
+    decode_tokens(&text)
+}
+
+fn load_with_issuer(paths: &Paths, auth: &AuthCfg) -> Option<(OAuthTokens, Option<String>)> {
+    if let Some(found) = read_stored(
+        &oauth_tokens_file(paths, auth),
+        &oauth_keyring_user(paths, auth),
+    ) {
+        return Some(found);
     }
-    None
+    // The old profile-wide set was always from `formless auth login`, i.e.
+    // the default provider: it moves into that provider's slot only.
+    let owner = crate::Config::load_file_only(paths).ok()?.provider.auth;
+    if token_slot(&owner) != token_slot(auth) {
+        return None;
+    }
+    let (tokens, _) = read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))?;
+    save_oauth_tokens(paths, auth, &tokens).ok()?;
+    delete_legacy_tokens(paths);
+    Some((tokens, Some(auth.token_url.clone())))
+}
+
+/// The token set of the provider with `auth`, if one is stored.
+pub fn load_oauth_tokens(paths: &Paths, auth: &AuthCfg) -> Option<OAuthTokens> {
+    load_with_issuer(paths, auth).map(|(tokens, _)| tokens)
 }
 
 /// A JSON credential stored like the provider tokens (keychain + `0600`
@@ -157,12 +206,40 @@ pub fn delete_named_secret(paths: &Paths, name: &str) {
     let _ = std::fs::remove_file(paths.config_dir.join(format!("{name}.json")));
 }
 
-pub fn delete_oauth_tokens(paths: &Paths) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths)) {
+pub fn delete_oauth_tokens(paths: &Paths, auth: &AuthCfg) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths, auth)) {
+        let _ = entry.delete_credential();
+    }
+    let file = oauth_tokens_file(paths, auth);
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(file.with_extension("json.tmp"));
+}
+
+fn delete_legacy_tokens(paths: &Paths) {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &legacy_keyring_user(paths)) {
         let _ = entry.delete_credential();
     }
     let _ = std::fs::remove_file(paths.oauth_tokens_file());
     let _ = std::fs::remove_file(paths.oauth_tokens_file().with_extension("json.tmp"));
+}
+
+/// Every OAuth token set of the profile (`formless reset`): the providers
+/// in `cfg`, the legacy profile-wide set, and any orphaned token files.
+pub fn delete_all_oauth_tokens(paths: &Paths, cfg: Option<&crate::Config>) {
+    if let Some(cfg) = cfg {
+        delete_oauth_tokens(paths, &cfg.provider.auth);
+        for p in cfg.providers.values() {
+            delete_oauth_tokens(paths, &p.auth);
+        }
+    }
+    delete_legacy_tokens(paths);
+    if let Ok(dir) = std::fs::read_dir(&paths.config_dir) {
+        for e in dir.flatten() {
+            if e.file_name().to_string_lossy().starts_with("oauth_tokens-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 /// Whether a usable credential exists without performing a network refresh.
@@ -172,7 +249,7 @@ pub fn has_provider_credential(paths: &Paths, cfg: &ProviderCfg) -> bool {
         if env_access_token().is_some() {
             return true;
         }
-        let Some(tokens) = load_oauth_tokens(paths) else {
+        let Some(tokens) = load_oauth_tokens(paths, &cfg.auth) else {
             return false;
         };
         !tokens.is_expired(now_epoch()) || tokens.has_refresh_token()
@@ -194,7 +271,7 @@ pub fn auth_status(paths: &Paths, cfg: &ProviderCfg) -> AuthStatus {
                 scope: None,
             };
         }
-        match load_oauth_tokens(paths) {
+        match load_oauth_tokens(paths, &cfg.auth) {
             Some(tokens) => AuthStatus {
                 mode: cfg.auth.mode.clone(),
                 credential_present: true,
@@ -566,23 +643,61 @@ pub async fn resolve_provider_token(paths: &Paths, cfg: &ProviderCfg) -> Result<
     // Serialize refreshes within this process: several Runs may otherwise
     // redeem the same rotating refresh token concurrently.
     let _guard = refresh_lock().lock().await;
-    let tokens = load_oauth_tokens(paths).ok_or_else(|| {
-        anyhow!("OAuth login required: run `formless auth login` for this profile")
-    })?;
+    let (tokens, issuer) = stored_tokens(paths, cfg)?;
     if !tokens.is_expired(now_epoch()) {
         return Ok(tokens.access_token);
     }
+    refresh_stored(paths, cfg, &tokens, issuer.as_deref()).await
+}
+
+/// After the server rejected `rejected` (401: revoked, or clock skew past
+/// the expiry margin), refresh once even though it has not expired. A
+/// token another caller already replaced is returned as is.
+pub async fn force_refresh_provider_token(
+    paths: &Paths,
+    cfg: &ProviderCfg,
+    rejected: &str,
+) -> Result<String> {
+    if !cfg.oauth() || env_access_token().is_some() {
+        bail!("the provider rejected the credential (401)");
+    }
+    let _guard = refresh_lock().lock().await;
+    let (tokens, issuer) = stored_tokens(paths, cfg)?;
+    if tokens.access_token != rejected && !tokens.is_expired(now_epoch()) {
+        return Ok(tokens.access_token);
+    }
+    refresh_stored(paths, cfg, &tokens, issuer.as_deref()).await
+}
+
+fn stored_tokens(paths: &Paths, cfg: &ProviderCfg) -> Result<(OAuthTokens, Option<String>)> {
+    load_with_issuer(paths, &cfg.auth)
+        .ok_or_else(|| anyhow!("OAuth login required: run `formless auth login` for this profile"))
+}
+
+async fn refresh_stored(
+    paths: &Paths,
+    cfg: &ProviderCfg,
+    tokens: &OAuthTokens,
+    issuer: Option<&str>,
+) -> Result<String> {
     if !tokens.has_refresh_token() {
         bail!(
             "OAuth access token expired and no refresh_token is stored: run `formless auth login`"
         );
     }
-    let refreshed = refresh_tokens(&cfg.auth, &tokens)
+    // A refresh token only ever goes back to the endpoint that issued it.
+    if let Some(issuer) = issuer.filter(|i| *i != cfg.auth.token_url) {
+        bail!(
+            "stored OAuth tokens were issued by {issuer}, not {}; run `formless auth login`",
+            cfg.auth.token_url
+        );
+    }
+    let refreshed = refresh_tokens(&cfg.auth, tokens)
         .await
         .context("OAuth token refresh failed; run `formless auth login` if this persists")?;
     // Persist before use so a rotated refresh token cannot be lost after the
     // provider has already invalidated its predecessor.
-    save_oauth_tokens(paths, &refreshed).context("persist refreshed OAuth tokens")?;
+    save_oauth_tokens(paths, &cfg.auth, &refreshed).context("persist refreshed OAuth tokens")?;
     Ok(refreshed.access_token)
 }
 
@@ -732,7 +847,7 @@ where
     validate_oauth_config(cfg)?;
     let auth = cfg.auth.clone();
     let tokens = run_code_flow(cfg.auth.redirect_port, |_| Ok(auth), on_url, timeout)?;
-    save_oauth_tokens(paths, &tokens).context("persist OAuth tokens")?;
+    save_oauth_tokens(paths, &cfg.auth, &tokens).context("persist OAuth tokens")?;
     Ok(tokens)
 }
 

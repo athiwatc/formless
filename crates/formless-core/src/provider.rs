@@ -188,6 +188,69 @@ pub struct Provider {
     /// Told before each retry wait, so clients can show "rate limited ·
     /// retrying in 8s (2/5)" instead of a plain wait (SPEC §4.4).
     on_retry: Option<RetryHook>,
+    /// Told when a model's circuit breaker opens or closes (#621).
+    on_note: Option<NoteHook>,
+}
+
+pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Per-model circuit breakers (#621), shared by every Session in the
+/// daemon: after `BREAKER_TRIP` consecutive retryable failures a model is
+/// skipped for a cooldown (doubling, with jitter, up to 10 minutes), then
+/// tried by one request (half-open).
+#[derive(Default)]
+struct Breaker {
+    fails: u32,
+    open_until: Option<std::time::Instant>,
+    cooldown: Duration,
+}
+
+const BREAKER_TRIP: u32 = 3;
+
+static BREAKERS: std::sync::Mutex<Option<HashMap<String, Breaker>>> = std::sync::Mutex::new(None);
+
+fn with_breaker<T>(key: &str, f: impl FnOnce(&mut Breaker) -> T) -> T {
+    let mut all = BREAKERS.lock().unwrap_or_else(|e| e.into_inner());
+    f(all
+        .get_or_insert_with(HashMap::new)
+        .entry(key.to_string())
+        .or_default())
+}
+
+/// Skipped for now: open and still cooling down.
+fn breaker_open(key: &str) -> bool {
+    with_breaker(key, |b| {
+        b.open_until.is_some_and(|t| std::time::Instant::now() < t)
+    })
+}
+
+/// A success closes it; true when it had been open (worth saying).
+fn breaker_success(key: &str) -> bool {
+    with_breaker(key, |b| {
+        let was = b.open_until.is_some();
+        *b = Breaker::default();
+        was
+    })
+}
+
+/// A retryable failure; Some(cooldown) when this one opened the breaker.
+fn breaker_failure(key: &str) -> Option<Duration> {
+    with_breaker(key, |b| {
+        b.fails += 1;
+        if b.fails < BREAKER_TRIP {
+            return None;
+        }
+        let base = if b.cooldown.is_zero() {
+            Duration::from_secs(60)
+        } else {
+            (b.cooldown * 2).min(Duration::from_secs(600))
+        };
+        b.cooldown = base;
+        b.fails = 0;
+        b.open_until =
+            Some(std::time::Instant::now() + base.mul_f64(1.0 + rand::random::<f64>() * 0.25));
+        Some(base)
+    })
 }
 
 /// A provider request is about to be retried after `wait`.
@@ -589,9 +652,16 @@ pub fn proxy_in_use(cfg: &ProviderCfg) -> Option<String> {
     if !cfg.proxy.trim().is_empty() {
         return Some(cfg.proxy.trim().to_string());
     }
-    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
-        .iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
 impl Provider {
@@ -603,6 +673,7 @@ impl Provider {
             credential_paths: None,
             cache_key: None,
             on_retry: None,
+            on_note: None,
             http,
         })
     }
@@ -621,6 +692,7 @@ impl Provider {
             credential_paths: None,
             cache_key: None,
             on_retry: None,
+            on_note: None,
             http,
         }
     }
@@ -648,6 +720,7 @@ impl Provider {
             credential_paths: Some(paths),
             cache_key: None,
             on_retry: None,
+            on_note: None,
             http,
         })
     }
@@ -672,6 +745,19 @@ impl Provider {
     pub fn with_retry_hook(mut self, hook: RetryHook) -> Self {
         self.on_retry = Some(hook);
         self
+    }
+
+    /// Report breaker changes (a model skipped, back again) to `hook`.
+    pub fn with_note_hook(mut self, hook: NoteHook) -> Self {
+        self.on_note = Some(hook);
+        self
+    }
+
+    fn note(&self, text: String) {
+        tracing::info!("{text}");
+        if let Some(h) = &self.on_note {
+            h(text);
+        }
     }
 
     /// Tell the hook, then wait before retry `attempt` (0-based).
@@ -754,7 +840,10 @@ impl Provider {
         match native {
             Ok(true) => t.tool_calling = true,
             other => {
-                if probe_prompt_tool_call(self, model, &tool).await.unwrap_or(false) {
+                if probe_prompt_tool_call(self, model, &tool)
+                    .await
+                    .unwrap_or(false)
+                {
                     t.tool_calling = true;
                     t.prompt_fallback = true;
                 } else if let Err(e) = other {
@@ -767,9 +856,15 @@ impl Provider {
     }
 
     /// `/models` with each model's metadata (SPEC §4.2).
-    pub async fn list_models_meta(&self) -> Result<(Vec<String>, HashMap<String, u32>, HashMap<String, Value>)> {
+    pub async fn list_models_meta(
+        &self,
+    ) -> Result<(Vec<String>, HashMap<String, u32>, HashMap<String, Value>)> {
         let body = self.models_body().await?;
-        Ok((parse_models(&body), parse_model_windows(&body), parse_model_meta(&body)))
+        Ok((
+            parse_models(&body),
+            parse_model_windows(&body),
+            parse_model_meta(&body),
+        ))
     }
 
     /// `GET /models`; on the Messages API every page of it
@@ -815,9 +910,13 @@ impl Provider {
             }
         }
         let body = all.unwrap_or_default();
-        crate::anthropic::note_output_caps(body["data"].as_array().into_iter().flatten().filter_map(|m| {
-            Some((m["id"].as_str()?.to_string(), m["max_tokens"].as_u64()?))
-        }));
+        crate::anthropic::note_output_caps(
+            body["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| Some((m["id"].as_str()?.to_string(), m["max_tokens"].as_u64()?))),
+        );
         Ok(body)
     }
 
@@ -919,7 +1018,9 @@ impl Provider {
     /// rejection and reasoning_effort was set, retries once without it and
     /// flags `dropped` via the returned marker in ChatResult paths.
     async fn post_chat(&self, body: &mut Value, effort: Option<&str>) -> Result<reqwest::Response> {
-        self.post_provider(body, effort, true).await.map(|(r, _, _)| r)
+        self.post_provider(body, effort, true)
+            .await
+            .map(|(r, _, _)| r)
     }
 
     async fn post_provider(
@@ -935,7 +1036,9 @@ impl Provider {
         } else {
             "chat/completions"
         };
-        let requested = self.cfg.resolve_alias(body["model"].as_str().unwrap_or_default());
+        let requested = self
+            .cfg
+            .resolve_alias(body["model"].as_str().unwrap_or_default());
         let mut models = vec![requested.clone()];
         if allow_failover {
             for m in &self.cfg.fallback_models {
@@ -947,9 +1050,18 @@ impl Provider {
         }
         let mut recovered = Recovered::default();
         let mut last_err = String::new();
-        for model in &models {
+        let last = models.len().saturating_sub(1);
+        for (mi, model) in models.iter().enumerate() {
+            // A model whose breaker is open is skipped while another is
+            // left to try; the last one is always tried (#621).
+            let key = format!("{} {model}", self.cfg.base_url);
+            if mi < last && breaker_open(&key) {
+                tracing::info!("skipping {model}: its circuit breaker is open");
+                continue;
+            }
             let mut with_effort = effort.is_some();
-            for attempt in 0..=self.cfg.max_retries {
+            let mut reauthed = false;
+            'attempts: for attempt in 0..=self.cfg.max_retries {
                 let mut b = body.clone();
                 b["model"] = json!(model);
                 if with_effort {
@@ -973,6 +1085,9 @@ impl Provider {
                         let status = resp.status();
                         note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
+                            if breaker_success(&key) {
+                                self.note(format!("{model} is answering again."));
+                            }
                             return Ok((resp, recovered, model.clone()));
                         }
                         server_wait = retry_after(resp.headers());
@@ -1009,7 +1124,9 @@ impl Provider {
                                 None
                             };
                             if let Some(fix) = fix {
-                                tracing::info!("provider rejected the request ({fix:?}); resending");
+                                tracing::info!(
+                                    "provider rejected the request ({fix:?}); resending"
+                                );
                                 recovered.notes.push(fix.note().to_string());
                                 recovered.dropped_replayed_thinking |=
                                     fix == crate::anthropic::Recovery::ReplayedThinking;
@@ -1020,6 +1137,21 @@ impl Provider {
                             Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
                             None => format!("{status}: {text}"),
                         };
+                        // A rejected OAuth token (revoked, or clock skew past
+                        // the expiry margin): refresh once and resend.
+                        if status.as_u16() == 401 && self.cfg.oauth() && !reauthed {
+                            if let Some(paths) = &self.credential_paths {
+                                reauthed = true;
+                                crate::auth::force_refresh_provider_token(
+                                    paths,
+                                    &self.cfg,
+                                    &credential,
+                                )
+                                .await
+                                .with_context(|| format!("provider error: {last_err}"))?;
+                                continue;
+                            }
+                        }
                         if is_model_error(status.as_u16(), &text) && models.len() > 1 {
                             break; // fail over to the next model
                         }
@@ -1035,6 +1167,17 @@ impl Provider {
                     Err(e) => {
                         last_err = e.to_string();
                         reason = "connection failed".to_string();
+                    }
+                }
+                // Several failures in a row: stop paying retries on this
+                // model and fail over, for every Session, for a while.
+                if let Some(cool) = breaker_failure(&key) {
+                    if mi < last {
+                        self.note(format!(
+                            "{model} failed {BREAKER_TRIP} times in a row ({reason}); skipping it for about {}s.",
+                            cool.as_secs()
+                        ));
+                        break 'attempts;
                     }
                 }
                 if attempt < self.cfg.max_retries {
@@ -1533,8 +1676,12 @@ impl Provider {
             let mut failed: Option<String> = None;
             let fold = |f: &mut crate::anthropic::Folded, raw: &[u8], on_delta: &mut F| {
                 let line = String::from_utf8_lossy(raw);
-                let Some(data) = line.trim().strip_prefix("data:") else { return };
-                let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { return };
+                let Some(data) = line.trim().strip_prefix("data:") else {
+                    return;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+                    return;
+                };
                 match f.event(&v) {
                     crate::anthropic::Delta::Text(t) => on_delta(DeltaKind::Content, t),
                     crate::anthropic::Delta::Thinking(t) => on_delta(DeltaKind::Reasoning, t),
@@ -1637,7 +1784,12 @@ impl Provider {
                 model_used,
                 truncated: f.truncated,
                 usage: Some(usage),
-                stop_reason: f.stop_reason.filter(|r| !matches!(r.as_str(), "end_turn" | "tool_use" | "stop_sequence" | "max_tokens")),
+                stop_reason: f.stop_reason.filter(|r| {
+                    !matches!(
+                        r.as_str(),
+                        "end_turn" | "tool_use" | "stop_sequence" | "max_tokens"
+                    )
+                }),
                 stop_detail: f.stop_detail,
                 notes,
                 dropped_replayed_thinking,
@@ -1799,14 +1951,23 @@ pub fn known_model_meta(id: &str) -> Value {
         }
     };
     if name.starts_with("gpt-5") {
-        set(&mut meta, true, true, Some(&["minimal", "low", "medium", "high"]));
+        set(
+            &mut meta,
+            true,
+            true,
+            Some(&["minimal", "low", "medium", "high"]),
+        );
     } else if name.starts_with("o1") || name.starts_with("o3") || name.starts_with("o4") {
         set(&mut meta, true, true, Some(&["low", "medium", "high"]));
     } else if name.starts_with("gpt-4o") || name.starts_with("gpt-4.1") {
         set(&mut meta, true, true, Some(&[]));
     } else if name.contains("claude") {
         // Claude before 3.7 rejects extended thinking.
-        let efforts: Option<&[&str]> = if crate::anthropic::supports_thinking(name) { None } else { Some(&[]) };
+        let efforts: Option<&[&str]> = if crate::anthropic::supports_thinking(name) {
+            None
+        } else {
+            Some(&[])
+        };
         set(&mut meta, true, true, efforts);
         if let Some(cap) = crate::anthropic::output_cap(name) {
             meta["max_output"] = json!(cap);
@@ -1831,10 +1992,7 @@ fn merge_tool_fragment(calls: &mut Vec<ToolCall>, tc: &Value) {
     let id = tc["id"].as_str().filter(|i| !i.is_empty());
     let idx = match (tc["index"].as_u64(), id) {
         (Some(i), _) => i as usize,
-        (None, Some(id)) => calls
-            .iter()
-            .position(|c| c.id == id)
-            .unwrap_or(calls.len()),
+        (None, Some(id)) => calls.iter().position(|c| c.id == id).unwrap_or(calls.len()),
         (None, None) => calls.len().saturating_sub(1),
     };
     while calls.len() <= idx {

@@ -171,9 +171,17 @@ pub fn explain_task_choice(
 ) -> serde_json::Value {
     let stat = |m: &str| stats.iter().find(|s| s.model == m);
     let qualified = |s: &TaskStat| s.samples >= min_samples && s.good_rate() >= quality_bar;
-    let q: Vec<&TaskStat> = candidates.iter().filter_map(|m| stat(m)).filter(|s| qualified(s)).collect();
+    let q: Vec<&TaskStat> = candidates
+        .iter()
+        .filter_map(|m| stat(m))
+        .filter(|s| qualified(s))
+        .collect();
     let best_ms = q.iter().map(|s| s.avg_ms).fold(f64::MAX, f64::min).max(1.0);
-    let best_tok = q.iter().map(|s| s.avg_tokens).fold(f64::MAX, f64::min).max(1.0);
+    let best_tok = q
+        .iter()
+        .map(|s| s.avg_tokens)
+        .fold(f64::MAX, f64::min)
+        .max(1.0);
     let rows: Vec<serde_json::Value> = candidates
         .iter()
         .map(|m| match stat(m) {
@@ -188,7 +196,10 @@ pub fn explain_task_choice(
     let reason = if explored {
         format!("exploring: {picked} has the fewest samples (under {min_samples})")
     } else if q.is_empty() {
-        format!("no candidate has {min_samples}+ samples at {:.0}%+ good yet: the first one", quality_bar * 100.0)
+        format!(
+            "no candidate has {min_samples}+ samples at {:.0}%+ good yet: the first one",
+            quality_bar * 100.0
+        )
     } else {
         "the quickest and cheapest (time + tokens) of those passing the quality gate".to_string()
     };
@@ -247,7 +258,11 @@ mod explain_tests {
             avg_ms: ms,
             avg_tokens: 1000.0,
         };
-        let stats = vec![st("a", 10, 9, 2000.0), st("b", 10, 9, 1000.0), st("c", 10, 2, 500.0)];
+        let stats = vec![
+            st("a", 10, 9, 2000.0),
+            st("b", 10, 9, 1000.0),
+            st("c", 10, 2, 500.0),
+        ];
         let cands: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let picked = select_task_model(&cands, &stats, 5, 0.7, false).unwrap();
         assert_eq!(picked, "b");

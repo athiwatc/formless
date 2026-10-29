@@ -90,6 +90,25 @@ fn spawn_token_server() -> (String, Captured) {
                     }),
                 )
                 .route(
+                    "/v1/chat/completions",
+                    post(|headers: axum::http::HeaderMap| async move {
+                        let ok = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer new-access");
+                        if ok {
+                            Json(json!({"choices": [{"message": {"content": "hi"}}]}))
+                                .into_response()
+                        } else {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({"error": {"message": "revoked"}})),
+                            )
+                                .into_response()
+                        }
+                    }),
+                )
+                .route(
                     "/token",
                     post(
                         |State(captured): State<Captured>, body: String| async move {
@@ -248,17 +267,20 @@ prompt = "consent"
     assert_eq!(parsed.expires_at, Some(1_120));
     assert_eq!(parsed.refresh_token.as_deref(), Some("previous-refresh"));
 
-    save_oauth_tokens(&paths, &parsed).unwrap();
-    let loaded = load_oauth_tokens(&paths).unwrap();
+    save_oauth_tokens(&paths, &cfg.provider.auth, &parsed).unwrap();
+    let loaded = load_oauth_tokens(&paths, &cfg.provider.auth).unwrap();
     assert_eq!(loaded, parsed);
-    assert!(paths.oauth_tokens_file().exists());
+    assert!(formless_core::auth::oauth_tokens_file(&paths, &cfg.provider.auth).exists());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(paths.oauth_tokens_file())
-            .unwrap()
-            .permissions()
-            .mode();
+        let mode = std::fs::metadata(formless_core::auth::oauth_tokens_file(
+            &paths,
+            &cfg.provider.auth,
+        ))
+        .unwrap()
+        .permissions()
+        .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
     let debug = format!("{:?}", loaded);
@@ -269,8 +291,8 @@ prompt = "consent"
     let status = auth_status(&paths, &cfg.provider);
     assert_eq!(status.mode, "oauth");
     assert!(status.has_refresh_token);
-    delete_oauth_tokens(&paths);
-    assert!(load_oauth_tokens(&paths).is_none());
+    delete_oauth_tokens(&paths, &cfg.provider.auth);
+    assert!(load_oauth_tokens(&paths, &cfg.provider.auth).is_none());
 }
 
 #[tokio::test]
@@ -285,12 +307,12 @@ async fn expired_tokens_refresh_once_and_rotated_tokens_persist() {
         token_type: "Bearer".into(),
         scope: Some("openid profile".into()),
     };
-    save_oauth_tokens(&paths, &old).unwrap();
+    save_oauth_tokens(&paths, &cfg.auth, &old).unwrap();
     assert!(has_provider_credential(&paths, &cfg));
 
     let first = resolve_provider_token(&paths, &cfg).await.unwrap();
     assert_eq!(first, "new-access");
-    let stored = load_oauth_tokens(&paths).unwrap();
+    let stored = load_oauth_tokens(&paths, &cfg.auth).unwrap();
     assert_eq!(stored.access_token, "new-access");
     assert_eq!(stored.refresh_token.as_deref(), Some("rotated-refresh"));
     assert_eq!(captured.lock().unwrap().len(), 1);
@@ -303,7 +325,7 @@ async fn expired_tokens_refresh_once_and_rotated_tokens_persist() {
         1,
         "a still-valid access token must not be refreshed again"
     );
-    delete_oauth_tokens(&paths);
+    delete_oauth_tokens(&paths, &cfg.auth);
 }
 
 #[tokio::test]
@@ -318,13 +340,13 @@ async fn managed_provider_refreshes_again_when_token_expires_mid_run() {
         token_type: "Bearer".into(),
         scope: Some("openid profile".into()),
     };
-    save_oauth_tokens(&paths, &expired).unwrap();
+    save_oauth_tokens(&paths, &cfg.auth, &expired).unwrap();
     let provider = Provider::for_profile(cfg.clone(), paths.clone())
         .await
         .unwrap();
     assert_eq!(captured.lock().unwrap().len(), 1);
     assert_eq!(
-        load_oauth_tokens(&paths).unwrap().access_token,
+        load_oauth_tokens(&paths, &cfg.auth).unwrap().access_token,
         "new-access"
     );
     assert_eq!(provider.list_models().await.unwrap(), ["test-model"]);
@@ -332,14 +354,17 @@ async fn managed_provider_refreshes_again_when_token_expires_mid_run() {
     // Simulate time passing inside the same long-lived provider: storing an
     // expired token set must be noticed before the next HTTP request, not
     // only when some outer daemon code constructs another Provider.
-    save_oauth_tokens(&paths, &expired).unwrap();
+    save_oauth_tokens(&paths, &cfg.auth, &expired).unwrap();
     assert_eq!(provider.list_models().await.unwrap(), ["test-model"]);
     assert_eq!(captured.lock().unwrap().len(), 2);
     assert_eq!(
-        load_oauth_tokens(&paths).unwrap().refresh_token.as_deref(),
+        load_oauth_tokens(&paths, &cfg.auth)
+            .unwrap()
+            .refresh_token
+            .as_deref(),
         Some("rotated-refresh")
     );
-    delete_oauth_tokens(&paths);
+    delete_oauth_tokens(&paths, &cfg.auth);
 }
 
 #[tokio::test]
@@ -385,6 +410,7 @@ fn browser_login_callback_exchanges_code_and_saves_tokens() {
     let paths = test_paths("login");
     let (base, captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
+    let auth = cfg.auth.clone();
     let (url_tx, url_rx) = std::sync::mpsc::channel();
     let login_paths = paths.clone();
     let handle = std::thread::spawn(move || {
@@ -406,12 +432,12 @@ fn browser_login_callback_exchanges_code_and_saves_tokens() {
 
     let tokens = handle.join().unwrap().unwrap();
     assert_eq!(tokens.access_token, "login-access");
-    assert_eq!(load_oauth_tokens(&paths).unwrap(), tokens);
+    assert_eq!(load_oauth_tokens(&paths, &auth).unwrap(), tokens);
     let body = captured.lock().unwrap()[0].clone();
     let verifier = form_value(&body, "code_verifier").unwrap();
     assert_eq!(verifier.len(), 43);
     assert_eq!(pkce_challenge(verifier), challenge);
-    delete_oauth_tokens(&paths);
+    delete_oauth_tokens(&paths, &auth);
 }
 
 #[test]
@@ -419,6 +445,7 @@ fn browser_login_rejects_state_mismatch() {
     let paths = test_paths("badstate");
     let (base, _captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
+    let auth = cfg.auth.clone();
     let (url_tx, url_rx) = std::sync::mpsc::channel();
     let login_paths = paths.clone();
     let handle = std::thread::spawn(move || {
@@ -439,7 +466,7 @@ fn browser_login_rejects_state_mismatch() {
     );
     let error = handle.join().unwrap().unwrap_err();
     assert!(format!("{error:#}").contains("state mismatch"));
-    assert!(load_oauth_tokens(&paths).is_none());
+    assert!(load_oauth_tokens(&paths, &auth).is_none());
 }
 
 #[tokio::test]
@@ -471,4 +498,106 @@ async fn credential_resolution_errors_and_api_key_mode_are_actionable() {
     assert_eq!(status.mode, "api_key");
     assert!(status.credential_present);
     delete_api_key(&paths);
+}
+
+fn tokens(access: &str, refresh: &str, expires_at: i64) -> OAuthTokens {
+    OAuthTokens {
+        access_token: access.into(),
+        refresh_token: Some(refresh.into()),
+        expires_at: Some(expires_at),
+        token_type: "Bearer".into(),
+        scope: None,
+    }
+}
+
+#[tokio::test]
+async fn two_oauth_providers_keep_separate_tokens() {
+    let paths = test_paths("two");
+    let a = oauth_cfg("http://a.example");
+    let b = oauth_cfg("http://b.example");
+    save_oauth_tokens(
+        &paths,
+        &a.auth,
+        &tokens("a-access", "a-refresh", now_epoch() + 600),
+    )
+    .unwrap();
+    save_oauth_tokens(
+        &paths,
+        &b.auth,
+        &tokens("b-access", "b-refresh", now_epoch() + 600),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_provider_token(&paths, &a).await.unwrap(),
+        "a-access"
+    );
+    assert_eq!(
+        resolve_provider_token(&paths, &b).await.unwrap(),
+        "b-access"
+    );
+    delete_oauth_tokens(&paths, &a.auth);
+    assert!(load_oauth_tokens(&paths, &a.auth).is_none());
+    assert_eq!(
+        load_oauth_tokens(&paths, &b.auth).unwrap().access_token,
+        "b-access"
+    );
+    delete_oauth_tokens(&paths, &b.auth);
+}
+
+#[tokio::test]
+async fn legacy_tokens_move_to_the_default_provider_only() {
+    let paths = test_paths("legacy");
+    let mut cfg = formless_core::Config::default();
+    cfg.provider = oauth_cfg("http://default.example");
+    cfg.save(&paths).unwrap();
+    let other = oauth_cfg("http://other.example");
+    let legacy = serde_json::to_string(&tokens("old", "r", now_epoch() + 600)).unwrap();
+    formless_core::config::write_secret_file(&paths.oauth_tokens_file(), &legacy).unwrap();
+    // Another provider never picks up (or refreshes with) the default's tokens.
+    assert!(load_oauth_tokens(&paths, &other.auth).is_none());
+    assert_eq!(
+        load_oauth_tokens(&paths, &cfg.provider.auth)
+            .unwrap()
+            .access_token,
+        "old"
+    );
+    assert!(
+        !paths.oauth_tokens_file().exists(),
+        "migrated out of the legacy file"
+    );
+    assert!(formless_core::auth::oauth_tokens_file(&paths, &cfg.provider.auth).exists());
+    delete_oauth_tokens(&paths, &cfg.provider.auth);
+}
+
+#[tokio::test]
+async fn a_401_forces_one_refresh_and_resends() {
+    let paths = test_paths("401");
+    let (base, captured) = spawn_token_server();
+    let mut cfg = oauth_cfg(&base);
+    cfg.max_retries = 1;
+    // Not expired by the clock, but the server has revoked it.
+    save_oauth_tokens(
+        &paths,
+        &cfg.auth,
+        &tokens("old-access", "old-refresh", now_epoch() + 600),
+    )
+    .unwrap();
+    let provider = Provider::for_profile(cfg.clone(), paths.clone())
+        .await
+        .unwrap();
+    let out = provider
+        .complete(
+            &[json!({"role": "user", "content": "hi"})],
+            "test-model",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "hi");
+    assert_eq!(captured.lock().unwrap().len(), 1, "one refresh");
+    assert_eq!(
+        load_oauth_tokens(&paths, &cfg.auth).unwrap().access_token,
+        "new-access"
+    );
+    delete_oauth_tokens(&paths, &cfg.auth);
 }

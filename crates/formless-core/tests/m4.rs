@@ -156,12 +156,25 @@ impl Client {
             .unwrap();
         self.write.write_all(b"\n").await.unwrap();
         loop {
-            let line = self.lines.next_line().await.unwrap().expect("daemon closed");
-            if let Ok(formless_protocol::ServerMessage::Response { id: rid, ok, result, error }) =
-                serde_json::from_str::<formless_protocol::ServerMessage>(&line)
+            let line = self
+                .lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("daemon closed");
+            if let Ok(formless_protocol::ServerMessage::Response {
+                id: rid,
+                ok,
+                result,
+                error,
+            }) = serde_json::from_str::<formless_protocol::ServerMessage>(&line)
             {
                 if rid == id {
-                    return if ok { Ok(result.unwrap_or(Value::Null)) } else { Err(error.unwrap_or_default()) };
+                    return if ok {
+                        Ok(result.unwrap_or(Value::Null))
+                    } else {
+                        Err(error.unwrap_or_default())
+                    };
                 }
             }
         }
@@ -2437,7 +2450,9 @@ async fn a_per_run_step_limit_pauses_and_is_cleared_after() {
     let explained = explained.unwrap();
     assert_eq!(explained.category, "budget");
     assert!(
-        explained.message.contains("3 of the 3 steps set with /limit"),
+        explained
+            .message
+            .contains("3 of the 3 steps set with /limit"),
         "{}",
         explained.message
     );
@@ -2487,7 +2502,11 @@ async fn retry_reruns_the_last_message_on_another_model() {
     write_cfg(&paths, &base, 30, false, 128_000);
     let server = start_daemon(&paths).await;
     let mut c = Client::connect(&paths).await;
-    let id = c.rpc(Request::CreateSession { name: Some("Q".into()) }).await["id"]
+    let id = c
+        .rpc(Request::CreateSession {
+            name: Some("Q".into()),
+        })
+        .await["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -2653,7 +2672,11 @@ async fn run_file_changes_are_listed_and_rewound() {
     assert_eq!(status(&files, "c.txt").as_deref(), Some("removed"));
     let recap = recap.expect("a recap after 5 steps");
     assert!(recap.steps >= 4, "{recap:?}");
-    assert!(recap.used.iter().any(|u| u.starts_with("writer ×")), "{:?}", recap.used);
+    assert!(
+        recap.used.iter().any(|u| u.starts_with("writer ×")),
+        "{:?}",
+        recap.used
+    );
     assert_eq!(recap.files.len(), 3, "{:?}", recap.files);
     // The diff shows the edit.
     let r = c
@@ -2688,8 +2711,14 @@ async fn run_file_changes_are_listed_and_rewound() {
         })
         .await;
     assert_eq!(r["restored"].as_array().unwrap().len(), 2, "{r}");
-    assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "one\ntwo\n");
-    assert_eq!(std::fs::read_to_string(work.join("c.txt")).unwrap(), "gone soon");
+    assert_eq!(
+        std::fs::read_to_string(work.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("c.txt")).unwrap(),
+        "gone soon"
+    );
     server.abort();
 }
 
@@ -2721,16 +2750,30 @@ async fn update_plan_is_stored_and_broadcast() {
                     let last = body["messages"].as_array().unwrap().last().unwrap().clone();
                     async move {
                         match n {
-                            0 => sse_tool("p1", "update_plan", json!({"items": [
+                            0 => sse_tool(
+                                "p1",
+                                "update_plan",
+                                json!({"items": [
                                 {"content": "Read the files", "status": "completed"},
                                 {"content": "Fix the bug", "status": "in_progress"},
-                                {"content": "Run the tests", "status": "pending"}]})),
+                                {"content": "Run the tests", "status": "pending"}]}),
+                            ),
                             1 => {
-                                assert!(last["content"].as_str().unwrap().contains("1/3 done"), "{last}");
-                                sse_tool("p2", "update_plan", json!({"items": [{"content": "x", "status": "maybe"}]}))
+                                assert!(
+                                    last["content"].as_str().unwrap().contains("1/3 done"),
+                                    "{last}"
+                                );
+                                sse_tool(
+                                    "p2",
+                                    "update_plan",
+                                    json!({"items": [{"content": "x", "status": "maybe"}]}),
+                                )
                             }
                             _ => {
-                                assert!(last["content"].as_str().unwrap().contains("error"), "{last}");
+                                assert!(
+                                    last["content"].as_str().unwrap().contains("error"),
+                                    "{last}"
+                                );
                                 sse_text("done")
                             }
                         }
@@ -2843,7 +2886,9 @@ async fn step_mode_pauses_edits_and_skips_calls() {
             .unwrap()
             .unwrap();
         match serde_json::from_str::<ServerMessage>(&line) {
-            Ok(ServerMessage::Event(Event::StepPending { step_id, tool_name, .. })) => {
+            Ok(ServerMessage::Event(Event::StepPending {
+                step_id, tool_name, ..
+            })) => {
                 assert_eq!(tool_name, "echo_fast");
                 steps += 1;
                 let (action, arguments) = if steps == 1 {
@@ -2884,7 +2929,10 @@ async fn step_mode_pauses_edits_and_skips_calls() {
         .find(|m| m["role"] == "assistant" && m["meta"].as_str().is_some_and(|x| x.contains("s1")))
         .unwrap()
         .clone();
-    assert!(call["meta"].as_str().unwrap().contains(r#"{\"x\": 5}"#), "{call}");
+    assert!(
+        call["meta"].as_str().unwrap().contains(r#"{\"x\": 5}"#),
+        "{call}"
+    );
     server.abort();
 }
 
@@ -2918,7 +2966,11 @@ async fn compare_runs_each_model_in_a_fork_and_reports_both() {
     write_cfg(&paths, &base, 30, false, 128_000);
     let server = start_daemon(&paths).await;
     let mut c = Client::connect(&paths).await;
-    let id = c.rpc(Request::CreateSession { name: Some("Q".into()) }).await["id"]
+    let id = c
+        .rpc(Request::CreateSession {
+            name: Some("Q".into()),
+        })
+        .await["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -2942,8 +2994,11 @@ async fn compare_runs_each_model_in_a_fork_and_reports_both() {
             .expect("timed out")
             .unwrap()
             .unwrap();
-        if let Ok(ServerMessage::Event(Event::ComparisonReady { session_id, results, .. })) =
-            serde_json::from_str::<ServerMessage>(&line)
+        if let Ok(ServerMessage::Event(Event::ComparisonReady {
+            session_id,
+            results,
+            ..
+        })) = serde_json::from_str::<ServerMessage>(&line)
         {
             assert_eq!(session_id, id);
             break results;

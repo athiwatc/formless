@@ -246,9 +246,7 @@ enum Cmd {
     ImportAll { file: std::path::PathBuf },
     /// Replace the database with a backup (stop the daemon first); the
     /// current one is saved next to the backups
-    Restore {
-        file: std::path::PathBuf,
-    },
+    Restore { file: std::path::PathBuf },
     /// Remove Formless from this machine: stop the daemon, remove the login
     /// service, delete keychain entries and every profile's data, and the
     /// binary (SPEC §15)
@@ -1312,20 +1310,32 @@ fn main() -> Result<()> {
         Some(Cmd::Backup) => backup_cmd(&paths),
         Some(Cmd::ExportAll { sessions, output }) => {
             formless_core::daemon::ensure_daemon(&paths)?;
-            let bundle = formless_tui::client::request_once(&paths, Request::ExportAll { sessions })?;
+            let bundle =
+                formless_tui::client::request_once(&paths, Request::ExportAll { sessions })?;
             let file = output.unwrap_or_else(|| {
                 std::path::PathBuf::from(format!(
                     "formless-export-{}.json",
                     chrono::Local::now().format("%Y%m%d-%H%M")
                 ))
             });
-            formless_core::config::write_secret_file(&file, &serde_json::to_string_pretty(&bundle)?)?;
+            formless_core::config::write_secret_file(
+                &file,
+                &serde_json::to_string_pretty(&bundle)?,
+            )?;
             let n = |k: &str| bundle[k].as_array().map_or(0, Vec::len);
             println!("exported:  {}", file.display());
             println!(
                 "contains:  {} Tools, {} modules, {} Skills, {} memories, {} jobs{}",
-                n("tools"), n("modules"), n("skills"), n("memories"), n("jobs"),
-                if sessions { format!(", {} Sessions", n("sessions")) } else { String::new() }
+                n("tools"),
+                n("modules"),
+                n("skills"),
+                n("memories"),
+                n("jobs"),
+                if sessions {
+                    format!(", {} Sessions", n("sessions"))
+                } else {
+                    String::new()
+                }
             );
             if n("blanked") > 0 {
                 println!("left out:  {} secret value(s) (API keys never leave the keychain); fill them in after import", n("blanked"));
@@ -1333,8 +1343,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::ImportAll { file }) => {
-            let text = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-            let bundle: serde_json::Value = serde_json::from_str(&text).context("not a JSON export")?;
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            let bundle: serde_json::Value =
+                serde_json::from_str(&text).context("not a JSON export")?;
             formless_core::daemon::ensure_daemon(&paths)?;
             let r = formless_tui::client::request_once(&paths, Request::ImportAll { bundle })?;
             println!(
@@ -1817,7 +1829,12 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         DaemonAction::InstallService { dry_run } => {
             let plan = formless_core::service::plan_here(&paths)?;
             if dry_run {
-                println!("# {} ({})\n{}", plan.file.display(), plan.manager, plan.contents);
+                println!(
+                    "# {} ({})\n{}",
+                    plan.file.display(),
+                    plan.manager,
+                    plan.contents
+                );
                 for c in &plan.enable {
                     println!("$ {}", c.join(" "));
                 }
@@ -1880,26 +1897,48 @@ fn print_daemon_status(v: &serde_json::Value) {
     let b = |k: &str| human_bytes(r[k].as_u64().unwrap_or(0));
     println!(
         "daemon:      running (pid {}, version {}, protocol {})",
-        v["pid"], v["version"].as_str().unwrap_or_default(), v["protocol"]
+        v["pid"],
+        v["version"].as_str().unwrap_or_default(),
+        v["protocol"]
     );
     if let Some(up) = r["uptime_secs"].as_u64() {
-        println!("uptime:      {}", if up >= 3600 { format!("{}h {}m", up / 3600, up % 3600 / 60) } else { format!("{}m {}s", up / 60, up % 60) });
+        println!(
+            "uptime:      {}",
+            if up >= 3600 {
+                format!("{}h {}m", up / 3600, up % 3600 / 60)
+            } else {
+                format!("{}m {}s", up / 60, up % 60)
+            }
+        );
     }
     if r["memory_bytes"].is_u64() {
         println!(
             "memory:      {}  ·  cpu {}% (total {})",
             b("memory_bytes"),
-            r["cpu_percent"].as_f64().map_or("?".into(), |c| format!("{c:.1}")),
+            r["cpu_percent"]
+                .as_f64()
+                .map_or("?".into(), |c| format!("{c:.1}")),
             r["cpu_time"].as_str().unwrap_or("?")
         );
     }
-    println!("database:    {}  ·  artifacts {}", b("db_bytes"), b("artifacts_bytes"));
+    println!(
+        "database:    {}  ·  artifacts {}",
+        b("db_bytes"),
+        b("artifacts_bytes")
+    );
     let running = v["running_sessions"].as_array().map_or(0, Vec::len);
     println!(
         "work:        {} Session(s) · {running} running Run(s) · {} pending Invocation(s)",
         v["sessions"], r["running_invocations"]
     );
-    println!("approvals:   {}", if v["secure"] == true { "on (--secure)" } else { "off" });
+    println!(
+        "approvals:   {}",
+        if v["secure"] == true {
+            "on (--secure)"
+        } else {
+            "off"
+        }
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -2038,7 +2077,7 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
             Ok(())
         }
         AuthAction::Logout => {
-            formless_core::auth::delete_oauth_tokens(&paths);
+            formless_core::auth::delete_oauth_tokens(&paths, &cfg.provider.auth);
             println!("Stored OAuth tokens deleted for this profile.");
             Ok(())
         }
@@ -2169,6 +2208,15 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
             paths.config_file(),
         ]
         .into_iter()
+        // One OAuth token file per provider (oauth_tokens-<id>.json).
+        .chain(
+            std::fs::read_dir(&paths.config_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("oauth_tokens-"))
+                .map(|e| e.path()),
+        )
         .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0))
         .collect();
         if !open.is_empty() {
@@ -2415,7 +2463,11 @@ fn storage_cmd(paths: &Paths, json: bool) -> Result<()> {
         let inside = k["inside_db"] == true;
         tbl.row(vec![
             t(
-                format!("{}{}", if inside { "  " } else { "" }, k["kind"].as_str().unwrap_or_default()),
+                format!(
+                    "{}{}",
+                    if inside { "  " } else { "" },
+                    k["kind"].as_str().unwrap_or_default()
+                ),
                 if inside { Tone::Dim } else { Tone::Strong },
             ),
             c(human_bytes(k["bytes"].as_u64().unwrap_or(0))),
@@ -2522,8 +2574,13 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         None => say!("proxy:      none"),
     }
     match formless_core::service::installed(&paths) {
-        Some((manager, file)) => say!("service:    starts at login ({manager}: {})", file.display()),
-        None => say!("service:    not installed (formless daemon install-service starts it at login)"),
+        Some((manager, file)) => say!(
+            "service:    starts at login ({manager}: {})",
+            file.display()
+        ),
+        None => {
+            say!("service:    not installed (formless daemon install-service starts it at login)")
+        }
     }
     match formless_core::housekeeping::last_backup(&paths) {
         Some((file, at)) => {
@@ -3839,11 +3896,15 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             model,
             no_key,
         } => {
-            let pairs = |items: &[String], what: &str| -> Result<std::collections::BTreeMap<String, String>> {
+            let pairs = |items: &[String],
+                         what: &str|
+             -> Result<std::collections::BTreeMap<String, String>> {
                 items
                     .iter()
                     .map(|h| {
-                        let (k, v) = h.split_once('=').with_context(|| format!("{what} takes key=value"))?;
+                        let (k, v) = h
+                            .split_once('=')
+                            .with_context(|| format!("{what} takes key=value"))?;
                         Ok((k.trim().to_string(), v.trim().to_string()))
                     })
                     .collect()
@@ -3930,14 +3991,25 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             let ms = |k: &str| t[k].as_u64().map_or("-".into(), |v| format!("{v} ms"));
             let yes = |k: &str| if t[k] == true { "yes" } else { "no" };
             println!("model:       {}", t["model"].as_str().unwrap_or_default());
-            println!("result:      {}", if t["ok"] == true { "ok" } else { "problems" });
-            println!("first token: {}  ·  total {}", ms("first_token_ms"), ms("total_ms"));
+            println!(
+                "result:      {}",
+                if t["ok"] == true { "ok" } else { "problems" }
+            );
+            println!(
+                "first token: {}  ·  total {}",
+                ms("first_token_ms"),
+                ms("total_ms")
+            );
             println!("streaming:   {}", yes("streaming"));
             println!("reasoning:   {}", yes("reasoning"));
             println!(
                 "tool calls:  {}{}",
                 yes("tool_calling"),
-                if t["prompt_fallback"] == true { " (prompt-based fallback only)" } else { "" }
+                if t["prompt_fallback"] == true {
+                    " (prompt-based fallback only)"
+                } else {
+                    ""
+                }
             );
             if let Some(e) = t["error"].as_str() {
                 println!("error:       {e}");
@@ -4319,7 +4391,10 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                 println!("added:   {}", r["added"].as_str().unwrap_or(&name));
                 report(&r);
                 for k in r["env_keys"].as_array().into_iter().flatten() {
-                    println!("needs:   {} in the daemon's environment", k.as_str().unwrap_or_default());
+                    println!(
+                        "needs:   {} in the daemon's environment",
+                        k.as_str().unwrap_or_default()
+                    );
                 }
                 if r["needs_login"] == true {
                     println!("next:    formless mcp login {name}");
@@ -4415,7 +4490,14 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                 }
                 let id = e["id"].as_str().unwrap_or_default();
                 tbl.row(vec![
-                    t(id, if e["added"] == true { Tone::Dim } else { Tone::Strong }),
+                    t(
+                        id,
+                        if e["added"] == true {
+                            Tone::Dim
+                        } else {
+                            Tone::Strong
+                        },
+                    ),
                     c(e["title"].as_str().unwrap_or_default()),
                     t(e["description"].as_str().unwrap_or_default(), Tone::Dim),
                     c(needs.join(" ")),
@@ -4453,7 +4535,10 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                     println!("  env: {}", env.join(", "));
                 }
                 for m in cand["missing_env"].as_array().into_iter().flatten() {
-                    println!("  not imported: {} (a placeholder; set it yourself)", m.as_str().unwrap_or_default());
+                    println!(
+                        "  not imported: {} (a placeholder; set it yourself)",
+                        m.as_str().unwrap_or_default()
+                    );
                 }
                 if cand["exists"] == true {
                     println!("  skipped: a server named {name} is already configured");
@@ -4500,16 +4585,39 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             for tool in r["tools"].as_array().into_iter().flatten() {
                 let on = tool["enabled"] == true;
                 tbl.row(vec![
-                    t(tool["name"].as_str().unwrap_or_default(), if on { Tone::Strong } else { Tone::Dim }),
-                    if on { t("on", Tone::Good) } else { t("off", Tone::Dim) },
+                    t(
+                        tool["name"].as_str().unwrap_or_default(),
+                        if on { Tone::Strong } else { Tone::Dim },
+                    ),
+                    if on {
+                        t("on", Tone::Good)
+                    } else {
+                        t("off", Tone::Dim)
+                    },
                     c(tool["tokens"].to_string()),
-                    t(tool["description"].as_str().unwrap_or_default().lines().next().unwrap_or_default(), Tone::Dim),
+                    t(
+                        tool["description"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .lines()
+                            .next()
+                            .unwrap_or_default(),
+                        Tone::Dim,
+                    ),
                 ]);
             }
             tbl.print();
-            println!("tool list cost: ~{} tokens per request (enabled tools)", r["enabled_tokens"]);
+            println!(
+                "tool list cost: ~{} tokens per request (enabled tools)",
+                r["enabled_tokens"]
+            );
         }
-        McpAction::Tool { name, tool, on, off } => {
+        McpAction::Tool {
+            name,
+            tool,
+            on,
+            off,
+        } => {
             if on == off {
                 anyhow::bail!("pass --on or --off");
             }
@@ -5413,7 +5521,9 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
     }
     match (&exe, managed, keep_binary) {
         (_, _, true) => {}
-        (_, Some(how), _) => println!("  the binary: installed by a package manager, remove it with {how}"),
+        (_, Some(how), _) => {
+            println!("  the binary: installed by a package manager, remove it with {how}")
+        }
         (Some(e), None, false) => println!("  the binary: {}", e.display()),
         _ => {}
     }
@@ -5457,11 +5567,17 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
     }
     if let (Some(e), None, false) = (&exe, managed, keep_binary) {
         if cfg!(windows) {
-            println!("Windows can't delete a running program: delete {} yourself now.", e.display());
+            println!(
+                "Windows can't delete a running program: delete {} yourself now.",
+                e.display()
+            );
         } else {
             match std::fs::remove_file(e) {
                 Ok(()) => println!("removed {}", e.display()),
-                Err(err) => eprintln!("could not remove {}: {err} (delete it yourself)", e.display()),
+                Err(err) => eprintln!(
+                    "could not remove {}: {err} (delete it yourself)",
+                    e.display()
+                ),
             }
         }
     }

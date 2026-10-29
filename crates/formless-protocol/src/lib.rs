@@ -1,9 +1,71 @@
 //! Shared daemon <-> client protocol (SPEC §9.3). NDJSON framing: one JSON
 //! value per line.
+//!
+//! Compatibility rules:
+//! - Additive changes are minor and keep [`PROTOCOL_VERSION`]: a new
+//!   optional field (with `#[serde(default)]`), a new `Request` or `Event`
+//!   variant. Peers ignore fields they don't know; a daemon answers a
+//!   request type it doesn't know with an `unsupported` error (see
+//!   [`unsupported`]); clients skip events they can't parse. Name the new
+//!   capability in [`FEATURES`] so peers can check for it.
+//! - Removing or renaming a field or variant, or changing a field's type
+//!   or meaning, is major: bump [`PROTOCOL_VERSION`], and raise
+//!   [`MIN_PROTOCOL_VERSION`] only when the old shape is no longer served.
 
 use serde::{Deserialize, Serialize};
 
+/// The newest protocol this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// The oldest protocol this build still accepts.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// Named optional capabilities, advertised by `Ping` and `Status`.
+pub const FEATURES: &[&str] = &[
+    "subscribe_filter",
+    "ask_user",
+    "approval_batches",
+    "unsupported_error",
+];
+
+/// The highest version both peers speak, if any.
+pub fn negotiate(their_min: u32, their_max: u32) -> Option<u32> {
+    let v = their_max.min(PROTOCOL_VERSION);
+    (v >= their_min.max(MIN_PROTOCOL_VERSION)).then_some(v)
+}
+
+/// The envelope id of a request line that failed to parse, when it is
+/// readable at all, so the error still reaches the right caller.
+pub fn lenient_id(line: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v["id"].as_u64())
+        .unwrap_or(0)
+}
+
+/// The `type` of a request line this build doesn't know, if that is why
+/// it failed to parse (the envelope itself is well formed).
+pub fn unknown_request_type(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let kind = v["request"]["type"].as_str()?;
+    let known = serde_json::from_value::<Request>(serde_json::json!({ "type": kind }));
+    match known {
+        Err(e) if e.to_string().contains("unknown variant") => Some(kind.to_string()),
+        _ => None,
+    }
+}
+
+/// The reply to a request type this daemon doesn't serve: an error with
+/// a machine-readable `{"code": "unsupported", "type": …}` result.
+pub fn unsupported(id: u64, kind: &str) -> ServerMessage {
+    ServerMessage::Response {
+        id,
+        ok: false,
+        result: Some(serde_json::json!({"code": "unsupported", "type": kind})),
+        error: Some(format!(
+            "unsupported: this daemon does not know the request type '{kind}'"
+        )),
+    }
+}
 
 /// A browser connected through the relay (SPEC §12).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -388,13 +450,32 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             .to_ascii_lowercase();
         if matches!(
             base.as_str(),
-            "sh" | "bash" | "zsh" | "fish" | "dash" | "cmd" | "powershell" | "pwsh"
-                | "python" | "python3" | "node" | "deno" | "bun" | "perl" | "ruby" | "php"
-                | "osascript" | "env" | "xargs" | "sudo"
+            "sh" | "bash"
+                | "zsh"
+                | "fish"
+                | "dash"
+                | "cmd"
+                | "powershell"
+                | "pwsh"
+                | "python"
+                | "python3"
+                | "node"
+                | "deno"
+                | "bun"
+                | "perl"
+                | "ruby"
+                | "php"
+                | "osascript"
+                | "env"
+                | "xargs"
+                | "sudo"
         ) {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
-        if matches!(base.as_str(), "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat") {
+        if matches!(
+            base.as_str(),
+            "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat"
+        ) {
             return Some("it can reach any host and write files, like net plus fs:write");
         }
     }
@@ -2446,6 +2527,54 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_negotiate_to_the_highest_common_one() {
+        assert_eq!(negotiate(1, 1), Some(1));
+        assert_eq!(negotiate(1, PROTOCOL_VERSION + 3), Some(PROTOCOL_VERSION));
+        assert_eq!(negotiate(PROTOCOL_VERSION + 1, PROTOCOL_VERSION + 2), None);
+    }
+
+    #[test]
+    fn older_and_newer_envelopes_still_parse() {
+        // One version behind: a Subscribe from before `client` existed.
+        let old: RequestEnvelope = serde_json::from_str(
+            r#"{"id":4,"protocol":1,"request":{"type":"subscribe","sessions":["s"]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old.request,
+            Request::Subscribe {
+                client: None,
+                deltas: true,
+                ..
+            }
+        ));
+        // A newer peer's extra fields are ignored (additive = minor).
+        let newer: RequestEnvelope = serde_json::from_str(
+            r#"{"id":5,"protocol":1,"trace":"x","request":{"type":"ping","hint":1}}"#,
+        )
+        .unwrap();
+        assert!(matches!(newer.request, Request::Ping));
+        let round = serde_json::to_string(&newer).unwrap();
+        assert!(serde_json::from_str::<RequestEnvelope>(&round).is_ok());
+    }
+
+    #[test]
+    fn unknown_request_types_are_named_and_keep_their_id() {
+        let line = r#"{"id":9,"protocol":1,"request":{"type":"teleport","to":"mars"}}"#;
+        assert_eq!(lenient_id(line), 9);
+        assert_eq!(unknown_request_type(line).as_deref(), Some("teleport"));
+        // A known type with bad fields is a bad request, not unsupported.
+        let bad = r#"{"id":3,"protocol":1,"request":{"type":"send_message"}}"#;
+        assert_eq!(unknown_request_type(bad), None);
+        assert_eq!(lenient_id("not json"), 0);
+        let ServerMessage::Response { id, ok, result, .. } = unsupported(9, "teleport") else {
+            panic!()
+        };
+        assert_eq!((id, ok), (9, false));
+        assert_eq!(result.unwrap()["code"], "unsupported");
+    }
 
     #[test]
     fn event_session_id_scopes_session_events() {

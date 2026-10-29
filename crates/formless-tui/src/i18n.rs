@@ -71,10 +71,7 @@ pub fn current() -> Lang {
 pub fn tr(s: &'static str) -> &'static str {
     match current() {
         Lang::En => s,
-        Lang::Th => TH
-            .iter()
-            .find(|(en, _)| *en == s)
-            .map_or(s, |(_, th)| th),
+        Lang::Th => TH.iter().find(|(en, _)| *en == s).map_or(s, |(_, th)| th),
     }
 }
 
@@ -114,47 +111,124 @@ const TH: &[(&str, &str)] = &[
     ("App", "แอป"),
     ("Keys", "ปุ่มลัด"),
     // Common command descriptions.
-    ("start a new Session, optionally from a template", "เริ่มเซสชันใหม่ (จากเทมเพลต NAME)"),
+    (
+        "start a new Session, optionally from a template",
+        "เริ่มเซสชันใหม่ (จากเทมเพลต NAME)",
+    ),
     ("list and switch Sessions", "ดูและสลับเซสชัน"),
     ("fork the current Session", "แยกเซสชันปัจจุบัน"),
     ("search all Sessions", "ค้นหาทุกเซสชัน"),
-    ("edit your last message and retry from there", "แก้ข้อความล่าสุดแล้วลองใหม่จากตรงนั้น"),
+    (
+        "edit your last message and retry from there",
+        "แก้ข้อความล่าสุดแล้วลองใหม่จากตรงนั้น",
+    ),
     ("stop the current Run (Esc)", "หยุดการทำงานปัจจุบัน (Esc)"),
-    ("continue an interrupted or paused Run", "ทำงานต่อจากที่ถูกขัดจังหวะหรือหยุดไว้"),
-    ("drop an interrupted or paused Run", "ทิ้งงานที่ถูกขัดจังหวะหรือหยุดไว้"),
-    ("re-run your last message, optionally on another model; the old answer stays in a fork", "ส่งข้อความล่าสุดอีกครั้ง (เลือกโมเดลอื่นได้) คำตอบเดิมเก็บไว้ในเซสชันที่แยกออกมา"),
-    ("cap the current (or next) Run at N steps; it pauses there", "จำกัดจำนวนขั้นของงานนี้ (หรืองานถัดไป) ที่ N แล้วหยุดรอ"),
-    ("rate the last answer 👍 (feeds Run metrics and routing)", "ให้คะแนนคำตอบล่าสุด 👍"),
-    ("rate the last answer 👎 (feeds Run metrics and routing)", "ให้คะแนนคำตอบล่าสุด 👎"),
-    ("the files the last Run changed, with diffs", "ไฟล์ที่งานล่าสุดแก้ไข พร้อมส่วนที่เปลี่ยน"),
-    ("put the last Run's file changes back (one file, or all)", "ย้อนการแก้ไขไฟล์ของงานล่าสุด (ไฟล์เดียวหรือทั้งหมด)"),
-    ("step mode: pause before each Tool call (Enter run, e edit, s skip)", "โหมดทีละขั้น: หยุดก่อนเรียกเครื่องมือแต่ละครั้ง (Enter ทำ, e แก้, s ข้าม)"),
-    ("the same prompt on two models, side by side with time and cost", "ถามคำถามเดียวกันกับสองโมเดล เทียบคำตอบ เวลา และค่าใช้จ่าย"),
-    ("the messages queued for after this Run: edit, remove or reorder them", "ข้อความที่รอส่งหลังงานนี้: แก้ ลบ หรือจัดลำดับ"),
-    ("expand or fold the last long Run's \"What I did\"", "เปิดหรือพับสรุป \"สิ่งที่ทำ\" ของงานล่าสุด"),
-    ("pick the model and effort (fuzzy search)", "เลือกโมเดลและระดับการคิด"),
-    ("the daemon: memory, CPU, database, running work", "เดมอน: หน่วยความจำ CPU ฐานข้อมูล งานที่กำลังทำ"),
-    ("disk used by Sessions, artifacts, logs, backups", "พื้นที่ดิสก์ที่เซสชัน ไฟล์ผลลัพธ์ บันทึก และสำรองข้อมูลใช้"),
-    ("what clean-up would free; `run` frees it", "ดูว่าการล้างข้อมูลจะคืนพื้นที่เท่าไร; `run` เพื่อล้างจริง"),
+    (
+        "continue an interrupted or paused Run",
+        "ทำงานต่อจากที่ถูกขัดจังหวะหรือหยุดไว้",
+    ),
+    (
+        "drop an interrupted or paused Run",
+        "ทิ้งงานที่ถูกขัดจังหวะหรือหยุดไว้",
+    ),
+    (
+        "re-run your last message, optionally on another model; the old answer stays in a fork",
+        "ส่งข้อความล่าสุดอีกครั้ง (เลือกโมเดลอื่นได้) คำตอบเดิมเก็บไว้ในเซสชันที่แยกออกมา",
+    ),
+    (
+        "cap the current (or next) Run at N steps; it pauses there",
+        "จำกัดจำนวนขั้นของงานนี้ (หรืองานถัดไป) ที่ N แล้วหยุดรอ",
+    ),
+    (
+        "rate the last answer 👍 (feeds Run metrics and routing)",
+        "ให้คะแนนคำตอบล่าสุด 👍",
+    ),
+    (
+        "rate the last answer 👎 (feeds Run metrics and routing)",
+        "ให้คะแนนคำตอบล่าสุด 👎",
+    ),
+    (
+        "the files the last Run changed, with diffs",
+        "ไฟล์ที่งานล่าสุดแก้ไข พร้อมส่วนที่เปลี่ยน",
+    ),
+    (
+        "put the last Run's file changes back (one file, or all)",
+        "ย้อนการแก้ไขไฟล์ของงานล่าสุด (ไฟล์เดียวหรือทั้งหมด)",
+    ),
+    (
+        "step mode: pause before each Tool call (Enter run, e edit, s skip)",
+        "โหมดทีละขั้น: หยุดก่อนเรียกเครื่องมือแต่ละครั้ง (Enter ทำ, e แก้, s ข้าม)",
+    ),
+    (
+        "the same prompt on two models, side by side with time and cost",
+        "ถามคำถามเดียวกันกับสองโมเดล เทียบคำตอบ เวลา และค่าใช้จ่าย",
+    ),
+    (
+        "the messages queued for after this Run: edit, remove or reorder them",
+        "ข้อความที่รอส่งหลังงานนี้: แก้ ลบ หรือจัดลำดับ",
+    ),
+    (
+        "expand or fold the last long Run's \"What I did\"",
+        "เปิดหรือพับสรุป \"สิ่งที่ทำ\" ของงานล่าสุด",
+    ),
+    (
+        "pick the model and effort (fuzzy search)",
+        "เลือกโมเดลและระดับการคิด",
+    ),
+    (
+        "the daemon: memory, CPU, database, running work",
+        "เดมอน: หน่วยความจำ CPU ฐานข้อมูล งานที่กำลังทำ",
+    ),
+    (
+        "disk used by Sessions, artifacts, logs, backups",
+        "พื้นที่ดิสก์ที่เซสชัน ไฟล์ผลลัพธ์ บันทึก และสำรองข้อมูลใช้",
+    ),
+    (
+        "what clean-up would free; `run` frees it",
+        "ดูว่าการล้างข้อมูลจะคืนพื้นที่เท่าไร; `run` เพื่อล้างจริง",
+    ),
     ("back up the database now", "สำรองฐานข้อมูลตอนนี้"),
-    ("all commands and keys (also ? on an empty input)", "คำสั่งและปุ่มลัดทั้งหมด (หรือกด ? ตอนช่องพิมพ์ว่าง)"),
-    ("quit the TUI (the daemon keeps running)", "ออกจาก TUI (เดมอนยังทำงานต่อ)"),
+    (
+        "all commands and keys (also ? on an empty input)",
+        "คำสั่งและปุ่มลัดทั้งหมด (หรือกด ? ตอนช่องพิมพ์ว่าง)",
+    ),
+    (
+        "quit the TUI (the daemon keeps running)",
+        "ออกจาก TUI (เดมอนยังทำงานต่อ)",
+    ),
     // Banners and blocks.
     ("Plan", "แผน"),
     ("Plan done", "แผนเสร็จแล้ว"),
     ("Queued for after this Run", "รอส่งหลังงานนี้"),
     ("What I did", "สิ่งที่ทำ"),
     ("Step mode · about to call", "โหมดทีละขั้น · กำลังจะเรียก"),
-    ("Enter run it · e edit the arguments · s skip it · a run the rest · Esc stop the Run", "Enter ทำ · e แก้อาร์กิวเมนต์ · s ข้าม · a ทำที่เหลือทั้งหมด · Esc หยุดงาน"),
+    (
+        "Enter run it · e edit the arguments · s skip it · a run the rest · Esc stop the Run",
+        "Enter ทำ · e แก้อาร์กิวเมนต์ · s ข้าม · a ทำที่เหลือทั้งหมด · Esc หยุดงาน",
+    ),
     ("The last Run was", "งานล่าสุด"),
-    ("Enter (empty input) or /resume retries it · /abandon closes it", "Enter (ช่องว่าง) หรือ /resume เพื่อลองใหม่ · /abandon เพื่อปิด"),
+    (
+        "Enter (empty input) or /resume retries it · /abandon closes it",
+        "Enter (ช่องว่าง) หรือ /resume เพื่อลองใหม่ · /abandon เพื่อปิด",
+    ),
 ];
 
 /// Thai short weekdays, Sunday first.
 const TH_DAYS: [&str; 7] = ["อา.", "จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส."];
 /// Thai short months.
 const TH_MONTHS: [&str; 12] = [
-    "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.",
+    "ม.ค.",
+    "ก.พ.",
+    "มี.ค.",
+    "เม.ย.",
+    "พ.ค.",
+    "มิ.ย.",
+    "ก.ค.",
+    "ส.ค.",
+    "ก.ย.",
+    "ต.ค.",
+    "พ.ย.",
+    "ธ.ค.",
 ];
 
 /// A message time in the current language: `now`/`2m`/`3h`, a weekday
@@ -219,7 +293,9 @@ mod tests {
 
     #[test]
     fn thai_is_used_when_chosen_and_english_fills_gaps() {
-        let at = chrono::Local.with_ymd_and_hms(2026, 3, 3, 14, 2, 0).unwrap();
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 3, 3, 14, 2, 0)
+            .unwrap();
         with_lang(Lang::Th, || {
             assert_eq!(tr("ready"), "พร้อม");
             assert_eq!(tr_str("thinking"), "กำลังคิด");

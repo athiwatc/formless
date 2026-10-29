@@ -98,7 +98,11 @@ async fn failed_tool_results_are_sent_with_is_error() {
         .await
         .unwrap();
     for _ in 0..200 {
-        if store.last_run(&sid).unwrap().is_some_and(|(_, s)| s != "running") {
+        if store
+            .last_run(&sid)
+            .unwrap()
+            .is_some_and(|(_, s)| s != "running")
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -134,10 +138,19 @@ async fn repointing_a_provider_rederives_its_api_style() {
             .api_style
             .clone()
     };
-    daemon.handle(upsert("https://api.openai.com/v1")).await.unwrap();
+    daemon
+        .handle(upsert("https://api.openai.com/v1"))
+        .await
+        .unwrap();
     assert_eq!(style(), "chat");
-    daemon.handle(upsert("https://api.anthropic.com")).await.unwrap();
+    daemon
+        .handle(upsert("https://api.anthropic.com"))
+        .await
+        .unwrap();
     assert_eq!(style(), "anthropic");
-    daemon.handle(upsert("https://api.openai.com/v1")).await.unwrap();
+    daemon
+        .handle(upsert("https://api.openai.com/v1"))
+        .await
+        .unwrap();
     assert_eq!(style(), "chat");
 }

@@ -834,12 +834,16 @@ async fn aliases_key_header_query_rate_limits_and_model_test() {
     let mut c = cfg(&base);
     c.fallback_models.clear();
     c.api_key_header = Some("api-key".into());
-    c.query_params.insert("api-version".into(), "2024-10-21".into());
+    c.query_params
+        .insert("api-version".into(), "2024-10-21".into());
     c.aliases.insert("smart".into(), "real-model".into());
     let p = Provider::new(c, "k".into()).unwrap();
     let t = p.test_model("smart").await;
     assert_eq!(t.error, None);
-    assert!(t.ok && t.streaming && t.tool_calling && !t.prompt_fallback, "{t:?}");
+    assert!(
+        t.ok && t.streaming && t.tool_calling && !t.prompt_fallback,
+        "{t:?}"
+    );
     assert!(t.first_token_ms.is_some());
     let limits = formless_core::provider::rate_limits();
     assert_eq!(limits[&base]["remaining-requests"], "41");
@@ -858,13 +862,33 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
     ]});
     let meta = parse_model_meta(&body);
     let v = &meta["vendor/visionary"];
-    assert_eq!((v["context"].as_u64(), v["vision"].as_bool(), v["tools"].as_bool()), (Some(200000), Some(true), Some(true)));
-    assert_eq!((v["input_price"].as_f64(), v["output_price"].as_f64()), (Some(3.0), Some(15.0)));
+    assert_eq!(
+        (
+            v["context"].as_u64(),
+            v["vision"].as_bool(),
+            v["tools"].as_bool()
+        ),
+        (Some(200000), Some(true), Some(true))
+    );
+    assert_eq!(
+        (v["input_price"].as_f64(), v["output_price"].as_f64()),
+        (Some(3.0), Some(15.0))
+    );
     assert_eq!(v["efforts"], json!(["low", "medium", "high"]));
-    assert_eq!(meta["plain"]["efforts"], json!([]), "no reasoning parameter: effort has no effect");
+    assert_eq!(
+        meta["plain"]["efforts"],
+        json!([]),
+        "no reasoning parameter: effort has no effect"
+    );
     assert_eq!(meta["plain"]["tools"], false);
-    assert_eq!(meta["gpt-5-mini"]["efforts"], json!(["minimal", "low", "medium", "high"]));
-    assert!(known_model_meta("some-unknown").get("efforts").is_none(), "unknown: all offered");
+    assert_eq!(
+        meta["gpt-5-mini"]["efforts"],
+        json!(["minimal", "low", "medium", "high"])
+    );
+    assert!(
+        known_model_meta("some-unknown").get("efforts").is_none(),
+        "unknown: all offered"
+    );
 }
 
 /// `api_style = "anthropic"` (SPEC §4.1): Messages API with x-api-key,
@@ -919,24 +943,42 @@ async fn native_anthropic_messages_stream_and_complete() {
         json!({"role": "system", "content": "sys"}),
         json!({"role": "user", "content": "read a"}),
     ];
-    let tools = [json!({"type": "function", "function": {"name": "read", "description": "Read", "parameters": {"type": "object"}}})];
+    let tools = [
+        json!({"type": "function", "function": {"name": "read", "description": "Read", "parameters": {"type": "object"}}}),
+    ];
     let mut thinking = String::new();
     let r = p
-        .chat_stream(&msgs, &tools, "claude-x", Some("medium"), &CancellationToken::new(), |k, d| {
-            if k == DeltaKind::Reasoning {
-                thinking.push_str(d);
-            }
-        })
+        .chat_stream(
+            &msgs,
+            &tools,
+            "claude-x",
+            Some("medium"),
+            &CancellationToken::new(),
+            |k, d| {
+                if k == DeltaKind::Reasoning {
+                    thinking.push_str(d);
+                }
+            },
+        )
         .await
         .unwrap();
     assert_eq!(thinking, "need the file");
     assert_eq!(r.tool_calls.len(), 1);
-    assert_eq!((r.tool_calls[0].id.as_str(), r.tool_calls[0].name.as_str()), ("tu_1", "read"));
+    assert_eq!(
+        (r.tool_calls[0].id.as_str(), r.tool_calls[0].name.as_str()),
+        ("tu_1", "read")
+    );
     assert_eq!(r.tool_calls[0].arguments, r#"{"path":"a"}"#);
     assert_eq!(r.thinking_blocks[0]["signature"], "s1");
     let u = r.usage.unwrap();
-    assert_eq!((u.cached_tokens, u.completion_tokens, u.prompt_tokens), (100, 12, 103));
-    assert_eq!(p.complete(&msgs, "claude-x", None).await.unwrap(), "summary");
+    assert_eq!(
+        (u.cached_tokens, u.completion_tokens, u.prompt_tokens),
+        (100, 12, 103)
+    );
+    assert_eq!(
+        p.complete(&msgs, "claude-x", None).await.unwrap(),
+        "summary"
+    );
 }
 
 /// Serves each scripted (status, body) on POST /messages in turn (the
@@ -958,7 +1000,14 @@ async fn scripted_messages(
             async move {
                 axum::response::Response::builder()
                     .status(status)
-                    .header("content-type", if status == 200 { "text/event-stream" } else { "application/json" })
+                    .header(
+                        "content-type",
+                        if status == 200 {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )
                     .body(axum::body::Body::from(text))
                     .unwrap()
             }
@@ -999,15 +1048,25 @@ async fn anthropic_turn(
     msgs: &[Value],
     tools: &[Value],
     effort: Option<&str>,
-) -> (anyhow::Result<formless_core::provider::ChatResult>, Vec<DeltaKind>) {
+) -> (
+    anyhow::Result<formless_core::provider::ChatResult>,
+    Vec<DeltaKind>,
+) {
     let p = Provider::new(c, "k".into()).unwrap();
     let mut kinds = Vec::new();
     let r = p
-        .chat_stream(msgs, tools, "claude-x", effort, &CancellationToken::new(), |k, _| {
-            if k != DeltaKind::Bytes {
-                kinds.push(k)
-            }
-        })
+        .chat_stream(
+            msgs,
+            tools,
+            "claude-x",
+            effort,
+            &CancellationToken::new(),
+            |k, _| {
+                if k != DeltaKind::Bytes {
+                    kinds.push(k)
+                }
+            },
+        )
         .await;
     (r, kinds)
 }
@@ -1030,10 +1089,17 @@ async fn anthropic_turn_shape_results_first_errors_flagged_images_checked() {
     ];
     let (r, _) = anthropic_turn(anthropic_cfg(&base), &msgs, &[], None).await;
     let r = r.unwrap();
-    assert!(r.notes.iter().any(|n| n.contains("image/heic")), "{:?}", r.notes);
+    assert!(
+        r.notes.iter().any(|n| n.contains("image/heic")),
+        "{:?}",
+        r.notes
+    );
     let body = seen.lock().unwrap()[0].clone();
     let first = body["messages"][0]["content"].as_array().unwrap();
-    assert!(first.iter().all(|b| b["type"] != "image"), "no image/heic block: {first:?}");
+    assert!(
+        first.iter().all(|b| b["type"] != "image"),
+        "no image/heic block: {first:?}"
+    );
     let turn = &body["messages"][2]["content"];
     assert_eq!(turn[0]["tool_use_id"], "a");
     assert_eq!(turn[0]["is_error"], true);
@@ -1046,7 +1112,13 @@ async fn anthropic_turn_shape_results_first_errors_flagged_images_checked() {
 /// cache_control is answered by exactly one resend without it.
 #[tokio::test]
 async fn anthropic_400s_are_stripped_and_resent_once() {
-    let err = |m: &str| (400, json!({"type": "error", "error": {"type": "invalid_request_error", "message": m}}).to_string());
+    let err = |m: &str| {
+        (
+            400,
+            json!({"type": "error", "error": {"type": "invalid_request_error", "message": m}})
+                .to_string(),
+        )
+    };
     let ok = (200, messages_sse("fine", "end_turn"));
     let history = [
         json!({"role": "system", "content": "sys"}),
@@ -1057,7 +1129,11 @@ async fn anthropic_400s_are_stripped_and_resent_once() {
         json!({"role": "tool", "tool_call_id": "t", "content": "1"}),
     ];
 
-    let (base, seen) = scripted_messages(vec![err("thinking is not supported by this model"), ok.clone()]).await;
+    let (base, seen) = scripted_messages(vec![
+        err("thinking is not supported by this model"),
+        ok.clone(),
+    ])
+    .await;
     let (r, _) = anthropic_turn(anthropic_cfg(&base), &history[..2], &[], Some("high")).await;
     let r = r.unwrap();
     let bodies = seen.lock().unwrap().clone();
@@ -1065,7 +1141,11 @@ async fn anthropic_400s_are_stripped_and_resent_once() {
     assert!(bodies[0].get("thinking").is_some() && bodies[1].get("thinking").is_none());
     assert!(r.notes.iter().any(|n| n.contains("extended thinking")));
 
-    let (base, seen) = scripted_messages(vec![err("messages.1.content.0: Invalid `signature` in `thinking` block"), ok.clone()]).await;
+    let (base, seen) = scripted_messages(vec![
+        err("messages.1.content.0: Invalid `signature` in `thinking` block"),
+        ok.clone(),
+    ])
+    .await;
     let (r, _) = anthropic_turn(anthropic_cfg(&base), &history, &[], None).await;
     let r = r.unwrap();
     assert!(r.dropped_replayed_thinking);
@@ -1074,7 +1154,11 @@ async fn anthropic_400s_are_stripped_and_resent_once() {
     assert!(bodies[0].to_string().contains("\"signature\""));
     assert!(!bodies[1].to_string().contains("\"signature\""));
 
-    let (base, seen) = scripted_messages(vec![err("cache_control: unsupported here"), err("cache_control: unsupported here")]).await;
+    let (base, seen) = scripted_messages(vec![
+        err("cache_control: unsupported here"),
+        err("cache_control: unsupported here"),
+    ])
+    .await;
     let (r, _) = anthropic_turn(anthropic_cfg(&base), &history[..2], &[], None).await;
     assert!(r.is_err(), "the second rejection is final");
     let bodies = seen.lock().unwrap().clone();
@@ -1092,8 +1176,15 @@ async fn anthropic_incomplete_streams_retry_and_stop_reasons_surface() {
         .next()
         .unwrap()
         .to_string();
-    let (base, seen) = scripted_messages(vec![(200, cut), (200, messages_sse("whole", "end_turn"))]).await;
-    let (r, kinds) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+    let (base, seen) =
+        scripted_messages(vec![(200, cut), (200, messages_sse("whole", "end_turn"))]).await;
+    let (r, kinds) = anthropic_turn(
+        anthropic_cfg(&base),
+        &[json!({"role": "user", "content": "hi"})],
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(r.unwrap().content, "whole");
     assert_eq!(seen.lock().unwrap().len(), 2);
     assert!(kinds.contains(&DeltaKind::Restart), "{kinds:?}");
@@ -1101,16 +1192,34 @@ async fn anthropic_incomplete_streams_retry_and_stop_reasons_surface() {
     // A last event without its trailing newline still counts.
     let sse = messages_sse("done", "end_turn");
     let (base, _) = scripted_messages(vec![(200, sse.trim_end().to_string())]).await;
-    let (r, _) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+    let (r, _) = anthropic_turn(
+        anthropic_cfg(&base),
+        &[json!({"role": "user", "content": "hi"})],
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(r.unwrap().content, "done");
 
     for stop in ["refusal", "model_context_window_exceeded", "pause_turn"] {
         let (base, _) = scripted_messages(vec![(200, messages_sse("", stop))]).await;
-        let (r, _) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+        let (r, _) = anthropic_turn(
+            anthropic_cfg(&base),
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            None,
+        )
+        .await;
         assert_eq!(r.unwrap().stop_reason.as_deref(), Some(stop));
     }
     let (base, _) = scripted_messages(vec![(200, messages_sse("cut", "max_tokens"))]).await;
-    let (r, _) = anthropic_turn(anthropic_cfg(&base), &[json!({"role": "user", "content": "hi"})], &[], None).await;
+    let (r, _) = anthropic_turn(
+        anthropic_cfg(&base),
+        &[json!({"role": "user", "content": "hi"})],
+        &[],
+        None,
+    )
+    .await;
     assert!(r.unwrap().truncated);
 }
 
@@ -1118,19 +1227,33 @@ async fn anthropic_incomplete_streams_retry_and_stop_reasons_surface() {
 /// body (no native tools, instruction in `system`) and parse the call.
 #[tokio::test]
 async fn anthropic_prompt_tool_mode_sends_messages_bodies() {
-    let call = "```json\n{\"tool_calls\": [{\"name\": \"writer\", \"arguments\": {\"x\": 1}}]}\n```";
+    let call =
+        "```json\n{\"tool_calls\": [{\"name\": \"writer\", \"arguments\": {\"x\": 1}}]}\n```";
     let (base, seen) = scripted_messages(vec![(200, messages_sse(call, "end_turn"))]).await;
     let mut c = anthropic_cfg(&base);
     c.tool_mode = "prompt".into();
-    let (r, _) = anthropic_turn(c, &[json!({"role": "user", "content": "write"})], &[writer_tool()], None).await;
+    let (r, _) = anthropic_turn(
+        c,
+        &[json!({"role": "user", "content": "write"})],
+        &[writer_tool()],
+        None,
+    )
+    .await;
     let r = r.unwrap();
     assert_eq!(r.tool_calls.len(), 1, "{r:?}");
     assert_eq!(r.tool_calls[0].name, "writer");
     let body = seen.lock().unwrap()[0].clone();
     assert!(body.get("tools").is_none());
     assert!(body.get("stream_options").is_none() && body.get("reasoning_effort").is_none());
-    assert!(body["system"][0]["text"].as_str().unwrap().contains("writer"));
-    assert!(body["messages"].as_array().unwrap().iter().all(|m| m["role"] != "system"));
+    assert!(body["system"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("writer"));
+    assert!(body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["role"] != "system"));
 }
 
 /// #1062: the native listing's `max_input_tokens` is the context window,
@@ -1155,7 +1278,10 @@ async fn anthropic_model_listing_pages_and_windows() {
     let p = Provider::new(anthropic_cfg(&base), "k".into()).unwrap();
     let (models, windows, meta) = p.list_models_meta().await.unwrap();
     assert_eq!(models, ["claude-a", "claude-b"]);
-    assert_eq!((windows["claude-a"], windows["claude-b"]), (200_000, 1_000_000));
+    assert_eq!(
+        (windows["claude-a"], windows["claude-b"]),
+        (200_000, 1_000_000)
+    );
     assert_eq!(meta["claude-a"]["max_output"], 64000);
 }
 
@@ -1191,9 +1317,15 @@ async fn stream_edges_lose_and_duplicate_nothing() {
     );
     let r = stream_full(scripted_sse("/chat/completions", vec![last]).await, false).await;
     assert_eq!(r.content, "hi");
-    assert_eq!(r.usage.map(|u| u.prompt_tokens), Some(7), "the unterminated last event counts");
+    assert_eq!(
+        r.usage.map(|u| u.prompt_tokens),
+        Some(7),
+        "the unterminated last event counts"
+    );
 
-    let split = "data: {\"choices\": [{\"delta\":\ndata: {\"content\": \"joined\"}}]}\n\ndata: [DONE]\n\n".to_string();
+    let split =
+        "data: {\"choices\": [{\"delta\":\ndata: {\"content\": \"joined\"}}]}\n\ndata: [DONE]\n\n"
+            .to_string();
     let r = stream_full(scripted_sse("/chat/completions", vec![split]).await, false).await;
     assert_eq!(r.content, "joined");
 
@@ -1208,7 +1340,13 @@ async fn stream_edges_lose_and_duplicate_nothing() {
     .concat();
     let r = stream_full(scripted_sse("/chat/completions", vec![calls]).await, false).await;
     assert_eq!(r.tool_calls.len(), 1, "{:?}", r.tool_calls);
-    assert_eq!((r.tool_calls[0].name.as_str(), r.tool_calls[0].arguments.as_str()), ("read", "{\"x\":1}"));
+    assert_eq!(
+        (
+            r.tool_calls[0].name.as_str(),
+            r.tool_calls[0].arguments.as_str()
+        ),
+        ("read", "{\"x\":1}")
+    );
 }
 
 /// Refusals and filter stops are never silent empty answers, and a
@@ -1221,12 +1359,20 @@ async fn refusals_filters_and_responses_truncation_are_told() {
         ev(json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})),
     ]
     .concat();
-    let r = stream_full(scripted_sse("/chat/completions", vec![refusal]).await, false).await;
+    let r = stream_full(
+        scripted_sse("/chat/completions", vec![refusal]).await,
+        false,
+    )
+    .await;
     assert_eq!(r.content, "I can't help with that.");
     assert_eq!(r.stop_reason.as_deref(), Some("refusal"));
 
     let filtered = ev(json!({"choices": [{"delta": {}, "finish_reason": "content_filter"}]}));
-    let r = stream_full(scripted_sse("/chat/completions", vec![filtered]).await, false).await;
+    let r = stream_full(
+        scripted_sse("/chat/completions", vec![filtered]).await,
+        false,
+    )
+    .await;
     assert_eq!(r.stop_reason.as_deref(), Some("content_filter"));
 
     let partial = [
@@ -1237,4 +1383,57 @@ async fn refusals_filters_and_responses_truncation_are_told() {
     let r = stream_full(scripted_sse("/responses", vec![partial]).await, true).await;
     assert_eq!(r.content, "part");
     assert!(r.truncated, "kept and marked, not an error");
+}
+
+/// A model in an outage is skipped by later requests instead of re-paying
+/// its retries every time (#621), and the user is told once.
+#[tokio::test]
+async fn a_failing_model_trips_its_breaker_and_is_skipped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    let bad_hits = Arc::new(AtomicUsize::new(0));
+    let hits = bad_hits.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let hits = hits.clone();
+            async move {
+                if body["model"] == "bad" {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+                }
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices": [{"delta": {"content": "ok"}}]})
+                )
+                .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models = vec!["good".into()];
+    c.max_retries = 3;
+    c.max_backoff_secs = 1;
+    let notes = Arc::new(Mutex::new(Vec::new()));
+    let n2 = notes.clone();
+    let p = Provider::new(c, "k".into())
+        .unwrap()
+        .with_note_hook(Arc::new(move |t| n2.lock().unwrap().push(t)));
+    let msgs = [json!({"role": "user", "content": "x"})];
+    let cancel = CancellationToken::new();
+    let ask = || p.chat_stream(&msgs, &[], "bad", None, &cancel, |_, _| {});
+    assert_eq!(ask().await.unwrap().content, "ok");
+    assert_eq!(
+        bad_hits.load(Ordering::SeqCst),
+        3,
+        "tripped after 3, not 4 attempts"
+    );
+    assert_eq!(ask().await.unwrap().content, "ok");
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 3, "skipped while open");
+    let notes = notes.lock().unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("bad failed 3 times"), "{notes:?}");
 }

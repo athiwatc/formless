@@ -37,7 +37,8 @@ pub const CATALOG: &[Entry] = &[
     Entry {
         id: "github",
         title: "GitHub",
-        description: "Repositories, issues and pull requests (GitHub's remote server; log in with OAuth)",
+        description:
+            "Repositories, issues and pull requests (GitHub's remote server; log in with OAuth)",
         command: "",
         args: &[],
         url: "https://api.githubcopilot.com/mcp/",
@@ -349,7 +350,13 @@ fn parse_server(s: &Value) -> Option<(McpServerCfg, Vec<String>)> {
 fn sanitize_name(name: &str) -> String {
     let s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
     if s.is_empty() {
