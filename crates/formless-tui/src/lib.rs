@@ -513,6 +513,8 @@ struct Wizard {
     /// Previously saved model, pre-selected when the list arrives (§17).
     saved_model: String,
     prompt_fallback: bool,
+    /// Ctrl+R: show the API key in full while typing it.
+    reveal_key: bool,
     jobs: mpsc::Receiver<WizardJob>,
     job_tx: mpsc::Sender<WizardJob>,
 }
@@ -562,8 +564,113 @@ impl Wizard {
             status,
             saved_model: cfg.provider.model.clone(),
             prompt_fallback: false,
+            reveal_key: false,
             jobs,
             job_tx,
+        }
+    }
+
+    /// The wizard to show: a resumed draft (SPEC §10.1) when there is one
+    /// and no saved setup, else a fresh one that offers a local server
+    /// already running when no key is around.
+    fn start(cfg: &Config, paths: &Paths) -> Self {
+        let mut w = Self::new(cfg);
+        if w.step != WizardStep::PickPreset {
+            return w;
+        }
+        if let Some(d) = load_wizard_draft(paths).filter(|d| d["step"] != "preset") {
+            w.resume(&d);
+            return w;
+        }
+        w.offer_local();
+        w
+    }
+
+    /// Pick up a quit wizard where it was; the key is never saved, so a
+    /// later step resumes at the key.
+    fn resume(&mut self, d: &serde_json::Value) {
+        let preset = d["preset"].as_str().and_then(formless_core::presets::find);
+        self.preset = preset;
+        if let Some(p) = preset {
+            self.preset_idx = formless_core::presets::PRESETS
+                .iter()
+                .position(|x| x.id == p.id)
+                .unwrap_or(0);
+        } else if d["custom"] == true {
+            self.preset_idx = formless_core::presets::PRESETS.len();
+        }
+        self.base_url = d["base_url"].as_str().unwrap_or_default().to_string();
+        if let Some(m) = d["model"].as_str().filter(|m| !m.is_empty()) {
+            self.saved_model = m.to_string();
+        }
+        self.effort_idx = d["effort_idx"].as_u64().unwrap_or(0) as usize % EFFORTS.len();
+        let local = preset.is_some_and(|p| p.local);
+        match d["step"].as_str() {
+            Some("base_url") => {
+                self.step = WizardStep::BaseUrl;
+                self.status = "Welcome back. Enter your provider base URL.".into();
+            }
+            Some("api_key" | "model" | "effort") if local => {
+                self.retry_fetch = true;
+                self.fetch_models();
+            }
+            Some("api_key" | "model" | "effort") if !self.base_url.is_empty() => {
+                self.enter_api_key_step();
+                self.status = format!("Welcome back: you were setting up {}. {}", self.base_url, self.status);
+            }
+            _ => {}
+        }
+    }
+
+    /// No saved setup and no key in the environment: offer Ollama or
+    /// LM Studio if one is already running here (#398).
+    fn offer_local(&mut self) {
+        let presets = formless_core::presets::PRESETS;
+        if presets.iter().any(|p| formless_core::presets::env_key(p).is_some()) {
+            return;
+        }
+        for (i, p) in presets.iter().enumerate().filter(|(_, p)| p.local) {
+            if local_server_running(p.base_url) {
+                self.preset_idx = i;
+                self.status = format!(
+                    "Welcome to Formless. {} is running on this machine: press Enter to use it (no account or API key needed), or choose another provider.",
+                    p.name
+                );
+                return;
+            }
+        }
+    }
+
+    /// What to keep if the TUI quits here: never the key.
+    fn draft(&self) -> serde_json::Value {
+        let step = match self.step {
+            WizardStep::PickPreset => "preset",
+            WizardStep::BaseUrl => "base_url",
+            WizardStep::ApiKey | WizardStep::FetchModels => "api_key",
+            WizardStep::PickModel => "model",
+            WizardStep::PickEffort | WizardStep::Probing | WizardStep::Failed => "effort",
+        };
+        serde_json::json!({
+            "step": step,
+            "preset": self.preset.map(|p| p.id),
+            "custom": self.preset.is_none() && self.step != WizardStep::PickPreset,
+            "base_url": self.base_url,
+            "model": if matches!(self.step, WizardStep::PickModel | WizardStep::PickEffort | WizardStep::Probing | WizardStep::Failed) { self.model() } else { self.saved_model.clone() },
+            "effort_idx": self.effort_idx,
+        })
+    }
+
+    /// The key as shown: `••••abcd`, or in full after Ctrl+R (#396).
+    fn shown_key(&self) -> String {
+        if self.reveal_key {
+            return self.api_key.clone();
+        }
+        let n = self.api_key.chars().count();
+        let tail: String = self.api_key.chars().skip(n.saturating_sub(4)).collect();
+        if n > 8 {
+            format!("{}{tail}", "•".repeat(n - 4))
+        } else {
+            "•".repeat(n)
         }
     }
     fn model(&self) -> String {
@@ -625,6 +732,58 @@ impl Wizard {
             self.enter_api_key_step();
         }
     }
+}
+
+/// One-time onboarding moments already shown (#393, #394).
+#[derive(Debug, Default, Clone)]
+struct Seen {
+    /// The first-approval explainer.
+    approval_help: bool,
+    /// The tour was offered, and finished or skipped.
+    tour_offered: bool,
+    tour_done: bool,
+}
+
+fn seen_file(paths: &Paths) -> std::path::PathBuf {
+    paths.data_dir.join("tui-seen.json")
+}
+
+fn load_seen(paths: &Paths) -> Seen {
+    let v: serde_json::Value = std::fs::read_to_string(seen_file(paths))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    Seen {
+        approval_help: v["approval_help"] == true,
+        tour_offered: v["tour_offered"] == true,
+        tour_done: v["tour_done"] == true,
+    }
+}
+
+/// The tour's sample task: small, and it makes the agent build a Tool.
+const TOUR_TASK: &str = "Build a Tool that counts the words, lines and characters of a text, then use it on: \"The quick brown fox jumps over the lazy dog.\"";
+
+fn wizard_draft_file(paths: &Paths) -> std::path::PathBuf {
+    paths.config_dir.join("setup-draft.json")
+}
+
+fn load_wizard_draft(paths: &Paths) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(wizard_draft_file(paths)).ok()?).ok()
+}
+
+/// Something answers on a local server's port (a quick TCP check).
+fn local_server_running(base_url: &str) -> bool {
+    let Some(hostport) = base_url
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+    else {
+        return false;
+    };
+    let hostport = hostport.replace("localhost", "127.0.0.1");
+    hostport
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_ok())
 }
 
 /// A Tool call waiting in step mode (SPEC §5.9).
@@ -1115,6 +1274,11 @@ struct App {
     mcp_import_pick: Option<String>,
     /// An Ollama download in progress (`/pull`), for the status bar.
     pull_status: Option<String>,
+    /// One-time onboarding moments, persisted.
+    seen: Seen,
+    /// The guided tour's stage while it runs (`/tour`): 1 sent the task,
+    /// 2 the Tool exists, 3 done.
+    tour: Option<u8>,
     /// The daemon connection was lost: (since, last reconnect attempt).
     offline: Option<(Instant, Instant)>,
     /// Step mode (`/step`) for the Session on screen, the call waiting
@@ -1191,7 +1355,7 @@ impl App {
             cfg.provider.is_configured() && cfg.provider.oauth() && !has_credential;
         let mut app = Self {
             wizard: if needs_wizard {
-                Some(Wizard::new(&cfg))
+                Some(Wizard::start(&cfg, &paths))
             } else {
                 None
             },
@@ -1339,6 +1503,8 @@ impl App {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            seen: Seen::default(),
+            tour: None,
             pull_status: None,
             step_mode: false,
             step: None,
@@ -1349,6 +1515,7 @@ impl App {
             last_click: None,
             stream_cache: Default::default(),
         };
+        app.seen = load_seen(&app.paths);
         if oauth_login_required {
             app.notes
                 .push("OAuth login required: run `formless auth login`.".into());
@@ -3332,6 +3499,24 @@ impl App {
                 self.set_activity("waiting for model");
             }
             Event::RunFinished {
+                session_id,
+                run_id,
+                status,
+            } if self.tour.is_some() && self.is_current(&session_id) => {
+                self.tour = None;
+                self.seen.tour_done = true;
+                self.save_seen();
+                self.notes.push(
+                    "Tour 3/3 · Done. Ask for anything: the agent reuses its Tools and builds new ones. /help lists every command and key; Tab switches views."
+                        .into(),
+                );
+                self.on_event(Event::RunFinished {
+                    session_id,
+                    run_id,
+                    status,
+                });
+            }
+            Event::RunFinished {
                 session_id, status, ..
             } => {
                 self.running_sessions.remove(&session_id);
@@ -3442,6 +3627,13 @@ impl App {
             } => {
                 if !self.is_current(&session_id) {
                     return;
+                }
+                if ok && tool_name == "create_tool" && self.tour == Some(1) {
+                    self.tour = Some(2);
+                    self.notes.push(
+                        "Tour 2/3 · The agent just built a Tool. It's in the Tools view now (Tab to switch views, Esc back): its code, versions and how well it does. Watch it use the Tool next."
+                            .into(),
+                    );
                 }
                 if let Some(call) = self
                     .live_tools
@@ -5162,6 +5354,37 @@ impl App {
             }
             "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
             "status" => self.request(Pending::DaemonStatus, Request::Status),
+            "tour skip" => {
+                self.tour = None;
+                self.seen.tour_done = true;
+                self.save_seen();
+                self.notes.push("tour skipped; /tour starts it any time".into());
+            }
+            "setup" => {
+                // The wizard again, at the key step of the saved provider:
+                // re-enter a key, or Esc back to change provider (§10.1).
+                match Config::load(&self.paths) {
+                    Ok(cfg) => {
+                        let mut w = Wizard::new(&cfg);
+                        if w.step == WizardStep::PickPreset {
+                            w.offer_local();
+                        }
+                        self.wizard = Some(w);
+                    }
+                    Err(e) => self.notes.push(format!("can't read the config: {e:#}")),
+                }
+            }
+            cmd if cmd.starts_with("tour ") => {
+                self.notes.push("usage: /tour starts the guided first task; /tour skip hides the offer".into())
+            }
+            "tour" => {
+                self.tour = Some(1);
+                self.input.set(TOUR_TASK);
+                self.notes.push(
+                    "Tour 1/3 · A sample task is in the input. Press Enter: the agent has no Tool for this yet, so it builds one, and keeps it for next time."
+                        .into(),
+                );
+            }
             "routing" => self.request(Pending::Routing, Request::RoutingDecisions),
             cmd if cmd == "test" || cmd.starts_with("test ") => {
                 let model = cmd["test".len()..].trim().to_string();
@@ -5548,6 +5771,16 @@ impl App {
         }
         cfg.save(&self.paths)?;
         save_api_key(&self.paths, &w.api_key)?;
+        let _ = std::fs::remove_file(wizard_draft_file(&self.paths));
+        // A guided first task, offered once (#393).
+        if !self.seen.tour_offered {
+            self.seen.tour_offered = true;
+            self.save_seen();
+            self.notes.push(
+                "New here? /tour runs a 2-minute guided first task (/tour skip hides this for good)."
+                    .into(),
+            );
+        }
         // Say plainly how Tools are trusted (SPEC §10.3).
         self.notes.push(if cfg.security.secure {
             "Approvals are on: a Tool asks before it uses files, the network or programs.".into()
@@ -5560,8 +5793,52 @@ impl App {
     }
 
     fn wizard_key(&mut self, key: KeyEvent) {
+        self.wizard_step_key(key);
+        // Keep where the user got to (never the key), so quitting halfway
+        // resumes there next time (#397).
+        if let Some(w) = &self.wizard {
+            let _ = std::fs::create_dir_all(&self.paths.config_dir);
+            let _ = std::fs::write(wizard_draft_file(&self.paths), w.draft().to_string());
+        }
+    }
+
+    fn wizard_step_key(&mut self, key: KeyEvent) {
         let Some(w) = &mut self.wizard else { return };
         let presets = formless_core::presets::PRESETS.len();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+R shows the key while typing it (#396).
+        if ctrl && key.code == KeyCode::Char('r') {
+            w.reveal_key = !w.reveal_key;
+            return;
+        }
+        // Esc goes back one step everywhere, keeping what was typed (#395).
+        if key.code == KeyCode::Esc {
+            let local = w.preset.is_some_and(|p| p.local);
+            let (step, status) = match w.step {
+                WizardStep::PickPreset => return,
+                WizardStep::BaseUrl => (WizardStep::PickPreset, "Choose your model provider."),
+                WizardStep::ApiKey if w.preset.is_none() => {
+                    (WizardStep::BaseUrl, "Enter your provider base URL (any OpenAI-compatible endpoint).")
+                }
+                WizardStep::ApiKey => (WizardStep::PickPreset, "Choose your model provider."),
+                WizardStep::FetchModels | WizardStep::PickModel | WizardStep::Failed if local => {
+                    (WizardStep::PickPreset, "Choose your model provider.")
+                }
+                WizardStep::FetchModels | WizardStep::PickModel => {
+                    w.enter_api_key_step();
+                    return;
+                }
+                WizardStep::PickEffort => (WizardStep::PickModel, "Pick a model."),
+                WizardStep::Probing | WizardStep::Failed => (WizardStep::PickEffort, "Pick reasoning effort."),
+            };
+            w.retry_fetch = false;
+            w.step = step;
+            w.status = status.into();
+            return;
+        }
+        if ctrl {
+            return;
+        }
         match w.step {
             WizardStep::PickPreset => match key.code {
                 KeyCode::Up => w.preset_idx = w.preset_idx.saturating_sub(1),
@@ -5577,10 +5854,6 @@ impl App {
                 _ => {}
             },
             WizardStep::BaseUrl => match key.code {
-                KeyCode::Esc => {
-                    w.step = WizardStep::PickPreset;
-                    w.status = "Choose your model provider.".into();
-                }
                 KeyCode::Enter if !w.base_url.trim().is_empty() => w.enter_api_key_step(),
                 KeyCode::Char(c) => w.base_url.push(c),
                 KeyCode::Backspace => {
@@ -5589,10 +5862,6 @@ impl App {
                 _ => {}
             },
             WizardStep::ApiKey => match key.code {
-                KeyCode::Esc => {
-                    w.step = WizardStep::PickPreset;
-                    w.status = "Choose your model provider.".into();
-                }
                 KeyCode::Enter => {
                     if w.api_key.is_empty() {
                         if let Some((_, k)) = w.preset.and_then(formless_core::presets::env_key) {
@@ -5641,11 +5910,6 @@ impl App {
                 }
                 _ => {}
             },
-            WizardStep::Failed if w.retry_fetch && key.code == KeyCode::Esc => {
-                w.retry_fetch = false;
-                w.step = WizardStep::PickPreset;
-                w.status = "Choose your model provider.".into();
-            }
             WizardStep::Failed if w.retry_fetch && key.code == KeyCode::Enter => w.fetch_models(),
             WizardStep::Failed if key.code == KeyCode::Enter => {
                 w.step = WizardStep::PickModel;
@@ -6665,7 +6929,23 @@ impl App {
 
     /// Remember how a batch's held call was answered, for the list the
     /// next prompts of that batch show.
+    fn save_seen(&self) {
+        let _ = std::fs::write(
+            seen_file(&self.paths),
+            serde_json::json!({
+                "approval_help": self.seen.approval_help,
+                "tour_offered": self.seen.tour_offered,
+                "tour_done": self.seen.tour_done,
+            })
+            .to_string(),
+        );
+    }
+
     fn note_batch_answer(&mut self, approval_id: &str, word: &str) {
+        if !self.seen.approval_help {
+            self.seen.approval_help = true;
+            self.save_seen();
+        }
         if let Some(b) = self.approval_batches.remove(approval_id) {
             let answers = self.batch_answers.entry(b.batch_id).or_default();
             answers.push((b.index, word.to_string()));
@@ -7610,7 +7890,8 @@ fn draw(f: &mut Frame, app: &mut App) {
             more,
             app.color,
             !app.input_focus,
-            app.approval_explain,
+            app.approval_explain || !app.seen.approval_help,
+            !app.seen.approval_help,
         );
     } else if let Some(pick) = &app.rollback_pick {
         draw_rollback_picker(f, app, pick);
@@ -12765,6 +13046,7 @@ fn draw_approval(
     color: bool,
     focused: bool,
     explain: bool,
+    first_time: bool,
 ) {
     let mut lines = match &req.detail {
         // A non-Tool approval (e.g. the agent adding an MCP server).
@@ -12948,6 +13230,17 @@ fn draw_approval(
         },
         ui::dim(color),
     ));
+    // The first approval ever: what this is and how to undo it (#394).
+    if first_time && !promotion {
+        for l in [
+            "First approval? Tools run in a sandbox with no access at all; each capability above",
+            "(files, network, programs…) is something this Tool asks to use. y lets it keep using",
+            "them, o allows just this call, s for this Session, n says no. Change your mind any",
+            "time: /approvals lists what you allowed, /revoke takes it back.",
+        ] {
+            lines.push(Line::styled(l.to_string(), fg(color, Color::Cyan)));
+        }
+    }
     // The answer keys are a footer pinned under the body, so a body too
     // tall for the screen can never push them out of the box.
     let mut footer = vec![Line::raw("")];
@@ -13459,9 +13752,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         WizardStep::BaseUrl => text.push(field("Base URL", format!("{}▏", w.base_url))),
         WizardStep::ApiKey | WizardStep::FetchModels => {
             text.push(field("Base URL", w.base_url.clone()));
-            text.push(field(
-                "API key",
-                format!("{}▏", "•".repeat(w.api_key.len())),
+            text.push(field("API key", format!("{}▏", w.shown_key())));
+            text.push(Line::styled(
+                if w.reveal_key { "          Ctrl+R hide · paste works" } else { "          Ctrl+R show · paste works" },
+                ui::dim(color),
             ));
         }
         WizardStep::PickModel => {
@@ -13860,6 +14154,8 @@ mod tests {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            seen: Seen::default(),
+            tour: None,
             pull_status: None,
             step_mode: false,
             step: None,
@@ -14079,6 +14375,46 @@ mod tests {
         let narrow = compare_lines(&results, 40);
         assert!(narrow.iter().any(|l| l == "── beta ──"));
         assert!(!narrow.iter().any(|l| l.contains('│')));
+    }
+
+    #[test]
+    fn the_wizard_masks_goes_back_and_resumes() {
+        let mut w = Wizard::new(&Config::default());
+        w.api_key = "sk-1234567890abcd".into();
+        assert_eq!(w.shown_key(), format!("{}abcd", "•".repeat(13)));
+        w.reveal_key = true;
+        assert_eq!(w.shown_key(), "sk-1234567890abcd");
+        // A draft never holds the key, and resumes at the key step.
+        w.preset = formless_core::presets::find("openrouter");
+        w.base_url = "https://openrouter.ai/api/v1".into();
+        w.step = WizardStep::PickModel;
+        let d = w.draft();
+        assert!(!d.to_string().contains("sk-123"));
+        let mut again = Wizard::new(&Config::default());
+        again.resume(&d);
+        assert_eq!(again.step, WizardStep::ApiKey);
+        assert_eq!(again.preset.unwrap().id, "openrouter");
+        // Esc goes back one step at a time.
+        let mut app = test_app();
+        let mut w = Wizard::new(&Config::default());
+        w.step = WizardStep::PickEffort;
+        app.wizard = Some(w);
+        app.wizard_step_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickModel);
+        // Ctrl+R toggles reveal instead of typing an "r".
+        app.wizard.as_mut().unwrap().step = WizardStep::ApiKey;
+        app.wizard_step_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let w = app.wizard.as_ref().unwrap();
+        assert!(w.reveal_key && w.api_key.is_empty());
+    }
+
+    #[test]
+    fn a_local_server_is_found_by_its_port() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(local_server_running(&format!("http://localhost:{port}/v1")));
+        drop(l);
+        assert!(!local_server_running("not a url"));
     }
 
     #[test]

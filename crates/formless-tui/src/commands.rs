@@ -468,6 +468,18 @@ pub const COMMANDS: &[Command] = &[
     cmd("storage", "", "disk used by Sessions, artifacts, logs, backups", App),
     cmd("gc", "[run]", "what clean-up would free; `run` frees it", App),
     cmd("backup", "", "back up the database now", App),
+    cmd(
+        "setup",
+        "",
+        "the setup wizard again: re-enter the API key, or change provider",
+        App,
+    ),
+    cmd(
+        "tour",
+        "[skip]",
+        "a 2-minute guided first task; `skip` hides the offer",
+        App,
+    ),
     cmd("notes", "", "every note so far, in the pager", App),
     cmd(
         "help",
