@@ -692,6 +692,22 @@ pub struct RunSummary {
     pub avg_duration_ms: f64,
 }
 
+/// One model's answer in a comparison (SPEC §5.10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ComparisonResult {
+    pub model: String,
+    /// The fork the Run happened in (open it to continue there).
+    pub session_id: String,
+    /// completed, paused or interrupted.
+    pub status: String,
+    pub answer: String,
+    pub duration_ms: i64,
+    pub tokens: i64,
+    /// USD, when every model used has a price.
+    pub cost: Option<f64>,
+    pub steps: i64,
+}
+
 /// One step of the agent's plan (`update_plan`, SPEC §5.8).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlanItem {
@@ -1255,6 +1271,30 @@ pub enum Request {
     /// Stop the server's process (if any) and list its tools again.
     RestartMcpServer {
         name: String,
+    },
+    /// Run the same prompt on two or more models, each in a fork of the
+    /// Session (`/compare A B [prompt]`, SPEC §5.10): `prompt`, or the
+    /// Session's last message re-asked. `ComparisonReady` reports back.
+    CompareModels {
+        session_id: String,
+        models: Vec<String>,
+        #[serde(default)]
+        prompt: Option<String>,
+    },
+    /// Step mode (`/step`): pause before each Tool call of this Session's
+    /// Runs until the user decides (SPEC §5.9).
+    SetStepMode {
+        session_id: String,
+        on: bool,
+    },
+    /// Answer a `StepPending`: `action` is "continue", "skip", "edit"
+    /// (run it with `arguments`, a JSON object as text) or "all" (run this
+    /// and the rest of the Run without pausing).
+    StepDecision {
+        step_id: String,
+        action: String,
+        #[serde(default)]
+        arguments: Option<String>,
     },
     /// Everything for a new machine as one `formless.all/1` bundle (SPEC
     /// §15): Tools, modules, Skills, memories, jobs, and the config with
@@ -1962,6 +2002,28 @@ pub enum Event {
         run_id: String,
         files: Vec<RunFileInfo>,
     },
+    /// Every Run of a `CompareModels` finished: the answers side by side.
+    ComparisonReady {
+        session_id: String,
+        comparison_id: String,
+        results: Vec<ComparisonResult>,
+    },
+    /// Step mode: the Run is about to call `tool_name` with `arguments`
+    /// (call `index` of `count` in this step) and waits for StepDecision.
+    StepPending {
+        session_id: String,
+        run_id: String,
+        step_id: String,
+        tool_name: String,
+        arguments: String,
+        index: usize,
+        count: usize,
+    },
+    /// The step was decided (by any client) or the Run stopped waiting.
+    StepResolved {
+        session_id: String,
+        step_id: String,
+    },
     /// A Session's queue of messages waiting for the current Run changed
     /// (queued, sent, edited, removed or reordered).
     QueueChanged {
@@ -2231,6 +2293,9 @@ impl Event {
             | Event::RunRecap { session_id, .. }
             | Event::ToolProgress { session_id, .. }
             | Event::PlanUpdated { session_id, .. }
+            | Event::StepPending { session_id, .. }
+            | Event::ComparisonReady { session_id, .. }
+            | Event::StepResolved { session_id, .. }
             | Event::RunFinished { session_id, .. }
             | Event::RunPaused { session_id, .. }
             | Event::CompactionNotice { session_id, .. }

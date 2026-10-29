@@ -688,6 +688,36 @@ pasting paths.
   `▸` in progress, `○` pending) and the web above the composer. Once every
   step is done and no Run is active it folds to "✓ Plan done (n/n)".
 
+### 5.9 Step mode
+
+- `/step` (`SetStepMode {session_id, on}`; `GetSession.step_mode`) makes
+  the Session's Runs stop before each Tool call. The daemon broadcasts
+  `StepPending {step_id, tool_name, arguments, index, count}` and waits
+  for `StepDecision {step_id, action, arguments?}`: `continue` runs it,
+  `edit` runs it with new arguments (a JSON object, also stored on the
+  call), `skip` answers the model that the user chose not to run it, and
+  `all` runs it and the rest of the Run without stopping (step mode off).
+  `StepResolved` tells every client the step was decided. Esc interrupts
+  the Run as usual; with no client connected the Run does not wait.
+- The TUI shows the call and its arguments at the end of the chat: Enter
+  runs it, `e` puts the arguments in the input to edit (Enter runs, Esc
+  cancels), `s` skips, `a` runs the rest; the keys work while the input is
+  empty. The web shows a banner with Run, Edit, Skip and Run the rest.
+
+### 5.10 Comparing models
+
+- `/compare MODEL_A MODEL_B [prompt]` (`CompareModels {session_id,
+  models, prompt?}`, 2–4 models) forks the Session once per model, sets
+  each fork's model, and asks the prompt there, or, without one, the
+  Session's last message again (forked just before it). The original
+  Session is left as it was.
+- When every fork's Run has ended, `ComparisonReady {session_id,
+  comparison_id, results}` goes to the original Session: per model its
+  answer, status, duration, tokens, steps and cost (when priced), and the
+  fork's id to continue there. The TUI opens a pager with the figures and
+  the answers in columns (stacked when narrow); the web a dialog with one
+  column per model and "Continue in this Session".
+
 ## 6. Invocations: async by design
 
 ### 6.1 Execution model
@@ -2814,6 +2844,24 @@ run_tool = "network_policy"     # a registry Tool, or…
   The web tab title also counts unseen alerts (`(2) Formless`) until you
   come back. Interrupted Runs never notify.
 
+### 10.8 Language
+
+- UI strings live in catalogs keyed by the English text: the TUI's
+  `i18n.rs` (`tr`) and the web's `I18N` table in `app.js` (`tr`). A
+  string is translated by wrapping it and adding a row; anything without
+  a row shows in English, so strings move into the catalog gradually.
+  Thai (`th`) is the first language: the status bar, activity labels,
+  command groups, the most-used command descriptions, help, and the
+  plan, queue, recap, step-mode and paused-Run blocks; on the web also
+  the composer, its buttons and the run banners.
+- `tui.language` (`auto`, `en`, `th`) chooses it; `auto` follows the
+  system locale (`LC_ALL`, `LC_MESSAGES`, `LANG`) in the TUI and the
+  browser's language on the web. Message times use the language's day
+  and month names (`3 มี.ค. 14:02`), the web formats dates and numbers
+  with that locale, and token counts are digit-grouped.
+- Agent answers are not translated; they are in whatever language the
+  conversation is in.
+
 ## 11. Compaction
 
 - Trigger: Run/Session approaching the model's `context_tokens` (§4.2).
@@ -3218,6 +3266,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 | `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
 | `tui.animations` | true | Spinners and other moving indicators in the TUI; false (or `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` set to anything but empty, `0`, `false`, `no` or `off`) shows a static `●` and a steady cursor (§10.2) |
+| `tui.language` | auto | UI language: `auto` (the system locale: `LC_ALL`, `LC_MESSAGES`, `LANG`), `en` or `th`; the web follows it, else the browser's language (§10.8) |
 | `tui.hyperlinks` | auto | Clickable OSC 8 links for URLs in the TUI chat: `on`, `off`, or `auto` (on except Terminal.app and the Linux console) (§10.2) |
 | `tui.theme` | auto | `dark`, `light` (deeper hues for white backgrounds), `high-contrast` (bright variants), or `auto` (light when `COLORFGBG` reports a light background) (§10.6) |
 | `tui.colors` | {} | Per-role colour overrides: `user`, `assistant`, `tool`, `note`, `error`, `accent` → a name (`light-cyan`) or `#rrggbb` (§10.6) |

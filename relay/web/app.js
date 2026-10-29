@@ -187,16 +187,58 @@
     }
   }
 
+  // ----------------------------------------------------- strings (§10.8)
+  // Keyed by the English text, like the TUI's catalog: anything missing
+  // shows in English. `tui.language` picks it; `auto` uses the browser's.
+  const I18N = {
+    th: {
+      "Send": "ส่ง", "Steer": "ปรับทิศ", "Re-run": "ส่งใหม่", "Stop": "หยุด",
+      "Message Formless…": "พิมพ์ข้อความถึง Formless…",
+      "Steer, or Ctrl/⌘+Enter to queue…": "ปรับทิศ หรือ Ctrl/⌘+Enter เพื่อรอส่ง…",
+      "Resume": "ทำต่อ", "Abandon": "ทิ้ง", "Retry": "ลองใหม่", "Retry with…": "ลองใหม่กับโมเดล…",
+      "Run": "ทำ", "Edit": "แก้", "Skip": "ข้าม", "Run the rest": "ทำที่เหลือทั้งหมด",
+      "What I did": "สิ่งที่ทำ", "Plan": "แผน", "Plan done": "แผนเสร็จแล้ว",
+      "Queued for after this Run": "รอส่งหลังงานนี้",
+      "thinking": "กำลังคิด", "responding": "กำลังตอบ", "waiting for model": "รอโมเดล",
+      "provider stalled": "ผู้ให้บริการไม่ตอบสนอง", "awaiting your approval": "รอการอนุมัติจากคุณ",
+      "awaiting your answer": "รอคำตอบจากคุณ", "running": "กำลังทำงาน",
+      "just now": "เมื่อกี้", "m ago": " นาทีที่แล้ว", "h ago": " ชม.ที่แล้ว", "d ago": " วันที่แล้ว",
+      "Session": "เซสชัน", "Run control": "ควบคุมการทำงาน", "Tools": "เครื่องมือ",
+      "Integrations": "การเชื่อมต่อ", "Settings": "การตั้งค่า", "App": "แอป",
+      "start a new Session, optionally from a template": "เริ่มเซสชันใหม่ (เลือกจากเทมเพลตได้)",
+      "stop the current Run (Esc)": "หยุดการทำงานปัจจุบัน (Esc)",
+      "continue an interrupted or paused Run": "ทำงานต่อจากที่ถูกขัดจังหวะหรือหยุดไว้",
+      "the files the last Run changed, with diffs": "ไฟล์ที่งานล่าสุดแก้ไข พร้อมส่วนที่เปลี่ยน",
+      "step mode: pause before each Tool call": "โหมดทีละขั้น: หยุดก่อนเรียกเครื่องมือแต่ละครั้ง",
+      "the same prompt on two models, side by side with time and cost": "ถามคำถามเดียวกันกับสองโมเดล เทียบคำตอบ เวลา และค่าใช้จ่าย",
+      "clean up: shows what it frees first": "ล้างข้อมูล: แสดงก่อนว่าจะคืนพื้นที่เท่าไร",
+    },
+  };
+  function uiLang() {
+    const set = S.settings && S.settings.tui && S.settings.tui.language;
+    const l = set && set !== "auto" ? set : (navigator.language || "en");
+    return String(l).toLowerCase().startsWith("th") ? "th" : "en";
+  }
+  /** `s` in the UI language (English when there is no translation). */
+  function tr(s) {
+    const t = I18N[uiLang()];
+    return (t && t[s]) || s;
+  }
+  /** The locale for dates and numbers: the UI language's, else the browser's. */
+  function uiLocale() {
+    return uiLang() === "th" ? "th-TH" : undefined;
+  }
+
   // -------------------------------------------------------------- helpers
   function relTime(ts) {
     const t = Date.parse(ts);
     if (isNaN(t)) return ts || "";
     const s = Math.max(0, (Date.now() - t) / 1000);
-    if (s < 60) return "just now";
-    if (s < 3600) return Math.floor(s / 60) + "m ago";
-    if (s < 86400) return Math.floor(s / 3600) + "h ago";
-    if (s < 604800) return Math.floor(s / 86400) + "d ago";
-    return new Date(t).toLocaleDateString();
+    if (s < 60) return tr("just now");
+    if (s < 3600) return Math.floor(s / 60) + tr("m ago");
+    if (s < 86400) return Math.floor(s / 3600) + tr("h ago");
+    if (s < 604800) return Math.floor(s / 86400) + tr("d ago");
+    return new Date(t).toLocaleDateString(uiLocale());
   }
   /** "in 42m": how long until a future time. */
   function untilTime(ts) {
@@ -208,7 +250,7 @@
   }
   function clock(ts) {
     const t = Date.parse(ts);
-    return isNaN(t) ? "" : new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return isNaN(t) ? "" : new Date(t).toLocaleTimeString(uiLocale() || [], { hour: "2-digit", minute: "2-digit" });
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
@@ -391,7 +433,7 @@
       const left = Math.ceil((a.retryAt - Date.now()) / 1000);
       return a.label + " · " + (left > 0 ? "retrying in " + left + "s " : "retrying ") + a.count + " · Esc to stop";
     }
-    return a.label + "… " + elapsed(a.since);
+    return tr(a.label) + "… " + elapsed(a.since);
   }
   function setActivity(label) {
     if (!label) S.activity = null;
@@ -1280,7 +1322,7 @@
     }
     palette.box.replaceChildren(...palette.items.map((c, i) => {
       const li = h("li", { role: "option", "aria-selected": String(i === palette.sel), class: i === palette.sel ? "sel" : null },
-        h("span", { class: "cmd-usage" }, usage(c)), h("span", { class: "muted" }, c.desc));
+        h("span", { class: "cmd-usage" }, usage(c)), h("span", { class: "muted" }, tr(c.desc)));
       li.onmousedown = (e) => { e.preventDefault(); palette.sel = i; acceptCommand(true); };
       return li;
     }));
@@ -1589,11 +1631,11 @@
     const btn = (rating, label, title) => h("button", { class: "btn ghost small" + (cur === rating ? " active" : ""), type: "button", title, "aria-pressed": String(cur === rating),
       onclick: () => rate(cur === rating ? "" : rating) }, label);
     return h("div", { class: "rate" }, btn("good", "👍", "Good answer"), btn("bad", "👎", "Bad answer"),
-      h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message (/retry)", onclick: () => retryRun("") }, "Retry"),
+      h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message (/retry)", onclick: () => retryRun("") }, tr("Retry")),
       h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message on another model; this answer stays in a fork", onclick: () => {
         const m = prompt("Retry on which model?");
         if (m && m.trim()) retryRun(m.trim());
-      } }, "Retry with…"));
+      } }, tr("Retry with…")));
   }
   // Re-run the last user message, on `model` for that Run when given.
   async function retryRun(model) {
@@ -1758,10 +1800,31 @@
       text,
       h("button", { class: "btn small primary", type: "button", onclick: async () => {
         if (await act({ type: "resume_run", session_id: S.current })) { S.unfinished = null; renderRunBanner(); }
-      } }, "Resume"),
+      } }, tr("Resume")),
       h("button", { class: "btn small", type: "button", onclick: async () => {
         if (await act({ type: "abandon_run", session_id: S.current }, "Abandoned")) { S.unfinished = null; renderRunBanner(); }
-      } }, "Abandon"));
+      } }, tr("Abandon")));
+  }
+
+  /** Step mode (SPEC §5.9): the call waiting for a decision. */
+  function renderStep() {
+    const box = $("step");
+    const st = S.step;
+    box.classList.toggle("hidden", !st);
+    if (!st) return box.replaceChildren();
+    const decide = (action, args) => act({ type: "step_decision", step_id: st.step_id, action, arguments: args || null });
+    let pretty = st.arguments;
+    try { pretty = JSON.stringify(JSON.parse(st.arguments), null, 2); } catch (_) {}
+    box.replaceChildren(
+      h("span", { class: "banner-text" }, "⏸ Step mode · about to call ", h("strong", null, st.tool_name), " (" + (st.index + 1) + " of " + st.count + ")",
+        h("details", null, h("summary", null, "arguments"), h("pre", { class: "diff" }, pretty))),
+      h("button", { class: "btn small primary", type: "button", onclick: () => decide("continue") }, tr("Run")),
+      h("button", { class: "btn small", type: "button", onclick: async () => {
+        const v = await ask({ title: "Edit the arguments for " + st.tool_name, text: "JSON object", input: true, value: pretty });
+        if (v != null) decide("edit", v);
+      } }, tr("Edit")),
+      h("button", { class: "btn small", type: "button", onclick: () => decide("skip") }, tr("Skip")),
+      h("button", { class: "btn small", type: "button", onclick: () => { S.stepMode = false; decide("all"); } }, tr("Run the rest")));
   }
 
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
@@ -1771,9 +1834,9 @@
     box.classList.toggle("hidden", !items.length);
     if (!items.length) return box.replaceChildren();
     const done = items.filter((i) => i.status === "completed").length;
-    if (done === items.length && !isRunning()) return box.replaceChildren(h("span", { class: "muted" }, "✓ Plan done (" + done + "/" + items.length + ")"));
+    if (done === items.length && !isRunning()) return box.replaceChildren(h("span", { class: "muted" }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
     const mark = { completed: "✓", in_progress: "▸" };
-    box.replaceChildren(h("span", { class: "muted" }, "Plan (" + done + "/" + items.length + ")"),
+    box.replaceChildren(h("span", { class: "muted" }, tr("Plan") + " (" + done + "/" + items.length + ")"),
       h("ul", null, items.map((i) => h("li", { class: i.status }, (mark[i.status] || "○") + " " + i.content))));
   }
 
@@ -1786,7 +1849,7 @@
     const sid = S.current;
     const btn = (label, title, fn) => h("button", { class: "btn ghost small", type: "button", title, "aria-label": title, onclick: fn }, label);
     box.replaceChildren(
-      h("span", { class: "muted" }, "⏳ Queued for after this Run (" + q.length + ")"),
+      h("span", { class: "muted" }, "⏳ " + tr("Queued for after this Run") + " (" + q.length + ")"),
       h("ol", null, q.map((m, i) => h("li", null,
         h("span", { class: "text", title: m.content }, m.content),
         btn("✎", "Edit", () => {
@@ -1817,8 +1880,9 @@
     const running = isRunning();
     $("composer").classList.toggle("running", running);
     $("stop-btn").hidden = !running;
-    $("send-btn").textContent = S.editMessageId ? "Re-run" : running ? "Steer" : "Send";
-    $("input").placeholder = running ? "Steer, or Ctrl/⌘+Enter to queue…" : "Message Formless…";
+    $("send-btn").textContent = tr(S.editMessageId ? "Re-run" : running ? "Steer" : "Send");
+    $("stop-btn").textContent = tr("Stop");
+    $("input").placeholder = tr(running ? "Steer, or Ctrl/⌘+Enter to queue…" : "Message Formless…");
     const mode = $("compose-mode");
     mode.replaceChildren();
     if (S.editMessageId) {
@@ -2627,6 +2691,7 @@
           ["notify (off, bell, desktop)", c.tui.notify, "tui.notify", "text"],
           ["notify_min_secs", c.tui.notify_min_secs, "tui.notify_min_secs", "number"],
           ["timestamps", on(c.tui.timestamps), "tui.timestamps", "bool"],
+          ["language (auto, en, th)", c.tui.language || "auto", "tui.language", "text"],
           ["animations", on(c.tui.animations), "tui.animations", "bool"],
           ["on_start (last, new, picker)", c.tui.on_start, "tui.on_start", "text"],
           ["screen_reader", on(c.tui.screen_reader), "tui.screen_reader", "bool"]]),
@@ -3345,6 +3410,7 @@
     S.editMessageId = null;
     S.queued = []; renderQueue();
     S.plan = []; renderPlan();
+    S.step = null; renderStep();
     S.recap = null;
     S.follow = true;
     const r = await act({ type: "get_session", id });
@@ -3356,6 +3422,7 @@
       renderQueue();
       S.plan = r.plan || [];
       renderPlan();
+      S.stepMode = !!r.step_mode;
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
     }
@@ -3716,6 +3783,16 @@
     { name: "status", group: "Settings", desc: "the daemon: memory, CPU, database, running work", run: () => showStatus() },
     { name: "storage", group: "Settings", desc: "disk used by Sessions, artifacts, logs, backups", run: () => showStorage() },
     { name: "gc", group: "Settings", desc: "clean up: shows what it frees first", run: () => showGc() },
+    { name: "compare", args: "MODEL_A MODEL_B [PROMPT]", group: "Run control", desc: "the same prompt on two models, side by side with time and cost", run: async (arg) => {
+      const [a, b, ...rest] = (arg || "").trim().split(/\s+/);
+      if (!a || !b) return note("usage: /compare MODEL_A MODEL_B [prompt] (no prompt: your last message again)", true);
+      const r = await act({ type: "compare_models", session_id: S.current, models: [a, b], prompt: rest.join(" ") || null });
+      if (r) { note("comparing " + a + " vs " + b + " in forked Sessions; the answers show here when both finish"); refreshSessions(); }
+    } },
+    { name: "step", group: "Run control", desc: "step mode: pause before each Tool call", run: async () => {
+      S.stepMode = !S.stepMode;
+      if (await act({ type: "set_step_mode", session_id: S.current, on: S.stepMode })) note(S.stepMode ? "step mode on: the agent stops before each Tool call" : "step mode off");
+    } },
     { name: "files", group: "Run control", desc: "the files the last Run changed, with diffs", run: () => showRunFiles() },
     { name: "rewind", args: "[PATH]", group: "Run control", desc: "put the last Run's file changes back (one file, or all)", run: async (arg) => {
       const path = (arg || "").trim();
@@ -3813,7 +3890,7 @@
     const rows = (pairs) => h("div", { class: "help-grid" }, pairs.map(([k, d]) => [h("code", null, k), h("span", null, d)]));
     const keyName = (k) => (k === "ArrowDown" ? "↓" : k === "ArrowUp" ? "↑" : k);
     const sections = [...new Set(COMMANDS.map((c) => c.group))].map((g) =>
-      h("section", null, h("h3", null, g), rows(COMMANDS.filter((c) => c.group === g).map((c) => [usage(c), c.desc]))));
+      h("section", null, h("h3", null, tr(g)), rows(COMMANDS.filter((c) => c.group === g).map((c) => [usage(c), tr(c.desc)]))));
     sections.push(h("section", null, h("h3", null, "Keys"), rows([
       ...SHORTCUTS.map((sc) => [sc.keys.map(keyName).join(" "), (sc.view ? "(" + sc.view + ") " : "") + sc.help]),
       ["Enter", "send, or steer the running Run"], ["Shift+Enter", "new line"], ["Ctrl/⌘+Enter", "queue for after the Run"],
@@ -3865,7 +3942,7 @@
     const n = (k, what) => (k ? " · " + k + " " + what : "");
     const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
     return h("details", { class: "recap" },
-      h("summary", null, "What I did · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + n(r.used.length, "calls") + n(r.built.length, "Tools changed") + n(r.files.length, "files")),
+      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + n(r.used.length, "calls") + n(r.built.length, "Tools changed") + n(r.files.length, "files")),
       ...list("Used", r.used), ...list("Built", r.built), ...list("Files", r.files),
       r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
   }
@@ -4053,6 +4130,22 @@
         break;
       case "provider_stalled":
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
+        break;
+      case "comparison_ready":
+        if (here) {
+          const cols = ev.results.map((r) => h("div", { class: "compare-col" },
+            h("h3", null, r.model),
+            h("div", { class: "muted" }, r.status + " · " + (r.duration_ms / 1000).toFixed(1) + "s · " + r.tokens + " tokens · " + r.steps + " steps" + (r.cost != null ? " · $" + r.cost.toFixed(4) : "")),
+            h("div", { class: "compare-answer" }, markdown(r.answer || "(no answer)")),
+            h("button", { class: "btn small", type: "button", onclick: () => { document.querySelector(".backdrop") && document.querySelector(".backdrop").remove(); openSession(r.session_id); } }, "Continue in this Session")));
+          modal("Compare: " + ev.results.map((r) => r.model).join(" vs "), h("div", { class: "compare" }, cols));
+        }
+        break;
+      case "step_pending":
+        if (here) { S.step = ev; renderStep(); }
+        break;
+      case "step_resolved":
+        if (here && S.step && S.step.step_id === ev.step_id) { S.step = null; renderStep(); }
         break;
       case "plan_updated":
         if (here) { S.plan = ev.items || []; renderPlan(); }

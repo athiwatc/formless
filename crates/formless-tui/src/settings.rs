@@ -195,6 +195,13 @@ pub fn rows(
         ),
         Row::new(
             "Interface",
+            "tui.language",
+            "language",
+            cfg.tui.language.clone(),
+            Choice(crate::i18n::LANGUAGES),
+        ),
+        Row::new(
+            "Interface",
             "tui.animations",
             "animations",
             on(cfg.tui.animations),

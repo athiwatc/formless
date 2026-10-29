@@ -401,6 +401,7 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("tui.theme", &["auto", "dark", "light", "high-contrast"]),
     ("tui.inline_images", &["auto", "off"]),
     ("tui.on_start", &["last", "new", "picker"]),
+    ("tui.language", &["auto", "en", "th"]),
 ];
 
 /// SPEC §13's settings table is the one description of every key; the
@@ -1125,6 +1126,8 @@ pub struct TuiCfg {
     /// What the TUI opens on launch: "last" (the most recently active
     /// Session), "new" (a fresh one) or "picker" (the Sessions view).
     pub on_start: String,
+    /// UI language: "auto" (the system locale), "en" or "th".
+    pub language: String,
     /// Spinners and other moving indicators; false (or the
     /// `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` env var) shows static
     /// ones instead.
@@ -1147,6 +1150,7 @@ impl Default for TuiCfg {
             screen_reader: false,
             on_start: "last".into(),
             animations: true,
+            language: "auto".into(),
         }
     }
 }
@@ -1261,6 +1265,7 @@ impl Config {
                 "on_start": self.tui.on_start,
                 "screen_reader": self.tui.screen_reader,
                 "animations": self.tui.animations,
+                "language": self.tui.language,
             },
             // Keys that apply only when the TUI next starts.
             "on_tui_start": ON_TUI_START,
