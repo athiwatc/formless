@@ -206,6 +206,18 @@ enum Cmd {
         #[command(subcommand)]
         action: NamingAction,
     },
+    /// Open the guides in a browser: gallery, capabilities, approvals,
+    /// keys, troubleshooting, mcp, skills, jobs, spec
+    Docs {
+        topic: Option<String>,
+        /// Print the URL instead of opening it
+        #[arg(long)]
+        print: bool,
+        /// Print the keyboard and command reference as Markdown
+        /// (docs/keys.md)
+        #[arg(long, conflicts_with_all = ["topic", "print"])]
+        keys: bool,
+    },
     /// Disk used by Sessions, artifacts, Tool versions, logs, backups
     Storage {
         #[arg(long)]
@@ -236,6 +248,21 @@ enum Cmd {
     /// current one is saved next to the backups
     Restore {
         file: std::path::PathBuf,
+    },
+    /// Remove Formless from this machine: stop the daemon, remove the login
+    /// service, delete keychain entries and every profile's data, and the
+    /// binary (SPEC §15)
+    Uninstall {
+        /// Keep Sessions, Tools and config (remove only the service,
+        /// secrets and binary)
+        #[arg(long)]
+        keep_data: bool,
+        /// Leave the binary in place
+        #[arg(long)]
+        keep_binary: bool,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
     Reset {
@@ -1255,7 +1282,32 @@ fn main() -> Result<()> {
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
+        Some(Cmd::Uninstall {
+            keep_data,
+            keep_binary,
+            yes,
+        }) => uninstall_cmd(&paths, keep_data, keep_binary, yes),
         Some(Cmd::Storage { json }) => storage_cmd(&paths, json),
+        Some(Cmd::Docs { topic, print, keys }) => {
+            if keys {
+                print!("{}", formless_tui::keys_reference());
+                return Ok(());
+            }
+            let Some(url) = formless_core::docs::url(topic.as_deref()) else {
+                let mut tbl = Table::new(&["TOPIC", "WHAT"]);
+                for (name, _, what) in formless_core::docs::TOPICS {
+                    tbl.row(vec![t(*name, Tone::Strong), c(*what)]);
+                }
+                tbl.print();
+                return Ok(());
+            };
+            if print || !formless_core::docs::open_url(&url) {
+                println!("{url}");
+            } else {
+                println!("opened {url}");
+            }
+            Ok(())
+        }
         Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
         Some(Cmd::Backup) => backup_cmd(&paths),
         Some(Cmd::ExportAll { sessions, output }) => {
@@ -2439,6 +2491,10 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
     let paths = paths.clone();
     let mut problems = doctor_local_problems(&paths);
     use formless_core::Store;
+    say!(
+        "help:       {}",
+        formless_core::docs::url(Some("troubleshooting")).unwrap_or_default()
+    );
     say!("data dir:   {}", paths.data_dir.display());
     say!("config dir: {}", paths.config_dir.display());
     say!(
@@ -5322,6 +5378,95 @@ fn tool_run(
             Ok(1)
         }
     }
+}
+
+/// `formless uninstall` (SPEC §15): every profile's daemon, login service
+/// and secrets, then its folders (unless --keep-data), then the binary
+/// (unless --keep-binary or a package manager owns it).
+fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -> Result<()> {
+    let profiles = paths.list_profiles();
+    let exe = std::env::current_exe().ok();
+    // A package manager's binary is removed with the package manager.
+    let managed = exe.as_ref().and_then(|e| {
+        let s = e.to_string_lossy();
+        if s.contains("/Cellar/") || s.contains("/homebrew/") {
+            Some("brew uninstall formless")
+        } else if s.starts_with("/usr/bin/") {
+            Some("your package manager (apt remove formless / dnf remove formless / pacman -R formless-bin)")
+        } else if s.contains("WinGet") {
+            Some("winget uninstall formless")
+        } else {
+            None
+        }
+    });
+    println!("This removes Formless from this machine:");
+    for p in &profiles {
+        println!(
+            "  profile {}: daemon, login service, keychain entries{}",
+            p.profile,
+            if keep_data {
+                String::new()
+            } else {
+                format!(", {} and {}", p.data_dir.display(), p.config_dir.display())
+            }
+        );
+    }
+    match (&exe, managed, keep_binary) {
+        (_, _, true) => {}
+        (_, Some(how), _) => println!("  the binary: installed by a package manager, remove it with {how}"),
+        (Some(e), None, false) => println!("  the binary: {}", e.display()),
+        _ => {}
+    }
+    if !keep_data {
+        println!("Sessions, Tools, memories and backups are deleted. Keep a copy first with `formless export-all`.");
+    }
+    if !yes {
+        eprint!("Type 'uninstall' to confirm: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != "uninstall" {
+            eprintln!("aborted");
+            std::process::exit(2);
+        }
+    }
+    for p in &profiles {
+        if daemon_reachable(p) {
+            let _ = formless_tui::client::request_once(p, Request::Shutdown);
+            for _ in 0..50 {
+                if !daemon_reachable(p) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        if let Ok(plan) = formless_core::service::plan_here(p) {
+            if plan.file.exists() {
+                match formless_core::service::uninstall(&plan) {
+                    Ok(()) => println!("removed the login service ({})", plan.file.display()),
+                    Err(e) => eprintln!("could not remove the login service: {e:#}"),
+                }
+            }
+        }
+        if keep_data {
+            formless_core::config::delete_secrets(p);
+        } else {
+            formless_core::config::reset_all(p)?;
+        }
+        println!("removed profile {}", p.profile);
+    }
+    if let (Some(e), None, false) = (&exe, managed, keep_binary) {
+        if cfg!(windows) {
+            println!("Windows can't delete a running program: delete {} yourself now.", e.display());
+        } else {
+            match std::fs::remove_file(e) {
+                Ok(()) => println!("removed {}", e.display()),
+                Err(err) => eprintln!("could not remove {}: {err} (delete it yourself)", e.display()),
+            }
+        }
+    }
+    println!("Formless is uninstalled.");
+    Ok(())
 }
 
 fn reset_cmd(paths: Paths, force: bool) -> Result<()> {

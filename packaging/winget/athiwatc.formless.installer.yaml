@@ -5,7 +5,7 @@ PackageVersion: 0.1.0
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
-  - RelativeFilePath: formless.exe
+  - RelativeFilePath: formless-v0.1.0-x86_64-pc-windows-msvc/formless.exe
     PortableCommandAlias: formless
 Installers:
   - Architecture: x64

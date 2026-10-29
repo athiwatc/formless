@@ -1511,6 +1511,15 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
             return Some(v);
         }
     }
+    // A file holding the key, e.g. a Docker / Kubernetes secret mounted
+    // at /run/secrets/… (docs/docker.md).
+    if let Some(k) = std::env::var_os("FORMLESS_API_KEY_FILE")
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(k);
+    }
     if let Some(k) = read_secret_file(&paths.key_fallback_file())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1564,15 +1573,30 @@ pub fn delete_provider_key(paths: &Paths, name: &str) {
 /// Full reset (SPEC §15): keychain entry, config, and the entire data dir.
 /// Caller must stop the daemon first.
 pub fn reset_all(paths: &Paths) -> Result<()> {
-    delete_api_key(paths);
-    crate::auth::delete_oauth_tokens(paths);
-    delete_relay_secret(paths);
+    delete_secrets(paths);
     for dir in [&paths.data_dir, &paths.config_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
         }
     }
     Ok(())
+}
+
+/// Every credential a profile keeps outside its folders (keychain and
+/// secret files): the API key, OAuth tokens, the relay secret, named
+/// providers' keys and MCP servers' logins.
+pub fn delete_secrets(paths: &Paths) {
+    if let Ok(cfg) = Config::load_file_only(paths) {
+        for name in cfg.providers.keys() {
+            delete_provider_key(paths, name);
+        }
+        for server in cfg.mcp.servers.keys() {
+            crate::mcp_auth::logout(paths, server);
+        }
+    }
+    delete_api_key(paths);
+    crate::auth::delete_oauth_tokens(paths);
+    delete_relay_secret(paths);
 }
 
 // --- Relay pairing secret: 32 random bytes, base64url. It *is* the

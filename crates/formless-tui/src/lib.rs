@@ -5354,6 +5354,24 @@ impl App {
             }
             "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
             "status" => self.request(Pending::DaemonStatus, Request::Status),
+            cmd if cmd == "docs" || cmd.starts_with("docs ") => {
+                let topic = cmd["docs".len()..].trim();
+                match formless_core::docs::url(Some(topic).filter(|t| !t.is_empty())) {
+                    Some(url) => {
+                        let opened = formless_core::docs::open_url(&url);
+                        self.notes.push(if opened {
+                            format!("opened {url}")
+                        } else {
+                            format!("docs: {url}")
+                        });
+                    }
+                    None => {
+                        let names: Vec<&str> =
+                            formless_core::docs::TOPICS.iter().map(|(n, _, _)| *n).collect();
+                        self.notes.push(format!("docs topics: {}", names.join(", ")));
+                    }
+                }
+            }
             "tour skip" => {
                 self.tour = None;
                 self.seen.tour_done = true;
@@ -13795,6 +13813,11 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             .wrap(Wrap { trim: false }),
         rect,
     );
+}
+
+/// The keyboard and command reference as Markdown (`docs/keys.md`).
+pub fn keys_reference() -> String {
+    commands::reference_markdown()
 }
 
 pub fn run(paths: Paths) -> Result<()> {
