@@ -2046,6 +2046,9 @@
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
     body.replaceChildren(h("div", null,
+      // The first approval ever: what this is and how to undo it (#394).
+      !promo && !prefs.get("seen.approvalHelp", false) ? h("p", { class: "first-approval" },
+        "First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Once allows just this call, Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.") : null,
       req.broadConfirm ? h("p", { class: "error broad-confirm" }, "This grants broad access. Press the same button (or key) again to confirm, or allow it once.") : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
@@ -2163,6 +2166,7 @@
     }
     if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
     else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: pickedPaths(req), remember_denial: !!rememberDenial });
+    prefs.set("seen.approvalHelp", true);
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
     renderApproval();

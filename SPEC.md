@@ -2161,6 +2161,33 @@ run_tool = "network_policy"     # a registry Tool, or…
   reasoning effort, (3) run the endpoint probe (§4.3) incl. test tool-call;
   failure blocks Session start with an explanation, (4) optionally type a
   first message (nothing pre-filled, no starter Tools).
+- **`/setup`** opens the wizard again at the saved provider's key step
+  (re-enter the key, or Esc back to change provider); finishing saves and
+  reconnects as on first launch.
+- **Moving around.** Esc goes back one step at every step (effort →
+  model → key → URL → provider), keeping what was typed; the header shows
+  "step N of 5".
+- **The API key** shows as `••••abcd` (only the last 4 characters);
+  Ctrl+R shows it in full while typing, and pasting works (bracketed
+  paste). Ctrl-key presses never type letters into it.
+- **Resuming.** After every key the wizard keeps a draft in
+  `<config>/setup-draft.json`: the step, preset, base URL, model and
+  effort, never the key. The next launch resumes there (at the key step
+  for providers that need one); finishing deletes it.
+- **No key needed.** With no saved setup and no provider key in the
+  environment, a running Ollama or LM Studio (a quick check of its port)
+  is pre-selected and offered: "press Enter to use it (no account or API
+  key needed)".
+- **The first approval** (TUI and web) adds a short explainer: Tools have
+  no access by default, what the Capabilities are, Always vs Once vs this
+  Session vs Deny, and `/approvals` / `/revoke` to undo. It is shown until
+  the first answer (`<data>/tui-seen.json`; the web remembers it in the
+  browser).
+- **A guided first task.** Once setup finishes, a note offers `/tour`
+  (and `/tour skip`, which hides the offer for good); it is offered once.
+  `/tour` puts a sample task in the input that makes the agent build a
+  Tool, then points to the Tools view when `create_tool` succeeds and to
+  `/help` when the Run ends.
 
 - **What opens on launch.** `tui.on_start` is `last` (default: the most
   recently active, unarchived Session; not the first row, since pinned
