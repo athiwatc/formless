@@ -1165,6 +1165,22 @@ async fn anthropic_400s_are_stripped_and_resent_once() {
     assert_eq!(bodies.len(), 2, "exactly one resend");
     assert!(bodies[0].to_string().contains("cache_control"));
     assert!(!bodies[1].to_string().contains("cache_control"));
+
+    // Fixes are not retries (#1088): two strips, then a 429, then success,
+    // all within max_retries = 1.
+    let (base, seen) = scripted_messages(vec![
+        err("messages.1.content.0: Invalid `signature` in `thinking` block"),
+        err("thinking is not supported by this model"),
+        (429, "{}".to_string()),
+        ok.clone(),
+    ])
+    .await;
+    let mut c = anthropic_cfg(&base);
+    c.max_retries = 1;
+    c.max_backoff_secs = 1;
+    let (r, _) = anthropic_turn(c, &history, &[], Some("high")).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(seen.lock().unwrap().len(), 4);
 }
 
 /// #1060, #1061: a stream without `message_stop` is a dropped stream
@@ -1286,6 +1302,13 @@ async fn anthropic_model_listing_pages_and_windows() {
 }
 
 async fn stream_full(base: String, responses: bool) -> formless_core::provider::ChatResult {
+    try_stream_full(base, responses).await.unwrap()
+}
+
+async fn try_stream_full(
+    base: String,
+    responses: bool,
+) -> anyhow::Result<formless_core::provider::ChatResult> {
     let mut c = cfg(&base);
     c.fallback_models.clear();
     c.max_retries = 0;
@@ -1302,7 +1325,6 @@ async fn stream_full(base: String, responses: bool) -> formless_core::provider::
         |_, _| {},
     )
     .await
-    .unwrap()
 }
 
 /// The stream's last event without a trailing newline, a JSON field split
@@ -1436,4 +1458,61 @@ async fn a_failing_model_trips_its_breaker_and_is_skipped() {
     let notes = notes.lock().unwrap();
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("bad failed 3 times"), "{notes:?}");
+}
+
+/// Repeated-prefix deltas append, id-less parallel calls stay apart, and a
+/// huge streamed index is an error, not an allocation (#1106, #1107, #1108).
+#[tokio::test]
+async fn tool_call_fragments_are_merged_exactly_and_bounded() {
+    let ev = |v: Value| format!("data: {v}\n\n");
+    let call = |frag: Value| ev(json!({"choices": [{"delta": {"tool_calls": [frag]}}]}));
+    // Incremental: "aaa" then "aaa" is "aaaaaa"; a lone "{" then "{" too.
+    let inc = [
+        call(json!({"index": 0, "id": "c", "function": {"name": "echo", "arguments": "{\"s\":\"aaa"}})),
+        call(json!({"index": 0, "function": {"arguments": "aaa"}})),
+        call(json!({"index": 0, "function": {"arguments": "aaa"}})),
+        call(json!({"index": 0, "function": {"arguments": "\"}"}})),
+        call(json!({"index": 1, "id": "d", "function": {"name": "nest", "arguments": "{"}})),
+        call(json!({"index": 1, "function": {"arguments": "{"}})),
+        call(json!({"index": 1, "function": {"arguments": "}}"}})),
+    ]
+    .concat();
+    let r = stream_full(scripted_sse("/chat/completions", vec![inc]).await, false).await;
+    assert_eq!(r.tool_calls[0].arguments, "{\"s\":\"aaaaaaaaa\"}");
+    assert_eq!(r.tool_calls[1].arguments, "{{}}");
+    // Cumulative style: each fragment resends everything so far.
+    let cum = [
+        call(json!({"index": 0, "id": "c", "function": {"name": "echo", "arguments": "{\"s\":\"aaa"}})),
+        call(json!({"index": 0, "function": {"arguments": "{\"s\":\"aaaaaa"}})),
+        call(json!({"index": 0, "function": {"arguments": "{\"s\":\"aaaaaa\"}"}})),
+    ]
+    .concat();
+    let r = stream_full(scripted_sse("/chat/completions", vec![cum]).await, false).await;
+    assert_eq!(r.tool_calls[0].arguments, "{\"s\":\"aaaaaa\"}");
+
+    // No index, no id: a new name after arguments is a second call.
+    let bare = [
+        call(json!({"function": {"name": "read", "arguments": "{}"}})),
+        call(json!({"function": {"name": "write", "arguments": "{}"}})),
+    ]
+    .concat();
+    let r = stream_full(scripted_sse("/chat/completions", vec![bare]).await, false).await;
+    let names: Vec<&str> = r.tool_calls.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["read", "write"]);
+
+    // Two id-less calls in one message both survive.
+    let msg = ev(json!({"choices": [{"message": {"tool_calls": [
+        {"type": "function", "function": {"name": "read", "arguments": "{\"p\":1}"}},
+        {"type": "function", "function": {"name": "read", "arguments": "{\"p\":2}"}}
+    ]}, "finish_reason": "tool_calls"}]}));
+    let r = stream_full(scripted_sse("/chat/completions", vec![msg]).await, false).await;
+    assert_eq!(r.tool_calls.len(), 2, "{:?}", r.tool_calls);
+
+    let huge = call(
+        json!({"index": 100_000_000u64, "id": "x", "function": {"name": "n", "arguments": "{}"}}),
+    );
+    let err = try_stream_full(scripted_sse("/chat/completions", vec![huge]).await, false)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("tool call index"), "{err:#}");
 }

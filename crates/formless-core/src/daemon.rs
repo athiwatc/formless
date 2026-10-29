@@ -4165,17 +4165,33 @@ impl Daemon {
                             .to_string()
                     });
                 // Never an empty answer for a refusal or a filter stop (#615).
-                let content = match result.stop_reason.as_deref() {
+                // The placeholder is marked as such (#1104): clients show it
+                // as a note, and the model never sees it as its own words.
+                let placeholder = match result.stop_reason.as_deref() {
                     Some("refusal") if result.content.trim().is_empty() => {
-                        "(The model declined to answer this request.)".to_string()
+                        Some("(The model declined to answer this request.)")
                     }
                     Some("content_filter") if result.content.trim().is_empty() => {
-                        "(The provider's content filter stopped this answer.)".to_string()
+                        Some("(The provider's content filter stopped this answer.)")
                     }
-                    _ => result.content.clone(),
+                    _ => None,
+                };
+                let content = placeholder.map_or_else(|| result.content.clone(), str::to_string);
+                let meta = match (&result.stop_reason, served) {
+                    (Some(stop), served) => {
+                        let mut m: Value = served
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_else(|| json!({}));
+                        m["stop_reason"] = json!(stop);
+                        if placeholder.is_some() {
+                            m["placeholder"] = json!(true);
+                        }
+                        Some(m.to_string())
+                    }
+                    (None, served) => served,
                 };
                 let msg = self.with_store(|st| {
-                    st.append_message_meta(session_id, "assistant", &content, served)
+                    st.append_message_meta(session_id, "assistant", &content, meta)
                 })?;
                 self.broadcast(Event::MessageComplete {
                     session_id: session_id.to_string(),

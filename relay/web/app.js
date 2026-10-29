@@ -1650,7 +1650,11 @@
           let served = null;
           try { served = JSON.parse(m.meta || "{}").model; } catch (_) {}
           if (served && served.name) n.append(h("div", { class: "muted sent-from", title: "The Session asked for " + (served.requested || "another model") }, "via " + served.name + " (" + (served.via || "fallback") + ")"));
-          if (m.content) n.append(markdown(m.content));
+          let placeholder = false;
+          try { placeholder = JSON.parse(m.meta || "{}").placeholder === true; } catch (_) {}
+          // An empty refusal/filter stop: the daemon's note, not the model's words.
+          if (placeholder) n.append(h("div", { class: "muted stop-note" }, m.content));
+          else if (m.content) n.append(markdown(m.content));
           let calls = [];
           try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
           calls.forEach((c) => n.append(toolCallChip(c)));

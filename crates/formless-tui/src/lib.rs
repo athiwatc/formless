@@ -9582,6 +9582,15 @@ fn steer_step(m: &MessageInfo) -> Option<i64> {
     meta["steer"]["step"].as_i64()
 }
 
+/// Text the daemon wrote in place of an empty refusal or filter stop,
+/// shown as a note rather than as the model's answer (#1104).
+fn is_placeholder(m: &MessageInfo) -> bool {
+    m.meta
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .is_some_and(|meta| meta["placeholder"] == true)
+}
+
 /// "via gpt-4.1-mini (fallback)" when another model than the Session's
 /// answered (SPEC §4.5).
 fn served_by(m: &MessageInfo) -> Option<String> {
@@ -11466,7 +11475,11 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 if focused {
                     focus_line = Some(lines.len());
                 }
-                lines.extend(app.markdown_cached(m, width));
+                if is_placeholder(m) {
+                    lines.push(Line::styled(format!("  {}", m.content), ui::dim(app.color)));
+                } else {
+                    lines.extend(app.markdown_cached(m, width));
+                }
                 if focused {
                     lines.push(focus_hint(app.color, false));
                 }
