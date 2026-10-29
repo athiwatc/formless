@@ -213,6 +213,18 @@ pub const COMMANDS: &[Command] = &[
     cmd("cancel", "", "cancel the stalled or pending Tool call", Run),
     cmd("resend", "", "re-send a stalled provider request", Run),
     cmd(
+        "compare",
+        "A B [prompt]",
+        "the same prompt on two models, side by side with time and cost",
+        Run,
+    ),
+    cmd(
+        "step",
+        "",
+        "step mode: pause before each Tool call (Enter run, e edit, s skip)",
+        Run,
+    ),
+    cmd(
         "good",
         "[comment]",
         "rate the last answer 👍 (feeds Run metrics and routing)",
@@ -539,13 +551,13 @@ pub fn help_lines() -> Vec<String> {
             if group.is_some() {
                 out.push(String::new());
             }
-            out.push(c.group.title().to_string());
+            out.push(crate::i18n::tr(c.group.title()).to_string());
             group = Some(c.group);
         }
-        out.push(format!("  {:<width$}  {}", c.usage(), c.desc));
+        out.push(format!("  {:<width$}  {}", c.usage(), crate::i18n::tr(c.desc)));
     }
     out.push(String::new());
-    out.push("Keys".into());
+    out.push(crate::i18n::tr("Keys").into());
     for (k, d) in KEYS {
         out.push(format!("  {k:<width$}  {d}"));
     }

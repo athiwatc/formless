@@ -1,6 +1,7 @@
 pub mod client;
 mod clipimg;
 mod commands;
+mod i18n;
 mod highlight;
 mod images;
 mod input;
@@ -137,6 +138,10 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/compare A B [prompt]`: the forks were started.
+    Compare,
+    /// A step-mode decision (errors keep the step waiting).
+    StepDecision,
     /// `/status`, `/storage`, `/gc [run]`, `/backup` (SPEC §9.6).
     DaemonStatus,
     Storage,
@@ -581,6 +586,16 @@ impl Wizard {
             self.enter_api_key_step();
         }
     }
+}
+
+/// A Tool call waiting in step mode (SPEC §5.9).
+#[derive(Clone)]
+struct PendingStep {
+    step_id: String,
+    tool_name: String,
+    arguments: String,
+    index: usize,
+    count: usize,
 }
 
 struct Activity {
@@ -1061,6 +1076,11 @@ struct App {
     mcp_import_pick: Option<String>,
     /// The daemon connection was lost: (since, last reconnect attempt).
     offline: Option<(Instant, Instant)>,
+    /// Step mode (`/step`) for the Session on screen, the call waiting
+    /// for a decision, and whether the input holds its edited arguments.
+    step_mode: bool,
+    step: Option<PendingStep>,
+    editing_step: bool,
     should_quit: bool,
     /// Rendered Markdown of settled messages, keyed by content and width.
     /// Rendered settled messages by (id, content length, width).
@@ -1149,7 +1169,10 @@ impl App {
             color: colors_enabled(),
             multi_pane: cfg.tui.multi_pane,
             show_timestamps: cfg.tui.timestamps,
-            animations: animations_enabled(cfg.tui.animations),
+            animations: {
+                i18n::set(&cfg.tui.language);
+                animations_enabled(cfg.tui.animations)
+            },
             hyperlinks: links::enabled(&cfg.tui.hyperlinks),
             model_label: cfg.provider.model.clone(),
             tick: 0,
@@ -1275,6 +1298,9 @@ impl App {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            step_mode: false,
+            step: None,
+            editing_step: false,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -1330,6 +1356,21 @@ impl App {
                 .notes
                 .push(format!("Could not restart the daemon: {e:#}")),
         }
+    }
+
+    /// Answer the call waiting in step mode.
+    fn step_decide(&mut self, action: &str, arguments: Option<String>) {
+        let Some(step) = self.step.clone() else {
+            return;
+        };
+        self.request(
+            Pending::StepDecision,
+            Request::StepDecision {
+                step_id: step.step_id,
+                action: action.into(),
+                arguments,
+            },
+        );
     }
 
     /// The daemon went away (restart, crash): keep everything on screen,
@@ -2587,6 +2628,21 @@ impl App {
                                 .collect();
                             self.notes.extend(lines);
                         }
+                        // StepResolved clears the waiting call.
+                        Pending::StepDecision => {}
+                        Pending::Compare => {
+                            let models: Vec<&str> = result["forks"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|f| f["model"].as_str())
+                                .collect();
+                            self.notes.push(format!(
+                                "comparing {} in forked Sessions; the answers show here when both finish",
+                                models.join(" vs ")
+                            ));
+                            self.request(Pending::ListSessions, Request::ListSessions);
+                        }
                         Pending::RunFiles => {
                             let files: Vec<formless_protocol::RunFileInfo> =
                                 serde_json::from_value(result["files"].clone()).unwrap_or_default();
@@ -2704,6 +2760,7 @@ impl App {
                                 .unwrap_or_default();
                             self.plan = serde_json::from_value(result["plan"].clone())
                                 .unwrap_or_default();
+                            self.step_mode = result["step_mode"] == true;
                         }
                     }
                 }
@@ -2854,20 +2911,22 @@ impl App {
         self.activity.as_ref().map(|a| {
             if let Some((at, count)) = &a.retry {
                 let left = at.saturating_duration_since(Instant::now()).as_secs_f64().ceil();
+                let stop = i18n::tr("Esc to stop");
                 return if left > 0.0 {
                     format!(
-                        "{} {} · retrying in {left}s {count} · Esc to stop",
+                        "{} {} · {} {left}s {count} · {stop}",
                         self.spinner(),
-                        a.label
+                        a.label,
+                        i18n::tr("retrying in")
                     )
                 } else {
-                    format!("{} {} · retrying {count} · Esc to stop", self.spinner(), a.label)
+                    format!("{} {} · retrying {count} · {stop}", self.spinner(), a.label)
                 };
             }
             format!(
                 "{} {}… ({})",
                 self.spinner(),
-                a.label,
+                i18n::tr_str(&a.label),
                 format_elapsed(a.since.elapsed())
             )
         })
@@ -2955,6 +3014,8 @@ impl App {
         self.queued.clear();
         self.recap = None;
         self.plan.clear();
+        self.step = None;
+        self.editing_step = false;
         self.activity = None;
         if self.running() {
             self.set_activity("working");
@@ -3021,6 +3082,60 @@ impl App {
                     .find(|c| c.status == "running" && c.name == tool_name && c.depth == depth)
                 {
                     call.progress = Some((fraction, label));
+                }
+            }
+            Event::ComparisonReady {
+                session_id,
+                results,
+                ..
+            } => {
+                if !self.is_current(&session_id) {
+                    return;
+                }
+                let width = self.chat_area.map_or(100, |a| a.width as usize);
+                self.pager = Some(Pager {
+                    title: format!(
+                        "Compare: {}",
+                        results.iter().map(|r| r.model.as_str()).collect::<Vec<_>>().join(" vs ")
+                    ),
+                    lines: compare_lines(&results, width),
+                    top: 0,
+                    left: 0,
+                    styled: Vec::new(),
+                });
+            }
+            Event::StepPending {
+                session_id,
+                step_id,
+                tool_name,
+                arguments,
+                index,
+                count,
+                ..
+            } => {
+                if self.is_current(&session_id) {
+                    self.set_activity(format!("step mode: waiting before {tool_name}"));
+                    self.step = Some(PendingStep {
+                        step_id,
+                        tool_name,
+                        arguments,
+                        index,
+                        count,
+                    });
+                }
+            }
+            Event::StepResolved {
+                session_id,
+                step_id,
+            } => {
+                if self.is_current(&session_id)
+                    && self.step.as_ref().is_some_and(|s| s.step_id == step_id)
+                {
+                    self.step = None;
+                    if self.editing_step {
+                        self.editing_step = false;
+                        self.input.clear();
+                    }
                 }
             }
             Event::PlanUpdated { session_id, items } => {
@@ -3184,6 +3299,7 @@ impl App {
                     self.multi_pane = cfg.tui.multi_pane;
                     self.show_timestamps = cfg.tui.timestamps;
                     self.animations = animations_enabled(cfg.tui.animations);
+                    i18n::set(&cfg.tui.language);
                     self.hyperlinks = links::enabled(&cfg.tui.hyperlinks);
                     self.pane_widths = pane_widths(&cfg.tui.pane_widths);
                     // Rendered answers carry the old colours and options.
@@ -3656,6 +3772,12 @@ impl App {
             );
             return;
         }
+        if self.editing_step {
+            let text = self.input.take();
+            self.editing_step = false;
+            self.step_decide("edit", Some(text.trim().to_string()));
+            return;
+        }
         if let Some(id) = self.editing_queued.take() {
             if let Some(session_id) = self.current.clone() {
                 self.fire(Request::EditQueued {
@@ -4068,7 +4190,7 @@ impl App {
                     format!("/{} ", c.name)
                 },
                 label: c.usage(),
-                desc: c.desc.to_string(),
+                desc: i18n::tr(c.desc).to_string(),
                 runnable: !c.needs_args(),
             })
             .collect()
@@ -4940,6 +5062,42 @@ impl App {
             }
             "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
             "status" => self.request(Pending::DaemonStatus, Request::Status),
+            cmd if cmd == "compare" || cmd.starts_with("compare ") => {
+                let Some(session_id) = self.current.clone() else {
+                    return;
+                };
+                let mut words = cmd["compare".len()..].split_whitespace();
+                let (a, b) = (words.next(), words.next());
+                let (Some(a), Some(b)) = (a, b) else {
+                    self.notes.push(
+                        "usage: /compare MODEL_A MODEL_B [prompt] (no prompt: your last message again)".into(),
+                    );
+                    return;
+                };
+                let prompt = words.collect::<Vec<_>>().join(" ");
+                self.request(
+                    Pending::Compare,
+                    Request::CompareModels {
+                        session_id,
+                        models: vec![a.to_string(), b.to_string()],
+                        prompt: Some(prompt).filter(|p| !p.is_empty()),
+                    },
+                );
+            }
+            "step" => {
+                if let Some(session_id) = self.current.clone() {
+                    self.step_mode = !self.step_mode;
+                    self.fire(Request::SetStepMode {
+                        session_id,
+                        on: self.step_mode,
+                    });
+                    self.notes.push(if self.step_mode {
+                        "step mode on: the agent stops before each Tool call (Enter runs it, e edits, s skips, a runs the rest)".into()
+                    } else {
+                        "step mode off".into()
+                    });
+                }
+            }
             "storage" => self.request(Pending::Storage, Request::StorageUsage),
             "gc" => self.request(Pending::Gc, Request::Gc { dry_run: true }),
             "gc run" => self.request(Pending::Gc, Request::Gc { dry_run: false }),
@@ -7034,7 +7192,31 @@ impl App {
         }
         let page = self.chat_view_height.saturating_sub(1).max(1);
         let empty = self.input.is_empty();
+        // Step mode: a call waits, and the input is free for the choice.
+        if self.step.is_some() && empty && !self.editing_step && !ctrl && !alt {
+            match key.code {
+                KeyCode::Enter => return self.step_decide("continue", None),
+                KeyCode::Char('s') => return self.step_decide("skip", None),
+                KeyCode::Char('a') => {
+                    self.step_mode = false;
+                    return self.step_decide("all", None);
+                }
+                KeyCode::Char('e') => {
+                    let args = self.step.as_ref().map(|s| pretty_json(&s.arguments)).unwrap_or_default();
+                    self.input.set(&args);
+                    self.editing_step = true;
+                    self.notes
+                        .push("Edit the arguments (JSON), then Enter runs the call with them; Esc cancels.".into());
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
+            KeyCode::Esc if self.editing_step => {
+                self.editing_step = false;
+                self.input.clear();
+            }
             KeyCode::Up if ctrl => self.jump_user_message(false),
             KeyCode::Down if ctrl => self.jump_user_message(true),
             KeyCode::Char('{') if empty => self.jump_user_message(false),
@@ -8026,15 +8208,25 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let mut left: Vec<Span> = vec![Span::raw(" ")];
     if let Some((since, _)) = app.offline {
         left.push(Span::styled(
-            format!("⚠ reconnecting to the daemon… ({})", format_elapsed(since.elapsed())),
+            format!(
+                "⚠ {} ({})",
+                i18n::tr("reconnecting to the daemon…"),
+                format_elapsed(since.elapsed())
+            ),
             bold_fg(app.color, Color::Red),
         ));
     } else if let Some(activity) = app.activity_text() {
         left.push(Span::styled(activity, bold_fg(app.color, Color::Yellow)));
     } else if app.running() {
-        left.push(Span::styled("● running", bold_fg(app.color, Color::Yellow)));
+        left.push(Span::styled(
+            format!("● {}", i18n::tr("running")),
+            bold_fg(app.color, Color::Yellow),
+        ));
     } else {
-        left.push(Span::styled("● ready", fg(app.color, Color::Green)));
+        left.push(Span::styled(
+            format!("● {}", i18n::tr("ready")),
+            fg(app.color, Color::Green),
+        ));
     }
     left.push(sep());
     left.push(Span::styled(
@@ -8042,7 +8234,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             .iter()
             .find(|s| Some(&s.id) == app.current.as_ref())
             .map(|s| s.name.clone())
-            .unwrap_or_else(|| "no session".into()),
+            .unwrap_or_else(|| i18n::tr("no session").into()),
         bold_fg(app.color, Color::Cyan),
     ));
     if let Some(dir) = app
@@ -8439,13 +8631,13 @@ fn plan_lines(
     let mut out = vec![Line::raw("")];
     if done == plan.len() && !running {
         out.push(Line::styled(
-            format!("  ✓ Plan done ({done}/{})", plan.len()),
+            format!("  ✓ {} ({done}/{})", i18n::tr("Plan done"), plan.len()),
             ui::dim(color),
         ));
         return out;
     }
     out.push(Line::styled(
-        format!("  Plan ({done}/{})", plan.len()),
+        format!("  {} ({done}/{})", i18n::tr("Plan"), plan.len()),
         bold_fg(color, Color::Cyan),
     ));
     for i in plan {
@@ -8481,8 +8673,9 @@ fn progress_text(fraction: Option<f64>, label: &str) -> String {
 /// The "What I did" block: one line, or the full recap after `/recap`.
 fn recap_lines(r: &formless_protocol::RunRecap, open: bool, color: bool) -> Vec<Line<'static>> {
     let mut head = format!(
-        "  {} What I did · {} steps · {}",
+        "  {} {} · {} steps · {}",
         if open { "▾" } else { "▸" },
+        i18n::tr("What I did"),
         r.steps,
         format_elapsed(Duration::from_millis(r.duration_ms.max(0) as u64))
     );
@@ -8627,6 +8820,86 @@ fn storage_lines(v: &serde_json::Value, gc: bool) -> Vec<String> {
         _ => format!("freed about {total}"),
     });
     out
+}
+
+/// Text wrapped to `width` columns (display width), line by line.
+fn wrap_rows(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let (mut row, mut used) = (String::new(), 0);
+        for c in line.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width {
+                out.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += w;
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// The `/compare` pager: each model's figures, then the answers in
+/// columns side by side (stacked when the screen is narrow).
+fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let head = |r: &formless_protocol::ComparisonResult| {
+        format!(
+            "{} · {} · {:.1}s · {} tokens · {} steps{}",
+            r.model,
+            r.status,
+            r.duration_ms as f64 / 1000.0,
+            i18n::number(r.tokens),
+            r.steps,
+            r.cost.map(|c| format!(" · ${c:.4}")).unwrap_or_default()
+        )
+    };
+    let mut out: Vec<String> = results.iter().map(|r| format!("▍{}", head(r))).collect();
+    out.push(String::new());
+    let n = results.len().max(1);
+    let col = (width.saturating_sub(3 * (n - 1)) / n).max(1);
+    if col < 30 {
+        for r in results {
+            out.push(format!("── {} ──", r.model));
+            out.extend(wrap_rows(&r.answer, width));
+            out.push(String::new());
+        }
+    } else {
+        let cols: Vec<Vec<String>> = results
+            .iter()
+            .map(|r| {
+                let mut c = vec![format!("── {} ──", r.model)];
+                c.extend(wrap_rows(&r.answer, col));
+                c
+            })
+            .collect();
+        let rows = cols.iter().map(Vec::len).max().unwrap_or(0);
+        for i in 0..rows {
+            let cells: Vec<String> = cols
+                .iter()
+                .map(|c| {
+                    let cell = c.get(i).cloned().unwrap_or_default();
+                    let pad = col.saturating_sub(cell.width());
+                    format!("{cell}{}", " ".repeat(pad))
+                })
+                .collect();
+            out.push(cells.join(" │ ").trim_end().to_string());
+        }
+    }
+    out.push(String::new());
+    out.push("Each answer is in its own Session (\"… · compare MODEL\" in /sessions) to continue there.".into());
+    out
+}
+
+/// JSON text pretty-printed, or as it was when it does not parse.
+fn pretty_json(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .and_then(|v| serde_json::to_string_pretty(&v))
+        .unwrap_or_else(|_| text.to_string())
 }
 
 /// Words with simple quoting: `a "b c" d` → [a, b c, d].
@@ -10636,7 +10909,8 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!(
-                "  ⏸ The last Run was {status}{}",
+                "  ⏸ {} {status}{}",
+                i18n::tr("The last Run was"),
                 if reason.is_empty() {
                     String::new()
                 } else {
@@ -10646,7 +10920,10 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             bold_fg(app.color, Color::Yellow),
         ));
         lines.push(Line::styled(
-            "    Enter (empty input) or /resume retries it · /abandon closes it",
+            format!(
+                "    {}",
+                i18n::tr("Enter (empty input) or /resume retries it · /abandon closes it")
+            ),
             ui::dim(app.color),
         ));
     }
@@ -10663,12 +10940,36 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     if !app.plan.is_empty() {
         lines.extend(plan_lines(&app.plan, app.running(), width, app.color));
     }
+    if let Some(step) = &app.step {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!(
+                "  ⏸ {} {} ({} of {})",
+                i18n::tr("Step mode · about to call"),
+                step.tool_name,
+                step.index + 1,
+                step.count
+            ),
+            bold_fg(app.color, Color::Magenta),
+        ));
+        for l in pretty_json(&step.arguments).lines().take(12) {
+            lines.push(Line::styled(format!("    {l}"), ui::dim(app.color)));
+        }
+        lines.push(Line::styled(
+            format!(
+                "    {}",
+                i18n::tr("Enter run it · e edit the arguments · s skip it · a run the rest · Esc stop the Run")
+            ),
+            ui::dim(app.color),
+        ));
+    }
     // Messages waiting for this Run (Ctrl+J), oldest first (SPEC §5.3).
     if !app.queued.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!(
-                "  ⏳ Queued for after this Run ({}) · /queue edit|rm|up|down N",
+                "  ⏳ {} ({}) · /queue edit|rm|up|down N",
+                i18n::tr("Queued for after this Run"),
                 app.queued.len()
             ),
             ui::dim(app.color),
@@ -13338,6 +13639,9 @@ mod tests {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            step_mode: false,
+            step: None,
+            editing_step: false,
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -13531,6 +13835,28 @@ mod tests {
         app.submit_chat(false);
         assert_eq!(app.input.expanded(), "half-typed message", "kept while offline");
         assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
+    }
+
+    #[test]
+    fn compare_answers_sit_side_by_side_or_stack_when_narrow() {
+        use formless_protocol::ComparisonResult;
+        let r = |m: &str, a: &str| ComparisonResult {
+            model: m.into(),
+            session_id: format!("s-{m}"),
+            status: "completed".into(),
+            answer: a.into(),
+            duration_ms: 1500,
+            tokens: 42,
+            cost: Some(0.0012),
+            steps: 1,
+        };
+        let results = vec![r("alpha", "short"), r("beta", "a longer answer here")];
+        let wide = compare_lines(&results, 100);
+        assert!(wide[0].contains("alpha · completed · 1.5s · 42 tokens · 1 steps · $0.0012"));
+        assert!(wide.iter().any(|l| l.contains("short") && l.contains("│ a longer answer here")), "{wide:?}");
+        let narrow = compare_lines(&results, 40);
+        assert!(narrow.iter().any(|l| l == "── beta ──"));
+        assert!(!narrow.iter().any(|l| l.contains('│')));
     }
 
     #[test]

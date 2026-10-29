@@ -206,6 +206,11 @@ pub struct Daemon {
     step_limits: StdMutex<HashMap<String, u32>>,
     /// A model for a Session's next Run only (`RetryRun {model}`).
     next_run_model: StdMutex<HashMap<String, String>>,
+    /// Comparisons in flight: id → (origin Session, [(fork, model)]).
+    comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
+    /// Sessions in step mode (`/step`), and the step decisions awaited.
+    step_sessions: StdMutex<std::collections::HashSet<String>>,
+    step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
     /// When each running Invocation last sent ToolProgress (throttle).
     progress_sent: StdMutex<HashMap<String, (std::time::Instant, String)>>,
     /// Registry changes made by each running Run, by run id.
@@ -333,6 +338,9 @@ impl Daemon {
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
+            comparisons: StdMutex::new(Default::default()),
+            step_sessions: StdMutex::new(Default::default()),
+            step_waiters: StdMutex::new(Default::default()),
             run_tool_changes: StdMutex::new(Default::default()),
             session_grants: StdMutex::new(Default::default()),
             timed_grants: StdMutex::new(Default::default()),
@@ -752,7 +760,7 @@ impl Daemon {
                 let (queued, plan) = queued;
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "unfinished_run": last_run}),
+                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.lock().unwrap().contains(&id), "unfinished_run": last_run}),
                 )
             }
             Request::ForkSession {
@@ -2636,6 +2644,45 @@ impl Daemon {
                 self.import_session_bundle(&bundle)?,
             )?),
             Request::ExportAll { sessions } => self.export_all(sessions),
+            Request::CompareModels {
+                session_id,
+                models,
+                prompt,
+            } => self.compare_models(&session_id, models, prompt),
+            Request::SetStepMode { session_id, on } => {
+                let mut set = self.step_sessions.lock().unwrap();
+                if on {
+                    set.insert(session_id.clone());
+                } else {
+                    set.remove(&session_id);
+                }
+                Ok(json!({"session_id": session_id, "on": on}))
+            }
+            Request::StepDecision {
+                step_id,
+                action,
+                arguments,
+            } => {
+                if !matches!(action.as_str(), "continue" | "skip" | "edit" | "all") {
+                    return Err(anyhow!("action must be continue, skip, edit or all"));
+                }
+                if action == "edit" {
+                    let a = arguments.as_deref().unwrap_or_default();
+                    let v: Value = serde_json::from_str(a)
+                        .context("edited arguments must be a JSON object")?;
+                    if !v.is_object() {
+                        return Err(anyhow!("edited arguments must be a JSON object"));
+                    }
+                }
+                let tx = self
+                    .step_waiters
+                    .lock()
+                    .unwrap()
+                    .remove(&step_id)
+                    .context("that step is no longer waiting")?;
+                let _ = tx.send((action.clone(), arguments));
+                Ok(json!({"step_id": step_id, "action": action}))
+            }
             Request::ImportAll { bundle } => self.import_all(&bundle).await,
             Request::RunOptimiser { tool_id } => {
                 let this = self.clone();
@@ -3158,6 +3205,7 @@ impl Daemon {
             status: final_status.to_string(),
         });
         self.maybe_name_session(&session_id);
+        self.comparison_run_ended(&session_id);
         self.job_run_ended(&session_id, &run_id, final_status);
         self.maybe_auto_skill(&session_id, &run_id, final_status);
         self.record_primary_task(&session_id, &run_id, final_status);
@@ -3721,6 +3769,11 @@ impl Daemon {
                 }
                 return Ok(());
             }
+            // Step mode (SPEC §5.9): the user sees each call first.
+            let mut result = result;
+            let skipped = self
+                .step_gate(session_id, run_id, &mut result.tool_calls, cancel)
+                .await?;
             // Persist the assistant tool-call turn, execute calls, persist results.
             let calls_json: Vec<Value> = result
                 .tool_calls
@@ -3782,10 +3835,16 @@ impl Daemon {
                 let flag = cancel_flag.clone();
                 let tok = cancel.clone();
                 let denied = denied.clone();
+                let skip = skipped.contains(&tc.id);
                 futs.push(async move {
-                    let text = this
-                        .dispatch_call(&sid, &rid, &tc, &cfg2, &flag, &tok, &denied)
-                        .await;
+                    let text = if skip {
+                        "skipped: the user chose not to run this call (step mode). \
+                         Continue without its result, or ask them."
+                            .to_string()
+                    } else {
+                        this.dispatch_call(&sid, &rid, &tc, &cfg2, &flag, &tok, &denied)
+                            .await
+                    };
                     (tc, text)
                 });
             }
@@ -3812,6 +3871,197 @@ impl Daemon {
                 });
             }
         }
+    }
+
+    /// `CompareModels` (SPEC §5.10): one fork per model, each asked the
+    /// same thing on its own model.
+    fn compare_models(
+        self: &Arc<Self>,
+        session_id: &str,
+        models: Vec<String>,
+        prompt: Option<String>,
+    ) -> Result<Value> {
+        let models: Vec<String> = models
+            .into_iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if models.len() < 2 || models.len() > 4 {
+            return Err(anyhow!("compare 2 to 4 models: /compare MODEL_A MODEL_B [prompt]"));
+        }
+        let session = self
+            .with_reader(|st| st.get_session(session_id))?
+            .context("session not found")?;
+        // Re-ask the last message (forked before it), or ask `prompt`.
+        let (up_to, text) = match prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+            Some(p) => (None, p),
+            None => {
+                let msgs = self.with_reader(|st| st.list_messages(session_id))?;
+                let last = msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .context("nothing to compare: give a prompt, or send a message first")?;
+                (Some(last.seq - 1), last.content.clone())
+            }
+        };
+        let comparison_id = uuid::Uuid::new_v4().to_string();
+        let mut forks = Vec::new();
+        for model in &models {
+            let fork = self
+                .with_store(|st| {
+                    st.fork_session(session_id, Some(format!("{} · compare {model}", session.name)), up_to)
+                })?
+                .context("session not found")?;
+            if let Some(info) =
+                self.with_store(|st| st.set_session_model(&fork.id, Some(model.clone()), None))?
+            {
+                self.broadcast(Event::SessionUpdated { session: info });
+            }
+            let msg = self.with_store(|st| st.append_message(&fork.id, "user", &text))?;
+            self.broadcast(Event::MessageAppended {
+                session_id: fork.id.clone(),
+                message: msg,
+            });
+            forks.push((fork.id.clone(), model.clone()));
+        }
+        self.comparisons.lock().unwrap().insert(
+            comparison_id.clone(),
+            (session_id.to_string(), forks.clone()),
+        );
+        for (fork, _) in &forks {
+            if let Err(e) = self.start_run(fork.clone()) {
+                tracing::warn!("compare: could not start a Run in {fork}: {e:#}");
+            }
+        }
+        Ok(json!({
+            "comparison_id": comparison_id,
+            "forks": forks.iter().map(|(s, m)| json!({"session_id": s, "model": m})).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// A compared fork finished: once every fork has, report the answers
+    /// to the Session the comparison came from.
+    fn comparison_run_ended(&self, session_id: &str) {
+        let done = {
+            let mut all = self.comparisons.lock().unwrap();
+            let Some(id) = all
+                .iter()
+                .find(|(_, (_, forks))| forks.iter().any(|(f, _)| f == session_id))
+                .map(|(id, _)| id.clone())
+            else {
+                return;
+            };
+            let busy = {
+                let runs = self.runs.lock().unwrap();
+                all[&id].1.iter().any(|(f, _)| f != session_id && runs.contains_key(f))
+            };
+            if busy {
+                return;
+            }
+            all.remove(&id).map(|c| (id, c))
+        };
+        let Some((comparison_id, (origin, forks))) = done else {
+            return;
+        };
+        let cfg = self.config().unwrap_or_default();
+        let results = forks
+            .into_iter()
+            .map(|(fork, model)| {
+                let answer = self
+                    .with_reader(|st| st.list_messages(&fork))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                    .find(|m| m.role == "assistant" && !m.content.is_empty())
+                    .map(|m| m.content)
+                    .unwrap_or_default();
+                let run = self
+                    .with_reader(|st| st.run_metrics_for(Some(&fork), 1, None))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next();
+                let cost = self
+                    .usage_info(Some(&fork), run.as_ref().map(|r| r.run_id.as_str()), &cfg)
+                    .ok()
+                    .and_then(|u| u.cost);
+                ComparisonResult {
+                    model,
+                    session_id: fork,
+                    status: run.as_ref().map_or("completed".into(), |r| r.status.clone()),
+                    answer,
+                    duration_ms: run.as_ref().map_or(0, |r| r.duration_ms),
+                    tokens: run.as_ref().map_or(0, |r| r.prompt_tokens + r.completion_tokens),
+                    cost,
+                    steps: run.as_ref().map_or(0, |r| r.steps),
+                }
+            })
+            .collect();
+        self.broadcast(Event::ComparisonReady {
+            session_id: origin,
+            comparison_id,
+            results,
+        });
+    }
+
+    /// Step mode (SPEC §5.9): before a step's calls run, ask about each
+    /// one. Edited arguments replace the call's; returns the ids of the
+    /// calls to skip. Without a connected client it does not wait.
+    async fn step_gate(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        calls: &mut [ToolCall],
+        cancel: &CancellationToken,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut skipped = std::collections::HashSet::new();
+        let count = calls.len();
+        for (index, tc) in calls.iter_mut().enumerate() {
+            if !self.step_sessions.lock().unwrap().contains(session_id)
+                || self.subscriber_count() == 0
+            {
+                break;
+            }
+            let step_id = uuid::Uuid::new_v4().to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.step_waiters.lock().unwrap().insert(step_id.clone(), tx);
+            self.broadcast(Event::StepPending {
+                session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                step_id: step_id.clone(),
+                tool_name: tc.name.clone(),
+                arguments: tc.arguments.clone(),
+                index,
+                count,
+            });
+            let decision = tokio::select! {
+                _ = cancel.cancelled() => None,
+                d = rx => d.ok(),
+            };
+            self.step_waiters.lock().unwrap().remove(&step_id);
+            self.broadcast(Event::StepResolved {
+                session_id: session_id.to_string(),
+                step_id,
+            });
+            let Some((action, arguments)) = decision else {
+                return Err(anyhow!("interrupted"));
+            };
+            match action.as_str() {
+                "skip" => {
+                    skipped.insert(tc.id.clone());
+                }
+                "edit" => {
+                    if let Some(a) = arguments {
+                        tc.arguments = a;
+                    }
+                }
+                "all" => {
+                    self.step_sessions.lock().unwrap().remove(session_id);
+                }
+                _ => {}
+            }
+        }
+        Ok(skipped)
     }
 
     /// Approval pre-pass (SPEC §5.2/§10.3): one prompt per unapproved

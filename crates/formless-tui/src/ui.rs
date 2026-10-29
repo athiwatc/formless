@@ -82,12 +82,13 @@ pub(crate) fn message_stamp(ts: &str, now: DateTime<Utc>) -> Option<String> {
     let t = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
     let secs = (now - t).num_seconds().max(0);
     let local = t.with_timezone(&Local);
+    use crate::i18n::{stamp, Stamp};
     Some(match secs {
-        0..=59 => "now".into(),
-        60..=3599 => format!("{}m", secs / 60),
-        3600..=43_199 => format!("{}h", secs / 3600),
-        43_200..=518_399 => local.format("%a %H:%M").to_string(),
-        _ => local.format("%-d %b %H:%M").to_string(),
+        0..=59 => stamp(Stamp::Now, local),
+        60..=3599 => stamp(Stamp::Minutes(secs / 60), local),
+        3600..=43_199 => stamp(Stamp::Hours(secs / 3600), local),
+        43_200..=518_399 => stamp(Stamp::Weekday, local),
+        _ => stamp(Stamp::Date, local),
     })
 }
 

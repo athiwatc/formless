@@ -140,6 +140,32 @@ impl Client {
             }
         }
     }
+    /// Like `rpc`, but an error response is returned, not a panic.
+    async fn rpc_result(&mut self, req: formless_protocol::Request) -> Result<Value, String> {
+        use tokio::io::AsyncWriteExt;
+        self.next += 1;
+        let id = self.next;
+        let env = formless_protocol::RequestEnvelope {
+            id,
+            protocol: formless_protocol::PROTOCOL_VERSION,
+            request: req,
+        };
+        self.write
+            .write_all(serde_json::to_string(&env).unwrap().as_bytes())
+            .await
+            .unwrap();
+        self.write.write_all(b"\n").await.unwrap();
+        loop {
+            let line = self.lines.next_line().await.unwrap().expect("daemon closed");
+            if let Ok(formless_protocol::ServerMessage::Response { id: rid, ok, result, error }) =
+                serde_json::from_str::<formless_protocol::ServerMessage>(&line)
+            {
+                if rid == id {
+                    return if ok { Ok(result.unwrap_or(Value::Null)) } else { Err(error.unwrap_or_default()) };
+                }
+            }
+        }
+    }
     async fn send(&mut self, req: formless_protocol::Request) {
         use tokio::io::AsyncWriteExt;
         self.next += 1;
@@ -2749,5 +2775,187 @@ async fn update_plan_is_stored_and_broadcast() {
     assert_eq!(updates[0][1].status, "in_progress");
     let plan = c.rpc(Request::GetSession { id: id.clone() }).await["plan"].clone();
     assert_eq!(plan.as_array().unwrap().len(), 3, "{plan}");
+    server.abort();
+}
+
+/// Step mode (SPEC §5.9): each call waits; an edit changes its
+/// arguments, a skip tells the model it did not run.
+#[cfg(unix)]
+#[tokio::test]
+async fn step_mode_pauses_edits_and_skips_calls() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4step");
+    seed_sleeper(&paths);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        match n {
+                            0 => sse_tool("s1", "echo_fast", json!({"x": 1})),
+                            1 => sse_tool("s2", "echo_fast", json!({"x": 2})),
+                            _ => sse_text("done"),
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.rpc(Request::SetStepMode {
+        session_id: id.clone(),
+        on: true,
+    })
+    .await;
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut steps = 0;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(&line) {
+            Ok(ServerMessage::Event(Event::StepPending { step_id, tool_name, .. })) => {
+                assert_eq!(tool_name, "echo_fast");
+                steps += 1;
+                let (action, arguments) = if steps == 1 {
+                    ("edit", Some(r#"{"x": 5}"#.to_string()))
+                } else {
+                    ("skip", None)
+                };
+                c.send(Request::StepDecision {
+                    step_id,
+                    action: action.into(),
+                    arguments,
+                })
+                .await;
+            }
+            Ok(ServerMessage::Event(Event::RunFinished { status, .. })) => {
+                assert_eq!(status, "completed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(steps, 2);
+    let msgs = c.rpc(Request::GetSession { id: id.clone() }).await["messages"].clone();
+    let tool: Vec<&str> = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert!(tool[0].contains('5'), "edited arguments ran: {tool:?}");
+    assert!(tool[1].contains("skipped"), "{tool:?}");
+    // The stored call carries the edited arguments too.
+    let call = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["meta"].as_str().is_some_and(|x| x.contains("s1")))
+        .unwrap()
+        .clone();
+    assert!(call["meta"].as_str().unwrap().contains(r#"{\"x\": 5}"#), "{call}");
+    server.abort();
+}
+
+/// `/compare A B` (SPEC §5.10): the same prompt on each model in its own
+/// fork; the answers come back together to the original Session.
+#[cfg(unix)]
+#[tokio::test]
+async fn compare_runs_each_model_in_a_fork_and_reports_both() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4cmp");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "alpha"}, {"id": "beta"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                let m = body["model"].as_str().unwrap_or_default().to_string();
+                sse_text(&format!("answer from {m}"))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: Some("Q".into()) }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bad = c
+        .rpc_result(Request::CompareModels {
+            session_id: id.clone(),
+            models: vec!["alpha".into()],
+            prompt: Some("hi".into()),
+        })
+        .await;
+    assert!(bad.is_err(), "needs two models");
+    c.send(Request::CompareModels {
+        session_id: id.clone(),
+        models: vec!["alpha".into(), "beta".into()],
+        prompt: Some("which is best?".into()),
+    })
+    .await;
+    let results = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::ComparisonReady { session_id, results, .. })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            assert_eq!(session_id, id);
+            break results;
+        }
+    };
+    assert_eq!(results.len(), 2);
+    let get = |m: &str| results.iter().find(|r| r.model == m).unwrap().clone();
+    assert_eq!(get("alpha").answer, "answer from alpha");
+    assert_eq!(get("beta").answer, "answer from beta");
+    assert_ne!(get("alpha").session_id, id, "each in its own fork");
+    // The original Session is untouched.
+    let msgs = c.rpc(Request::GetSession { id: id.clone() }).await["messages"].clone();
+    assert_eq!(msgs.as_array().unwrap().len(), 0, "{msgs}");
     server.abort();
 }
