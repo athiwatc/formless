@@ -36,7 +36,9 @@ name = "formless"
 maintainer = "Athiwat Chunlakhan <731394+athiwatc@users.noreply.github.com>"
 section = "utils"
 priority = "optional"
-depends = "ca-certificates"
+# $auto: the shared libraries the binary links (libc, libdbus) from shlibdeps.
+depends = "$auto, ca-certificates"
+license-file = ["../../LICENSE", "0"]
 extended-description = "Formless is an AI agent harness that builds the Tools it needs, keeps them, and improves them over time. One binary: TUI, daemon, CLI and web UI."
 assets = [
     ["target/release/formless", "usr/bin/", "755"],
@@ -46,7 +48,10 @@ assets = [
 
 [package.metadata.generate-rpm]
 name = "formless"
+# Requires: from the libraries the binary links.
+auto-req = "builtin"
 assets = [
+    { source = "../../LICENSE", dest = "/usr/share/licenses/formless/LICENSE", mode = "644", doc = true },
     { source = "target/release/formless", dest = "/usr/bin/formless", mode = "755" },
     { source = "../../target/formless.1", dest = "/usr/share/man/man1/formless.1", mode = "644", doc = true },
     { source = "../../README.md", dest = "/usr/share/doc/formless/README.md", mode = "644", doc = true },

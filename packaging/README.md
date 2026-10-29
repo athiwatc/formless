@@ -10,24 +10,33 @@ platform app-dirs (SPEC §9.4).
 2. Run `cargo test --workspace --locked`.
 3. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. `.github/workflows/release.yml` then:
-   - builds macOS (arm64/x86_64), Linux (x86_64) and Windows (x86_64)
-     archives with SHA-256 files;
-   - builds `.deb` and `.rpm` packages (`cargo-deb`, `cargo-generate-rpm`,
-     metadata in `crates/formless/Cargo.toml`);
-   - pushes the Docker image `ghcr.io/athiwatc/formless:<tag>` and
-     `:latest` (`Dockerfile`, [docs/docker.md](../docs/docker.md));
-   - renders the Homebrew formula, winget manifests and AUR `PKGBUILD`
-     for the version (`scripts/render-packaging.sh`) and attaches the
-     formula and PKGBUILD to the GitHub Release;
+   - builds macOS (arm64/x86_64) and Windows (x86_64) archives with
+     SHA-256 files;
+   - builds the Linux archive, `.deb` and `.rpm` (`cargo-deb`,
+     `cargo-generate-rpm`, metadata in `crates/formless/Cargo.toml`) on
+     Debian bullseye, so they need **glibc 2.31 or newer** (Debian 11+,
+     Ubuntu 20.04+, RHEL/Rocky 9+); the packages record the shared
+     libraries the binary links (libc, libdbus) and ship the license;
+   - installs the packages in clean Debian, Ubuntu and Rocky containers
+     and runs `formless --version`;
+   - builds the Docker image, runs it and checks the daemon answers, then
+     pushes `ghcr.io/athiwatc/formless:<tag>` and `:latest` (`Dockerfile`,
+     [docs/docker.md](../docs/docker.md)); nothing is published if that
+     fails;
+   - renders the Homebrew formula and AUR `PKGBUILD` for the version
+     (`scripts/render-packaging.sh`, which fails on a missing checksum or
+     an unfilled placeholder) and attaches them to the GitHub Release;
    - publishes to the tap, winget and the AUR **only when their secrets
-     exist** (below).
+     exist** (below), each on its own: one failing doesn't stop the
+     others, the job summary lists each channel's result, and a re-run
+     is safe.
 
 ## Publishing to package managers (maintainer setup, once)
 
 | Where | Set up | Secret |
 |---|---|---|
 | Homebrew tap | Create the public repo `athiwatc/homebrew-tap` (with a `Formula/` folder). Users then run `brew install athiwatc/tap/formless`. | `HOMEBREW_TAP_TOKEN`: a fine-grained token with contents write on that repo |
-| winget | Submit the first version by hand (`wingetcreate new` with the rendered manifests, or a PR to `microsoft/winget-pkgs`); later versions are automatic. Users run `winget install athiwatc.formless`. | `WINGET_TOKEN`: a classic token with `public_repo`, for the fork the action opens PRs from |
+| winget | Submit the first version by hand (`wingetcreate new`, starting from the templates in `packaging/winget/`, or a PR to `microsoft/winget-pkgs`); later versions are automatic (winget-releaser builds them from the last published one). Users run `winget install athiwatc.formless`. | `WINGET_TOKEN`: a classic token with `public_repo`, for the fork the action opens PRs from |
 | AUR | Create the `formless-bin` package on aur.archlinux.org with your SSH key. Users run `yay -S formless-bin`. | `AUR_SSH_KEY`: that SSH private key |
 | Docker | Nothing: the workflow's own token pushes to GHCR. Make the package public once in the repository's Packages settings. | — |
 
