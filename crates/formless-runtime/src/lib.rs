@@ -515,9 +515,16 @@ fn non_public(ip: std::net::IpAddr) -> bool {
 /// private one is refused unless a grant names this host exactly. The
 /// address returned is the one the request is then pinned to, so DNS
 /// can't change between the check and the connection.
-fn checked_address(url: &reqwest::Url, scope: &[String]) -> Result<Option<std::net::SocketAddr>, String> {
+fn checked_address(
+    url: &reqwest::Url,
+    scope: &[String],
+) -> Result<Option<std::net::SocketAddr>, String> {
     use std::net::ToSocketAddrs;
-    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']).to_lowercase();
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .to_lowercase();
     let port = url.port_or_known_default().unwrap_or(443);
     let literal = host.parse::<std::net::IpAddr>().ok();
     let addrs: Vec<std::net::SocketAddr> = match literal {
@@ -537,7 +544,11 @@ fn checked_address(url: &reqwest::Url, scope: &[String]) -> Result<Option<std::n
         }
     }
     // An IP literal needs no pinning; a name is pinned to what was checked.
-    Ok(if literal.is_some() { None } else { addrs.first().copied() })
+    Ok(if literal.is_some() {
+        None
+    } else {
+        addrs.first().copied()
+    })
 }
 
 /// Is `cmd` covered by a `process:<name>` grant? A bare grant matches the
@@ -622,7 +633,8 @@ fn send_request(mut req: FetchRequest) -> Result<reqwest::blocking::Response, St
             )));
         }
         let host = next.host_str().unwrap_or_default().to_lowercase();
-        if !req.scope.is_empty() && !host_in_scope(&req.scope, &host, next.port_or_known_default()) {
+        if !req.scope.is_empty() && !host_in_scope(&req.scope, &host, next.port_or_known_default())
+        {
             return Err(denied(format!("redirect to {host} not in net scope")));
         }
         if status == 303 || (matches!(status, 301 | 302) && req.method == reqwest::Method::POST) {
@@ -689,9 +701,7 @@ const PROCESS_BASE_ENV: &[&str] = &[
 pub fn process_grant(grant: &str) -> (&str, Option<Vec<&str>>) {
     match grant.rsplit_once(':') {
         // `C:\…` is a Windows path, not a command with sub-commands.
-        Some((cmd, subs))
-            if cmd.len() > 1 && !subs.is_empty() && !subs.contains(['/', '\\']) =>
-        {
+        Some((cmd, subs)) if cmd.len() > 1 && !subs.is_empty() && !subs.contains(['/', '\\']) => {
             (cmd, Some(subs.split('|').collect()))
         }
         _ => (grant, None),
@@ -819,8 +829,10 @@ impl State {
             }
             "progress" => {
                 if self.mode == HostMode::Live {
-                    self.ops
-                        .progress(a["fraction"].as_f64(), a["label"].as_str().unwrap_or_default());
+                    self.ops.progress(
+                        a["fraction"].as_f64(),
+                        a["label"].as_str().unwrap_or_default(),
+                    );
                 }
                 Ok(Value::Null)
             }
@@ -1058,7 +1070,12 @@ impl State {
                 let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
                 if let Ok(m) = std::fs::metadata(&p) {
                     if m.len() > cap {
-                        return Err(over_limit("fs.read", m.len(), "tools.max_read_bytes", "read it with fs.readChunks or fs.readLines"));
+                        return Err(over_limit(
+                            "fs.read",
+                            m.len(),
+                            "tools.max_read_bytes",
+                            "read it with fs.readChunks or fs.readLines",
+                        ));
                     }
                 }
                 std::fs::read(&p)
@@ -1523,12 +1540,25 @@ impl State {
             // The body is read up to the cap and no further (#604).
             let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
             if let Some(len) = resp.content_length().filter(|l| *l > cap) {
-                return Err(over_limit("fetch", len, "tools.max_read_bytes", "stream it with fetchChunks"));
+                return Err(over_limit(
+                    "fetch",
+                    len,
+                    "tools.max_read_bytes",
+                    "stream it with fetchChunks",
+                ));
             }
             let mut bytes = Vec::new();
-            (&mut resp).take(cap + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            (&mut resp)
+                .take(cap + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
             if bytes.len() as u64 > cap {
-                return Err(over_limit("fetch", bytes.len() as u64, "tools.max_read_bytes", "stream it with fetchChunks"));
+                return Err(over_limit(
+                    "fetch",
+                    bytes.len() as u64,
+                    "tools.max_read_bytes",
+                    "stream it with fetchChunks",
+                ));
             }
             Ok((meta, bytes))
         })?;
@@ -1613,7 +1643,10 @@ impl State {
             .process
             .as_ref()
             .ok_or_else(|| denied("process not declared"))?;
-        let first_arg = a["args"].as_array().and_then(|v| v.first()).and_then(|x| x.as_str());
+        let first_arg = a["args"]
+            .as_array()
+            .and_then(|v| v.first())
+            .and_then(|x| x.as_str());
         if !allowed.is_empty() && !process_allowed(allowed, cmd, first_arg) {
             return Err(denied(format!(
                 "process:{cmd}{} not in scope",
@@ -1960,7 +1993,8 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
     let low = msg.to_lowercase();
     let kind = if msg.starts_with("denied:") {
         ExecErrorKind::Denied
-    } else if low.contains("resource limit") || low.contains("out of memory")
+    } else if low.contains("resource limit")
+        || low.contains("out of memory")
         || low.contains("allocation")
         || low.contains("memory") && low.contains("limit")
     {
@@ -2228,14 +2262,29 @@ mod tests {
         execute(&req, ops.clone()).unwrap();
         assert_eq!(
             *ops.0.lock().unwrap(),
-            [(Some(0.5), "half".into()), (Some(1.0), String::new()), (None, String::new())]
+            [
+                (Some(0.5), "half".into()),
+                (Some(1.0), String::new()),
+                (None, String::new())
+            ]
         );
     }
 
     #[test]
     fn private_addresses_need_an_exact_grant() {
         use std::net::IpAddr;
-        for ip in ["127.0.0.1", "10.1.2.3", "192.168.0.9", "169.254.169.254", "100.64.0.1", "::1", "fe80::1", "fd00::5", "::ffff:10.0.0.1", "0.0.0.0"] {
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.9",
+            "169.254.169.254",
+            "100.64.0.1",
+            "::1",
+            "fe80::1",
+            "fd00::5",
+            "::ffff:10.0.0.1",
+            "0.0.0.0",
+        ] {
             assert!(non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
         }
         for ip in ["1.1.1.1", "8.8.8.8", "2606:4700::1111"] {
@@ -2243,7 +2292,10 @@ mod tests {
         }
         let url = |u: &str| reqwest::Url::parse(u).unwrap();
         let err = checked_address(&url("http://169.254.169.254/latest"), &[]).unwrap_err();
-        assert!(err.starts_with("denied:") && err.contains("169.254.169.254"), "{err}");
+        assert!(
+            err.starts_with("denied:") && err.contains("169.254.169.254"),
+            "{err}"
+        );
         assert!(checked_address(&url("http://127.0.0.1:11434/v1"), &["127.0.0.1".into()]).is_ok());
         // A parent-domain grant doesn't reach a private address.
         assert!(checked_address(&url("http://localhost/"), &["host".into()]).is_err());
@@ -2252,16 +2304,31 @@ mod tests {
 
     #[test]
     fn ports_in_grants_are_kept_and_enforced() {
-        let g = vec!["api.example.com:8443".to_string(), "example.org".to_string()];
+        let g = vec![
+            "api.example.com:8443".to_string(),
+            "example.org".to_string(),
+        ];
         assert!(host_in_scope(&g, "api.example.com", Some(8443)));
-        assert!(!host_in_scope(&g, "api.example.com", Some(443)), "not every port");
-        assert!(host_in_scope(&g, "www.example.org", Some(8080)), "portless grants keep any port");
+        assert!(
+            !host_in_scope(&g, "api.example.com", Some(443)),
+            "not every port"
+        );
+        assert!(
+            host_in_scope(&g, "www.example.org", Some(8080)),
+            "portless grants keep any port"
+        );
     }
 
     #[test]
     fn process_grants_scope_sub_commands_and_cwd() {
-        assert_eq!(process_grant("git:status|log"), ("git", Some(vec!["status", "log"])));
-        assert_eq!(process_grant("C:\\tools\\x.exe"), ("C:\\tools\\x.exe", None));
+        assert_eq!(
+            process_grant("git:status|log"),
+            ("git", Some(vec!["status", "log"]))
+        );
+        assert_eq!(
+            process_grant("C:\\tools\\x.exe"),
+            ("C:\\tools\\x.exe", None)
+        );
         let allowed = vec!["git:status|log".to_string()];
         assert!(process_allowed(&allowed, "git", Some("log")));
         assert!(!process_allowed(&allowed, "git", Some("push")));
@@ -2270,7 +2337,11 @@ mod tests {
         let mut req = live("function run() { return process.run('ls', [], {cwd: '/'}); }");
         req.caps = Capabilities::parse(&["process:ls".to_string()]).unwrap();
         let e = execute(&req, Arc::new(NoHostOps)).unwrap_err();
-        assert!(e.message.contains("outside this Tool's fs grants"), "{}", e.message);
+        assert!(
+            e.message.contains("outside this Tool's fs grants"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

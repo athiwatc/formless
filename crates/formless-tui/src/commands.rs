@@ -585,7 +585,11 @@ pub fn help_lines() -> Vec<String> {
             out.push(crate::i18n::tr(c.group.title()).to_string());
             group = Some(c.group);
         }
-        out.push(format!("  {:<width$}  {}", c.usage(), crate::i18n::tr(c.desc)));
+        out.push(format!(
+            "  {:<width$}  {}",
+            c.usage(),
+            crate::i18n::tr(c.desc)
+        ));
     }
     out.push(String::new());
     out.push("Guides: /docs [topic] (gallery, capabilities, keys, troubleshooting…)".into());
@@ -654,7 +658,10 @@ pub fn reference_markdown() -> String {
     let mut group = None;
     for c in sorted {
         if group != Some(c.group) {
-            out.push_str(&format!("\n### {}\n\n| Command | What it does |\n|---|---|\n", c.group.title()));
+            out.push_str(&format!(
+                "\n### {}\n\n| Command | What it does |\n|---|---|\n",
+                c.group.title()
+            ));
             group = Some(c.group);
         }
         out.push_str(&format!("| `{}` | {} |\n", cell(&c.usage()), cell(c.desc)));

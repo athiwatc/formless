@@ -85,7 +85,9 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
         json!({"kind": "backups", "bytes": backups, "detail": "rotated and pre-migration database copies"}),
     ];
     let total = path_bytes(&paths.data_dir);
-    Ok(json!({"data_dir": paths.data_dir.display().to_string(), "total_bytes": total, "kinds": rows}))
+    Ok(
+        json!({"data_dir": paths.data_dir.display().to_string(), "total_bytes": total, "kinds": rows}),
+    )
 }
 
 /// What `gc` would free (dry run) or freed: one row per kind.
@@ -100,7 +102,11 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
     };
     // Files the database lost track of (#609).
     if !dry_run {
-        let _ = crate::artifacts::reconcile(store, &paths.data_dir.join("artifacts"), std::time::Duration::from_secs(3600));
+        let _ = crate::artifacts::reconcile(
+            store,
+            &paths.data_dir.join("artifacts"),
+            std::time::Duration::from_secs(3600),
+        );
     }
     rows.push(json!({"kind": "artifacts", "items": n, "bytes": bytes,
         "detail": format!("older than {} days or over {} MB (artifacts.*)", cfg.artifacts.max_age_days, cfg.artifacts.max_total_mb)}));
@@ -114,7 +120,11 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
         "detail": format!("older than {SNAPSHOT_DAYS} days (no /rewind past them)")}));
     // MCP logs cut to their last part.
     let (mut n, mut bytes) = (0, 0u64);
-    for e in std::fs::read_dir(paths.data_dir.join("mcp")).into_iter().flatten().flatten() {
+    for e in std::fs::read_dir(paths.data_dir.join("mcp"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let p = e.path();
         let len = path_bytes(&p);
         if p.extension().is_some_and(|x| x == "log") && len > MCP_LOG_KEEP {
@@ -138,15 +148,19 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
             let _ = std::fs::remove_file(p);
         }
     }
-    rows.push(json!({"kind": "migration backups", "items": old.len(), "bytes": bytes,
-        "detail": format!("all but the newest {MIGRATION_BACKUPS_KEEP}")}));
+    rows.push(
+        json!({"kind": "migration backups", "items": old.len(), "bytes": bytes,
+        "detail": format!("all but the newest {MIGRATION_BACKUPS_KEEP}")}),
+    );
     // Free pages left behind in the database.
     let free = store.free_bytes()?;
     if !dry_run && free > 0 {
         store.vacuum()?;
     }
-    rows.push(json!({"kind": "database free space", "items": 0, "bytes": free,
-        "detail": "reclaimed with VACUUM"}));
+    rows.push(
+        json!({"kind": "database free space", "items": 0, "bytes": free,
+        "detail": "reclaimed with VACUUM"}),
+    );
     let total: u64 = rows.iter().map(|r| r["bytes"].as_u64().unwrap_or(0)).sum();
     Ok(json!({"dry_run": dry_run, "total_bytes": total, "kinds": rows}))
 }
@@ -207,16 +221,17 @@ pub fn last_backup(paths: &Paths) -> Option<(PathBuf, std::time::SystemTime)> {
 /// is checked first (a Formless database this build can open), and the
 /// current database is backed up next to it. Returns that backup.
 pub fn restore(paths: &Paths, file: &Path) -> Result<PathBuf> {
-    let probe = rusqlite::Connection::open_with_flags(
-        file,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("cannot open {}", file.display()))?;
+    let probe =
+        rusqlite::Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("cannot open {}", file.display()))?;
     let ok: String = probe
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .context("not a SQLite database")?;
     if ok != "ok" {
-        return Err(anyhow!("{} failed its integrity check: {ok}", file.display()));
+        return Err(anyhow!(
+            "{} failed its integrity check: {ok}",
+            file.display()
+        ));
     }
     let version: i64 = probe.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let has_sessions: bool = probe
@@ -323,7 +338,12 @@ mod tests {
         let saved = restore(&paths, all.last().unwrap()).unwrap();
         assert!(saved.exists());
         let store = Store::open(&paths.db_file()).unwrap();
-        let names: Vec<String> = store.list_sessions().unwrap().into_iter().map(|s| s.name).collect();
+        let names: Vec<String> = store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(names, ["kept"]);
         assert!(store.get_session(&s).unwrap().is_some());
         // Not a database: refused.
@@ -344,9 +364,19 @@ mod tests {
         assert!(u["kinds"].as_array().unwrap().len() >= 8);
         let cfg = Config::default();
         let dry = gc(&paths, &store, &cfg, true).unwrap();
-        let mcp = dry["kinds"].as_array().unwrap().iter().find(|r| r["kind"] == "MCP logs").unwrap().clone();
+        let mcp = dry["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "MCP logs")
+            .unwrap()
+            .clone();
         assert_eq!(mcp["items"], 1);
-        assert_eq!(path_bytes(&paths.data_dir.join("mcp/x.log")), 1_500_000, "dry run changes nothing");
+        assert_eq!(
+            path_bytes(&paths.data_dir.join("mcp/x.log")),
+            1_500_000,
+            "dry run changes nothing"
+        );
         gc(&paths, &store, &cfg, false).unwrap();
         assert!(path_bytes(&paths.data_dir.join("mcp/x.log")) <= MCP_LOG_KEEP);
         assert_eq!(human_bytes(1_500_000), "1.5 MB");

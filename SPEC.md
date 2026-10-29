@@ -272,8 +272,12 @@ without redesign.
   `http://127.0.0.1:<port>/callback`, uses a fresh `state` and S256 PKCE
   verifier/challenge, exchanges the code at the configured token
   endpoint, and stores tokens via keychain + a `0600`
-  `oauth_tokens.json` fallback. `formless auth status|logout` inspect or
-  delete those tokens without printing them. Full reset deletes them too.
+  `oauth_tokens-<id>.json` fallback, one set per provider (`<id>` is
+  derived from its `token_url` and `client_id`, so two OAuth providers
+  never overwrite each other). A profile-wide set from an older version
+  moves to the default provider on first use. `formless auth
+  status|logout` inspect or delete those tokens without printing them.
+  Full reset deletes them too.
 - Before every provider construction (main Runs, sub-agents,
   Tool-initiated `llm.complete`, optimiser calls, compaction through the
   already-constructed provider, and `doctor` probes), the daemon/CLI
@@ -284,6 +288,9 @@ without redesign.
   Refresh is serialized in-process, a rotated refresh token is persisted
   before the new access token is used, and failures name
   `formless auth login` rather than silently falling back to an API key.
+  A refresh token is only sent to the token endpoint that issued it. A
+  401 for a token that has not expired by the clock (revoked, or clock
+  skew) forces one refresh and one resend before the request fails.
   A confidential OAuth client secret, when a provider requires one, is
   read only from `FORMLESS_OAUTH_CLIENT_SECRET` and sent as HTTP Basic
   credentials to the token endpoint; it is never stored in config.
@@ -570,7 +577,9 @@ task, with quality as a gate**.
 - **Opt-in spending limits.** `[limits]` `daily_usd` (all Sessions, per
   UTC day), `run_usd` and `run_steps` (per Run), all unset by default and
   settable from Settings. Dollar limits count only while every model used
-  has a `provider.prices` entry. Before each model request the daemon
+  has a `provider.prices` entry. Model calls made on the Run's behalf
+  (`llm.complete` from a Tool, each sub-agent step) count toward them and
+  toward usage, and are checked too. Before each model request the daemon
   checks them: at 80% it posts a note ("Spending: …"), and at 100% it pauses
   the Run with a `budget:` error (explained category `budget`). The pause
   banner's Resume goes past the limits for that one Run. Raising or
@@ -2006,7 +2015,18 @@ such as `read_file`, `read_text_file` and `file_read`.
   `deltas`) reach it. Tool/module/proposal events, approvals, the Session
   list and Run start/end stay global. A new connection receives everything;
   the TUI, web and headless clients subscribe to the Session they show.
-- A client whose protocol version mismatches the daemon's **refuses to
+- **Compatibility.** `Ping` and `Status` report `min_protocol`,
+  `max_protocol` and `features` (named optional capabilities); peers use
+  the highest version both speak, and the daemon accepts any envelope
+  version in its range. Additive changes (an optional field, a new
+  request or event type) keep the version: peers ignore unknown fields,
+  clients skip events they can't parse, and the daemon answers a request
+  type it doesn't know with an `unsupported:` error carrying the request
+  id and a `{"code": "unsupported", "type": …}` result. A request that
+  fails to parse keeps its id when the id is readable. Removing or
+  renaming anything is a new protocol version (rules in
+  `formless-protocol`).
+- A client whose protocol version is outside the daemon's range **refuses to
   attach** with a clear message (no silent incompatibility) that points to
   `formless daemon restart`. Restart stops a daemon on another protocol by
   signalling the pid in its lock file, since that daemon cannot be asked.
@@ -3142,7 +3162,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   the Homebrew formula into `man1`.
 - `formless doctor` ends with the problems it found, each with what to
   run next: a stale socket or lock, a daemon that runs but doesn't answer,
-  secret files (`api_key`, `relay_secret`, `oauth_tokens.json`,
+  secret files (`api_key`, `relay_secret`, `oauth_tokens*.json`,
   `config.toml`) others can read, a missing credential, an unconfigured
   provider, a failed probe, or a model without tool calling. `--fix`
   applies only the safe fixes:

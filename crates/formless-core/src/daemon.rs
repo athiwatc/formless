@@ -95,7 +95,10 @@ fn request_kind(req: &Request) -> String {
 async fn handle_safely(this: &Arc<Daemon>, req: Request) -> Result<Value> {
     use futures_util::FutureExt;
     let kind = request_kind(&req);
-    match std::panic::AssertUnwindSafe(this.handle(req)).catch_unwind().await {
+    match std::panic::AssertUnwindSafe(this.handle(req))
+        .catch_unwind()
+        .await
+    {
         Ok(r) => r,
         Err(p) => {
             let why = panic_text(&p);
@@ -200,24 +203,31 @@ pub(crate) struct PendingEntry {
 /// Never waits: a full queue drops live deltas, and disconnects the client
 /// for anything else (SPEC §9.3).
 fn send_all(subs: &Subs, ev: Event) {
-    subs.lock().unwrap_or_else(|e| e.into_inner()).retain(|sub| {
-        if !sub.filter.lock().unwrap_or_else(|e| e.into_inner()).wants(&ev) {
-            return true;
-        }
-        match sub.tx.try_send(ServerMessage::Event(ev.clone())) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) if droppable(&ev) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
+    subs.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|sub| {
+            if !sub
+                .filter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .wants(&ev)
+            {
+                return true;
+            }
+            match sub.tx.try_send(ServerMessage::Event(ev.clone())) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) if droppable(&ev) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
                     "client {} stopped reading ({CLIENT_QUEUE} messages queued); disconnecting it",
                     sub.conn
                 );
-                sub.kick.cancel();
-                false
+                    sub.kick.cancel();
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        }
-    });
+        });
 }
 
 /// The line a JS error points at (`eval_script:3:13`, `<eval>:3`, `line
@@ -446,7 +456,9 @@ impl Daemon {
             .collect::<Result<Vec<_>>>()?;
         // `provider.proxy` applies from start-up (restart to change it).
         let http = crate::provider::http_client(
-            &Config::load(&paths).map(|c| c.provider.proxy).unwrap_or_default(),
+            &Config::load(&paths)
+                .map(|c| c.provider.proxy)
+                .unwrap_or_default(),
         )?;
         Ok(Self {
             paths,
@@ -610,7 +622,11 @@ impl Daemon {
             let mut role = cfg.role(role_name)?.clone();
             let pcfg = cfg.provider_cfg(role.provider.as_deref())?;
             role.model = pcfg.resolve_alias(&role.model);
-            role.candidates = role.candidates.iter().map(|c| pcfg.resolve_alias(c)).collect();
+            role.candidates = role
+                .candidates
+                .iter()
+                .map(|c| pcfg.resolve_alias(c))
+                .collect();
             let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
             let model = if role.model.is_empty() {
                 cfg.provider_cfg(role.provider.as_deref())?.model
@@ -626,7 +642,8 @@ impl Daemon {
                     explore,
                 )
                 .unwrap_or_else(|| role.model.clone());
-                let samples = |m: &str| stats.iter().find(|s| s.model == m).map_or(0, |s| s.samples);
+                let samples =
+                    |m: &str| stats.iter().find(|s| s.model == m).map_or(0, |s| s.samples);
                 let explored = explore && samples(&picked) < cfg.tools.task_min_samples;
                 let mut why = crate::routing::explain_task_choice(
                     &role.candidates,
@@ -704,7 +721,13 @@ impl Daemon {
     /// callers and tests; `Subscribe` needs a connection).
     pub async fn handle(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
         match req {
-            Request::Ping => Ok(json!({"pong": true, "protocol": PROTOCOL_VERSION})),
+            Request::Ping => Ok(json!({
+                "pong": true,
+                "protocol": PROTOCOL_VERSION,
+                "min_protocol": MIN_PROTOCOL_VERSION,
+                "max_protocol": PROTOCOL_VERSION,
+                "features": formless_protocol::FEATURES,
+            })),
             Request::Status => {
                 let sessions = self.with_reader(|s| Ok(s.list_sessions()?.len()))?;
                 let auth = self.config().map(|cfg| {
@@ -750,6 +773,9 @@ impl Daemon {
                     "proxy": self.config().ok().and_then(|c| crate::provider::proxy_in_use(&c.provider)),
                     "resources": resources,
                     "protocol": PROTOCOL_VERSION,
+                    "min_protocol": MIN_PROTOCOL_VERSION,
+                    "max_protocol": PROTOCOL_VERSION,
+                    "features": formless_protocol::FEATURES,
                     "version": env!("CARGO_PKG_VERSION"),
                     "build": self.build,
                     // The binary on disk was replaced since start-up (§9.3).
@@ -1046,7 +1072,9 @@ impl Daemon {
                 path,
             } => {
                 if self.runs.lock().unwrap().contains_key(&session_id) {
-                    return Err(anyhow!("session has an active run; stop it before rewinding"));
+                    return Err(anyhow!(
+                        "session has an active run; stop it before rewinding"
+                    ));
                 }
                 let run_id = self.files_run(&session_id, run_id)?;
                 let rows = self.with_reader(|st| st.run_files(&run_id))?;
@@ -1101,7 +1129,9 @@ impl Daemon {
             } => {
                 let content = content.map(|c| c.trim().to_string());
                 if content.as_deref() == Some("") {
-                    return Err(anyhow!("a queued message cannot be empty; remove it instead"));
+                    return Err(anyhow!(
+                        "a queued message cannot be empty; remove it instead"
+                    ));
                 }
                 let found =
                     self.with_store(|st| st.edit_queued(&session_id, id, content.as_deref()))?;
@@ -1157,7 +1187,9 @@ impl Daemon {
                     });
                     original = Some(fork.id);
                 }
-                let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+                let model = model
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
                 if let Some(m) = &model {
                     self.next_run_model
                         .lock()
@@ -1801,7 +1833,8 @@ impl Daemon {
                     .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|m| (m.to_string(), v)))
                     .collect();
                 for m in &models {
-                    meta.entry(m.clone()).or_insert_with(|| crate::provider::known_model_meta(m));
+                    meta.entry(m.clone())
+                        .or_insert_with(|| crate::provider::known_model_meta(m));
                 }
                 let roles: Vec<_> = cfg
                     .roles
@@ -2178,12 +2211,14 @@ impl Daemon {
             }
             Request::StorageUsage => {
                 let mut u = self.with_reader(|st| crate::housekeeping::usage(&self.paths, st))?;
-                u["last_backup"] = json!(crate::housekeeping::last_backup(&self.paths).map(|(f, _)| f.display().to_string()));
+                u["last_backup"] = json!(crate::housekeeping::last_backup(&self.paths)
+                    .map(|(f, _)| f.display().to_string()));
                 Ok(u)
             }
             Request::Gc { dry_run } => {
                 let cfg = self.config()?;
-                let r = self.with_store(|st| crate::housekeeping::gc(&self.paths, st, &cfg, dry_run))?;
+                let r =
+                    self.with_store(|st| crate::housekeeping::gc(&self.paths, st, &cfg, dry_run))?;
                 if !dry_run {
                     let _ = self.with_store(|st| {
                         st.audit("user", "gc", &format!("{} bytes", r["total_bytes"]))
@@ -2194,7 +2229,9 @@ impl Daemon {
             Request::Backup => {
                 let keep = self.config()?.daemon.backups_keep.max(1);
                 let f = self.with_store(|st| crate::housekeeping::backup(&self.paths, st, keep))?;
-                Ok(json!({"file": f.display().to_string(), "bytes": crate::housekeeping::path_bytes(&f)}))
+                Ok(
+                    json!({"file": f.display().to_string(), "bytes": crate::housekeeping::path_bytes(&f)}),
+                )
             }
             Request::ListMcpPrompts => {
                 let cfg = self.config()?;
@@ -2242,8 +2279,10 @@ impl Daemon {
                         .flatten()
                         .filter_map(|a| a["name"].as_str().map(str::to_string))
                         .collect();
-                    let free: Vec<&String> =
-                        declared.iter().filter(|d| !arguments.contains_key(*d)).collect();
+                    let free: Vec<&String> = declared
+                        .iter()
+                        .filter(|d| !arguments.contains_key(*d))
+                        .collect();
                     if positional.len() > free.len() {
                         return Err(anyhow!(
                             "{server}:{name} takes {} argument(s): {}",
@@ -2340,7 +2379,11 @@ impl Daemon {
                     server.disabled_tools.sort();
                 }
                 cfg.save(&self.paths)?;
-                let action = if enabled { "mcp.tool_enable" } else { "mcp.tool_disable" };
+                let action = if enabled {
+                    "mcp.tool_enable"
+                } else {
+                    "mcp.tool_disable"
+                };
                 let _ = self.with_store(|st| st.audit("user", action, &format!("{name}: {tool}")));
                 let tools = self.sync_mcp_server(&cfg, &name).await;
                 self.mcp
@@ -2358,8 +2401,9 @@ impl Daemon {
                 Ok(list)
             }
             Request::AddMcpFromCatalog { id, name, params } => {
-                let entry = crate::mcp_catalog::find(&id)
-                    .with_context(|| format!("no catalog server '{id}' (see `formless mcp catalog`)"))?;
+                let entry = crate::mcp_catalog::find(&id).with_context(|| {
+                    format!("no catalog server '{id}' (see `formless mcp catalog`)")
+                })?;
                 let server = crate::mcp_catalog::server_config(entry, &params)?;
                 let name = name
                     .map(|n| n.trim().to_string())
@@ -2844,13 +2888,15 @@ impl Daemon {
                 }
                 self.session_bundle(&id)
             }
-            Request::ImportSession { bundle } => Ok(serde_json::to_value(
-                self.import_session_bundle(&bundle)?,
-            )?),
+            Request::ImportSession { bundle } => {
+                Ok(serde_json::to_value(self.import_session_bundle(&bundle)?)?)
+            }
             Request::ExportAll { sessions } => self.export_all(sessions),
             Request::TestModel { model, provider } => {
                 let cfg = self.config()?;
-                Ok(json!(self.test_model(&cfg, provider.as_deref(), &model).await?))
+                Ok(json!(
+                    self.test_model(&cfg, provider.as_deref(), &model).await?
+                ))
             }
             Request::RoutingDecisions => Ok(json!(self
                 .routing_log
@@ -2863,7 +2909,12 @@ impl Daemon {
             Request::RateLimits => Ok(json!(crate::provider::rate_limits())),
             Request::OllamaPull { model } => {
                 let cfg = self.config()?;
-                let base = cfg.provider.base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+                let base = cfg
+                    .provider
+                    .base_url
+                    .trim_end_matches('/')
+                    .trim_end_matches("/v1")
+                    .to_string();
                 let this = self.clone();
                 let http = self.http.clone();
                 tokio::spawn(async move { this.ollama_pull(&http, &base, &model).await });
@@ -3362,9 +3413,18 @@ impl Daemon {
         let error = format!("internal error: {why}");
         let _ = self.with_store(|st| st.set_run_status(run_id, "paused"));
         let _ = self.with_store(|st| st.set_run_error(run_id, &error));
-        self.runs.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
-        self.budget_waived.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
-        self.step_limits.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id);
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        self.budget_waived
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+        self.step_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
         self.broadcast(Event::RunPaused {
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
@@ -3777,7 +3837,11 @@ impl Daemon {
         let once = self.next_run_model.lock().unwrap().remove(session_id);
         let target = self.target(&cfg, session_id, once.as_deref()).await?;
         let provider = {
-            let (sid, rid, subs) = (session_id.to_string(), run_id.to_string(), self.subs.clone());
+            let (sid, rid, subs) = (
+                session_id.to_string(),
+                run_id.to_string(),
+                self.subs.clone(),
+            );
             target
                 .provider
                 .with_cache_key(&format!("formless-{session_id}"))
@@ -3794,6 +3858,18 @@ impl Daemon {
                         },
                     );
                 }))
+                .with_note_hook({
+                    let (sid, subs) = (session_id.to_string(), self.subs.clone());
+                    Arc::new(move |text: String| {
+                        send_all(
+                            &subs,
+                            Event::Note {
+                                session_id: Some(sid.clone()),
+                                text,
+                            },
+                        );
+                    })
+                })
         };
         let requested_model = target.model.clone();
         let (context_chars, tool_count) = self.with_store(|st| {
@@ -4002,10 +4078,19 @@ impl Daemon {
                 if up_to > 0 {
                     self.broadcast(Event::Note {
                         session_id: Some(session_id.to_string()),
-                        text: "The model's context window is full; compacting and asking again.".into(),
+                        text: "The model's context window is full; compacting and asking again."
+                            .into(),
                     });
-                    self.compact(&provider, &cfg, session_id, &model, context_tokens, up_to, None)
-                        .await?;
+                    self.compact(
+                        &provider,
+                        &cfg,
+                        session_id,
+                        &model,
+                        context_tokens,
+                        up_to,
+                        None,
+                    )
+                    .await?;
                     continue;
                 }
             }
@@ -4224,7 +4309,11 @@ impl Daemon {
 
     /// Stream an Ollama `/api/pull` as `ModelPullProgress` (SPEC §4.2).
     async fn ollama_pull(&self, http: &reqwest::Client, base: &str, model: &str) {
-        let send = |status: String, completed: Option<u64>, total: Option<u64>, done: bool, error: Option<String>| {
+        let send = |status: String,
+                    completed: Option<u64>,
+                    total: Option<u64>,
+                    done: bool,
+                    error: Option<String>| {
             self.broadcast(Event::ModelPullProgress {
                 model: model.to_string(),
                 status,
@@ -4244,7 +4333,13 @@ impl Daemon {
             Ok(r) => {
                 let status = r.status();
                 let text = r.text().await.unwrap_or_default();
-                return send("failed".into(), None, None, true, Some(format!("{status}: {text}")));
+                return send(
+                    "failed".into(),
+                    None,
+                    None,
+                    true,
+                    Some(format!("{status}: {text}")),
+                );
             }
             Err(e) => return send("failed".into(), None, None, true, Some(format!("{e:#}"))),
         };
@@ -4256,7 +4351,9 @@ impl Daemon {
             buf.extend_from_slice(&chunk);
             while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
-                let Ok(v) = serde_json::from_slice::<Value>(&line) else { continue };
+                let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+                    continue;
+                };
                 if let Some(e) = v["error"].as_str() {
                     return send("failed".into(), None, None, true, Some(e.to_string()));
                 }
@@ -4265,7 +4362,13 @@ impl Daemon {
                 // At most 4 updates a second, plus every status change at the end.
                 if done || last.elapsed() >= std::time::Duration::from_millis(250) {
                     last = std::time::Instant::now();
-                    send(status, v["completed"].as_u64(), v["total"].as_u64(), done, None);
+                    send(
+                        status,
+                        v["completed"].as_u64(),
+                        v["total"].as_u64(),
+                        done,
+                        None,
+                    );
                 }
                 if done {
                     return;
@@ -4289,13 +4392,18 @@ impl Daemon {
             .filter(|m| !m.is_empty())
             .collect();
         if models.len() < 2 || models.len() > 4 {
-            return Err(anyhow!("compare 2 to 4 models: /compare MODEL_A MODEL_B [prompt]"));
+            return Err(anyhow!(
+                "compare 2 to 4 models: /compare MODEL_A MODEL_B [prompt]"
+            ));
         }
         let session = self
             .with_reader(|st| st.get_session(session_id))?
             .context("session not found")?;
         // Re-ask the last message (forked before it), or ask `prompt`.
-        let (up_to, text) = match prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+        let (up_to, text) = match prompt
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+        {
             Some(p) => (None, p),
             None => {
                 let msgs = self.with_reader(|st| st.list_messages(session_id))?;
@@ -4312,7 +4420,11 @@ impl Daemon {
         for model in &models {
             let fork = self
                 .with_store(|st| {
-                    st.fork_session(session_id, Some(format!("{} · compare {model}", session.name)), up_to)
+                    st.fork_session(
+                        session_id,
+                        Some(format!("{} · compare {model}", session.name)),
+                        up_to,
+                    )
                 })?
                 .context("session not found")?;
             if let Some(info) =
@@ -4356,7 +4468,10 @@ impl Daemon {
             };
             let busy = {
                 let runs = self.runs.lock().unwrap();
-                all[&id].1.iter().any(|(f, _)| f != session_id && runs.contains_key(f))
+                all[&id]
+                    .1
+                    .iter()
+                    .any(|(f, _)| f != session_id && runs.contains_key(f))
             };
             if busy {
                 return;
@@ -4390,10 +4505,14 @@ impl Daemon {
                 ComparisonResult {
                     model,
                     session_id: fork,
-                    status: run.as_ref().map_or("completed".into(), |r| r.status.clone()),
+                    status: run
+                        .as_ref()
+                        .map_or("completed".into(), |r| r.status.clone()),
                     answer,
                     duration_ms: run.as_ref().map_or(0, |r| r.duration_ms),
-                    tokens: run.as_ref().map_or(0, |r| r.prompt_tokens + r.completion_tokens),
+                    tokens: run
+                        .as_ref()
+                        .map_or(0, |r| r.prompt_tokens + r.completion_tokens),
                     cost,
                     steps: run.as_ref().map_or(0, |r| r.steps),
                 }
@@ -4426,7 +4545,10 @@ impl Daemon {
             }
             let step_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.step_waiters.lock().unwrap().insert(step_id.clone(), tx);
+            self.step_waiters
+                .lock()
+                .unwrap()
+                .insert(step_id.clone(), tx);
             self.broadcast(Event::StepPending {
                 session_id: session_id.to_string(),
                 run_id: run_id.to_string(),
@@ -4781,7 +4903,14 @@ impl Daemon {
         CALL_FAILED
             .scope(std::cell::Cell::new(false), async {
                 let text = Box::pin(self.dispatch_call_inner(
-                    session_id, run_id, tc, cfg, cancel_flag, cancel, denied, agent_depth,
+                    session_id,
+                    run_id,
+                    tc,
+                    cfg,
+                    cancel_flag,
+                    cancel,
+                    denied,
+                    agent_depth,
                 ))
                 .await;
                 (text, CALL_FAILED.with(std::cell::Cell::get))
@@ -4925,7 +5054,9 @@ impl Daemon {
                     .await;
                 if !approved {
                     let _ = self.with_store(|st| st.audit("agent", "mcp.remove.denied", &name));
-                    call_failed("error: the user did not approve removing this MCP server".to_string())
+                    call_failed(
+                        "error: the user did not approve removing this MCP server".to_string(),
+                    )
                 } else {
                     match self.remove_mcp_server(&name, "agent").await {
                         Ok(v) => v.to_string(),
@@ -5026,9 +5157,15 @@ impl Daemon {
                         Some((ok, text)) => {
                             entry.delivered.store(true, Ordering::SeqCst);
                             self.forget_pending(handle);
-                            if ok { text } else { call_failed(text) }
+                            if ok {
+                                text
+                            } else {
+                                call_failed(text)
+                            }
                         }
-                        None => call_failed("error: interrupted while awaiting invocation".to_string()),
+                        None => {
+                            call_failed("error: interrupted while awaiting invocation".to_string())
+                        }
                     },
                     None => self.stale_handle_answer(handle),
                 }
@@ -5552,7 +5689,11 @@ impl Daemon {
             Some((ok, text)) => {
                 entry.delivered.store(true, Ordering::SeqCst);
                 self.forget_pending(&handle);
-                if ok { text } else { call_failed(text) }
+                if ok {
+                    text
+                } else {
+                    call_failed(text)
+                }
             }
             None => {
                 let _ = self.with_store(|st| st.add_pending_handle(&handle, session_id, name));
@@ -5805,7 +5946,9 @@ impl Daemon {
     /// `ImportAll`: what came in, by kind, with anything that failed.
     async fn import_all(self: &Arc<Self>, bundle: &Value) -> Result<Value> {
         if bundle["format"].as_str() != Some("formless.all/1") {
-            return Err(anyhow!("not a formless.all/1 bundle (from `formless export-all`)"));
+            return Err(anyhow!(
+                "not a formless.all/1 bundle (from `formless export-all`)"
+            ));
         }
         let list = |k: &str| bundle[k].as_array().cloned().unwrap_or_default();
         let mut failed: Vec<String> = Vec::new();
@@ -5842,11 +5985,19 @@ impl Daemon {
             let (Some(name), Some(code)) = (m["name"].as_str(), m["code"].as_str()) else {
                 continue;
             };
-            if self.with_reader(|st| st.get_module_by_name(name))?.is_some() {
+            if self
+                .with_reader(|st| st.get_module_by_name(name))?
+                .is_some()
+            {
                 continue;
             }
             match self.with_store(|st| {
-                st.create_module_version(name, m["description"].as_str().unwrap_or_default(), code, "import")
+                st.create_module_version(
+                    name,
+                    m["description"].as_str().unwrap_or_default(),
+                    code,
+                    "import",
+                )
             }) {
                 Ok(_) => modules += 1,
                 Err(e) => failed.push(format!("module {name}: {e}")),
@@ -5894,7 +6045,11 @@ impl Daemon {
             };
             let made = self.with_store(|st| {
                 let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
-                st.set_job_options(&job.id, j["overlap"].as_str(), (!j["deliver"].is_null()).then_some(&j["deliver"]))?;
+                st.set_job_options(
+                    &job.id,
+                    j["overlap"].as_str(),
+                    (!j["deliver"].is_null()).then_some(&j["deliver"]),
+                )?;
                 // Paused: review, then enable on this machine.
                 st.set_job_enabled(&job.id, false)?;
                 Ok(())
@@ -5908,10 +6063,19 @@ impl Daemon {
         for b in list("sessions") {
             match self.import_session_bundle(&b) {
                 Ok(_) => sessions += 1,
-                Err(e) => failed.push(format!("session {}: {e}", b["name"].as_str().unwrap_or("?"))),
+                Err(e) => failed.push(format!(
+                    "session {}: {e}",
+                    b["name"].as_str().unwrap_or("?")
+                )),
             }
         }
-        let _ = self.with_store(|st| st.audit("user", "import_all", &format!("{tools} tools, {skills} skills")));
+        let _ = self.with_store(|st| {
+            st.audit(
+                "user",
+                "import_all",
+                &format!("{tools} tools, {skills} skills"),
+            )
+        });
         self.broadcast(Event::SkillsChanged);
         self.broadcast(Event::MemoryUpdated);
         self.broadcast(Event::JobsChanged);
@@ -5941,7 +6105,11 @@ impl Daemon {
             "provider.model is \"auto\" but no routing candidates are configured; set provider.routing_models (or fallback_models)",
         )?;
         let mut why = crate::routing::explain_model_choice(&cfg.provider, &stats, complex, &picked);
-        why["kind"] = json!(if complex { "auto (complex task)" } else { "auto (simple task)" });
+        why["kind"] = json!(if complex {
+            "auto (complex task)"
+        } else {
+            "auto (simple task)"
+        });
         self.note_routing("", why);
         Ok(picked)
     }
@@ -6052,22 +6220,28 @@ impl Daemon {
             wanted.push((None, p.resolve_alias(m)));
         }
         for r in cfg.roles.values() {
-            let Ok(pc) = cfg.provider_cfg(r.provider.as_deref()) else { continue };
+            let Ok(pc) = cfg.provider_cfg(r.provider.as_deref()) else {
+                continue;
+            };
             for m in std::iter::once(&r.model).chain(&r.candidates) {
                 wanted.push((r.provider.clone(), pc.resolve_alias(m)));
             }
         }
-        wanted.retain(|(_, m)| !m.is_empty() && !ProviderCfg::is_auto_model(m) && !m.starts_with("role:"));
+        wanted.retain(|(_, m)| {
+            !m.is_empty() && !ProviderCfg::is_auto_model(m) && !m.starts_with("role:")
+        });
         let mut missing = Vec::new();
         let mut listed: HashMap<Option<String>, Option<Vec<String>>> = HashMap::new();
         for (prov, m) in wanted {
             if !listed.contains_key(&prov) {
                 let models = match self.provider_named(cfg, prov.as_deref()).await {
-                    Ok(pv) => tokio::time::timeout(std::time::Duration::from_secs(15), pv.list_models())
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .filter(|l| !l.is_empty()),
+                    Ok(pv) => {
+                        tokio::time::timeout(std::time::Duration::from_secs(15), pv.list_models())
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .filter(|l| !l.is_empty())
+                    }
                     Err(_) => None,
                 };
                 listed.insert(prov.clone(), models);
@@ -6412,6 +6586,7 @@ impl Daemon {
                     if step >= max_turns {
                         return Err(anyhow!("sub-agent hit its turn limit ({max_turns})"));
                     }
+                    self.check_budget(session_id, run_id, &cfg)?;
                     // Rebuilt each step: find_tools/create_tool load new Tools.
                     let defs = sub_defs()?;
                     let result = provider
@@ -6426,6 +6601,9 @@ impl Daemon {
                         .await?;
                     step += 1;
                     if let Some(u) = &result.usage {
+                        let _ = self.with_store(|st| {
+                            st.record_usage_from(session_id, run_id, &model, u, "agent")
+                        });
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
                         task_cost = task_cost
                             .zip(cfg.provider.cost_of(
@@ -6486,7 +6664,8 @@ impl Daemon {
                                 agent_depth,
                             )
                             .await;
-                        let mut msg = json!({"role": "tool", "tool_call_id": tc.id, "content": text});
+                        let mut msg =
+                            json!({"role": "tool", "tool_call_id": tc.id, "content": text});
                         if is_error {
                             msg["_is_error"] = json!(true);
                         }
@@ -7625,8 +7804,16 @@ impl Daemon {
             .unwrap_or_default()
             .into_iter()
             .map(|(name, n, failed)| {
-                let times = if n > 1 { format!(" ×{n}") } else { String::new() };
-                let fails = if failed > 0 { format!(" ({failed} failed)") } else { String::new() };
+                let times = if n > 1 {
+                    format!(" ×{n}")
+                } else {
+                    String::new()
+                };
+                let fails = if failed > 0 {
+                    format!(" ({failed} failed)")
+                } else {
+                    String::new()
+                };
                 format!("{name}{times}{fails}")
             })
             .collect();
@@ -7647,9 +7834,7 @@ impl Daemon {
             .filter(|m| {
                 m.role == "user"
                     && m.created_at >= started
-                    && m.meta
-                        .as_deref()
-                        .is_some_and(|x| x.contains("\"steer\""))
+                    && m.meta.as_deref().is_some_and(|x| x.contains("\"steer\""))
             })
             .count() as i64;
         Some(RunRecap {
@@ -7710,7 +7895,12 @@ impl Daemon {
                     i.status
                 ));
             }
-            i.content = i.content.trim().chars().take(toolreg::MAX_PLAN_TEXT).collect();
+            i.content = i
+                .content
+                .trim()
+                .chars()
+                .take(toolreg::MAX_PLAN_TEXT)
+                .collect();
             if i.content.is_empty() {
                 return Err(anyhow!("a step needs content"));
             }
@@ -9993,7 +10183,10 @@ impl Daemon {
             let (this, tx, client) = (self.clone(), tx.clone(), client.clone());
             tokio::spawn(async move {
                 while let Some(env) = work_rx.recv().await {
-                    let resp = match CLIENT.scope(client(), handle_safely(&this, env.request)).await {
+                    let resp = match CLIENT
+                        .scope(client(), handle_safely(&this, env.request))
+                        .await
+                    {
                         Ok(v) => ServerMessage::ok(env.id, v),
                         Err(e) => ServerMessage::err(env.id, e.to_string()),
                     };
@@ -10022,11 +10215,11 @@ impl Daemon {
             }
             let resp = match serde_json::from_str::<RequestEnvelope>(&line) {
                 Ok(env) => {
-                    if env.protocol != PROTOCOL_VERSION {
+                    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&env.protocol) {
                         ServerMessage::err(
                             env.id,
                             format!(
-                                "protocol mismatch: client {} daemon {PROTOCOL_VERSION}",
+                                "protocol mismatch: client {} daemon {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}",
                                 env.protocol
                             ),
                         )
@@ -10054,10 +10247,11 @@ impl Daemon {
                     } else if is_control(&env.request) {
                         let (this, tx, who) = (self.clone(), tx.clone(), client());
                         tokio::spawn(async move {
-                            let resp = match CLIENT.scope(who, handle_safely(&this, env.request)).await {
-                                Ok(v) => ServerMessage::ok(env.id, v),
-                                Err(e) => ServerMessage::err(env.id, e.to_string()),
-                            };
+                            let resp =
+                                match CLIENT.scope(who, handle_safely(&this, env.request)).await {
+                                    Ok(v) => ServerMessage::ok(env.id, v),
+                                    Err(e) => ServerMessage::err(env.id, e.to_string()),
+                                };
                             let _ = tx.send(resp).await;
                         });
                         continue;
@@ -10068,7 +10262,13 @@ impl Daemon {
                         continue;
                     }
                 }
-                Err(e) => ServerMessage::err(0, format!("bad request: {e}")),
+                Err(e) => {
+                    let id = formless_protocol::lenient_id(&line);
+                    match formless_protocol::unknown_request_type(&line) {
+                        Some(kind) => formless_protocol::unsupported(id, &kind),
+                        None => ServerMessage::err(id, format!("bad request: {e}")),
+                    }
+                }
             };
             if tx.send(resp).await.is_err() {
                 break;
@@ -10342,7 +10542,8 @@ impl Daemon {
                             r.orphan_files, r.orphan_bytes, r.missing_rows
                         );
                         tracing::info!("artifact reconcile: {what}");
-                        let _ = self.with_store(|st| st.audit("daemon", "artifact.reconcile", &what));
+                        let _ =
+                            self.with_store(|st| st.audit("daemon", "artifact.reconcile", &what));
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!("artifact reconcile: {e}"),
@@ -11139,7 +11340,10 @@ struct ScriptScope {
 fn mcp_state(s: &McpServerInfo) -> &'static str {
     let auth = |e: &str| {
         let e = e.to_lowercase();
-        e.contains("401") || e.contains("unauthorized") || e.contains("login") || e.contains("oauth")
+        e.contains("401")
+            || e.contains("unauthorized")
+            || e.contains("login")
+            || e.contains("oauth")
     };
     if s.disabled {
         "disabled"
@@ -11345,6 +11549,10 @@ impl HostOps for NestedOps {
         if self.cancel.is_cancelled() {
             return Err("interrupted".into());
         }
+        // Nested spend counts toward the Run's budget (SPEC §13 limits).
+        self.daemon
+            .check_budget(&self.session_id, &self.run_id, &self.cfg)
+            .map_err(|e| e.to_string())?;
         let target = self
             .handle
             .block_on(self.daemon.target(&self.cfg, &self.session_id, model))
@@ -11374,6 +11582,11 @@ impl HostOps for NestedOps {
             &model,
             effort.as_deref(),
         ))?;
+        if let Some(u) = &usage {
+            let _ = self.daemon.with_store(|st| {
+                st.record_usage_from(&self.session_id, &self.run_id, &model, u, "llm")
+            });
+        }
         // A Tool's own model calls count toward its Cost per Success, and
         // as its model use (§10.4).
         if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
@@ -11832,10 +12045,16 @@ mod backpressure_tests {
     async fn frames_are_capped_while_reading() {
         let data = b"short\nxxxxxxxxxxxxxxxxxxxx\n".to_vec();
         let mut r = BufReader::new(&data[..]);
-        assert_eq!(read_frame(&mut r, 10).await.unwrap().as_deref(), Some("short"));
+        assert_eq!(
+            read_frame(&mut r, 10).await.unwrap().as_deref(),
+            Some("short")
+        );
         assert!(read_frame(&mut r, 10).await.is_err(), "20 bytes > 10");
         let mut r = BufReader::new(&b"last"[..]);
-        assert_eq!(read_frame(&mut r, 10).await.unwrap().as_deref(), Some("last"));
+        assert_eq!(
+            read_frame(&mut r, 10).await.unwrap().as_deref(),
+            Some("last")
+        );
         assert_eq!(read_frame(&mut r, 10).await.unwrap(), None);
     }
 
@@ -11858,8 +12077,17 @@ mod backpressure_tests {
         send_all(&subs, delta()); // dropped, client kept
         assert_eq!(subs.lock().unwrap().len(), 1);
         assert!(!kick.is_cancelled());
-        send_all(&subs, Event::Note { session_id: None, text: "important".into() });
-        assert!(subs.lock().unwrap().is_empty(), "can't take what matters: gone");
+        send_all(
+            &subs,
+            Event::Note {
+                session_id: None,
+                text: "important".into(),
+            },
+        );
+        assert!(
+            subs.lock().unwrap().is_empty(),
+            "can't take what matters: gone"
+        );
         assert!(kick.is_cancelled(), "and its connection closes");
     }
 }

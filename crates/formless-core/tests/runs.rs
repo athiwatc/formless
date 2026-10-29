@@ -683,7 +683,10 @@ fn ratings_set_the_outcome_and_summary() {
     );
     // Another Session's Run cannot be rated from here.
     let other = store.create_session(None).unwrap().id;
-    assert_eq!(store.rate_run(&other, Some(&r1), "bad", None).unwrap(), None);
+    assert_eq!(
+        store.rate_run(&other, Some(&r1), "bad", None).unwrap(),
+        None
+    );
 }
 
 /// The queue can be edited, reordered and pruned before it is sent
@@ -701,7 +704,10 @@ fn queued_messages_can_be_edited_moved_and_removed() {
     assert!(store.edit_queued(&s, items[1].id, Some("B")).unwrap());
     assert_eq!(texts(&store), ["a", "B", "c"]);
     // Moving swaps with the neighbour; the ends do not move further.
-    assert_eq!(store.move_queued(&s, items[2].id, true).unwrap(), Some(items[1].id));
+    assert_eq!(
+        store.move_queued(&s, items[2].id, true).unwrap(),
+        Some(items[1].id)
+    );
     assert_eq!(texts(&store), ["a", "c", "B"]);
     assert_eq!(store.move_queued(&s, items[0].id, true).unwrap(), None);
     assert_eq!(store.move_queued(&s, items[2].id, false).unwrap(), None);

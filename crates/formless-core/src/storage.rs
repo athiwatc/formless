@@ -344,7 +344,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 51;
+pub const SCHEMA_VERSION: i64 = 52;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -429,7 +429,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 51] = [
+const MIGRATIONS: [(i64, MigrationStep); 52] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -642,6 +642,11 @@ const MIGRATIONS: [(i64, MigrationStep); 51] = [
                PRIMARY KEY (run_id, path));
              CREATE INDEX IF NOT EXISTS idx_run_files_session ON run_files(session_id, created_at);",
         )?)
+    }),
+    // Nested model spend (llm.complete, sub-agents) is tagged so it counts
+    // toward usage and budgets but not the context estimate.
+    (52, |c| {
+        add_column(c, "run_usage", "source TEXT NOT NULL DEFAULT 'run'")
     }),
 ];
 
@@ -2056,18 +2061,20 @@ impl Store {
     /// What a Run called: (name, calls, failed), registry Tools and
     /// built-ins together, most-used first (the "What I did" recap).
     pub fn run_calls(&self, run_id: &str) -> Result<Vec<(String, i64, i64)>> {
-        let mut stmt = self.ps(
-            "SELECT name, COUNT(*), SUM(failed) FROM (
+        let mut stmt = self.ps("SELECT name, COUNT(*), SUM(failed) FROM (
                SELECT t.name AS name, (i.status NOT IN ('success','running','pending')) AS failed
                  FROM invocations i JOIN tools t ON t.id=i.tool_id
                 WHERE i.run_id=?1 AND i.parent_id IS NULL
                UNION ALL
                SELECT name, (ok=0) FROM builtin_calls WHERE run_id=?1)
-             GROUP BY name ORDER BY COUNT(*) DESC, name",
-        )?;
+             GROUP BY name ORDER BY COUNT(*) DESC, name")?;
         let rows = stmt
             .query_map(params![run_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?.unwrap_or(0)))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
@@ -2130,13 +2137,18 @@ impl Store {
     }
 
     pub fn delete_run_files_before(&self, cutoff: &str) -> Result<()> {
-        self.ex("DELETE FROM run_files WHERE created_at < ?1", params![cutoff])?;
+        self.ex(
+            "DELETE FROM run_files WHERE created_at < ?1",
+            params![cutoff],
+        )?;
         Ok(())
     }
 
     /// Unused pages VACUUM would give back.
     pub fn free_bytes(&self) -> Result<u64> {
-        let free: i64 = self.conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let free: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
         let size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         Ok((free * size).max(0) as u64)
     }
@@ -2195,7 +2207,12 @@ impl Store {
         };
         let n = self.ex(
             "UPDATE runs SET rating=?3, rating_comment=?4 WHERE id=?1 AND session_id=?2",
-            params![run_id, session_id, rating, comment.filter(|c| !c.trim().is_empty())],
+            params![
+                run_id,
+                session_id,
+                rating,
+                comment.filter(|c| !c.trim().is_empty())
+            ],
         )?;
         if n == 0 {
             return Ok(None);
@@ -2457,9 +2474,8 @@ impl Store {
 
     /// The Session's queued messages with their ids, in send order.
     pub fn queued_items(&self, session_id: &str) -> Result<Vec<formless_protocol::QueuedMessage>> {
-        let mut stmt = self.ps(
-            "SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id",
-        )?;
+        let mut stmt =
+            self.ps("SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id")?;
         let rows = stmt
             .query_map(params![session_id], |r| {
                 Ok(formless_protocol::QueuedMessage {
@@ -2542,7 +2558,11 @@ impl Store {
             else {
                 continue;
             };
-            if meta.as_object_mut().and_then(|o| o.remove("thinking_blocks")).is_some() {
+            if meta
+                .as_object_mut()
+                .and_then(|o| o.remove("thinking_blocks"))
+                .is_some()
+            {
                 changed += self.ex(
                     "UPDATE messages SET meta=?3 WHERE session_id=?1 AND id=?2",
                     params![session_id, m.id, meta.to_string()],
@@ -4566,8 +4586,21 @@ impl Store {
         model: &str,
         usage: &crate::provider::Usage,
     ) -> Result<()> {
+        self.record_usage_from(session_id, run_id, model, usage, "run")
+    }
+
+    /// Record a provider request made on a Run's behalf: `source` is "run"
+    /// for its own steps, "llm" for `llm.complete`, "agent" for sub-agents.
+    pub fn record_usage_from(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        model: &str,
+        usage: &crate::provider::Usage,
+        source: &str,
+    ) -> Result<()> {
         self.ex(
-            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 session_id,
                 run_id,
@@ -4578,7 +4611,8 @@ impl Store {
                 usage.cached_tokens as i64,
                 usage.cache_write_tokens as i64,
                 usage.cost,
-                now()
+                now(),
+                source
             ],
         )?;
         Ok(())
@@ -4656,7 +4690,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT prompt_tokens FROM run_usage WHERE session_id=?1 \
+                "SELECT prompt_tokens FROM run_usage WHERE session_id=?1 AND source='run' \
                  AND created_at > COALESCE((SELECT MAX(created_at) FROM checkpoints WHERE session_id=?1), '') \
                  ORDER BY rowid DESC LIMIT 1",
                 params![session_id],

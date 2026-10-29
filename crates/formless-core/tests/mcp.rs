@@ -725,7 +725,9 @@ async fn mcp_servers_are_managed_through_the_daemon() {
         .unwrap();
     let all = tools["tools"].as_array().unwrap();
     assert_eq!(all.len(), 4);
-    assert!(all.iter().all(|t| t["enabled"] == true && t["tokens"].as_u64().unwrap() > 0));
+    assert!(all
+        .iter()
+        .all(|t| t["enabled"] == true && t["tokens"].as_u64().unwrap() > 0));
     let before = tools["enabled_tokens"].as_u64().unwrap();
     daemon
         .handle(Request::SetMcpToolEnabled {

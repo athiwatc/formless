@@ -78,7 +78,10 @@ fn family_output_cap(m: &str) -> Option<u64> {
     if m.starts_with("claude-opus-4-2025") {
         return Some(32_000);
     }
-    if m.starts_with("claude-sonnet-4") || m.starts_with("claude-haiku-4") || m.starts_with("claude-opus-4-5") {
+    if m.starts_with("claude-sonnet-4")
+        || m.starts_with("claude-haiku-4")
+        || m.starts_with("claude-opus-4-5")
+    {
         return Some(64_000);
     }
     None
@@ -101,12 +104,17 @@ fn image_block(url: &str) -> Result<Value, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         return Ok(json!({"type": "image", "source": {"type": "url", "url": url}}));
     }
-    let Some((media, data)) = url.strip_prefix("data:").and_then(|r| r.split_once(";base64,")) else {
+    let Some((media, data)) = url
+        .strip_prefix("data:")
+        .and_then(|r| r.split_once(";base64,"))
+    else {
         return Err("image not sent: not an inline image or http(s) URL".into());
     };
     let media = media.to_ascii_lowercase();
     if !IMAGE_TYPES.contains(&media.as_str()) {
-        return Err(format!("image not sent: {media} is not supported by this API (JPEG, PNG, GIF or WebP only)"));
+        return Err(format!(
+            "image not sent: {media} is not supported by this API (JPEG, PNG, GIF or WebP only)"
+        ));
     }
     // base64 → bytes is 3/4 of the length.
     let bytes = data.len() / 4 * 3;
@@ -124,20 +132,26 @@ fn image_block(url: &str) -> Result<Value, String> {
 fn content_blocks(content: &Value) -> Vec<Value> {
     match content {
         Value::String(s) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| match p["type"].as_str() {
-                Some("text") => p["text"]
-                    .as_str()
-                    .filter(|t| !t.is_empty())
-                    .map(|t| json!({"type": "text", "text": t})),
-                Some("image_url") => {
-                    let url = p["image_url"]["url"].as_str().or_else(|| p["image_url"].as_str())?;
-                    Some(image_block(url).unwrap_or_else(|why| json!({"type": "text", "text": format!("[{why}]")})))
-                }
-                _ => None,
-            })
-            .collect(),
+        Value::Array(parts) => {
+            parts
+                .iter()
+                .filter_map(|p| match p["type"].as_str() {
+                    Some("text") => p["text"]
+                        .as_str()
+                        .filter(|t| !t.is_empty())
+                        .map(|t| json!({"type": "text", "text": t})),
+                    Some("image_url") => {
+                        let url = p["image_url"]["url"]
+                            .as_str()
+                            .or_else(|| p["image_url"].as_str())?;
+                        Some(image_block(url).unwrap_or_else(
+                            |why| json!({"type": "text", "text": format!("[{why}]")}),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -149,7 +163,10 @@ pub fn skipped_images(messages: &[Value]) -> Vec<String> {
     for m in messages {
         for p in m["content"].as_array().into_iter().flatten() {
             if p["type"] == "image_url" {
-                let url = p["image_url"]["url"].as_str().or_else(|| p["image_url"].as_str()).unwrap_or_default();
+                let url = p["image_url"]["url"]
+                    .as_str()
+                    .or_else(|| p["image_url"].as_str())
+                    .unwrap_or_default();
                 if let Err(why) = image_block(url) {
                     if !out.contains(&why) {
                         out.push(why);
@@ -169,7 +186,11 @@ pub fn skipped_images(messages: &[Value]) -> Vec<String> {
 /// steer or note stored between a call and its result follows them).
 /// With `cache`, breakpoints go on the end of the system prompt and of
 /// the last message, the stable prefix (§4.1).
-pub fn request(messages: &[Value], tools: &[Value], cache: bool) -> (Value, Vec<Value>, Vec<Value>) {
+pub fn request(
+    messages: &[Value],
+    tools: &[Value],
+    cache: bool,
+) -> (Value, Vec<Value>, Vec<Value>) {
     let mut system: Vec<Value> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
     let mut push = |role: &str, blocks: Vec<Value>| {
@@ -200,7 +221,8 @@ pub fn request(messages: &[Value], tools: &[Value], cache: bool) -> (Value, Vec<
             "assistant" => {
                 // Thinking blocks first, signatures intact: required back on
                 // tool-use turns.
-                let mut blocks: Vec<Value> = m["thinking_blocks"].as_array().cloned().unwrap_or_default();
+                let mut blocks: Vec<Value> =
+                    m["thinking_blocks"].as_array().cloned().unwrap_or_default();
                 blocks.extend(content_blocks(&m["content"]));
                 for tc in m["tool_calls"].as_array().into_iter().flatten() {
                     let args = tc["function"]["arguments"].as_str().unwrap_or("{}");
@@ -223,7 +245,10 @@ pub fn request(messages: &[Value], tools: &[Value], cache: bool) -> (Value, Vec<
     }
     // The first turn must be the user's.
     if out.first().is_some_and(|m| m["role"] == "assistant") {
-        out.insert(0, json!({"role": "user", "content": [{"type": "text", "text": "(continue)"}]}));
+        out.insert(
+            0,
+            json!({"role": "user", "content": [{"type": "text", "text": "(continue)"}]}),
+        );
     }
     if cache {
         if let Some(b) = system.last_mut() {
@@ -308,10 +333,16 @@ impl Recovery {
     /// What the user is told.
     pub fn note(self) -> &'static str {
         match self {
-            Self::ReplayedThinking => "The provider rejected the replayed thinking from earlier turns; resent without it.",
+            Self::ReplayedThinking => {
+                "The provider rejected the replayed thinking from earlier turns; resent without it."
+            }
             Self::Thinking => "The model does not accept extended thinking; resent without it.",
-            Self::MaxTokens => "The provider rejected the output limit; resent with the model's maximum.",
-            Self::CacheControl => "The provider rejected prompt-cache breakpoints; resent without them.",
+            Self::MaxTokens => {
+                "The provider rejected the output limit; resent with the model's maximum."
+            }
+            Self::CacheControl => {
+                "The provider rejected prompt-cache breakpoints; resent without them."
+            }
             Self::Images => "The provider rejected an image; resent without images.",
         }
     }
@@ -351,7 +382,11 @@ pub fn strip_cache_control(v: &mut Value) -> bool {
 /// 8192, which is the maximum …`).
 fn named_limit(text: &str) -> Option<u64> {
     let after = &text[text.find('>')? + 1..];
-    let digits: String = after.trim_start().chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     digits.parse().ok().filter(|n| *n > 0)
 }
 
@@ -489,11 +524,13 @@ impl Folded {
                     }
                     "signature_delta" => {
                         let cur = block["signature"].as_str().unwrap_or_default().to_string();
-                        block["signature"] = json!(cur + d["signature"].as_str().unwrap_or_default());
+                        block["signature"] =
+                            json!(cur + d["signature"].as_str().unwrap_or_default());
                     }
                     "input_json_delta" => {
                         let cur = block["_json"].as_str().unwrap_or_default().to_string();
-                        block["_json"] = json!(cur + d["partial_json"].as_str().unwrap_or_default());
+                        block["_json"] =
+                            json!(cur + d["partial_json"].as_str().unwrap_or_default());
                     }
                     _ => {}
                 }
@@ -506,7 +543,10 @@ impl Folded {
                 };
                 match block["type"].as_str().unwrap_or_default() {
                     "tool_use" => {
-                        let args = block["_json"].as_str().filter(|a| !a.trim().is_empty()).unwrap_or("{}");
+                        let args = block["_json"]
+                            .as_str()
+                            .filter(|a| !a.trim().is_empty())
+                            .unwrap_or("{}");
                         self.tool_calls.push((
                             block["id"].as_str().unwrap_or_default().to_string(),
                             block["name"].as_str().unwrap_or_default().to_string(),
@@ -523,7 +563,10 @@ impl Folded {
                     self.stop_reason = Some(r.to_string());
                 }
                 let details = &v["delta"]["stop_details"];
-                if let Some(c) = details["category"].as_str().or_else(|| details["type"].as_str()) {
+                if let Some(c) = details["category"]
+                    .as_str()
+                    .or_else(|| details["type"].as_str())
+                {
                     self.stop_detail = Some(c.to_string());
                 }
                 if let Some(n) = v["usage"]["output_tokens"].as_u64() {
@@ -534,7 +577,10 @@ impl Folded {
             "error" => {
                 self.error = Some((
                     v["error"]["type"].as_str().unwrap_or("error").to_string(),
-                    v["error"]["message"].as_str().unwrap_or_default().to_string(),
+                    v["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
                 ));
             }
             _ => {}
@@ -565,7 +611,9 @@ pub fn unusable_stop(v: &Value) -> Option<String> {
     match v["stop_reason"].as_str()? {
         "refusal" => Some("the model refused the request".into()),
         "max_tokens" => Some("the answer was cut off at the output token limit".into()),
-        "model_context_window_exceeded" => Some("the request exceeded the model's context window".into()),
+        "model_context_window_exceeded" => {
+            Some("the request exceeded the model's context window".into())
+        }
         _ => None,
     }
 }
@@ -602,19 +650,31 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "t1", "content": "42"}),
             json!({"role": "system-note", "content": "x"}),
         ];
-        let tools = vec![json!({"type": "function", "function": {"name": "read", "description": "Read", "parameters": {"type": "object"}}})];
+        let tools = vec![
+            json!({"type": "function", "function": {"name": "read", "description": "Read", "parameters": {"type": "object"}}}),
+        ];
         let b = body("claude-x", &msgs, &tools, true, Some("low"), true);
         assert_eq!(b["system"][0]["text"], "You are Formless.");
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
         let m = b["messages"].as_array().unwrap();
         assert_eq!(m[0]["content"][1]["type"], "image");
         assert_eq!(m[0]["content"][1]["source"]["media_type"], "image/png");
-        assert_eq!(m[1]["content"][0]["signature"], "sig", "thinking echoed first");
+        assert_eq!(
+            m[1]["content"][0]["signature"], "sig",
+            "thinking echoed first"
+        );
         assert_eq!(m[1]["content"][1]["input"]["p"], 1);
         assert_eq!(m[2]["role"], "user");
         assert_eq!(m[2]["content"][0]["type"], "tool_result");
         assert_eq!(m[2]["content"][0]["tool_use_id"], "t1");
-        assert_eq!(m.last().unwrap()["content"].as_array().unwrap().last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            m.last().unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
         assert_eq!(b["tools"][0]["input_schema"]["type"], "object");
         assert_eq!(b["thinking"]["budget_tokens"], 4096);
         assert!(b["max_tokens"].as_u64().unwrap() > 4096);
@@ -642,7 +702,10 @@ mod tests {
             f.event(e);
         }
         assert_eq!((f.text.as_str(), f.thinking.as_str()), ("Hi", "plan"));
-        assert_eq!(f.tool_calls, [("tu1".into(), "read".into(), "{\"p\":2}".into())]);
+        assert_eq!(
+            f.tool_calls,
+            [("tu1".into(), "read".into(), "{\"p\":2}".into())]
+        );
         assert_eq!(f.thinking_blocks[0]["signature"], "abc");
         assert_eq!((f.input_tokens, f.output_tokens, f.cache_read), (10, 33, 7));
         assert!(!f.truncated);
@@ -652,32 +715,60 @@ mod tests {
     #[test]
     fn output_caps_and_thinking_support_shape_the_body() {
         // A model capped at 8,192 that has no thinking: never above its cap.
-        let b = body("claude-3-5-haiku-20241022", &[json!({"role": "user", "content": "x"})], &[], false, Some("high"), true);
+        let b = body(
+            "claude-3-5-haiku-20241022",
+            &[json!({"role": "user", "content": "x"})],
+            &[],
+            false,
+            Some("high"),
+            true,
+        );
         assert!(b["max_tokens"].as_u64().unwrap() <= 8_192);
         assert!(b.get("thinking").is_none(), "3.5 rejects thinking");
         // A thinking model whose listing reports a small cap: the budget fits under it.
         note_output_caps([("claude-test-8k".to_string(), 8_192)]);
         let b = body("claude-test-8k", &[], &[], false, Some("high"), true);
-        let (max, budget) = (b["max_tokens"].as_u64().unwrap(), b["thinking"]["budget_tokens"].as_u64().unwrap());
-        assert!(max <= 8_192 && budget < max && budget >= 1_024, "{max} {budget}");
+        let (max, budget) = (
+            b["max_tokens"].as_u64().unwrap(),
+            b["thinking"]["budget_tokens"].as_u64().unwrap(),
+        );
+        assert!(
+            max <= 8_192 && budget < max && budget >= 1_024,
+            "{max} {budget}"
+        );
         // Unknown models keep the defaults.
         let b = body("claude-x", &[], &[], false, Some("high"), true);
         assert_eq!(b["max_tokens"], 40_192);
-        assert!(!supports_thinking("anthropic/claude-3-opus") && supports_thinking("claude-3-7-sonnet"));
+        assert!(
+            !supports_thinking("anthropic/claude-3-opus") && supports_thinking("claude-3-7-sonnet")
+        );
     }
 
     #[test]
     fn rejections_are_recovered_once_each() {
-        let mut b = body("claude-x", &[json!({"role": "user", "content": "x"})], &[], true, Some("high"), true);
+        let mut b = body(
+            "claude-x",
+            &[json!({"role": "user", "content": "x"})],
+            &[],
+            true,
+            Some("high"),
+            true,
+        );
         let e = "max_tokens: 40192 > 8192, which is the maximum allowed number of output tokens";
         assert_eq!(recover(&mut b, e), Some(Recovery::MaxTokens));
         assert_eq!(b["max_tokens"], 8_192);
         assert!(b["thinking"]["budget_tokens"].as_u64().unwrap() < 8_192);
         assert_eq!(recover(&mut b, e), None, "already at the limit");
-        assert_eq!(recover(&mut b, "cache_control not allowed"), Some(Recovery::CacheControl));
+        assert_eq!(
+            recover(&mut b, "cache_control not allowed"),
+            Some(Recovery::CacheControl)
+        );
         assert!(!b.to_string().contains("cache_control"));
         assert_eq!(recover(&mut b, "cache_control not allowed"), None);
-        assert_eq!(recover(&mut b, "thinking: not supported"), Some(Recovery::Thinking));
+        assert_eq!(
+            recover(&mut b, "thinking: not supported"),
+            Some(Recovery::Thinking)
+        );
         assert_eq!(recover(&mut b, "thinking: not supported"), None);
         assert_eq!(recover(&mut b, "something else"), None);
     }
@@ -696,7 +787,10 @@ mod tests {
         assert!(blocks[1]["text"].as_str().unwrap().contains("5 MB"));
         assert_eq!(blocks[2]["source"]["type"], "url");
         assert_eq!(blocks[3]["source"]["media_type"], "image/jpeg");
-        assert_eq!(skipped_images(&[json!({"role": "user", "content": parts})]).len(), 2);
+        assert_eq!(
+            skipped_images(&[json!({"role": "user", "content": parts})]).len(),
+            2
+        );
     }
 
     #[test]
@@ -705,11 +799,21 @@ mod tests {
         f.event(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t", "name": "x"}}));
         assert!(f.incomplete().is_some());
         f.event(&json!({"type": "message_stop"}));
-        assert_eq!(f.incomplete(), Some("stream ended with a content block still open"));
+        assert_eq!(
+            f.incomplete(),
+            Some("stream ended with a content block still open")
+        );
         let mut f = Folded::default();
         f.event(&json!({"type": "message_delta", "delta": {"stop_reason": "refusal", "stop_details": {"category": "cyber"}}}));
         f.event(&json!({"type": "message_stop"}));
-        assert_eq!((f.stop_reason.as_deref(), f.stop_detail.as_deref(), f.incomplete()), (Some("refusal"), Some("cyber"), None));
+        assert_eq!(
+            (
+                f.stop_reason.as_deref(),
+                f.stop_detail.as_deref(),
+                f.incomplete()
+            ),
+            (Some("refusal"), Some("cyber"), None)
+        );
         assert!(unusable_stop(&json!({"stop_reason": "max_tokens"})).is_some());
         assert!(unusable_stop(&json!({"stop_reason": "end_turn"})).is_none());
     }

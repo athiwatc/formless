@@ -1262,38 +1262,52 @@ impl Config {
                 }
             }
         };
-        let provider_secrets = |p: &mut serde_json::Value, at: &str, blank: &mut dyn FnMut(&mut serde_json::Value, String)| {
-            blank(&mut p["extra_headers"], format!("{at}.extra_headers"));
-            if let Some(auth) = p["auth"].as_object_mut() {
-                let mut secret = serde_json::Map::new();
-                for (k, val) in auth.iter_mut() {
-                    let lk = k.to_lowercase();
-                    if lk.contains("secret") || lk.contains("token") || lk.contains("password") {
-                        secret.insert(k.clone(), val.clone());
+        let provider_secrets =
+            |p: &mut serde_json::Value,
+             at: &str,
+             blank: &mut dyn FnMut(&mut serde_json::Value, String)| {
+                blank(&mut p["extra_headers"], format!("{at}.extra_headers"));
+                if let Some(auth) = p["auth"].as_object_mut() {
+                    let mut secret = serde_json::Map::new();
+                    for (k, val) in auth.iter_mut() {
+                        let lk = k.to_lowercase();
+                        if lk.contains("secret") || lk.contains("token") || lk.contains("password")
+                        {
+                            secret.insert(k.clone(), val.clone());
+                        }
+                    }
+                    let mut secret = serde_json::Value::Object(secret);
+                    blank(&mut secret, format!("{at}.auth"));
+                    for (k, val) in secret.as_object().unwrap() {
+                        auth.insert(k.clone(), val.clone());
                     }
                 }
-                let mut secret = serde_json::Value::Object(secret);
-                blank(&mut secret, format!("{at}.auth"));
-                for (k, val) in secret.as_object().unwrap() {
-                    auth.insert(k.clone(), val.clone());
-                }
-            }
-        };
+            };
         provider_secrets(&mut v["provider"], "provider", &mut blank_map);
         let names: Vec<String> = v["providers"]
             .as_object()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
         for n in names {
-            provider_secrets(&mut v["providers"][&n], &format!("providers.{n}"), &mut blank_map);
+            provider_secrets(
+                &mut v["providers"][&n],
+                &format!("providers.{n}"),
+                &mut blank_map,
+            );
         }
         let servers: Vec<String> = v["mcp"]["servers"]
             .as_object()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
         for n in servers {
-            blank_map(&mut v["mcp"]["servers"][&n]["env"], format!("mcp.servers.{n}.env"));
-            blank_map(&mut v["mcp"]["servers"][&n]["headers"], format!("mcp.servers.{n}.headers"));
+            blank_map(
+                &mut v["mcp"]["servers"][&n]["env"],
+                format!("mcp.servers.{n}.env"),
+            );
+            blank_map(
+                &mut v["mcp"]["servers"][&n]["headers"],
+                format!("mcp.servers.{n}.headers"),
+            );
         }
         (v, blanked)
     }
@@ -1632,12 +1646,18 @@ fn merge_toml(old: &str, fresh: &str) -> Option<String> {
     let target = meaning(&new)?;
     let mut path: Vec<String> = Vec::new();
     let mut inserted: Vec<Vec<String>> = Vec::new();
-    merge_table(doc.as_table_mut(), new.as_table(), &mut path, &mut inserted, &mut |p: &[String]| {
-        // Would dropping this old-only key change the parsed config?
-        let mut probe: toml_edit::DocumentMut = old.parse().ok()?;
-        remove_path(probe.as_item_mut(), p)?;
-        Some(meaning(&probe)? != base)
-    });
+    merge_table(
+        doc.as_table_mut(),
+        new.as_table(),
+        &mut path,
+        &mut inserted,
+        &mut |p: &[String]| {
+            // Would dropping this old-only key change the parsed config?
+            let mut probe: toml_edit::DocumentMut = old.parse().ok()?;
+            remove_path(probe.as_item_mut(), p)?;
+            Some(meaning(&probe)? != base)
+        },
+    );
     // Keys added only because the serializer writes every default are
     // left out again, so a hand-written file stays as short as it was.
     for p in inserted.iter().rev() {
@@ -1716,7 +1736,9 @@ pub fn write_atomic(file: &Path, bytes: &[u8]) -> Result<()> {
     let dir = file.parent().context("no parent folder")?;
     let tmp = dir.join(format!(
         ".{}.tmp-{}",
-        file.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+        file.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
         std::process::id()
     ));
     {
@@ -1741,7 +1763,8 @@ pub fn write_atomic(file: &Path, bytes: &[u8]) -> Result<()> {
 /// secret files): the API key, OAuth tokens, the relay secret, named
 /// providers' keys and MCP servers' logins.
 pub fn delete_secrets(paths: &Paths) {
-    if let Ok(cfg) = Config::load_file_only(paths) {
+    let cfg = Config::load_file_only(paths).ok();
+    if let Some(cfg) = &cfg {
         for name in cfg.providers.keys() {
             delete_provider_key(paths, name);
         }
@@ -1750,7 +1773,7 @@ pub fn delete_secrets(paths: &Paths) {
         }
     }
     delete_api_key(paths);
-    crate::auth::delete_oauth_tokens(paths);
+    crate::auth::delete_all_oauth_tokens(paths, cfg.as_ref());
     delete_relay_secret(paths);
 }
 
@@ -1853,12 +1876,27 @@ base_url = \"http://localhost:11434/v1\"\n";
         cfg.providers.remove("local");
         cfg.save(&paths).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
-        assert!(text.starts_with("# My Formless setup — keep this note"), "{text}");
-        assert!(text.contains("# the endpoint I use\nbase_url"), "comment stays with its key:\n{text}");
+        assert!(
+            text.starts_with("# My Formless setup — keep this note"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# the endpoint I use\nbase_url"),
+            "comment stays with its key:\n{text}"
+        );
         assert!(text.contains("model = \"new-model\""));
-        assert!(text.contains("future_option = \"from a newer build\""), "unknown key kept");
-        assert!(!text.contains("reasoning_effort"), "a cleared setting is removed");
-        assert!(!text.contains("localhost:11434"), "a removed provider is removed");
+        assert!(
+            text.contains("future_option = \"from a newer build\""),
+            "unknown key kept"
+        );
+        assert!(
+            !text.contains("reasoning_effort"),
+            "a cleared setting is removed"
+        );
+        assert!(
+            !text.contains("localhost:11434"),
+            "a removed provider is removed"
+        );
         // It still loads, and an unchanged save changes nothing.
         let again = Config::load_file_only(&paths).unwrap();
         assert_eq!(again.provider.model, "new-model");

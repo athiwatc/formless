@@ -75,7 +75,11 @@ pub struct Reconciled {
 /// Make disk and database agree (#609): a file in `dir` with no row and
 /// older than `grace` (so an `emit` still writing is left alone) is
 /// removed, and a row whose file is gone is dropped.
-pub fn reconcile(store: &Store, dir: &std::path::Path, grace: std::time::Duration) -> Result<Reconciled> {
+pub fn reconcile(
+    store: &Store,
+    dir: &std::path::Path,
+    grace: std::time::Duration,
+) -> Result<Reconciled> {
     let rows = store.list_artifacts()?;
     let known: std::collections::HashSet<std::path::PathBuf> = rows
         .iter()
@@ -136,8 +140,12 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let kept = dir.join("kept.txt");
         std::fs::write(&kept, "keep").unwrap();
-        store.save_artifact(None, &kept.display().to_string(), "", 4).unwrap();
-        store.save_artifact(None, &dir.join("gone.txt").display().to_string(), "", 9).unwrap();
+        store
+            .save_artifact(None, &kept.display().to_string(), "", 4)
+            .unwrap();
+        store
+            .save_artifact(None, &dir.join("gone.txt").display().to_string(), "", 9)
+            .unwrap();
         std::fs::write(dir.join("orphan.txt"), "12345").unwrap();
         // Too young to touch: an emit may still be writing it.
         let r = reconcile(&store, &dir, std::time::Duration::from_secs(3600)).unwrap();

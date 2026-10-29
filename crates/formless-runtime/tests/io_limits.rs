@@ -31,9 +31,20 @@ fn reads_output_and_logs_stop_at_their_caps() {
     std::fs::write(&big, "x".repeat(5_000)).unwrap();
     let read = format!("fs:read:{}", dir.display());
 
-    let e = run(&format!("function run(){{ return fs.read({:?}); }}", big.display().to_string()), &[read.clone()]).unwrap_err();
+    let e = run(
+        &format!(
+            "function run(){{ return fs.read({:?}); }}",
+            big.display().to_string()
+        ),
+        &[read.clone()],
+    )
+    .unwrap_err();
     assert_eq!(e.kind, ExecErrorKind::Resource, "{}", e.message);
-    assert!(e.message.contains("fs.readChunks") && e.message.contains("tools.max_read_bytes"), "{}", e.message);
+    assert!(
+        e.message.contains("fs.readChunks") && e.message.contains("tools.max_read_bytes"),
+        "{}",
+        e.message
+    );
 
     // Chunked reading still works past the cap.
     let n = run(

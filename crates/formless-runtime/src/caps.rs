@@ -594,9 +594,18 @@ mod scope_tests {
 
     #[test]
     fn bound_urls_keep_their_port_and_process_grants_cover_sub_commands() {
-        assert_eq!(bound_host("https://api.example.com:8443/x").unwrap(), "api.example.com:8443");
-        assert_eq!(bound_host("https://api.example.com/x").unwrap(), "api.example.com");
-        assert_eq!(bound_host("Host.example:9000").unwrap(), "host.example:9000");
+        assert_eq!(
+            bound_host("https://api.example.com:8443/x").unwrap(),
+            "api.example.com:8443"
+        );
+        assert_eq!(
+            bound_host("https://api.example.com/x").unwrap(),
+            "api.example.com"
+        );
+        assert_eq!(
+            bound_host("Host.example:9000").unwrap(),
+            "host.example:9000"
+        );
         assert!(bound_host("host:notaport").is_err());
         let wide = Capabilities::parse(&["process:git".to_string()]).unwrap();
         let narrow = Capabilities::parse(&["process:git:status".to_string()]).unwrap();

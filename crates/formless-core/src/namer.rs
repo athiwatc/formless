@@ -46,9 +46,30 @@ impl ModelSpec {
     pub fn tokenizer_path(&self, paths: &Paths) -> PathBuf {
         models_dir(paths).join(format!("{}.tokenizer.json", self.file_stem()))
     }
+    /// Both files present, the weights at their pinned size (a truncated
+    /// file counts as missing, so it is fetched again).
     pub fn installed(&self, paths: &Paths) -> bool {
-        self.gguf_path(paths).is_file() && self.tokenizer_path(paths).is_file()
+        std::fs::metadata(self.gguf_path(paths)).is_ok_and(|m| m.len() == self.gguf_bytes)
+            && self.tokenizer_path(paths).is_file()
     }
+}
+
+/// Delete a spec's files after they failed to load, once per process, so
+/// the next Session downloads them again instead of failing forever.
+#[cfg_attr(not(feature = "embedded-llm"), allow(dead_code))]
+fn discard_once(paths: &Paths, spec: &ModelSpec) {
+    static DISCARDED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut done = DISCARDED.lock().unwrap_or_else(|e| e.into_inner());
+    if done.contains(&spec.id) {
+        return;
+    }
+    done.push(spec.id);
+    tracing::warn!(
+        "session-naming model {} would not load; downloading it again",
+        spec.id
+    );
+    let _ = std::fs::remove_file(spec.gguf_path(paths));
+    let _ = std::fs::remove_file(spec.tokenizer_path(paths));
 }
 
 /// Default: Qwen2.5-0.5B-Instruct (Apache-2.0). It titles better than
@@ -110,6 +131,7 @@ pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
         &http,
         spec.tokenizer_url,
         spec.tokenizer_sha256,
+        None,
         &spec.tokenizer_path(paths),
     )
     .await?;
@@ -117,6 +139,7 @@ pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
         &http,
         spec.gguf_url,
         spec.gguf_sha256,
+        Some(spec.gguf_bytes),
         &spec.gguf_path(paths),
     )
     .await
@@ -126,12 +149,15 @@ async fn fetch_verified(
     http: &reqwest::Client,
     url: &str,
     sha256: &str,
+    bytes: Option<u64>,
     dest: &std::path::Path,
 ) -> Result<()> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    if dest.is_file() {
-        return Ok(());
+    match std::fs::metadata(dest) {
+        Ok(m) if bytes.is_none_or(|b| m.len() == b) => return Ok(()),
+        Ok(_) => std::fs::remove_file(dest)?,
+        Err(_) => {}
     }
     let part = dest.with_extension("part");
     let resp = http.get(url).send().await?.error_for_status()?;
@@ -225,79 +251,127 @@ fn prompt(spec: &ModelSpec, user: &str) -> String {
     )
 }
 
-/// Run the model on the first user message. Blocking and CPU-heavy
-/// (~0.5-1 s plus model load): call from `spawn_blocking`, never from an
-/// async task.
 #[cfg(feature = "embedded-llm")]
-pub fn llm_title(paths: &Paths, spec: &ModelSpec, user: &str) -> Result<String> {
+mod embedded {
+    use super::{prompt, Arch, ModelSpec, MAX_NEW_TOKENS};
+    use crate::Paths;
+    use anyhow::Result;
     use candle_core::{quantized::gguf_file, Device, Tensor};
     use candle_transformers::models::{quantized_lfm2, quantized_qwen2};
 
-    enum Model {
+    enum Weights {
         Qwen2(quantized_qwen2::ModelWeights),
         Lfm2(quantized_lfm2::ModelWeights),
     }
-    impl Model {
+    impl Weights {
         fn forward(&mut self, x: &Tensor, pos: usize) -> candle_core::Result<Tensor> {
             match self {
-                Model::Qwen2(m) => m.forward(x, pos),
-                Model::Lfm2(m) => m.forward(x, pos),
+                Weights::Qwen2(m) => m.forward(x, pos),
+                Weights::Lfm2(m) => m.forward(x, pos),
             }
         }
     }
 
-    let dev = Device::Cpu;
-    let mut file = std::fs::File::open(spec.gguf_path(paths))?;
-    let content = gguf_file::Content::read(&mut file)?;
-    let mut model = match spec.arch {
-        Arch::Qwen2 => Model::Qwen2(quantized_qwen2::ModelWeights::from_gguf(
-            content, &mut file, &dev,
-        )?),
-        Arch::Lfm2 => Model::Lfm2(quantized_lfm2::ModelWeights::from_gguf(
-            content, &mut file, &dev,
-        )?),
-    };
-    let tok =
-        tokenizers::Tokenizer::from_file(spec.tokenizer_path(paths)).map_err(anyhow::Error::msg)?;
-    let stops: Vec<u32> = spec
-        .stop
-        .iter()
-        .filter_map(|s| tok.token_to_id(s))
-        .collect();
-    let ids = tok
-        .encode(prompt(spec, user), false)
-        .map_err(anyhow::Error::msg)?
-        .get_ids()
-        .to_vec();
-
-    let mut out = Vec::new();
-    let mut input = Tensor::new(ids.as_slice(), &dev)?.unsqueeze(0)?;
-    let mut pos = 0;
-    for _ in 0..MAX_NEW_TOKENS {
-        let logits = model.forward(&input, pos)?.squeeze(0)?;
-        // Some models return logits for every position, others only the last.
-        let logits = if logits.rank() == 2 {
-            logits.get(logits.dim(0)? - 1)?
-        } else {
-            logits
-        };
-        let next = logits.argmax(0)?.to_scalar::<u32>()?;
-        pos += input.dim(1)?;
-        if stops.contains(&next) {
-            break;
-        }
-        out.push(next);
-        // Titles are one line; stop as soon as the model starts another.
-        if tok
-            .decode(&out, true)
-            .map_err(anyhow::Error::msg)?
-            .contains('\n')
-        {
-            break;
-        }
-        input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+    /// Weights and tokenizer, loaded once per spec and reused: opening the
+    /// GGUF costs more than titling itself.
+    pub(super) struct Loaded {
+        id: &'static str,
+        model: Weights,
+        tok: tokenizers::Tokenizer,
+        stops: Vec<u32>,
     }
-    tok.decode(&out, true).map_err(anyhow::Error::msg)
+
+    pub(super) fn load(paths: &Paths, spec: &ModelSpec) -> Result<Loaded> {
+        let dev = Device::Cpu;
+        let mut file = std::fs::File::open(spec.gguf_path(paths))?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let model = match spec.arch {
+            Arch::Qwen2 => Weights::Qwen2(quantized_qwen2::ModelWeights::from_gguf(
+                content, &mut file, &dev,
+            )?),
+            Arch::Lfm2 => Weights::Lfm2(quantized_lfm2::ModelWeights::from_gguf(
+                content, &mut file, &dev,
+            )?),
+        };
+        let tok = tokenizers::Tokenizer::from_file(spec.tokenizer_path(paths))
+            .map_err(anyhow::Error::msg)?;
+        let stops = spec
+            .stop
+            .iter()
+            .filter_map(|s| tok.token_to_id(s))
+            .collect();
+        Ok(Loaded {
+            id: spec.id,
+            model,
+            tok,
+            stops,
+        })
+    }
+
+    pub(super) static CACHE: std::sync::Mutex<Option<Loaded>> = std::sync::Mutex::new(None);
+
+    pub(super) fn cached_id(cache: &Option<Loaded>) -> Option<&'static str> {
+        cache.as_ref().map(|l| l.id)
+    }
+
+    pub(super) fn generate(l: &mut Loaded, spec: &ModelSpec, user: &str) -> Result<String> {
+        let dev = Device::Cpu;
+        let ids = l
+            .tok
+            .encode(prompt(spec, user), false)
+            .map_err(anyhow::Error::msg)?
+            .get_ids()
+            .to_vec();
+        let mut out = Vec::new();
+        let mut input = Tensor::new(ids.as_slice(), &dev)?.unsqueeze(0)?;
+        // Position 0 resets the model's KV cache from the previous title.
+        let mut pos = 0;
+        for _ in 0..MAX_NEW_TOKENS {
+            let logits = l.model.forward(&input, pos)?.squeeze(0)?;
+            // Some models return logits for every position, others only the last.
+            let logits = if logits.rank() == 2 {
+                logits.get(logits.dim(0)? - 1)?
+            } else {
+                logits
+            };
+            let next = logits.argmax(0)?.to_scalar::<u32>()?;
+            pos += input.dim(1)?;
+            if l.stops.contains(&next) {
+                break;
+            }
+            out.push(next);
+            // Titles are one line; stop as soon as the model starts another.
+            if l.tok
+                .decode(&[next], true)
+                .map_err(anyhow::Error::msg)?
+                .contains('\n')
+            {
+                break;
+            }
+            input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+        }
+        l.tok.decode(&out, true).map_err(anyhow::Error::msg)
+    }
+}
+
+/// Run the model on the first user message. Blocking and CPU-heavy
+/// (~0.5-1 s, plus loading the model the first time): call from
+/// `spawn_blocking`, never from an async task.
+#[cfg(feature = "embedded-llm")]
+pub fn llm_title(paths: &Paths, spec: &ModelSpec, user: &str) -> Result<String> {
+    let mut cache = embedded::CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if embedded::cached_id(&cache) != Some(spec.id) {
+        *cache = None;
+        match embedded::load(paths, spec) {
+            Ok(l) => *cache = Some(l),
+            Err(e) => {
+                discard_once(paths, spec);
+                return Err(e.context("load the naming model"));
+            }
+        }
+    }
+    let loaded = cache.as_mut().expect("loaded above");
+    embedded::generate(loaded, spec, user)
 }
 
 #[cfg(not(feature = "embedded-llm"))]
@@ -362,5 +436,40 @@ mod tests {
         assert_eq!(spec("Qwen2.5-0.5B").unwrap().arch, Arch::Qwen2);
         assert_eq!(spec("lfm2.5-350m").unwrap().arch, Arch::Lfm2);
         assert!(spec("nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_truncated_model_counts_as_missing_and_is_fetched_again() {
+        let weights: &'static [u8] = b"full weights";
+        let app = axum::Router::new()
+            .route("/w", axum::routing::get(move || async move { weights }))
+            .route("/t", axum::routing::get(|| async { "{}" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        let spec = ModelSpec {
+            id: "test-model",
+            gguf_url: leak(format!("{base}/w")),
+            gguf_sha256: leak(format!("{:x}", Sha256::digest(weights))),
+            gguf_bytes: weights.len() as u64,
+            tokenizer_url: leak(format!("{base}/t")),
+            tokenizer_sha256: leak(format!("{:x}", Sha256::digest(b"{}"))),
+            ..QWEN2_5_0_5B
+        };
+        let dir = std::env::temp_dir().join(format!("fl-namer-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            data_dir: dir.join("d"),
+            config_dir: dir.join("c"),
+            profile: "t".into(),
+        };
+        std::fs::create_dir_all(models_dir(&paths)).unwrap();
+        std::fs::write(spec.gguf_path(&paths), b"full").unwrap();
+        std::fs::write(spec.tokenizer_path(&paths), b"{}").unwrap();
+        assert!(!spec.installed(&paths), "a short file is not installed");
+        download(&paths, &spec).await.unwrap();
+        assert!(spec.installed(&paths));
+        assert_eq!(std::fs::read(spec.gguf_path(&paths)).unwrap(), weights);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

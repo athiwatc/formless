@@ -170,7 +170,11 @@ pub fn azure(
     resource: &str,
     deployment: &str,
     api_version: Option<&str>,
-) -> anyhow::Result<(String, std::collections::BTreeMap<String, String>, &'static str)> {
+) -> anyhow::Result<(
+    String,
+    std::collections::BTreeMap<String, String>,
+    &'static str,
+)> {
     let resource = resource.trim().trim_end_matches('/');
     let deployment = deployment.trim();
     if resource.is_empty() || deployment.is_empty() {
@@ -185,7 +189,11 @@ pub fn azure(
     let mut q = std::collections::BTreeMap::new();
     q.insert(
         "api-version".to_string(),
-        api_version.map(str::trim).filter(|v| !v.is_empty()).unwrap_or(AZURE_API_VERSION).to_string(),
+        api_version
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(AZURE_API_VERSION)
+            .to_string(),
     );
     Ok((base, q, "api-key"))
 }
@@ -204,7 +212,10 @@ mod azure_tests {
     #[test]
     fn azure_builds_the_deployment_url_version_and_key_header() {
         let (base, q, header) = super::azure("contoso", "gpt4o", None).unwrap();
-        assert_eq!(base, "https://contoso.openai.azure.com/openai/deployments/gpt4o");
+        assert_eq!(
+            base,
+            "https://contoso.openai.azure.com/openai/deployments/gpt4o"
+        );
         assert_eq!(q["api-version"], super::AZURE_API_VERSION);
         assert_eq!(header, "api-key");
         let (base, q, _) =
@@ -245,13 +256,25 @@ mod tests {
     #[test]
     fn restyle_follows_the_endpoint_family() {
         let (oa, an) = ("https://api.openai.com/v1", "https://api.anthropic.com/v1");
-        assert_eq!(restyle(None, "https://api.anthropic.com", "chat"), Some("anthropic"));
+        assert_eq!(
+            restyle(None, "https://api.anthropic.com", "chat"),
+            Some("anthropic")
+        );
         assert_eq!(restyle(Some(oa), an, "chat"), Some("anthropic"));
         assert_eq!(restyle(Some(an), oa, "anthropic"), Some("chat"));
-        assert_eq!(restyle(Some(an), "http://my-proxy:8080/v1", "anthropic"), Some("chat"));
+        assert_eq!(
+            restyle(Some(an), "http://my-proxy:8080/v1", "anthropic"),
+            Some("chat")
+        );
         // Unrelated edits and explicit choices are kept.
-        assert_eq!(restyle(Some(an), "https://api.anthropic.com/v1/", "anthropic"), None);
-        assert_eq!(restyle(Some("http://a/v1"), "http://b/v1", "responses"), None);
+        assert_eq!(
+            restyle(Some(an), "https://api.anthropic.com/v1/", "anthropic"),
+            None
+        );
+        assert_eq!(
+            restyle(Some("http://a/v1"), "http://b/v1", "responses"),
+            None
+        );
         assert_eq!(restyle(Some(an), "http://my-proxy/v1", "responses"), None);
     }
 }

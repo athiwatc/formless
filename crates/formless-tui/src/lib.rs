@@ -1,8 +1,8 @@
 pub mod client;
 mod clipimg;
 mod commands;
-mod i18n;
 mod highlight;
+mod i18n;
 mod images;
 mod input;
 mod keys;
@@ -43,11 +43,16 @@ use client::DaemonClient;
 /// asks for reduced motion (`REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION`
 /// set to anything but empty, `0`, `false` or `off`).
 fn animations_enabled(setting: bool) -> bool {
-    let reduced = ["FORMLESS_REDUCED_MOTION", "REDUCED_MOTION"].iter().any(|k| {
-        std::env::var(k).is_ok_and(|v| {
-            !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no")
-        })
-    });
+    let reduced = ["FORMLESS_REDUCED_MOTION", "REDUCED_MOTION"]
+        .iter()
+        .any(|k| {
+            std::env::var(k).is_ok_and(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "off" | "no"
+                )
+            })
+        });
     setting && !reduced
 }
 
@@ -283,7 +288,13 @@ impl ModelOverlay {
             Some(a) => {
                 let names: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
                 std::iter::once(None)
-                    .chain(ALL_EFFORTS.iter().copied().filter(|e| names.contains(e)).map(Some))
+                    .chain(
+                        ALL_EFFORTS
+                            .iter()
+                            .copied()
+                            .filter(|e| names.contains(e))
+                            .map(Some),
+                    )
                     .collect()
             }
             None => EFFORTS.to_vec(),
@@ -293,7 +304,9 @@ impl ModelOverlay {
     /// The chosen effort, if the highlighted model accepts it.
     fn effort(&self) -> Option<&'static str> {
         let all = self.efforts();
-        all.get(self.effort_idx % all.len().max(1)).copied().flatten()
+        all.get(self.effort_idx % all.len().max(1))
+            .copied()
+            .flatten()
     }
 }
 
@@ -616,7 +629,10 @@ impl Wizard {
             }
             Some("api_key" | "model" | "effort") if !self.base_url.is_empty() => {
                 self.enter_api_key_step();
-                self.status = format!("Welcome back: you were setting up {}. {}", self.base_url, self.status);
+                self.status = format!(
+                    "Welcome back: you were setting up {}. {}",
+                    self.base_url, self.status
+                );
             }
             _ => {}
         }
@@ -626,7 +642,10 @@ impl Wizard {
     /// LM Studio if one is already running here (#398).
     fn offer_local(&mut self) {
         let presets = formless_core::presets::PRESETS;
-        if presets.iter().any(|p| formless_core::presets::env_key(p).is_some()) {
+        if presets
+            .iter()
+            .any(|p| formless_core::presets::env_key(p).is_some())
+        {
             return;
         }
         for (i, p) in presets.iter().enumerate().filter(|(_, p)| p.local) {
@@ -2010,7 +2029,13 @@ impl App {
                             }
                             for s in list {
                                 let state = if s.state.is_empty() {
-                                    if s.disabled { "disabled" } else if s.running { "ready" } else { "idle" }
+                                    if s.disabled {
+                                        "disabled"
+                                    } else if s.running {
+                                        "ready"
+                                    } else {
+                                        "idle"
+                                    }
                                 } else {
                                     s.state.as_str()
                                 };
@@ -2679,7 +2704,9 @@ impl App {
                         Pending::Backup => self.notes.push(format!(
                             "backed up the database to {} ({})",
                             result["file"].as_str().unwrap_or_default(),
-                            formless_core::housekeeping::human_bytes(result["bytes"].as_u64().unwrap_or(0))
+                            formless_core::housekeeping::human_bytes(
+                                result["bytes"].as_u64().unwrap_or(0)
+                            )
                         )),
                         Pending::McpLog => {
                             let lines: Vec<String> = result["lines"]
@@ -2756,12 +2783,18 @@ impl App {
                                     if params.is_empty() {
                                         String::new()
                                     } else {
-                                        format!("  [/mcp add {} {}]", e["id"].as_str().unwrap_or_default(), params.join(" "))
+                                        format!(
+                                            "  [/mcp add {} {}]",
+                                            e["id"].as_str().unwrap_or_default(),
+                                            params.join(" ")
+                                        )
                                     }
                                 ));
                             }
                             lines.push(String::new());
-                            lines.push("/mcp add ID [key=value] adds one; ✓ = already added.".into());
+                            lines.push(
+                                "/mcp add ID [key=value] adds one; ✓ = already added.".into(),
+                            );
                             self.pager = Some(Pager {
                                 title: "MCP server catalog".into(),
                                 lines,
@@ -2773,8 +2806,12 @@ impl App {
                         Pending::McpAdded => {
                             let name = result["added"].as_str().unwrap_or_default();
                             match result["error"].as_str() {
-                                Some(e) => self.notes.push(format!("added {name}, but it failed to start: {e}")),
-                                None => self.notes.push(format!("added {name} · {} tools", result["tools"])),
+                                Some(e) => self
+                                    .notes
+                                    .push(format!("added {name}, but it failed to start: {e}")),
+                                None => self
+                                    .notes
+                                    .push(format!("added {name} · {} tools", result["tools"])),
                             }
                             for k in result["env_keys"].as_array().into_iter().flatten() {
                                 self.notes.push(format!(
@@ -2783,7 +2820,8 @@ impl App {
                                 ));
                             }
                             if result["needs_login"] == true {
-                                self.notes.push(format!("log in with: formless mcp login {name}"));
+                                self.notes
+                                    .push(format!("log in with: formless mcp login {name}"));
                             }
                         }
                         Pending::McpImport => {
@@ -2801,33 +2839,47 @@ impl App {
                                             if c["exists"] == true { "✓" } else { "+" },
                                             c["name"].as_str().unwrap_or_default(),
                                             c["source"].as_str().unwrap_or_default(),
-                                            truncate_chars(c["target"].as_str().unwrap_or_default(), 80),
-                                            if c["exists"] == true { " · already added" } else { "" }
+                                            truncate_chars(
+                                                c["target"].as_str().unwrap_or_default(),
+                                                80
+                                            ),
+                                            if c["exists"] == true {
+                                                " · already added"
+                                            } else {
+                                                ""
+                                            }
                                         ));
                                     }
                                     if found.iter().any(|c| c["exists"] != true) {
-                                        self.notes.push("/mcp import NAME adds one (check its command first)".into());
-                                    }
-                                }
-                                Some(name) => match found.iter().find(|c| c["name"] == name.as_str()) {
-                                    Some(c) if c["exists"] == true => {
-                                        self.notes.push(format!("{name} is already configured"))
-                                    }
-                                    Some(c) => {
-                                        self.notes.push(format!(
-                                            "adding {name}: {}",
-                                            c["target"].as_str().unwrap_or_default()
-                                        ));
-                                        self.request(
-                                            Pending::McpAdded,
-                                            Request::AddMcpServer {
-                                                name: name.clone(),
-                                                server: c["server"].clone(),
-                                            },
+                                        self.notes.push(
+                                            "/mcp import NAME adds one (check its command first)"
+                                                .into(),
                                         );
                                     }
-                                    None => self.notes.push(format!("no importable server named {name} (see /mcp import)")),
-                                },
+                                }
+                                Some(name) => {
+                                    match found.iter().find(|c| c["name"] == name.as_str()) {
+                                        Some(c) if c["exists"] == true => {
+                                            self.notes.push(format!("{name} is already configured"))
+                                        }
+                                        Some(c) => {
+                                            self.notes.push(format!(
+                                                "adding {name}: {}",
+                                                c["target"].as_str().unwrap_or_default()
+                                            ));
+                                            self.request(
+                                                Pending::McpAdded,
+                                                Request::AddMcpServer {
+                                                    name: name.clone(),
+                                                    server: c["server"].clone(),
+                                                },
+                                            );
+                                        }
+                                        None => self.notes.push(format!(
+                                            "no importable server named {name} (see /mcp import)"
+                                        )),
+                                    }
+                                }
                             }
                         }
                         Pending::GetMcpPrompt => {
@@ -2861,7 +2913,8 @@ impl App {
                                 let mut parts = Vec::new();
                                 for kind in ["requests", "tokens"] {
                                     if let Some(rem) = l[format!("remaining-{kind}")].as_str() {
-                                        let limit = l[format!("limit-{kind}")].as_str().unwrap_or("?");
+                                        let limit =
+                                            l[format!("limit-{kind}")].as_str().unwrap_or("?");
                                         let reset = l[format!("reset-{kind}")]
                                             .as_str()
                                             .map(|r| format!(", resets {r}"))
@@ -2870,7 +2923,10 @@ impl App {
                                     }
                                 }
                                 if !parts.is_empty() {
-                                    self.notes.push(format!("rate limit at {endpoint}: {}", parts.join(" · ")));
+                                    self.notes.push(format!(
+                                        "rate limit at {endpoint}: {}",
+                                        parts.join(" · ")
+                                    ));
                                 }
                             }
                         }
@@ -3002,8 +3058,8 @@ impl App {
                             });
                             self.queued = serde_json::from_value(result["queued_items"].clone())
                                 .unwrap_or_default();
-                            self.plan = serde_json::from_value(result["plan"].clone())
-                                .unwrap_or_default();
+                            self.plan =
+                                serde_json::from_value(result["plan"].clone()).unwrap_or_default();
                             self.step_mode = result["step_mode"] == true;
                         }
                     }
@@ -3019,10 +3075,14 @@ impl App {
             return;
         };
         let mut words = cmd.split_whitespace().skip(1);
-        let (verb, n) = (words.next(), words.next().and_then(|n| n.parse::<usize>().ok()));
+        let (verb, n) = (
+            words.next(),
+            words.next().and_then(|n| n.parse::<usize>().ok()),
+        );
         let Some(verb) = verb else {
             if self.queued.is_empty() {
-                self.notes.push("nothing queued (Ctrl+J queues a message for after this Run)".into());
+                self.notes
+                    .push("nothing queued (Ctrl+J queues a message for after this Run)".into());
             } else {
                 self.notes.push(format!(
                     "{} queued · /queue edit|rm|up|down N",
@@ -3031,7 +3091,10 @@ impl App {
             }
             return;
         };
-        let Some(item) = n.and_then(|n| n.checked_sub(1)).and_then(|i| self.queued.get(i)).cloned()
+        let Some(item) = n
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| self.queued.get(i))
+            .cloned()
         else {
             self.notes
                 .push("usage: /queue edit|rm|up|down N (N from the queued list)".into());
@@ -3054,9 +3117,7 @@ impl App {
                 id: item.id,
                 up: verb == "up",
             }),
-            _ => self
-                .notes
-                .push("usage: /queue edit|rm|up|down N".into()),
+            _ => self.notes.push("usage: /queue edit|rm|up|down N".into()),
         }
     }
 
@@ -3154,7 +3215,10 @@ impl App {
     fn activity_text(&self) -> Option<String> {
         self.activity.as_ref().map(|a| {
             if let Some((at, count)) = &a.retry {
-                let left = at.saturating_duration_since(Instant::now()).as_secs_f64().ceil();
+                let left = at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64()
+                    .ceil();
                 let stop = i18n::tr("Esc to stop");
                 return if left > 0.0 {
                     format!(
@@ -3362,7 +3426,11 @@ impl App {
                 self.pager = Some(Pager {
                     title: format!(
                         "Compare: {}",
-                        results.iter().map(|r| r.model.as_str()).collect::<Vec<_>>().join(" vs ")
+                        results
+                            .iter()
+                            .map(|r| r.model.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" vs ")
                     ),
                     lines: compare_lines(&results, width),
                     top: 0,
@@ -3909,7 +3977,7 @@ impl App {
                         elapsed_ms: None,
                         handle: None,
                         stalled_secs: None,
-                    progress: None,
+                        progress: None,
                     });
                 }
             }
@@ -5709,7 +5777,13 @@ impl App {
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(model) = o.picker.choice() {
                     self.notes.push(format!("testing {model}…"));
-                    self.request(Pending::TestModel, Request::TestModel { model, provider: None });
+                    self.request(
+                        Pending::TestModel,
+                        Request::TestModel {
+                            model,
+                            provider: None,
+                        },
+                    );
                 }
             }
             KeyCode::Backspace => o.picker.backspace(),
@@ -5835,9 +5909,10 @@ impl App {
             let (step, status) = match w.step {
                 WizardStep::PickPreset => return,
                 WizardStep::BaseUrl => (WizardStep::PickPreset, "Choose your model provider."),
-                WizardStep::ApiKey if w.preset.is_none() => {
-                    (WizardStep::BaseUrl, "Enter your provider base URL (any OpenAI-compatible endpoint).")
-                }
+                WizardStep::ApiKey if w.preset.is_none() => (
+                    WizardStep::BaseUrl,
+                    "Enter your provider base URL (any OpenAI-compatible endpoint).",
+                ),
                 WizardStep::ApiKey => (WizardStep::PickPreset, "Choose your model provider."),
                 WizardStep::FetchModels | WizardStep::PickModel | WizardStep::Failed if local => {
                     (WizardStep::PickPreset, "Choose your model provider.")
@@ -5847,7 +5922,9 @@ impl App {
                     return;
                 }
                 WizardStep::PickEffort => (WizardStep::PickModel, "Pick a model."),
-                WizardStep::Probing | WizardStep::Failed => (WizardStep::PickEffort, "Pick reasoning effort."),
+                WizardStep::Probing | WizardStep::Failed => {
+                    (WizardStep::PickEffort, "Pick reasoning effort.")
+                }
             };
             w.retry_fetch = false;
             w.step = step;
@@ -5916,7 +5993,9 @@ impl App {
                     // The preset's API style (native Anthropic) applies to the probe too.
                     let pcfg = formless_core::config::ProviderCfg {
                         base_url: w.base_url.trim().to_string(),
-                        api_style: w.preset.map_or_else(|| "chat".into(), |p| p.api_style.to_string()),
+                        api_style: w
+                            .preset
+                            .map_or_else(|| "chat".into(), |p| p.api_style.to_string()),
                         ..Default::default()
                     };
                     let (key2, model) = (w.api_key.clone(), w.model());
@@ -7637,7 +7716,11 @@ impl App {
                     return self.step_decide("all", None);
                 }
                 KeyCode::Char('e') => {
-                    let args = self.step.as_ref().map(|s| pretty_json(&s.arguments)).unwrap_or_default();
+                    let args = self
+                        .step
+                        .as_ref()
+                        .map(|s| pretty_json(&s.arguments))
+                        .unwrap_or_default();
                     self.input.set(&args);
                     self.editing_step = true;
                     self.notes
@@ -8662,7 +8745,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             bold_fg(app.color, Color::Red),
         ));
     } else if let Some(pull) = &app.pull_status {
-        left.push(Span::styled(format!("⇣ {pull}"), bold_fg(app.color, Color::Cyan)));
+        left.push(Span::styled(
+            format!("⇣ {pull}"),
+            bold_fg(app.color, Color::Cyan),
+        ));
     } else if let Some(activity) = app.activity_text() {
         left.push(Span::styled(activity, bold_fg(app.color, Color::Yellow)));
     } else if app.running() {
@@ -9095,7 +9181,10 @@ fn plan_lines(
             _ => ("○", Style::default()),
         };
         out.push(Line::styled(
-            format!("    {mark} {}", truncate_chars(&i.content, width.saturating_sub(8).max(20))),
+            format!(
+                "    {mark} {}",
+                truncate_chars(&i.content, width.saturating_sub(8).max(20))
+            ),
             style,
         ));
     }
@@ -9114,7 +9203,11 @@ fn progress_text(fraction: Option<f64>, label: &str) -> String {
         "█".repeat(filled),
         "░".repeat(W - filled),
         f * 100.0,
-        if label.is_empty() { String::new() } else { format!(" {label}") }
+        if label.is_empty() {
+            String::new()
+        } else {
+            format!(" {label}")
+        }
     )
 }
 
@@ -9127,7 +9220,11 @@ fn recap_lines(r: &formless_protocol::RunRecap, open: bool, color: bool) -> Vec<
         r.steps,
         format_elapsed(Duration::from_millis(r.duration_ms.max(0) as u64))
     );
-    for (n, what) in [(r.used.len(), "calls"), (r.built.len(), "Tools changed"), (r.files.len(), "files")] {
+    for (n, what) in [
+        (r.used.len(), "calls"),
+        (r.built.len(), "Tools changed"),
+        (r.files.len(), "files"),
+    ] {
         if n > 0 {
             head.push_str(&format!(" · {n} {what}"));
         }
@@ -9173,13 +9270,22 @@ fn files_note(files: &[formless_protocol::RunFileInfo]) -> String {
     if changed.is_empty() {
         return "the Run's file changes were all undone".into();
     }
-    let shown = changed.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    let shown = changed
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
     let more = changed.len().saturating_sub(5);
     format!(
         "{} file{} changed: {shown}{} · /files shows the changes, /rewind reverts them",
         changed.len(),
         if changed.len() == 1 { "" } else { "s" },
-        if more > 0 { format!(", +{more} more") } else { String::new() }
+        if more > 0 {
+            format!(", +{more} more")
+        } else {
+            String::new()
+        }
     )
 }
 
@@ -9196,7 +9302,11 @@ fn files_pager_lines(files: &[formless_protocol::RunFileInfo]) -> Vec<String> {
                 _ => "M",
             },
             f.path,
-            if f.revertible { "" } else { "  (not revertible: too large or a folder)" }
+            if f.revertible {
+                ""
+            } else {
+                "  (not revertible: too large or a folder)"
+            }
         ));
         if let Some(d) = &f.diff {
             out.extend(d.lines().map(|l| format!("    {l}")));
@@ -9219,17 +9329,26 @@ fn status_lines(v: &serde_json::Value) -> Vec<String> {
         v["protocol"]
     )];
     if let Some(up) = r["uptime_secs"].as_u64() {
-        out.push(format!("uptime      {}", format_elapsed(Duration::from_secs(up))));
+        out.push(format!(
+            "uptime      {}",
+            format_elapsed(Duration::from_secs(up))
+        ));
     }
     if r["memory_bytes"].is_u64() {
         out.push(format!(
             "memory      {} · cpu {}% (total {})",
             b("memory_bytes"),
-            r["cpu_percent"].as_f64().map_or("?".into(), |c| format!("{c:.1}")),
+            r["cpu_percent"]
+                .as_f64()
+                .map_or("?".into(), |c| format!("{c:.1}")),
             r["cpu_time"].as_str().unwrap_or("?")
         ));
     }
-    out.push(format!("database    {} · artifacts {}", b("db_bytes"), b("artifacts_bytes")));
+    out.push(format!(
+        "database    {} · artifacts {}",
+        b("db_bytes"),
+        b("artifacts_bytes")
+    ));
     out.push(format!(
         "work        {} Sessions · {} running Runs · {} pending Invocations",
         v["sessions"],
@@ -9250,7 +9369,11 @@ fn storage_lines(v: &serde_json::Value, gc: bool) -> Vec<String> {
         .flatten()
         .map(|k| {
             let inside = k["inside_db"] == true;
-            let items = if gc { format!("{:>5} items  ", k["items"]) } else { String::new() };
+            let items = if gc {
+                format!("{:>5} items  ", k["items"])
+            } else {
+                String::new()
+            };
             format!(
                 "{}{:<22} {items}{:>10}  {}",
                 if inside { "  " } else { "" },
@@ -9283,7 +9406,11 @@ fn model_test_note(t: &serde_json::Value) -> String {
         yn("streaming"),
         yn("reasoning"),
         yn("tool_calling"),
-        if t["prompt_fallback"] == true { " (prompt fallback)" } else { "" }
+        if t["prompt_fallback"] == true {
+            " (prompt fallback)"
+        } else {
+            ""
+        }
     );
     if let Some(e) = t["error"].as_str() {
         out.push_str(&format!(" · {}", truncate_chars(e, 160)));
@@ -9297,11 +9424,17 @@ fn routing_lines(v: &serde_json::Value) -> Vec<String> {
     for d in v.as_array().into_iter().flatten() {
         out.push(format!(
             "{} · {} → {}",
-            d["at"].as_str().map(|t| ui::relative_time(t, chrono::Utc::now())).unwrap_or_default(),
+            d["at"]
+                .as_str()
+                .map(|t| ui::relative_time(t, chrono::Utc::now()))
+                .unwrap_or_default(),
             d["kind"].as_str().unwrap_or_default(),
             d["picked"].as_str().unwrap_or_default()
         ));
-        out.push(format!("  why: {}", d["reason"].as_str().unwrap_or_default()));
+        out.push(format!(
+            "  why: {}",
+            d["reason"].as_str().unwrap_or_default()
+        ));
         for c in d["candidates"].as_array().into_iter().flatten() {
             let mut fig = vec![format!("{} samples", c["samples"])];
             if let Some(r) = c["good_rate"].as_f64() {
@@ -9319,8 +9452,16 @@ fn routing_lines(v: &serde_json::Value) -> Vec<String> {
             if c["qualified"] == false {
                 fig.push("below the quality gate".into());
             }
-            let mark = if c["model"] == d["picked"] { "▸" } else { " " };
-            out.push(format!("  {mark} {} · {}", c["model"].as_str().unwrap_or_default(), fig.join(" · ")));
+            let mark = if c["model"] == d["picked"] {
+                "▸"
+            } else {
+                " "
+            };
+            out.push(format!(
+                "  {mark} {} · {}",
+                c["model"].as_str().unwrap_or_default(),
+                fig.join(" · ")
+            ));
         }
         out.push(String::new());
     }
@@ -9399,7 +9540,10 @@ fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) 
         }
     }
     out.push(String::new());
-    out.push("Each answer is in its own Session (\"… · compare MODEL\" in /sessions) to continue there.".into());
+    out.push(
+        "Each answer is in its own Session (\"… · compare MODEL\" in /sessions) to continue there."
+            .into(),
+    );
     out
 }
 
@@ -11378,7 +11522,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 ),
                 style,
             )];
-            if let Some((fraction, label)) = call.progress.as_ref().filter(|_| call.status == "running") {
+            if let Some((fraction, label)) =
+                call.progress.as_ref().filter(|_| call.status == "running")
+            {
                 spans.push(Span::styled(
                     format!("{}  ", progress_text(*fraction, label)),
                     fg(app.color, Color::Cyan),
@@ -13772,7 +13918,11 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             text.push(field("Base URL", w.base_url.clone()));
             text.push(field("API key", format!("{}▏", w.shown_key())));
             text.push(Line::styled(
-                if w.reveal_key { "          Ctrl+R hide · paste works" } else { "          Ctrl+R show · paste works" },
+                if w.reveal_key {
+                    "          Ctrl+R hide · paste works"
+                } else {
+                    "          Ctrl+R show · paste works"
+                },
                 ui::dim(color),
             ));
         }
@@ -14262,7 +14412,10 @@ mod tests {
             max_attempts: 5,
         });
         let text = app.activity_text().unwrap();
-        assert!(text.contains("rate limited · retrying in 8s (2/5) · Esc to stop"), "{text}");
+        assert!(
+            text.contains("rate limited · retrying in 8s (2/5) · Esc to stop"),
+            "{text}"
+        );
         // The next delta replaces the countdown.
         app.on_event(Event::MessageDelta {
             session_id: "s1".into(),
@@ -14284,7 +14437,10 @@ mod tests {
             meta: meta.map(str::to_string),
         };
         assert_eq!(steer_step(&msg(Some(r#"{"steer":{"step":4}}"#))), Some(4));
-        assert_eq!(steer_step(&msg(Some(r#"{"client":{"label":"web"}}"#))), None);
+        assert_eq!(
+            steer_step(&msg(Some(r#"{"client":{"label":"web"}}"#))),
+            None
+        );
         assert_eq!(steer_step(&msg(None)), None);
     }
 
@@ -14352,16 +14508,28 @@ mod tests {
         let text = |lines: Vec<Line>| {
             lines
                 .iter()
-                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.to_string())
+                        .collect::<String>()
+                })
                 .collect::<Vec<_>>()
         };
-        let plan = vec![item("Read", "completed"), item("Fix", "in_progress"), item("Test", "pending")];
+        let plan = vec![
+            item("Read", "completed"),
+            item("Fix", "in_progress"),
+            item("Test", "pending"),
+        ];
         assert_eq!(
             text(plan_lines(&plan, true, 80, false)),
             ["", "  Plan (1/3)", "    ✓ Read", "    ▸ Fix", "    ○ Test"]
         );
         let done = vec![item("Read", "completed")];
-        assert_eq!(text(plan_lines(&done, false, 80, false)), ["", "  ✓ Plan done (1/1)"]);
+        assert_eq!(
+            text(plan_lines(&done, false, 80, false)),
+            ["", "  ✓ Plan done (1/1)"]
+        );
     }
 
     #[test]
@@ -14374,7 +14542,11 @@ mod tests {
         app.drain_daemon();
         assert!(app.offline.is_some() && app.inbox.is_none());
         app.submit_chat(false);
-        assert_eq!(app.input.expanded(), "half-typed message", "kept while offline");
+        assert_eq!(
+            app.input.expanded(),
+            "half-typed message",
+            "kept while offline"
+        );
         assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
     }
 
@@ -14394,7 +14566,11 @@ mod tests {
         let results = vec![r("alpha", "short"), r("beta", "a longer answer here")];
         let wide = compare_lines(&results, 100);
         assert!(wide[0].contains("alpha · completed · 1.5s · 42 tokens · 1 steps · $0.0012"));
-        assert!(wide.iter().any(|l| l.contains("short") && l.contains("│ a longer answer here")), "{wide:?}");
+        assert!(
+            wide.iter()
+                .any(|l| l.contains("short") && l.contains("│ a longer answer here")),
+            "{wide:?}"
+        );
         let narrow = compare_lines(&results, 40);
         assert!(narrow.iter().any(|l| l == "── beta ──"));
         assert!(!narrow.iter().any(|l| l.contains('│')));
@@ -18012,7 +18188,7 @@ mod tests {
             elapsed_ms: Some(5),
             handle: None,
             stalled_secs: None,
-                    progress: None,
+            progress: None,
         };
         let calls = vec![
             node("done_top", 0, "ok"),

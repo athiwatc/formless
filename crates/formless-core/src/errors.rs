@@ -305,7 +305,9 @@ pub fn tool_error_detail(message: &str, code: &str, input: &serde_json::Value) -
         .collect();
     let src: Vec<&str> = code.lines().collect();
     let mut out = vec![head];
-    let Some((_, line, col)) = frames.first().filter(|(_, l, _)| *l >= 1 && *l <= src.len())
+    let Some((_, line, col)) = frames
+        .first()
+        .filter(|(_, l, _)| *l >= 1 && *l <= src.len())
     else {
         // No position in the Tool's code: keep what QuickJS said.
         return message.trim_end().to_string();
@@ -349,6 +351,9 @@ mod tool_error_tests {
             "cannot read property 'deep' of undefined\n  at helper (line 2) ← run (line 6)\n\n  1 | function helper(x) {\n> 2 |   return x.missing.deep;\n    |          ^\n  3 | }\n  4 | function run(input) {\n\ninput: {\"a\":1}"
         );
         // No usable frame: unchanged.
-        assert_eq!(tool_error_detail("boom\n", code, &serde_json::json!({})), "boom");
+        assert_eq!(
+            tool_error_detail("boom\n", code, &serde_json::json!({})),
+            "boom"
+        );
     }
 }

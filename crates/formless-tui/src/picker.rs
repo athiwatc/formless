@@ -25,7 +25,13 @@ pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Optio
         });
     }
     if let (Some(i), Some(o)) = (meta["input_price"].as_f64(), meta["output_price"].as_f64()) {
-        let fmt = |v: f64| if v.fract() == 0.0 { format!("{v:.0}") } else { format!("{v:.2}") };
+        let fmt = |v: f64| {
+            if v.fract() == 0.0 {
+                format!("{v:.0}")
+            } else {
+                format!("{v:.2}")
+            }
+        };
         parts.push(format!("${}/${} per M", fmt(i), fmt(o)));
     }
     if meta["vision"] == true {

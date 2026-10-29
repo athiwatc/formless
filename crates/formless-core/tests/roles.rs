@@ -443,3 +443,70 @@ async fn old_auto_configs_migrate_on_start_and_primary_runs_feed_routing() {
     store.mark_last_run_followup(&sid, "corrected").unwrap();
     assert_eq!(store.task_stats("primary").unwrap()[0].good, 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_llm_spend_counts_toward_the_run_budget() {
+    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let seen: Seen = Arc::default();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        post({
+            let seen = seen.clone();
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "cost": 1.0}
+                    }))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-budget-{short}"));
+    let paths = Paths {
+        data_dir: dir.join("d"),
+        config_dir: dir.join("c"),
+        profile: format!("test-budget-{short}"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = base;
+    cfg.provider.model = "m".into();
+    cfg.provider.max_retries = 1;
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.limits.run_usd = Some(2.5);
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let out = daemon
+        .call_tool_direct(&sid, "create_tool", serde_json::json!({
+            "name": "spender", "description": "loops", "input_schema": {"type": "object"},
+            "output_schema": {}, "implementation_js": "function run(i){ for (let n = 0; n < 10; n++) llm.complete('hi'); return {}; }",
+            "capabilities": ["llm"]}))
+        .await;
+    assert!(out.contains("\"created\""), "{out}");
+    let (tool, ver) = store.get_tool_by_name("spender").unwrap().unwrap();
+    store
+        .set_approval(
+            &tool.id,
+            &formless_runtime::Capabilities::parse(&ver.capabilities).unwrap(),
+            ver.memory_mb,
+        )
+        .unwrap();
+    let before = seen.lock().unwrap().len();
+    let r = daemon
+        .call_tool_direct(&sid, "spender", serde_json::json!({}))
+        .await;
+    assert!(r.contains("budget"), "{r}");
+    // $1 a call against $2.50: the fourth call is refused.
+    assert_eq!(seen.lock().unwrap().len() - before, 3);
+    assert_eq!(store.run_usage("direct").unwrap().prompt_tokens, 30);
+}
