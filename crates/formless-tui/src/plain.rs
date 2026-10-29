@@ -45,6 +45,11 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
         Event::MessageComplete { .. } => {
             return (*streaming).then(|| end_stream(streaming).to_string());
         }
+        // Scripted output is never silently wrong (#1096).
+        Event::DeltasDropped { .. } => {
+            eprintln!("\n[output fell behind: some live text was skipped; the full answer is in the transcript]");
+            return None;
+        }
         Event::ToolCallStarted {
             tool_name, depth, ..
         } if *depth == 0 => format!("{}Tool started: {tool_name}.", end_stream(streaming)),

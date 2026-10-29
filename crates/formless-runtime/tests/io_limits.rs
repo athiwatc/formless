@@ -46,6 +46,43 @@ fn reads_output_and_logs_stop_at_their_caps() {
         e.message
     );
 
+    // A file whose size says 0 is still read only up to the cap (#1103).
+    #[cfg(unix)]
+    {
+        let e = run(
+            "function run(){ return fs.read('/dev/zero'); }",
+            &["fs:read:/dev".into()],
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ExecErrorKind::Resource, "{}", e.message);
+    }
+    // An overlay (dry-run) read over the cap fails the same way.
+    let staged = dir.join("staged.txt");
+    let e = execute(
+        &ExecRequest {
+            code: format!(
+                "function run(){{ fs.write({p:?}, 'y'.repeat(1500)); return fs.read({p:?}); }}",
+                p = staged.display().to_string()
+            ),
+            input: json!({}),
+            caps: Capabilities::parse(&[
+                format!("fs:write:{}", dir.display()),
+                format!("fs:read:{}", dir.display()),
+            ])
+            .unwrap(),
+            memory_mb: 64,
+            mode: HostMode::DryRun,
+            cancel: Arc::new(AtomicBool::new(false)),
+            overlay: None,
+            activity: None,
+            modules: Arc::new(Vec::new()),
+        },
+        Arc::new(NoHostOps),
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, ExecErrorKind::Resource, "{}", e.message);
+    assert!(!staged.exists(), "dry run never wrote");
+
     // Chunked reading still works past the cap.
     let n = run(
         &format!("function run(){{ let n = 0; fs.readChunks({:?}, 500, (c) => {{ n += c.length; }}); return n; }}", big.display().to_string()),

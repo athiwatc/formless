@@ -448,6 +448,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             .unwrap_or(name)
             .trim_end_matches(".exe")
             .to_ascii_lowercase();
+        // Versioned names (`python3.11`, `ruby3.2`, `node20`) count too.
+        let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
         if matches!(
             base.as_str(),
             "sh" | "bash"
@@ -457,18 +459,14 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "cmd"
                 | "powershell"
                 | "pwsh"
-                | "python"
-                | "python3"
-                | "node"
-                | "deno"
-                | "bun"
-                | "perl"
-                | "ruby"
-                | "php"
                 | "osascript"
                 | "env"
                 | "xargs"
                 | "sudo"
+                | "doas"
+        ) || matches!(
+            stem,
+            "python" | "node" | "deno" | "bun" | "perl" | "ruby" | "php" | "lua" | "tclsh"
         ) {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
@@ -477,6 +475,20 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat"
         ) {
             return Some("it can reach any host and write files, like net plus fs:write");
+        }
+        // Run other programs through options or files they read (#1099).
+        match base.as_str() {
+            "git" => {
+                return Some(
+                    "git runs hooks and settings from the repository it works in, even for read-only sub-commands",
+                )
+            }
+            "find" => return Some("find can run any program (-exec)"),
+            "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
+            "make" | "cmake" | "ninja" => {
+                return Some("a build tool runs whatever the build files say")
+            }
+            _ => {}
         }
     }
     if let Some(key) = spec.strip_prefix("env:") {
@@ -2109,6 +2121,13 @@ pub enum Event {
         run_id: String,
         message: MessageInfo,
     },
+    /// Some live answer deltas were dropped for this client (it fell
+    /// behind): the text shown so far has a gap, and `MessageComplete`
+    /// carries the whole answer (#1096).
+    DeltasDropped {
+        session_id: String,
+        run_id: String,
+    },
     /// The provider stream dropped and the request is being re-sent:
     /// clients discard the partial answer and reasoning shown so far.
     StreamRestarted {
@@ -2432,6 +2451,7 @@ impl Event {
             | Event::MessageDelta { session_id, .. }
             | Event::ReasoningDelta { session_id, .. }
             | Event::MessageComplete { session_id, .. }
+            | Event::DeltasDropped { session_id, .. }
             | Event::StreamRestarted { session_id, .. }
             | Event::ProviderStalled { session_id, .. }
             | Event::ProviderRetrying { session_id, .. }
@@ -2527,6 +2547,23 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn programs_that_run_others_are_flagged_broad() {
+        for spec in [
+            "process:python3.11",
+            "process:ruby3.2",
+            "process:node20",
+            "process:git",
+            "process:git:status|log",
+            "process:find",
+            "process:tar",
+            "process:make",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        assert!(broad_capability("process:ls").is_none());
+    }
 
     #[test]
     fn versions_negotiate_to_the_highest_common_one() {
@@ -2655,7 +2692,7 @@ mod tests {
         }
         for scoped in [
             "net:example.com",
-            "process:git",
+            "process:ls",
             "fs:write:/Users/ada/project",
             "fs:write:/tmp/out",
             "fs:read:/",

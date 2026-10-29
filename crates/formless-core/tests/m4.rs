@@ -3044,6 +3044,12 @@ async fn a_panicking_run_frees_its_session() {
         .as_str()
         .unwrap()
         .to_string();
+    // Queued before the Run starts: the panicking Run's finish starts it
+    // (#1097).
+    formless_core::Store::open(&paths.db_file())
+        .unwrap()
+        .enqueue_message(&id, "queued after the panic")
+        .unwrap();
     c.send(Request::SendMessage {
         session_id: id.clone(),
         content: "please panic-now-7c1".into(),
@@ -3067,6 +3073,7 @@ async fn a_panicking_run_frees_its_session() {
         }
     }
     assert!(paused.unwrap().contains("internal error"));
+    assert_eq!(c.run_to_finish().await, "fine", "the queued message ran");
     c.send(Request::SendMessage {
         session_id: id.clone(),
         content: "hello again".into(),

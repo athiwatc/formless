@@ -2015,6 +2015,11 @@ such as `read_file`, `read_text_file` and `file_read`.
   Sessions, settings, export/import) and daemon→client streamed events
   (model content and reasoning deltas, tool-call lifecycle, pending/stall
   notices, approval requests, compaction notices, optimiser activity).
+- A client that falls behind loses live deltas first; it is told with
+  `DeltasDropped {session_id, run_id}` once there is room, and the
+  answer's `MessageComplete` carries the whole text (plain mode notes the
+  gap on stderr). Only when it can't take an event that matters is it
+  disconnected, and then all of its connection's tasks end.
 - Each connection may `Subscribe {sessions, deltas}`: only the listed
   Sessions' transcript and live events (and token deltas only if
   `deltas`) reach it. Tool/module/proposal events, approvals, the Session
@@ -3559,7 +3564,15 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   Children start from an empty environment: only a minimal base (`PATH`,
   `HOME`, `USER`, locale, `TERM`, `TZ`, temp dirs, and the Windows
   system variables) plus the keys the Tool's `env:` Capability grants are
-  passed on, and `FORMLESS_*` variables never are.
+  passed on, and `FORMLESS_*` variables never are. A call's own `env`
+  may set other variables, except ones that change what runs or loads
+  (`PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `*_OPTIONS`, `BASH_ENV`,
+  interpreter paths, pagers and editors), which need that key's `env:`
+  grant. Git under a sub-command grant (`process:git:status|log`) runs
+  with fsmonitor, pager, credential helpers, external diff and ssh
+  turned off; repository hooks and settings can still run, so `git`,
+  `find`, `tar`, build tools and versioned interpreters (`python3.11`)
+  are flagged as broad when approved.
 - **Network:** `fetch` honours the `net` scope (domain allowlist when
   scoped), http(s) only; redirects are followed but every hop is checked,
   so they may not escape a domain scope.

@@ -3531,6 +3531,13 @@ impl App {
                     self.notes.push("provider stream dropped; retrying".into());
                 }
             }
+            // The live text has a gap; the finished message replaces it.
+            Event::DeltasDropped { session_id, .. } => {
+                if self.is_current(&session_id) {
+                    self.notes
+                        .push("display fell behind; the full answer shows when it's done".into());
+                }
+            }
             Event::ReasoningDelta {
                 session_id, delta, ..
             } => {
