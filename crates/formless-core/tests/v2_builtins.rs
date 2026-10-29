@@ -118,7 +118,8 @@ fn process_run_takes_cwd_stdin_env_and_binary_output() {
              }}"
         ),
         json!({}),
-        &["process"],
+        // The working folder must be one the Tool may read (#608).
+        &["process", &format!("fs:read:{dir}")],
     )
     .unwrap();
     assert_eq!(out["a"], "piped in");
@@ -381,7 +382,9 @@ async fn fetch_redirect_hops_follow_browser_rules() {
         let code = format!(
             "function run(){{ return fetch('{base}{path}', {{method: 'POST', body: 'abc', headers: {{authorization: 'secret'}}}}).body; }}"
         );
-        tokio::task::spawn_blocking(move || live(&code, json!({}), &["net"]))
+        tokio::task::spawn_blocking(move || {
+            live(&code, json!({}), &["net:127.0.0.1", "net:localhost"])
+        })
     };
     assert_eq!(
         fetch("/see-other").await.unwrap().unwrap(),

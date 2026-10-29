@@ -2959,3 +2959,65 @@ async fn compare_runs_each_model_in_a_fork_and_reports_both() {
     assert_eq!(msgs.as_array().unwrap().len(), 0, "{msgs}");
     server.abort();
 }
+
+/// A Run that panics frees its Session (#607): the Run is left paused with
+/// the reason, and the next message runs normally without a restart.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_panicking_run_frees_its_session() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    std::env::set_var("FORMLESS_TEST_PANIC_MARKER", "panic-now-7c1");
+    let paths = temp_paths("m4panic");
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route("/chat/completions", post(|| async { sse_text("fine") }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "please panic-now-7c1".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut paused = None;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(&line) {
+            Ok(ServerMessage::Event(Event::RunPaused { error, .. })) => paused = Some(error),
+            Ok(ServerMessage::Event(Event::RunFinished { status, .. })) => {
+                assert_eq!(status, "paused");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(paused.unwrap().contains("internal error"));
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "hello again".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    assert_eq!(c.run_to_finish().await, "fine", "the Session works again");
+    server.abort();
+}

@@ -1061,6 +1061,26 @@ pattern (§4.4).
   recorded input. This lets one generic Tool keep least privilege: it gets
   exactly the paths/hosts it was called with, never a project directory
   baked in at creation.
+- **Private addresses (#603).** Every `fetch` hop resolves the host once
+  and refuses loopback, private, link-local, CGNAT, unique-local,
+  multicast and unspecified addresses (IPv4-mapped too), unless a grant
+  names that host or IP exactly: `net:localhost` / `net:127.0.0.1` reach a
+  local model, while `net:example.com` never reaches a subdomain that
+  resolves inside your network, and bare `net` reaches public hosts only.
+  The connection is pinned to the checked address, so DNS can't change in
+  between. Denials name it: `denied: net:x resolves to 10.0.0.5, a private
+  or local address; grant net:x itself to reach it`.
+- **Ports.** A `net` grant may carry a port (`net:api.example.com:8443`)
+  and then allows that port only; a portless grant allows any. An
+  input-bound URL with a non-default port binds to `host:port`, so the
+  approval shows exactly that port.
+- **`process` scoping (#608).** `process:git:status|log|diff` allows only
+  those first arguments; `process:git` (unscoped) allows any and covers
+  the scoped forms. A `cwd` must lie inside the Tool's `fs:read` /
+  `fs:write` grants (`denied: cwd … is outside this Tool's fs grants`).
+  Approvals flag interpreters and shells (`bash`, `python`, `node`, `env`,
+  `sudo`, …) as broad as bare `process`, and `curl` / `wget` / `ssh` /
+  `rsync` / `nc` as `net` plus `fs:write`.
 - `memory_mb` (default 256) is declared and governed like a Capability:
   shown at approval, widening re-prompts, bounded by a daemon max
   (default 4 GB).
@@ -1891,6 +1911,18 @@ such as `read_file`, `read_text_file` and `file_read`.
   which never stops for being idle, so scheduled jobs (§9.7) fire on
   time. `uninstall-service` unloads and removes it; `formless doctor`
   shows whether it is installed, and the jobs warning suggests it.
+- **Back-pressure (#605).** A request line over 32 MB closes the
+  connection while it is being read (nothing larger is buffered). Each
+  client's outgoing queue holds 4,096 messages: when it is full, live
+  deltas (message and reasoning text, progress, usage, activity) are
+  dropped for that client, and anything else (responses, approvals,
+  questions, results) disconnects it with a log line instead of waiting.
+  `Status.resources.client_queues` shows each client's queue.
+- **Panics (#607).** A panic while handling a request becomes that
+  request's error reply (`internal error while handling send_message: …`,
+  logged) instead of a dead connection. A panic inside a Run frees its
+  Session: the Run is left `paused` with `internal error: …`, `RunPaused`
+  and `RunFinished` go out, and the next message starts normally.
 - **Reconnecting.** When the daemon goes away (restart, crash), the TUI
   keeps the screen, Session, draft and scroll position, shows "⚠
   reconnecting to the daemon… (Ns)" in the status bar, and tries again
@@ -3286,6 +3318,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   [optimiser] [metrics] [tools]`. Env vars `FORMLESS_*` override file values.
   Per-Session model/effort live in SQLite, not the file. Nothing configurable
   is a hidden constant: this table is exhaustive for v1.
+- **Saving keeps your file (#610).** Every save (a setting, an MCP
+  server, a migration) merges into the existing `config.toml`: changed
+  values are replaced in place with their comments, new non-default keys
+  are added, removed settings are deleted, and keys this build doesn't
+  read (a newer build's, your own notes as keys) stay. Writes are atomic:
+  a temporary file beside it, flushed to disk, renamed over it, so a crash
+  leaves the old file or the new one.
 - **Changing settings from a client:** clients never write the file.
   `SetSetting {key, value}` asks the daemon to set one dotted key. The
   daemon checks the key against an allow-list: provider model, effort,

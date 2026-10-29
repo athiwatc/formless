@@ -359,7 +359,21 @@ impl Capabilities {
         }) && path_covers(&self.fs_read, &other.fs_read)
             && path_covers(&self.fs_write, &other.fs_write)
             && other.env.iter().all(|k| self.env.contains(k))
-            && scoped_covers(&self.process, &other.process, |a, b| a == b)
+            // `process:git` covers `process:git:status`; a scoped grant
+            // covers only the sub-commands it lists.
+            && scoped_covers(&self.process, &other.process, |a, b| {
+                if a == b {
+                    return true;
+                }
+                let (ac, asub) = crate::process_grant(a);
+                let (bc, bsub) = crate::process_grant(b);
+                ac == bc
+                    && match (asub, bsub) {
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(x), Some(y)) => y.iter().all(|s| x.contains(s)),
+                    }
+            })
             && (!other.clipboard_read || self.clipboard_read)
             && (!other.clipboard_write || self.clipboard_write)
             && (!other.notify || self.notify)
@@ -443,19 +457,33 @@ pub fn canonical_path(raw: &str) -> Result<std::path::PathBuf, String> {
 }
 
 /// Host of a bound `net` value: a URL's host, or the value as a bare host.
+/// A non-default port is kept (`host:8443`), so the grant shown for
+/// approval is exactly that port, never every port (#603).
 fn bound_host(raw: &str) -> Result<String, String> {
     if raw.contains("://") {
         let u = reqwest::Url::parse(raw).map_err(|e| format!("bad URL for net binding: {e}"))?;
-        return u
+        let host = u
             .host_str()
             .map(str::to_string)
-            .ok_or_else(|| format!("URL has no host: {raw}"));
+            .ok_or_else(|| format!("URL has no host: {raw}"))?;
+        return Ok(match u.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host,
+        });
     }
-    let host = raw.split(['/', ':']).next().unwrap_or_default();
+    let first = raw.split('/').next().unwrap_or_default();
+    let (host, port) = match first.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (h, Some(p)),
+        _ => (first, None),
+    };
     if host.is_empty() || host.contains(char::is_whitespace) {
         return Err(format!("bad host for net binding: {raw}"));
     }
-    Ok(host.to_lowercase())
+    match port {
+        Some(p) if p.parse::<u16>().is_ok() => Ok(format!("{}:{p}", host.to_lowercase())),
+        Some(_) => Err(format!("bad port for net binding: {raw}")),
+        None => Ok(host.to_lowercase()),
+    }
 }
 
 fn scoped_covers(
@@ -517,7 +545,8 @@ mod tests {
             b.fs_write,
             vec![dir.join("new.txt").to_string_lossy().to_string()]
         );
-        assert_eq!(b.net, Some(vec!["api.example.com".to_string()]));
+        // The input URL's port stays in the grant (#603).
+        assert_eq!(b.net, Some(vec!["api.example.com:8443".to_string()]));
     }
 
     #[test]
@@ -556,5 +585,22 @@ mod tests {
         assert!(caps(&["net:x.com"])
             .union(&caps(&["net"]))
             .covers(&caps(&["net"])));
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn bound_urls_keep_their_port_and_process_grants_cover_sub_commands() {
+        assert_eq!(bound_host("https://api.example.com:8443/x").unwrap(), "api.example.com:8443");
+        assert_eq!(bound_host("https://api.example.com/x").unwrap(), "api.example.com");
+        assert_eq!(bound_host("Host.example:9000").unwrap(), "host.example:9000");
+        assert!(bound_host("host:notaport").is_err());
+        let wide = Capabilities::parse(&["process:git".to_string()]).unwrap();
+        let narrow = Capabilities::parse(&["process:git:status".to_string()]).unwrap();
+        assert!(wide.covers(&narrow));
+        assert!(!narrow.covers(&wide));
     }
 }
