@@ -1722,8 +1722,15 @@ impl Daemon {
                     return Err(anyhow!("provider names use letters, digits, '-' and '_' (and 'default' is [provider])"));
                 }
                 let mut cfg = Config::load_file_only(&self.paths)?;
+                let new = !cfg.providers.contains_key(&name);
                 let p = cfg.providers.entry(name.clone()).or_default();
                 p.base_url = base_url.trim_end_matches('/').to_string();
+                // A preset's endpoint gets its API style (Anthropic: native).
+                if new {
+                    if let Some(preset) = crate::presets::for_url(&p.base_url) {
+                        p.api_style = preset.api_style.to_string();
+                    }
+                }
                 if let Some(m) = model {
                     p.model = m;
                 }
@@ -3884,6 +3891,10 @@ impl Daemon {
             let mut meta = json!({"tool_calls": calls_json});
             if !result.reasoning.is_empty() {
                 meta["reasoning_content"] = json!(result.reasoning);
+            }
+            // Anthropic: the signed thinking goes back with the results.
+            if !result.thinking_blocks.is_empty() {
+                meta["thinking_blocks"] = json!(result.thinking_blocks);
             }
             let call_msg = self.with_store(|st| {
                 st.append_message_meta(
@@ -6185,6 +6196,9 @@ impl Daemon {
                         json!({"role": "assistant", "content": preamble, "tool_calls": calls_json});
                     if !result.reasoning.is_empty() {
                         assistant["reasoning_content"] = json!(result.reasoning);
+                    }
+                    if !result.thinking_blocks.is_empty() {
+                        assistant["thinking_blocks"] = json!(result.thinking_blocks);
                     }
                     record(&assistant);
                     messages.push(assistant);

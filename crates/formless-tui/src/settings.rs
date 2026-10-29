@@ -107,7 +107,7 @@ pub fn rows(
             "provider.api_style",
             "api_style",
             p.api_style.clone(),
-            Choice(&["chat", "responses"]),
+            Choice(&["chat", "responses", "anthropic"]),
         ),
         Row::new(
             "Provider",
