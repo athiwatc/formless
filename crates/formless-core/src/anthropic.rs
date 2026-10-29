@@ -323,6 +323,8 @@ pub enum Recovery {
     Thinking,
     /// `max_tokens` lowered to the limit the error named.
     MaxTokens,
+    /// The thinking budget lowered under `max_tokens`.
+    ThinkingBudget,
     /// `cache_control` breakpoints removed.
     CacheControl,
     /// Image blocks replaced with a text line.
@@ -339,6 +341,9 @@ impl Recovery {
             Self::Thinking => "The model does not accept extended thinking; resent without it.",
             Self::MaxTokens => {
                 "The provider rejected the output limit; resent with the model's maximum."
+            }
+            Self::ThinkingBudget => {
+                "The thinking budget did not fit under the output limit; resent with a smaller one."
             }
             Self::CacheControl => {
                 "The provider rejected prompt-cache breakpoints; resent without them."
@@ -403,6 +408,19 @@ pub fn recover(body: &mut Value, error: &str) -> Option<Recovery> {
             }
             return Some(Recovery::ReplayedThinking);
         }
+    }
+    // "`max_tokens` must be greater than `thinking.budget_tokens`": fit the
+    // budget under the output limit and keep thinking (#1089).
+    if lower.contains("budget_tokens") && lower.contains("max_tokens") {
+        let max = body["max_tokens"].as_u64().unwrap_or(MAX_TOKENS);
+        let budget = body["thinking"]["budget_tokens"].as_u64()?;
+        let fitted = max.saturating_sub(MIN_THINKING).min(budget);
+        if fitted >= MIN_THINKING && fitted < budget {
+            body["thinking"]["budget_tokens"] = json!(fitted);
+            return Some(Recovery::ThinkingBudget);
+        }
+        body.as_object_mut()?.remove("thinking");
+        return Some(Recovery::Thinking);
     }
     if lower.contains("thinking") && body.get("thinking").is_some() {
         body.as_object_mut()?.remove("thinking");
@@ -771,6 +789,43 @@ mod tests {
         );
         assert_eq!(recover(&mut b, "thinking: not supported"), None);
         assert_eq!(recover(&mut b, "something else"), None);
+    }
+
+    /// Anthropic's real wordings each take their own branch (#1089).
+    #[test]
+    fn budget_errors_fit_thinking_instead_of_dropping_it() {
+        let msgs = [json!({"role": "user", "content": "x"})];
+        let mut b = body("claude-x", &msgs, &[], false, Some("high"), true);
+        b["max_tokens"] = json!(16_000);
+        b["thinking"]["budget_tokens"] = json!(16_000);
+        let e = "max_tokens must be greater than thinking.budget_tokens. Please consult our documentation";
+        assert_eq!(recover(&mut b, e), Some(Recovery::ThinkingBudget));
+        let budget = b["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!((MIN_THINKING..16_000).contains(&budget), "{budget}");
+
+        let mut b = body("claude-x", &msgs, &[], false, Some("high"), true);
+        assert_eq!(
+            recover(&mut b, "thinking: Extra inputs are not permitted"),
+            Some(Recovery::Thinking)
+        );
+        assert!(b.get("thinking").is_none());
+
+        let replay = [
+            json!({"role": "user", "content": "x"}),
+            json!({"role": "assistant", "content": null,
+                   "thinking_blocks": [{"type": "thinking", "thinking": "t", "signature": "bad"}],
+                   "tool_calls": [{"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t", "content": "1"}),
+        ];
+        let mut b = body("claude-x", &replay, &[], false, Some("high"), true);
+        assert_eq!(
+            recover(
+                &mut b,
+                "messages.1.content.0: Invalid `signature` in `thinking` block"
+            ),
+            Some(Recovery::ReplayedThinking)
+        );
+        assert!(b.get("thinking").is_some(), "thinking itself kept");
     }
 
     #[test]

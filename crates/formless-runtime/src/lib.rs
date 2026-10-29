@@ -461,29 +461,49 @@ fn utf8_cut(b: &[u8]) -> usize {
     n
 }
 
+/// A `net:` grant as (host, port): `host`, `host:port`, an IPv6 literal
+/// (`::1`), or a bracketed one with a port (`[::1]:8080`, the form input
+/// binding produces).
+fn split_grant(d: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = d.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            return (host, after.strip_prefix(':').and_then(|p| p.parse().ok()));
+        }
+    }
+    match d.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => match p.parse() {
+            Ok(port) => (h, Some(port)),
+            Err(_) => (d, None),
+        },
+        _ => (d, None),
+    }
+}
+
 fn host_in_scope(domains: &[String], host: &str, port: Option<u16>) -> bool {
+    let host = host.trim_matches(['[', ']']);
     domains.iter().any(|d| {
         // `host:port` grants (input-bound URLs with a port) match that port only.
-        let (dh, dp) = match d.rsplit_once(':') {
-            Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok() => (h, p.parse().ok()),
-            _ => (d.as_str(), None),
-        };
+        let (dh, dp) = split_grant(d);
         (host == dh || host.ends_with(&format!(".{dh}"))) && dp.is_none_or(|p| Some(p) == port)
     })
 }
 
-/// A grant names `host` itself (not a parent domain): only then may it
-/// reach a private address (`net:localhost` for a local model).
-fn names_host_exactly(domains: &[String], host: &str) -> bool {
-    domains
-        .iter()
-        .any(|d| d == host || d.rsplit_once(':').is_some_and(|(h, _)| h == host))
+/// A grant names `host` itself (not a parent domain), on this port or on
+/// any: only then may it reach a private address (`net:localhost` for a
+/// local model).
+fn names_host_exactly(domains: &[String], host: &str, port: u16) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    domains.iter().any(|d| {
+        let (dh, dp) = split_grant(d);
+        dh == host && dp.is_none_or(|p| p == port)
+    })
 }
 
-/// Loopback, private, link-local, CGNAT, multicast, unspecified or
-/// otherwise not public (SPEC §7.4).
+/// Loopback, private, link-local, CGNAT, multicast, unspecified, reserved
+/// or otherwise not public (SPEC §7.4). IPv6 forms that carry an IPv4
+/// address (mapped, compatible, NAT64, 6to4) are judged by that address.
 fn non_public(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -495,18 +515,42 @@ fn non_public(ip: std::net::IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || (o[0] == 100 && (64..128).contains(&o[1])) // CGNAT
+                || (o[0] == 198 && (18..20).contains(&o[1])) // benchmarking
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol
+                || o[0] >= 240 // reserved
                 || o[0] == 0
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // IPv4-mapped and IPv4-compatible (`::a.b.c.d`).
+            if let Some(v4) = v6.to_ipv4() {
                 return non_public(IpAddr::V4(v4));
             }
             let seg = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                IpAddr::V4(Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    hi as u8,
+                    (lo >> 8) as u8,
+                    lo as u8,
+                ))
+            };
+            // NAT64 well-known prefix 64:ff9b::/96.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return non_public(embedded(seg[6], seg[7]));
+            }
+            // 6to4 2002::/16.
+            if seg[0] == 0x2002 {
+                return non_public(embedded(seg[1], seg[2]));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // unique local
                 || (seg[0] & 0xffc0) == 0xfe80 // link-local
+                || (seg[0] == 0x64 && seg[1] == 0xff9b) // local-use NAT64
+                || (seg[0] == 0x2001 && seg[1] == 0) // Teredo
+                || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation
+                || (seg[0] == 0x100 && seg[1..4] == [0, 0, 0]) // discard-only
         }
     }
 }
@@ -518,7 +562,7 @@ fn non_public(ip: std::net::IpAddr) -> bool {
 fn checked_address(
     url: &reqwest::Url,
     scope: &[String],
-) -> Result<Option<std::net::SocketAddr>, String> {
+) -> Result<Vec<std::net::SocketAddr>, String> {
     use std::net::ToSocketAddrs;
     let host = url
         .host_str()
@@ -534,7 +578,7 @@ fn checked_address(
             .map_err(|e| format!("cannot resolve {host}: {e}"))?
             .collect(),
     };
-    let exact = names_host_exactly(scope, &host);
+    let exact = names_host_exactly(scope, &host, port);
     if let Some(bad) = addrs.iter().find(|a| non_public(a.ip())) {
         if !exact {
             return Err(denied(format!(
@@ -543,12 +587,9 @@ fn checked_address(
             )));
         }
     }
-    // An IP literal needs no pinning; a name is pinned to what was checked.
-    Ok(if literal.is_some() {
-        None
-    } else {
-        addrs.first().copied()
-    })
+    // An IP literal needs no pinning; a name is pinned to what was checked,
+    // every address in order.
+    Ok(if literal.is_some() { Vec::new() } else { addrs })
 }
 
 /// Is `cmd` covered by a `process:<name>` grant? A bare grant matches the
@@ -566,18 +607,52 @@ struct FetchRequest {
     scope: Vec<String>,
 }
 
-/// One blocking client for every fetch (connection pool and TLS sessions
-/// survive between calls). Redirects are off: [`send_request`] follows
-/// them itself so it can scope-check every hop.
+/// A client for fetches. Redirects are off: [`send_request`] follows
+/// them itself so it can scope-check every hop. Proxies are off too: a
+/// proxy would resolve the name itself, so the checked address would not
+/// be the one connected to (#1093).
+fn client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(None)
+        .no_proxy()
+}
+
+/// One blocking client for IP-literal fetches (connection pool and TLS
+/// sessions survive between calls).
 fn http_client() -> &'static reqwest::blocking::Client {
     static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(None)
-            .build()
-            .expect("build HTTP client")
-    })
+    CLIENT.get_or_init(|| client_builder().build().expect("build HTTP client"))
+}
+
+/// A client that connects only to `addrs` for `host` (tried in order; TLS
+/// still checks the name), kept per (host, addresses) so repeated fetches
+/// reuse its pool instead of a new handshake per call and per hop.
+fn pinned_client(
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+) -> Result<reqwest::blocking::Client, String> {
+    type Key = (String, Vec<std::net::SocketAddr>);
+    static PINNED: std::sync::Mutex<Vec<(Key, reqwest::blocking::Client)>> =
+        std::sync::Mutex::new(Vec::new());
+    const KEEP: usize = 32;
+    let key = (host.to_string(), addrs.to_vec());
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = pinned.iter().position(|(k, _)| *k == key) {
+        let hit = pinned.remove(i);
+        let client = hit.1.clone();
+        pinned.push(hit);
+        return Ok(client);
+    }
+    let client = client_builder()
+        .resolve_to_addrs(host, addrs)
+        .build()
+        .map_err(|e| e.to_string())?;
+    if pinned.len() >= KEEP {
+        pinned.remove(0);
+    }
+    pinned.push((key, client.clone()));
+    Ok(client)
 }
 
 /// Send a fetch, following up to 10 redirects. Every hop is scope-checked,
@@ -588,15 +663,8 @@ fn send_request(mut req: FetchRequest) -> Result<reqwest::blocking::Response, St
     use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION};
     for _ in 0..=10 {
         let pinned = checked_address(&req.url, &req.scope)?;
-        let client = match (pinned, req.url.host_str()) {
-            // A client that connects only to the checked address (TLS still
-            // checks the name).
-            (Some(addr), Some(host)) => reqwest::blocking::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(None)
-                .resolve(host, addr)
-                .build()
-                .map_err(|e| e.to_string())?,
+        let client = match req.url.host_str() {
+            Some(host) if !pinned.is_empty() => pinned_client(host, &pinned)?,
             _ => http_client().clone(),
         };
         let mut builder = client.request(req.method.clone(), req.url.clone());
@@ -2300,6 +2368,60 @@ mod tests {
         // A parent-domain grant doesn't reach a private address.
         assert!(checked_address(&url("http://localhost/"), &["host".into()]).is_err());
         assert!(checked_address(&url("http://localhost/"), &["localhost".into()]).is_ok());
+    }
+
+    /// Reserved and transition address families are not public (#1092).
+    #[test]
+    fn transition_and_reserved_addresses_are_not_public() {
+        use std::net::IpAddr;
+        for ip in [
+            "::a9fe:a9fe",         // IPv4-compatible 169.254.169.254
+            "64:ff9b::a9fe:a9fe",  // NAT64 of it
+            "64:ff9b::7f00:1",     // NAT64 of 127.0.0.1
+            "64:ff9b:1::1",        // local-use NAT64
+            "2002:a9fe:a9fe::1",   // 6to4 of it
+            "2001:0:4136:e378::1", // Teredo
+            "2001:db8::1",         // documentation
+            "100::1",              // discard-only
+            "240.0.0.1",           // reserved
+            "255.255.255.254",
+            "198.18.0.1", // benchmarking
+            "192.0.0.8",
+        ] {
+            assert!(non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        for ip in ["64:ff9b::808:808", "2002:808:808::1", "198.20.0.1"] {
+            assert!(!non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        for u in ["http://[64:ff9b::a9fe:a9fe]/", "http://[::a9fe:a9fe]/"] {
+            let err = checked_address(&url(u), &["example.com".into()]).unwrap_err();
+            assert!(err.starts_with("denied:"), "{err}");
+        }
+        assert!(checked_address(&url("http://[::a9fe:a9fe]/"), &["::a9fe:a9fe".into()]).is_ok());
+    }
+
+    /// The private-address exception honours the grant's port, and IPv6
+    /// host:port grants match in their bracketed form (#1094).
+    #[test]
+    fn exact_grants_match_port_and_ipv6() {
+        let g = vec![
+            "example.com".to_string(),
+            "api.example.com:8443".to_string(),
+        ];
+        assert!(names_host_exactly(&g, "api.example.com", 8443));
+        assert!(
+            !names_host_exactly(&g, "api.example.com", 22),
+            "a parent grant plus host:port is not any port"
+        );
+        let v6 = vec!["[::1]:8080".to_string()];
+        assert!(host_in_scope(&v6, "[::1]", Some(8080)));
+        assert!(!host_in_scope(&v6, "[::1]", Some(9090)));
+        assert!(names_host_exactly(&v6, "::1", 8080));
+        let url = |u: &str| reqwest::Url::parse(u).unwrap();
+        assert!(checked_address(&url("http://[::1]:8080/"), &v6).is_ok());
+        assert!(checked_address(&url("http://[::1]:9090/"), &v6).is_err());
+        assert!(host_in_scope(&["::1".to_string()], "[::1]", Some(1)));
     }
 
     #[test]
