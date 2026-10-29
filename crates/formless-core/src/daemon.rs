@@ -206,6 +206,8 @@ pub struct Daemon {
     step_limits: StdMutex<HashMap<String, u32>>,
     /// A model for a Session's next Run only (`RetryRun {model}`).
     next_run_model: StdMutex<HashMap<String, String>>,
+    /// When each running Invocation last sent ToolProgress (throttle).
+    progress_sent: StdMutex<HashMap<String, (std::time::Instant, String)>>,
     /// Registry changes made by each running Run, by run id.
     run_tool_changes: StdMutex<HashMap<String, Vec<ToolChange>>>,
     /// Approvals for one Session only, by (session id, tool id): the
@@ -328,6 +330,7 @@ impl Daemon {
             budget_waived: StdMutex::new(Default::default()),
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
+            progress_sent: StdMutex::new(Default::default()),
             run_tool_changes: StdMutex::new(Default::default()),
             session_grants: StdMutex::new(Default::default()),
             timed_grants: StdMutex::new(Default::default()),
@@ -715,7 +718,7 @@ impl Daemon {
                         .filter(|_| !st.session_deleted(&id).unwrap_or(false))
                         .context("session not found")?;
                     let m = st.list_messages(&id)?;
-                    let q = st.queued_items(&id)?;
+                    let q = (st.queued_items(&id)?, st.session_plan(&id)?);
                     let l = st.unfinished_last_run(&id)?;
                     Ok((s, m, q, l))
                 })?;
@@ -727,9 +730,10 @@ impl Daemon {
                 });
                 // `queued`: the texts (as before); `queued_items` adds ids
                 // for editing.
+                let (queued, plan) = queued;
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "unfinished_run": last_run}),
+                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "unfinished_run": last_run}),
                 )
             }
             Request::ForkSession {
@@ -837,6 +841,65 @@ impl Daemon {
                 content,
                 mode,
             } => self.send_message(session_id, content, mode).await,
+            Request::RunFiles { session_id, run_id } => {
+                let run_id = self.files_run(&session_id, run_id)?;
+                let files = self.run_file_infos(&run_id, true)?;
+                Ok(json!({"run_id": run_id, "files": files}))
+            }
+            Request::RewindRun {
+                session_id,
+                run_id,
+                path,
+            } => {
+                if self.runs.lock().unwrap().contains_key(&session_id) {
+                    return Err(anyhow!("session has an active run; stop it before rewinding"));
+                }
+                let run_id = self.files_run(&session_id, run_id)?;
+                let rows = self.with_reader(|st| st.run_files(&run_id))?;
+                let picked: Vec<_> = match &path {
+                    Some(p) => {
+                        let found: Vec<_> = rows
+                            .into_iter()
+                            .filter(|(f, ..)| {
+                                f == p
+                                    || f.ends_with(&format!("/{p}"))
+                                    || f.ends_with(&format!("\\{p}"))
+                            })
+                            .collect();
+                        if found.is_empty() {
+                            return Err(anyhow!("that Run did not change {p}"));
+                        }
+                        found
+                    }
+                    None => rows,
+                };
+                let (mut restored, mut skipped) = (Vec::new(), Vec::new());
+                // Newest first, so a file created then renamed unwinds.
+                for (f, existed, _kept, before) in picked.into_iter().rev() {
+                    match self.revert_run_file(&f, existed, before.as_deref()) {
+                        Ok(()) => {
+                            let _ = self.with_store(|st| st.forget_run_file(&run_id, &f));
+                            restored.push(f);
+                        }
+                        Err(e) => skipped.push(json!({"path": f, "reason": e.to_string()})),
+                    }
+                }
+                if !restored.is_empty() {
+                    let note = format!(
+                        "The user reverted these files to how they were before an earlier Run: {}.",
+                        restored.join(", ")
+                    );
+                    if let Ok(msg) =
+                        self.with_store(|st| st.append_message(&session_id, "system-note", &note))
+                    {
+                        self.broadcast(Event::MessageAppended {
+                            session_id: session_id.clone(),
+                            message: msg,
+                        });
+                    }
+                }
+                Ok(json!({"run_id": run_id, "restored": restored, "skipped": skipped}))
+            }
             Request::EditQueued {
                 session_id,
                 id,
@@ -2935,11 +2998,26 @@ impl Daemon {
         self.budget_waived.lock().unwrap().remove(&session_id);
         self.step_limits.lock().unwrap().remove(&session_id);
         let changes = self.run_tool_changes.lock().unwrap().remove(&run_id);
+        let files = self.run_file_infos(&run_id, false).unwrap_or_default();
+        if let Some(recap) = self.run_recap(&session_id, &run_id, changes.as_deref(), &files) {
+            self.broadcast(Event::RunRecap {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                recap,
+            });
+        }
         if let Some(changes) = changes.filter(|c| !c.is_empty()) {
             self.broadcast(Event::RunToolChanges {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
                 changes,
+            });
+        }
+        if !files.is_empty() {
+            self.broadcast(Event::RunFilesChanged {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                files,
             });
         }
         self.broadcast(Event::RunFinished {
@@ -3996,6 +4074,10 @@ impl Daemon {
             toolreg::REMEMBER => match self.remember_impl(session_id, &args, cfg, cancel).await {
                 Ok(text) => text,
                 Err(e) => format!("error: remember failed: {e}"),
+            },
+            toolreg::UPDATE_PLAN => match self.update_plan_impl(session_id, &args) {
+                Ok(text) => text,
+                Err(e) => format!("error: update_plan failed: {e}"),
             },
             toolreg::FORGET => match self.forget_impl(session_id, &args) {
                 Ok(text) => text,
@@ -6260,6 +6342,186 @@ impl Daemon {
     }
 
     /// Append a user message, carrying the Session's pending attachments.
+    /// Before a Tool first changes `path` in a Run, keep what it held
+    /// (SPEC §5.7): files up to 2 MB are kept, so they can be reverted.
+    fn snapshot_before_change(&self, session_id: &str, run_id: &str, path: &std::path::Path) {
+        const MAX: u64 = 2 * 1024 * 1024;
+        if run_id.is_empty() {
+            return; // a Tool run outside any Run (`formless tools run`)
+        }
+        let shown = path.to_string_lossy().into_owned();
+        let (existed, before) = match std::fs::symlink_metadata(path) {
+            Err(_) => (false, None),
+            Ok(m) if m.is_file() && m.len() <= MAX => (true, std::fs::read(path).ok()),
+            Ok(_) => (true, None),
+        };
+        let _ = self.with_store(|st| {
+            st.snapshot_run_file(session_id, run_id, &shown, existed, before.as_deref())
+        });
+    }
+
+    /// A Run's changed files compared with now, optionally with diffs.
+    fn run_file_infos(&self, run_id: &str, diffs: bool) -> Result<Vec<RunFileInfo>> {
+        let rows = self.with_reader(|st| st.run_files(run_id))?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, existed, kept, before)| {
+                let now = std::fs::read(&path).ok();
+                let exists = std::path::Path::new(&path).exists();
+                let status = match (existed, exists) {
+                    (false, true) => "created",
+                    (true, false) => "removed",
+                    (false, false) => "unchanged",
+                    (true, true) if kept && before.as_deref() == now.as_deref() => "unchanged",
+                    (true, true) => "modified",
+                };
+                let text = |b: &Option<Vec<u8>>| {
+                    b.as_ref()
+                        .map(|b| std::str::from_utf8(b).ok().map(str::to_string))
+                        .unwrap_or(Some(String::new()))
+                };
+                let diff = (diffs && kept && status != "unchanged")
+                    .then(|| match (text(&before), text(&now)) {
+                        (Some(a), Some(b)) => Some(crate::diff::context_diff(&a, &b).join("\n")),
+                        _ => Some("(binary file)".to_string()),
+                    })
+                    .flatten();
+                RunFileInfo {
+                    path,
+                    status: status.to_string(),
+                    revertible: kept,
+                    diff,
+                }
+            })
+            .collect())
+    }
+
+    /// "What I did" for a Run of 4+ steps, from its trace (SPEC §5.7).
+    fn run_recap(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        changes: Option<&[ToolChange]>,
+        files: &[RunFileInfo],
+    ) -> Option<RunRecap> {
+        let steps = self.with_reader(|st| st.run_steps(run_id)).ok()?;
+        if steps < 4 {
+            return None;
+        }
+        let (duration_ms, started) = self
+            .with_reader(|st| st.run_metrics_for(Some(session_id), 5, None))
+            .ok()?
+            .into_iter()
+            .find(|r| r.run_id == run_id)
+            .map_or((0, String::new()), |r| (r.duration_ms, r.created_at));
+        let used = self
+            .with_reader(|st| st.run_calls(run_id))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, n, failed)| {
+                let times = if n > 1 { format!(" ×{n}") } else { String::new() };
+                let fails = if failed > 0 { format!(" ({failed} failed)") } else { String::new() };
+                format!("{name}{times}{fails}")
+            })
+            .collect();
+        let built = changes
+            .unwrap_or_default()
+            .iter()
+            .map(|c| format!("{} {} v{}", c.change, c.name, c.version))
+            .collect();
+        let files = files
+            .iter()
+            .filter(|f| f.status != "unchanged")
+            .map(|f| format!("{} {}", f.status, f.path))
+            .collect();
+        let steered = self
+            .with_reader(|st| st.list_messages(session_id))
+            .unwrap_or_default()
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.created_at >= started
+                    && m.meta
+                        .as_deref()
+                        .is_some_and(|x| x.contains("\"steer\""))
+            })
+            .count() as i64;
+        Some(RunRecap {
+            steps,
+            duration_ms,
+            used,
+            built,
+            files,
+            steered,
+        })
+    }
+
+    /// The Run `/files` and `/rewind` act on: the given one, else the
+    /// Session's latest that changed files.
+    fn files_run(&self, session_id: &str, run_id: Option<String>) -> Result<String> {
+        match run_id {
+            Some(r) => Ok(r),
+            None => self
+                .with_reader(|st| st.last_run_with_files(session_id))?
+                .context("no Run in this session changed files"),
+        }
+    }
+
+    /// Put one recorded file back as it was before the Run.
+    fn revert_run_file(&self, path: &str, existed: bool, before: Option<&[u8]>) -> Result<()> {
+        let p = std::path::Path::new(path);
+        match (existed, before) {
+            (true, Some(bytes)) => {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(p, bytes)?;
+            }
+            (false, _) => {
+                if p.is_dir() {
+                    std::fs::remove_dir_all(p)?;
+                } else if p.exists() {
+                    std::fs::remove_file(p)?;
+                }
+            }
+            (true, None) => return Err(anyhow!("its earlier content was not kept")),
+        }
+        Ok(())
+    }
+
+    /// `update_plan` (SPEC §5.8): replace the Session's checklist.
+    fn update_plan_impl(&self, session_id: &str, args: &Value) -> Result<String> {
+        let items: Vec<PlanItem> = serde_json::from_value(args["items"].clone())
+            .context("items must be a list of {content, status}")?;
+        if items.len() > toolreg::MAX_PLAN_ITEMS {
+            return Err(anyhow!("at most {} steps", toolreg::MAX_PLAN_ITEMS));
+        }
+        let mut items = items;
+        for i in &mut items {
+            if !matches!(i.status.as_str(), "pending" | "in_progress" | "completed") {
+                return Err(anyhow!(
+                    "status must be pending, in_progress or completed, not {:?}",
+                    i.status
+                ));
+            }
+            i.content = i.content.trim().chars().take(toolreg::MAX_PLAN_TEXT).collect();
+            if i.content.is_empty() {
+                return Err(anyhow!("a step needs content"));
+            }
+        }
+        self.with_store(|st| st.set_session_plan(session_id, &items))?;
+        self.broadcast(Event::PlanUpdated {
+            session_id: session_id.to_string(),
+            items: items.clone(),
+        });
+        let done = items.iter().filter(|i| i.status == "completed").count();
+        Ok(if items.is_empty() {
+            "plan cleared".into()
+        } else {
+            format!("plan updated ({done}/{} done)", items.len())
+        })
+    }
+
     /// Tell clients the Session's queue changed.
     fn queue_changed(&self, session_id: &str) {
         if let Ok(queued) = self.with_reader(|st| st.queued_items(session_id)) {
@@ -8234,6 +8496,7 @@ impl Daemon {
                 tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn)).await;
             let elapsed = dur(&started);
             let finish = |ok: bool, this: &Daemon| {
+                this.progress_sent.lock().unwrap().remove(&inv_id);
                 this.broadcast(Event::ToolCallFinished {
                     session_id: session_id.clone(),
                     run_id: run_id.clone(),
@@ -8297,9 +8560,15 @@ impl Daemon {
                         ExecErrorKind::Denied => ("failure", "denied-capability"),
                         ExecErrorKind::Js => ("failure", ""),
                     };
-                    self.finish_inv(&inv_id, &info, status, tag, "", &e.message, elapsed, &cfg);
+                    // Where in the Tool's code, and on what input (§7.1).
+                    let message = if e.kind == ExecErrorKind::Js {
+                        crate::errors::tool_error_detail(&e.message, &ver.code, &input)
+                    } else {
+                        e.message
+                    };
+                    self.finish_inv(&inv_id, &info, status, tag, "", &message, elapsed, &cfg);
                     finish(false, &self);
-                    Err(e.message)
+                    Err(message)
                 }
                 Err(join_err) => {
                     self.finish_inv(
@@ -9627,6 +9896,45 @@ impl NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn progress(&self, fraction: Option<f64>, label: &str) {
+        // At most 5 updates a second per Invocation, unless the label
+        // changes or the work is done.
+        let key = self.parent_inv.clone().unwrap_or_default();
+        {
+            let mut sent = self.daemon.progress_sent.lock().unwrap();
+            let now = std::time::Instant::now();
+            if let Some((at, last)) = sent.get(&key) {
+                let soon = now.duration_since(*at) < std::time::Duration::from_millis(200);
+                if soon && last == label && fraction != Some(1.0) {
+                    return;
+                }
+            }
+            sent.insert(key, (now, label.to_string()));
+        }
+        let tool_name = self
+            .kv_scope
+            .strip_prefix("tool:")
+            .and_then(|id| {
+                self.daemon
+                    .with_reader(|st| st.get_tool_current(id))
+                    .ok()
+                    .flatten()
+            })
+            .map(|(t, _)| t.name)
+            .unwrap_or_default();
+        self.daemon.broadcast(Event::ToolProgress {
+            session_id: self.session_id.clone(),
+            run_id: self.run_id.clone(),
+            tool_name,
+            depth: self.depth.saturating_sub(1),
+            fraction,
+            label: label.to_string(),
+        });
+    }
+    fn file_changing(&self, path: &std::path::Path) {
+        self.daemon
+            .snapshot_before_change(&self.session_id, &self.run_id, path);
+    }
     fn harness(&self, op: &str, args: &Value, reason: &str) -> std::result::Result<Value, String> {
         let tool = self
             .kv_scope

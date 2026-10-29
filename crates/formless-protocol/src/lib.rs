@@ -692,6 +692,44 @@ pub struct RunSummary {
     pub avg_duration_ms: f64,
 }
 
+/// One step of the agent's plan (`update_plan`, SPEC §5.8).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanItem {
+    pub content: String,
+    /// "pending", "in_progress" or "completed".
+    pub status: String,
+}
+
+/// "What I did": a long Run's recap from its trace, no model call
+/// (SPEC §5.7).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RunRecap {
+    pub steps: i64,
+    pub duration_ms: i64,
+    /// "read_file ×3", "fetch_page ×2 (1 failed)".
+    pub used: Vec<String>,
+    /// "created csv_stats v1", "updated git_log v3".
+    pub built: Vec<String>,
+    /// "modified src/main.rs".
+    pub files: Vec<String>,
+    /// Messages the user steered with during the Run.
+    pub steered: i64,
+}
+
+/// A file a Run's Tools changed (SPEC §5.7).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunFileInfo {
+    pub path: String,
+    /// "created", "modified", "removed" or "unchanged" (changed back),
+    /// comparing the snapshot with the file now.
+    pub status: String,
+    /// The pre-Run content was kept, so `RewindRun` can restore it.
+    pub revertible: bool,
+    /// For text files: the change as `- `/`+ ` lines with context.
+    #[serde(default)]
+    pub diff: Option<String>,
+}
+
 /// A message waiting to start its own Run after the current one (§5.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuedMessage {
@@ -1117,6 +1155,22 @@ pub enum Request {
     /// Give up on a Session's interrupted or paused Run.
     AbandonRun {
         session_id: String,
+    },
+    /// The files a Run's Tools changed, with diffs: `run_id` defaults to
+    /// the Session's latest Run that changed any.
+    RunFiles {
+        session_id: String,
+        #[serde(default)]
+        run_id: Option<String>,
+    },
+    /// Put files back as they were before a Run changed them (`/rewind`):
+    /// one `path`, or all of the Run's revertible files.
+    RewindRun {
+        session_id: String,
+        #[serde(default)]
+        run_id: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
     },
     /// Change a queued message's text, or remove it (`content: None`).
     EditQueued {
@@ -1820,6 +1874,26 @@ pub enum Event {
         session_id: String,
         run_id: String,
     },
+    /// The agent replaced the Session's plan (`update_plan`); empty
+    /// `items` clears it.
+    PlanUpdated {
+        session_id: String,
+        items: Vec<PlanItem>,
+    },
+    /// At the end of a long Run (4+ steps): what it did, for a
+    /// collapsible "What I did" block under the answer.
+    RunRecap {
+        session_id: String,
+        run_id: String,
+        recap: RunRecap,
+    },
+    /// At the end of a Run whose Tools changed files: what changed (no
+    /// diffs; `RunFiles` has them).
+    RunFilesChanged {
+        session_id: String,
+        run_id: String,
+        files: Vec<RunFileInfo>,
+    },
     /// A Session's queue of messages waiting for the current Run changed
     /// (queued, sent, edited, removed or reordered).
     QueueChanged {
@@ -1887,6 +1961,17 @@ pub enum Event {
         /// made inside that Tool, … (clients draw a tree).
         #[serde(default)]
         depth: usize,
+    },
+    /// A running Tool reported `progress(fraction, label)`: `fraction`
+    /// 0..1 or None when unknown; `depth` as in ToolCallStarted.
+    ToolProgress {
+        session_id: String,
+        run_id: String,
+        tool_name: String,
+        #[serde(default)]
+        depth: usize,
+        fraction: Option<f64>,
+        label: String,
     },
     ToolCallFinished {
         session_id: String,
@@ -2074,6 +2159,10 @@ impl Event {
             | Event::ProviderStalled { session_id, .. }
             | Event::ProviderRetrying { session_id, .. }
             | Event::QueueChanged { session_id, .. }
+            | Event::RunFilesChanged { session_id, .. }
+            | Event::RunRecap { session_id, .. }
+            | Event::ToolProgress { session_id, .. }
+            | Event::PlanUpdated { session_id, .. }
             | Event::RunFinished { session_id, .. }
             | Event::RunPaused { session_id, .. }
             | Event::CompactionNotice { session_id, .. }

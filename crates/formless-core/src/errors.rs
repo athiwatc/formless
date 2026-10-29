@@ -280,3 +280,75 @@ mod transient_tests {
         assert!(!is_transient("parse response: expected value"));
     }
 }
+
+/// A Tool's JavaScript error made readable (SPEC §7.1): the message, the
+/// call path in the Tool's own code, the failing line with two lines of
+/// context, and the input that caused it. QuickJS reports Tool-code
+/// frames as `at NAME (eval_script:LINE:COL)`; the runner's own frames
+/// (`<anonymous>`, `<eval>`) are left out.
+pub fn tool_error_detail(message: &str, code: &str, input: &serde_json::Value) -> String {
+    let mut lines = message.lines();
+    let head = lines.next().unwrap_or_default().trim().to_string();
+    let frames: Vec<(String, usize, usize)> = lines
+        .filter_map(|l| {
+            let l = l.trim().strip_prefix("at ")?;
+            let (name, loc) = l.split_once(" (")?;
+            if name.starts_with('<') {
+                return None;
+            }
+            let loc = loc.strip_suffix(')')?.strip_prefix("eval_script:")?;
+            let mut parts = loc.split(':');
+            let line = parts.next()?.parse().ok()?;
+            let col = parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+            Some((name.to_string(), line, col))
+        })
+        .collect();
+    let src: Vec<&str> = code.lines().collect();
+    let mut out = vec![head];
+    let Some((_, line, col)) = frames.first().filter(|(_, l, _)| *l >= 1 && *l <= src.len())
+    else {
+        // No position in the Tool's code: keep what QuickJS said.
+        return message.trim_end().to_string();
+    };
+    let path: Vec<String> = frames
+        .iter()
+        .map(|(name, l, _)| format!("{name} (line {l})"))
+        .collect();
+    out.push(format!("  at {}", path.join(" ← ")));
+    out.push(String::new());
+    let width = (line + 2).min(src.len()).to_string().len();
+    for n in line.saturating_sub(2).max(1)..=(line + 2).min(src.len()) {
+        let mark = if n == *line { ">" } else { " " };
+        out.push(format!("{mark} {n:>width$} | {}", src[n - 1]));
+        if n == *line && *col > 0 {
+            out.push(format!("  {:>width$} | {}^", "", " ".repeat(col - 1)));
+        }
+    }
+    let shown = input.to_string();
+    let shown: String = if shown.chars().count() > 500 {
+        format!("{}…", shown.chars().take(500).collect::<String>())
+    } else {
+        shown
+    };
+    out.push(String::new());
+    out.push(format!("input: {shown}"));
+    out.join("\n")
+}
+
+#[cfg(test)]
+mod tool_error_tests {
+    use super::tool_error_detail;
+
+    #[test]
+    fn js_errors_show_the_line_the_path_and_the_input() {
+        let code = "function helper(x) {\n  return x.missing.deep;\n}\nfunction run(input) {\n  const a = 1;\n  return helper(input);\n}";
+        let msg = "cannot read property 'deep' of undefined\n    at helper (eval_script:2:10)\n    at run (eval_script:6:17)\n    at <anonymous> (eval_script:8:34)\n    at <eval> (eval_script:11:3)\n";
+        let out = tool_error_detail(msg, code, &serde_json::json!({"a": 1}));
+        assert_eq!(
+            out,
+            "cannot read property 'deep' of undefined\n  at helper (line 2) ← run (line 6)\n\n  1 | function helper(x) {\n> 2 |   return x.missing.deep;\n    |          ^\n  3 | }\n  4 | function run(input) {\n\ninput: {\"a\":1}"
+        );
+        // No usable frame: unchanged.
+        assert_eq!(tool_error_detail("boom\n", code, &serde_json::json!({})), "boom");
+    }
+}

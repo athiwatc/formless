@@ -137,6 +137,10 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/files`: the last Run's changed files, shown in the pager.
+    RunFiles,
+    /// `/rewind`: files put back.
+    RewindRun,
     /// `/retry [--model X]`: the last message is re-running.
     RetryRun,
     /// `/good` / `/bad`: the rating was stored.
@@ -669,6 +673,8 @@ struct LiveToolCall {
     handle: Option<String>,
     /// Seconds without activity, while the daemon flags it stalled.
     stalled_secs: Option<u64>,
+    /// The Tool's latest `progress(fraction, label)`.
+    progress: Option<(Option<f64>, String)>,
 }
 
 /// The live calls to draw, with how many descendants each folds away. A
@@ -1032,6 +1038,12 @@ struct App {
     queued: Vec<formless_protocol::QueuedMessage>,
     /// `/queue edit N`: the queued message the input replaces.
     editing_queued: Option<i64>,
+    /// The last long Run's "What I did" recap, and whether `/recap`
+    /// expanded it.
+    recap: Option<formless_protocol::RunRecap>,
+    recap_open: bool,
+    /// The agent's checklist (`update_plan`), pinned under the chat.
+    plan: Vec<formless_protocol::PlanItem>,
     should_quit: bool,
     /// Rendered Markdown of settled messages, keyed by content and width.
     /// Rendered settled messages by (id, content length, width).
@@ -1241,6 +1253,9 @@ impl App {
             editing_id: None,
             queued: Vec::new(),
             editing_queued: None,
+            recap: None,
+            recap_open: false,
+            plan: Vec::new(),
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -2306,6 +2321,37 @@ impl App {
                                 .collect();
                             self.notes.extend(lines);
                         }
+                        Pending::RunFiles => {
+                            let files: Vec<formless_protocol::RunFileInfo> =
+                                serde_json::from_value(result["files"].clone()).unwrap_or_default();
+                            self.pager = Some(Pager {
+                                title: format!("Files changed by the Run ({})", files.len()),
+                                lines: files_pager_lines(&files),
+                                top: 0,
+                                left: 0,
+                                styled: Vec::new(),
+                            });
+                        }
+                        Pending::RewindRun => {
+                            let restored: Vec<&str> = result["restored"]
+                                .as_array()
+                                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                                .unwrap_or_default();
+                            if !restored.is_empty() {
+                                self.notes.push(format!(
+                                    "reverted {} file(s): {}",
+                                    restored.len(),
+                                    restored.join(", ")
+                                ));
+                            }
+                            for s in result["skipped"].as_array().into_iter().flatten() {
+                                self.notes.push(format!(
+                                    "not reverted: {} ({})",
+                                    s["path"].as_str().unwrap_or_default(),
+                                    s["reason"].as_str().unwrap_or_default()
+                                ));
+                            }
+                        }
                         Pending::RateRun => self.notes.push(
                             match result["rating"].as_str() {
                                 Some("good") => "rated the last answer 👍 · /unrate clears it",
@@ -2389,6 +2435,8 @@ impl App {
                                 )
                             });
                             self.queued = serde_json::from_value(result["queued_items"].clone())
+                                .unwrap_or_default();
+                            self.plan = serde_json::from_value(result["plan"].clone())
                                 .unwrap_or_default();
                         }
                     }
@@ -2639,6 +2687,8 @@ impl App {
         self.editing_id = None;
         self.editing_queued = None;
         self.queued.clear();
+        self.recap = None;
+        self.plan.clear();
         self.activity = None;
         if self.running() {
             self.set_activity("working");
@@ -2685,6 +2735,46 @@ impl App {
                     self.notes.push(format!(
                         "no data from the provider for {idle_secs}s; /resend re-sends the request"
                     ));
+                }
+            }
+            Event::ToolProgress {
+                session_id,
+                tool_name,
+                depth,
+                fraction,
+                label,
+                ..
+            } => {
+                if !self.is_current(&session_id) {
+                    return;
+                }
+                if let Some(call) = self
+                    .live_tools
+                    .iter_mut()
+                    .rev()
+                    .find(|c| c.status == "running" && c.name == tool_name && c.depth == depth)
+                {
+                    call.progress = Some((fraction, label));
+                }
+            }
+            Event::PlanUpdated { session_id, items } => {
+                if self.is_current(&session_id) {
+                    self.plan = items;
+                }
+            }
+            Event::RunRecap {
+                session_id, recap, ..
+            } => {
+                if self.is_current(&session_id) {
+                    self.recap = Some(recap);
+                    self.recap_open = false;
+                }
+            }
+            Event::RunFilesChanged {
+                session_id, files, ..
+            } => {
+                if self.is_current(&session_id) {
+                    self.notes.push(files_note(&files));
                 }
             }
             Event::QueueChanged { session_id, queued } => {
@@ -2755,6 +2845,7 @@ impl App {
                     return;
                 }
                 self.run_banner = None;
+                self.recap = None;
                 self.thinking.clear();
                 self.streaming.clear();
                 self.live_tools.clear();
@@ -2857,6 +2948,7 @@ impl App {
                     elapsed_ms: None,
                     handle: None,
                     stalled_secs: None,
+                    progress: None,
                 });
                 self.notes.push(format!("running {tool_name}…"));
             }
@@ -3144,6 +3236,7 @@ impl App {
                         elapsed_ms: None,
                         handle: None,
                         stalled_secs: None,
+                    progress: None,
                     });
                 }
             }
@@ -3897,6 +3990,34 @@ impl App {
                 None => self.notes.push("no user message to edit".into()),
             },
             cmd if cmd == "queue" || cmd.starts_with("queue ") => self.queue_command(cmd),
+            "recap" => match self.recap {
+                Some(_) => self.recap_open = !self.recap_open,
+                None => self.notes.push("no recap: it is made after Runs of 4 or more steps".into()),
+            },
+            "files" => {
+                if let Some(session_id) = self.current.clone() {
+                    self.request(
+                        Pending::RunFiles,
+                        Request::RunFiles {
+                            session_id,
+                            run_id: None,
+                        },
+                    );
+                }
+            }
+            cmd if cmd == "rewind" || cmd.starts_with("rewind ") => {
+                if let Some(session_id) = self.current.clone() {
+                    let path = cmd.trim_start_matches("rewind").trim();
+                    self.request(
+                        Pending::RewindRun,
+                        Request::RewindRun {
+                            session_id,
+                            run_id: None,
+                            path: Some(path.to_string()).filter(|p| !p.is_empty() && p != "all"),
+                        },
+                    );
+                }
+            }
             cmd if cmd == "retry" || cmd.starts_with("retry ") => {
                 let Some(session_id) = self.current.clone() else {
                     self.notes.push("no session".into());
@@ -7933,6 +8054,145 @@ fn sent_elsewhere(app: &App, m: &MessageInfo) -> Option<String> {
     (other_kind || other_tui).then(|| label.to_string())
 }
 
+/// The agent's plan (SPEC §5.8): every step while it works; one line once
+/// all are done and nothing is running.
+fn plan_lines(
+    plan: &[formless_protocol::PlanItem],
+    running: bool,
+    width: usize,
+    color: bool,
+) -> Vec<Line<'static>> {
+    let done = plan.iter().filter(|i| i.status == "completed").count();
+    let mut out = vec![Line::raw("")];
+    if done == plan.len() && !running {
+        out.push(Line::styled(
+            format!("  ✓ Plan done ({done}/{})", plan.len()),
+            ui::dim(color),
+        ));
+        return out;
+    }
+    out.push(Line::styled(
+        format!("  Plan ({done}/{})", plan.len()),
+        bold_fg(color, Color::Cyan),
+    ));
+    for i in plan {
+        let (mark, style) = match i.status.as_str() {
+            "completed" => ("✓", ui::dim(color)),
+            "in_progress" => ("▸", bold_fg(color, Color::Yellow)),
+            _ => ("○", Style::default()),
+        };
+        out.push(Line::styled(
+            format!("    {mark} {}", truncate_chars(&i.content, width.saturating_sub(8).max(20))),
+            style,
+        ));
+    }
+    out
+}
+
+/// `▕████░░░░▏ 50% label`, or just the label when the fraction is unknown.
+fn progress_text(fraction: Option<f64>, label: &str) -> String {
+    let Some(f) = fraction else {
+        return label.to_string();
+    };
+    const W: usize = 10;
+    let filled = ((f.clamp(0.0, 1.0) * W as f64).round() as usize).min(W);
+    format!(
+        "▕{}{}▏ {:.0}%{}",
+        "█".repeat(filled),
+        "░".repeat(W - filled),
+        f * 100.0,
+        if label.is_empty() { String::new() } else { format!(" {label}") }
+    )
+}
+
+/// The "What I did" block: one line, or the full recap after `/recap`.
+fn recap_lines(r: &formless_protocol::RunRecap, open: bool, color: bool) -> Vec<Line<'static>> {
+    let mut head = format!(
+        "  {} What I did · {} steps · {}",
+        if open { "▾" } else { "▸" },
+        r.steps,
+        format_elapsed(Duration::from_millis(r.duration_ms.max(0) as u64))
+    );
+    for (n, what) in [(r.used.len(), "calls"), (r.built.len(), "Tools changed"), (r.files.len(), "files")] {
+        if n > 0 {
+            head.push_str(&format!(" · {n} {what}"));
+        }
+    }
+    if !open {
+        head.push_str(" · /recap expands");
+    }
+    let mut out = vec![Line::raw(""), Line::styled(head, ui::dim(color))];
+    if open {
+        let mut section = |title: &str, items: &[String]| {
+            if !items.is_empty() {
+                out.push(Line::styled(format!("    {title}"), ui::dim(color)));
+                for i in items {
+                    out.push(Line::styled(format!("      · {i}"), ui::dim(color)));
+                }
+            }
+        };
+        section("Used", &r.used);
+        section("Built", &r.built);
+        section("Files", &r.files);
+        if r.steered > 0 {
+            out.push(Line::styled(
+                format!("    You steered it {} time(s).", r.steered),
+                ui::dim(color),
+            ));
+        }
+    }
+    out
+}
+
+/// "3 files changed: a.rs (modified), b.md (created) · /files · /rewind".
+fn files_note(files: &[formless_protocol::RunFileInfo]) -> String {
+    let changed: Vec<String> = files
+        .iter()
+        .filter(|f| f.status != "unchanged")
+        .map(|f| {
+            let name = std::path::Path::new(&f.path)
+                .file_name()
+                .map_or(f.path.clone(), |n| n.to_string_lossy().into_owned());
+            format!("{name} ({})", f.status)
+        })
+        .collect();
+    if changed.is_empty() {
+        return "the Run's file changes were all undone".into();
+    }
+    let shown = changed.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+    let more = changed.len().saturating_sub(5);
+    format!(
+        "{} file{} changed: {shown}{} · /files shows the changes, /rewind reverts them",
+        changed.len(),
+        if changed.len() == 1 { "" } else { "s" },
+        if more > 0 { format!(", +{more} more") } else { String::new() }
+    )
+}
+
+/// The `/files` pager: each file's status, then its diff.
+fn files_pager_lines(files: &[formless_protocol::RunFileInfo]) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in files {
+        out.push(format!(
+            "{} {}{}",
+            match f.status.as_str() {
+                "created" => "A",
+                "removed" => "D",
+                "unchanged" => "=",
+                _ => "M",
+            },
+            f.path,
+            if f.revertible { "" } else { "  (not revertible: too large or a folder)" }
+        ));
+        if let Some(d) = &f.diff {
+            out.extend(d.lines().map(|l| format!("    {l}")));
+        }
+        out.push(String::new());
+    }
+    out.push("/rewind PATH reverts one file, /rewind all of them.".into());
+    out
+}
+
 /// The step a steering message (sent while a Run was active) arrived at.
 fn steer_step(m: &MessageInfo) -> Option<i64> {
     let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
@@ -9867,6 +10127,12 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 ),
                 style,
             )];
+            if let Some((fraction, label)) = call.progress.as_ref().filter(|_| call.status == "running") {
+                spans.push(Span::styled(
+                    format!("{}  ", progress_text(*fraction, label)),
+                    fg(app.color, Color::Cyan),
+                ));
+            }
             if let Some(secs) = call.stalled_secs {
                 spans.push(Span::styled(
                     format!("stalled {secs}s · /cancel  "),
@@ -9905,6 +10171,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         }
         group = None;
     }
+    if let Some(recap) = app.recap.as_ref().filter(|_| !app.running()) {
+        lines.extend(recap_lines(recap, app.recap_open, app.color));
+    }
     if let Some((status, reason)) = app.run_banner.as_ref().filter(|_| !app.running()) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -9932,6 +10201,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 bold_fg(app.color, Color::Yellow),
             ));
         }
+    }
+    if !app.plan.is_empty() {
+        lines.extend(plan_lines(&app.plan, app.running(), width, app.color));
     }
     // Messages waiting for this Run (Ctrl+J), oldest first (SPEC §5.3).
     if !app.queued.is_empty() {
@@ -12602,6 +12874,9 @@ mod tests {
             editing_id: None,
             queued: Vec::new(),
             editing_queued: None,
+            recap: None,
+            recap_open: false,
+            plan: Vec::new(),
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
@@ -12735,6 +13010,52 @@ mod tests {
             queued: vec![],
         });
         assert_eq!(app.queued.len(), 1);
+    }
+
+    #[test]
+    fn tool_progress_draws_a_bar() {
+        assert_eq!(progress_text(Some(0.5), "rows"), "▕█████░░░░░▏ 50% rows");
+        assert_eq!(progress_text(None, "waiting"), "waiting");
+        let mut app = test_app();
+        app.on_event(Event::ToolCallStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            tool_name: "import".into(),
+            version: 1,
+            arguments: "{}".into(),
+            depth: 0,
+        });
+        app.on_event(Event::ToolProgress {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            tool_name: "import".into(),
+            depth: 0,
+            fraction: Some(0.3),
+            label: "rows".into(),
+        });
+        assert_eq!(app.live_tools[0].progress, Some((Some(0.3), "rows".into())));
+    }
+
+    #[test]
+    fn the_plan_shows_every_step_then_folds_when_done() {
+        use formless_protocol::PlanItem;
+        let item = |c: &str, st: &str| PlanItem {
+            content: c.into(),
+            status: st.into(),
+        };
+        let text = |lines: Vec<Line>| {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let plan = vec![item("Read", "completed"), item("Fix", "in_progress"), item("Test", "pending")];
+        assert_eq!(
+            text(plan_lines(&plan, true, 80, false)),
+            ["", "  Plan (1/3)", "    ✓ Read", "    ▸ Fix", "    ○ Test"]
+        );
+        let done = vec![item("Read", "completed")];
+        assert_eq!(text(plan_lines(&done, false, 80, false)), ["", "  ✓ Plan done (1/1)"]);
     }
 
     #[test]
@@ -16305,6 +16626,7 @@ mod tests {
             elapsed_ms: Some(5),
             handle: None,
             stalled_secs: None,
+                    progress: None,
         };
         let calls = vec![
             node("done_top", 0, "ok"),

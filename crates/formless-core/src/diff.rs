@@ -49,6 +49,31 @@ pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
     out
 }
 
+/// The changed lines from `old` to `new` (`- `/`+ ` prefixed) with two
+/// lines of context around them; skipped runs show as `  …`.
+pub fn context_diff(old: &str, new: &str) -> Vec<String> {
+    let lines = line_diff(old, new);
+    let near = |i: usize| {
+        lines[i.saturating_sub(2)..(i + 3).min(lines.len())]
+            .iter()
+            .any(|(k, _)| *k != ' ')
+    };
+    let mut out = Vec::new();
+    let mut skipped = false;
+    for (i, (kind, text)) in lines.iter().enumerate() {
+        if *kind == ' ' && !near(i) {
+            skipped = true;
+            continue;
+        }
+        if skipped {
+            out.push("  …".into());
+            skipped = false;
+        }
+        out.push(format!("{kind} {text}"));
+    }
+    out
+}
+
 fn pretty(json: &str) -> String {
     serde_json::from_str::<serde_json::Value>(json)
         .and_then(|v| serde_json::to_string_pretty(&v))
@@ -87,25 +112,7 @@ pub fn version_diff(old: &ToolVersionInfo, new: &ToolVersionInfo) -> String {
             continue;
         }
         out.push(format!("@@ {name} (v{} → v{})", old.version, new.version));
-        let lines = line_diff(&a, &b);
-        // Keep changed lines plus two lines of context around them.
-        let near = |i: usize| {
-            lines[i.saturating_sub(2)..(i + 3).min(lines.len())]
-                .iter()
-                .any(|(k, _)| *k != ' ')
-        };
-        let mut skipped = false;
-        for (i, (kind, text)) in lines.iter().enumerate() {
-            if *kind == ' ' && !near(i) {
-                skipped = true;
-                continue;
-            }
-            if skipped {
-                out.push("  …".into());
-                skipped = false;
-            }
-            out.push(format!("{kind} {text}"));
-        }
+        out.extend(context_diff(&a, &b));
     }
     if out.is_empty() {
         "(no changes)".into()
