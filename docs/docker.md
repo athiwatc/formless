@@ -47,6 +47,21 @@ Later changes: `docker exec formless formless config set provider.model …`
 
 Daily database backups land in `/data/backups` (`daemon.backups_keep`).
 
+Named volumes (above) just work. A **bind mount** of a host folder must be
+writable by the container's user, uid `10001`: `sudo chown -R 10001:10001
+./formless-data ./formless-config` first, or the daemon can't start (it
+can't write its database), and `docker logs formless` says so.
+
+## Image details
+
+- `linux/amd64` only for now; on Apple silicon or other arm64 servers it
+  runs under emulation (slow) or build it yourself with
+  `docker build -t formless .`.
+- Bases are pinned by digest in the `Dockerfile`; a release updates them
+  together.
+- `HEALTHCHECK` reports healthy while the daemon answers on its socket
+  (`docker ps` shows it).
+
 ## The API key
 
 - `FORMLESS_API_KEY_FILE=/run/secrets/…`: a file holding the key (Docker
