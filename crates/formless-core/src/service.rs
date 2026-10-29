@@ -183,17 +183,27 @@ pub fn install(plan: &Plan) -> Result<()> {
     run_all(&plan.enable)
 }
 
-/// Unload the service and remove its file.
+/// Unload the service, then remove its file. A failed unload keeps the
+/// file, so the service manager never respawns a deleted binary (#1079).
+/// A Windows task is deleted by name even when its script is gone.
 pub fn uninstall(plan: &Plan) -> Result<()> {
-    if !plan.file.exists() {
+    let present = plan.file.exists();
+    if !present && plan.manager != "Task Scheduler" {
         return Err(anyhow!(
             "not installed ({} is missing)",
             plan.file.display()
         ));
     }
-    let unloaded = run_all(&plan.disable);
-    std::fs::remove_file(&plan.file)?;
-    unloaded
+    if let Err(e) = run_all(&plan.disable) {
+        if present {
+            return Err(e.context("could not unload the service; its file is kept"));
+        }
+        return Err(anyhow!("not installed (no {} task)", plan.manager));
+    }
+    if present {
+        std::fs::remove_file(&plan.file)?;
+    }
+    Ok(())
 }
 
 /// The plan for this binary and this user.

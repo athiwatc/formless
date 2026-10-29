@@ -2672,6 +2672,18 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             "MISSING"
         }
     );
+    if !cfg.provider.oauth() {
+        // Which source the key comes from, never the key (#1083).
+        let (source, file_problem) = formless_core::config::api_key_source(&paths);
+        say!("key from:   {source}");
+        if let Some(why) = file_problem {
+            problems.push(Problem {
+                what: why,
+                next: Some("fix the file or unset FORMLESS_API_KEY_FILE".into()),
+                fix: None,
+            });
+        }
+    }
     if cfg.provider.oauth() {
         say!(
             "oauth:      refresh={} expires_at={}",
@@ -5503,6 +5515,8 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
             Some("your package manager (apt remove formless / dnf remove formless / pacman -R formless-bin)")
         } else if s.contains("WinGet") {
             Some("winget uninstall formless")
+        } else if s.contains("/.cargo/bin/") || s.contains("\\.cargo\\bin\\") {
+            Some("cargo uninstall formless-bin")
         } else {
             None
         }
@@ -5540,32 +5554,84 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
             std::process::exit(2);
         }
     }
+    // What could not be removed; any of it makes the exit non-zero.
+    let mut failed: Vec<String> = Vec::new();
     for p in &profiles {
-        if daemon_reachable(p) {
-            let _ = formless_tui::client::request_once(p, Request::Shutdown);
-            for _ in 0..50 {
-                if !daemon_reachable(p) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
+        // The login service goes first: a service manager must not start
+        // the daemon again while its files are being deleted (#1079).
         if let Ok(plan) = formless_core::service::plan_here(p) {
-            if plan.file.exists() {
+            if plan.file.exists() || plan.manager == "Task Scheduler" {
                 match formless_core::service::uninstall(&plan) {
-                    Ok(()) => println!("removed the login service ({})", plan.file.display()),
-                    Err(e) => eprintln!("could not remove the login service: {e:#}"),
+                    Ok(()) => println!("removed the login service ({})", plan.manager),
+                    Err(e) if !plan.file.exists() && e.to_string().starts_with("not installed") => {
+                    }
+                    Err(e) => {
+                        failed.push(format!(
+                            "profile {}: the login service ({e:#}); nothing of this profile was deleted",
+                            p.profile
+                        ));
+                        continue;
+                    }
                 }
             }
         }
-        if keep_data {
-            formless_core::config::delete_secrets(p);
-        } else {
-            formless_core::config::reset_all(p)?;
+        if !stop_daemon(p) {
+            failed.push(format!(
+                "profile {}: its daemon is still running (stop it with `formless daemon stop`); nothing of it was deleted",
+                p.profile
+            ));
+            continue;
         }
-        println!("removed profile {}", p.profile);
+        let warnings = if keep_data {
+            let w = formless_core::config::delete_secrets(p);
+            println!(
+                "profile {}: deleted the API key, provider keys, OAuth and MCP logins and the relay secret; kept {} and {} (its config may still name providers whose keys are gone)",
+                p.profile,
+                p.data_dir.display(),
+                p.config_dir.display()
+            );
+            w
+        } else {
+            match formless_core::config::reset_all(p) {
+                Ok(w) => {
+                    println!("removed profile {}", p.profile);
+                    w
+                }
+                Err(e) => {
+                    failed.push(format!("profile {}: {e:#}", p.profile));
+                    continue;
+                }
+            }
+        };
+        for w in warnings {
+            failed.push(format!("profile {}: {w}", p.profile));
+        }
     }
     if let (Some(e), None, false) = (&exe, managed, keep_binary) {
+        // install.sh puts completions and the man page under the
+        // binary's prefix.
+        let extras: Vec<std::path::PathBuf> = e
+            .parent()
+            .and_then(|bin| bin.parent())
+            .map(|prefix| {
+                [
+                    "share/bash-completion/completions/formless",
+                    "share/zsh/site-functions/_formless",
+                    "share/fish/vendor_completions.d/formless.fish",
+                    "share/man/man1/formless.1",
+                ]
+                .iter()
+                .map(|f| prefix.join(f))
+                .filter(|f| f.exists())
+                .collect()
+            })
+            .unwrap_or_default();
+        for f in extras {
+            match std::fs::remove_file(&f) {
+                Ok(()) => println!("removed {}", f.display()),
+                Err(err) => failed.push(format!("{}: {err}", f.display())),
+            }
+        }
         if cfg!(windows) {
             println!(
                 "Windows can't delete a running program: delete {} yourself now.",
@@ -5574,15 +5640,44 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
         } else {
             match std::fs::remove_file(e) {
                 Ok(()) => println!("removed {}", e.display()),
-                Err(err) => eprintln!(
-                    "could not remove {}: {err} (delete it yourself)",
+                Err(err) => failed.push(format!(
+                    "{}: {err} (delete it yourself, e.g. with sudo)",
                     e.display()
-                ),
+                )),
             }
         }
     }
+    println!(
+        "Browsers you paired keep their own copy of the relay secret; clear the site data there (it no longer connects to anything)."
+    );
+    if !failed.is_empty() {
+        eprintln!("Not everything was removed:");
+        for f in &failed {
+            eprintln!("  - {f}");
+        }
+        return Err(anyhow::anyhow!(
+            "uninstall incomplete ({} item(s))",
+            failed.len()
+        ));
+    }
     println!("Formless is uninstalled.");
     Ok(())
+}
+
+/// Ask a profile's daemon to stop and wait up to 10 s; true once its
+/// socket no longer answers.
+fn stop_daemon(paths: &Paths) -> bool {
+    if !daemon_reachable(paths) {
+        return true;
+    }
+    let _ = formless_tui::client::request_once(paths, Request::Shutdown);
+    for _ in 0..100 {
+        if !daemon_reachable(paths) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }
 
 fn reset_cmd(paths: Paths, force: bool) -> Result<()> {
@@ -5596,16 +5691,14 @@ fn reset_cmd(paths: Paths, force: bool) -> Result<()> {
             std::process::exit(2);
         }
     }
-    if daemon_reachable(&paths) {
-        let _ = formless_tui::client::request_once(&paths, Request::Shutdown);
-        for _ in 0..50 {
-            if !daemon_reachable(&paths) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+    if !stop_daemon(&paths) {
+        return Err(anyhow::anyhow!(
+            "the daemon is still running; stop it with `formless daemon stop`, then reset again"
+        ));
     }
-    formless_core::config::reset_all(&paths)?;
+    for w in formless_core::config::reset_all(&paths)? {
+        eprintln!("warning: {w}");
+    }
     println!("reset complete");
     Ok(())
 }

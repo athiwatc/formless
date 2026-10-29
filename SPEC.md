@@ -414,7 +414,10 @@ The user talks to one **primary** model; work can go to others.
   for existing setups. `[providers.<name>]` adds more, with the same
   fields (`base_url`, `model`, headers, per-model `context_tokens`, …).
   - Keys: a named provider's API key lives in the keychain or 0600 secret
-    `provider-key-<name>` (or the env var `FORMLESS_API_KEY_<NAME>`), and
+    `provider-key-<name>` (or the env var `FORMLESS_API_KEY_<NAME>`, or
+    the file `FORMLESS_API_KEY_<NAME>_FILE` names, like
+    `FORMLESS_API_KEY_FILE` for the default; a set but unusable file is
+    named in the log and `doctor`), and
     is never in the config file or a listing. Named providers use API
     keys; OAuth stays with `default`.
   - Requests: `ListProviders` (with `has_key`), `UpsertProvider` (the key
@@ -3098,7 +3101,7 @@ run_tool = "network_policy"     # a registry Tool, or…
 ### 10.9 Guides
 
 - The user guides live in `docs/`: a gallery of example tasks, the
-  Capabilities in plain words, every key and command, troubleshooting,
+  Capabilities in plain words, the main keys and every command, troubleshooting,
   and Docker. `/docs [topic]` (TUI and web) and `formless docs [topic]
   [--print]` open one (`gallery`, `capabilities`, `approvals`, `keys`,
   `troubleshooting`, `mcp`, `skills`, `jobs`, `spec`; a prefix works;

@@ -1567,6 +1567,53 @@ pub fn save_api_key(paths: &Paths, key: &str) -> Result<()> {
     }
 }
 
+/// The key in the file a `*_FILE` variable names: None when the variable
+/// is unset, an error naming the variable and file when it can't be used
+/// (missing, unreadable, not UTF-8, empty). A BOM and surrounding
+/// whitespace are trimmed (#1083).
+pub fn key_from_file_env(var: &str) -> Option<std::result::Result<String, String>> {
+    let path = std::env::var_os(var)?;
+    let shown = std::path::Path::new(&path).display().to_string();
+    Some(match std::fs::read(&path) {
+        Err(e) => Err(format!("{var} names {shown}, which can't be read: {e}")),
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Err(_) => Err(format!("{var} names {shown}, which isn't UTF-8 text")),
+            Ok(text) => {
+                let key = text.trim_start_matches('\u{feff}').trim();
+                if key.is_empty() {
+                    Err(format!("{var} names {shown}, which is empty"))
+                } else {
+                    Ok(key.to_string())
+                }
+            }
+        },
+    })
+}
+
+/// Where the API key comes from, for `doctor` (never the key itself):
+/// ("env" | "file" | "fallback file" | "keychain" | "none", a problem
+/// with `FORMLESS_API_KEY_FILE` if it is set but unusable).
+pub fn api_key_source(paths: &Paths) -> (&'static str, Option<String>) {
+    let file_problem = match key_from_file_env("FORMLESS_API_KEY_FILE") {
+        Some(Err(why)) => Some(why),
+        _ => None,
+    };
+    if std::env::var("FORMLESS_API_KEY").is_ok_and(|v| !v.is_empty()) {
+        return ("env", file_problem);
+    }
+    if matches!(key_from_file_env("FORMLESS_API_KEY_FILE"), Some(Ok(_))) {
+        return ("file", None);
+    }
+    if read_secret_file(&paths.key_fallback_file()).is_some_and(|s| !s.trim().is_empty()) {
+        return ("fallback file", file_problem);
+    }
+    let keychain = keyring::Entry::new(KEYRING_SERVICE, &keyring_user(paths))
+        .ok()
+        .and_then(|e| e.get_password().ok())
+        .is_some_and(|k| !k.is_empty());
+    (if keychain { "keychain" } else { "none" }, file_problem)
+}
+
 pub fn load_api_key(paths: &Paths) -> Option<String> {
     if let Ok(v) = std::env::var("FORMLESS_API_KEY") {
         if !v.is_empty() {
@@ -1575,12 +1622,10 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
     }
     // A file holding the key, e.g. a Docker / Kubernetes secret mounted
     // at /run/secrets/… (docs/docker.md).
-    if let Some(k) = std::env::var_os("FORMLESS_API_KEY_FILE")
-        .and_then(|f| std::fs::read_to_string(f).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        return Some(k);
+    match key_from_file_env("FORMLESS_API_KEY_FILE") {
+        Some(Ok(k)) => return Some(k),
+        Some(Err(why)) => tracing::warn!("{why}; trying the other key sources"),
+        None => {}
     }
     if let Some(k) = read_secret_file(&paths.key_fallback_file())
         .map(|s| s.trim().to_string())
@@ -1599,7 +1644,8 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
 }
 
 /// The API key of a named provider (SPEC §4.5): `FORMLESS_API_KEY_<NAME>`
-/// (upper-case, non-alphanumerics as `_`), else the keychain/0600 secret.
+/// (upper-case, non-alphanumerics as `_`), else the file that
+/// `FORMLESS_API_KEY_<NAME>_FILE` names, else the keychain/0600 secret.
 pub fn provider_key(paths: &Paths, name: &str) -> Option<String> {
     let env = format!(
         "FORMLESS_API_KEY_{}",
@@ -1611,10 +1657,15 @@ pub fn provider_key(paths: &Paths, name: &str) -> Option<String> {
             })
             .collect::<String>()
     );
-    if let Ok(v) = std::env::var(env) {
+    if let Ok(v) = std::env::var(&env) {
         if !v.is_empty() {
             return Some(v);
         }
+    }
+    match key_from_file_env(&format!("{env}_FILE")) {
+        Some(Ok(k)) => return Some(k),
+        Some(Err(why)) => tracing::warn!("{why}; trying the stored key"),
+        None => {}
     }
     crate::auth::load_named_secret(paths, &format!("provider-key-{name}"))
         .and_then(|v| v.as_str().map(str::to_string))
@@ -1634,14 +1685,22 @@ pub fn delete_provider_key(paths: &Paths, name: &str) {
 
 /// Full reset (SPEC §15): keychain entry, config, and the entire data dir.
 /// Caller must stop the daemon first.
-pub fn reset_all(paths: &Paths) -> Result<()> {
-    delete_secrets(paths);
+pub fn reset_all(paths: &Paths) -> Result<Vec<String>> {
+    let warnings = delete_secrets(paths);
     for dir in [&paths.data_dir, &paths.config_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
         }
     }
-    Ok(())
+    // A long data path's socket lives elsewhere (SPEC §9.1).
+    let sock = paths.socket_path();
+    if sock.parent() != Some(paths.data_dir.as_path()) {
+        let _ = std::fs::remove_file(&sock);
+        if let Some(dir) = sock.parent() {
+            let _ = std::fs::remove_dir(dir); // only when empty
+        }
+    }
+    Ok(warnings)
 }
 
 /// `fresh` (a whole serialized config) merged into the `old` file text:
@@ -1867,8 +1926,23 @@ pub fn write_atomic(file: &Path, bytes: &[u8]) -> Result<()> {
 /// Every credential a profile keeps outside its folders (keychain and
 /// secret files): the API key, OAuth tokens, the relay secret, named
 /// providers' keys and MCP servers' logins.
-pub fn delete_secrets(paths: &Paths) {
-    let cfg = Config::load_file_only(paths).ok();
+///
+/// Named secrets are found from the config and from their files in the
+/// config folder, so ones whose provider or server was renamed or removed
+/// go too (#1080). Returns warnings: when `config.toml` doesn't parse,
+/// keychain-only named entries can't be listed.
+pub fn delete_secrets(paths: &Paths) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let cfg = match Config::load_file_only(paths) {
+        Ok(c) => Some(c),
+        Err(e) if paths.config_file().exists() => {
+            warnings.push(format!(
+                "config.toml could not be read ({e:#}), so keychain entries of named providers and MCP servers that have no file could not be listed"
+            ));
+            None
+        }
+        Err(_) => None,
+    };
     if let Some(cfg) = &cfg {
         for name in cfg.providers.keys() {
             delete_provider_key(paths, name);
@@ -1877,9 +1951,23 @@ pub fn delete_secrets(paths: &Paths) {
             crate::mcp_auth::logout(paths, server);
         }
     }
+    // Every named secret with a file, whatever the config says now.
+    for entry in std::fs::read_dir(&paths.config_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let file = entry.file_name().to_string_lossy().to_string();
+        if let Some(name) = file.strip_suffix(".json") {
+            if name.starts_with("provider-key-") || name.starts_with("mcp-oauth-") {
+                crate::auth::delete_named_secret(paths, name);
+            }
+        }
+    }
     delete_api_key(paths);
     crate::auth::delete_all_oauth_tokens(paths, cfg.as_ref());
     delete_relay_secret(paths);
+    warnings
 }
 
 // --- Relay pairing secret: 32 random bytes, base64url. It *is* the

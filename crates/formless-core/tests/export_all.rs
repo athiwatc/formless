@@ -152,3 +152,78 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
         "{again}"
     );
 }
+
+/// A provider key whose provider was removed from the config by hand is
+/// still deleted, and an unreadable config is reported (#1080).
+#[test]
+fn orphaned_named_secrets_are_deleted_and_bad_configs_reported() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-secrets-{short}"));
+    let paths = formless_core::Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-secrets-{short}"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    formless_core::config::save_provider_key(&paths, "gone", "sk-test").unwrap();
+    let file = paths.config_dir.join("provider-key-gone.json");
+    assert!(file.exists());
+    // Not in the config (never was, like one removed by hand).
+    let warnings = formless_core::config::delete_secrets(&paths);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(!file.exists(), "the orphaned key file is gone");
+    assert!(formless_core::config::provider_key(&paths, "gone").is_none());
+
+    std::fs::write(paths.config_file(), "[provider\nbroken").unwrap();
+    let warnings = formless_core::config::delete_secrets(&paths);
+    assert!(
+        warnings.iter().any(|w| w.contains("could not be read")),
+        "{warnings:?}"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// `*_FILE` keys: BOM and whitespace trimmed, unusable files named, and
+/// named providers read theirs too (#1083).
+#[test]
+fn key_files_are_trimmed_named_and_work_for_named_providers() {
+    use formless_core::config::key_from_file_env;
+    let dir = std::env::temp_dir().join(format!("fl-keyfile-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("key");
+    std::fs::write(&good, "\u{feff}  sk-file-key \n").unwrap();
+    std::env::set_var("FORMLESS_TEST_KEYFILE_GOOD", &good);
+    assert_eq!(
+        key_from_file_env("FORMLESS_TEST_KEYFILE_GOOD"),
+        Some(Ok("sk-file-key".into()))
+    );
+    let empty = dir.join("empty");
+    std::fs::write(&empty, " \n").unwrap();
+    std::env::set_var("FORMLESS_TEST_KEYFILE_EMPTY", &empty);
+    let e = key_from_file_env("FORMLESS_TEST_KEYFILE_EMPTY")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        e.contains("FORMLESS_TEST_KEYFILE_EMPTY") && e.contains("empty"),
+        "{e}"
+    );
+    std::env::set_var("FORMLESS_TEST_KEYFILE_MISSING", dir.join("nope"));
+    let e = key_from_file_env("FORMLESS_TEST_KEYFILE_MISSING")
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("can't be read"), "{e}");
+    assert_eq!(key_from_file_env("FORMLESS_TEST_KEYFILE_UNSET"), None);
+
+    let paths = formless_core::Paths {
+        data_dir: dir.join("d"),
+        config_dir: dir.join("c"),
+        profile: "keyfile".into(),
+    };
+    std::env::set_var("FORMLESS_API_KEY_FILETESTPROV_FILE", &good);
+    assert_eq!(
+        formless_core::config::provider_key(&paths, "filetestprov").as_deref(),
+        Some("sk-file-key")
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
