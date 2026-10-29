@@ -62,6 +62,55 @@ pub fn gc_preview(store: &Store, cfg: &ArtifactsCfg) -> Result<(usize, u64)> {
     Ok((files, bytes))
 }
 
+/// What [`reconcile`] fixed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Files with no row, removed, and their bytes.
+    pub orphan_files: usize,
+    pub orphan_bytes: u64,
+    /// Rows whose file was gone, dropped.
+    pub missing_rows: usize,
+}
+
+/// Make disk and database agree (#609): a file in `dir` with no row and
+/// older than `grace` (so an `emit` still writing is left alone) is
+/// removed, and a row whose file is gone is dropped.
+pub fn reconcile(store: &Store, dir: &std::path::Path, grace: std::time::Duration) -> Result<Reconciled> {
+    let rows = store.list_artifacts()?;
+    let known: std::collections::HashSet<std::path::PathBuf> = rows
+        .iter()
+        .map(|(_, p, _, _)| std::path::PathBuf::from(p))
+        .collect();
+    let mut out = Reconciled::default();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || known.contains(&path) {
+            continue;
+        }
+        let young = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_none_or(|age| age < grace);
+        if young {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            out.orphan_files += 1;
+            out.orphan_bytes += meta.len();
+        }
+    }
+    let gone: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, p, _, _)| !std::path::Path::new(p).exists())
+        .map(|(id, ..)| id)
+        .collect();
+    out.missing_rows = gone.len();
+    store.delete_artifact_rows(&gone)?;
+    Ok(out)
+}
+
 /// Delete a Session's artifact files and rows (call before the Session).
 pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
     for path in store.session_artifact_paths(session_id)? {
@@ -74,4 +123,30 @@ pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
 pub fn usage(store: &Store) -> Result<(usize, u64)> {
     let all = store.list_artifacts()?;
     Ok((all.len(), all.iter().map(|a| a.2.max(0) as u64).sum()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphans_both_ways_are_reconciled() {
+        let dir = std::env::temp_dir().join(format!("fl-recon-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let kept = dir.join("kept.txt");
+        std::fs::write(&kept, "keep").unwrap();
+        store.save_artifact(None, &kept.display().to_string(), "", 4).unwrap();
+        store.save_artifact(None, &dir.join("gone.txt").display().to_string(), "", 9).unwrap();
+        std::fs::write(dir.join("orphan.txt"), "12345").unwrap();
+        // Too young to touch: an emit may still be writing it.
+        let r = reconcile(&store, &dir, std::time::Duration::from_secs(3600)).unwrap();
+        assert_eq!((r.orphan_files, r.missing_rows), (0, 1));
+        let r = reconcile(&store, &dir, std::time::Duration::ZERO).unwrap();
+        assert_eq!((r.orphan_files, r.orphan_bytes), (1, 5));
+        assert!(kept.exists() && !dir.join("orphan.txt").exists());
+        let (n, bytes) = usage(&store).unwrap();
+        assert_eq!((n, bytes), (1, 4), "usage matches the disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
