@@ -64,6 +64,11 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | [docs/adr/](docs/adr) | Architecture Decision Records |
 | [relay/README.md](relay/README.md) | The Worker that powers browser access |
 | [packaging/README.md](packaging/README.md) | Release process, installer, Homebrew/winget templates |
+| [docs/gallery.md](docs/gallery.md) | What Formless can do: 15 example tasks |
+| [docs/capabilities.md](docs/capabilities.md) | What Tools can access, the risks, recommended trust settings |
+| [docs/keys.md](docs/keys.md) | Every key and command (generated: `formless docs --keys`) |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems and their fixes |
+| [docs/docker.md](docs/docker.md) | Running the daemon in Docker |
 | `Cargo.toml` | Rust workspace, edition 2021, Apache-2.0 |
 
 ---
@@ -224,7 +229,13 @@ cargo build --release          # binary at ./target/release/formless
 
 `cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code. You can also `cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked`.
 
-**Homebrew / winget.** A source formula ships at [`packaging/homebrew/formless.rb`](packaging/homebrew/formless.rb) and winget templates at [`packaging/winget/`](packaging/winget); neither is published yet, so for now use the installer or a source build. **Windows:** download the release archive and unzip it, or build from source.
+**Linux packages.** Each release has a `.deb` (`sudo apt install ./formless_<version>_amd64.deb`) and an `.rpm` (`sudo dnf install ./formless-<version>.x86_64.rpm`); Arch users can install `formless-bin` from the AUR once it is published.
+
+**Docker.** `ghcr.io/athiwatc/formless` runs the daemon headless on a server, reachable through the relay; volumes, the API key as a secret and profiles are in [docs/docker.md](docs/docker.md).
+
+**Homebrew / winget.** Releases render a Homebrew formula and winget manifests and publish them once the maintainer's tap and tokens are set up ([packaging/README.md](packaging/README.md)): then `brew install athiwatc/tap/formless` and `winget install athiwatc.formless`. Until then, use the installer or a source build. **Windows:** download the release archive and unzip it, or build from source.
+
+**Uninstall.** `formless uninstall` stops the daemon, removes the login service, deletes keychain entries and every profile's data, and removes the binary (or names the package-manager command). `--keep-data` keeps Sessions, Tools and config; `formless export-all` keeps a copy first.
 
 > [!NOTE]
 > Release artifacts are checksummed but unsigned. On macOS you may need `xattr -d com.apple.quarantine formless` after installing by hand. `formless update check` reports newer releases but never rewrites the installed binary — updates stay with the installer and checksum verification ([§3.12](#312-updating)).

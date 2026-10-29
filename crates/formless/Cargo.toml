@@ -28,3 +28,26 @@ reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+
+# Linux packages (packaging/README.md): `cargo deb -p formless-bin` and
+# `cargo generate-rpm -p crates/formless` after a release build.
+[package.metadata.deb]
+name = "formless"
+maintainer = "Athiwat Chunlakhan <731394+athiwatc@users.noreply.github.com>"
+section = "utils"
+priority = "optional"
+depends = "ca-certificates"
+extended-description = "Formless is an AI agent harness that builds the Tools it needs, keeps them, and improves them over time. One binary: TUI, daemon, CLI and web UI."
+assets = [
+    ["target/release/formless", "usr/bin/", "755"],
+    ["../../target/formless.1", "usr/share/man/man1/formless.1", "644"],
+    ["../../README.md", "usr/share/doc/formless/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "formless"
+assets = [
+    { source = "target/release/formless", dest = "/usr/bin/formless", mode = "755" },
+    { source = "../../target/formless.1", dest = "/usr/share/man/man1/formless.1", mode = "644", doc = true },
+    { source = "../../README.md", dest = "/usr/share/doc/formless/README.md", mode = "644", doc = true },
+]

@@ -2976,6 +2976,19 @@ run_tool = "network_policy"     # a registry Tool, or…
 - Agent answers are not translated; they are in whatever language the
   conversation is in.
 
+### 10.9 Guides
+
+- The user guides live in `docs/`: a gallery of example tasks, the
+  Capabilities in plain words, every key and command, troubleshooting,
+  and Docker. `/docs [topic]` (TUI and web) and `formless docs [topic]
+  [--print]` open one (`gallery`, `capabilities`, `approvals`, `keys`,
+  `troubleshooting`, `mcp`, `skills`, `jobs`, `spec`; a prefix works;
+  none lists them). `formless doctor` prints the troubleshooting link, and
+  `/help` points to `/docs`.
+- `docs/keys.md` is generated from the same key and command tables `/help`
+  shows (`formless docs --keys`); a test fails when it is stale, and when
+  a web key it lists is gone from the web UI.
+
 ## 11. Compaction
 
 - Trigger: Run/Session approaching the model's `context_tokens` (§4.2).
@@ -3451,6 +3464,15 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
   Recorded payloads never leave the data dir except redacted, to the user's
   own endpoint, for optimisation.
+- **Uninstalling.** `formless uninstall [--keep-data] [--keep-binary]
+  [--yes]` asks for `uninstall` typed, then for every profile stops the
+  daemon, removes the login service (§9.1), deletes every secret it keeps
+  outside its folders (the API key, OAuth tokens, the relay secret, named
+  providers' keys, MCP logins), and (unless `--keep-data`) the data and
+  config folders; finally it removes the binary, unless a package
+  manager installed it (Homebrew, apt/dnf/pacman, winget: it names that
+  command instead) or on Windows (a running program can't delete itself:
+  it says to). `formless reset` deletes the same secrets.
 - **Moving to a new machine.** `formless export-all [--sessions] [-o
   FILE]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600):
   every active registry Tool (MCP tools come back with their server), the

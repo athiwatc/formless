@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod daemon;
 pub mod diff;
+pub mod docs;
 pub mod dupes;
 pub mod errors;
 pub mod files;

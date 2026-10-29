@@ -3855,6 +3855,14 @@
       if (!model) return note("usage: /pull MODEL", true);
       if (await act({ type: "ollama_pull", model })) note("pulling " + model + " with Ollama…");
     } },
+    { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: gallery, capabilities, approvals, keys, troubleshooting", run: (arg) => {
+      const base = "https://github.com/athiwatc/formless/blob/main/";
+      const topics = { gallery: "docs/gallery.md", capabilities: "docs/capabilities.md", approvals: "docs/capabilities.md#are-you-asked", keys: "docs/keys.md", troubleshooting: "docs/troubleshooting.md", mcp: "SPEC.md#79-external-mcp-servers", skills: "SPEC.md#710-skills", jobs: "SPEC.md#97-scheduled-jobs", spec: "SPEC.md" };
+      const t = (arg || "").trim().toLowerCase();
+      const key = !t ? "gallery" : Object.keys(topics).find((k) => k === t) || Object.keys(topics).find((k) => k.startsWith(t));
+      if (!key) return note("docs topics: " + Object.keys(topics).join(", "), true);
+      window.open(base + topics[key], "_blank", "noopener");
+    } },
     { name: "status", group: "Settings", desc: "the daemon: memory, CPU, database, running work", run: () => showStatus() },
     { name: "storage", group: "Settings", desc: "disk used by Sessions, artifacts, logs, backups", run: () => showStorage() },
     { name: "gc", group: "Settings", desc: "clean up: shows what it frees first", run: () => showGc() },
