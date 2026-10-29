@@ -344,7 +344,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 50;
+pub const SCHEMA_VERSION: i64 = 51;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -429,7 +429,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 50] = [
+const MIGRATIONS: [(i64, MigrationStep); 51] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -630,6 +630,18 @@ const MIGRATIONS: [(i64, MigrationStep); 50] = [
     (50, |c| {
         add_column(c, "runs", "rating TEXT NOT NULL DEFAULT ''")?;
         add_column(c, "runs", "rating_comment TEXT")
+    }),
+    // Files a Run's Tools changed, with what they held before (SPEC §5.7).
+    (51, |c| {
+        add_column(c, "sessions", "plan TEXT")?;
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_files (
+               run_id TEXT NOT NULL, session_id TEXT NOT NULL, path TEXT NOT NULL,
+               existed INTEGER NOT NULL, kept INTEGER NOT NULL, before BLOB,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY (run_id, path));
+             CREATE INDEX IF NOT EXISTS idx_run_files_session ON run_files(session_id, created_at);",
+        )?)
     }),
 ];
 
@@ -1981,6 +1993,121 @@ impl Store {
             "UPDATE task_stats SET outcome=?2 WHERE run_id=(SELECT id FROM runs WHERE session_id=?1
                ORDER BY created_at DESC, rowid DESC LIMIT 1) AND outcome='completed'",
             params![session_id, followup],
+        )?;
+        Ok(())
+    }
+
+    /// Record what `path` held before a Run first changed it: `existed`
+    /// false for a new file; `before` its bytes when `kept` (small enough
+    /// and a regular file). Later changes in the same Run keep the first.
+    pub fn snapshot_run_file(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        path: &str,
+        existed: bool,
+        before: Option<&[u8]>,
+    ) -> Result<()> {
+        self.ex(
+            "INSERT OR IGNORE INTO run_files(run_id,session_id,path,existed,kept,before,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                run_id,
+                session_id,
+                path,
+                existed,
+                !existed || before.is_some(),
+                before,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The files a Run changed: (path, existed before, revertible, bytes
+    /// before), in the order first touched.
+    #[allow(clippy::type_complexity)]
+    pub fn run_files(&self, run_id: &str) -> Result<Vec<(String, bool, bool, Option<Vec<u8>>)>> {
+        let mut stmt = self.ps(
+            "SELECT path, existed, kept, before FROM run_files WHERE run_id=?1 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The Session's latest Run that changed files.
+    pub fn last_run_with_files(&self, session_id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT run_id FROM run_files WHERE session_id=?1
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// What a Run called: (name, calls, failed), registry Tools and
+    /// built-ins together, most-used first (the "What I did" recap).
+    pub fn run_calls(&self, run_id: &str) -> Result<Vec<(String, i64, i64)>> {
+        let mut stmt = self.ps(
+            "SELECT name, COUNT(*), SUM(failed) FROM (
+               SELECT t.name AS name, (i.status NOT IN ('success','running','pending')) AS failed
+                 FROM invocations i JOIN tools t ON t.id=i.tool_id
+                WHERE i.run_id=?1 AND i.parent_id IS NULL
+               UNION ALL
+               SELECT name, (ok=0) FROM builtin_calls WHERE run_id=?1)
+             GROUP BY name ORDER BY COUNT(*) DESC, name",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?.unwrap_or(0)))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The agent's plan for a Session (`update_plan`); empty when none.
+    pub fn session_plan(&self, session_id: &str) -> Result<Vec<formless_protocol::PlanItem>> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT plan FROM sessions WHERE id=?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .flatten()
+            .and_then(|p| serde_json::from_str(&p).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn set_session_plan(
+        &self,
+        session_id: &str,
+        items: &[formless_protocol::PlanItem],
+    ) -> Result<()> {
+        let plan = (!items.is_empty()).then(|| serde_json::to_string(items).unwrap_or_default());
+        self.ex(
+            "UPDATE sessions SET plan=?2 WHERE id=?1",
+            params![session_id, plan],
+        )?;
+        Ok(())
+    }
+
+    /// Forget one recorded file (after it was reverted).
+    pub fn forget_run_file(&self, run_id: &str, path: &str) -> Result<()> {
+        self.ex(
+            "DELETE FROM run_files WHERE run_id=?1 AND path=?2",
+            params![run_id, path],
         )?;
         Ok(())
     }

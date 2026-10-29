@@ -649,6 +649,45 @@ pasting paths.
   model name when unset. This works on Chat Completions with native tool
   calling; elsewhere the reference line alone is sent.
 
+### 5.7 What a Run changed
+
+- **Files.** Before a Tool's live `fs.write` / `fs.append` / `fs.remove` /
+  `fs.rename` first touches a path in a Run, the daemon keeps what it held
+  (`run_files`, schema v51: whether it existed, and its bytes when it is a
+  regular file of at most 2 MB). Later changes in the same Run keep that
+  first snapshot. Files changed by `process.run` or other programs are not
+  tracked, and neither are Tools run outside a Run.
+- At the end of a Run that changed files, `RunFilesChanged {files}` lists
+  them (`created`, `modified`, `removed`, or `unchanged` when changed
+  back); clients note "3 files changed … · /files · /rewind".
+  `RunFiles {session_id, run_id?}` adds a context diff for text files.
+  The TUI's `/files` opens them in the pager; the web shows a dialog with
+  diffs and Revert buttons.
+- **Rewind.** `RewindRun {session_id, run_id?, path?}` (`/rewind [PATH]`)
+  puts one file, or all of the Run's revertible files, back as they were
+  before the Run: rewritten from the snapshot, or deleted when the Run
+  created it. Files whose content was not kept (too large, a folder) are
+  reported as skipped. A system note tells the agent which files were
+  reverted. Not while a Run is active.
+- **What I did.** After a Run of 4 or more steps, `RunRecap {steps,
+  duration_ms, used, built, files, steered}` sums up its trace with no
+  model call: Tools and built-ins called (with counts and failures),
+  Tools created or updated, files changed, and how often the user steered.
+  The TUI shows a folded "▸ What I did" line under the answer (`/recap`
+  expands it); the web shows it as a collapsible block.
+
+### 5.8 The agent's plan
+
+- `update_plan(items)` is a built-in for tasks of 3 or more steps: a
+  checklist of up to 20 `{content, status}` items (`pending`,
+  `in_progress`, `completed`; at most 200 characters each). Each call
+  replaces the whole list; an empty list clears it. It is stored on the
+  Session (`sessions.plan`, schema v51), returned by `GetSession` as
+  `plan`, and broadcast as `PlanUpdated {session_id, items}`.
+- The TUI pins it at the end of the chat, just above the input (`✓` done,
+  `▸` in progress, `○` pending) and the web above the composer. Once every
+  step is done and no Run is active it folds to "✓ Plan done (n/n)".
+
 ## 6. Invocations: async by design
 
 ### 6.1 Execution model
@@ -722,7 +761,7 @@ pattern (§4.4).
   `find_tools`, `read_tool`, `read_module`, `read_artifact`, `test_tool`,
   `run_script` (v2.3, §7.12),
   `unload_tools`, `remember`, `forget` (§7.11), `ask_user` (§5.5),
-  `schedule_run` (§9.7), `read_metrics` (§8.9),
+  `schedule_run` (§9.7), `read_metrics` (§8.9), `update_plan` (§5.8),
   and the Pending Invocation handles (§6.3). Their names are reserved, as is `spawn_subagent` (a
   former built-in; sub-agents are now the `agent` Capability, §7.6), so no
   registry Tool can impersonate one.
@@ -798,6 +837,13 @@ pattern (§4.4).
     (60).
 - `create_tool` is **immutable, excluded from Self-Optimisation**, and cannot
   be retired, edited, or widened by the agent or the optimiser.
+- **Readable Tool errors.** When a Tool's JavaScript throws, the error the
+  agent and the user see (the tool result, the expanded call, the
+  Invocation's stored error) is the message, the call path in the Tool's
+  own code (`at helper (line 2) ← run (line 6)`), the failing line with
+  two lines of context and a `^` at the column, and the input (first 500
+  characters). The runner's own frames are left out; without a position
+  in the Tool's code the QuickJS text is kept as is.
 
 ### 7.2 Tool lifecycle
 
@@ -931,6 +977,13 @@ pattern (§4.4).
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
     stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` —
     gated by `process`, no shell, stdin closed unless given.
+  - `progress(fraction, label)` — no Capability needed: `fraction` 0..1
+    (or null when unknown) and a short label. The daemon broadcasts
+    `ToolProgress {tool_name, depth, fraction, label}` (at most 5 a second
+    per Invocation, plus every label change and completion), the TUI and
+    web draw a bar on the running call, and like any host call it counts
+    as activity for stall detection (§6.1). Ignored in smoke tests and
+    replays.
   - `tools.call(name, input)` — composition (§7.6). Returns a Promise of
     the nested Tool's output, so several run in parallel under
     `Promise.all` (§7.12). Every call must settle before `run` is done: a

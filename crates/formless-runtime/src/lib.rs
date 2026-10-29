@@ -78,6 +78,12 @@ pub trait HostOps: Send + Sync {
     ) -> Result<Value, String> {
         Err("store is not available in this context".into())
     }
+    /// A live `fs.write` / `fs.append` / `fs.remove` / `fs.rename` is about
+    /// to change `path` (each side of a rename): the daemon snapshots the
+    /// file first so the Run's changes can be listed and reverted.
+    fn file_changing(&self, _path: &std::path::Path) {}
+    /// `progress(fraction, label)` from a running Tool (SPEC §7.5).
+    fn progress(&self, _fraction: Option<f64>, _label: &str) {}
     /// One non-streaming LLM completion via the daemon's provider.
     fn llm_complete(
         &self,
@@ -325,6 +331,12 @@ globalThis.requireModule = (name) => {
 };
 globalThis.modules = { load: globalThis.requireModule, list: () => __call("module_list", {}) };
 globalThis.emit = (chunk) => __call("emit", { chunk: String(chunk) });
+// Progress for long work: a fraction 0..1 (or null when unknown) and a
+// short label; shown on the running call and counted as activity.
+globalThis.progress = (fraction, label) => __call("progress", {
+  fraction: typeof fraction === "number" && isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : null,
+  label: label == null ? "" : String(label).slice(0, 120),
+});
 globalThis.sleep = (ms) => __call("sleep", { ms: ms | 0 });
 // Real timers: callbacks run from the host's event loop after the current
 // job, in due order (ties by creation), never synchronously.
@@ -667,6 +679,13 @@ impl State {
                 self.ops.emit(a["chunk"].as_str().unwrap_or_default())?;
                 Ok(Value::Null)
             }
+            "progress" => {
+                if self.mode == HostMode::Live {
+                    self.ops
+                        .progress(a["fraction"].as_f64(), a["label"].as_str().unwrap_or_default());
+                }
+                Ok(Value::Null)
+            }
             "tools_call" => {
                 if self.mode == HostMode::Smoke {
                     return Err(self.stub(denied("tools.call in smoke test")));
@@ -930,6 +949,7 @@ impl State {
                     self.overlay_put(&p, Some(full));
                     return Ok(json!(data.len()));
                 }
+                self.ops.file_changing(&p);
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
@@ -995,6 +1015,7 @@ impl State {
                 }
                 let m =
                     std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                self.ops.file_changing(&p);
                 if m.is_dir() {
                     if a["recursive"].as_bool().unwrap_or(false) {
                         std::fs::remove_dir_all(&p)
@@ -1026,6 +1047,8 @@ impl State {
                     self.overlay_put(&from, None);
                     return Ok(Value::Null);
                 }
+                self.ops.file_changing(&from);
+                self.ops.file_changing(&to);
                 if let Some(parent) = to.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
@@ -2001,6 +2024,27 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records `progress` calls.
+    struct ProgressOps(Mutex<Vec<(Option<f64>, String)>>);
+    impl HostOps for ProgressOps {
+        fn progress(&self, fraction: Option<f64>, label: &str) {
+            self.0.lock().unwrap().push((fraction, label.to_string()));
+        }
+    }
+
+    #[test]
+    fn progress_reaches_the_host_clamped() {
+        let ops = Arc::new(ProgressOps(Mutex::new(Vec::new())));
+        let req = live(
+            "function run() { progress(0.5, 'half'); progress(7); progress('x', null); return 1; }",
+        );
+        execute(&req, ops.clone()).unwrap();
+        assert_eq!(
+            *ops.0.lock().unwrap(),
+            [(Some(0.5), "half".into()), (Some(1.0), String::new()), (None, String::new())]
+        );
+    }
 
     #[test]
     fn utf8_cut_never_splits_a_char() {

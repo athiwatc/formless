@@ -1566,7 +1566,10 @@
           let calls = [];
           try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
           calls.forEach((c) => n.append(toolCallChip(c)));
-          if (m === lastAnswer && !isRunning()) n.append(rateButtons());
+          if (m === lastAnswer && !isRunning()) {
+            if (S.recap) n.append(recapBlock(S.recap));
+            n.append(rateButtons());
+          }
         }));
       }
     }
@@ -1708,6 +1711,9 @@
           h("span", { class: "tname" }, t.name + (t.version > 0 ? " v" + t.version : "")),
           h("span", { class: "targs" }, t.subagent ? (t.step || "") : summarizeArgs(t.arguments || "")),
           folded ? h("span", { class: "tag" }, "+" + folded + " nested") : null,
+          running && t.progress ? h("span", { class: "tprogress" },
+            t.progress.fraction != null ? h("progress", { max: "1", value: String(t.progress.fraction), "aria-label": "Progress" }) : null,
+            (t.progress.fraction != null ? " " + Math.round(t.progress.fraction * 100) + "%" : "") + (t.progress.label ? " " + t.progress.label : "")) : null,
           t.stalledSecs != null ? h("span", { class: "tag broad" }, "stalled " + t.stalledSecs + "s") : null,
           t.handle && running ? h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(t.handle); } }, "Cancel") : null,
           t.subagent ? h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(t.subagent); } }, "Transcript") : null,
@@ -1756,6 +1762,19 @@
       h("button", { class: "btn small", type: "button", onclick: async () => {
         if (await act({ type: "abandon_run", session_id: S.current }, "Abandoned")) { S.unfinished = null; renderRunBanner(); }
       } }, "Abandon"));
+  }
+
+  /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
+  function renderPlan() {
+    const box = $("plan");
+    const items = S.plan || [];
+    box.classList.toggle("hidden", !items.length);
+    if (!items.length) return box.replaceChildren();
+    const done = items.filter((i) => i.status === "completed").length;
+    if (done === items.length && !isRunning()) return box.replaceChildren(h("span", { class: "muted" }, "✓ Plan done (" + done + "/" + items.length + ")"));
+    const mark = { completed: "✓", in_progress: "▸" };
+    box.replaceChildren(h("span", { class: "muted" }, "Plan (" + done + "/" + items.length + ")"),
+      h("ul", null, items.map((i) => h("li", { class: i.status }, (mark[i.status] || "○") + " " + i.content))));
   }
 
   /** Messages queued for after this Run (SPEC §5.3): edit, reorder, remove. */
@@ -3194,6 +3213,8 @@
     S.liveTools = [];
     S.editMessageId = null;
     S.queued = []; renderQueue();
+    S.plan = []; renderPlan();
+    S.recap = null;
     S.follow = true;
     const r = await act({ type: "get_session", id });
     if (r && S.current === id) {
@@ -3202,6 +3223,8 @@
       renderRunBanner();
       S.queued = r.queued_items || [];
       renderQueue();
+      S.plan = r.plan || [];
+      renderPlan();
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
     }
@@ -3559,6 +3582,14 @@
       if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
     } },
     { name: "retry", args: "[--model MODEL]", group: "Run control", desc: "re-run your last message, optionally on another model (the old answer stays in a fork)", run: (arg) => retryRun((arg || "").replace(/^--model\s*/, "").trim()) },
+    { name: "files", group: "Run control", desc: "the files the last Run changed, with diffs", run: () => showRunFiles() },
+    { name: "rewind", args: "[PATH]", group: "Run control", desc: "put the last Run's file changes back (one file, or all)", run: async (arg) => {
+      const path = (arg || "").trim();
+      const x = await act({ type: "rewind_run", session_id: S.current, path: path && path !== "all" ? path : null });
+      if (!x) return;
+      note(x.restored.length ? "reverted " + x.restored.join(", ") : "nothing reverted");
+      x.skipped.forEach((k) => note("not reverted: " + k.path + " (" + k.reason + ")", true));
+    } },
     { name: "limit", args: "N|off", group: "Run control", desc: "cap the current (or next) Run at N steps: /limit 20, /limit off", run: async (arg) => {
       const n = (arg || "").trim();
       const max = /^(off|none|0)$/.test(n) ? null : parseInt(n, 10);
@@ -3663,6 +3694,45 @@
     dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
     document.body.append(dialog);
     close.focus();
+  }
+  // The files the last Run changed, with diffs and revert buttons (SPEC §5.7).
+  async function showRunFiles() {
+    if (!S.current) return note("open a session first", true);
+    const sid = S.current;
+    const r = await act({ type: "run_files", session_id: sid });
+    if (!r) return;
+    const close = h("button", { class: "btn small primary", type: "button" }, "Close");
+    const rewind = async (path) => {
+      const x = await act({ type: "rewind_run", session_id: sid, run_id: r.run_id, path: path || null });
+      if (!x) return;
+      if (x.restored.length) note("reverted " + x.restored.join(", "));
+      x.skipped.forEach((k) => note("not reverted: " + k.path + " (" + k.reason + ")", true));
+      done();
+    };
+    const mark = { created: "A", removed: "D", unchanged: "=" };
+    const body = h("div", { class: "files-body" }, r.files.map((f) => h("div", { class: "run-file" },
+      h("div", { class: "run-file-head" }, h("code", null, (mark[f.status] || "M") + " " + f.path),
+        h("span", { class: "spacer" }),
+        f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible")),
+      f.diff ? h("pre", { class: "diff" }, f.diff.split("\n").map((l) => h("span", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : "" }, l + "\n"))) : null)));
+    const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Revert every file this Run changed?")) rewind(""); } }, "Revert all");
+    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
+      h("div", { class: "modal help" }, h("h2", null, "Files changed by the Run (" + r.files.length + ")"), body,
+        h("div", { class: "modal-actions" }, all, h("span", { class: "spacer" }), close)));
+    const done = () => { dialog.remove(); $("input").focus(); };
+    close.onclick = done;
+    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
+    document.body.append(dialog);
+    close.focus();
+  }
+  // "What I did" under the last answer of a long Run (SPEC §5.7).
+  function recapBlock(r) {
+    const n = (k, what) => (k ? " · " + k + " " + what : "");
+    const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
+    return h("details", { class: "recap" },
+      h("summary", null, "What I did · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + n(r.used.length, "calls") + n(r.built.length, "Tools changed") + n(r.files.length, "files")),
+      ...list("Used", r.used), ...list("Built", r.built), ...list("Files", r.files),
+      r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
   }
   async function showContext() {
     if (!S.current) return note("open a session first", true);
@@ -3807,8 +3877,17 @@
     switch (ev.type) {
       case "run_started":
         S.running.add(ev.session_id);
-        if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; }
+        if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; }
         if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = []; setActivity("waiting for model"); }
+        break;
+      case "run_recap":
+        if (here) { S.recap = ev.recap; renderHistory(); }
+        break;
+      case "run_files_changed":
+        if (here) {
+          const changed = ev.files.filter((f) => f.status !== "unchanged");
+          if (changed.length) note(changed.length + " file(s) changed: " + changed.slice(0, 5).map((f) => f.path.split(/[\\/]/).pop() + " (" + f.status + ")").join(", ") + " · /files shows them, /rewind reverts");
+        }
         break;
       case "run_tool_changes":
         if (here) { S.runTools = ev.changes; renderRunTools(); }
@@ -3825,6 +3904,9 @@
         break;
       case "provider_stalled":
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
+        break;
+      case "plan_updated":
+        if (here) { S.plan = ev.items || []; renderPlan(); }
         break;
       case "queue_changed":
         if (here) { S.queued = ev.queued || []; renderQueue(); }
@@ -3845,6 +3927,7 @@
       case "run_paused":
         S.running.delete(ev.session_id);
         if (here) {
+          renderPlan();
           // run_paused carries the error (and its explanation); the
           // run_finished that follows must not wipe it.
           if (ev.type === "run_paused") S.unfinished = { status: "paused", error: ev.error, explained: ev.explained };
@@ -3866,6 +3949,12 @@
         if (here) {
           S.liveTools.push({ name: ev.tool_name, version: ev.version, arguments: ev.arguments, status: "running", started: Date.now(), depth: ev.depth || 0 });
           setActivity("running " + ev.tool_name);
+        }
+        break;
+      case "tool_progress":
+        if (here) {
+          const t = [...S.liveTools].reverse().find((x) => x.name === ev.tool_name && x.status === "running" && (x.depth || 0) === (ev.depth || 0));
+          if (t) { t.progress = { fraction: ev.fraction, label: ev.label }; renderLive(); }
         }
         break;
       case "tool_call_finished":

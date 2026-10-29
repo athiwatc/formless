@@ -226,6 +226,24 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd("unrate", "", "clear your rating of the last answer", Run),
     cmd(
+        "recap",
+        "",
+        "expand or fold the last long Run's \"What I did\"",
+        Run,
+    ),
+    cmd(
+        "files",
+        "",
+        "the files the last Run changed, with diffs",
+        Run,
+    ),
+    cmd(
+        "rewind",
+        "[PATH]",
+        "put the last Run's file changes back (one file, or all)",
+        Run,
+    ),
+    cmd(
         "queue",
         "[edit|rm|up|down N]",
         "the messages queued for after this Run: edit, remove or reorder them",

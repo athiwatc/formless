@@ -2511,3 +2511,243 @@ async fn retry_reruns_the_last_message_on_another_model() {
     );
     server.abort();
 }
+
+/// A Run's file changes are snapshotted, listed with diffs, summed up in
+/// the recap, and reverted by `/rewind` (SPEC §5.7).
+#[cfg(unix)]
+#[tokio::test]
+async fn run_file_changes_are_listed_and_rewound() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4files");
+    let work = paths.data_dir.parent().unwrap().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let w = work.display().to_string();
+    std::fs::write(work.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(work.join("c.txt"), "gone soon").unwrap();
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let caps = Capabilities::parse(&[format!("fs:write:{w}"), format!("fs:read:{w}")]).unwrap();
+        store
+            .create_tool_version(
+                "writer",
+                "edits files",
+                r#"{"type":"object"}"#,
+                "{}",
+                &format!(
+                    "function run(i){{ fs.write('{w}/a.txt', 'one\\nTWO\\n'); fs.write('{w}/b.txt', 'new'); \
+                     if (fs.exists('{w}/c.txt')) fs.remove('{w}/c.txt'); return {{ok: true}}; }}"
+                ),
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap();
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n < 4 {
+                            sse_tool(&format!("c{n}"), "writer", json!({}))
+                        } else {
+                            sse_text("done")
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "edit".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let (mut files, mut recap) = (None, None);
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(&line) {
+            Ok(ServerMessage::Event(Event::ApprovalRequested { approval_id, .. })) => {
+                c.send(Request::ApprovalDecision {
+                    remember_denial: Default::default(),
+                    paths: Default::default(),
+                    approval_id,
+                    approved: true,
+                    scope: formless_protocol::ApprovalScope::Session,
+                })
+                .await;
+            }
+            Ok(ServerMessage::Event(Event::RunFilesChanged { files: f, .. })) => files = Some(f),
+            Ok(ServerMessage::Event(Event::RunRecap { recap: r, .. })) => recap = Some(r),
+            Ok(ServerMessage::Event(Event::RunFinished { status, .. })) => {
+                assert_eq!(status, "completed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let status = |files: &[formless_protocol::RunFileInfo], name: &str| {
+        files
+            .iter()
+            .find(|f| f.path.ends_with(name))
+            .map(|f| f.status.clone())
+    };
+    let files = files.expect("files changed event");
+    assert_eq!(status(&files, "a.txt").as_deref(), Some("modified"));
+    assert_eq!(status(&files, "b.txt").as_deref(), Some("created"));
+    assert_eq!(status(&files, "c.txt").as_deref(), Some("removed"));
+    let recap = recap.expect("a recap after 5 steps");
+    assert!(recap.steps >= 4, "{recap:?}");
+    assert!(recap.used.iter().any(|u| u.starts_with("writer ×")), "{:?}", recap.used);
+    assert_eq!(recap.files.len(), 3, "{:?}", recap.files);
+    // The diff shows the edit.
+    let r = c
+        .rpc(Request::RunFiles {
+            session_id: id.clone(),
+            run_id: None,
+        })
+        .await;
+    let a = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"].as_str().unwrap().ends_with("a.txt"))
+        .unwrap()
+        .clone();
+    assert!(a["diff"].as_str().unwrap().contains("- two\n+ TWO"), "{a}");
+    // Rewind one file, then the rest.
+    let r = c
+        .rpc(Request::RewindRun {
+            session_id: id.clone(),
+            run_id: None,
+            path: Some("b.txt".into()),
+        })
+        .await;
+    assert_eq!(r["restored"].as_array().unwrap().len(), 1, "{r}");
+    assert!(!work.join("b.txt").exists());
+    let r = c
+        .rpc(Request::RewindRun {
+            session_id: id.clone(),
+            run_id: None,
+            path: None,
+        })
+        .await;
+    assert_eq!(r["restored"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "one\ntwo\n");
+    assert_eq!(std::fs::read_to_string(work.join("c.txt")).unwrap(), "gone soon");
+    server.abort();
+}
+
+/// `update_plan` (SPEC §5.8) stores the checklist on the Session,
+/// broadcasts it, and rejects malformed steps.
+#[cfg(unix)]
+#[tokio::test]
+async fn update_plan_is_stored_and_broadcast() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4plan");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                move |Json(body): Json<Value>| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+                    async move {
+                        match n {
+                            0 => sse_tool("p1", "update_plan", json!({"items": [
+                                {"content": "Read the files", "status": "completed"},
+                                {"content": "Fix the bug", "status": "in_progress"},
+                                {"content": "Run the tests", "status": "pending"}]})),
+                            1 => {
+                                assert!(last["content"].as_str().unwrap().contains("1/3 done"), "{last}");
+                                sse_tool("p2", "update_plan", json!({"items": [{"content": "x", "status": "maybe"}]}))
+                            }
+                            _ => {
+                                assert!(last["content"].as_str().unwrap().contains("error"), "{last}");
+                                sse_text("done")
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "fix it".into(),
+        mode: SendMode::Send,
+    })
+    .await;
+    let mut updates = Vec::new();
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        match serde_json::from_str::<ServerMessage>(&line) {
+            Ok(ServerMessage::Event(Event::PlanUpdated { items, .. })) => updates.push(items),
+            Ok(ServerMessage::Event(Event::RunFinished { status, .. })) => {
+                assert_eq!(status, "completed");
+                break;
+            }
+            Ok(ServerMessage::Event(Event::RunPaused { error, .. })) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(updates.len(), 1, "the invalid plan is not broadcast");
+    assert_eq!(updates[0][1].status, "in_progress");
+    let plan = c.rpc(Request::GetSession { id: id.clone() }).await["plan"].clone();
+    assert_eq!(plan.as_array().unwrap().len(), 3, "{plan}");
+    server.abort();
+}

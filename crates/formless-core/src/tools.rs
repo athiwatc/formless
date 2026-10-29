@@ -35,7 +35,11 @@ pub const MAX_QUESTIONS: usize = 4;
 pub const SCHEDULE_RUN: &str = "schedule_run";
 pub const READ_METRICS: &str = "read_metrics";
 pub const RUN_SCRIPT: &str = "run_script";
-pub const RESERVED: [&str; 25] = [
+pub const UPDATE_PLAN: &str = "update_plan";
+/// Most steps a plan may have, and longest step text.
+pub const MAX_PLAN_ITEMS: usize = 20;
+pub const MAX_PLAN_TEXT: usize = 200;
+pub const RESERVED: [&str; 26] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -61,6 +65,7 @@ pub const RESERVED: [&str; 25] = [
     SCHEDULE_RUN,
     READ_METRICS,
     RUN_SCRIPT,
+    UPDATE_PLAN,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -386,6 +391,34 @@ fn remember_definition() -> Value {
                     "scope": {"type": "string", "description": "\"global\" (default) or \"project:<absolute path>\" for one project"}
                 },
                 "required": ["text"]
+            }
+        }
+    })
+}
+
+fn update_plan_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": UPDATE_PLAN,
+            "description": "For a task of 3 or more distinct steps, keep a short checklist the user sees pinned above the input. Send the whole list each time (it replaces the last one): set a step in_progress when you start it and completed when it is done, with exactly one in_progress while working. Skip it for simple tasks; send an empty list to clear it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "maxItems": MAX_PLAN_ITEMS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "A short imperative step"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["items"]
             }
         }
     })
@@ -917,6 +950,7 @@ pub fn builtin_definitions() -> Vec<Value> {
         read_mcp_resource_definition(),
         test_tool_definition(),
         run_script_definition(),
+        update_plan_definition(),
         pending_definition(AWAIT_INVOCATION, "Wait (unbounded) for a Pending Invocation handle and return its final result."),
         pending_definition(CHECK_INVOCATION, "Check a Pending Invocation handle: returns status pending, or its final result if complete."),
         pending_definition(ABANDON_INVOCATION, "Abandon a Pending Invocation handle: it still finishes and is recorded, but its result will not be delivered."),
