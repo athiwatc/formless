@@ -5171,6 +5171,11 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                 msg["reasoning_content"] = json!(r);
             }
         }
+        // Anthropic's signed thinking (only that API reads it; the others
+        // drop it before sending).
+        if meta["thinking_blocks"].is_array() {
+            msg["thinking_blocks"] = meta["thinking_blocks"].clone();
+        }
         return msg;
     }
     // Attachments (SPEC §5.6): a reference line the model can follow with

@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod artifacts;
 pub mod auth;
 pub mod config;

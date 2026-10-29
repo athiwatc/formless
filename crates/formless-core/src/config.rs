@@ -391,7 +391,7 @@ pub const HARNESS_MODEL_KEYS: &[&str] = &[
 /// Settable keys whose value must be one of a few strings (null always
 /// resets to the default).
 pub const CHOICES: &[(&str, &[&str])] = &[
-    ("provider.api_style", &["chat", "responses"]),
+    ("provider.api_style", &["chat", "responses", "anthropic"]),
     ("provider.tool_mode", &["native", "prompt"]),
     ("provider.cache_key", &["session", "off"]),
     ("provider.cache_control", &["auto", "on", "off"]),
@@ -828,6 +828,10 @@ impl ProviderCfg {
     }
     pub fn responses(&self) -> bool {
         self.api_style.eq_ignore_ascii_case("responses")
+    }
+    /// The native Anthropic Messages API (`api_style = "anthropic"`).
+    pub fn anthropic(&self) -> bool {
+        self.api_style.eq_ignore_ascii_case("anthropic")
     }
     pub fn prompt_tools(&self) -> bool {
         self.tool_mode.eq_ignore_ascii_case("prompt")

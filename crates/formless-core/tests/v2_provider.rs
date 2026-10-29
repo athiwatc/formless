@@ -859,3 +859,75 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
     assert_eq!(meta["gpt-5-mini"]["efforts"], json!(["minimal", "low", "medium", "high"]));
     assert!(known_model_meta("some-unknown").get("efforts").is_none(), "unknown: all offered");
 }
+
+/// `api_style = "anthropic"` (SPEC §4.1): Messages API with x-api-key,
+/// streamed thinking + tool_use folded into the usual result, usage with
+/// cache reads, and non-streamed completions.
+#[tokio::test]
+async fn native_anthropic_messages_stream_and_complete() {
+    use axum::http::HeaderMap;
+    let app = Router::new().route(
+        "/messages",
+        post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+            assert_eq!(headers.get("x-api-key").and_then(|v| v.to_str().ok()), Some("k"));
+            assert_eq!(headers.get("anthropic-version").and_then(|v| v.to_str().ok()), Some("2023-06-01"));
+            assert!(headers.get("authorization").is_none());
+            assert_eq!(body["system"][0]["text"], "sys");
+            if body["stream"] == false {
+                return Json(json!({
+                    "content": [{"type": "text", "text": "summary"}],
+                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                }))
+                .into_response();
+            }
+            assert_eq!(body["thinking"]["type"], "enabled", "effort became a thinking budget");
+            assert_eq!(body["tools"][0]["name"], "read");
+            let ev = |v: Value| format!("event: {}\ndata: {}\n\n", v["type"].as_str().unwrap(), v);
+            let sse = [
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 3, "cache_read_input_tokens": 100}}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "need the file"}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "s1"}}),
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "tu_1", "name": "read"}}),
+                json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"a\"}"}}),
+                json!({"type": "content_block_stop", "index": 1}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 12}}),
+                json!({"type": "message_stop"}),
+            ]
+            .into_iter()
+            .map(ev)
+            .collect::<String>();
+            sse.into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    c.api_style = "anthropic".into();
+    let p = Provider::new(c, "k".into()).unwrap();
+    let msgs = [
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "read a"}),
+    ];
+    let tools = [json!({"type": "function", "function": {"name": "read", "description": "Read", "parameters": {"type": "object"}}})];
+    let mut thinking = String::new();
+    let r = p
+        .chat_stream(&msgs, &tools, "claude-x", Some("medium"), &CancellationToken::new(), |k, d| {
+            if k == DeltaKind::Reasoning {
+                thinking.push_str(d);
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(thinking, "need the file");
+    assert_eq!(r.tool_calls.len(), 1);
+    assert_eq!((r.tool_calls[0].id.as_str(), r.tool_calls[0].name.as_str()), ("tu_1", "read"));
+    assert_eq!(r.tool_calls[0].arguments, r#"{"path":"a"}"#);
+    assert_eq!(r.thinking_blocks[0]["signature"], "s1");
+    let u = r.usage.unwrap();
+    assert_eq!((u.cached_tokens, u.completion_tokens, u.prompt_tokens), (100, 12, 103));
+    assert_eq!(p.complete(&msgs, "claude-x", None).await.unwrap(), "summary");
+}

@@ -8,7 +8,7 @@ pub struct Preset {
     pub id: &'static str,
     pub name: &'static str,
     pub base_url: &'static str,
-    /// "chat" or "responses" (`provider.api_style`).
+    /// "chat", "responses" or "anthropic" (`provider.api_style`).
     pub api_style: &'static str,
     /// Environment variable that commonly holds its key.
     pub key_env: Option<&'static str>,
@@ -51,15 +51,18 @@ pub const PRESETS: &[Preset] = &[
         "gpt-5",
         false,
     ),
-    preset(
-        "anthropic",
-        "Anthropic (OpenAI-compatible endpoint)",
-        "https://api.anthropic.com/v1",
-        Some("ANTHROPIC_API_KEY"),
-        Some("https://console.anthropic.com/settings/keys"),
-        "claude-sonnet-5-5",
-        false,
-    ),
+    Preset {
+        api_style: "anthropic",
+        ..preset(
+            "anthropic",
+            "Anthropic (native Messages API)",
+            "https://api.anthropic.com/v1",
+            Some("ANTHROPIC_API_KEY"),
+            Some("https://console.anthropic.com/settings/keys"),
+            "claude-sonnet-5-5",
+            false,
+        )
+    },
     preset(
         "openrouter",
         "OpenRouter",

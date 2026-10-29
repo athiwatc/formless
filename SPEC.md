@@ -137,6 +137,35 @@ without redesign.
   authorization-code + PKCE (`provider.auth.mode = "oauth"`). This is a
   credential mode, not a second provider protocol: Chat Completions,
   Responses, probe, failover, and measured routing semantics are unchanged.
+- **Native Anthropic** (`provider.api_style = "anthropic"`, the default
+  for the `anthropic` preset): `POST {base_url}/messages` with
+  `x-api-key` and `anthropic-version: 2023-06-01` (`api_key_header`
+  overrides the key header). Chat-Completions-shaped context is converted
+  (`anthropic.rs`): system messages join the top-level `system` blocks,
+  tool calls become `tool_use` blocks and results `tool_result` blocks on
+  a user turn, images become base64 image blocks, and consecutive turns of
+  one role merge. Unless `provider.cache_control = "off"`, `cache_control`
+  breakpoints go on the end of the system prompt and of the last message
+  (the cache-stable prefix), and cache reads and writes are counted.
+  `reasoning_effort` becomes an extended-thinking budget (minimal 1k, low
+  4k, medium 12k, high 32k tokens, with `max_tokens` raised above it);
+  thinking streams as reasoning, and the signed `thinking` blocks are
+  stored with a tool-call turn (`meta.thinking_blocks`) and sent back on
+  the next request, as the API requires (other APIs drop them). Tools are
+  native; the probe forces a call with `tool_choice: {type: "any"}`.
+  Overloaded or dropped streams are retried before anything streamed;
+  `stop_reason: "max_tokens"` marks the answer truncated.
+- **Gemini** is used through its OpenAI-compatible endpoint (the `gemini`
+  preset). What works there: chat, streaming, native tool calls, images,
+  and `reasoning_effort` (low/medium/high) as Gemini's thinking level.
+  What the compatible endpoint does not offer, and Formless therefore does
+  not use: explicit context caching (`cachedContents`; Gemini's implicit
+  caching still applies and is counted when reported), a thinking token
+  budget beyond the three effort levels, thought summaries as a separate
+  stream, safety settings, Google Search grounding, code execution, and
+  the Files API. There is no `api_style = "gemini"`; use the compatible
+  endpoint, or a gateway that exposes these as OpenAI-compatible options
+  through `provider.query_params` / `extra_headers`.
 
 ### 4.2 Configuration and selection
 
@@ -3264,7 +3293,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.tool_use_nudge` | true | Push models to build Tools: a GPT-family system-prompt addendum, and one nudge per step when an answer refuses for lack of access before using any Tool (§5.2) |
 | `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this long (`ProviderStalled`; `/resend` re-sends); 0 = never |
 | `provider.first_byte_timeout_secs` | 0 | Auto re-send when no first byte arrives in time (up to `max_retries`); 0 = off |
-| `provider.api_style` | `chat` | `chat` or `responses` (§4.1) |
+| `provider.api_style` | `chat` | `chat`, `responses` or `anthropic` (native Messages API) (§4.1) |
 | `provider.tool_mode` | `native` | `native` or prompt-based fallback (§4.1) |
 | `provider.fallback_models` | [] | Failover models, in order (§4.1) |
 | `provider.aliases` | {} | Short names for model ids (`fast = "…"`), accepted wherever a model is (§4.2) |

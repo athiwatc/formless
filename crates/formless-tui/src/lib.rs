@@ -592,6 +592,9 @@ impl Wizard {
         self.status = format!("Fetching models from {}…", self.base_url.trim());
         let (tx, mut cfg) = (self.job_tx.clone(), Config::default());
         cfg.provider.base_url = self.base_url.trim().to_string();
+        if let Some(p) = self.preset {
+            cfg.provider.api_style = p.api_style.to_string();
+        }
         let (pcfg, key) = (cfg.provider.clone(), self.api_key.clone());
         std::thread::spawn(move || {
             let _ = tx.send(WizardJob::Models(
@@ -5623,8 +5626,10 @@ impl App {
                     w.step = WizardStep::Probing;
                     w.status = "Probing endpoint (connectivity + streaming + tool-calling)…".into();
                     let tx = w.job_tx.clone();
+                    // The preset's API style (native Anthropic) applies to the probe too.
                     let pcfg = formless_core::config::ProviderCfg {
                         base_url: w.base_url.trim().to_string(),
+                        api_style: w.preset.map_or_else(|| "chat".into(), |p| p.api_style.to_string()),
                         ..Default::default()
                     };
                     let (key2, model) = (w.api_key.clone(), w.model());

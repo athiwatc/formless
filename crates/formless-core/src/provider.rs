@@ -102,8 +102,17 @@ fn apply_headers(
     cfg: &ProviderCfg,
     api_key: &str,
 ) -> reqwest::RequestBuilder {
+    if cfg.anthropic() {
+        req = req.header("anthropic-version", crate::anthropic::VERSION);
+    }
     if !api_key.is_empty() {
-        req = match cfg.api_key_header.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+        let header = cfg
+            .api_key_header
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .or(cfg.anthropic().then_some("x-api-key"));
+        req = match header {
             Some(h) => req.header(h, api_key),
             None => req.bearer_auth(api_key),
         };
@@ -213,6 +222,9 @@ pub struct ChatResult {
     /// / `reasoning` deltas), empty when the endpoint emits none.
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Anthropic `thinking` blocks with signatures, sent back on the next
+    /// request of a tool-use turn (empty for other APIs).
+    pub thinking_blocks: Vec<Value>,
     pub dropped_reasoning_effort: bool,
     /// Model that actually served the request (failover routing).
     pub model_used: String,
@@ -254,7 +266,8 @@ impl Usage {
             reasoning_tokens: n(&u["completion_tokens_details"]["reasoning_tokens"])
                 .max(n(&u["output_tokens_details"]["reasoning_tokens"])),
             cached_tokens: n(&u["prompt_tokens_details"]["cached_tokens"])
-                .max(n(&u["input_tokens_details"]["cached_tokens"])),
+                .max(n(&u["input_tokens_details"]["cached_tokens"]))
+                .max(n(&u["cache_read_input_tokens"])),
             cache_write_tokens: n(&u["prompt_tokens_details"]["cache_write_tokens"])
                 .max(n(&u["input_tokens_details"]["cache_write_tokens"]))
                 .max(n(&u["cache_creation_input_tokens"])),
@@ -819,6 +832,13 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<(String, Option<Usage>)> {
+        if self.cfg.anthropic() {
+            let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
+            let (resp, _, _) = self.post_provider(&mut body, None, true).await?;
+            let v: Value = resp.json().await.context("parse Messages response")?;
+            let usage = Usage::parse(&v["usage"]);
+            return Ok((crate::anthropic::response_parts(&v).0, usage));
+        }
         let mut body = if self.cfg.responses() {
             json!({"model": model, "input": responses_input(messages), "stream": false})
         } else {
@@ -863,7 +883,9 @@ impl Provider {
         effort: Option<&str>,
         allow_failover: bool,
     ) -> Result<(reqwest::Response, bool, String)> {
-        let endpoint = if self.cfg.responses() {
+        let endpoint = if self.cfg.anthropic() {
+            "messages"
+        } else if self.cfg.responses() {
             "responses"
         } else {
             "chat/completions"
@@ -990,6 +1012,21 @@ impl Provider {
         mut on_delta: F,
     ) -> Result<ChatResult> {
         let prepared = self.prepare_attachments(messages, model);
+        if self.cfg.anthropic() && !self.cfg.prompt_tools() {
+            return self
+                .chat_stream_anthropic(&prepared, tools, model, effort, cancel, on_delta)
+                .await;
+        }
+        // Anthropic thinking blocks mean nothing to other APIs.
+        let prepared: Vec<Value> = prepared
+            .into_iter()
+            .map(|mut m| {
+                if let Some(o) = m.as_object_mut() {
+                    o.remove("thinking_blocks");
+                }
+                m
+            })
+            .collect();
         let messages: &[Value] = &prepared;
         // Prompt-based fallback: describe tools in-band, send none natively,
         // and buffer content so tool-call JSON never streams to the user.
@@ -1285,11 +1322,111 @@ impl Provider {
             content,
             reasoning,
             tool_calls,
+            thinking_blocks: Vec::new(),
             dropped_reasoning_effort: dropped,
             model_used,
             truncated,
             usage,
         })
+    }
+
+    /// The native Anthropic Messages stream (SPEC §4.1): retries like
+    /// the other APIs before anything streamed, folds the events into the
+    /// same `ChatResult`.
+    async fn chat_stream_anthropic<F: FnMut(DeltaKind, &str) + Send>(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        cancel: &CancellationToken,
+        mut on_delta: F,
+    ) -> Result<ChatResult> {
+        let cache = !self.cfg.cache_control.eq_ignore_ascii_case("off");
+        let mut body = crate::anthropic::body(model, messages, tools, cache, effort, true);
+        let mut attempt = 0;
+        loop {
+            let (resp, _, model_used) = tokio::select! {
+                _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+                r = self.post_provider(&mut body, None, true) => r?,
+            };
+            let mut stream = resp.bytes_stream();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut f = crate::anthropic::Folded::default();
+            let mut failed: Option<String> = None;
+            'read: loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+                    next = stream.next() => {
+                        let Some(chunk) = next else { break 'read };
+                        let chunk = match chunk {
+                            Ok(c) => c,
+                            Err(e) => {
+                                failed = Some(format!("stream dropped: {e}"));
+                                break 'read;
+                            }
+                        };
+                        on_delta(DeltaKind::Bytes, "");
+                        buf.extend_from_slice(&chunk);
+                        while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                            let raw: Vec<u8> = buf.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&raw);
+                            let Some(data) = line.trim().strip_prefix("data:") else { continue };
+                            let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { continue };
+                            match f.event(&v) {
+                                crate::anthropic::Delta::Text(t) => on_delta(DeltaKind::Content, t),
+                                crate::anthropic::Delta::Thinking(t) => on_delta(DeltaKind::Reasoning, t),
+                                crate::anthropic::Delta::None => {}
+                            }
+                            if let Some((kind, msg)) = &f.error {
+                                failed = Some(format!("{kind}: {msg}"));
+                                break 'read;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(why) = failed {
+                // Overloaded / dropped before any output: re-send (§4.4).
+                let retryable = why.contains("overloaded") || why.contains("api_error") || why.starts_with("stream dropped");
+                if retryable && f.nothing_streamed() && attempt < self.cfg.max_retries {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+                        _ = self.retry_wait(attempt, None, "provider error".into()) => {}
+                    }
+                    attempt += 1;
+                    continue;
+                }
+                return Err(anyhow!("provider error: {why}"));
+            }
+            let tool_calls = f
+                .tool_calls
+                .iter()
+                .filter(|(_, name, _)| !name.trim().is_empty())
+                .map(|(id, name, arguments)| ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                })
+                .collect();
+            let usage = Usage {
+                prompt_tokens: f.input_tokens + f.cache_read + f.cache_write,
+                completion_tokens: f.output_tokens,
+                cached_tokens: f.cache_read,
+                cache_write_tokens: f.cache_write,
+                ..Default::default()
+            };
+            return Ok(ChatResult {
+                content: f.text,
+                reasoning: f.thinking,
+                tool_calls,
+                thinking_blocks: f.thinking_blocks,
+                dropped_reasoning_effort: false,
+                model_used,
+                truncated: f.truncated,
+                usage: Some(usage),
+            });
+        }
     }
 
     /// Server-side compaction (SPEC §11): POST {base_url}/compact with
@@ -1435,7 +1572,8 @@ pub fn known_model_meta(id: &str) -> Value {
     } else if name.contains("claude") {
         set(&mut meta, true, true, None);
     } else if name.contains("gemini") {
-        set(&mut meta, true, true, None);
+        // The compatible endpoint maps these onto its thinking levels.
+        set(&mut meta, true, true, Some(&["low", "medium", "high"]));
     } else if name.contains("deepseek-r1") || name.contains("qwq") {
         set(&mut meta, false, false, Some(&[]));
     }
@@ -1595,6 +1733,22 @@ fn is_tool_choice_rejection(text: &str) -> bool {
 }
 
 async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) -> Result<bool> {
+    if p.cfg.anthropic() {
+        let mut b = crate::anthropic::body(
+            model,
+            &[json!({"role": "user", "content": "Call the probe_ping tool now."})],
+            std::slice::from_ref(tool),
+            false,
+            None,
+            false,
+        );
+        if forced {
+            b["tool_choice"] = json!({"type": "any"});
+        }
+        let (resp, _, _) = p.post_provider(&mut b, None, false).await?;
+        let v: Value = resp.json().await.context("parse probe response")?;
+        return Ok(!crate::anthropic::response_parts(&v).1.is_empty());
+    }
     let mut body = if p.cfg.responses() {
         let mut b = json!({
             "model": model,
