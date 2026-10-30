@@ -10950,6 +10950,9 @@ impl Daemon {
         cfg.save(&self.paths)?;
         drop(edit);
         self.mcp.stop(name).await;
+        // Its login goes with it: a server added later under the same name
+        // must not inherit it (#866).
+        let _ = crate::mcp_auth::logout(&self.paths, name);
         let retired = self.with_store(|st| crate::mcp::sync_registry(st, name, &[]))?;
         let _ = self.with_store(|st| st.audit(actor, "mcp.remove", name));
         self.broadcast(Event::McpServersChanged);

@@ -120,29 +120,115 @@ fn decode_tokens(text: &str) -> Option<(OAuthTokens, Option<String>)> {
     (!tokens.access_token.is_empty()).then_some((tokens, issuer))
 }
 
-pub fn save_oauth_tokens(paths: &Paths, auth: &AuthCfg, tokens: &OAuthTokens) -> Result<()> {
-    let encoded = encode_tokens(auth, tokens)?;
-    let file = oauth_tokens_file(paths, auth);
-    let file_result = crate::config::write_secret_file(&file, &encoded);
-    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths, auth))
-        .map(|entry| entry.set_password(&encoded).is_ok())
-        .unwrap_or(false);
-    if file_result.is_ok() || keyring_ok {
-        Ok(())
-    } else {
-        file_result
+/// A secret kept in the keychain and a `0600` file at once (#868). Each
+/// copy carries when it was saved, a read takes the newer, a save that
+/// can't replace an older copy fails (or removes it), and a delete says
+/// which copy it couldn't remove.
+struct DualStore {
+    file: std::path::PathBuf,
+    user: String,
+}
+
+impl DualStore {
+    fn entry(&self) -> Option<keyring::Entry> {
+        keyring::Entry::new(KEYRING_SERVICE, &self.user).ok()
+    }
+
+    fn keyring_text(&self) -> Option<String> {
+        self.entry()?.get_password().ok()
+    }
+
+    /// (saved at, the value): new copies are `{"v", "saved_at"}`; an older
+    /// plain copy counts as saved at 0.
+    fn unwrap(text: &str) -> Option<(i128, String)> {
+        let v: Value = serde_json::from_str(text).ok()?;
+        match (v.get("saved_at").and_then(Value::as_i64), v.get("v")) {
+            (Some(at), Some(inner)) => Some((at as i128, inner.to_string())),
+            _ => Some((0, text.to_string())),
+        }
+    }
+
+    fn save(&self, value: &str) -> Result<()> {
+        let at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let inner: Value = serde_json::from_str(value).unwrap_or(Value::String(value.into()));
+        let wrapped = serde_json::json!({"v": inner, "saved_at": at}).to_string();
+        let file_result = crate::config::write_secret_file(&self.file, &wrapped);
+        let key_result = self
+            .entry()
+            .ok_or_else(|| anyhow!("no keychain"))
+            .and_then(|e| e.set_password(&wrapped).map_err(|e| anyhow!("{e}")));
+        match (file_result, key_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            // One copy written: the other must not keep an older value.
+            (Ok(()), Err(_)) => {
+                if self.keyring_text().is_some()
+                    && self.entry().is_none_or(|e| e.delete_credential().is_err())
+                {
+                    bail!("the keychain holds an older copy that could not be replaced or removed");
+                }
+                Ok(())
+            }
+            (Err(e), Ok(())) => {
+                if self.file.exists() && std::fs::remove_file(&self.file).is_err() {
+                    return Err(e.context(format!(
+                        "{} holds an older copy that could not be replaced or removed",
+                        self.file.display()
+                    )));
+                }
+                Ok(())
+            }
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+
+    /// The newer of the two copies.
+    fn load(&self) -> Option<String> {
+        let file = crate::config::read_secret_file(&self.file).and_then(|t| Self::unwrap(&t));
+        let key = self.keyring_text().and_then(|t| Self::unwrap(&t));
+        match (file, key) {
+            (Some(f), Some(k)) => Some(if k.0 > f.0 { k.1 } else { f.1 }),
+            (Some(one), None) | (None, Some(one)) => Some(one.1),
+            (None, None) => None,
+        }
+    }
+
+    /// Remove both copies; what could not be removed.
+    fn delete(&self) -> Vec<String> {
+        let mut left = Vec::new();
+        if let Some(e) = self.entry() {
+            let _ = e.delete_credential();
+        }
+        if self.keyring_text().is_some() {
+            left.push("the keychain copy".to_string());
+        }
+        let _ = std::fs::remove_file(&self.file);
+        if self.file.exists() {
+            left.push(self.file.display().to_string());
+        }
+        left
     }
 }
 
-fn read_stored(file: &std::path::Path, user: &str) -> Option<(OAuthTokens, Option<String>)> {
-    if let Some(found) = crate::config::read_secret_file(file).and_then(|t| decode_tokens(&t)) {
-        return Some(found);
+fn token_store(paths: &Paths, auth: &AuthCfg) -> DualStore {
+    DualStore {
+        file: oauth_tokens_file(paths, auth),
+        user: oauth_keyring_user(paths, auth),
     }
-    let text = keyring::Entry::new(KEYRING_SERVICE, user)
-        .ok()?
-        .get_password()
-        .ok()?;
-    decode_tokens(&text)
+}
+
+pub fn save_oauth_tokens(paths: &Paths, auth: &AuthCfg, tokens: &OAuthTokens) -> Result<()> {
+    token_store(paths, auth).save(&encode_tokens(auth, tokens)?)
+}
+
+fn read_stored(file: &std::path::Path, user: &str) -> Option<(OAuthTokens, Option<String>)> {
+    let store = DualStore {
+        file: file.to_path_buf(),
+        user: user.to_string(),
+    };
+    decode_tokens(&store.load()?)
 }
 
 fn load_with_issuer(paths: &Paths, auth: &AuthCfg) -> Option<(OAuthTokens, Option<String>)> {
@@ -171,48 +257,43 @@ pub fn load_oauth_tokens(paths: &Paths, auth: &AuthCfg) -> Option<OAuthTokens> {
 
 /// A JSON credential stored like the provider tokens (keychain + `0600`
 /// file), under its own name (e.g. one per MCP server).
-pub fn save_named_secret(paths: &Paths, name: &str, value: &Value) -> Result<()> {
-    let encoded = value.to_string();
-    let file = paths.config_dir.join(format!("{name}.json"));
-    let file_result = (|| -> Result<()> { crate::config::write_secret_file(&file, &encoded) })();
-    let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, &format!("{name}-{}", paths.profile))
-        .map(|entry| entry.set_password(&encoded).is_ok())
-        .unwrap_or(false);
-    if file_result.is_ok() || keyring_ok {
-        Ok(())
-    } else {
-        file_result
+fn named_store(paths: &Paths, name: &str) -> DualStore {
+    DualStore {
+        file: paths.config_dir.join(format!("{name}.json")),
+        user: format!("{name}-{}", paths.profile),
     }
+}
+
+pub fn save_named_secret(paths: &Paths, name: &str, value: &Value) -> Result<()> {
+    named_store(paths, name).save(&value.to_string())
 }
 
 pub fn load_named_secret(paths: &Paths, name: &str) -> Option<Value> {
-    let file = paths.config_dir.join(format!("{name}.json"));
-    if let Some(v) =
-        crate::config::read_secret_file(&file).and_then(|t| serde_json::from_str(&t).ok())
-    {
-        return Some(v);
-    }
-    keyring::Entry::new(KEYRING_SERVICE, &format!("{name}-{}", paths.profile))
-        .ok()?
-        .get_password()
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+    serde_json::from_str(&named_store(paths, name).load()?).ok()
 }
 
-pub fn delete_named_secret(paths: &Paths, name: &str) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &format!("{name}-{}", paths.profile)) {
-        let _ = entry.delete_credential();
-    }
-    let _ = std::fs::remove_file(paths.config_dir.join(format!("{name}.json")));
+/// Delete a named secret; what could not be removed (#868).
+pub fn delete_named_secret(paths: &Paths, name: &str) -> Vec<String> {
+    named_store(paths, name).delete()
 }
 
-pub fn delete_oauth_tokens(paths: &Paths, auth: &AuthCfg) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &oauth_keyring_user(paths, auth)) {
-        let _ = entry.delete_credential();
+/// Delete a provider's stored tokens; what could not be removed (#868).
+pub fn delete_oauth_tokens(paths: &Paths, auth: &AuthCfg) -> Vec<String> {
+    let left = token_store(paths, auth).delete();
+    let _ = std::fs::remove_file(oauth_tokens_file(paths, auth).with_extension("json.tmp"));
+    left
+}
+
+/// Whether the OS keychain works here (`doctor`): false means secrets
+/// live only in their `0600` files.
+pub fn keychain_available() -> bool {
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, "formless-probe") else {
+        return false;
+    };
+    match entry.get_password() {
+        Ok(_) | Err(keyring::Error::NoEntry) => true,
+        Err(_) => false,
     }
-    let file = oauth_tokens_file(paths, auth);
-    let _ = std::fs::remove_file(&file);
-    let _ = std::fs::remove_file(file.with_extension("json.tmp"));
 }
 
 fn delete_legacy_tokens(paths: &Paths) {
@@ -535,6 +616,95 @@ fn sanitized_oauth_error(body: &[u8]) -> String {
         .collect()
 }
 
+/// Revoke `token` at an RFC 7009 endpoint (blocking-safe async).
+pub async fn revoke_token(
+    revocation_url: &str,
+    client_id: &str,
+    token: &str,
+    hint: &str,
+) -> Result<()> {
+    validate_endpoint("revocation_url", revocation_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let mut request = client.post(revocation_url.trim()).form(&[
+        ("token", token),
+        ("token_type_hint", hint),
+        ("client_id", client_id.trim()),
+    ]);
+    if let Ok(secret) = std::env::var("FORMLESS_OAUTH_CLIENT_SECRET") {
+        if !secret.is_empty() {
+            request = request.basic_auth(client_id.trim(), Some(secret));
+        }
+    }
+    let status = request
+        .send()
+        .await
+        .context("send revocation request")?
+        .status();
+    if !status.is_success() {
+        bail!("the revocation endpoint returned {status}");
+    }
+    Ok(())
+}
+
+/// `formless auth logout` (#866): revoke at the provider when it has a
+/// revocation endpoint, delete both local copies, and say plainly what
+/// is still in force. Lines for the user.
+pub fn logout_provider(paths: &Paths, cfg: &ProviderCfg) -> Vec<String> {
+    let mut out = Vec::new();
+    if !cfg.oauth() {
+        out.push(
+            "provider.auth.mode is api_key: there are no OAuth tokens to delete; the API key stays (`formless reset` removes it)."
+                .into(),
+        );
+        if std::env::var_os("FORMLESS_API_KEY").is_some() {
+            out.push("FORMLESS_API_KEY is set in this environment and is still used.".into());
+        }
+        return out;
+    }
+    match load_oauth_tokens(paths, &cfg.auth) {
+        None => out.push("No OAuth tokens were stored for this provider.".into()),
+        Some(tokens) => {
+            if cfg.auth.revocation_url.is_empty() {
+                out.push(
+                    "The provider has no revocation endpoint (provider.auth.revocation_url): only the local copies were deleted; the refresh token stays valid at the provider until it expires."
+                        .into(),
+                );
+            } else {
+                let (token, hint) = match tokens.refresh_token.as_deref().filter(|t| !t.is_empty())
+                {
+                    Some(r) => (r.to_string(), "refresh_token"),
+                    None => (tokens.access_token.clone(), "access_token"),
+                };
+                match run_blocking(revoke_token(&cfg.auth.revocation_url, &cfg.auth.client_id, &token, hint)) {
+                    Ok(()) => out.push("Revoked the login at the provider.".into()),
+                    Err(e) => out.push(format!(
+                        "Could not revoke at the provider ({e:#}); the local copies are deleted anyway."
+                    )),
+                }
+            }
+            let left = delete_oauth_tokens(paths, &cfg.auth);
+            if left.is_empty() {
+                out.push("Deleted the stored OAuth tokens (keychain and file).".into());
+            } else {
+                out.push(format!(
+                    "Could not delete: {} (remove it by hand).",
+                    left.join(", ")
+                ));
+            }
+        }
+    }
+    if std::env::var_os("FORMLESS_OAUTH_ACCESS_TOKEN").is_some() {
+        out.push(
+            "FORMLESS_OAUTH_ACCESS_TOKEN is set in this environment and is still used for every request."
+                .into(),
+        );
+    }
+    out
+}
+
 async fn token_request(
     cfg: &AuthCfg,
     standard_params: Vec<(&str, &str)>,
@@ -640,14 +810,66 @@ pub async fn resolve_provider_token(paths: &Paths, cfg: &ProviderCfg) -> Result<
         return Ok(token);
     }
 
-    // Serialize refreshes within this process: several Runs may otherwise
-    // redeem the same rotating refresh token concurrently.
+    // Still valid: no lock needed.
+    let (tokens, _) = stored_tokens(paths, cfg)?;
+    if !tokens.is_expired(now_epoch()) {
+        return Ok(tokens.access_token);
+    }
+    // Serialize refreshes in this process and across processes (the
+    // daemon and a CLI, #865), then look again: another may have done it.
     let _guard = refresh_lock().lock().await;
+    let _file = refresh_file_lock(paths, &token_slot(&cfg.auth)).await?;
     let (tokens, issuer) = stored_tokens(paths, cfg)?;
     if !tokens.is_expired(now_epoch()) {
         return Ok(tokens.access_token);
     }
     refresh_stored(paths, cfg, &tokens, issuer.as_deref()).await
+}
+
+/// A lock every process of this profile shares for redeeming one
+/// rotating refresh token (`config_dir/.refresh-<slot>.lock`), held until
+/// the returned file is dropped.
+pub async fn refresh_file_lock(paths: &Paths, slot: &str) -> Result<std::fs::File> {
+    let path = paths.config_dir.join(format!(".refresh-{slot}.lock"));
+    tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        f.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        Ok(f)
+    })
+    .await
+    .context("refresh lock task")?
+}
+
+/// The stored token as it is, never refreshed (`doctor`, `auth status`):
+/// a diagnostic must not redeem a rotating refresh token (#865).
+pub fn peek_provider_token(paths: &Paths, cfg: &ProviderCfg) -> Result<String> {
+    if cfg.auth.mode.eq_ignore_ascii_case("api_key") {
+        return Ok(load_api_key(paths).unwrap_or_default());
+    }
+    if let Some(token) = env_access_token() {
+        return Ok(token);
+    }
+    let (tokens, _) = stored_tokens(paths, cfg)?;
+    if tokens.is_expired(now_epoch()) {
+        bail!(
+            "the stored access token has expired{}",
+            if tokens.has_refresh_token() {
+                "; the daemon refreshes it on the next request"
+            } else {
+                " and no refresh token is stored: run `formless auth login`"
+            }
+        );
+    }
+    Ok(tokens.access_token)
 }
 
 /// After the server rejected `rejected` (401: revoked, or clock skew past
@@ -662,6 +884,7 @@ pub async fn force_refresh_provider_token(
         bail!("the provider rejected the credential (401)");
     }
     let _guard = refresh_lock().lock().await;
+    let _file = refresh_file_lock(paths, &token_slot(&cfg.auth)).await?;
     let (tokens, issuer) = stored_tokens(paths, cfg)?;
     if tokens.access_token != rejected && !tokens.is_expired(now_epoch()) {
         return Ok(tokens.access_token);

@@ -806,6 +806,10 @@ pub struct AuthCfg {
     /// Provider-specific token-endpoint form parameters.
     #[serde(default)]
     pub extra_token_params: BTreeMap<String, String>,
+    /// RFC 7009 token revocation endpoint: `formless auth logout` revokes
+    /// the refresh token there before deleting local copies (#866).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revocation_url: String,
 }
 impl Default for AuthCfg {
     fn default() -> Self {
@@ -818,6 +822,7 @@ impl Default for AuthCfg {
             redirect_port: 8977,
             extra_authorize_params: BTreeMap::new(),
             extra_token_params: BTreeMap::new(),
+            revocation_url: String::new(),
         }
     }
 }
