@@ -30,7 +30,18 @@ fn words(text: &str) -> BTreeSet<String> {
 }
 
 fn name_tokens(name: &str) -> BTreeSet<String> {
-    name.split(['_', '-'])
+    // camelCase and PascalCase split like snake_case (#829).
+    let mut spaced = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        if c.is_uppercase() && prev_lower {
+            spaced.push('_');
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        spaced.push(c);
+    }
+    spaced
+        .split(['_', '-'])
         .map(|w| w.to_lowercase())
         .map(|w| w.strip_suffix('s').map(str::to_string).unwrap_or(w))
         .filter(|w| !w.is_empty())
@@ -55,8 +66,43 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
     a.intersection(b).count() as f64 / a.union(b).count() as f64
 }
 
+/// Code with layout whitespace dropped but string and template literals
+/// kept as written, so `"a b"` and `"ab"` stay different (#829).
 fn code_key(code: &str) -> String {
-    code.chars().filter(|c| !c.is_whitespace()).collect()
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in code.chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if matches!(c, '"' | '\'' | '`') => {
+                quote = Some(c);
+                out.push(c);
+            }
+            None if c.is_whitespace() => {}
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// Input fields alike; two Tools that both take nothing count as alike
+/// (they shouldn't be marked down for it, #829).
+fn fields_alike(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        1.0
+    } else {
+        jaccard(a, b)
+    }
 }
 
 /// How alike two Tools are (0..1), and why.
@@ -69,7 +115,7 @@ pub fn similarity(
     }
     let name = jaccard(&name_tokens(&a.0.name), &name_tokens(&b.0.name));
     let desc = jaccard(&words(&a.0.description), &words(&b.0.description));
-    let fields = jaccard(
+    let fields = fields_alike(
         &schema_fields(&a.1.input_schema),
         &schema_fields(&b.1.input_schema),
     );
@@ -114,4 +160,29 @@ pub fn near_duplicates(tools: &[(ToolInfo, ToolVersionInfo)]) -> Vec<DupPair> {
     }
     out.sort_by(|p, q| q.score.total_cmp(&p.score));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literals_keep_their_spaces_and_names_tokenise_alike() {
+        assert_ne!(code_key("return \"a b\";"), code_key("return \"ab\";"));
+        assert_eq!(code_key("return  1 ;\n"), code_key("return 1;"));
+        assert_eq!(code_key("x = `a ${b}`"), "x=`a ${b}`");
+        assert_eq!(name_tokens("readFile"), name_tokens("read_file"));
+        assert_eq!(
+            name_tokens("HTTPGetJson").len(),
+            2,
+            "{:?}",
+            name_tokens("HTTPGetJson")
+        );
+        let none = BTreeSet::new();
+        assert_eq!(
+            fields_alike(&none, &none),
+            1.0,
+            "two no-input Tools are alike"
+        );
+    }
 }

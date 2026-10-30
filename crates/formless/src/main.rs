@@ -1672,9 +1672,20 @@ fn upgrade_command() -> &'static str {
     } else if exe.contains("/.cargo/bin/") {
         "cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked --force"
     } else {
-        "curl -fsSL https://formless.athiwat.xyz/install.sh | sh"
+        // Downloaded first, so a failed download stops with an error
+        // instead of piping nothing into sh (#834).
+        concat!(
+            "curl -fsSL ",
+            "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh",
+            " -o /tmp/formless-install.sh && sh /tmp/formless-install.sh"
+        )
     }
 }
+
+/// Where the install script is served: the repository's own file, the
+/// same URL the README gives.
+const INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh";
 
 /// `formless update`: what's newer than this build and what changed in
 /// each release, then how to upgrade (`--check` stops after the report).
@@ -6222,6 +6233,32 @@ mod tests {
         .into();
         assert_eq!(super::exit_code(&not_found), 2);
         assert_eq!(super::exit_code(&anyhow::anyhow!("disk full")), 1);
+    }
+
+    /// The upgrade command names the install script that exists in the
+    /// repository, at the URL the README gives (#834).
+    #[test]
+    fn the_upgrade_url_points_at_a_real_script() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = super::INSTALL_SCRIPT_URL
+            .split("/main/")
+            .nth(1)
+            .expect("a path in the repository");
+        assert!(root.join(path).is_file(), "{path}");
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        assert!(readme.contains(super::INSTALL_SCRIPT_URL));
+        // Whatever this machine's install, a script upgrade names that URL.
+        let cmd = super::upgrade_command();
+        assert!(
+            cmd.starts_with("brew")
+                || cmd.starts_with("cargo")
+                || cmd.contains(super::INSTALL_SCRIPT_URL),
+            "{cmd}"
+        );
+        assert!(
+            !cmd.contains("| sh"),
+            "a failed download must not be piped into sh: {cmd}"
+        );
     }
 
     /// The man page documents nested options (#895).

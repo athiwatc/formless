@@ -125,11 +125,23 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
             format!("The API key was rejected by {host}."),
             Some("Re-enter the key: run `formless` setup again, or `formless providers add NAME` for a named provider".into()),
         )
-    } else if code == Some(404) || crate::provider::is_model_error_text(&t) {
+    } else if crate::provider::is_model_error_text(&t)
+        || (code == Some(404) && !ctx.model.is_empty() && t.contains(&ctx.model.to_lowercase()))
+    {
         (
             "model",
             format!("Model `{}` isn't available on {host}.", ctx.model),
             Some("Pick another model with /model".into()),
+        )
+    } else if code == Some(404) {
+        // A 404 that names no model is almost always the wrong address
+        // (a missing /v1, a typo), not the model (#833).
+        (
+            "endpoint",
+            format!("{host} has nothing at the address Formless called (404)."),
+            Some(
+                "Check provider.base_url (often a missing /v1), then run `formless doctor`".into(),
+            ),
         )
     } else if code == Some(429) || t.contains("rate limit") || t.contains("quota") {
         let wait = retry_after(raw)
@@ -218,6 +230,16 @@ mod tests {
             e("provider error: 400 Bad Request: The model `gpt-x` does not exist"),
             "model"
         );
+        // A bare or HTML 404 is the address, not the model (#833).
+        assert_eq!(
+            e("provider error: 404 Not Found: <html><body>Not Found</body></html>"),
+            "endpoint"
+        );
+        assert_eq!(e("provider error: 404 Not Found: "), "endpoint");
+        assert!(explain("provider error: 404 Not Found: ", &c)
+            .action
+            .unwrap()
+            .contains("base_url"));
         assert_eq!(e("provider request failed after retries: 429 Too Many Requests (retry after 30s): {}"), "rate_limit");
         assert_eq!(
             e("provider error: 400: This model's maximum context length is 128000 tokens"),

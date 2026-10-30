@@ -10,6 +10,8 @@ fn corrections_are_recognised_narrowly() {
         "no, that is the old one",
         "It didn't work",
         "Not what I asked",
+        "Wrong. Try again",
+        "wrong",
     ] {
         assert!(is_correction(t), "{t}");
     }
@@ -17,6 +19,10 @@ fn corrections_are_recognised_narrowly() {
         "Thanks! Now do the same for March",
         "Is that wrong?",
         "Explain why the wrong value appears",
+        // Praise and whole words (#831).
+        "No, that was perfect, thanks!",
+        "You didn't need to do that!",
+        "Wrongdoing at the plant: summarise this",
     ] {
         assert!(!is_correction(t), "{t}");
     }

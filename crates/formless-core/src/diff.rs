@@ -71,6 +71,22 @@ pub fn context_diff(old: &str, new: &str) -> Vec<String> {
         }
         out.push(format!("{kind} {text}"));
     }
+    // A skipped tail is marked too, so the end of a diff is never mistaken
+    // for the end of the text (#828).
+    if skipped && !out.is_empty() {
+        out.push("  …".into());
+    }
+    // Lines alike but the texts differ: only the final newline changed.
+    if !old.eq(new) && lines.iter().all(|(k, _)| *k == ' ') {
+        out.push(
+            match (old.ends_with('\n'), new.ends_with('\n')) {
+                (true, false) => "\\ the final newline was removed",
+                (false, true) => "\\ a final newline was added",
+                _ => "\\ only whitespace at line ends changed",
+            }
+            .into(),
+        );
+    }
     out
 }
 
@@ -118,5 +134,29 @@ pub fn version_diff(old: &ToolVersionInfo, new: &ToolVersionInfo) -> String {
         "(no changes)".into()
     } else {
         out.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A newline-only change says so, and a skipped tail is marked (#828).
+    #[test]
+    fn newline_only_changes_and_tails_are_shown() {
+        assert_eq!(
+            context_diff("a", "a\n"),
+            vec!["\\ a final newline was added"]
+        );
+        assert_eq!(
+            context_diff("a\n", "a"),
+            vec!["\\ the final newline was removed"]
+        );
+        assert!(context_diff("", "").is_empty());
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n";
+        let new = "X\n2\n3\n4\n5\n6\n7\n8\n";
+        let d = context_diff(old, new);
+        assert_eq!(d.first().map(String::as_str), Some("- 1"));
+        assert_eq!(d.last().map(String::as_str), Some("  …"), "{d:?}");
     }
 }
