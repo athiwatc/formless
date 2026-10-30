@@ -38,6 +38,8 @@ pub fn gc(store: &Store, cfg: &ArtifactsCfg) -> Result<Collected> {
         doomed.push(id);
     }
     store.delete_artifact_rows(&doomed)?;
+    // Attachments among them are marked expired where they were sent (#858).
+    store.mark_attachments_expired(&doomed)?;
     Ok(out)
 }
 

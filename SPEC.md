@@ -701,6 +701,23 @@ accepted as a label. The user may always answer in their own words.
 Users attach files and screenshots to their next message instead of
 pasting paths.
 
+- **Intake (daemon, for every client).** The type comes from the bytes
+  (PNG, JPEG, GIF, WebP, PDF); a claimed image the bytes don't bear out is
+  text or plain bytes. Only raster images go to a vision model or a
+  terminal image; SVG is a document. Names lose control characters and
+  brackets, are cut to 120 bytes (the full name stays in the message
+  meta), and are quoted in the line the model sees. Held attachments are
+  stored (they survive a daemon restart); detaching one deletes its copy,
+  and one held a day without being sent is deleted. An `@path` typed or
+  pasted shows as a chip before it is sent (TUI composer title; on the
+  web the first Send turns it into a chip and stops), reaches only the
+  working folder (or `~/…` when written so), and never a credential
+  (`.ssh`, `.aws`, `.env`, private keys, …), whoever wrote it.
+- **Retention.** Attachments are artifacts, so `artifacts.*` retention
+  removes them too. A removed one is marked expired where it was sent:
+  clients show "name · expired" and the model's history says it is no
+  longer available instead of pointing at `read_artifact`.
+
 - **Clients:** in the TUI, files wait in the input as chips
   (`[image 1 · 240 KB]`) until the message is sent, then upload before
   it. Backspace on an empty input removes the last chip.
@@ -3482,7 +3499,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
 | `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
 | `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
-| `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit |
+| `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit. Attachments count too: a removed one shows as expired in its message (§5.6) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |
 | `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |

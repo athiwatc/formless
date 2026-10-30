@@ -203,7 +203,7 @@ async fn mentions_list_attach_and_reference_files() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let body = seen.lock().unwrap()[0].to_string();
-    assert!(body.contains("[attached: main.rs (text/"), "{body}");
+    assert!(body.contains(r#"[attached: \"main.rs\" (text/"#), "{body}");
     assert!(
         body.contains("big.log (307200 bytes); not attached"),
         "{body}"

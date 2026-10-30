@@ -425,7 +425,6 @@ pub struct Daemon {
     /// The opt-in localhost web UI, while running (SPEC §12).
     web: tokio::sync::Mutex<Option<Arc<crate::webui::WebUi>>>,
     /// Files attached to each Session's next user message (SPEC §5.6).
-    attachments: StdMutex<HashMap<String, Vec<Value>>>,
     /// `@`-mention file indexes by root, refreshed after `FILE_INDEX_SECS`.
     file_index: StdMutex<HashMap<std::path::PathBuf, FileIndex>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
@@ -537,7 +536,6 @@ impl Daemon {
             denial_notes: StdMutex::new(Default::default()),
             grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
-            attachments: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
@@ -1481,11 +1479,12 @@ impl Daemon {
                 Ok(json!({ "disconnected": sent }))
             }
             Request::DetachFile { session_id, id } => {
-                let mut pending = self.attachments.lock().unwrap();
-                let list = pending.entry(session_id).or_default();
-                let before = list.len();
-                list.retain(|a| a["id"].as_str() != Some(&id) && a["path"].as_str() != Some(&id));
-                Ok(json!({ "removed": list.len() < before }))
+                let gone = self.with_store(|st| st.remove_pending_attachment(&session_id, &id))?;
+                // A detached copy is deleted, not left behind (#857).
+                if let Some(att) = &gone {
+                    self.discard_attachment(att);
+                }
+                Ok(json!({ "removed": gone.is_some() }))
             }
             Request::AttachFile {
                 session_id,
@@ -7826,14 +7825,11 @@ impl Daemon {
                 MAX_ATTACHMENT_BYTES / 1024 / 1024
             ));
         }
-        let name = std::path::Path::new(name)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "attachment".into());
-        let mime = mime
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| guess_mime(&name).to_string());
+        let full_name = attachment_name(name);
+        let name = cap_name(&full_name, 120);
+        // What the bytes are, not what the client or the name claims (#855).
+        let claimed = mime.filter(|m| !m.is_empty());
+        let mime = resolve_mime(claimed.as_deref(), &name, &bytes);
         let dir = self.paths.data_dir.join("artifacts");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}-{name}", uuid::Uuid::new_v4().simple()));
@@ -7847,15 +7843,39 @@ impl Daemon {
                 bytes.len() as i64,
             )
         })?;
-        let att =
+        let mut att =
             json!({"id": id, "name": name, "mime": mime, "bytes": bytes.len(), "path": path_s});
-        self.attachments
-            .lock()
-            .unwrap()
-            .entry(session_id.to_string())
-            .or_default()
-            .push(att.clone());
+        if full_name != name {
+            att["full_name"] = json!(full_name);
+        }
+        self.with_store(|st| st.add_pending_attachment(session_id, &att))?;
         Ok(json!({"id": id, "name": name, "mime": mime, "bytes": bytes.len()}))
+    }
+
+    /// Delete a held attachment's stored copy (its file and artifact row);
+    /// a referenced file is the user's own and stays.
+    fn discard_attachment(&self, att: &Value) {
+        if att["reference"] == true {
+            return;
+        }
+        if let Some(path) = att["path"].as_str() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(id) = att["id"].as_str() {
+            let _ = self.with_store(|st| st.delete_artifact_rows(&[id.to_string()]));
+        }
+    }
+
+    /// Attachments held for a day and never sent are deleted (#857).
+    pub(crate) fn expire_pending_attachments(&self) -> usize {
+        let before = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let gone = self
+            .with_store(|st| st.expire_pending_attachments(&before))
+            .unwrap_or_default();
+        for att in &gone {
+            self.discard_attachment(att);
+        }
+        gone.len()
     }
 
     /// The cached `@`-mention index for `root`, walked again when stale.
@@ -7899,12 +7919,28 @@ impl Daemon {
             ))
             .canonicalize()
             .with_context(|| format!("no file '{path}'"))?;
+        // A mention reaches only the working folder (or ~/ when written so),
+        // and never a credential, whoever pasted it (#863).
+        let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+        let inside = full.starts_with(&root)
+            || (path.starts_with("~/") && home.as_ref().is_some_and(|h| full.starts_with(h)));
+        if !inside {
+            return Err(anyhow!(
+                "@{path} is outside the working folder {}; attach it with /attach instead",
+                root.display()
+            ));
+        }
+        if let Some(why) = credential_path(&full) {
+            return Err(anyhow!(
+                "@{path} looks like a credential ({why}); it is never attached from a mention, use /attach if you mean it"
+            ));
+        }
         let meta = std::fs::metadata(&full)?;
         let name = full
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
-        let inline_limit = if guess_mime(&name).starts_with("image/") {
+        let inline_limit = if is_raster_image(guess_mime(&name)) {
             MAX_INLINE_IMAGE_BYTES
         } else {
             MAX_MENTION_INLINE_BYTES
@@ -7918,14 +7954,9 @@ impl Daemon {
         }
         self.with_store(|st| st.get_session(session_id))?
             .context("session not found")?;
-        let att = json!({"reference": true, "name": name, "path": full,
+        let att = json!({"reference": true, "name": attachment_name(&name), "path": full,
                          "dir": meta.is_dir(), "bytes": if meta.is_dir() { 0 } else { meta.len() }});
-        self.attachments
-            .lock()
-            .unwrap()
-            .entry(session_id.to_string())
-            .or_default()
-            .push(att.clone());
+        self.with_store(|st| st.add_pending_attachment(session_id, &att))?;
         Ok(att)
     }
 
@@ -8142,12 +8173,7 @@ impl Daemon {
         content: &str,
         extra: Option<(&str, serde_json::Value)>,
     ) -> Result<MessageInfo> {
-        let atts = self
-            .attachments
-            .lock()
-            .unwrap()
-            .remove(session_id)
-            .unwrap_or_default();
+        let atts = self.with_store(|st| st.take_pending_attachments(session_id))?;
         let mut meta = json!({});
         if !atts.is_empty() {
             meta["attachments"] = json!(atts);
@@ -10842,6 +10868,10 @@ impl Daemon {
                     Ok(_) => {}
                     Err(e) => tracing::warn!("artifact retention: {e}"),
                 }
+                let expired = self.expire_pending_attachments();
+                if expired > 0 {
+                    tracing::info!("removed {expired} attachment(s) held for a day and never sent");
+                }
                 // Files without rows (a crash between write and insert) and
                 // rows without files (#609); anything under an hour old is
                 // left for a writer that may still be going.
@@ -12094,10 +12124,136 @@ fn mention_root(root: Option<&str>) -> Result<std::path::PathBuf> {
     Ok(root)
 }
 
+/// An attachment's name as shown and stored: the last path part, with
+/// control characters (newlines) as spaces and brackets made round, so it
+/// can't break the reference line the model sees (#862).
+pub fn attachment_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let clean: String = base
+        .chars()
+        .map(|c| match c {
+            '[' => '(',
+            ']' => ')',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        "attachment".into()
+    } else {
+        clean
+    }
+}
+
+/// `name` cut to at most `max` bytes (on a character boundary), keeping
+/// its extension, for the file on disk and the line shown.
+pub fn cap_name(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if e.len() <= 10 && !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    let mut cut = max.saturating_sub(ext.len() + 3);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...{ext}", &stem[..cut])
+}
+
+/// The type the bytes say, for the formats Formless treats specially.
+pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else {
+        None
+    }
+}
+
+/// An image a vision model and a terminal can take: raster formats only.
+/// SVG (which can carry scripts) and the rest are documents (#855).
+pub fn is_raster_image(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+/// An attachment's type: what its bytes are when they say, else the claim
+/// or the name, except that a claimed image or PDF the bytes don't bear
+/// out becomes text or plain bytes (#855).
+pub fn resolve_mime(claimed: Option<&str>, name: &str, bytes: &[u8]) -> String {
+    if let Some(real) = sniff_mime(bytes) {
+        return real.to_string();
+    }
+    let said = claimed.unwrap_or_else(|| guess_mime(name));
+    if is_raster_image(said) || said == "application/pdf" {
+        return if std::str::from_utf8(bytes).is_ok() {
+            "text/plain".into()
+        } else {
+            "application/octet-stream".into()
+        };
+    }
+    said.to_string()
+}
+
+/// Why `path` looks like a credential (keys, tokens, cloud logins), if it
+/// does: never attached from an `@` mention (#863).
+pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    const DIRS: &[(&str, &str)] = &[
+        (".ssh", "an SSH folder"),
+        (".aws", "AWS credentials"),
+        (".gnupg", "GnuPG keys"),
+        (".kube", "Kubernetes config"),
+        (".docker", "Docker credentials"),
+        ("gcloud", "Google Cloud credentials"),
+        ("Keychains", "a keychain"),
+        (".password-store", "a password store"),
+    ];
+    for part in path.components() {
+        let p = part.as_os_str().to_string_lossy();
+        if let Some((_, why)) = DIRS.iter().find(|(d, _)| *d == p) {
+            return Some(why);
+        }
+    }
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let secret_file = [
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "credentials",
+        ".git-credentials",
+    ]
+    .contains(&name.as_str())
+        || name == ".env"
+        || name.starts_with(".env.")
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+        || name.starts_with("id_ecdsa")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx");
+    secret_file.then_some("a key or secrets file")
+}
+
 /// A MIME type from a file name's extension.
 pub fn guess_mime(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or_default().to_lowercase();
     match ext.as_str() {
+        "svg" => "image/svg+xml",
+        "heic" => "image/heic",
+        "tif" | "tiff" => "image/tiff",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
