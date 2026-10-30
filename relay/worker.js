@@ -27,6 +27,8 @@ export class RelayRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    // Sockets already torn down: close and error both end here once (#910).
+    this.gone = new WeakSet();
   }
 
   sockets(role) {
@@ -117,10 +119,12 @@ export class RelayRoom {
     const att = this.attachment(ws);
     const ctl = this.control(message);
     if (ctl && att.role === "daemon" && ctl.relay === "push") return this.pushAll();
-    // The daemon closes one browser (it may reconnect; rotating revokes).
+    // The daemon closes one browser: 4001 when kicked (it may reconnect;
+    // rotating revokes), 4002 when its channel broke (it reconnects, #905).
     if (ctl && att.role === "daemon" && ctl.relay === "disconnect" && typeof ctl.cid === "string") {
+      const [code, reason] = ctl.code === 4002 ? [4002, "link integrity failure"] : [4001, "disconnected by the daemon"];
       for (const target of this.state.getWebSockets(ctl.cid)) {
-        try { target.close(4001, "disconnected by the daemon"); } catch (_) {}
+        try { target.close(code, reason); } catch (_) {}
       }
       return;
     }
@@ -155,7 +159,10 @@ export class RelayRoom {
     }
   }
 
-  async webSocketClose(ws) {
+  /** One teardown for close and error, however many times either runs. */
+  teardown(ws) {
+    if (this.gone.has(ws)) return;
+    this.gone.add(ws);
     const att = this.attachment(ws);
     if (att.role === "daemon") {
       this.notifyClients("daemon_offline");
@@ -165,8 +172,13 @@ export class RelayRoom {
     if (daemon && att.cid) this.notifyDaemon(daemon, "client_close", att.cid);
   }
 
+  async webSocketClose(ws) {
+    this.teardown(ws);
+  }
+
   async webSocketError(ws) {
     try { ws.close(1011, "error"); } catch (_) {}
+    this.teardown(ws);
   }
 }
 
@@ -174,7 +186,7 @@ export class RelayRoom {
 export const SECURITY_HEADERS = {
   "content-security-policy":
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
-    "connect-src 'self' wss: ws:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; " +
+    "connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; " +
     "form-action 'none'; frame-ancestors 'none'",
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",

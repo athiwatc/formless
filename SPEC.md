@@ -3433,9 +3433,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   browser connection opens with a handshake (`{"v":2,"hello":<16 random
   bytes>}` from each side) and derives a session key with HKDF-SHA256
   over the pairing key, salted with both nonces; every frame carries a
-  per-direction `seq` bound into the AES-GCM associated data and must
-  increase, so the Relay cannot replay, reorder or reflect frames, nor
-  reuse them in another connection. The relay link itself is not a
+  per-direction `seq` bound into the AES-GCM associated data and must be
+  exactly one more than the last, so the Relay cannot replay, reorder,
+  withhold or reflect frames, nor reuse them in another connection. A
+  frame that does not open is a link integrity failure: the daemon logs
+  it and has the Relay close that browser with code 4002, and a browser
+  that receives one closes with 4002 itself; either way the browser says
+  so, handshakes again and reloads its state. The relay link itself is not a
   subscriber: with no browser attached, approvals fail closed and the
   daemon can idle-close. The browser URL carries
   the secret in the `#k=` fragment, which is never sent to a server.
@@ -3458,9 +3462,23 @@ run_tool = "network_policy"     # a registry Tool, or…
   same daemon protocol, decrypted in the browser. `GetSettings` returns a
   read-only configuration summary for remote clients and never includes
   `provider.extra_headers` or any other credential-bearing field. The
-  page loads no inline script (`script-src 'self'`), because its URL
-  fragment carries the key, and it removes the key from the address bar
-  once connected.
+  page loads no inline script (`script-src 'self'`) and connects only
+  to its own origin (`connect-src 'self'`; `dev.mjs` alone adds loopback
+  `ws://`), because its URL fragment carries the key, and it removes the
+  key from the address bar once connected. `relay.url` must be `wss://`,
+  or `ws://` to this machine (`FORMLESS_RELAY_ALLOW_INSECURE=1` allows
+  others, for development only): `relay enable` refuses anything else,
+  `doctor` reports it and the daemon does not connect; a page served over
+  plain HTTP from another machine refuses to take a pairing secret.
+  **Reconnecting:** the daemon and the page back off exponentially (daemon
+  to 30 s, page to 15 s) with full jitter, and reset the backoff only
+  after a link has stayed up (daemon 60 s, page 30 s after the
+  handshake), so a relay that accepts and drops at once is not hammered.
+  **Teardown:** the Relay sends `client_close` / `daemon_offline` once
+  per socket whether it closed or errored. Browsers send a `Ping` every
+  minute; the daemon drops a browser it has heard nothing from for 5
+  minutes (code 4002), so a vanished tab never stays an approval
+  subscriber.
   **Pairing by QR code:** `formless relay enable` (and `formless relay
   status --qr`) print the browser link as a terminal QR code, white on
   black so phones read it on any theme, and only on a terminal, never into
@@ -3470,7 +3488,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   **Devices:** the relay tells the daemon each browser's User-Agent on
   `client_open`. `ListRelayClients` lists the browsers on the link (cid,
   User-Agent, first and last seen), and `DisconnectRelayClient {cid}`
-  makes the relay close that one (code 4001). The web Settings → Relay
+  makes the relay close that one (code 4001; 4002 means the channel broke
+  and the browser reconnects). The web Settings → Relay
   devices and `formless relay status` show the list; the web offers
   Disconnect. A disconnected tab stops reconnecting and says why. It can
   rejoin with the pairing link; `formless relay enable --rotate` is what

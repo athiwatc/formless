@@ -31,6 +31,7 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
 | `dev.mjs` | Local stand-in for the Worker, for frontend work |
 | `push.mjs` | Payload-free Web Push signed with VAPID (shared by the Worker and `dev.mjs`) |
 | `vapid-keys.mjs` | Makes the VAPID key pair for push |
+| `room.test.mjs` | `node relay/room.test.mjs` (room teardown, disconnect codes, CSP) |
 | `push.test.mjs`, `push.dev-test.mjs` | `node relay/push.test.mjs` (signing), `node relay/push.dev-test.mjs` (end to end through `dev.mjs`) |
 
 ## Use
