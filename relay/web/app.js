@@ -1639,6 +1639,7 @@
         group = null;
         const from = sentElsewhere(m);
         open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)),
+          ...attachmentTags(m),
           ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
           ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
       } else if (m.role === "tool") {
@@ -4119,15 +4120,27 @@
     closeMentions();
     const toolNames = new Set((S.tools || []).map((t) => t.name));
     const already = mentionAttached[S.current] || new Set();
+    // A typed or pasted @path is never sent unseen (#863): it becomes a
+    // chip first, and this Send stops so the chips can be checked.
+    const fresh = [];
     for (const path of mentionsIn(text)) {
       // Tools are named for the agent; chosen files are attached already.
       if (toolNames.has(path) || already.has(path)) continue;
       try {
         const a = await request({ type: "attach_path", session_id: S.current, path });
-        note(a.reference ? "referenced " + a.name + " (the agent reads it with its Tools)" : "attached " + a.name);
+        (mentionAttached[S.current] = mentionAttached[S.current] || new Set()).add(path);
+        (S.chips[S.current] = S.chips[S.current] || []).push(a);
+        fresh.push(a.name);
       } catch (e) {
         if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
       }
+    }
+    if (fresh.length) {
+      input.value = text;
+      autosize();
+      renderChips();
+      note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
+      return;
     }
     // One key per user action (#891): pressing Send again after a reply
     // was lost reuses it, so the daemon doesn't send the message twice.
@@ -4780,6 +4793,16 @@
       }
     }
   }
+  /** A sent message's attachments by name; one retention removed says
+   * so instead of vanishing (#858). */
+  function attachmentTags(m) {
+    let atts = [];
+    try { atts = JSON.parse(m.meta || "{}").attachments || []; } catch (_) {}
+    if (!atts.length) return [];
+    return [h("div", { class: "muted sent-from" }, ...atts.map((a) => h("span", { class: "tag attach-chip" },
+      a.reference ? "↗ " : (a.mime || "").startsWith("image/") ? "🖼 " : "📄 ", a.name || "attachment",
+      a.expired ? " · expired" : "")))];
+  }
   /** The current Session's pending attachments, each removable (×). */
   function renderChips() {
     const box = $("attach-chips");
@@ -4789,8 +4812,9 @@
       (a.mime || "").startsWith("image/") ? "🖼 " : "📄 ", a.name,
       h("button", { class: "btn ghost small", type: "button", "aria-label": "Remove " + a.name, onclick: async () => {
         const sid = S.current;
-        if (await act({ type: "detach_file", session_id: sid, id: a.id })) {
-          S.chips[sid] = (S.chips[sid] || []).filter((x) => x.id !== a.id);
+        // A referenced file (too big to attach) is named by its path.
+        if (await act({ type: "detach_file", session_id: sid, id: a.id || a.path })) {
+          S.chips[sid] = (S.chips[sid] || []).filter((x) => x !== a);
           // Its @path stays in the text but isn't attached again on send.
           renderChips();
         }

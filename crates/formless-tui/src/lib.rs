@@ -8777,6 +8777,21 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         };
         title.push_str(&format!("[{label} · {}] ", size_text(bytes.len())));
     }
+    // A typed or pasted @path is visible before it is sent (#863): a chip
+    // per file it will attach; removing the @ removes the chip.
+    let root = app.work_dir();
+    for path in formless_core::files::mentions(&app.input.expanded()) {
+        let full = root.join(&path);
+        if !full.exists() || app.tools.iter().any(|t| t.name == path) {
+            continue;
+        }
+        let label = truncate_chars(&path, 24);
+        if formless_core::daemon::credential_path(&full).is_some() {
+            title.push_str(&format!("[@{label} · not sent: credential] "));
+        } else {
+            title.push_str(&format!("[@{label}] "));
+        }
+    }
     let flashing = app.target_flash.is_some_and(|t| Instant::now() < t);
     let mut block = ui::panel(
         title,
@@ -9807,7 +9822,11 @@ fn image_attachments(m: &MessageInfo) -> Vec<(String, String)> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|a| a["mime"].as_str().is_some_and(|t| t.starts_with("image/")))
+        .filter(|a| {
+            a["mime"]
+                .as_str()
+                .is_some_and(formless_core::daemon::is_raster_image)
+        })
         .filter_map(|a| {
             let path = a["path"].as_str()?;
             std::path::Path::new(path).is_file().then(|| {
@@ -9817,6 +9836,31 @@ fn image_attachments(m: &MessageInfo) -> Vec<(String, String)> {
                 )
             })
         })
+        .collect()
+}
+
+/// Attachments of a message whose stored copy retention has removed:
+/// shown by name as expired rather than silently missing (#858).
+fn expired_attachments(m: &MessageInfo) -> Vec<String> {
+    let Some(meta) = m
+        .meta
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    else {
+        return Vec::new();
+    };
+    meta["attachments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["reference"] != true)
+        .filter(|a| {
+            a["expired"] == true
+                || a["path"]
+                    .as_str()
+                    .is_some_and(|p| !std::path::Path::new(p).exists())
+        })
+        .map(|a| a["name"].as_str().unwrap_or("attachment").to_string())
         .collect()
 }
 
@@ -11542,6 +11586,12 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
                 for l in m.content.lines() {
                     lines.push(mention_line(&truncate_chars(l, 2000), app.color));
+                }
+                for name in expired_attachments(m) {
+                    lines.push(Line::styled(
+                        format!("  📎 {name} · expired (removed by artifact retention)"),
+                        ui::dim(app.color),
+                    ));
                 }
                 if app.image_proto.is_some() {
                     for (name, path) in image_attachments(m) {

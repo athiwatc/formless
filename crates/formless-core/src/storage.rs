@@ -348,7 +348,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 52;
+pub const SCHEMA_VERSION: i64 = 53;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -433,7 +433,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 52] = [
+const MIGRATIONS: [(i64, MigrationStep); 53] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -651,6 +651,14 @@ const MIGRATIONS: [(i64, MigrationStep); 52] = [
     // toward usage and budgets but not the context estimate.
     (52, |c| {
         add_column(c, "run_usage", "source TEXT NOT NULL DEFAULT 'run'")
+    }),
+    // Attachments waiting for a Session's next message survive a restart (#857).
+    (53, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_attachments (
+               session_id TEXT NOT NULL, att TEXT NOT NULL, created_at TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS idx_pending_att_session ON pending_attachments(session_id);",
+        )?)
     }),
 ];
 
@@ -4622,6 +4630,81 @@ impl Store {
         Ok(())
     }
 
+    /// Hold an attachment for the Session's next user message.
+    pub fn add_pending_attachment(&self, session_id: &str, att: &Value) -> Result<()> {
+        self.ex(
+            "INSERT INTO pending_attachments(session_id, att, created_at) VALUES(?1,?2,?3)",
+            params![session_id, att.to_string(), now()],
+        )?;
+        Ok(())
+    }
+
+    /// The Session's held attachments, oldest first.
+    pub fn pending_attachments(&self, session_id: &str) -> Result<Vec<Value>> {
+        let mut stmt =
+            self.ps("SELECT att FROM pending_attachments WHERE session_id=?1 ORDER BY rowid")?;
+        let rows = stmt
+            .query_map(params![session_id], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok().and_then(|t| serde_json::from_str(&t).ok()))
+            .collect();
+        Ok(rows)
+    }
+
+    /// Take the Session's held attachments (they go with its next message).
+    pub fn take_pending_attachments(&self, session_id: &str) -> Result<Vec<Value>> {
+        let out = self.pending_attachments(session_id)?;
+        self.ex(
+            "DELETE FROM pending_attachments WHERE session_id=?1",
+            params![session_id],
+        )?;
+        Ok(out)
+    }
+
+    /// Drop the held attachment whose id (or, for a referenced file, path)
+    /// is `key`; returns it.
+    pub fn remove_pending_attachment(&self, session_id: &str, key: &str) -> Result<Option<Value>> {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self.ps(
+                "SELECT rowid, att FROM pending_attachments WHERE session_id=?1 ORDER BY rowid",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        for (rowid, text) in rows {
+            let Ok(att) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if att["id"].as_str() == Some(key) || att["path"].as_str() == Some(key) {
+                self.ex(
+                    "DELETE FROM pending_attachments WHERE rowid=?1",
+                    params![rowid],
+                )?;
+                return Ok(Some(att));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Held attachments never sent and older than `before` (RFC 3339),
+    /// taken off the queue and returned so their files can go.
+    pub fn expire_pending_attachments(&self, before: &str) -> Result<Vec<Value>> {
+        let rows: Vec<Value> = {
+            let mut stmt = self.ps("SELECT att FROM pending_attachments WHERE created_at < ?1")?;
+            let rows = stmt
+                .query_map(params![before], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok().and_then(|t| serde_json::from_str(&t).ok()))
+                .collect();
+            rows
+        };
+        self.ex(
+            "DELETE FROM pending_attachments WHERE created_at < ?1",
+            params![before],
+        )?;
+        Ok(rows)
+    }
+
     /// Summed (prompt, completion, cached) tokens per model.
     pub fn usage_by_model(
         &self,
@@ -4743,6 +4826,47 @@ impl Store {
                 .execute("DELETE FROM artifacts WHERE id=?1", params![id])?;
         }
         Ok(())
+    }
+
+    /// Mark the attachments with these artifact ids as expired in the
+    /// messages that carry them, so every client and the model's history
+    /// say so instead of pointing at a removed file (#858).
+    pub fn mark_attachments_expired(&self, ids: &[String]) -> Result<usize> {
+        let mut changed = 0;
+        for id in ids {
+            let rows: Vec<(String, String)> = {
+                let mut stmt =
+                    self.ps("SELECT id, meta FROM messages WHERE role='user' AND meta LIKE ?1")?;
+                let rows = stmt
+                    .query_map(params![format!("%{id}%")], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                rows
+            };
+            for (msg_id, meta) in rows {
+                let Ok(mut v) = serde_json::from_str::<Value>(&meta) else {
+                    continue;
+                };
+                let mut hit = false;
+                for a in v["attachments"].as_array_mut().into_iter().flatten() {
+                    if a["id"].as_str() == Some(id.as_str()) && a["expired"] != true {
+                        a["expired"] = json!(true);
+                        hit = true;
+                    }
+                }
+                if hit {
+                    self.ex(
+                        "UPDATE messages SET meta=?1 WHERE id=?2",
+                        params![v.to_string(), msg_id],
+                    )?;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.rewrites
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(changed)
     }
 
     pub fn delete_session_artifact_rows(&self, session_id: &str) -> Result<()> {
@@ -5298,14 +5422,35 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                     ));
                     continue;
                 }
-                content.push_str(&format!(
-                    "\n[attached: {} ({}, {} bytes), artifact {}; read it with read_artifact]",
+                // The name quoted (it is the user's, not the harness's), and
+                // cleaned again for messages stored before intake did (#862).
+                let name = serde_json::to_string(&crate::daemon::attachment_name(
                     a["name"].as_str().unwrap_or("file"),
+                ))
+                .unwrap_or_default();
+                // Collected by retention: say so instead of sending the model
+                // to read a file that is gone (#858).
+                let gone = a["expired"] == true
+                    || a["path"]
+                        .as_str()
+                        .is_some_and(|p| !std::path::Path::new(p).exists());
+                if gone {
+                    content.push_str(&format!(
+                        "\n[attachment {name} is no longer available: it was removed by artifact retention]"
+                    ));
+                    continue;
+                }
+                content.push_str(&format!(
+                    "\n[attached: {name} ({}, {} bytes), artifact {}; read it with read_artifact]",
                     a["mime"].as_str().unwrap_or("application/octet-stream"),
                     a["bytes"],
                     a["id"].as_str().unwrap_or_default()
                 ));
-                if a["mime"].as_str().is_some_and(|t| t.starts_with("image/")) {
+                // Only raster images go to a vision model (#855).
+                if a["mime"]
+                    .as_str()
+                    .is_some_and(crate::daemon::is_raster_image)
+                {
                     images.push(json!({"path": a["path"], "mime": a["mime"]}));
                 }
             }
