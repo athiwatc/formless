@@ -1,3 +1,7 @@
 /target
 .wrangler/
 relay/.wrangler/
+
+# Local agent scratch state and automation screenshots
+.opencode/
+.screenshots/
