@@ -2703,6 +2703,22 @@ run_tool = "network_policy"     # a registry Tool, or…
   `/rename auto` (web: "Suggest name") re-runs the namer on the last few
   user messages and offers its name for editing before it's applied;
   `/rename NAME` sets it directly.
+- **Automatic names.** After each Run an "Untitled" Session is named from
+  its first substantive user message (a trivial opener such as "hi" is
+  skipped once something follows it; a long message contributes its head
+  and its tail). Names record their source (schema v56
+  `sessions.name_source`): a heuristic name (first line, a few words, or
+  24 grapheme clusters when the text has no spaces, as in Thai or CJK) is
+  provisional and is redone on later Runs, and once the naming model is
+  installed every provisionally named Session is renamed by it once. A
+  model's name is final, and a user's name is never changed. The model is
+  asked for a title in the conversation's own language; titles are cut
+  between grapheme clusters, never inside one. Measured with `formless
+  naming test` on qwen2.5-0.5b: "ช่วยเขียนสคริปต์ที่แปลงไฟล์ซีเอสวีเป็นเจสัน…"
+  → "สคริปต์เจสัน"; "สรุปข่าวเทคโนโลยีประจำสัปดาห์นี้ให้หน่อย" →
+  "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
+  "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
+  "Debug Rust Code".
 - **Attached clients.** `Subscribe` takes a `client` label ("TUI",
   "TUI (plain)", "web", "web (relay)", "CLI") and replies with the
   connection's id, `{subscribed, conn}`. Whenever the clients showing a

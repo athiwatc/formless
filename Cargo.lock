@@ -1329,6 +1329,7 @@ dependencies = [
  "toml",
  "toml_edit 0.22.27",
  "tracing",
+ "unicode-segmentation",
  "uuid",
  "windows-sys 0.59.0",
  "zeroize",

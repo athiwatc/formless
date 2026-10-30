@@ -52,3 +52,74 @@ async fn suggests_a_name_from_recent_messages_without_renaming() {
     assert_eq!(store.get_session(&sid).unwrap().unwrap().name, "Old topic");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A heuristic name is provisional: the model's name replaces it once the
+/// model is installed, a model name is final, and a user's name is never
+/// touched (#871).
+#[test]
+fn heuristic_names_are_provisional_and_user_names_final() {
+    use formless_core::storage::DEFAULT_SESSION_NAME;
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let db = std::path::PathBuf::from(format!("/tmp/fl-provisional-{short}.db"));
+    let store = Store::open(&db).unwrap();
+
+    // Downloaded after the first Run: the heuristic title is replaced.
+    let a = store.create_session(None).unwrap().id;
+    assert_eq!(
+        store.get_session(&a).unwrap().unwrap().name,
+        DEFAULT_SESSION_NAME
+    );
+    let s = store
+        .auto_name_session(&a, "can you write me a tool…", "heuristic")
+        .unwrap();
+    assert_eq!(s.unwrap().name, "can you write me a tool…");
+    assert!(store.name_is_provisional(&a).unwrap());
+    assert_eq!(
+        store.provisionally_named_sessions(10).unwrap(),
+        vec![a.clone()]
+    );
+    let s = store
+        .auto_name_session(&a, "CSV to JSON Tool", "model")
+        .unwrap();
+    assert_eq!(s.unwrap().name, "CSV to JSON Tool");
+    assert!(!store.name_is_provisional(&a).unwrap());
+    assert!(
+        store
+            .auto_name_session(&a, "Other", "model")
+            .unwrap()
+            .is_none(),
+        "model names are final"
+    );
+    assert!(store
+        .auto_name_session(&a, "Other", "heuristic")
+        .unwrap()
+        .is_none());
+    assert!(store.provisionally_named_sessions(10).unwrap().is_empty());
+
+    // Renamed by the user before the download: untouched.
+    let b = store.create_session(None).unwrap().id;
+    store.auto_name_session(&b, "hi", "heuristic").unwrap();
+    store.rename_session(&b, "My budget").unwrap();
+    assert!(!store.name_is_provisional(&b).unwrap());
+    assert!(store
+        .auto_name_session(&b, "Budget Planning", "model")
+        .unwrap()
+        .is_none());
+    assert_eq!(store.get_session(&b).unwrap().unwrap().name, "My budget");
+
+    // The same heuristic name again is not a change.
+    let c = store.create_session(None).unwrap().id;
+    assert!(store
+        .auto_name_session(&c, "hi", "heuristic")
+        .unwrap()
+        .is_some());
+    assert!(store
+        .auto_name_session(&c, "hi", "heuristic")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .auto_name_session(&c, "convert this csv", "heuristic")
+        .unwrap()
+        .is_some());
+    let _ = std::fs::remove_file(&db);
+}

@@ -11,6 +11,7 @@
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::Paths;
 
@@ -182,9 +183,46 @@ async fn fetch_verified(
 
 const MAX_TITLE_CHARS: usize = 60;
 const HEURISTIC_WORDS: usize = 6;
+/// Title budget, in grapheme clusters, for text written without spaces
+/// between words (Thai, Chinese, Japanese) (#872).
+const MAX_UNSPACED_GRAPHEMES: usize = 24;
 
-/// Title from the first user message alone: its first non-empty line,
-/// cut to a few words.
+/// Where a title came from: provisional `Heuristic` titles are replaced
+/// once the naming model can do better (#871).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleSource {
+    Heuristic,
+    Model,
+}
+
+impl TitleSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TitleSource::Heuristic => "heuristic",
+            TitleSource::Model => "model",
+        }
+    }
+}
+
+/// Whether `s` is mostly written without spaces: few spaces for its
+/// length, as in Thai or CJK.
+fn unspaced(s: &str) -> bool {
+    let graphemes = s.graphemes(true).count();
+    let spaces = s.chars().filter(|c| c.is_whitespace()).count();
+    graphemes > 12 && spaces * 12 < graphemes
+}
+
+/// The first `n` grapheme clusters of `s`, so a base letter never loses
+/// its tone mark or vowel sign.
+fn take_graphemes(s: &str, n: usize) -> &str {
+    match s.grapheme_indices(true).nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// Title from a user message alone: its first non-empty line, cut to a
+/// few words, or to a few characters when the line has no spaces.
 pub fn heuristic_title(user: &str) -> Option<String> {
     let line = user.lines().map(str::trim).find(|l| !l.is_empty())?;
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -194,10 +232,44 @@ pub fn heuristic_title(user: &str) -> Option<String> {
         .copied()
         .collect::<Vec<_>>()
         .join(" ");
-    if words.len() > HEURISTIC_WORDS {
+    let mut cut = words.len() > HEURISTIC_WORDS;
+    if unspaced(&title) && title.graphemes(true).count() > MAX_UNSPACED_GRAPHEMES {
+        title = take_graphemes(&title, MAX_UNSPACED_GRAPHEMES)
+            .trim_end()
+            .to_string();
+        cut = true;
+    }
+    if cut {
         title.push('…');
     }
     clean_title(&title)
+}
+
+/// A message too short to say what a Session is about ("hi", "hello?").
+fn trivial(message: &str) -> bool {
+    let t = message.trim();
+    !t.contains('\n') && t.graphemes(true).count() < 12
+}
+
+/// What to name a Session from (#871): its first substantive user message
+/// (greetings and other trivial openers are skipped when something follows
+/// them), with its head and its tail when it is long, since the task often
+/// comes after pasted context.
+pub fn naming_text(user_messages: &[String]) -> Option<String> {
+    let mut msgs = user_messages
+        .iter()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty());
+    let first = msgs.clone().find(|m| !trivial(m));
+    let text = first.or_else(|| msgs.next())?;
+    if text.chars().count() <= MAX_PROMPT_CHARS {
+        return Some(text.to_string());
+    }
+    let head = truncate_chars(text, MAX_PROMPT_CHARS * 2 / 3);
+    let tail_chars = MAX_PROMPT_CHARS / 3;
+    let skip = text.chars().count() - tail_chars;
+    let tail_at = text.char_indices().nth(skip).map_or(text.len(), |(i, _)| i);
+    Some(format!("{head}\n…\n{}", &text[tail_at..]))
 }
 
 /// Normalise raw model output into a title: first line, no "Title:"
@@ -206,7 +278,10 @@ pub fn heuristic_title(user: &str) -> Option<String> {
 pub fn clean_title(raw: &str) -> Option<String> {
     let mut t = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
     for prefix in ["title:", "conversation title:"] {
-        if t.len() >= prefix.len() && t[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        // `get`: a non-ASCII title has no char boundary there.
+        if t.get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+        {
             t = t[prefix.len()..].trim();
         }
     }
@@ -221,13 +296,25 @@ pub fn clean_title(raw: &str) -> Option<String> {
     if t.is_empty() {
         return None;
     }
-    if t.chars().count() <= MAX_TITLE_CHARS {
+    // Unspaced scripts get a character budget, cut between graphemes;
+    // spaced text is cut at a word boundary (#872).
+    if unspaced(&t) {
+        let body = t.trim_end_matches('…');
+        if body.graphemes(true).count() <= MAX_UNSPACED_GRAPHEMES {
+            return Some(t);
+        }
+        return Some(format!(
+            "{}…",
+            take_graphemes(body, MAX_UNSPACED_GRAPHEMES).trim_end()
+        ));
+    }
+    if t.graphemes(true).count() <= MAX_TITLE_CHARS {
         return Some(t);
     }
-    let cut: String = t.chars().take(MAX_TITLE_CHARS).collect();
+    let cut = take_graphemes(&t, MAX_TITLE_CHARS);
     let cut = match cut.rfind(' ') {
-        Some(i) if i > MAX_TITLE_CHARS / 2 => &cut[..i],
-        _ => cut.as_str(),
+        Some(i) if cut[..i].graphemes(true).count() > MAX_TITLE_CHARS / 2 => &cut[..i],
+        _ => cut,
     };
     Some(format!("{}…", cut.trim_end()))
 }
@@ -239,7 +326,7 @@ fn truncate_chars(s: &str, n: usize) -> &str {
     }
 }
 
-const SYSTEM: &str = "You write short titles for chat conversations. Reply with only the title: 2 to 6 words, no quotes, no trailing punctuation.";
+const SYSTEM: &str = "You write short titles for chat conversations. Reply with only the title, a short phrase in the same language as the conversation (a few words; for Thai, Chinese or Japanese a short phrase without spaces), no quotes, no trailing punctuation.";
 const MAX_PROMPT_CHARS: usize = 1200;
 const MAX_NEW_TOKENS: usize = 24;
 
@@ -379,20 +466,25 @@ pub fn llm_title(_paths: &Paths, _spec: &ModelSpec, _user: &str) -> Result<Strin
     bail!("this build has no embedded model support (feature `embedded-llm`)")
 }
 
-/// Best available title: the embedded model when installed, else the
-/// heuristic. Blocking; see [`llm_title`].
-pub fn title(paths: &Paths, spec: Option<&ModelSpec>, user: &str) -> Option<String> {
-    if let Some(spec) = spec.filter(|s| embedded_available() && s.installed(paths)) {
+/// Whether the naming model can run now.
+pub fn model_ready(paths: &Paths, spec: Option<&ModelSpec>) -> bool {
+    spec.is_some_and(|s| embedded_available() && s.installed(paths))
+}
+
+/// Best available title and where it came from: the embedded model when
+/// installed, else the heuristic. Blocking; see [`llm_title`].
+pub fn title(paths: &Paths, spec: Option<&ModelSpec>, user: &str) -> Option<(String, TitleSource)> {
+    if let Some(spec) = spec.filter(|s| model_ready(paths, Some(s))) {
         match llm_title(paths, spec, user) {
             Ok(raw) => {
                 if let Some(t) = clean_title(&raw) {
-                    return Some(t);
+                    return Some((t, TitleSource::Model));
                 }
             }
             Err(e) => tracing::warn!("session naming model failed: {e:#}"),
         }
     }
-    heuristic_title(user)
+    heuristic_title(user).map(|t| (t, TitleSource::Heuristic))
 }
 
 #[cfg(test)]
@@ -419,6 +511,82 @@ mod tests {
         let t = clean_title(&long).unwrap();
         assert!(t.chars().count() <= MAX_TITLE_CHARS + 1);
         assert!(t.ends_with('…'));
+    }
+
+    /// No cut leaves a Thai base letter without its tone mark or vowel
+    /// sign: the kept text is a prefix of whole grapheme clusters.
+    fn whole_graphemes(original: &str, title: &str) -> bool {
+        let kept = title.trim_end_matches('…');
+        let gs: Vec<&str> = original.graphemes(true).collect();
+        let mut acc = String::new();
+        for g in gs {
+            if acc == kept {
+                return true;
+            }
+            acc.push_str(g);
+        }
+        acc == kept
+    }
+
+    #[test]
+    fn unspaced_thai_and_cjk_titles_are_cut_between_graphemes() {
+        // Realistic unspaced Thai: tone marks and above/below vowels.
+        let thai = "ช่วยเขียนสคริปต์ที่แปลงไฟล์ซีเอสวีเป็นเจสันให้หน่อยได้ไหมครับ แล้วก็อธิบายด้วย";
+        let h = heuristic_title(thai).unwrap();
+        assert!(h.ends_with('…'), "{h}");
+        assert!(
+            h.graphemes(true).count() <= MAX_UNSPACED_GRAPHEMES + 1,
+            "{h}"
+        );
+        assert!(whole_graphemes(thai, &h), "{h}");
+        assert_ne!(h, thai, "not the whole first line");
+
+        let ja = "このリポジトリのビルドが失敗する原因を調べて修正してください。テストも追加して";
+        let h = heuristic_title(ja).unwrap();
+        assert!(
+            h.graphemes(true).count() <= MAX_UNSPACED_GRAPHEMES + 1,
+            "{h}"
+        );
+        assert!(whole_graphemes(ja, &h), "{h}");
+
+        // Model output in Thai that runs long is cut the same way.
+        let c = clean_title("สรุปข่าวเทคโนโลยีประจำสัปดาห์นี้แบบละเอียดมากมายหลายหัวข้อ").unwrap();
+        assert!(
+            c.graphemes(true).count() <= MAX_UNSPACED_GRAPHEMES + 1,
+            "{c}"
+        );
+        assert!(
+            whole_graphemes("สรุปข่าวเทคโนโลยีประจำสัปดาห์นี้แบบละเอียดมากมายหลายหัวข้อ", &c),
+            "{c}"
+        );
+        // A short one is kept whole.
+        assert_eq!(clean_title("แปลงไฟล์ CSV").as_deref(), Some("แปลงไฟล์ CSV"));
+        // Mixed Thai-English keeps word cutting.
+        assert_eq!(
+            heuristic_title("ช่วย debug โค้ด Rust ตัวนี้ ที่ compile ไม่ผ่าน").as_deref(),
+            Some("ช่วย debug โค้ด Rust ตัวนี้ ที่…")
+        );
+    }
+
+    #[test]
+    fn naming_skips_trivial_openers_and_keeps_the_tail_of_long_messages() {
+        let msgs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            naming_text(&msgs(&["hi", "convert this csv to json please"])).as_deref(),
+            Some("convert this csv to json please")
+        );
+        assert_eq!(naming_text(&msgs(&["hi"])).as_deref(), Some("hi"));
+        let long = format!(
+            "{}\nNow: summarise the bug above",
+            "context line\n".repeat(200)
+        );
+        let t = naming_text(&msgs(&[&long])).unwrap();
+        assert!(t.starts_with("context line"));
+        assert!(
+            t.ends_with("Now: summarise the bug above"),
+            "the tail is kept"
+        );
+        assert!(t.chars().count() <= MAX_PROMPT_CHARS + 3);
     }
 
     #[test]

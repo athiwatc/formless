@@ -5109,10 +5109,14 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
             let started = std::time::Instant::now();
             let title = namer::title(&paths, spec.as_ref(), &text);
             println!(
-                "{}  ({:.2?}, {})",
-                title.as_deref().unwrap_or("(none)"),
+                "{}  ({:.2?}, {}{})",
+                title.as_ref().map_or("(none)", |(t, _)| t.as_str()),
                 started.elapsed(),
-                naming_model_status(&paths, &cfg)
+                naming_model_status(&paths, &cfg),
+                match title {
+                    Some((_, namer::TitleSource::Heuristic)) => ", heuristic",
+                    _ => "",
+                }
             );
         }
     }
