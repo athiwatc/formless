@@ -3170,7 +3170,12 @@ run_tool = "network_policy"     # a registry Tool, or…
 - Every CLI `list`/`status` subcommand takes `--json` and prints one JSON
   value (the daemon's data) instead of a table: `providers`, `roles`,
   `jobs`, `memory`, `mcp`, `skills`, `tools`, `prompts` and `sessions list`,
-  plus `runs`, `relay status` and `daemon status`. `relay status --json`
+  plus `runs`, `approvals list`, `profiles list`, `relay status`,
+  `security status`, `auth status`, `naming status` and `daemon status`
+  (a test walks the command tree, so a new `list`/`status` without it
+  fails). `tools show` and `sessions show` take it too. Without `--json`
+  each prints a short human summary. `auth status --json` never includes
+  the token. `relay status --json`
   leaves out the browser link (it holds the secret) and says `paired`.
   `daemon status --json` prints `{"running": false}` when no daemon runs.
 - `formless daemon restart` waits for the running Runs to finish, or with
@@ -3328,6 +3333,23 @@ run_tool = "network_policy"     # a registry Tool, or…
   reachability, endpoint connectivity + tool-calling probe result.
 - `formless reset` — full wipe (§15); typed confirmation in TUI contexts,
   `--force` required headless.
+- **Destructive commands** (`reset`, `uninstall`, `profiles rm`, `tools
+  purge`, `tools retire` of a Tool others use) share one rule: on a
+  terminal you type the confirmation word; anywhere else `--force` is
+  required (`--yes` is an alias where it was the old spelling), so piped
+  input never confirms. Refusing is a usage error.
+- **Exit codes**, for every command: 0 success; 1 a failure (the daemon,
+  the provider, the Tool); 2 a usage mistake (an unknown id, a missing or
+  conflicting flag, a bad value, malformed `--input`, a refused
+  confirmation), checked before a daemon is started where the client can
+  tell; 124 `run --timeout`; 130 interrupted. Errors print as `error: …`
+  on stderr. Flags that would silently override each other are refused by
+  the parser (`run --json --output`, `export NAME --all`, `jobs add --cron
+  --at`, `web --stop --port`, `approvals revoke … --all`), and the TUI's
+  `--plain`/`-c`/`--new` only go with starting the TUI. `relay enable`
+  keeps the configured `relay.url` unless `--url` is given. `tools run`
+  exits from the daemon's `ok`, not the result's wording. `formless man`
+  documents every subcommand's options, two levels deep.
 - The CLI is a client of the same protocol; **no behaviour lives only in
   the CLI**.
 
