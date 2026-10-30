@@ -350,7 +350,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 55;
+pub const SCHEMA_VERSION: i64 = 56;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -435,7 +435,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 55] = [
+const MIGRATIONS: [(i64, MigrationStep); 56] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -691,6 +691,10 @@ const MIGRATIONS: [(i64, MigrationStep); 55] = [
     // A grant names the code it was given for (#704); older grants get
     // theirs the first time they are used.
     (55, |c| add_column(c, "approvals", "code_hash TEXT")),
+    // Where an automatic name came from (#871): 'heuristic' names are
+    // provisional and the naming model replaces them; NULL is the default
+    // name, a user's name, or an earlier version's.
+    (56, |c| add_column(c, "sessions", "name_source TEXT")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -944,25 +948,59 @@ impl Store {
 
     pub fn rename_session(&self, id: &str, name: &str) -> Result<Option<SessionInfo>> {
         self.ex(
-            "UPDATE sessions SET name=?2, updated_at=?3 WHERE id=?1",
+            "UPDATE sessions SET name=?2, updated_at=?3, name_source=NULL WHERE id=?1",
             params![id, name, now()],
         )?;
         self.get_session(id)
     }
 
     /// Auto-naming: rename only while the Session still has the default
-    /// name, so a user rename that raced the namer always wins. Leaves
-    /// `updated_at` alone (naming is not activity). Returns the Session
-    /// when the rename applied.
-    pub fn auto_name_session(&self, id: &str, name: &str) -> Result<Option<SessionInfo>> {
+    /// name or a provisional (heuristic) one, so a user rename that raced
+    /// the namer always wins and a model name is final. `source` is
+    /// "heuristic" or "model" (#871). Leaves `updated_at` alone (naming is
+    /// not activity). Returns the Session when the rename changed it.
+    pub fn auto_name_session(
+        &self,
+        id: &str,
+        name: &str,
+        source: &str,
+    ) -> Result<Option<SessionInfo>> {
         let n = self.ex(
-            "UPDATE sessions SET name=?2 WHERE id=?1 AND name=?3",
-            params![id, name, DEFAULT_SESSION_NAME],
+            "UPDATE sessions SET name=?2, name_source=?4
+             WHERE id=?1 AND (name=?3 OR name_source='heuristic')
+               AND NOT (name=?2 AND name_source IS ?4)",
+            params![id, name, DEFAULT_SESSION_NAME, source],
         )?;
         if n == 0 {
             return Ok(None);
         }
         self.get_session(id)
+    }
+
+    /// Whether the Session's name may still be set automatically: the
+    /// default name, or a provisional heuristic one.
+    pub fn name_is_provisional(&self, id: &str) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name=?2 OR name_source IS 'heuristic' FROM sessions WHERE id=?1",
+                params![id, DEFAULT_SESSION_NAME],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Sessions with a provisional name, most recent first: what the naming
+    /// model renames once it is installed (#871).
+    pub fn provisionally_named_sessions(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.ps("SELECT id FROM sessions WHERE name_source='heuristic'
+             ORDER BY updated_at DESC LIMIT ?1")?;
+        let ids = stmt
+            .query_map(params![limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
     }
 
     /// Normalised tags: trimmed, lowercase, without `#`, unique, sorted.

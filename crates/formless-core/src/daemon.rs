@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, ProviderCfg};
 use crate::namer::{self, ModelSpec};
 use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
-use crate::storage::{ContextCache, Store, DEFAULT_SESSION_NAME};
+use crate::storage::{ContextCache, Store};
 use crate::tools as toolreg;
 use crate::Paths;
 
@@ -1858,7 +1858,8 @@ impl Daemon {
                 if recent.trim().is_empty() {
                     return Ok(json!({ "name": null }));
                 }
-                Ok(json!({ "name": self.generate_name(&self.config()?, recent).await }))
+                let name = self.generate_name(&self.config()?, recent).await;
+                Ok(json!({ "name": name.map(|(n, _)| n) }))
             }
             Request::ContextUsage { session_id } => {
                 let cfg = self.config()?;
@@ -3803,20 +3804,24 @@ impl Daemon {
         if !cfg.naming.enabled {
             return;
         }
-        let first_user = self.with_store(|st| {
-            if !st
-                .get_session(session_id)?
-                .is_some_and(|s| s.name == DEFAULT_SESSION_NAME)
-            {
+        // The default name or a provisional (heuristic) one may change; a
+        // user's or the model's name is final (#871).
+        let users = self.with_store(|st| {
+            if !st.name_is_provisional(session_id)? {
                 return Ok(None);
             }
-            Ok(st
-                .list_messages(session_id)?
-                .into_iter()
-                .find(|m| m.role == "user" && !m.content.trim().is_empty())
-                .map(|m| m.content))
+            Ok(Some(
+                st.list_messages(session_id)?
+                    .into_iter()
+                    .filter(|m| m.role == "user")
+                    .map(|m| m.content)
+                    .collect::<Vec<_>>(),
+            ))
         });
-        let Ok(Some(user)) = first_user else {
+        let Ok(Some(users)) = users else {
+            return;
+        };
+        let Some(user) = namer::naming_text(&users) else {
             return;
         };
         let spec = cfg.naming.spec();
@@ -3831,22 +3836,33 @@ impl Daemon {
         let this = self.clone();
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            let Some(name) = this.generate_name(&cfg, user).await else {
+            let Some((name, source)) = this.generate_name(&cfg, user).await else {
                 return;
             };
-            if let Ok(Some(s)) = this.with_store(|st| st.auto_name_session(&session_id, &name)) {
+            if let Ok(Some(s)) =
+                this.with_store(|st| st.auto_name_session(&session_id, &name, source.as_str()))
+            {
                 this.broadcast(Event::SessionUpdated { session: s });
             }
         });
     }
 
     /// A title for `text` from the naming model, falling back to the
-    /// heuristic when it's missing, fails or times out.
-    async fn generate_name(&self, cfg: &Config, text: String) -> Option<String> {
+    /// heuristic when it's missing, fails or times out; with where it
+    /// came from, since a heuristic one is provisional.
+    async fn generate_name(
+        &self,
+        cfg: &Config,
+        text: String,
+    ) -> Option<(String, namer::TitleSource)> {
         let spec = cfg.naming.spec();
+        let fallback = namer::heuristic_title(&text).map(|t| (t, namer::TitleSource::Heuristic));
+        // No model to wait for: no permit, no blocking job.
+        if !namer::model_ready(&self.paths, spec.as_ref()) {
+            return fallback;
+        }
         let timeout = std::time::Duration::from_secs(cfg.naming.timeout_secs.max(1));
         let permit = self.naming.clone().acquire_owned().await.ok()?;
-        let fallback = namer::heuristic_title(&text);
         let paths = self.paths.clone();
         // The permit moves into the blocking job: a timed-out job keeps
         // it until it really finishes, so jobs never pile up.
@@ -4026,6 +4042,14 @@ impl Daemon {
                 Ok(()) => {
                     tracing::info!("session-naming model {} installed", spec.id);
                     this.model_download.store(false, Ordering::SeqCst);
+                    // Sessions titled by the heuristic while it downloaded
+                    // get a real title now (#871).
+                    let ids = this
+                        .with_reader(|st| st.provisionally_named_sessions(100))
+                        .unwrap_or_default();
+                    for id in ids {
+                        this.maybe_name_session(&id);
+                    }
                 }
                 // Stays set: no retry storm on every new Session.
                 Err(e) => tracing::warn!("session-naming model download failed: {e:#}"),
