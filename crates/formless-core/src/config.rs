@@ -359,8 +359,15 @@ impl ModelPrice {
 /// A yes/no environment variable: `1/true/yes/on` or `0/false/no/off`
 /// (any case); unset or empty is `None`, anything else an error.
 pub fn env_flag(name: &str) -> Result<Option<bool>> {
-    let Ok(v) = std::env::var(name) else {
-        return Ok(None);
+    let v = match std::env::var(name) {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        // Set but unreadable is not "unset" (#846).
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(anyhow!(
+                "{name} is not text; use 1/true/yes/on or 0/false/no/off"
+            ))
+        }
     };
     match v.trim().to_ascii_lowercase().as_str() {
         "" => Ok(None),
@@ -1504,44 +1511,117 @@ pub fn write_secret_file(file: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // Unique per write, so two saves never share (or unlink) a temp (#849).
+    let tmp = file.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = (|| -> Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, file).with_context(|| format!("replace {}", file.display()))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let mut f = opts
-        .open(&tmp)
-        .with_context(|| format!("create {}", tmp.display()))?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, file).with_context(|| format!("replace {}", file.display()))?;
-    Ok(())
+    written
 }
 
 /// Read a secret file; one that group or others can read is tightened
-/// to 0600 first, with a warning (SPEC §4.2).
+/// to 0600 first, with a warning (SPEC §4.2). A symlink is not followed:
+/// a secret file is a plain file in the config folder (#849).
 pub fn read_secret_file(file: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(file).ok()?;
+    if meta.file_type().is_symlink() {
+        tracing::warn!(
+            "{} is a symlink; secret files must be plain files",
+            file.display()
+        );
+        return None;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(file) {
-            let mode = meta.permissions().mode();
-            if mode & 0o077 != 0 {
-                tracing::warn!(
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            match std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => tracing::warn!(
                     "{} was readable by others (mode {:o}); tightened to 0600",
                     file.display(),
                     mode & 0o777
-                );
-                let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+                ),
+                Err(e) => tracing::warn!(
+                    "{} is readable by others (mode {:o}) and could not be tightened: {e}",
+                    file.display(),
+                    mode & 0o777
+                ),
             }
         }
     }
     std::fs::read_to_string(file).ok()
+}
+
+/// Remove secret temp files a crashed write left behind (`*.tmp-*` in the
+/// config folder); run at daemon start (#849).
+pub fn sweep_secret_temps(paths: &Paths) -> usize {
+    let mut n = 0;
+    for e in std::fs::read_dir(&paths.config_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = e.file_name().to_string_lossy().to_string();
+        let ours = name.contains(".tmp-") && !name.starts_with('.');
+        // Old enough that no write in progress owns it.
+        let stale = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(60));
+        if ours
+            && stale
+            && e.file_type().is_ok_and(|t| t.is_file())
+            && std::fs::remove_file(e.path()).is_ok()
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Every file in the config folder that holds a secret: the API key and
+/// relay fallbacks, OAuth tokens and named secrets (provider keys, MCP
+/// logins), for `doctor`'s permission check.
+pub fn secret_files(paths: &Paths) -> Vec<std::path::PathBuf> {
+    let mut out = vec![paths.key_fallback_file(), paths.relay_secret_file()];
+    for e in std::fs::read_dir(&paths.config_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with("oauth_tokens")
+            || name.starts_with("provider-key-")
+            || name.starts_with("mcp-oauth-")
+        {
+            out.push(e.path());
+        }
+    }
+    out.retain(|p| p.exists());
+    out
 }
 
 const KEYRING_SERVICE: &str = "formless";
@@ -2042,6 +2122,61 @@ pub fn delete_api_key(paths: &Paths) {
         let _ = entry.delete_credential();
     }
     let _ = std::fs::remove_file(paths.key_fallback_file());
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    use super::*;
+
+    /// Concurrent saves leave one whole value and no temp; a failed write
+    /// leaves no temp; a symlink is not read through (#849).
+    #[test]
+    fn secret_writes_are_safe_under_concurrency_and_failure() {
+        let dir = std::env::temp_dir().join(format!("fl-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("api_key");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    write_secret_file(&file, &format!("value-{i}").repeat(200))
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().unwrap();
+        }
+        let v = read_secret_file(&file).unwrap();
+        let first = &v[..7];
+        assert_eq!(v, first.repeat(200), "one whole value");
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0);
+        // Writing where a directory stands fails, and leaves no temp.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(blocked.join("x")).unwrap();
+        assert!(write_secret_file(&blocked, "s").is_err());
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+                .count(),
+            0
+        );
+        #[cfg(unix)]
+        {
+            let target = dir.join("elsewhere");
+            std::fs::write(&target, "secret").unwrap();
+            let link = dir.join("linked");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert_eq!(read_secret_file(&link), None);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]

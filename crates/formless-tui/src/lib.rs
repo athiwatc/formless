@@ -143,6 +143,8 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
+    Revoked,
     /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
     TestModel,
     /// `/routing`: the latest routing decisions.
@@ -1094,6 +1096,10 @@ struct App {
     /// When each pending request was sent: one unanswered for
     /// [`REQUEST_DEADLINE`] is given up on with a note (#884).
     pending_since: HashMap<u64, Instant>,
+    /// `Status.secure` of the daemon this TUI is attached to.
+    daemon_secure: Option<bool>,
+    /// What the last `/revoke` named, for its reply.
+    revoking: String,
     tools: Vec<ToolInfo>,
     /// What the last Run on screen did to the registry (`/tool NAME`).
     run_tool_changes: Vec<ToolChange>,
@@ -1422,6 +1428,8 @@ impl App {
             toasts: Vec::new(),
             pending: HashMap::new(),
             pending_since: HashMap::new(),
+            daemon_secure: None,
+            revoking: String::new(),
             tools: Vec::new(),
             tool_idx: 0,
             run_tool_changes: Vec::new(),
@@ -1560,6 +1568,11 @@ impl App {
             self.notes
                 .push(format!("Warning: {warning} Or type /restart-daemon."));
         }
+        // The approvals the running daemon enforces, for Settings (#847).
+        self.daemon_secure =
+            client::request_once_within(&self.paths, Request::Status, Duration::from_secs(5))
+                .ok()
+                .and_then(|v| v["secure"].as_bool());
         let (client, inbox) = DaemonClient::connect(&self.paths)?;
         self.client = Some(client);
         self.inbox = Some(inbox);
@@ -1973,6 +1986,7 @@ impl App {
                                 serde_json::from_value(result).unwrap_or_default();
                             let mut n = 0;
                             let mut seen = HashSet::new();
+                            let mut still = std::collections::BTreeSet::new();
                             for g in grants.into_iter().filter(|g| {
                                 family
                                     .as_deref()
@@ -1987,6 +2001,9 @@ impl App {
                                     g.session_id.clone(),
                                 );
                                 if seen.insert(key) {
+                                    if g.trusted {
+                                        still.insert(g.capability.clone());
+                                    }
                                     self.fire(Request::RevokeGrant {
                                         tool_id: g.tool_id,
                                         capability,
@@ -2000,6 +2017,30 @@ impl App {
                                 (0, _) => "nothing to revoke".to_string(),
                                 (n, Some(f)) => format!("revoked {n} {f} grant(s)"),
                                 (n, None) => format!("revoked {n} grant(s)"),
+                            });
+                            // Config trust keeps approving these (#844).
+                            if !still.is_empty() {
+                                self.notes.push(format!(
+                                    "still allowed without asking by your trusted folders/hosts: {}",
+                                    still.into_iter().collect::<Vec<_>>().join(", ")
+                                ));
+                            }
+                        }
+                        Pending::Revoked => {
+                            let what = std::mem::take(&mut self.revoking);
+                            let still: Vec<String> = result["still_trusted"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|c| c.as_str().map(str::to_string))
+                                .collect();
+                            self.notes.push(if still.is_empty() {
+                                format!("revoked {what}; the next call asks again")
+                            } else {
+                                format!(
+                                    "revoked {what}; still allowed without asking by your trusted folders/hosts: {}",
+                                    still.join(", ")
+                                )
                             });
                         }
                         Pending::DryRunTool => {
@@ -5174,10 +5215,17 @@ impl App {
                 let capability = words.next().map(str::to_string);
                 match self.tools.iter().find(|t| t.name == name).map(|t| t.id.clone()) {
                     Some(tool_id) => {
-                        self.fire(Request::RevokeApproval {
-                            tool_id: tool_id.clone(),
-                            capability: capability.clone(),
-                        });
+                        self.revoking = format!(
+                            "{} for {name}",
+                            capability.as_deref().unwrap_or("every approval")
+                        );
+                        self.request(
+                            Pending::Revoked,
+                            Request::RevokeApproval {
+                                tool_id: tool_id.clone(),
+                                capability: capability.clone(),
+                            },
+                        );
                         // Its hour grant and this Session's grant too.
                         self.fire(Request::RevokeGrant {
                             tool_id: tool_id.clone(),
@@ -5193,10 +5241,6 @@ impl App {
                                 session_id: Some(s),
                             });
                         }
-                        self.notes.push(format!(
-                            "revoked {} for {name}; the next call asks again",
-                            capability.as_deref().unwrap_or("every approval")
-                        ));
                     }
                     None => self
                         .notes
@@ -7219,7 +7263,18 @@ impl App {
 
     fn settings_rows(&self) -> Vec<settings::Row> {
         match Config::load(&self.paths) {
-            Ok(cfg) => settings::rows(&cfg, &self.providers_info, self.show_thinking, &self.paths),
+            Ok(cfg) => {
+                let mut rows =
+                    settings::rows(&cfg, &self.providers_info, self.show_thinking, &self.paths);
+                // Show what the running daemon enforces, not what this
+                // process would (#847).
+                if let Some(running) = self.daemon_secure {
+                    if let Some(r) = rows.iter_mut().find(|r| r.key == "security.secure") {
+                        r.value = settings::approvals_text(running, cfg.security.secure);
+                    }
+                }
+                rows
+            }
             Err(_) => Vec::new(),
         }
     }
@@ -14282,6 +14337,8 @@ mod tests {
             toasts: Vec::new(),
             pending: HashMap::new(),
             pending_since: HashMap::new(),
+            daemon_secure: None,
+            revoking: String::new(),
             tools: Vec::new(),
             tool_idx: 0,
             run_tool_changes: Vec::new(),

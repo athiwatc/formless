@@ -35,6 +35,24 @@ pub struct Row {
     pub kind: Kind,
 }
 
+/// The approvals row: the running daemon's mode, and the remedy when the
+/// settings here say otherwise.
+pub fn approvals_text(running: bool, configured: bool) -> String {
+    let mode = if running {
+        "on: sensitive calls ask"
+    } else {
+        "off: Tools run without asking"
+    };
+    if running == configured {
+        mode.to_string()
+    } else {
+        format!(
+            "{mode} (the running daemon; config says {}: /restart-daemon)",
+            if configured { "on" } else { "off" }
+        )
+    }
+}
+
 impl Row {
     fn new(section: &'static str, key: &str, label: &str, value: String, kind: Kind) -> Self {
         Row {
@@ -673,5 +691,15 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod approvals_row_tests {
+    #[test]
+    fn the_row_shows_the_daemons_mode_and_a_mismatch() {
+        assert_eq!(super::approvals_text(true, true), "on: sensitive calls ask");
+        let t = super::approvals_text(false, true);
+        assert!(t.starts_with("off") && t.contains("/restart-daemon"), "{t}");
     }
 }

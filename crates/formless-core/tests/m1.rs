@@ -759,3 +759,30 @@ fn compaction_cuts_only_at_turn_boundaries() {
         "cut at {cut}, turns start at {user_seqs:?}"
     );
 }
+
+/// The audit view shows decisions by default; per-call approvals-off
+/// records are opt-in and capped (#848).
+#[test]
+fn audit_hides_and_caps_unasked_records() {
+    let store = formless_core::Store::open_in_memory().unwrap();
+    store.audit("user", "tool.approve", "fetch: net").unwrap();
+    for i in 0..(formless_core::storage::UNASKED_KEEP + 5) {
+        store
+            .audit("approvals-off", "tool.run_unasked", &format!("t{i}: net"))
+            .unwrap();
+    }
+    let default = store.list_audit(None, None, 500).unwrap();
+    assert_eq!(default.len(), 1, "only the decision");
+    assert_eq!(default[0].action, "tool.approve");
+    let unasked = store.list_audit(Some("run_unasked"), None, 500).unwrap();
+    assert_eq!(unasked.len(), 500);
+    let all = store.list_audit(Some("*"), None, 500).unwrap();
+    assert_eq!(all.len(), 500);
+    let without = store.list_audit(Some("-approve"), None, 500).unwrap();
+    assert!(without.iter().all(|e| e.action != "tool.approve"));
+    let kept: i64 = store
+        .recent_audit(Some("tool.run_unasked"), 100_000)
+        .unwrap()
+        .len() as i64;
+    assert_eq!(kept, formless_core::storage::UNASKED_KEEP, "capped");
+}

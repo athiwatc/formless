@@ -45,6 +45,10 @@ pub struct AttemptRecord {
     pub candidate: CandidateData,
 }
 
+/// Newest `*.run_unasked` audit records kept (approvals-off mode logs one
+/// per sensitive call).
+pub const UNASKED_KEEP: i64 = 2000;
+
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -4959,29 +4963,44 @@ impl Store {
         Ok(rows)
     }
 
-    /// Audit entries for the log view, newest first: `filter` matches the
-    /// actor, action or detail (case-insensitive); `before` pages back.
+    /// Audit entries for the log view, newest first; `before` pages back.
+    /// `filter` matches the actor, action or detail (case-insensitive);
+    /// `-text` leaves matches out; `*` shows everything. With no filter
+    /// the decisions show and the per-call `*.run_unasked` records don't
+    /// (#848): filter on `run_unasked` to see them.
     pub fn list_audit(
         &self,
         filter: Option<&str>,
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<formless_protocol::AuditEntry>> {
+        let (include, exclude) = match filter.map(str::trim) {
+            None | Some("") => (None, Some("run_unasked")),
+            Some("*") => (None, None),
+            Some(f) => match f.strip_prefix('-') {
+                Some(out) => (None, Some(out.trim())),
+                None => (Some(f), None),
+            },
+        };
         let mut stmt = self.ps(
             "SELECT actor, action, detail, created_at FROM audit
              WHERE (?1 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?1)) > 0)
+               AND (?4 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?4)) = 0)
                AND (?2 IS NULL OR created_at < ?2)
              ORDER BY created_at DESC, rowid DESC LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![filter, before, limit.clamp(1, 500) as i64], |r| {
-                Ok(formless_protocol::AuditEntry {
-                    actor: r.get(0)?,
-                    action: r.get(1)?,
-                    detail: r.get(2)?,
-                    created_at: r.get(3)?,
-                })
-            })?
+            .query_map(
+                params![include, before, limit.clamp(1, 500) as i64, exclude],
+                |r| {
+                    Ok(formless_protocol::AuditEntry {
+                        actor: r.get(0)?,
+                        action: r.get(1)?,
+                        detail: r.get(2)?,
+                        created_at: r.get(3)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -5019,6 +5038,16 @@ impl Store {
                 now()
             ],
         )?;
+        // The per-call records of approvals-off mode are kept to the newest
+        // UNASKED_KEEP; decisions are never trimmed (#848).
+        if action.ends_with(".run_unasked") {
+            self.ex(
+                "DELETE FROM audit WHERE action LIKE '%.run_unasked' AND rowid NOT IN
+                   (SELECT rowid FROM audit WHERE action LIKE '%.run_unasked'
+                    ORDER BY created_at DESC, rowid DESC LIMIT ?1)",
+                params![UNASKED_KEEP],
+            )?;
+        }
         Ok(())
     }
 }

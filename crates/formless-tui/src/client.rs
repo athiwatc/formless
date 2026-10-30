@@ -179,7 +179,7 @@ pub fn check_daemon_version(paths: &Paths) -> Result<Option<String>> {
         }
         Err(e) => return Err(e),
     };
-    let warnings = status_warnings(&status);
+    let warnings = status_warnings(&status)?;
     Ok((!warnings.is_empty()).then(|| warnings.join(" ")))
 }
 
@@ -187,7 +187,15 @@ pub fn check_daemon_version(paths: &Paths) -> Result<Option<String>> {
 /// client expects: another version, an older build of the same version
 /// (a rebuild since it started), or approvals off when this client asked
 /// for them (`--secure` / `FORMLESS_SECURE`) (SPEC §9.3, §10.3).
-pub fn status_warnings(status: &serde_json::Value) -> Vec<String> {
+///
+/// An invalid `FORMLESS_SECURE` is an error here, never "didn't ask" (#846).
+pub fn status_warnings(status: &serde_json::Value) -> Result<Vec<String>> {
+    let wants = formless_core::config::env_flag("FORMLESS_SECURE")?;
+    Ok(status_warnings_for(status, wants))
+}
+
+/// [`status_warnings`] with what this client asked for passed in.
+pub fn status_warnings_for(status: &serde_json::Value, wants_secure: Option<bool>) -> Vec<String> {
     let mut out = Vec::new();
     let ours = env!("CARGO_PKG_VERSION");
     if let Some(w) = version_warning(ours, status["version"].as_str()) {
@@ -195,19 +203,33 @@ pub fn status_warnings(status: &serde_json::Value) -> Vec<String> {
     } else if let Some(w) = build_warning(&formless_core::daemon::build_id(), status) {
         out.push(w);
     }
-    let wants_secure = formless_core::config::env_flag("FORMLESS_SECURE")
-        .ok()
-        .flatten()
-        == Some(true);
-    if wants_secure && status["secure"] == false {
-        out.push(
-            "approvals are off in the running daemon, though you asked for them (--secure / \
-             FORMLESS_SECURE). Run `formless --secure daemon restart`, or set security.secure = \
-             true in config.toml."
-                .into(),
-        );
+    if insecure_daemon(status, wants_secure) {
+        out.push(INSECURE_DAEMON.into());
     }
     out
+}
+
+const INSECURE_DAEMON: &str = "approvals are off in the running daemon, though you asked for them \
+    (--secure / FORMLESS_SECURE). Run `formless --secure daemon restart`, or set \
+    security.secure = true in config.toml.";
+
+/// The client asked for approvals and the daemon doesn't enforce them.
+pub fn insecure_daemon(status: &serde_json::Value, wants_secure: Option<bool>) -> bool {
+    wants_secure == Some(true) && status["secure"] == false
+}
+
+/// For commands that run Tools without a person watching (`run`, `tools
+/// run`): fail before sending anything when this client asked for
+/// approvals and the daemon doesn't enforce them (#846).
+pub fn require_secure_daemon(paths: &Paths) -> Result<()> {
+    if formless_core::config::env_flag("FORMLESS_SECURE")? != Some(true) {
+        return Ok(());
+    }
+    let status = request_once(paths, Request::Status)?;
+    if insecure_daemon(&status, Some(true)) {
+        anyhow::bail!("{INSECURE_DAEMON} Nothing was run.");
+    }
+    Ok(())
 }
 
 /// The warning when the daemon runs an older build of this version: it
@@ -350,6 +372,21 @@ mod tests {
 mod status_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn asking_for_approvals_from_a_daemon_without_them_warns() {
+        let off = json!({"version": env!("CARGO_PKG_VERSION"), "secure": false});
+        let on = json!({"version": env!("CARGO_PKG_VERSION"), "secure": true});
+        let w = status_warnings_for(&off, Some(true));
+        assert!(w.iter().any(|w| w.contains("approvals are off")), "{w:?}");
+        assert!(status_warnings_for(&off, None)
+            .iter()
+            .all(|w| !w.contains("approvals")));
+        assert!(status_warnings_for(&on, Some(true))
+            .iter()
+            .all(|w| !w.contains("approvals")));
+        assert!(insecure_daemon(&off, Some(true)) && !insecure_daemon(&on, Some(true)));
+    }
 
     #[test]
     fn a_stale_or_different_build_is_reported() {

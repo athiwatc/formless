@@ -4882,7 +4882,7 @@ impl Daemon {
         // Config trust still approves these, whatever the grant says.
         if let Ok(cfg) = self.config() {
             for g in &mut out {
-                g.trusted = spec_trusted(&cfg.security, &g.capability);
+                g.trusted = self.trust_approves(&cfg, &g.tool_id, &g.capability);
             }
         }
         Ok(out)
@@ -9325,7 +9325,12 @@ impl Daemon {
                 st.audit(
                     "approvals-off",
                     "tool.run_unasked",
-                    &format!("{}: {}", info.name, caps.to_specs().join(", ")),
+                    // Allowed at call time; the Session ties it to its Run (#848).
+                    &format!(
+                        "{}: {} (session {session_id})",
+                        info.name,
+                        caps.to_specs().join(", ")
+                    ),
                 )
             });
             return true;
@@ -9548,8 +9553,26 @@ impl Daemon {
         };
         specs
             .into_iter()
-            .filter(|s| spec_trusted(&cfg.security, s))
+            .filter(|s| self.trust_approves(&cfg, tool_id, s))
             .collect()
+    }
+
+    /// Would config trust approve `spec` for this Tool without asking? The
+    /// same rules as `ensure_approval` (#844): no remembered denial covers
+    /// it, and the Tool's memory is within the default.
+    fn trust_approves(&self, cfg: &Config, tool_id: &str, spec: &str) -> bool {
+        if !spec_trusted(&cfg.security, spec) {
+            return false;
+        }
+        let memory_ok = self
+            .with_reader(|st| st.get_tool_current(tool_id))
+            .ok()
+            .flatten()
+            .is_some_and(|(_, v)| v.memory_mb <= cfg.tools.default_memory_mb);
+        let denied = Capabilities::parse(&[spec.to_string()])
+            .map(|one| !self.remembered_denials(&one).is_empty())
+            .unwrap_or(false);
+        memory_ok && !denied
     }
 
     /// Remembered denials that cover any sensitive Capability in `caps`.
@@ -10978,6 +11001,10 @@ impl Daemon {
 
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         std::fs::write(self.paths.lock_file(), std::process::id().to_string())?;
+        let swept = crate::config::sweep_secret_temps(&self.paths);
+        if swept > 0 {
+            tracing::info!("removed {swept} leftover secret temp file(s)");
+        }
         // Trusted folders that can't be used are said out loud (§10.3).
         if let Ok(cfg) = self.config() {
             for (p, why) in cfg.security.roots_checked().1 {
@@ -11409,9 +11436,24 @@ pub fn explain_connect_error(paths: &Paths, err: &std::io::Error) -> String {
 /// Reports the binary on disk *now*, which is exactly what a client wants
 /// to know and what a daemon compares its own recorded identity against.
 pub fn build_id() -> String {
-    match std::env::current_exe() {
-        Ok(exe) => build_id_of(&exe),
-        Err(_) => String::new(),
+    exe_path().map(|p| build_id_of(&p)).unwrap_or_default()
+}
+
+/// This binary's path, recorded once at start: after an in-place
+/// replacement Linux reports `current_exe()` as "… (deleted)", so the
+/// recorded path is what to stat for the new file (#850).
+pub fn exe_path() -> Option<std::path::PathBuf> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::current_exe().ok().map(|p| strip_deleted(&p)))
+        .clone()
+}
+
+/// The path without Linux's " (deleted)" suffix for a replaced binary.
+pub fn strip_deleted(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_suffix(" (deleted)") {
+        Some(base) => std::path::PathBuf::from(base),
+        None => p.to_path_buf(),
     }
 }
 
@@ -12295,6 +12337,31 @@ mod trust_precedence_tests {
         assert!(trusted_rows.is_empty(), "{trusted_rows:?}");
         let grants = daemon.list_grants().unwrap();
         assert!(grants.iter().all(|g| g.trusted), "listed as still trusted");
+        // Revoking it says config trust still allows it (#844).
+        let spec = format!("fs:write:{}", target.display());
+        let r = daemon
+            .handle(Request::RevokeApproval {
+                tool_id: info.id.clone(),
+                capability: Some(spec.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["still_trusted"], json!([spec.clone()]), "{r}");
+        // A remembered denial wins over trust: not "still trusted".
+        daemon
+            .with_store(|st| st.add_denial(&spec, "writer", "test"))
+            .unwrap();
+        daemon
+            .with_store(|st| st.set_approval(&info.id, &caps, 64))
+            .unwrap();
+        let r = daemon
+            .handle(Request::RevokeApproval {
+                tool_id: info.id.clone(),
+                capability: Some(spec.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["still_trusted"], json!([]), "{r}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
@@ -12442,5 +12509,30 @@ mod backpressure_tests {
             .unwrap();
         assert!(daemon.subs.lock().unwrap().is_empty());
         drop(client);
+    }
+
+    #[cfg(test)]
+    mod build_id_tests {
+        use super::*;
+
+        /// A binary replaced in place is noticed through the recorded path,
+        /// even when the old one is reported as "(deleted)" (#850).
+        #[test]
+        fn a_replaced_binary_changes_its_build_id() {
+            let dir = std::env::temp_dir().join(format!("fl-build-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let exe = dir.join("formless");
+            std::fs::write(&exe, b"old build").unwrap();
+            let before = build_id_of(&exe);
+            assert!(!before.is_empty());
+            // Replace by rename, as installers do.
+            let fresh = dir.join("formless.new");
+            std::fs::write(&fresh, b"a newer, longer build").unwrap();
+            std::fs::rename(&fresh, &exe).unwrap();
+            let deleted = std::path::PathBuf::from(format!("{} (deleted)", exe.display()));
+            let after = build_id_of(&strip_deleted(&deleted));
+            assert!(!after.is_empty() && after != before);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

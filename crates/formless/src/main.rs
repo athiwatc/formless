@@ -990,6 +990,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
             };
             let mut seen = std::collections::HashSet::new();
             let mut n = 0;
+            let mut still: std::collections::BTreeSet<String> = Default::default();
             for (tool_id, capability, scope, session_id) in targets {
                 if !seen.insert((
                     tool_id.clone(),
@@ -999,7 +1000,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                 )) {
                     continue;
                 }
-                if request_once(
+                if let Ok(v) = request_once(
                     paths,
                     Request::RevokeGrant {
                         tool_id,
@@ -1007,16 +1008,24 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                         scope,
                         session_id,
                     },
-                )
-                .is_ok()
-                {
+                ) {
                     n += 1;
+                    for c in v["still_trusted"].as_array().into_iter().flatten() {
+                        still.extend(c.as_str().map(str::to_string));
+                    }
                 }
             }
             if n == 0 {
                 anyhow::bail!("nothing to revoke");
             }
             println!("revoked {n} grant(s)");
+            // Config trust keeps approving these: revoking doesn't make them ask (#844).
+            if !still.is_empty() {
+                println!(
+                    "still allowed without asking by security.trusted_paths / trusted_hosts: {}",
+                    still.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
             Ok(())
         }
     }
@@ -1877,7 +1886,7 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
                 } else {
                     print_daemon_status(&v);
                 }
-                for w in formless_tui::client::status_warnings(&v) {
+                for w in formless_tui::client::status_warnings(&v)? {
                     eprintln!("warning: {w}");
                 }
             } else if json {
@@ -2201,24 +2210,12 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let open: Vec<std::path::PathBuf> = [
-            paths.key_fallback_file(),
-            paths.relay_secret_file(),
-            paths.oauth_tokens_file(),
-            paths.config_file(),
-        ]
-        .into_iter()
-        // One OAuth token file per provider (oauth_tokens-<id>.json).
-        .chain(
-            std::fs::read_dir(&paths.config_dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("oauth_tokens-"))
-                .map(|e| e.path()),
-        )
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0))
-        .collect();
+        // Every secret file, named secrets included (#849).
+        let open: Vec<std::path::PathBuf> = formless_core::config::secret_files(paths)
+            .into_iter()
+            .chain([paths.config_file()])
+            .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0))
+            .collect();
         if !open.is_empty() {
             out.push(Problem {
                 what: format!(
@@ -2366,6 +2363,21 @@ fn redact(text: &str) -> String {
 }
 
 /// `doctor --json`: the facts and problems, redacted.
+/// The approval mode the running daemon enforces (`Status.secure`), when
+/// one answers and reports it.
+fn daemon_secure(paths: &Paths) -> Option<bool> {
+    if !daemon_reachable(paths) {
+        return None;
+    }
+    formless_tui::client::request_once_within(
+        paths,
+        Request::Status,
+        std::time::Duration::from_secs(5),
+    )
+    .ok()?["secure"]
+        .as_bool()
+}
+
 fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
     let cfg = Config::load(paths)?;
     let problems = doctor_report(paths, true)?;
@@ -2390,6 +2402,14 @@ fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
             "credential_present": auth.credential_present,
         },
         "relay": { "enabled": cfg.relay.enabled, "url": cfg.relay.url },
+        "approvals": {
+            // The running daemon's mode when there is one (#847).
+            "enforced": daemon_secure(paths).unwrap_or(cfg.security.secure),
+            "from": if daemon_secure(paths).is_some() { "daemon" } else { "config" },
+            "configured": cfg.security.secure,
+            "trusted_paths": cfg.security.roots().len(),
+            "trusted_hosts": cfg.security.trusted_hosts.len(),
+        },
         "naming": naming_model_status(paths, &cfg),
         "problems": problems.iter().map(|p| serde_json::json!({
             "what": p.what,
@@ -2605,17 +2625,37 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         cfg.daemon.log_max_bytes as f64 / 1e6,
         cfg.daemon.log_keep
     );
+    // What the running daemon enforces, not what this process would (#847).
+    let enforced = daemon_secure(&paths);
+    let secure = enforced.unwrap_or(cfg.security.secure);
     say!(
-        "approvals:  {} (trusted folders: {}, trusted hosts: {}; security.secure in {} or --secure)",
-        if cfg.security.secure {
+        "approvals:  {}{} (trusted folders: {}, trusted hosts: {}; security.secure in {} or --secure)",
+        if secure {
             "on: sensitive Tool calls ask first"
         } else {
             "OFF: Tools run without asking"
         },
+        if enforced.is_some() { ", in the running daemon" } else { "" },
         cfg.security.roots().len(),
         cfg.security.trusted_hosts.len(),
         paths.config_file().display()
     );
+    if let Some(running) = enforced {
+        if running != cfg.security.secure {
+            problems.push(Problem {
+                what: format!(
+                    "the running daemon has approvals {}, but this command's settings say {}",
+                    if running { "on" } else { "off" },
+                    if cfg.security.secure { "on" } else { "off" }
+                ),
+                next: Some(format!(
+                    "formless{} daemon restart",
+                    if cfg.security.secure { " --secure" } else { "" }
+                )),
+                fix: None,
+            });
+        }
+    }
     say!(
         "base_url:   {}",
         if cfg.provider.base_url.is_empty() {
@@ -2978,6 +3018,11 @@ fn run_headless(
         return Ok(2);
     }
     formless_core::daemon::ensure_daemon(&paths)?;
+    // Asked for approvals, the daemon has none: refuse, whatever --quiet says.
+    if let Err(e) = formless_tui::client::require_secure_daemon(&paths) {
+        eprintln!("error: {e:#}");
+        return Ok(2);
+    }
     if let Some(warning) = formless_tui::client::check_daemon_version(&paths)? {
         if !quiet {
             eprintln!("warning: {warning}");
@@ -4935,6 +4980,10 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 }
             };
             let tool = find_tool(&paths, &name)?;
+            if let Err(e) = formless_tui::client::require_secure_daemon(&paths) {
+                eprintln!("error: {e:#}");
+                std::process::exit(2);
+            }
             let code = tool_run(&paths, tool, input, yes, session, dry_run)?;
             std::process::exit(code);
         }

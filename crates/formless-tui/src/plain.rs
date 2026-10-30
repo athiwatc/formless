@@ -187,6 +187,11 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
         return Ok(());
     }
     formless_core::daemon::ensure_daemon(&paths)?;
+    // Told in words here too: an older or rebuilt daemon, or one without
+    // the approvals this client asked for (#845).
+    if let Some(warning) = crate::client::check_daemon_version(&paths)? {
+        println!("Warning: {warning}");
+    }
     let (client, rx) = DaemonClient::connect(&paths)?;
     let wait = |id: u64| -> Result<serde_json::Value> {
         loop {
