@@ -2334,9 +2334,17 @@
   }
   async function revokeGrants(grants) {
     if (!grants.length) return toast("Select grants to revoke first.", true);
-    if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
-    for (const g of grants) await act({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
+    const trusted = grants.filter((g) => g.trusted).map((g) => g.capability);
+    if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: trusted.length
+      ? "Their Tools ask again on their next call, except for what your trusted folders/hosts still allow: " + [...new Set(trusted)].join(", ") + "."
+      : "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
+    const still = new Set();
+    for (const g of grants) {
+      const r = await act({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
+      ((r && r.still_trusted) || []).forEach((c) => still.add(c));
+    }
     toast("Revoked " + grants.length + " grant" + (grants.length === 1 ? "" : "s"));
+    if (still.size) note("Still allowed without asking by your trusted folders/hosts: " + [...still].join(", "));
     refreshApprovals();
   }
   $("approvals-family").addEventListener("input", () => renderApprovals());
@@ -2758,6 +2766,15 @@
     const st = S.status;
     if (st) {
       const auth = st.auth || {};
+      // What the running daemon enforces, and whether it runs old code (#845).
+      if (st.stale) grid.append(h("p", { class: "banner warn", role: "status" },
+        "The daemon runs an older build than the one installed: restart it (formless daemon restart) to use the new one."));
+      if (st.secure === false) grid.append(h("p", { class: "banner", role: "status" },
+        "Approvals are off: Tools use their Capabilities without asking, and each sensitive call is logged. Start the daemon with --secure (or set security.secure = true) to be asked."));
+      const sec = (c && c.security) || {};
+      grid.append(section("Security", [["approvals", st.secure === true ? "on: sensitive calls ask" : st.secure === false ? "off: calls run and are logged" : "unknown (older daemon)"],
+        ["trusted folders", sec.trusted_paths || 0], ["trusted hosts", sec.trusted_hosts || 0],
+        ["build", st.stale ? "older than the installed binary" : "current"]]));
       grid.append(section("Daemon", [["protocol", st.protocol], ["pid", st.pid], ["sessions", st.sessions],
         ["credential", auth.credential_present ? "present" : "missing"], ["auth mode", auth.mode],
         ["token expires", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : ""]]));
@@ -2812,7 +2829,7 @@
         h("button", { class: "btn small", type: "button", onclick: () => addSkill() }, "Add skill"),
         h("button", { class: "btn small", type: "button", onclick: () => importSkillBundle() }, "Import bundle"))));
     const audit = S.audit || [];
-    const auditFilter = h("input", { type: "search", placeholder: "Filter: tool.approve, skill, a Tool name…", value: S.auditFilter || "" });
+    const auditFilter = h("input", { type: "search", placeholder: "Filter: tool.approve, a Tool name; -text hides; run_unasked or * shows unasked calls", value: S.auditFilter || "" });
     auditFilter.addEventListener("change", () => { S.auditFilter = auditFilter.value; loadAudit(false); });
     grid.append(h("section", null, h("h3", null, "Audit log"),
       auditFilter,
@@ -3419,7 +3436,12 @@
   }
   async function revokeApproval(t, capability) {
     if (!(await ask({ title: "Revoke " + (capability || "every approval") + " for " + t.name + "?", text: "The next call that needs it asks again.", ok: "Revoke", danger: true }))) return;
-    if (await act({ type: "revoke_approval", tool_id: t.id, capability }, "Revoked")) selectTool(t.id, true);
+    const r = await act({ type: "revoke_approval", tool_id: t.id, capability }, "Revoked");
+    if (r) {
+      // Config trust keeps approving these (#844).
+      if ((r.still_trusted || []).length) note("Still allowed without asking by your trusted folders/hosts: " + r.still_trusted.join(", "));
+      selectTool(t.id, true);
+    }
   }
   async function selectTool(id, quiet) {
     S.selectedTool = id;

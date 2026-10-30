@@ -3602,7 +3602,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   retirement, restore, purge, import, reset, and optimiser give-up is
   recorded (actor, time, Tool, capability diff). `ListAudit {filter,
   limit, before}` reads it newest first. `filter` matches the actor,
-  action or detail, and `before` pages back. The log is viewable in the
+  action or detail, `-text` leaves matches out, `*` shows everything, and
+  `before` pages back. Without a filter the per-call `*.run_unasked`
+  records of approvals-off mode are left out so decisions stay findable
+  (filter on `run_unasked` to see them); only the newest 2,000 of those
+  are kept, each naming its Session. The log is viewable in the
   TUI (`/audit [filter]`), the web Settings "Audit log" section (filter
   and "Older") and, for the agent, `read_metrics` (§8.9). Tool
   inputs/outputs recording follows §15 redaction.
