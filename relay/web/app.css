@@ -113,8 +113,10 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 .pair { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; }
 .pair-card { width: 100%; max-width: 480px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 28px; box-shadow: var(--shadow); }
 .pair-card h1 { font-size: 22px; margin: 18px 0 8px; }
-.pair-card form { display: flex; gap: 8px; margin-top: 18px; }
+.pair-card form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
 .pair-card input { flex: 1; min-width: 0; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--code-bg); }
+.pair-card .remember { flex-basis: 100%; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.pair-card .remember input { flex: none; padding: 0; }
 .brand { font-weight: 750; letter-spacing: .2px; white-space: nowrap; }
 .brand.big { font-size: 20px; }
 .mark { color: var(--accent); }

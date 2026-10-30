@@ -3465,7 +3465,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   page loads no inline script (`script-src 'self'`) and connects only
   to its own origin (`connect-src 'self'`; `dev.mjs` alone adds loopback
   `ws://`), because its URL fragment carries the key, and it removes the
-  key from the address bar once connected. `relay.url` must be `wss://`,
+  key from the address bar at startup, before connecting. The browser
+  keeps only a non-extractable key and the room id: the decoded bytes are
+  wiped, the pairing field is emptied once read, and the secret is kept
+  in `sessionStorage` (to survive a reload) only when "Stay paired after
+  reloading this tab" is ticked; a copied Session link carries the key
+  only then. In the daemon the key and session keys are zeroized on drop. `relay.url` must be `wss://`,
   or `ws://` to this machine (`FORMLESS_RELAY_ALLOW_INSECURE=1` allows
   others, for development only): `relay enable` refuses anything else,
   `doctor` reports it and the daemon does not connect; a page served over
@@ -3512,11 +3517,22 @@ run_tool = "network_policy"     # a registry Tool, or…
   - Settings → This browser subscribes with the relay's VAPID key
     (`GET /push/key`) and sends `{"relay":"push_subscribe","sub"}` to the
     room in the clear; a subscription is not Session data. "Turn off"
-    sends `push_unsubscribe`.
+    sends `push_unsubscribe`. The room keeps only real subscriptions: an
+    `https:` endpoint on a browser push service (FCM, Mozilla, Apple,
+    Windows; a self-hosted relay adds hosts with `PUSH_HOSTS`) with a
+    65-byte `p256dh` and 16-byte `auth` key, so it never POSTs to a URL a
+    client made up.
   - When an approval or `ask_user` question starts waiting, the daemon
     sends the relay `{"relay":"push"}` (at most every 30 s). The room
     sends each subscription a payload-free push signed with VAPID and
     drops subscriptions the push service reports gone (404/410).
+  - The VAPID secrets are checked once: the JWK must be the P-256
+    private half of `VAPID_PUBLIC_KEY` (and pass a sign/verify round
+    trip) and `VAPID_SUBJECT` a `mailto:`/`https:` URL. A bad setup turns
+    push off instead of failing requests. `/health` reports `push` as
+    `off`, `ok` or `misconfigured` (with a reason, never key material),
+    and a push service refusing our signature (400/401/403) shows there
+    and in the log.
   - The service worker shows "An approval or a question is waiting for
     you", and clicking it focuses the app. No Session content reaches the
     relay or the push service.

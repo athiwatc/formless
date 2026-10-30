@@ -30,17 +30,24 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::config::{load_relay_secret, RelayCfg};
 use crate::daemon::Daemon;
 
-pub fn key_from_secret(secret: &str) -> Result<[u8; 32]> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(secret.trim())
-        .context("relay secret is not base64url")?;
-    bytes
+/// The pairing key. It and every copy derived from it are wiped when
+/// dropped (#908).
+pub fn key_from_secret(secret: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let bytes = Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(secret.trim())
+            .context("relay secret is not base64url")?,
+    );
+    let key: [u8; 32] = bytes
+        .as_slice()
         .try_into()
-        .map_err(|_| anyhow!("relay secret must decode to 32 bytes"))
+        .map_err(|_| anyhow!("relay secret must decode to 32 bytes"))?;
+    Ok(Zeroizing::new(key))
 }
 
 pub fn room_id(key: &[u8; 32]) -> String {
@@ -111,12 +118,12 @@ pub struct Channel {
 impl Channel {
     pub fn new(key: &[u8; 32], browser_hello: &[u8], daemon_hello: &[u8], side: Side) -> Self {
         let salt = [browser_hello, daemon_hello].concat();
-        let mut session_key = [0u8; 32];
+        let mut session_key = Zeroizing::new([0u8; 32]);
         hkdf::Hkdf::<Sha256>::new(Some(&salt), key)
-            .expand(KDF_INFO, &mut session_key)
+            .expand(KDF_INFO, session_key.as_mut_slice())
             .expect("32 bytes is a valid HKDF-SHA256 output length");
         Self {
-            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&session_key)),
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(session_key.as_slice())),
             side,
             sent: 0,
             received: 0,
@@ -508,7 +515,7 @@ pub async fn relay_loop(daemon: Arc<Daemon>) {
             Ok(_) => return,
             Err(_) => return,
         };
-        let Some(secret) = load_relay_secret(&daemon.paths) else {
+        let Some(secret) = load_relay_secret(&daemon.paths).map(Zeroizing::new) else {
             tracing::warn!("relay enabled but no pairing secret; run `formless relay enable`");
             return;
         };

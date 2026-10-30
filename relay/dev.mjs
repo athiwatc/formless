@@ -26,11 +26,13 @@ const DEV_HEADERS = {
   "content-security-policy": SECURITY_HEADERS["content-security-policy"]
     .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*"),
 };
-import { sendPush, validSubscription, vapidFrom } from "./push.mjs";
+import { loadVapid, sendPush, validSubscription } from "./push.mjs";
 
 // Web Push as in worker.js: VAPID_PUBLIC_KEY / VAPID_PRIVATE_JWK from the
 // environment (node relay/vapid-keys.mjs makes them).
-const vapid = vapidFrom(process.env);
+const pushConfig = await loadVapid(process.env);
+if (pushConfig.state === "misconfigured") console.log("relay: push is off: " + pushConfig.reason);
+const vapid = pushConfig.vapid || null;
 
 const args = process.argv.slice(2);
 const port = Number(args[args.indexOf("--port") + 1]) || 8787;
@@ -151,7 +153,7 @@ function joinRoom(room, role, conn, reject, mux, ua) {
       if (t.startsWith('{"relay"')) {
         let ctl = null;
         try { ctl = JSON.parse(t); } catch (_) {}
-        if (ctl && ctl.relay === "push_subscribe" && validSubscription(ctl.sub, true) && r.subs.size < 10) r.subs.set(ctl.sub.endpoint, ctl.sub);
+        if (ctl && ctl.relay === "push_subscribe" && validSubscription(ctl.sub, true, process.env.PUSH_HOSTS) && r.subs.size < 10) r.subs.set(ctl.sub.endpoint, ctl.sub);
         if (ctl && ctl.relay === "push_unsubscribe") r.subs.delete(ctl.endpoint);
         return;
       }
