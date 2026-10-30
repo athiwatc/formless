@@ -105,7 +105,7 @@ enum Cmd {
         #[arg(long)]
         no_open: bool,
         /// Stop serving the web UI
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["port", "no_open"])]
         stop: bool,
     },
     /// Extra model providers (SPEC §4.5)
@@ -258,8 +258,8 @@ enum Cmd {
         /// Leave the binary in place
         #[arg(long)]
         keep_binary: bool,
-        /// Don't ask for confirmation
-        #[arg(long, short)]
+        /// Don't ask for confirmation (required when not on a terminal)
+        #[arg(long, short, visible_alias = "force")]
         yes: bool,
     },
     /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
@@ -286,7 +286,7 @@ enum Cmd {
         #[arg(long)]
         answer: Option<String>,
         /// Emit one JSON event per line (same as --output jsonl-events)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         json: bool,
         /// text: stream the answer and progress; final: only the final
         /// answer on stdout; json: one result object at the end;
@@ -332,7 +332,11 @@ enum AuthAction {
         no_browser: bool,
     },
     /// Show credential mode and stored-token status
-    Status,
+    Status {
+        /// One JSON object (never the token itself)
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete stored OAuth tokens for this profile
     Logout,
 }
@@ -359,9 +363,9 @@ fn print_pairing_qr(url: &str) {
 enum RelayAction {
     /// Enable the relay (generates a pairing secret on first use) and print the browser URL
     Enable {
-        /// Relay websocket base URL
-        #[arg(long, default_value = "wss://formless.athiwat.xyz")]
-        url: String,
+        /// Relay websocket base URL (default: relay.url from config.toml)
+        #[arg(long)]
+        url: Option<String>,
         /// Generate a fresh pairing secret (invalidates old browser links)
         #[arg(long)]
         rotate: bool,
@@ -442,7 +446,12 @@ enum ToolsAction {
         json: bool,
     },
     /// Retire a Tool: hidden from the agent, kept with its history
-    Retire { name: String },
+    Retire {
+        name: String,
+        /// Retire even when other Tools use it (required when not on a terminal)
+        #[arg(long)]
+        force: bool,
+    },
     /// Bring a retired Tool back
     Restore { name: String },
     /// Make an earlier version current again (default: the one before)
@@ -479,7 +488,7 @@ enum ToolsAction {
     Export {
         /// Tool name or id (omit with --all)
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "name")]
         all: bool,
         #[arg(short, long)]
         output: Option<String>,
@@ -531,7 +540,7 @@ enum SkillsAction {
     /// Write a skill (or --all) as a bundle file (no metrics)
     Export {
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "name")]
         all: bool,
         #[arg(short, long)]
         output: Option<String>,
@@ -636,8 +645,14 @@ enum JobsAction {
     Add {
         prompt: String,
         /// Cron expression, or plain English ("every 2 hours")
-        #[arg(long, visible_alias = "every")]
+        #[arg(
+            long,
+            visible_alias = "every",
+            conflicts_with = "at",
+            required_unless_present = "at"
+        )]
         cron: Option<String>,
+        /// Once: "in 30m", "tomorrow at 9am" or a time
         #[arg(long)]
         at: Option<String>,
         /// Run in this Session (default: a new Session each time)
@@ -785,7 +800,11 @@ enum McpAction {
 #[derive(Subcommand)]
 enum NamingAction {
     /// Show the configured model and whether it is installed
-    Status,
+    Status {
+        /// One JSON object
+        #[arg(long)]
+        json: bool,
+    },
     /// Download the model (default: the configured one)
     Pull {
         /// Model id: qwen2.5-0.5b or lfm2.5-350m
@@ -818,7 +837,7 @@ enum ApprovalsAction {
         #[arg(long)]
         session: Option<String>,
         /// Every grant (with --family, every grant of that family)
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["tool", "capability", "scope", "session"])]
         all: bool,
         #[arg(long)]
         family: Option<String>,
@@ -971,7 +990,11 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                     "always" => ApprovalScope::Always,
                     "session" => ApprovalScope::Session,
                     "hour" => ApprovalScope::Hour,
-                    other => anyhow::bail!("--scope is always, session or hour, not {other}"),
+                    other => {
+                        return Err(usage(format!(
+                            "--scope is always, session or hour, not {other}"
+                        )))
+                    }
                 })
             };
             let targets: Vec<(String, Option<String>, ApprovalScope, Option<String>)> = if all {
@@ -984,7 +1007,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                     })
                     .collect()
             } else {
-                let tool = tool.ok_or_else(|| anyhow::anyhow!("name a Tool, or pass --all"))?;
+                let tool = tool.ok_or_else(|| usage("name a Tool, or pass --all"))?;
                 let id = find_tool(paths, &tool)?.id;
                 vec![(id, capability, scope_of(&scope)?, session)]
             };
@@ -1041,9 +1064,9 @@ enum ProfilesAction {
     /// Delete a profile's data, config and stored secrets
     Rm {
         name: String,
-        /// Don't ask for confirmation
-        #[arg(long)]
-        yes: bool,
+        /// Don't ask for confirmation (required when not on a terminal)
+        #[arg(long, visible_alias = "yes")]
+        force: bool,
     },
 }
 
@@ -1097,7 +1120,7 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
             tbl.print();
             Ok(())
         }
-        ProfilesAction::Rm { name, yes } => {
+        ProfilesAction::Rm { name, force } => {
             if name == "default" {
                 anyhow::bail!("the default profile can't be removed; `formless reset` wipes it");
             }
@@ -1106,20 +1129,18 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
                 .into_iter()
                 .find(|p| p.profile == name)
             else {
-                anyhow::bail!("no profile named '{name}' (see `formless profiles list`)");
+                return Err(usage(format!(
+                    "no profile named '{name}' (see `formless profiles list`)"
+                )));
             };
-            if !yes {
-                eprint!(
-                    "This deletes profile '{name}': its config, API key, Tools and Sessions in {}. Type the profile name to confirm: ",
-                    target.data_dir.display()
-                );
-                let _ = std::io::stderr().flush();
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                if line.trim() != name {
-                    eprintln!("aborted");
-                    std::process::exit(2);
-                }
+            if !force {
+                confirm_typed(
+                    &format!(
+                        "This deletes profile '{name}': its config, API key, Tools and Sessions in {}.",
+                        target.data_dir.display()
+                    ),
+                    &name,
+                )?;
             }
             if daemon_reachable(&target) {
                 let _ = formless_tui::client::request_once(&target, Request::Shutdown);
@@ -1173,8 +1194,55 @@ enum DaemonAction {
     },
 }
 
-fn main() -> Result<()> {
+/// A mistake in how a command was called (an unknown id, a missing or
+/// conflicting choice, a bad value): exit 2, like clap's own errors (#896).
+#[derive(Debug)]
+struct Usage(String);
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+/// A [`Usage`] error to return with `?` or `Err(...)`.
+fn usage(msg: impl Into<String>) -> anyhow::Error {
+    Usage(msg.into()).into()
+}
+
+/// Exit 2 for usage mistakes, ours or the daemon's (an unknown id, a bad
+/// request), 1 for everything else.
+fn exit_code(e: &anyhow::Error) -> i32 {
+    use formless_protocol::codes;
+    if e.downcast_ref::<Usage>().is_some() {
+        return 2;
+    }
+    match e
+        .downcast_ref::<formless_tui::client::DaemonError>()
+        .and_then(|d| d.code.as_deref())
+    {
+        Some(codes::NOT_FOUND | codes::BAD_REQUEST | codes::INVALID | codes::UNSUPPORTED) => 2,
+        _ => 1,
+    }
+}
+
+fn main() {
     let cli = Cli::parse();
+    if let Err(e) = run_cli(cli) {
+        eprintln!("error: {e:#}");
+        std::process::exit(exit_code(&e));
+    }
+}
+
+fn run_cli(cli: Cli) -> Result<()> {
+    // The TUI's own flags mean nothing to other commands (#897).
+    if !matches!(cli.cmd, None | Some(Cmd::Tui)) && (cli.plain || cli.continue_last || cli.new) {
+        return Err(usage(
+            "--plain, -c/--continue and --new start the TUI; use them without a command (or `formless tui`)",
+        ));
+    }
     // The daemon logs warnings and info to daemon.log (`formless logs`);
     // other commands only errors. RUST_LOG overrides both. Colour codes
     // only on a terminal, never into the log file.
@@ -1208,8 +1276,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(Cmd::Man) = cli.cmd {
-        use clap::CommandFactory;
-        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        render_man(&mut std::io::stdout())?;
         return Ok(());
     }
     if cli.secure {
@@ -1719,7 +1786,10 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
                 ensure_relay_secret(&paths)?
             };
             cfg.relay.enabled = true;
-            cfg.relay.url = url.trim_end_matches('/').to_string();
+            // A self-hosted relay.url stays unless --url replaces it (#897).
+            if let Some(url) = url {
+                cfg.relay.url = url.trim_end_matches('/').to_string();
+            }
             cfg.save(&paths)?;
             println!("relay:      enabled ({})", cfg.relay.url);
             println!(
@@ -2037,8 +2107,29 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
             }
             Ok(())
         }
-        AuthAction::Status => {
+        AuthAction::Status { json } => {
             let status = formless_core::auth::auth_status(&paths, &cfg.provider);
+            if json {
+                let source = if !cfg.provider.oauth() {
+                    formless_core::config::api_key_source(&paths).0
+                } else if std::env::var_os("FORMLESS_OAUTH_ACCESS_TOKEN").is_some() {
+                    "env"
+                } else {
+                    "keychain / 0600 token file"
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "mode": status.mode,
+                        "credential_present": status.credential_present,
+                        "source": source,
+                        "expires_at": status.expires_at,
+                        "has_refresh_token": status.has_refresh_token,
+                        "scope": status.scope,
+                    }))?
+                );
+                return Ok(());
+            }
             println!("mode:           {}", status.mode);
             println!(
                 "credential:     {}",
@@ -3531,7 +3622,7 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
             let bundle = if all {
                 daemon(Request::ExportSkills)?
             } else {
-                let name = name.ok_or_else(|| anyhow::anyhow!("give a skill name or --all"))?;
+                let name = name.ok_or_else(|| usage("give a skill name or --all"))?;
                 daemon(Request::ExportSkill { name })?
             };
             let text = serde_json::to_string_pretty(&bundle)?;
@@ -3930,8 +4021,10 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
     }
     match matches.len() {
         1 => Ok(matches.remove(0)),
-        0 => anyhow::bail!("no Session '{id}' (formless sessions list)"),
-        n => anyhow::bail!("'{id}' matches {n} Sessions; give more of the id"),
+        0 => Err(usage(format!("no Session '{id}' (formless sessions list)"))),
+        n => Err(usage(format!(
+            "'{id}' matches {n} Sessions; give more of the id"
+        ))),
     }
 }
 
@@ -4714,7 +4807,7 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             off,
         } => {
             if on == off {
-                anyhow::bail!("pass --on or --off");
+                return Err(usage("pass --on or --off"));
             }
             daemon(Request::SetMcpToolEnabled {
                 name: name.clone(),
@@ -4752,7 +4845,24 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
     use formless_core::namer;
     let cfg = Config::load(&paths)?;
     match action {
-        NamingAction::Status => {
+        NamingAction::Status { json: true } => {
+            let spec = cfg.naming.spec();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "enabled": cfg.naming.enabled,
+                    "model": cfg.naming.model,
+                    "installed": spec.is_some_and(|s| s.installed(&paths)),
+                    "status": naming_model_status(&paths, &cfg),
+                    "models_dir": namer::models_dir(&paths).display().to_string(),
+                    "available": namer::MODELS
+                        .iter()
+                        .map(|m| serde_json::json!({"id": m.id, "bytes": m.gguf_bytes}))
+                        .collect::<Vec<_>>(),
+                }))?
+            );
+        }
+        NamingAction::Status { json: false } => {
             println!("enabled:    {}", cfg.naming.enabled);
             println!("model:      {}", naming_model_status(&paths, &cfg));
             println!("models dir: {}", namer::models_dir(&paths).display());
@@ -4864,6 +4974,17 @@ fn set_tool_pinned(paths: &Paths, name: &str, pinned: bool) -> Result<()> {
 
 fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
     use formless_tui::client::request_once;
+    // Checked here, before a daemon (and a database) is started (#896).
+    if let ToolsAction::Run { input, .. } = &action {
+        if !matches!(
+            serde_json::from_str(input),
+            Ok(serde_json::Value::Object(_))
+        ) {
+            return Err(usage(
+                "--input must be a JSON object, like '{\"url\": \"https://…\"}'",
+            ));
+        }
+    }
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
         ToolsAction::List { json, tag } => {
@@ -4929,14 +5050,14 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             let bundle = if all {
                 request_once(&paths, Request::ExportTools)?
             } else {
-                let name = name.ok_or_else(|| anyhow::anyhow!("give a tool name/id or --all"))?;
+                let name = name.ok_or_else(|| usage("give a tool name/id or --all"))?;
                 // Resolve name -> id via the list.
                 let v = request_once(&paths, Request::ListTools)?;
                 let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
                 let tool = tools
                     .iter()
                     .find(|t| t.name == name || t.id == name)
-                    .ok_or_else(|| anyhow::anyhow!("no tool '{name}'"))?;
+                    .ok_or_else(|| usage(format!("no tool '{name}'")))?;
                 request_once(
                     &paths,
                     Request::ExportTool {
@@ -5009,8 +5130,8 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             }
             Ok(())
         }
-        ToolsAction::Retire { name } => set_tool_retired(&paths, &name, true),
-        ToolsAction::Restore { name } => set_tool_retired(&paths, &name, false),
+        ToolsAction::Retire { name, force } => set_tool_retired(&paths, &name, true, force),
+        ToolsAction::Restore { name } => set_tool_retired(&paths, &name, false, false),
         ToolsAction::Rollback { name, to } => {
             let tool = find_tool(&paths, &name)?;
             let version = to.unwrap_or(tool.current_version - 1);
@@ -5160,7 +5281,7 @@ fn tool_dependents(paths: &Paths, id: &str) -> Vec<String> {
 
 /// Retire or restore a Tool by name or id. Retiring one that others call
 /// warns, and asks on a terminal.
-fn set_tool_retired(paths: &Paths, name: &str, retire: bool) -> Result<()> {
+fn set_tool_retired(paths: &Paths, name: &str, retire: bool, force: bool) -> Result<()> {
     let tool = find_tool(paths, name)?;
     let id = tool.id.clone();
     let dependents = if retire {
@@ -5175,9 +5296,15 @@ fn set_tool_retired(paths: &Paths, name: &str, retire: bool) -> Result<()> {
             dependents.join(", ")
         );
         use std::io::IsTerminal;
-        if std::io::stdin().is_terminal() && !confirm("Retire it anyway? [y/N] ")? {
-            eprintln!("not retired");
-            std::process::exit(2);
+        if !force {
+            if !std::io::stdin().is_terminal() {
+                return Err(usage(
+                    "not retired: pass --force to retire a Tool others use when not on a terminal",
+                ));
+            }
+            if !confirm("Retire it anyway? [y/N] ")? {
+                return Err(usage("not retired"));
+            }
         }
     }
     formless_tui::client::request_once(
@@ -5331,7 +5458,7 @@ fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
     tools
         .into_iter()
         .find(|t| t.name == name || t.id == name)
-        .ok_or_else(|| anyhow::anyhow!("no tool '{name}' (formless tools list)"))
+        .ok_or_else(|| usage(format!("no tool '{name}' (formless tools list)")))
 }
 
 fn print_tool_detail(d: &formless_protocol::ToolDetail) {
@@ -5573,17 +5700,66 @@ fn tool_run(
                 Ok(j) => println!("{}", serde_json::to_string_pretty(&j)?),
                 Err(_) => println!("{text}"),
             }
-            // The agent's result text marks failures with "error:".
-            Ok(if text.trim_start().starts_with("error") {
-                1
-            } else {
-                0
-            })
+            Ok(tool_run_exit(&v, &text))
         }
         Err(e) => {
             eprintln!("{e}");
             Ok(1)
         }
+    }
+}
+
+/// `formless man`: the top-level page, then every subcommand (two levels
+/// deep) with its synopsis and options, so `--timeout` and friends are in
+/// the one page that ships (#895).
+fn render_man(out: &mut dyn std::io::Write) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cli = Cli::command();
+    cli.build();
+    clap_mangen::Man::new(cli.clone()).render(out)?;
+    fn section(
+        cmd: &clap::Command,
+        path: &str,
+        depth: usize,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        for sub in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            let name = format!("{path} {}", sub.get_name());
+            let page = clap_mangen::Man::new(sub.clone().bin_name(&name));
+            writeln!(out, ".SH \"{}\"", name.to_uppercase())?;
+            if let Some(about) = sub.get_about() {
+                writeln!(out, "{}", about.to_string().replace('\\', "\\\\"))?;
+            }
+            for render in [
+                clap_mangen::Man::render_synopsis_section,
+                clap_mangen::Man::render_options_section,
+            ] {
+                let mut buf = Vec::new();
+                render(&page, &mut buf)?;
+                // One heading per command, not SYNOPSIS/OPTIONS each time.
+                let text = String::from_utf8_lossy(&buf)
+                    .replace(".SH SYNOPSIS\n", ".PP\n")
+                    .replace(".SH OPTIONS\n", ".PP\nOptions:\n");
+                out.write_all(text.as_bytes())?;
+            }
+            if depth < 2 {
+                section(sub, &name, depth + 1, out)?;
+            }
+        }
+        Ok(())
+    }
+    section(&cli, "formless", 1, out)
+}
+
+/// `tools run`'s exit code: from the daemon's `ok` (#901); an older daemon
+/// without it marks failures with a leading "error".
+fn tool_run_exit(v: &serde_json::Value, text: &str) -> i32 {
+    match v["ok"].as_bool() {
+        Some(ok) => i32::from(!ok),
+        None => i32::from(text.trim_start().starts_with("error")),
     }
 }
 
@@ -5632,14 +5808,7 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
         println!("Sessions, Tools, memories and backups are deleted. Keep a copy first with `formless export-all`.");
     }
     if !yes {
-        eprint!("Type 'uninstall' to confirm: ");
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        if line.trim() != "uninstall" {
-            eprintln!("aborted");
-            std::process::exit(2);
-        }
+        confirm_typed("", "uninstall")?;
     }
     // What could not be removed; any of it makes the exit non-zero.
     let mut failed: Vec<String> = Vec::new();
@@ -5767,16 +5936,35 @@ fn stop_daemon(paths: &Paths) -> bool {
     false
 }
 
+/// The one confirmation for destructive commands (SPEC §12, #898): on a
+/// terminal, type `word`; anywhere else the command's `--force` is
+/// required, so piped input can never confirm a wipe.
+fn confirm_typed(what: &str, word: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(usage(format!(
+            "{what} Not on a terminal, so nothing was asked: pass --force to confirm"
+        )));
+    }
+    eprint!(
+        "{}",
+        format!("{what} Type '{word}' to confirm: ").trim_start()
+    );
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if line.trim() != word {
+        return Err(usage("aborted"));
+    }
+    Ok(())
+}
+
 fn reset_cmd(paths: Paths, force: bool) -> Result<()> {
     if !force {
-        eprint!("This deletes ALL Formless data (config, API key, tools, sessions). Type 'reset' to confirm: ");
-        let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        if line.trim() != "reset" {
-            eprintln!("aborted");
-            std::process::exit(2);
-        }
+        confirm_typed(
+            "This deletes ALL Formless data (config, API key, tools, sessions).",
+            "reset",
+        )?;
     }
     if !stop_daemon(&paths) {
         return Err(anyhow::anyhow!(
@@ -5814,6 +6002,99 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+    /// Combinations that would silently drop a flag are refused by clap,
+    /// and usage mistakes exit 2 (#896, #897).
+    #[test]
+    fn conflicting_flags_are_refused_and_usage_exits_2() {
+        use clap::Parser;
+        let bad: &[&[&str]] = &[
+            &["formless", "run", "x", "--json", "--output", "final"],
+            &["formless", "tools", "export", "t", "--all"],
+            &["formless", "skills", "export", "s", "--all"],
+            &["formless", "approvals", "revoke", "t", "--all"],
+            &["formless", "jobs", "add", "x"],
+            &[
+                "formless",
+                "jobs",
+                "add",
+                "x",
+                "--cron",
+                "0 3 * * *",
+                "--at",
+                "in 30m",
+            ],
+            &["formless", "web", "--stop", "--port", "9999"],
+        ];
+        for args in bad {
+            assert!(
+                super::Cli::try_parse_from(*args).is_err(),
+                "{args:?} was accepted"
+            );
+        }
+        for args in [
+            &["formless", "run", "x", "--json"][..],
+            &["formless", "jobs", "add", "x", "--every", "every 2 hours"],
+            &["formless", "tools", "export", "--all"],
+        ] {
+            assert!(
+                super::Cli::try_parse_from(args).is_ok(),
+                "{args:?} was refused"
+            );
+        }
+        assert_eq!(super::exit_code(&super::usage("no Session 'x'")), 2);
+        let not_found: anyhow::Error = formless_tui::client::DaemonError {
+            code: Some(formless_protocol::codes::NOT_FOUND.into()),
+            message: "tool not found".into(),
+        }
+        .into();
+        assert_eq!(super::exit_code(&not_found), 2);
+        assert_eq!(super::exit_code(&anyhow::anyhow!("disk full")), 1);
+    }
+
+    /// The man page documents nested options (#895).
+    #[test]
+    fn the_man_page_has_subcommand_options() {
+        let mut buf = Vec::new();
+        super::render_man(&mut buf).unwrap();
+        let page = String::from_utf8(buf).unwrap();
+        for needle in [
+            "FORMLESS RUN",
+            "FORMLESS TOOLS RUN",
+            "\\-\\-timeout",
+            "\\-\\-dry\\-run",
+        ] {
+            assert!(page.contains(needle), "missing {needle}");
+        }
+    }
+
+    /// SPEC §12: every `list`/`status` subcommand takes `--json` (#899).
+    #[test]
+    fn every_list_and_status_takes_json() {
+        use clap::CommandFactory;
+        fn walk(cmd: &clap::Command, path: String, missing: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let here = format!("{path} {}", sub.get_name());
+                if matches!(sub.get_name(), "list" | "status")
+                    && !sub.get_arguments().any(|a| a.get_id() == "json")
+                {
+                    missing.push(here.clone());
+                }
+                walk(sub, here, missing);
+            }
+        }
+        let mut missing = Vec::new();
+        walk(&super::Cli::command(), "formless".into(), &mut missing);
+        assert!(missing.is_empty(), "no --json: {missing:?}");
+    }
+    #[test]
+    fn tool_run_exits_from_the_outcome_not_the_text() {
+        let ok = serde_json::json!({"result": "errors: 0", "ok": true});
+        assert_eq!(super::tool_run_exit(&ok, "errors: 0"), 0);
+        let failed = serde_json::json!({"result": "boom", "ok": false});
+        assert_eq!(super::tool_run_exit(&failed, "boom"), 1);
+        let old = serde_json::json!({"result": "error: x"});
+        assert_eq!(super::tool_run_exit(&old, "error: x"), 1);
+    }
 
     #[test]
     fn run_summary_line() {

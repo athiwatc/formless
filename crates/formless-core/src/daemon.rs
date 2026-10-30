@@ -2683,8 +2683,10 @@ impl Daemon {
                     return Err(anyhow!("the input must be a JSON object"));
                 }
                 let _ = self.with_store(|st| st.audit("user", "tool.run", &tool.name));
-                let result = self.call_tool_direct(&session_id, &tool.name, input).await;
-                Ok(json!({ "result": result }))
+                let (result, ok) = self
+                    .call_tool_direct_outcome(&session_id, &tool.name, input)
+                    .await;
+                Ok(json!({ "result": result, "ok": ok }))
             }
             Request::DryRunTool {
                 id,
@@ -5651,9 +5653,37 @@ impl Daemon {
         name: &str,
         args: Value,
     ) -> String {
+        self.call_tool_direct_outcome(session_id, name, args)
+            .await
+            .0
+    }
+
+    /// [`Self::call_tool_direct`] with whether the call succeeded, from the
+    /// Invocation's outcome rather than its text (#901).
+    pub async fn call_tool_direct_outcome(
+        self: &Arc<Self>,
+        session_id: &str,
+        name: &str,
+        args: Value,
+    ) -> (String, bool) {
+        let (text, failed) = CALL_FAILED
+            .scope(std::cell::Cell::new(false), async {
+                let text = self.call_tool_direct_inner(session_id, name, args).await;
+                (text, CALL_FAILED.with(std::cell::Cell::get))
+            })
+            .await;
+        (text, !failed)
+    }
+
+    async fn call_tool_direct_inner(
+        self: &Arc<Self>,
+        session_id: &str,
+        name: &str,
+        args: Value,
+    ) -> String {
         let cfg = match self.config() {
             Ok(c) => c,
-            Err(e) => return format!("error: {e}"),
+            Err(e) => return call_failed(format!("error: {e}")),
         };
         let tc = ToolCall {
             id: uuid::Uuid::new_v4().to_string(),
@@ -5672,7 +5702,7 @@ impl Daemon {
             .await
         {
             Ok(d) => d,
-            Err(e) => return format!("error: {e}"),
+            Err(e) => return call_failed(format!("error: {e}")),
         };
         self.dispatch_call_inner(
             session_id,

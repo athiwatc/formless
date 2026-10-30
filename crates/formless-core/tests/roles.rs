@@ -599,3 +599,64 @@ async fn a_refusal_placeholder_is_never_sent_back_as_the_models_words() {
     assert!(!second.contains("declined to answer"), "{second}");
     assert!(second.contains("No answer was given (refusal)"), "{second}");
 }
+
+/// `RunTool` says whether the call succeeded from its outcome, not its
+/// text: a result reading "errors: 0" is a success (#901).
+#[tokio::test(flavor = "multi_thread")]
+async fn run_tool_reports_ok_from_the_outcome() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let dir = std::path::PathBuf::from(format!("/tmp/fl-runok-{short}"));
+    let paths = Paths {
+        data_dir: dir.join("d"),
+        config_dir: dir.join("c"),
+        profile: format!("test-runok-{short}"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut cfg = Config::default();
+    cfg.naming.enabled = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    for (name, body) in [
+        ("count_errors", "return 'errors: 0';"),
+        (
+            "fails_on_ask",
+            "if (i.fail) throw new Error('boom'); return 1;",
+        ),
+    ] {
+        let out = daemon
+            .call_tool_direct(
+                &sid,
+                "create_tool",
+                serde_json::json!({
+                "name": name, "description": "d", "input_schema": {"type": "object"},
+                "output_schema": {}, "implementation_js": format!("function run(i){{ {body} }}"),
+                "capabilities": []}),
+            )
+            .await;
+        assert!(
+            out.contains("\"created\"") || out.contains("smoke"),
+            "{out}"
+        );
+    }
+    let id = |n: &str| store.get_tool_by_name(n).unwrap().unwrap().0.id;
+    let run = |tid: String, input: serde_json::Value| {
+        let d = daemon.clone();
+        let sid = sid.clone();
+        async move {
+            d.handle(Request::RunTool {
+                id: tid,
+                input,
+                session_id: sid,
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let ok = run(id("count_errors"), serde_json::json!({})).await;
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert!(ok["result"].as_str().unwrap().contains("errors: 0"));
+    let bad = run(id("fails_on_ask"), serde_json::json!({"fail": true})).await;
+    assert_eq!(bad["ok"], false, "{bad}");
+}
