@@ -1267,6 +1267,9 @@ struct App {
     /// Path scopes an approval offers, each with the one picked (0 = the
     /// path itself), by approval id (SPEC §10.3).
     approval_scopes: HashMap<String, Vec<(PathOption, usize)>>,
+    /// Which path option of an approval `p`/`r` change (index into its
+    /// scopes); `P`/`R` move it, so each path gets its own scope (#772).
+    scope_focus: HashMap<String, usize>,
     /// An approval with broad new Capabilities waiting for its second
     /// press: (approval id, the key pressed first) (SPEC §10.3).
     broad_arm: Option<(String, char)>,
@@ -1512,6 +1515,7 @@ impl App {
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
             approval_scopes: HashMap::new(),
+            scope_focus: HashMap::new(),
             forget_arm: None,
             forget_query: String::new(),
             forget_confirm: false,
@@ -6364,7 +6368,10 @@ impl App {
             // Typing anything else while the approval has focus moves
             // focus to the input (and types it).
             if modal_keys
-                && !matches!(c, 'y' | 'n' | 'N' | 'o' | 's' | '1' | 'v' | '?' | 'p' | 'r')
+                && !matches!(
+                    c,
+                    'y' | 'n' | 'N' | 'o' | 's' | '1' | 'v' | '?' | 'p' | 'r' | 'P' | 'R'
+                )
                 && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             {
                 self.input_focus = true;
@@ -6378,6 +6385,10 @@ impl App {
             }
             if (c == 'p' || c == 'r') && !self.approvals.is_empty() {
                 self.cycle_scope(c == 'p');
+                return;
+            }
+            if (c == 'P' || c == 'R') && !self.approvals.is_empty() {
+                self.next_scope_focus(c == 'P');
                 return;
             }
             if c == 'v' {
@@ -6400,6 +6411,23 @@ impl App {
                 }
                 return;
             }
+            // Always-deny remembers a Tool's Capabilities; other prompts
+            // (an MCP server, a harness change) are denied once (#764).
+            if c == 'N' && self.approvals.front().is_some_and(|r| r.tool_id.is_none()) {
+                let req = self.approvals.pop_front().unwrap();
+                self.fire(Request::ApprovalDecision {
+                    approval_id: req.approval_id,
+                    approved: false,
+                    scope: ApprovalScope::Once,
+                    paths: Default::default(),
+                    remember_denial: false,
+                });
+                self.notes.push(format!(
+                    "denied {} (always-deny is for Tool approvals; this asks again next time)",
+                    req.tool_name
+                ));
+                return;
+            }
             if c == 'N' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.note_batch_answer(&req.approval_id, "always denied");
@@ -6420,15 +6448,24 @@ impl App {
             if c == 'o' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
                 self.note_batch_answer(&req.approval_id, "once");
-                let paths = self.take_paths(&req.approval_id);
+                // A wider folder is a lasting grant's; once allows only this
+                // call (#765).
+                let widened = !self.take_paths(&req.approval_id).is_empty();
                 self.fire(Request::ApprovalDecision {
                     remember_denial: Default::default(),
-                    paths,
+                    paths: Default::default(),
                     approval_id: req.approval_id,
                     approved: true,
                     scope: ApprovalScope::Once,
                 });
-                self.notes.push(format!("approved {} once", req.tool_name));
+                self.notes.push(if widened {
+                    format!(
+                        "approved {} once, for this call's paths only (a wider folder needs y, s or h)",
+                        req.tool_name
+                    )
+                } else {
+                    format!("approved {} once", req.tool_name)
+                });
                 return;
             }
             // Granting broad access beyond this call takes a second press.
@@ -7093,15 +7130,27 @@ impl App {
                 .push("this approval has no paths to widen".into());
             return;
         };
+        // The focused path when it is of this kind, else the first one.
+        let focus = self.scope_focus.get(&id).copied();
+        let target = focus
+            .filter(|i| {
+                scopes
+                    .get(*i)
+                    .is_some_and(|(o, _)| o.capability.starts_with(prefix))
+            })
+            .or_else(|| {
+                scopes
+                    .iter()
+                    .position(|(o, _)| o.capability.starts_with(prefix))
+            });
         let mut changed = Vec::new();
-        for (o, pick) in scopes
-            .iter_mut()
-            .filter(|(o, _)| o.capability.starts_with(prefix))
-        {
+        if let Some(i) = target {
+            let (o, pick) = &mut scopes[i];
             *pick = (*pick + 1) % o.choices.len().max(1);
             if let Some(c) = o.choices.get(*pick) {
                 changed.push(scope_label(c));
             }
+            self.scope_focus.insert(id.clone(), i);
         }
         if changed.is_empty() {
             self.notes.push(format!(
@@ -7115,6 +7164,42 @@ impl App {
                 changed.join(", ")
             ));
         }
+    }
+
+    /// Move `p`/`r` to the next write (or read) path of the approval.
+    fn next_scope_focus(&mut self, write: bool) {
+        let Some(id) = self.approvals.front().map(|r| r.approval_id.clone()) else {
+            return;
+        };
+        let prefix = if write { "fs:write:" } else { "fs:read:" };
+        let Some(scopes) = self.approval_scopes.get(&id) else {
+            return;
+        };
+        let kinds: Vec<usize> = scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, (o, _))| o.capability.starts_with(prefix))
+            .map(|(i, _)| i)
+            .collect();
+        if kinds.is_empty() {
+            return;
+        }
+        let now = self.scope_focus.get(&id).copied();
+        let next = match now.and_then(|n| kinds.iter().position(|k| *k == n)) {
+            Some(p) => kinds[(p + 1) % kinds.len()],
+            None => kinds[0],
+        };
+        self.scope_focus.insert(id, next);
+        let path = scopes[next]
+            .0
+            .capability
+            .split_once(':')
+            .map_or("", |(_, rest)| rest);
+        self.notes.push(format!(
+            "{} changes the scope of {}",
+            if write { "p" } else { "r" },
+            path.rsplit_once(':').map_or(path, |(_, p)| p)
+        ));
     }
 
     /// Remember how a batch's held call was answered, for the list the
@@ -8083,13 +8168,14 @@ fn draw(f: &mut Frame, app: &mut App) {
             .get(&req.approval_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let focus = app.scope_focus.get(&req.approval_id).copied();
         draw_approval(
             f,
             req,
             title,
             summary,
             batch,
-            scopes,
+            (scopes, focus),
             cwd,
             promotion,
             more,
@@ -13370,7 +13456,7 @@ fn draw_approval(
     title: &str,
     summary: Option<&str>,
     batch: Option<(&ApprovalBatch, &[(usize, String)])>,
-    scopes: &[(PathOption, usize)],
+    (scopes, focus): (&[(PathOption, usize)], Option<usize>),
     cwd: Option<&str>,
     promotion: bool,
     more: usize,
@@ -13514,13 +13600,35 @@ fn draw_approval(
             ));
         }
         // Wider scopes on offer: the picked one is bracketed (§10.3).
-        if let Some((o, pick)) = scopes.iter().find(|(o, _)| &o.capability == cap) {
+        if let Some((i, (o, pick))) = scopes
+            .iter()
+            .enumerate()
+            .find(|(_, (o, _))| &o.capability == cap)
+        {
             let key = if cap.starts_with("fs:write:") {
                 'p'
             } else {
                 'r'
             };
-            let mut spans = vec![Span::styled("      grant: ", ui::dim(color))];
+            // With several paths of a kind, the one p/r change is marked.
+            let kind = if key == 'p' { "fs:write:" } else { "fs:read:" };
+            let several = scopes
+                .iter()
+                .filter(|(x, _)| x.capability.starts_with(kind))
+                .count()
+                > 1;
+            let first_of_kind = scopes
+                .iter()
+                .position(|(x, _)| x.capability.starts_with(kind));
+            let focused = focus.or(first_of_kind) == Some(i);
+            let mut spans = vec![Span::styled(
+                if several && focused {
+                    "    › grant: "
+                } else {
+                    "      grant: "
+                },
+                ui::dim(color),
+            )];
             for (i, c) in o.choices.iter().enumerate() {
                 let label = scope_label(c);
                 spans.push(if i == *pick {
@@ -13529,7 +13637,17 @@ fn draw_approval(
                     Span::styled(format!(" {label} "), ui::dim(color))
                 });
             }
-            spans.push(Span::styled(format!("  ({key} to change)"), ui::dim(color)));
+            spans.push(Span::styled(
+                if several {
+                    format!(
+                        "  ({key} to change, {} for the next path)",
+                        key.to_ascii_uppercase()
+                    )
+                } else {
+                    format!("  ({key} to change)")
+                },
+                ui::dim(color),
+            ));
             lines.push(Line::from(spans));
         }
         if explain {
@@ -14480,6 +14598,7 @@ mod tests {
             approval_summaries: HashMap::new(),
             approval_batches: HashMap::new(),
             approval_scopes: HashMap::new(),
+            scope_focus: HashMap::new(),
             forget_arm: None,
             forget_query: String::new(),
             forget_confirm: false,
@@ -15344,6 +15463,85 @@ mod tests {
         );
         assert!(screen.contains("broad access"), "{screen}");
         assert!(screen.contains("1 awaiting approval"), "{screen}");
+    }
+
+    #[test]
+    fn always_deny_is_only_for_tool_approvals() {
+        let mut app = test_app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "m".into(),
+            session_id: "s".into(),
+            tool_name: "mcp server github".into(),
+            version: 0,
+            capabilities: vec!["mcp:github".into()],
+            memory_mb: 0,
+            detail: Some("connect".into()),
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+            batch: None,
+            path_options: vec![],
+        });
+        app.key(key(KeyCode::Char('N')));
+        assert!(app.approvals.is_empty());
+        assert!(
+            app.notes
+                .iter()
+                .any(|n| n.contains("always-deny is for Tool approvals")),
+            "{:?}",
+            app.notes
+        );
+    }
+
+    #[test]
+    fn each_path_of_an_approval_gets_its_own_scope() {
+        let mut app = test_app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let choice = |path: &str, kind: &str| PathChoice {
+            path: path.into(),
+            kind: kind.into(),
+            label: String::new(),
+        };
+        let opt = |file: &str, dir: &str, repo: &str| PathOption {
+            capability: format!("fs:write:{file}"),
+            choices: vec![
+                choice(file, "file"),
+                choice(dir, "folder"),
+                choice(repo, "repo"),
+            ],
+        };
+        app.on_event(Event::ApprovalRequested {
+            approval_id: "b".into(),
+            session_id: "s".into(),
+            tool_name: "writer".into(),
+            version: 1,
+            capabilities: vec!["fs:write:/p/a/x.rs".into(), "fs:write:/q/b/y.rs".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+            batch: None,
+            path_options: vec![
+                opt("/p/a/x.rs", "/p/a", "/p"),
+                opt("/q/b/y.rs", "/q/b", "/q"),
+            ],
+        });
+        // Folder for the first path, repo for the second (#772).
+        app.key(key(KeyCode::Char('p')));
+        app.key(key(KeyCode::Char('P')));
+        app.key(key(KeyCode::Char('p')));
+        app.key(key(KeyCode::Char('p')));
+        let paths = app.take_paths("b");
+        assert_eq!(
+            paths.get("fs:write:/p/a/x.rs").map(String::as_str),
+            Some("/p/a")
+        );
+        assert_eq!(
+            paths.get("fs:write:/q/b/y.rs").map(String::as_str),
+            Some("/q")
+        );
     }
 
     #[test]

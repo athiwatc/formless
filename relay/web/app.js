@@ -2030,7 +2030,7 @@
       opt.choices.map((c, i) => h("option", { value: String(i) }, label(c))));
     sel.value = String(req.picks[cap] || 0);
     sel.onchange = () => { req.picks[cap] = Number(sel.value); };
-    return h("div", { class: "muted path-note" }, "Grant: ", sel);
+    return h("div", { class: "muted path-note" }, "Grant: ", sel, " (for Always, Session or Hour; Once allows just this call)");
   }
   /** The wider paths picked on an approval: requested spec → folder. */
   function pickedPaths(req) {
@@ -2089,7 +2089,9 @@
     $("modal-once").classList.toggle("hidden", promo);
     $("modal-session").classList.toggle("hidden", promo);
     $("modal-hour").classList.toggle("hidden", promo);
-    $("modal-deny-always").classList.toggle("hidden", promo);
+    // Always-deny remembers a Tool's Capabilities: not offered on other
+    // prompts (an MCP server, a harness change) (#764).
+    $("modal-deny-always").classList.toggle("hidden", promo || !req.tool_id);
     $("modal-approve").replaceChildren(h("kbd", { "aria-hidden": "true" }, "y"), promo ? " Approve" : " Always");
     rememberFocus("modal-backdrop");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
@@ -2170,7 +2172,8 @@
       answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
     }
     if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
-    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: pickedPaths(req), remember_denial: !!rememberDenial });
+    // A wider folder is a lasting grant's; "once" allows only this call (#765).
+    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: scope === "once" ? {} : pickedPaths(req), remember_denial: !!rememberDenial });
     prefs.set("seen.approvalHelp", true);
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
@@ -4385,7 +4388,7 @@
         break;
       }
       case "approval_requested":
-        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
+        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_id: ev.tool_id || null, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
           already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
           pathOptions: ev.path_options || [], picks: {} });
         if (here) setActivity("awaiting your approval");
@@ -4909,7 +4912,7 @@
       if (e.key === "s" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "session"); return; }
       if (e.key === "1" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "hour"); return; }
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
-      if (e.key === "N" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(false, "always", true); return; }
+      if (e.key === "N" && S.approvals[0] && S.approvals[0].kind !== "promotion" && S.approvals[0].tool_id) { e.preventDefault(); decide(false, "always", true); return; }
     }
     const dialogOpen = modalOpen || !$("ask-backdrop").classList.contains("hidden");
     if (!dialogOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !typingIn(document.activeElement) && S.channel) {

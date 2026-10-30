@@ -81,12 +81,39 @@ pub fn choices(path: &str) -> Vec<PathChoice> {
     out
 }
 
+/// `p` with symlinks resolved, also when it doesn't exist yet (a file
+/// about to be written): its nearest existing parent is resolved and the
+/// rest kept.
+fn canonical_lenient(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let mut rest = Vec::new();
+    let mut cur = p;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name.to_os_string());
+        }
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    p.to_path_buf()
+}
+
 /// Accept a chosen scope for `requested` only when it is the path itself
 /// or a folder above it (whole components, so `/proj` never covers
 /// `/proj-secrets`) and not too broad. Returns the canonical folder.
 pub fn validate(requested: &str, chosen: &str) -> Result<String, String> {
     let chosen_p = formless_runtime::caps::canonical_path(chosen)?;
-    let requested_p = Path::new(requested);
+    // Both sides resolved, so a symlink on the way (macOS /tmp, a linked
+    // home or repo) doesn't make a real parent look foreign (#772).
+    let requested_p = canonical_lenient(Path::new(requested));
     if !requested_p.starts_with(&chosen_p) {
         return Err(format!("{chosen} does not contain {requested}"));
     }
@@ -109,6 +136,26 @@ mod tests {
         ));
         std::fs::create_dir_all(d.join("src")).unwrap();
         d
+    }
+
+    /// A repo reached through a symlink can still be granted whole, for a
+    /// file not written yet too (#772).
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_paths_widen_to_their_real_folder() {
+        let real = tmp("real");
+        let link = real.parent().unwrap().join(format!(
+            "fl-scope-link-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = link.join("src/new.rs");
+        let granted = validate(&via_link.to_string_lossy(), &real.to_string_lossy()).unwrap();
+        assert_eq!(Path::new(&granted), real.as_path());
+        // and the grant covers a sibling file
+        assert!(real.join("src/other.rs").starts_with(&granted));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     #[test]
