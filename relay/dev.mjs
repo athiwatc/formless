@@ -18,6 +18,14 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SECURITY_HEADERS } from "./worker.js";
+
+// Plain ws:// to this machine is allowed here only: production pages may
+// connect to their own origin alone (#907).
+const DEV_HEADERS = {
+  ...SECURITY_HEADERS,
+  "content-security-policy": SECURITY_HEADERS["content-security-policy"]
+    .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*"),
+};
 import { sendPush, validSubscription, vapidFrom } from "./push.mjs";
 
 // Web Push as in worker.js: VAPID_PUBLIC_KEY / VAPID_PRIVATE_JWK from the
@@ -106,7 +114,8 @@ function joinRoom(room, role, conn, reject, mux, ua) {
         let ctl = null;
         try { ctl = JSON.parse(t); } catch (_) {}
         const c = ctl && r.clients.get(ctl.cid);
-        if (c) closeWith(c, 4001, "disconnected by the daemon");
+        if (c && ctl.code === 4002) closeWith(c, 4002, "link integrity failure");
+        else if (c) closeWith(c, 4001, "disconnected by the daemon");
         return;
       }
       if (t.startsWith('{"relay":"push"')) {
@@ -243,7 +252,7 @@ const server = createServer(async (req, res) => {
   if (!file.startsWith(webRoot)) { res.writeHead(404); return res.end("not found"); }
   try {
     const data = await readFile(file);
-    res.writeHead(200, { "content-type": TYPES[extname(file)] || "application/octet-stream", ...SECURITY_HEADERS });
+    res.writeHead(200, { "content-type": TYPES[extname(file)] || "application/octet-stream", ...DEV_HEADERS });
     res.end(data);
   } catch (_) {
     res.writeHead(404);

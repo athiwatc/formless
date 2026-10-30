@@ -52,11 +52,18 @@ fn relay_frames_cannot_be_replayed_or_reflected() {
     assert_eq!(daemon.open(&approve).unwrap(), "approve");
     assert!(daemon.open(&approve).is_err(), "same frame twice");
 
-    // An older frame after a newer one is rejected too.
+    // A withheld frame is not skipped over: the next one is refused as
+    // out of sequence (the daemon then closes the channel, #905).
     let first = browser.seal("1").unwrap();
     let second = browser.seal("2").unwrap();
+    let gap = daemon.open(&second).unwrap_err();
+    assert!(format!("{gap}").contains("out of sequence"), "{gap}");
+    assert_eq!(daemon.open(&first).unwrap(), "1");
     assert_eq!(daemon.open(&second).unwrap(), "2");
-    assert!(daemon.open(&first).is_err());
+    assert!(
+        daemon.open(&first).is_err(),
+        "older frame after a newer one"
+    );
 
     // A frame reflected back to its sender does not authenticate: the
     // direction is bound into the associated data.
@@ -250,18 +257,14 @@ async fn relay_gives_each_browser_its_own_connection() {
     answered.sort();
     assert_eq!(answered, ["a", "b"]);
 
-    // Replaying a's request is dropped: no second response arrives.
+    // Replaying a's request is not answered: the daemon closes a's
+    // channel as a link integrity failure instead (#905).
     let replay = serde_json::json!({"cid": "a", "f": sent[0]});
     ws.send(Message::Text(replay.to_string())).await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), ws.next())
-            .await
-            .is_err(),
-        "replayed frame must not be answered"
-    );
-
-    let close = serde_json::json!({"relay": "client_close", "cid": "a"});
-    ws.send(Message::Text(close.to_string())).await.unwrap();
+    let frame = recv(&mut ws).await;
+    assert_eq!(frame["relay"], "disconnect", "{frame}");
+    assert_eq!(frame["cid"], "a");
+    assert_eq!(frame["code"], 4002);
     settle(&daemon, 1).await;
 
     shutdown.cancel();
@@ -456,4 +459,42 @@ async fn relay_browsers_are_listed_and_can_be_disconnected() {
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+/// A relay that accepts and drops at once keeps doubling the backoff to
+/// its cap; only a link that lasted resets it; waits are jittered (#906).
+#[test]
+fn relay_backoff_resets_only_after_a_stable_link_and_is_jittered() {
+    use formless_core::relay::{jittered, next_backoff};
+    use std::time::Duration;
+    let mut ceiling = 1_000;
+    for _ in 0..10 {
+        ceiling = next_backoff(ceiling, Duration::from_millis(50));
+    }
+    assert_eq!(ceiling, 30_000, "short-lived links reach the cap");
+    assert_eq!(next_backoff(ceiling, Duration::from_secs(61)), 1_000);
+    let waits: std::collections::HashSet<_> = (0..20).map(|_| jittered(30_000)).collect();
+    assert!(waits.len() > 1, "waits are not all the same");
+    assert!(waits
+        .iter()
+        .all(|w| *w >= Duration::from_millis(250) && *w <= Duration::from_secs(30)));
+}
+
+/// Plain ws:// to another machine, or no scheme at all, is refused (#907).
+#[test]
+fn relay_url_must_be_wss_or_loopback() {
+    use formless_core::config::RelayCfg;
+    let cfg = |url: &str| RelayCfg {
+        enabled: true,
+        url: url.into(),
+    };
+    std::env::remove_var("FORMLESS_RELAY_ALLOW_INSECURE");
+    assert!(cfg("wss://formless.athiwat.xyz").check().is_ok());
+    assert!(cfg("ws://127.0.0.1:8787").check().is_ok());
+    assert!(cfg("ws://localhost:8787").check().is_ok());
+    assert!(cfg("ws://[::1]:8787").check().is_ok());
+    let e = cfg("ws://relay.example.com").check().unwrap_err();
+    assert!(format!("{e:#}").contains("wss://"), "{e:#}");
+    assert!(cfg("relay.example.com").check().is_err());
+    assert!(cfg("https://relay.example.com").check().is_err());
 }

@@ -141,7 +141,8 @@
   async function decrypt(frame) {
     const ch = S.channel;
     const v = JSON.parse(frame);
-    if (!ch || v.v !== FRAME_VERSION || !(v.seq > ch.received)) throw new Error("rejected frame");
+    // Exactly the next one: a gap means a frame went missing (#905).
+    if (!ch || v.v !== FRAME_VERSION || v.seq !== ch.received + 1) throw new Error("rejected frame");
     const pt = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: b64ToBytes(v.iv), additionalData: aad("d2b", v.seq) }, ch.key, b64ToBytes(v.ct));
     ch.received = v.seq;
@@ -4549,8 +4550,24 @@
     refreshSettings();
   }
 
+  /** The page can hold the pairing secret only over HTTPS or on this
+   * machine: over plain HTTP anyone on the path could read it (#907). */
+  function secureOrigin() {
+    const h = location.hostname.replace(/^\[|\]$/g, "");
+    return location.protocol === "https:" || h === "localhost" || h.endsWith(".localhost") || h === "::1" || /^127\./.test(h);
+  }
+  /** Reset the backoff only once a channel has stayed up a while (#906). */
+  function markStable() {
+    clearTimeout(S.stableTimer);
+    S.stableTimer = setTimeout(() => { S.backoff = 1000; }, 30000);
+  }
   async function connect(secret) {
     $("pair-error").textContent = "";
+    if (!secureOrigin()) {
+      $("pair-error").textContent = "This page was not loaded over HTTPS, so it will not take a pairing secret. Open the relay's https:// address.";
+      showPair();
+      return;
+    }
     let keyBytes;
     try {
       keyBytes = b64ToBytes(secret);
@@ -4569,7 +4586,6 @@
     const ws = new WebSocket(proto + "//" + location.host + "/relay/" + room + "?role=client");
     S.ws = ws;
     ws.onopen = () => {
-      S.backoff = 1000;
       try { sessionStorage.setItem("formless_secret", secret); } catch (_) {}
       // Keep the key out of the address bar and history.
       if (location.hash) history.replaceState(null, "", location.pathname);
@@ -4601,16 +4617,25 @@
         } catch (_) {}
         if (!hello || hello.length !== 16 || !S.hello) return;
         await finishHandshake(hello);
+        markStable();
         note("daemon online");
         loadAll();
         return;
       }
       let msg;
-      try { msg = JSON.parse(await decrypt(frame)); } catch (_) { return; }
+      try { msg = JSON.parse(await decrypt(frame)); } catch (_) {
+        // Replayed, missing or forged: the channel can't be trusted, so
+        // start over (a new handshake reloads everything) (#905).
+        note("link integrity failure: reconnecting", true);
+        try { ws.close(4002, "link integrity failure"); } catch (_) {}
+        return;
+      }
       onMessage(msg);
     }
     ws.onclose = (ev) => {
       if (S.ws !== ws) return;
+      clearTimeout(S.stableTimer);
+      if (ev && ev.code === 4002) note("link integrity failure: reconnecting", true);
       // Disconnected from the daemon's device list: stay off until asked.
       if (ev && ev.code === 4001) {
         S.userClosed = true;
@@ -4662,7 +4687,7 @@
     const ws = new WebSocket((location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/ws");
     S.ws = ws;
     ws.onopen = () => {
-      S.backoff = 1000;
+      markStable();
       S.localConnected = true;
       S.localFails = 0;
       S.channel = { local: true };
@@ -4680,6 +4705,7 @@
     };
     ws.onclose = () => {
       if (S.ws !== ws) return;
+      clearTimeout(S.stableTimer);
       const wasOpen = S.channel != null;
       S.daemonOnline = false;
       S.channel = null;
@@ -4705,7 +4731,8 @@
   // retries at once.
   function scheduleReconnect(fn) {
     clearTimeout(S.reconnect && S.reconnect.timer);
-    const delay = S.backoff;
+    // Full jitter, so tabs that lost the relay together don't return in waves.
+    const delay = 250 + Math.floor(Math.random() * (S.backoff - 250));
     S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(() => { S.reconnect = null; fn(); }, delay) };
     S.backoff = Math.min(S.backoff * 2, 15000);
     renderChrome();
@@ -4719,6 +4746,9 @@
     fn();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
+  // A heartbeat, so the daemon can tell a vanished browser from an idle
+  // one and drop it from its device list (#910).
+  setInterval(() => { if (S.channel && !S.local) request({ type: "ping" }, 20000).catch(() => {}); }, 60000);
 
   function showPair() {
     $("app").classList.add("hidden");

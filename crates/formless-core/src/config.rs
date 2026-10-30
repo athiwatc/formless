@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -690,7 +690,48 @@ impl Default for RelayCfg {
         }
     }
 }
+/// `localhost`, `*.localhost`, or a loopback IP address.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 impl RelayCfg {
+    /// The relay address must be `wss://`, or `ws://` to this machine: the
+    /// browser page served over plain HTTP would carry the pairing secret
+    /// where anyone on the path can read it (#907).
+    /// `FORMLESS_RELAY_ALLOW_INSECURE=1` allows other `ws://` relays, for
+    /// development only.
+    pub fn check(&self) -> Result<()> {
+        let url = reqwest::Url::parse(self.url.trim()).map_err(|e| {
+            anyhow::anyhow!(
+                "relay.url {:?} is not a URL ({e}): use wss://host, e.g. wss://formless.athiwat.xyz",
+                self.url
+            )
+        })?;
+        let host = url.host_str().unwrap_or_default();
+        if host.is_empty() {
+            bail!("relay.url {:?} has no host: use wss://host", self.url);
+        }
+        match url.scheme() {
+            "wss" => Ok(()),
+            "ws" if crate::config::is_loopback_host(host) => Ok(()),
+            "ws" if std::env::var("FORMLESS_RELAY_ALLOW_INSECURE").is_ok_and(|v| v == "1") => Ok(()),
+            "ws" => bail!(
+                "relay.url {:?} is plain ws:// to another machine: the pairing page would travel unencrypted. Use wss:// (or set FORMLESS_RELAY_ALLOW_INSECURE=1 for local development only)",
+                self.url
+            ),
+            other => bail!(
+                "relay.url {:?} has scheme {other}: use wss://host",
+                self.url
+            ),
+        }
+    }
+
     /// Browser-facing base URL derived from the websocket URL.
     pub fn web_url(&self) -> String {
         if let Some(rest) = self.url.strip_prefix("wss://") {

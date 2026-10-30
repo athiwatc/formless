@@ -10,8 +10,10 @@
 //! derive a fresh session key with HKDF-SHA256 over the pairing key,
 //! salted with both nonces. Every later frame carries a per-direction
 //! sequence number that is bound into the AES-GCM associated data and
-//! must increase, so a captured frame cannot be replayed (in this or any
-//! other session) or reflected back to its sender.
+//! must be exactly one more than the last, so a captured frame cannot be
+//! replayed (in this or any other session) or reflected back to its
+//! sender, and a frame the relay withholds breaks the channel instead of
+//! vanishing (#905).
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -160,6 +162,12 @@ impl Channel {
         if seq <= self.received {
             return Err(anyhow!("relay frame replayed (seq {seq})"));
         }
+        if seq != self.received + 1 {
+            return Err(anyhow!(
+                "relay frame out of sequence (expected {}, got {seq}): a frame went missing",
+                self.received + 1
+            ));
+        }
         let b64 = base64::engine::general_purpose::STANDARD;
         let iv = b64
             .decode(v["iv"].as_str().context("relay frame missing iv")?)
@@ -195,6 +203,8 @@ pub fn relay_ws_url(base: &str, secret: &str) -> Result<String> {
     ))
 }
 
+/// The browser URL carrying the pairing secret in its fragment. Check the
+/// relay address with [`RelayCfg::check`] before showing it.
 pub fn browser_url(cfg: &RelayCfg, secret: &str) -> String {
     format!("{}/#k={secret}", cfg.web_url())
 }
@@ -287,6 +297,14 @@ impl Drop for Forget {
     }
 }
 
+/// A browser that has sent nothing (its heartbeat included) for this long
+/// is dropped, in case the relay never said it closed (#910).
+const CLIENT_IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Close code the relay passes to a browser whose channel broke (#905):
+/// it reconnects and handshakes again, unlike 4001 (kicked).
+pub const INTEGRITY_CLOSE: u16 = 4002;
+
 /// Pushes for waiting approvals and questions are at least this far apart.
 const PUSH_GAP: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -325,9 +343,28 @@ pub async fn connect_once(
     let (kick_tx, mut kick_rx) = mpsc::unbounded_channel::<String>();
     *daemon.relay_kick.locked() = Some(kick_tx);
     let _forget = Forget(daemon.clone());
+    let mut seen: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut reap = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
+            _ = reap.tick() => {
+                let stale: Vec<String> = seen
+                    .iter()
+                    .filter(|(_, t)| t.elapsed() > CLIENT_IDLE)
+                    .map(|(cid, _)| cid.clone())
+                    .collect();
+                for cid in stale {
+                    tracing::info!("relay: dropping browser {cid}: silent for {}s", CLIENT_IDLE.as_secs());
+                    seen.remove(&cid);
+                    clients.remove(&cid);
+                    daemon.relay_clients.locked().remove(&cid);
+                    let frame = json!({"relay": "disconnect", "cid": cid, "code": INTEGRITY_CLOSE}).to_string();
+                    if ws_write.send(Message::Text(frame)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
             Some(cid) = kick_rx.recv() => {
                 clients.remove(&cid);
                 daemon.relay_clients.locked().remove(&cid);
@@ -363,6 +400,7 @@ pub async fn connect_once(
                 let now = chrono::Utc::now().to_rfc3339();
                 match relay.as_deref() {
                     Some("client_close") => {
+                        seen.remove(&cid);
                         clients.remove(&cid);
                         daemon.relay_clients.locked().remove(&cid);
                         continue;
@@ -380,6 +418,7 @@ pub async fn connect_once(
                 if let Some(c) = daemon.relay_clients.locked().get_mut(&cid) {
                     c.last_seen = now;
                 }
+                seen.insert(cid.clone(), std::time::Instant::now());
                 let Some(f) = f else { continue };
                 if let Some(browser_hello) = parse_hello(&f) {
                     // A (re)handshake starts a fresh connection and key.
@@ -404,7 +443,17 @@ pub async fn connect_once(
                             clients.remove(&cid);
                         }
                     }
-                    Err(e) => tracing::warn!("relay: dropping frame: {e}"),
+                    // A frame that does not open (replayed, out of sequence,
+                    // forged) breaks this browser's channel: close it so the
+                    // browser handshakes again and reloads its state (#905).
+                    Err(e) => {
+                        tracing::warn!("relay: link integrity failure for browser {cid}: {e}; closing its channel");
+                        clients.remove(&cid);
+                        let frame = json!({"relay": "disconnect", "cid": cid, "code": INTEGRITY_CLOSE}).to_string();
+                        if ws_write.send(Message::Text(frame)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
             }
             Some((cid, generation, line)) = out_rx.recv() => {
@@ -422,11 +471,34 @@ pub async fn connect_once(
     }
 }
 
+/// A link that lasted this long resets the reconnect backoff; a relay that
+/// accepts and drops at once does not (#906).
+const STABLE_LINK: std::time::Duration = std::time::Duration::from_secs(60);
+/// Reconnect backoff bounds, in milliseconds.
+const BACKOFF_MIN_MS: u64 = 1_000;
+const BACKOFF_MAX_MS: u64 = 30_000;
+
+/// The backoff ceiling after a link that lasted `lasted`.
+pub fn next_backoff(ceiling_ms: u64, lasted: std::time::Duration) -> u64 {
+    if lasted >= STABLE_LINK {
+        BACKOFF_MIN_MS
+    } else {
+        (ceiling_ms * 2).clamp(BACKOFF_MIN_MS, BACKOFF_MAX_MS)
+    }
+}
+
+/// How long to wait under `ceiling_ms`: full jitter, so daemons that lost
+/// the relay together do not come back in waves (#906).
+pub fn jittered(ceiling_ms: u64) -> std::time::Duration {
+    use rand::Rng;
+    std::time::Duration::from_millis(rand::thread_rng().gen_range(250..=ceiling_ms.max(250)))
+}
+
 /// Reconnect loop for `Daemon::serve`; runs only when relay is enabled
 /// and a pairing secret exists.
 pub async fn relay_loop(daemon: Arc<Daemon>) {
     let shutdown = daemon.shutdown.clone();
-    let mut backoff_secs = 1u64;
+    let mut ceiling_ms = BACKOFF_MIN_MS;
     loop {
         if shutdown.is_cancelled() {
             return;
@@ -440,14 +512,27 @@ pub async fn relay_loop(daemon: Arc<Daemon>) {
             tracing::warn!("relay enabled but no pairing secret; run `formless relay enable`");
             return;
         };
-        match connect_once(daemon.clone(), &cfg.url, &secret, &shutdown).await {
-            Ok(()) => backoff_secs = 1,
-            Err(e) => tracing::warn!("relay connection ended: {e}; retrying in {backoff_secs}s"),
+        if let Err(e) = cfg.check() {
+            tracing::warn!("relay not started: {e:#}");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let ended = connect_once(daemon.clone(), &cfg.url, &secret, &shutdown).await;
+        ceiling_ms = next_backoff(ceiling_ms, started.elapsed());
+        let wait = jittered(ceiling_ms);
+        match ended {
+            Ok(()) => tracing::info!(
+                "relay link closed; reconnecting in {:.1}s",
+                wait.as_secs_f64()
+            ),
+            Err(e) => tracing::warn!(
+                "relay connection ended: {e}; retrying in {:.1}s",
+                wait.as_secs_f64()
+            ),
         }
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            _ = tokio::time::sleep(wait) => {}
         }
-        backoff_secs = (backoff_secs * 2).min(30);
     }
 }

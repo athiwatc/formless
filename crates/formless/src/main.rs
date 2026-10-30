@@ -1827,6 +1827,7 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
             if let Some(url) = url {
                 cfg.relay.url = url.trim_end_matches('/').to_string();
             }
+            cfg.relay.check().map_err(|e| usage(format!("{e:#}")))?;
             cfg.save(&paths)?;
             println!("relay:      enabled ({})", cfg.relay.url);
             println!(
@@ -2267,6 +2268,15 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
         }
     }
     if let Ok(cfg) = Config::load(paths) {
+        if cfg.relay.enabled {
+            if let Err(e) = cfg.relay.check() {
+                out.push(Problem {
+                    what: format!("the relay will not connect: {e:#}"),
+                    next: Some("formless relay enable --url wss://HOST".into()),
+                    fix: None,
+                });
+            }
+        }
         for (p, why) in cfg.security.roots_checked().1 {
             out.push(Problem {
                 what: format!("security.trusted_paths entry {p:?} is ignored: {why}"),
