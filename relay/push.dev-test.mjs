@@ -34,7 +34,7 @@ try {
   });
   const client = await open("client");
   const port = await new Promise((r) => { const t = setInterval(() => { if (got.port) { clearInterval(t); r(got.port); } }, 10); });
-  client.send(JSON.stringify({ relay: "push_subscribe", sub: { endpoint: `http://127.0.0.1:${port}/push/abc`, keys: {} } }));
+  client.send(JSON.stringify({ relay: "push_subscribe", sub: { endpoint: `http://127.0.0.1:${port}/push/abc`, keys: { p256dh: env.VAPID_PUBLIC_KEY, auth: b64u(crypto.getRandomValues(new Uint8Array(16))) } } }));
   await new Promise((r) => setTimeout(r, 100));
   const daemon = await open("daemon");
   daemon.send(JSON.stringify({ relay: "push", kind: "approval" }));

@@ -45,3 +45,10 @@ assert.equal(b4.closed.code, 4001);
 
 assert.match(SECURITY_HEADERS["content-security-policy"], /connect-src 'self';/);
 console.log("room ok");
+
+// /health says whether push works, without secret material (#838).
+const worker = (await import("./worker.js")).default;
+const health = await (await worker.fetch(new Request("https://relay.test/health"), { VAPID_PUBLIC_KEY: "x", VAPID_PRIVATE_JWK: "{bad" })).json();
+assert.equal(health.push, "misconfigured");
+assert.ok(!JSON.stringify(health).includes("{bad"));
+console.log("health ok");

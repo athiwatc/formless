@@ -498,3 +498,26 @@ fn relay_url_must_be_wss_or_loopback() {
     assert!(cfg("relay.example.com").check().is_err());
     assert!(cfg("https://relay.example.com").check().is_err());
 }
+
+/// The pairing key and each session key are wiped when dropped (#908):
+/// a source check, since nothing observable shows a zeroed buffer.
+#[test]
+fn relay_key_material_is_zeroized() {
+    let src = include_str!("../src/relay.rs");
+    assert!(
+        src.contains("-> Result<Zeroizing<[u8; 32]>>"),
+        "pairing key"
+    );
+    assert!(
+        src.contains("let mut session_key = Zeroizing::new("),
+        "session key"
+    );
+    assert!(
+        src.contains("load_relay_secret(&daemon.paths).map(Zeroizing::new)"),
+        "secret string"
+    );
+    let key =
+        formless_core::relay::key_from_secret(&formless_core::config::generate_relay_secret())
+            .unwrap();
+    let _: &zeroize::Zeroizing<[u8; 32]> = &key;
+}

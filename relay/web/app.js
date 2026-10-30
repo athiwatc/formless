@@ -542,12 +542,15 @@
    * in. */
   function sessionLink(s) {
     const base = location.origin + location.pathname;
-    return S.local ? base + "#s=" + encodeURIComponent(s.id)
-      : base + "#k=" + encodeURIComponent(S.secret) + "&s=" + encodeURIComponent(s.id);
+    const secret = S.local ? "" : rememberedSecret();
+    return secret ? base + "#k=" + encodeURIComponent(secret) + "&s=" + encodeURIComponent(s.id)
+      : base + "#s=" + encodeURIComponent(s.id);
   }
   function copySessionLink(s) {
+    const withKey = !S.local && !!rememberedSecret();
     navigator.clipboard.writeText(sessionLink(s)).then(
-      () => toast(S.local ? "Copied: opens “" + s.name + "” in a browser signed in to this daemon" : "Copied: it holds the pairing key, so share it only with your own devices"),
+      () => toast(withKey ? "Copied: it holds the pairing key, so share it only with your own devices"
+        : "Copied: opens “" + s.name + "” in a browser already connected to this daemon"),
       () => toast("Copy failed", true));
   }
   /** Archived Sessions are hidden but kept (SPEC §10.4). */
@@ -4577,18 +4580,30 @@
       showPair();
       return;
     }
-    S.secret = secret;
     S.userClosed = false;
+    // Only a non-extractable key and the room stay; the raw bytes are
+    // wiped and the secret string is kept only when the user chose to stay
+    // paired across reloads (#908).
     S.key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveKey"]);
+    S.room = await roomFor(keyBytes);
+    keyBytes.fill(0);
+    try {
+      if (prefs.get("remember_pairing", false)) sessionStorage.setItem("formless_secret", secret);
+      else sessionStorage.removeItem("formless_secret");
+    } catch (_) {}
+    openRelay();
+  }
+  /** The stored pairing secret, only when the user chose to keep it. */
+  function rememberedSecret() {
+    try { return prefs.get("remember_pairing", false) ? sessionStorage.getItem("formless_secret") || "" : ""; } catch (_) { return ""; }
+  }
+  /** Connect (or reconnect) to the room with the key already imported. */
+  function openRelay() {
     S.channel = null;
-    const room = await roomFor(keyBytes);
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(proto + "//" + location.host + "/relay/" + room + "?role=client");
+    const ws = new WebSocket(proto + "//" + location.host + "/relay/" + S.room + "?role=client");
     S.ws = ws;
     ws.onopen = () => {
-      try { sessionStorage.setItem("formless_secret", secret); } catch (_) {}
-      // Keep the key out of the address bar and history.
-      if (location.hash) history.replaceState(null, "", location.pathname);
       $("pair").classList.add("hidden");
       $("app").classList.remove("hidden");
       renderAll();
@@ -4651,7 +4666,7 @@
       if (!$("app").classList.contains("hidden")) renderAll();
       if (S.userClosed) return;
       // Reconnect with backoff; the relay and daemon are both stateless here.
-      scheduleReconnect(() => { if (!S.userClosed && S.ws === ws) connect(S.secret); });
+      scheduleReconnect(() => { if (!S.userClosed && S.ws === ws) openRelay(); });
     };
   }
 
@@ -4765,7 +4780,15 @@
   }
 
   // ============================================================== wiring
-  $("pair-form").addEventListener("submit", (e) => { e.preventDefault(); connect($("secret").value.trim()); });
+  $("remember").checked = prefs.get("remember_pairing", false);
+  $("pair-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const secret = $("secret").value.trim();
+    // Not left in the form once read (#908).
+    $("secret").value = "";
+    prefs.set("remember_pairing", $("remember").checked);
+    connect(secret);
+  });
   $("disconnect").onclick = forget;
   document.querySelectorAll("#tabs button").forEach((b) => (b.onclick = () => setView(b.dataset.view)));
   $("new-session").onclick = pickNewSession;
@@ -4969,7 +4992,25 @@
   window.addEventListener("hashchange", () => {
     const frag = hashParams();
     // A Session link pasted into an open, connected tab: just open it.
-    if (frag.s && !frag.local && (!frag.k || frag.k === S.secret) && S.channel) {
+    // The fragment never stays in the address bar (#908). A Session link
+    // with a key opens here only when that key is this tab's room.
+    if (frag.k) {
+      history.replaceState(null, "", location.pathname);
+      if (frag.s && S.channel && !S.local) {
+        let bytes = null;
+        try { bytes = b64ToBytes(frag.k); } catch (_) {}
+        if (bytes && bytes.length === 32) {
+          roomFor(bytes).then((room) => {
+            bytes.fill(0);
+            if (room !== S.room) return note("That link is for another daemon: open it in a new tab.", true);
+            if (S.sessions.some((x) => x.id === frag.s)) openSession(frag.s);
+            else note("That Session link points to a Session that no longer exists.", true);
+          });
+        }
+      }
+      return;
+    }
+    if (frag.s && !frag.local && S.channel) {
       history.replaceState(null, "", location.pathname);
       if (S.sessions.some((s) => s.id === frag.s)) openSession(frag.s);
       else note("That Session link points to a Session that no longer exists.", true);
@@ -4994,11 +5035,11 @@
       connectLocal(frag.local || null);
       return;
     }
-    const fromHash = frag.k || "";
-    let saved = "";
-    try { saved = sessionStorage.getItem("formless_secret") || ""; } catch (_) {}
-    const secret = fromHash || saved;
-    if (secret) { $("secret").value = secret; connect(secret); }
+    // Out of the address bar and history before anything touches the
+    // network, whether or not the relay is reachable (#908).
+    if (location.hash) history.replaceState(null, "", location.pathname);
+    const secret = frag.k || rememberedSecret();
+    if (secret) connect(secret);
     else showPair();
   })();
 })();

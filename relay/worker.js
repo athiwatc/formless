@@ -19,9 +19,21 @@
 // when an approval or question waits, and the room sends each subscription
 // a payload-free VAPID push (push.mjs).
 
-import { sendPush, validSubscription, vapidFrom } from "./push.mjs";
+import { isConfigFailure, loadVapid, sendPush, validSubscription } from "./push.mjs";
 
 const MAX_SUBSCRIPTIONS = 10;
+
+// Checked once per isolate (#838); `refused` records a push service
+// rejecting our signature, so /health can say so.
+let pushConfig = null;
+let refused = null;
+function pushFor(env) {
+  if (!pushConfig) pushConfig = loadVapid(env).then((c) => {
+    if (c.state === "misconfigured") console.error("relay: push is off: " + c.reason);
+    return c;
+  });
+  return pushConfig;
+}
 
 export class RelayRoom {
   constructor(state, env) {
@@ -103,14 +115,20 @@ export class RelayRoom {
   }
 
   async pushAll() {
-    const vapid = vapidFrom(this.env);
+    const { vapid } = await pushFor(this.env);
     if (!vapid) return;
     const subs = await this.state.storage.list({ prefix: "push:" });
     await Promise.all([...subs].map(async ([key, sub]) => {
       try {
         const status = await sendPush(sub, vapid);
         if (status === 404 || status === 410) await this.state.storage.delete(key);
-      } catch (_) {}
+        else if (isConfigFailure(status) && !refused) {
+          refused = "a push service answered " + status + ": check that VAPID_PUBLIC_KEY and VAPID_PRIVATE_JWK are one pair";
+          console.error("relay: " + refused);
+        } else if (status < 300) refused = null;
+      } catch (e) {
+        console.error("relay: push failed: " + (e && e.message));
+      }
     }));
   }
 
@@ -129,7 +147,7 @@ export class RelayRoom {
       return;
     }
     if (ctl && att.role === "client") {
-      if (ctl.relay === "push_subscribe" && validSubscription(ctl.sub)) {
+      if (ctl.relay === "push_subscribe" && validSubscription(ctl.sub, false, this.env.PUSH_HOSTS)) {
         const subs = await this.state.storage.list({ prefix: "push:" });
         if (subs.size < MAX_SUBSCRIPTIONS) await this.state.storage.put(await this.subKey(ctl.sub.endpoint), ctl.sub);
       } else if (ctl.relay === "push_unsubscribe" && typeof ctl.endpoint === "string") {
@@ -197,11 +215,13 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/push/key") {
-      const vapid = vapidFrom(env);
+      const { vapid } = await pushFor(env);
       return vapid ? Response.json({ key: vapid.publicKey }) : new Response("push is not set up on this relay", { status: 404 });
     }
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, service: "formless-relay", version: 2 });
+      const push = await pushFor(env);
+      const state = push.state === "ok" && refused ? "misconfigured" : push.state;
+      return Response.json({ ok: true, service: "formless-relay", version: 2, push: state, push_problem: push.reason || refused || undefined });
     }
     const m = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
     if (m) {

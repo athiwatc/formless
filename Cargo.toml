@@ -38,6 +38,7 @@ sha2 = "0.10"
 hkdf = "0.12"
 base64 = "0.22"
 rand = "0.8"
+zeroize = "1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 rquickjs = "0.14"
 jsonschema = "0.59"
