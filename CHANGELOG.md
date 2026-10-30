@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automation screenshots (`.screenshots/`), so generated files stop showing up
   as untracked changes. `.screenshots` was already excluded from the Docker
   build context.
+- The README now describes the full built-in Tool set — all 25 are listed with
+  their arguments and what each one does — instead of claiming a fresh install
+  exposes only `create_tool`. `create_tool` keeps a section of its own, now
+  §5.2, and the subsections after it were renumbered.
 
 ## [0.1.0] - 2026-10-30
 

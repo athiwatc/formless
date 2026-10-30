@@ -4,7 +4,7 @@
 
 <h1>Formless</h1>
 
-<p><strong>A general-purpose agent harness that boots with one bootstrap tool and grows its own capabilities for any use case.</strong></p>
+<p><strong>A general-purpose agent harness that boots with a small, fixed set of built-in tools and builds every other capability itself — for any use case.</strong></p>
 
 <p>
   <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
@@ -26,7 +26,9 @@
 
 ## About The Project
 
-A fresh install of Formless exposes exactly one Tool: `create_tool`. Everything else — web access, file surgery, shell work, domain logic — is written on demand by the agent, persisted, versioned, measured and reused. Formless does not specialise in coding.
+A fresh install of Formless exposes **25 built-in Tools**: the ones the agent needs to grow and maintain its own registry (`create_tool`, `find_tools`, `read_tool`, `test_tool`, `run_script`, …), to reach MCP servers and skills, to keep short notes about you, and to stay in touch with you. They are implemented by the daemon rather than stored in the registry, so they are neither versioned nor optimised. Everything else — web access, file surgery, shell work, domain logic — is written on demand by the agent, persisted, versioned, measured and reused. Formless does not specialise in coding.
+
+[§5.1](#51-the-built-in-tools) lists all 25 and what each one does; `create_tool`, the Tool factory every other capability comes out of, is covered in [§5.2](#52-create_tool--the-tool-factory).
 
 A long-lived **Daemon Core** owns the agent loop, the Tools, the Sessions and all state. The TUI and the CLI are thin, interchangeable clients of that core: they render streamed events and send intents, and they can crash or disconnect without losing work.
 
@@ -111,11 +113,12 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
     <li>
       <a href="#5-the-tool-system">The Tool system</a>
       <ul>
-        <li><a href="#51-create_tool--the-bootstrap-tool"><code>create_tool</code> — the Bootstrap Tool</a></li>
-        <li><a href="#52-lifecycle-and-versioning">Lifecycle and versioning</a></li>
-        <li><a href="#53-capabilities-closed-taxonomy">Capabilities (closed taxonomy)</a></li>
-        <li><a href="#54-the-host-api-inside-a-tool">The host API inside a Tool</a></li>
-        <li><a href="#55-composition-rules">Composition rules</a></li>
+        <li><a href="#51-the-built-in-tools">The built-in Tools</a></li>
+        <li><a href="#52-create_tool--the-tool-factory"><code>create_tool</code> — the Tool factory</a></li>
+        <li><a href="#53-lifecycle-and-versioning">Lifecycle and versioning</a></li>
+        <li><a href="#54-capabilities-closed-taxonomy">Capabilities (closed taxonomy)</a></li>
+        <li><a href="#55-the-host-api-inside-a-tool">The host API inside a Tool</a></li>
+        <li><a href="#56-composition-rules">Composition rules</a></li>
       </ul>
     </li>
     <li><a href="#6-invocations-async-by-design">Invocations: async by design</a></li>
@@ -139,7 +142,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 
 ## 1. Principles
 
-1. **One tool at boot.** A fresh install exposes exactly `create_tool`. Everything else is built, persisted and reused. No starter Tools ship.
+1. **A small, fixed boot set.** A fresh install exposes 25 built-in Tools and nothing else: the registry, memory, MCP, skills and planning primitives ([§5.1](#51-the-built-in-tools)). No domain Tool ships — web access, files, shell work and everything task-specific is built by the agent, then persisted and reused.
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only by recorded Invocation outcomes. No silent or untested mutation, ever.
 3. **No time-based killing.** Runs and Invocations have no step, token or time limits. The only terminators are completion, fault or the user.
 4. **Deny by default.** Tools run sandboxed with only their declared Capabilities. The runtime offers nothing a Tool was not granted.
@@ -258,7 +261,7 @@ The result is written to `config.toml` in the config dir ([§4](#4-data-config-a
 
 ### 3.4 Using the TUI
 
-Type a task at the bottom and press **Enter**. Formless starts with only `create_tool` and builds whatever else the task needs.
+Type a task at the bottom and press **Enter**. Formless starts with the built-in Tools ([§5.1](#51-the-built-in-tools)) and builds whatever else the task needs with `create_tool`.
 
 | Key | Action |
 |---|---|
@@ -277,7 +280,7 @@ Type a task at the bottom and press **Enter**. Formless starts with only `create
 
 Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /quit`. Type `/` for a command palette (fuzzy filter, Tab completes, Enter runs); `/help` or `?` on an empty input lists every command grouped by area. Ctrl+V or `/paste` attaches a screenshot from the clipboard, and dragging a file into the terminal attaches it. Type `@` to reference files: a popup completes paths under the current directory (respecting `.gitignore`), and on send small files are attached while large files and directories go as a reference the agent reads with its Tools. `/model` opens a picker: type to filter (fuzzy, so `son4` finds `claude-sonnet-4`), Tab changes reasoning effort, Enter switches the current Session, Ctrl+Enter / Alt+Enter / Ctrl+D sets the global default. `/agents` lists the Session's sub-agents (started by `agents.run`) and `/agents <n>` shows one's stored transcript; their steps also show live as activity. `/cancel` stops just the running Tool the daemon flagged as pending or stalled, without stopping the Run. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
 
-Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.2](#52-lifecycle-and-versioning)).
+Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.3](#53-lifecycle-and-versioning)).
 
 ### 3.5 Headless runs (no TUI)
 
@@ -476,7 +479,55 @@ Global flags: `--profile <name>`, `--secure` (turn approval prompts on for the d
 
 ## 5. The Tool system
 
-### 5.1 `create_tool` — the Bootstrap Tool
+### 5.1 The built-in Tools
+
+A fresh install exposes **25 built-in Tools**. They are implemented by the daemon itself rather than stored in the registry, so they have no versions, are excluded from Self-Optimisation, cannot be retired and hold no Capabilities of their own. They exist so the agent can grow and maintain its registry, reach MCP servers and skills, keep short notes about you, and stay in touch with you while it works. How often each one is called is reported by `read_metrics({kind: "builtins"})`.
+
+Everything else — the web, the filesystem, the shell, git, file formats, domain logic — is a registry Tool the agent writes ([§5.2](#52-create_tool--the-tool-factory)).
+
+**Growing and maintaining the registry**
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `create_tool` | `name`, `title`, `description`, `tags[]`, `input_schema`, `output_schema`, `implementation_js`, `capabilities[]`, `memory_mb?` | Writes a Tool — or a new version of an existing one — after validating the name, both JSON Schemas and the JS syntax, then smoke-testing it in the sandbox. Nothing broken is saved. [§5.2](#52-create_tool--the-tool-factory). |
+| `create_module` | `name`, `description?`, `implementation_js` | Adds a version of a shared JS module (`module.exports = …`) that any Tool loads with `requireModule(name)`. Versions are immutable. |
+| `find_tools` | `query`, `limit?` | Keyword search over Tool names, descriptions and tags; the matches become callable in the current Session. This is how a Tool written in an earlier Session comes back, and it is the first step before writing a new one. |
+| `read_tool` | `name`, `version?`, `diff_from?` | A Tool's code, schemas, Capabilities, `memory_mb`, version history, metrics and recent failures; `diff_from` shows what one version changed. Read before writing a new version, so you change a Tool rather than rewrite it from memory. |
+| `read_module` | `name`, `version?` | A module's source, description and history, plus the Tools that require it. |
+| `test_tool` | `input`, plus `name` or the full `create_tool` draft | Dry-runs a saved Tool or an unsaved draft on real input, under its declared Capabilities and with the usual approvals. Nothing is saved or measured; it returns the output (or the error), console logs, and whether the output matched `output_schema`. |
+| `run_script` | `code`, `uses[]`, `input?`, `save_as?` | Runs a short script that may call only the registry Tools named in `uses` (built-ins are not callable from a script) — looping, filtering, branching, fanning out with `Promise.all` — and returns just the final value. The script has no Capabilities of its own, so anything that touches the world stays in a Tool; `save_as` persists a script you would run twice as a Tool. |
+| `unload_tools` | `names[]` | Drops Tools from the Session's listing at the next context compaction, so the prompt carries fewer, more relevant functions. `find_tools` loads them again later. |
+| `retire_tool` | `name`, `reason` | Makes a Tool uncallable everywhere, immediately. Data is retained and the user can restore it; deleting code and tallies ([purge](#53-lifecycle-and-versioning)) is user-only. |
+
+**Invocations, artifacts and metrics**
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `check_invocation` | `invocation_id` | A Pending Invocation's status: still `pending`, or its final result. |
+| `await_invocation` | `invocation_id` | Waits without a deadline for that result — this is how long work finishes instead of being killed ([§6](#6-invocations-async-by-design)). |
+| `abandon_invocation` | `invocation_id` | Stops waiting for a handle: the Invocation still finishes and is recorded, but its result is not delivered. |
+| `read_artifact` | `id`, `offset?`, `length?`, `grep?` | Reads a slice of a large output this Session stored as an artifact, or the lines matching `grep`, with line numbers. No approval needed, no other Session's artifacts. |
+| `read_metrics` | `kind`, `filter?`, `limit?` | Registry health, for cleaning up and explaining: `tools` (`needs_attention` \| `failing` \| `unused` \| a name), `audit`, `models`, `runs`, `builtins`, `duplicates`, `mcp_chains` ([§9](#9-self-optimisation)). |
+
+**Working with you, memory, MCP and skills**
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `ask_user` | `question` or `questions[]` (up to 4), `options[]`, `multi_select?` | Asks and waits for an answer without ending the Run, ideally with the options spelled out. With no client attached it fails at once, so the agent proceeds on a stated assumption instead of blocking. |
+| `update_plan` | `items[]` (`content`, `status`, up to 20) | The checklist pinned above the input for work of three or more steps; each call replaces the previous list. |
+| `remember` | `text` (≤ 300 chars), `scope?` | Saves a stable preference or fact ("use pnpm", "answer in Thai") as a note that reaches later Sessions. The user sees every note and can edit or disable it. |
+| `forget` | `id` | Deletes one memory note. |
+| `add_mcp_server` | `name`, `transport`, `command`/`args`/`env_keys` or `url`, `reason` | Proposes an [MCP server](#mcp-servers); the user approves the exact command or URL and env keys before it is connected, and its tools then appear as `mcp__<server>__<tool>`. |
+| `remove_mcp_server` | `name`, `reason` | Disconnects a server and retires its tools. |
+| `list_mcp_resources` | `server?`, `query?` | Lists the files, records and documents connected servers expose. |
+| `read_mcp_resource` | `server`, `uri` | Reads one of them; large contents become an artifact. |
+| `load_skill` | `name` | Loads an enabled [skill's](#skills) `SKILL.md` instructions before doing the kind of task it covers. |
+| `read_skill_file` | `name`, `path` | Reads one of that skill's extra files — reference docs, templates. |
+| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron, local time); recurring jobs need the user's approval. |
+
+Built-ins lead every Session's Tool list, in a fixed order, and are never unloaded by `unload_tools`.
+
+### 5.2 `create_tool` — the Tool factory
 
 ```text
 create_tool(name, description, input_schema, output_schema,
@@ -488,27 +539,20 @@ create_tool(name, description, input_schema, output_schema,
 * `create_tool` is immutable, excluded from Self-Optimisation, and cannot be retired or widened.
 * The smoke test is conclusive only until the Tool first meets a stub (fake fetch body, unbindable `$input` scope, …); a failure after that is reported as *inconclusive* and the Tool is saved.
 
-The other built-ins are the minimum the agent needs to grow and maintain its own registry:
-
-| Built-in | Purpose |
-|---|---|
-| `find_tools(query)` | Keyword search over the registry; matches become callable in this Session |
-| `read_tool(name, version?)` | Full code, schemas, Capabilities, versions, metrics and recent failures |
-| `test_tool(input, name \| draft)` | Dry-run a saved Tool or an unsaved draft on real input; not saved, not measured |
-| `create_module`, `retire_tool` | Shared JS modules, retirement |
+`find_tools` → `read_tool` → `create_tool` is the loop a Tool goes through the first time; `test_tool` and `run_script` shorten the next pass.
 
 Sub-agents are not a built-in: the agent builds a Tool with the `agent` Capability (`function run(i){ return agents.run(i.task); }`), so delegation is a measured, approval-gated Invocation. Several such calls in one turn run in parallel, and nesting is capped by `tools.max_agent_depth` (default 1).
 
 Each Session's Tool list is frozen at its first step: up to `tools.inline_limit` (default 40) Tools, the most-used first, plus the Tools that Session creates or finds later. Tools created in other Sessions are reached with `find_tools`, so they never change this Session's cached prompt prefix.
 
-### 5.2 Lifecycle and versioning
+### 5.3 Lifecycle and versioning
 
 * Tools are **never edited in place**. Any change creates a new integer version (`v1`, `v2`, …; no semver), recording timestamp, author (`agent` | `optimiser` | `import`) and, at promotion, the stats of the version it replaced.
 * A running Invocation always finishes on the version it started with; new Invocations use the current version.
 * **Retire** (agent): instant and global — the Tool becomes uncallable everywhere, data is retained, and it is restorable from the Tool browser. **Purge** (permanent deletion of code, history and tallies) is user-only, from the TUI.
 * Name collisions at creation are serialised by the daemon: the second creator gets the existing Tool as a new version instead of a fork.
 
-### 5.3 Capabilities (closed taxonomy)
+### 5.4 Capabilities (closed taxonomy)
 
 | Capability | Scoping | Notes |
 |---|---|---|
@@ -523,7 +567,7 @@ Each Session's Tool list is frozen at its first step: up to `tools.inline_limit`
 
 Capabilities are a **closed** list: no Tool can ask for a capability the runtime does not define, and nothing outside the declared set is reachable from the sandbox.
 
-### 5.4 The host API inside a Tool
+### 5.5 The host API inside a Tool
 
 QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provides the whole surface, and every entry is gated by a declared Capability.
 
@@ -559,7 +603,7 @@ function run(input) {
 }
 ```
 
-### 5.5 Composition rules
+### 5.6 Composition rules
 
 * `tools.call` records and measures nested Invocations exactly like top-level ones.
 * Composition cannot launder permissions: the called Tool runs under **its own** declared Capabilities, and the outer Tool's Capabilities also apply. Depth is bounded and cycle-safe.
@@ -721,7 +765,7 @@ Rules of the road: **no behaviour may live only in a client** — the CLI and TU
 
 Where to start:
 
-* **Runtime / sandbox** — `crates/formless-runtime`: the host API table in [§5.4](#54-the-host-api-inside-a-tool) is the contract.
+* **Runtime / sandbox** — `crates/formless-runtime`: the host API table in [§5.5](#55-the-host-api-inside-a-tool) is the contract.
 * **Agent loop, tools, optimiser** — `crates/formless-core`; [§5](#5-the-tool-system) and [§9](#9-self-optimisation) describe the invariants.
 * **Protocol** — `crates/formless-protocol` is versioned; clients and daemon must be updated together.
 * **Clients** — `crates/formless-tui` and `crates/formless`; the relay's web UI lives in `relay/`.
