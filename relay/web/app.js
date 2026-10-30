@@ -3431,6 +3431,8 @@
     const k = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
     let s = u.steps + " step" + (u.steps === 1 ? "" : "s") + " · " + k(u.prompt_tokens) + " in / " + k(u.completion_tokens) + " out";
     if (u.prompt_tokens > 0 && u.cached_tokens > 0) s += " · " + Math.round((100 * u.cached_tokens) / u.prompt_tokens) + "% cached";
+    if (u.cache_write_tokens > 0) s += " · " + u.cache_write_tokens + " written to cache";
+    if (u.cost == null && (u.unpriced || []).length) s += " · no price for " + u.unpriced.join(", ");
     if (u.cost != null) s += " · $" + u.cost.toFixed(3);
     if (u.memories > 0) s += " · used " + u.memories + (u.memories === 1 ? " memory" : " memories");
     return s;

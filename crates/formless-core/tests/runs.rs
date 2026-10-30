@@ -300,6 +300,7 @@ async fn session_usage_totals_and_priced_cost() {
             input: 2.0,
             output: 8.0,
             cached_input: Some(0.5),
+            ..Default::default()
         },
     );
     cfg.save(&paths).unwrap();

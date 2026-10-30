@@ -113,6 +113,11 @@ enum Cmd {
         #[command(subcommand)]
         action: ProvidersAction,
     },
+    /// Model prices for spending limits and cost (provider.prices)
+    Prices {
+        #[command(subcommand)]
+        action: PricesAction,
+    },
     /// Sessions: list, show, search, rename, delete, export or import them
     Sessions {
         #[command(subcommand)]
@@ -548,6 +553,24 @@ enum SkillsAction {
     /// Install a bundle; imported skills start disabled for review
     Import {
         file: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PricesAction {
+    /// Copy prices from the provider's /models listing (OpenRouter and
+    /// others that publish them) into provider.prices, for the models
+    /// you use (or every listed one with --all)
+    Import {
+        /// A named provider (default: the default one)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Every model the listing prices, not only the ones in use
+        #[arg(long)]
+        all: bool,
+        /// Show what would change; write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1330,6 +1353,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
+        Some(Cmd::Prices { action }) => prices_cmd(paths, action),
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
         Some(Cmd::Logs {
@@ -2716,6 +2740,58 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         cfg.daemon.log_max_bytes as f64 / 1e6,
         cfg.daemon.log_keep
     );
+    // Dollar limits that can't count a model, and prices gone stale (#809).
+    if cfg.limits.run_usd.is_some() || cfg.limits.daily_usd.is_some() {
+        let mut models: Vec<(String, String)> = std::iter::once(&cfg.provider.model)
+            .chain(&cfg.provider.fallback_models)
+            .map(|m| ("default".to_string(), m.clone()))
+            .collect();
+        for r in cfg.roles.values() {
+            if !r.model.is_empty() {
+                models.push((
+                    r.provider.clone().unwrap_or_else(|| "default".into()),
+                    r.model.clone(),
+                ));
+            }
+        }
+        let unpriced: Vec<String> = models
+            .into_iter()
+            .filter(|(p, m)| !m.is_empty() && cfg.cost_of(p, m, 1, 1, 0, 0, None).is_none())
+            .map(|(_, m)| m)
+            .collect();
+        if !unpriced.is_empty() {
+            problems.push(Problem {
+                what: format!(
+                    "spending limits are set but can't count {}: no price in provider.prices",
+                    unpriced.join(", ")
+                ),
+                next: Some("formless prices import (or add provider.prices entries)".into()),
+                fix: None,
+            });
+        }
+    }
+    let stale_before = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+    let stale: Vec<&String> = std::iter::once(&cfg.provider)
+        .chain(cfg.providers.values())
+        .flat_map(|p| p.prices.iter())
+        .filter(|(_, pr)| {
+            pr.retrieved_at
+                .as_deref()
+                .is_some_and(|t| t < stale_before.as_str())
+        })
+        .map(|(m, _)| m)
+        .collect();
+    if !stale.is_empty() {
+        problems.push(Problem {
+            what: format!(
+                "{} imported price(s) are over 90 days old (e.g. {})",
+                stale.len(),
+                stale[0]
+            ),
+            next: Some("formless prices import".into()),
+            fix: None,
+        });
+    }
     // What the running daemon enforces, not what this process would (#847).
     let enforced = daemon_secure(&paths);
     let secure = enforced.unwrap_or(cfg.security.secure);
@@ -4043,6 +4119,103 @@ fn set_archived(paths: &Paths, id: &str, archived: bool) -> Result<()> {
         if archived { "archived" } else { "restored" },
         s.name
     );
+    Ok(())
+}
+
+/// `formless prices import` (#809): the endpoint's own prices, dated, so
+/// dollar limits can count the models in use.
+fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
+    let PricesAction::Import {
+        provider,
+        all,
+        dry_run,
+    } = action;
+    let live = Config::load(&paths)?;
+    let pcfg = live.provider_cfg(provider.as_deref())?;
+    let name = provider.clone().unwrap_or_else(|| "default".into());
+    let rt = tokio::runtime::Runtime::new()?;
+    let listed = rt.block_on(async {
+        let p = match provider.as_deref() {
+            None => {
+                formless_core::provider::Provider::for_profile(pcfg.clone(), paths.clone()).await?
+            }
+            Some(n) => formless_core::provider::Provider::new(
+                pcfg.clone(),
+                formless_core::config::provider_key(&paths, n).unwrap_or_default(),
+            )?,
+        };
+        p.list_model_prices().await
+    })?;
+    if listed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{name}'s /models listing has no prices; add them to provider.prices by hand"
+        ));
+    }
+    // The models in use: the provider's model and fallbacks, Roles on it,
+    // and any it has served (from usage).
+    let mut wanted: std::collections::BTreeSet<String> = Default::default();
+    wanted.insert(pcfg.model.clone());
+    wanted.extend(pcfg.fallback_models.iter().cloned());
+    for r in live.roles.values() {
+        if r.provider.as_deref().unwrap_or("default") == name {
+            if !r.model.is_empty() {
+                wanted.insert(r.model.clone());
+            }
+        }
+    }
+    if let Ok(store) = formless_core::Store::open(&paths.db_file()) {
+        if let Ok(used) = store.usage_by_model(None) {
+            wanted.extend(used.into_keys());
+        }
+    }
+    let mut cfg = Config::load_file_only(&paths)?;
+    let target = match provider.as_deref() {
+        None => &mut cfg.provider,
+        Some(n) => cfg
+            .providers
+            .get_mut(n)
+            .with_context(|| format!("unknown provider '{n}'"))?,
+    };
+    let mut changed = Vec::new();
+    for (model, price) in listed {
+        let used = wanted.contains(&model)
+            || wanted
+                .iter()
+                .any(|w| w.rsplit('/').next() == model.rsplit('/').next());
+        if !all && !used {
+            continue;
+        }
+        let old = target.prices.get(&model);
+        let same = old.is_some_and(|o| {
+            o.input == price.input
+                && o.output == price.output
+                && o.cached_input == price.cached_input
+        });
+        if !same {
+            changed.push(format!(
+                "{model}: ${:.4} in / ${:.4} out per 1M tokens{}",
+                price.input,
+                price.output,
+                if old.is_some() { " (updated)" } else { "" }
+            ));
+            if !dry_run {
+                target.prices.insert(model, price);
+            }
+        }
+    }
+    if changed.is_empty() {
+        println!("prices for {name} are up to date");
+        return Ok(());
+    }
+    for c in &changed {
+        println!("{c}");
+    }
+    if dry_run {
+        println!("(dry run: nothing written)");
+    } else {
+        cfg.save(&paths)?;
+        println!("saved {} price(s) to provider.prices", changed.len());
+    }
     Ok(())
 }
 

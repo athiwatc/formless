@@ -174,6 +174,40 @@ fn stop_note(result: &crate::provider::ChatResult) -> Option<String> {
     }
 }
 
+/// What the daemon's own model calls inside [`counted`] are for, and the
+/// Session/Run they serve ("" when none).
+#[derive(Clone)]
+pub(crate) struct UsageFor {
+    pub source: &'static str,
+    pub session_id: String,
+    pub run_id: String,
+}
+
+tokio::task_local! {
+    static USAGE_FOR: UsageFor;
+}
+
+/// Run `fut` with its model calls recorded as `source` (`compaction`,
+/// `optimiser-generate`, `optimiser-eval`, `approval-summary`,
+/// `skill-distil`), so usage views and the daily limit count them (#806).
+pub(crate) async fn counted<F: std::future::Future>(
+    source: &'static str,
+    session_id: &str,
+    run_id: &str,
+    fut: F,
+) -> F::Output {
+    USAGE_FOR
+        .scope(
+            UsageFor {
+                source,
+                session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
+            },
+            fut,
+        )
+        .await
+}
+
 tokio::task_local! {
     /// The connection (id, label) a request came from, for attribution.
     static CLIENT: (u64, String);
@@ -645,7 +679,9 @@ impl Daemon {
                     ));
                 }
                 let key = crate::config::provider_key(&self.paths, n).unwrap_or_default();
-                Ok(Provider::with_key(pcfg, key, self.http.clone()))
+                Ok(Provider::with_key(pcfg, key, self.http.clone())
+                    .with_name(n)
+                    .with_usage_hook(self.usage_hook()))
             }
         }
     }
@@ -729,8 +765,37 @@ impl Daemon {
 
     /// A provider for `cfg` on the daemon's shared HTTP client.
     pub(crate) async fn provider(&self, cfg: &Config) -> Result<Provider> {
-        Provider::for_profile_with(cfg.provider.clone(), self.paths.clone(), self.http.clone())
-            .await
+        Ok(
+            Provider::for_profile_with(cfg.provider.clone(), self.paths.clone(), self.http.clone())
+                .await?
+                .with_name(crate::config::DEFAULT_PROVIDER)
+                .with_usage_hook(self.usage_hook()),
+        )
+    }
+
+    /// Records the usage of the daemon's own model calls (compaction, the
+    /// optimiser, approval summaries, skill distilling) made inside
+    /// [`counted`]; Run steps, sub-agents and `llm.complete` record
+    /// themselves (#806).
+    fn usage_hook(&self) -> crate::provider::UsageHook {
+        let store = self.store.clone();
+        Arc::new(
+            move |provider: &str, model: &str, u: &crate::provider::Usage| {
+                let Ok(f) = USAGE_FOR.try_with(Clone::clone) else {
+                    return;
+                };
+                if let Ok(st) = store.lock() {
+                    let _ = st.record_usage_full(
+                        &f.session_id,
+                        &f.run_id,
+                        provider,
+                        model,
+                        u,
+                        f.source,
+                    );
+                }
+            },
+        )
     }
 
     pub(crate) fn broadcast(&self, ev: Event) {
@@ -2174,8 +2239,8 @@ impl Daemon {
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
                 let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
-                for (key, model, p, c, cached, reported) in rows {
-                    let price = cfg.provider.cost_of(&model, p, c, cached, reported);
+                for (key, provider, model, p, c, cached, cw, reported) in rows {
+                    let price = cfg.cost_of(&provider, &model, p, c, cached, cw, reported);
                     match out.last_mut().filter(|o| o.0 == key) {
                         Some(o) => {
                             o.1 += p;
@@ -3281,10 +3346,13 @@ impl Daemon {
                 ver.capabilities.join(", "),
             )}),
         ];
-        let (text, _) = target
-            .provider
-            .complete_with_usage(&messages, &model, None)
-            .await?;
+        let (text, _) = counted(
+            "approval-summary",
+            "",
+            "",
+            target.provider.complete_with_usage(&messages, &model, None),
+        )
+        .await?;
         Ok(text
             .trim()
             .chars()
@@ -3845,18 +3913,21 @@ impl Daemon {
             .unwrap_or_else(|| cfg.provider.model.clone());
         let model = self.resolve_model(&requested, cfg, false)?;
         let input = crate::skills::distil_input(task, calls, outcome, existing);
-        let reply = self
-            .provider(cfg)
-            .await?
-            .complete(
+        let distiller = self.provider(cfg).await?;
+        let reply = counted(
+            "skill-distil",
+            "",
+            "",
+            distiller.complete(
                 &[
                     json!({"role": "system", "content": crate::skills::DISTIL_PROMPT}),
                     json!({"role": "user", "content": input}),
                 ],
                 &model,
                 None,
-            )
-            .await?;
+            ),
+        )
+        .await?;
         let Some((meta, text)) = crate::skills::parse_distilled(&reply) else {
             return Ok(());
         };
@@ -4000,6 +4071,21 @@ impl Daemon {
                 text: format!("Routed to model {model} (measured auto-selection)."),
             });
         }
+        // A dollar limit can't count a model without a price: say so rather
+        // than let the limit silently never fire (#809).
+        let dollar_limit = cfg.limits.run_usd.is_some() || cfg.limits.daily_usd.is_some();
+        if dollar_limit
+            && cfg
+                .cost_of(provider.name(), &model, 1, 1, 0, 0, None)
+                .is_none()
+        {
+            self.broadcast(Event::Note {
+                session_id: Some(session_id.to_string()),
+                text: format!(
+                    "Spending limits can't count {model}: it has no price in provider.prices (formless prices import, or add one), so limits.run_usd / daily_usd won't stop this Run."
+                ),
+            });
+        }
         let effort = target.effort.clone();
         let (context_tokens, _) = self.context_window(&provider, &model).await;
         self.record_run_memories(session_id, run_id);
@@ -4137,7 +4223,14 @@ impl Daemon {
                     let _ = self.with_store(|st| st.bump_run_steps(run_id));
                     if let Some(usage) = &r.usage {
                         let _ = self.with_store(|st| {
-                            st.record_usage(session_id, run_id, &r.model_used, usage)
+                            st.record_usage_full(
+                                session_id,
+                                run_id,
+                                provider.name(),
+                                &r.model_used,
+                                usage,
+                                "run",
+                            )
                         });
                     }
                     if let Ok(mut usage) = self.usage_info(None, Some(run_id), &cfg) {
@@ -6791,15 +6884,24 @@ impl Daemon {
                     step += 1;
                     if let Some(u) = &result.usage {
                         let _ = self.with_store(|st| {
-                            st.record_usage_from(session_id, run_id, &model, u, "agent")
+                            st.record_usage_full(
+                                session_id,
+                                run_id,
+                                provider.name(),
+                                &model,
+                                u,
+                                "agent",
+                            )
                         });
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
                         task_cost = task_cost
-                            .zip(cfg.provider.cost_of(
+                            .zip(cfg.cost_of(
+                                provider.name(),
                                 &model,
                                 u.prompt_tokens as i64,
                                 u.completion_tokens as i64,
                                 u.cached_tokens as i64,
+                                u.cache_write_tokens as i64,
                                 u.cost,
                             ))
                             .map(|(sum, c)| sum + c);
@@ -7659,8 +7761,8 @@ impl Daemon {
             let rows = self.with_reader(|st| st.usage_grouped(Some(&today), "model"))?;
             let day: Option<f64> = rows
                 .iter()
-                .map(|(_, model, p, c, cached, reported)| {
-                    cfg.provider.cost_of(model, *p, *c, *cached, *reported)
+                .map(|(_, provider, model, p, c, cached, cw, reported)| {
+                    cfg.cost_of(provider, model, *p, *c, *cached, *cw, *reported)
                 })
                 .sum();
             if let Some(cost) = day {
@@ -7716,13 +7818,16 @@ impl Daemon {
             ..Default::default()
         };
         let mut cost = Some(0.0);
-        for (model, p, c, cached, reported) in rows {
+        for (provider, model, p, c, cached, cw, reported) in rows {
             u.prompt_tokens += p;
             u.completion_tokens += c;
             u.cached_tokens += cached;
-            cost = cost
-                .zip(cfg.provider.cost_of(&model, p, c, cached, reported))
-                .map(|(sum, c)| sum + c);
+            u.cache_write_tokens += cw;
+            let one = cfg.cost_of(&provider, &model, p, c, cached, cw, reported);
+            if one.is_none() && !u.unpriced.contains(&model) {
+                u.unpriced.push(model.clone());
+            }
+            cost = cost.zip(one).map(|(sum, c)| sum + c);
         }
         u.cost = cost.filter(|_| u.prompt_tokens + u.completion_tokens > 0);
         if let Some(r) = run_id {
@@ -10354,11 +10459,23 @@ impl Daemon {
                         session_id: Some(session_id.to_string()),
                         text: format!("Server-side compaction unavailable ({e}); using daemon-side compaction."),
                     });
-                    provider.summarize(&input, &cmodel).await?
+                    counted(
+                        "compaction",
+                        session_id,
+                        "",
+                        provider.summarize(&input, &cmodel),
+                    )
+                    .await?
                 }
             }
         } else {
-            provider.summarize(&input, &cmodel).await?
+            counted(
+                "compaction",
+                session_id,
+                "",
+                provider.summarize(&input, &cmodel),
+            )
+            .await?
         };
         let summary = if previous.is_empty() || condense {
             summary
@@ -11946,18 +12063,27 @@ impl HostOps for NestedOps {
         ))?;
         if let Some(u) = &usage {
             let _ = self.daemon.with_store(|st| {
-                st.record_usage_from(&self.session_id, &self.run_id, &model, u, "llm")
+                st.record_usage_full(
+                    &self.session_id,
+                    &self.run_id,
+                    provider.name(),
+                    &model,
+                    u,
+                    "llm",
+                )
             });
         }
         // A Tool's own model calls count toward its Cost per Success, and
         // as its model use (§10.4).
         if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
             let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
-            let cost = self.cfg.provider.cost_of(
+            let cost = self.cfg.cost_of(
+                provider.name(),
                 &model,
                 u.prompt_tokens as i64,
                 u.completion_tokens as i64,
                 u.cached_tokens as i64,
+                u.cache_write_tokens as i64,
                 u.cost,
             );
             let _ = self.daemon.with_store(|st| {
@@ -12720,5 +12846,68 @@ mod backpressure_tests {
             assert!(!after.is_empty() && after != before);
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod internal_usage_tests {
+    use super::*;
+
+    /// The daemon's own calls (here a compaction summary) are recorded
+    /// with their purpose and serving provider, so usage views and the
+    /// daily limit see them; calls outside `counted` are not (#806).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn counted_calls_are_recorded_by_purpose() {
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "choices": [{"message": {"content": "summary"}}],
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 30}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        std::env::set_var("FORMLESS_API_KEY", "k");
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("fl-iu-{short}"));
+        let paths = crate::Paths {
+            data_dir: dir.join("d"),
+            config_dir: dir.join("c"),
+            profile: format!("test-iu-{short}"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.provider.base_url = base;
+        cfg.provider.model = "m".into();
+        cfg.save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let cfg = daemon.config().unwrap();
+        let provider = daemon.provider(&cfg).await.unwrap();
+        counted(
+            "compaction",
+            "s1",
+            "",
+            provider.summarize("long history", "m"),
+        )
+        .await
+        .unwrap();
+        // Not counted: Run steps record themselves.
+        provider.summarize("again", "m").await.unwrap();
+        let tokens = daemon
+            .with_store(|st| st.internal_tokens_today("compaction"))
+            .unwrap();
+        assert_eq!(tokens, 150);
+        let rows = daemon
+            .with_store(|st| st.usage_grouped(None, "purpose"))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1.as_str()),
+            ("compaction", "default")
+        );
     }
 }

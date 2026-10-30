@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
-pub type GroupedUsage = (String, String, i64, i64, i64, Option<f64>);
+/// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
+pub type GroupedUsage = (String, String, String, i64, i64, i64, i64, Option<f64>);
 
 pub struct Store {
     conn: Connection,
@@ -289,7 +290,8 @@ pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
 
 /// Token use of one model: (model, prompt, completion, cached,
 /// provider-reported USD when every request reported one).
-pub type ModelUsage = (String, i64, i64, i64, Option<f64>);
+/// (provider, model, prompt, completion, cached, cache-write, reported cost).
+pub type ModelUsage = (String, String, i64, i64, i64, i64, Option<f64>);
 
 /// Scheduled jobs (SPEC §9.7).
 const SCHEMA_V22: &str = "
@@ -348,7 +350,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 53;
+pub const SCHEMA_VERSION: i64 = 54;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -433,7 +435,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 53] = [
+const MIGRATIONS: [(i64, MigrationStep); 54] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -658,6 +660,32 @@ const MIGRATIONS: [(i64, MigrationStep); 53] = [
             "CREATE TABLE IF NOT EXISTS pending_attachments (
                session_id TEXT NOT NULL, att TEXT NOT NULL, created_at TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS idx_pending_att_session ON pending_attachments(session_id);",
+        )?)
+    }),
+    // Which provider served each request, for its own prices (#810); ''
+    // for rows from before (priced as the default provider's).
+    // Which provider served each request, for its own prices (#810; '' for
+    // older rows, priced as the default's). The table loses its Session
+    // foreign key: the daemon's own calls (compaction, the optimiser…)
+    // often have no Session but still count (#806).
+    (54, |c| {
+        add_column(c, "run_usage", "provider TEXT NOT NULL DEFAULT ''")?;
+        Ok(c.execute_batch(
+            "CREATE TABLE run_usage_new (
+               session_id TEXT NOT NULL, run_id TEXT NOT NULL, model TEXT NOT NULL,
+               prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
+               reasoning_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL,
+               created_at TEXT NOT NULL, cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+               cost REAL, source TEXT NOT NULL DEFAULT 'run', provider TEXT NOT NULL DEFAULT '');
+             INSERT INTO run_usage_new(session_id, run_id, model, prompt_tokens, completion_tokens,
+               reasoning_tokens, cached_tokens, created_at, cache_write_tokens, cost, source, provider)
+               SELECT session_id, run_id, model, prompt_tokens, completion_tokens,
+               reasoning_tokens, cached_tokens, created_at, cache_write_tokens, cost, source, provider
+               FROM run_usage;
+             DROP TABLE run_usage;
+             ALTER TABLE run_usage_new RENAME TO run_usage;
+             CREATE INDEX IF NOT EXISTS idx_run_usage_session ON run_usage(session_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_run_usage_run ON run_usage(run_id);",
         )?)
     }),
 ];
@@ -1828,13 +1856,21 @@ impl Store {
         run_id: Option<&str>,
     ) -> Result<(Vec<ModelUsage>, i64)> {
         let mut stmt = self.ps(
-            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens),
-               CASE WHEN COUNT(cost)=COUNT(*) THEN SUM(cost) END FROM run_usage
-             WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR run_id=?2) GROUP BY model",
+            "SELECT provider, model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens),
+               SUM(cache_write_tokens), CASE WHEN COUNT(cost)=COUNT(*) THEN SUM(cost) END FROM run_usage
+             WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR run_id=?2) GROUP BY provider, model",
         )?;
         let rows = stmt
             .query_map(params![session_id, run_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         let steps: i64 = self.conn.query_row(
@@ -4611,8 +4647,22 @@ impl Store {
         usage: &crate::provider::Usage,
         source: &str,
     ) -> Result<()> {
+        self.record_usage_full(session_id, run_id, "", model, usage, source)
+    }
+
+    /// [`Self::record_usage_from`] naming the provider that served it, so
+    /// its own prices apply (#810).
+    pub fn record_usage_full(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        provider: &str,
+        model: &str,
+        usage: &crate::provider::Usage,
+        source: &str,
+    ) -> Result<()> {
         self.ex(
-            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 session_id,
                 run_id,
@@ -4624,10 +4674,23 @@ impl Store {
                 usage.cache_write_tokens as i64,
                 usage.cost,
                 now(),
-                source
+                source,
+                provider
             ],
         )?;
         Ok(())
+    }
+
+    /// Tokens the daemon's own calls of `source_prefix` (e.g. `optimiser`)
+    /// reported today, UTC (#806).
+    pub fn internal_tokens_today(&self, source_prefix: &str) -> Result<i64> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens),0) FROM run_usage
+             WHERE created_at >= ?1 AND substr(source,1,length(?2))=?2",
+            params![today, source_prefix],
+            |r| r.get(0),
+        )?)
     }
 
     /// Hold an attachment for the Session's next user message.
@@ -4722,22 +4785,25 @@ impl Store {
         Ok(rows)
     }
 
-    /// Token use since `since` grouped by `by` ("model", "role",
-    /// "session", else the UTC day) and model (for pricing): (key, model,
-    /// prompt, completion, cached).
+    /// Token use since `since` grouped by `by` ("model", "provider",
+    /// "purpose", "role", "session", else the UTC day), then by provider
+    /// and model for pricing.
     pub fn usage_grouped(&self, since: Option<&str>, by: &str) -> Result<Vec<GroupedUsage>> {
         let key = match by {
             "model" => "u.model",
+            "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
+            "purpose" => "u.source",
             "session" => "COALESCE(s.name, u.session_id)",
             "role" => "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')",
             _ => "substr(u.created_at, 1, 10)",
         };
         let mut stmt = self.ps(&format!(
-            "SELECT {key}, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens), SUM(u.cached_tokens),
+            "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
+               SUM(u.cached_tokens), SUM(u.cache_write_tokens),
                CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END
              FROM run_usage u LEFT JOIN sessions s ON s.id=u.session_id
              WHERE ?1 IS NULL OR u.created_at >= ?1
-             GROUP BY 1, 2 ORDER BY 1"
+             GROUP BY 1, 2, 3 ORDER BY 1"
         ))?;
         let rows = stmt
             .query_map(params![since], |r| {
@@ -4748,6 +4814,8 @@ impl Store {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -4757,7 +4825,7 @@ impl Store {
     /// Summed usage of a Run's provider requests.
     pub fn run_usage(&self, run_id: &str) -> Result<crate::provider::Usage> {
         Ok(self.conn.query_row(
-            "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0) FROM run_usage WHERE run_id=?1",
+            "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_write_tokens),0) FROM run_usage WHERE run_id=?1",
             params![run_id],
             |r| {
                 Ok(crate::provider::Usage {
@@ -4765,6 +4833,7 @@ impl Store {
                     completion_tokens: r.get::<_, i64>(1)? as u64,
                     reasoning_tokens: r.get::<_, i64>(2)? as u64,
                     cached_tokens: r.get::<_, i64>(3)? as u64,
+                    cache_write_tokens: r.get::<_, i64>(4)? as u64,
                     ..Default::default()
                 })
             },

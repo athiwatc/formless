@@ -143,7 +143,14 @@ impl Daemon {
             "prompt",
             "generating a proposal (runs the eval suite)...".into(),
         );
-        if let Err(e) = self.generate_proposal_inner(&cfg).await {
+        if let Err(e) = crate::daemon::counted(
+            "optimiser-generate",
+            "",
+            "",
+            self.generate_proposal_inner(&cfg),
+        )
+        .await
+        {
             let text = e.to_string();
             self.activity(
                 "prompt",
@@ -291,10 +298,20 @@ impl Daemon {
         );
         let repeats = cfg.optimiser.eval_repeats;
         let measured = async {
-            let (base_score, total) =
-                evaluate_prompt(&provider, &baseline_prompt, &model, effort, repeats).await?;
-            let (cand_score, _) =
-                evaluate_prompt(&provider, &candidate_prompt, &model, effort, repeats).await?;
+            let (base_score, total) = crate::daemon::counted(
+                "optimiser-eval",
+                "",
+                "",
+                evaluate_prompt(&provider, &baseline_prompt, &model, effort, repeats),
+            )
+            .await?;
+            let (cand_score, _) = crate::daemon::counted(
+                "optimiser-eval",
+                "",
+                "",
+                evaluate_prompt(&provider, &candidate_prompt, &model, effort, repeats),
+            )
+            .await?;
             Ok::<_, anyhow::Error>((base_score, cand_score, total))
         }
         .await;
@@ -389,7 +406,13 @@ impl Daemon {
             return false;
         }
         if let Some(budget) = cfg.optimiser.token_budget {
-            if self.with_store(|st| st.attempt_tokens_today()).unwrap_or(0) >= budget as i64 {
+            // Real reported tokens (generation and eval suites) when the
+            // endpoint reports them, else the chars/4 estimates (#806).
+            let real = self
+                .with_store(|st| st.internal_tokens_today("optimiser"))
+                .unwrap_or(0);
+            let estimated = self.with_store(|st| st.attempt_tokens_today()).unwrap_or(0);
+            if real.max(estimated) >= budget as i64 {
                 return false;
             }
         }
@@ -431,7 +454,14 @@ impl Daemon {
             return;
         }
         self.activity(&info.name, "generating candidate…".into());
-        match self.generate_candidate(&info, &ver, cfg).await {
+        match crate::daemon::counted(
+            "optimiser-generate",
+            "",
+            "",
+            self.generate_candidate(&info, &ver, cfg),
+        )
+        .await
+        {
             Ok((cand, est_tokens)) => {
                 let attempt_id = match self
                     .with_store(|st| st.create_attempt(tool_id, ver.version, &cand, est_tokens))

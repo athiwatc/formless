@@ -752,8 +752,15 @@ pub struct UsageInfo {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cached_tokens: i64,
+    /// Part of `prompt_tokens` written to the prompt cache (#804).
+    #[serde(default)]
+    pub cache_write_tokens: i64,
     /// Estimated USD, when every model used has a configured price.
     pub cost: Option<f64>,
+    /// Models used that have no price, so `cost` (and dollar limits) can't
+    /// count them (#809).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpriced: Vec<String>,
     /// The latest step's prompt tokens and the model's context size
     /// (SPEC §10.6); 0 when unknown.
     #[serde(default)]

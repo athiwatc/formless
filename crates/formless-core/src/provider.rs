@@ -190,9 +190,16 @@ pub struct Provider {
     on_retry: Option<RetryHook>,
     /// Told when a model's circuit breaker opens or closes (#621).
     on_note: Option<NoteHook>,
+    /// Told of every request's reported usage (model, usage), so the
+    /// daemon's own calls are counted too (#806).
+    on_usage: Option<UsageHook>,
+    /// The configured provider's name (`default` or a `[providers.<name>]`
+    /// key), for pricing usage from its own table (#810).
+    name: String,
 }
 
 pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
+pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) + Send + Sync>;
 
 /// Per-model circuit breakers (#621), shared by every Session in the
 /// daemon: after `BREAKER_TRIP` consecutive retryable failures a model is
@@ -341,8 +348,19 @@ impl Usage {
             return None;
         }
         let n = |v: &Value| v.as_u64().unwrap_or(0);
+        // Anthropic reports cache reads and writes beside `input_tokens`;
+        // everywhere else they are parts of the prompt. Normalised to
+        // parts, so each is priced once (#804).
+        let beside = u.get("prompt_tokens").is_none()
+            && (u.get("cache_read_input_tokens").is_some()
+                || u.get("cache_creation_input_tokens").is_some());
+        let extra = if beside {
+            n(&u["cache_read_input_tokens"]) + n(&u["cache_creation_input_tokens"])
+        } else {
+            0
+        };
         Some(Self {
-            prompt_tokens: n(&u["prompt_tokens"]).max(n(&u["input_tokens"])),
+            prompt_tokens: n(&u["prompt_tokens"]).max(n(&u["input_tokens"])) + extra,
             completion_tokens: n(&u["completion_tokens"]).max(n(&u["output_tokens"])),
             reasoning_tokens: n(&u["completion_tokens_details"]["reasoning_tokens"])
                 .max(n(&u["output_tokens_details"]["reasoning_tokens"])),
@@ -679,6 +697,8 @@ impl Provider {
             cache_key: None,
             on_retry: None,
             on_note: None,
+            on_usage: None,
+            name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
     }
@@ -698,6 +718,8 @@ impl Provider {
             cache_key: None,
             on_retry: None,
             on_note: None,
+            on_usage: None,
+            name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         }
     }
@@ -726,6 +748,8 @@ impl Provider {
             cache_key: None,
             on_retry: None,
             on_note: None,
+            on_usage: None,
+            name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
     }
@@ -756,6 +780,30 @@ impl Provider {
     pub fn with_note_hook(mut self, hook: NoteHook) -> Self {
         self.on_note = Some(hook);
         self
+    }
+
+    /// Report each request's usage to `hook` as (provider name, model,
+    /// usage).
+    pub fn with_usage_hook(mut self, hook: UsageHook) -> Self {
+        self.on_usage = Some(hook);
+        self
+    }
+
+    /// Name this provider as it is configured.
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
+    }
+
+    /// The configured provider's name (`default` or a named provider).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn report_usage(&self, model: &str, usage: Option<&Usage>) {
+        if let (Some(hook), Some(u)) = (&self.on_usage, usage) {
+            hook(&self.name, model, u);
+        }
     }
 
     fn note(&self, text: String) {
@@ -925,6 +973,13 @@ impl Provider {
         Ok(body)
     }
 
+    /// Prices the endpoint's `/models` listing gives (OpenRouter's
+    /// per-model `pricing`), for `formless prices import` (#809).
+    pub async fn list_model_prices(&self) -> Result<HashMap<String, crate::config::ModelPrice>> {
+        let body = self.models_body().await?;
+        Ok(parse_model_prices(&body, &chrono::Utc::now().to_rfc3339()))
+    }
+
     pub async fn list_models_with_windows(&self) -> Result<(Vec<String>, HashMap<String, u32>)> {
         let body = self.models_body().await?;
         Ok((parse_models(&body), parse_model_windows(&body)))
@@ -983,6 +1038,19 @@ impl Provider {
 
     /// [`Provider::complete`] plus the reported token usage.
     pub async fn complete_with_usage(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<(String, Option<Usage>)> {
+        let out = self
+            .complete_with_usage_inner(messages, model, effort)
+            .await?;
+        self.report_usage(model, out.1.as_ref());
+        Ok(out)
+    }
+
+    async fn complete_with_usage_inner(
         &self,
         messages: &[Value],
         model: &str,
@@ -1223,6 +1291,27 @@ impl Provider {
     /// per content or reasoning chunk; honours cancel; assembles streamed
     /// tool_calls (SPEC §5/§7).
     pub async fn chat_stream<F: FnMut(DeltaKind, &str) + Send>(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        cancel: &CancellationToken,
+        on_delta: F,
+    ) -> Result<ChatResult> {
+        let out = self
+            .chat_stream_inner(messages, tools, model, effort, cancel, on_delta)
+            .await?;
+        let served = if out.model_used.is_empty() {
+            model
+        } else {
+            &out.model_used
+        };
+        self.report_usage(served, out.usage.as_ref());
+        Ok(out)
+    }
+
+    async fn chat_stream_inner<F: FnMut(DeltaKind, &str) + Send>(
         &self,
         messages: &[Value],
         tools: &[Value],
@@ -2088,6 +2177,48 @@ fn parse_models(body: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Per-model prices from a `/models` listing's `pricing` (USD per token,
+/// as strings or numbers: `prompt`, `completion`, `input_cache_read`,
+/// `input_cache_write`), as USD per million tokens. Free (0/0) and
+/// unparseable entries are left out.
+pub fn parse_model_prices(
+    body: &Value,
+    retrieved_at: &str,
+) -> HashMap<String, crate::config::ModelPrice> {
+    let per_m = |v: &Value| -> Option<f64> {
+        let x = match v {
+            Value::String(s) => s.parse::<f64>().ok()?,
+            Value::Number(n) => n.as_f64()?,
+            _ => return None,
+        };
+        (x.is_finite() && x >= 0.0).then_some(x * 1e6)
+    };
+    body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?;
+            let p = &m["pricing"];
+            let input = per_m(&p["prompt"])?;
+            let output = per_m(&p["completion"])?;
+            if input == 0.0 && output == 0.0 {
+                return None;
+            }
+            Some((
+                id.to_string(),
+                crate::config::ModelPrice {
+                    input,
+                    output,
+                    cached_input: per_m(&p["input_cache_read"]),
+                    cache_write_input: per_m(&p["input_cache_write"]),
+                    retrieved_at: Some(retrieved_at.to_string()),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Context window per model id, from a `/models` listing's per-model
