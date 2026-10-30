@@ -279,9 +279,15 @@ without redesign.
   `oauth_tokens-<id>.json` fallback, one set per provider (`<id>` is
   derived from its `token_url` and `client_id`, so two OAuth providers
   never overwrite each other). A profile-wide set from an older version
-  moves to the default provider on first use. `formless auth
-  status|logout` inspect or delete those tokens without printing them.
-  Full reset deletes them too.
+  moves to the default provider on first use. Both copies carry the time
+  they were saved and the newer one wins; when only one write succeeds,
+  the other store's older copy is removed (or the save fails). `formless
+  auth status|logout` inspect or delete those tokens without printing
+  them; logout first revokes the refresh token (RFC 7009) when
+  `provider.auth.revocation_url` is set, reports any copy it could not
+  delete, and says when an API key or `FORMLESS_OAUTH_ACCESS_TOKEN` stays
+  in force. `doctor` reports whether the keychain works or only the
+  files hold secrets. Full reset deletes them too.
 - Before every provider construction (main Runs, sub-agents,
   Tool-initiated `llm.complete`, optimiser calls, compaction through the
   already-constructed provider, and `doctor` probes), the daemon/CLI
@@ -289,7 +295,10 @@ without redesign.
   environment → fallback file → keychain load order. OAuth mode accepts
   `FORMLESS_OAUTH_ACCESS_TOKEN` as an explicit override; otherwise it
   returns a non-expired stored token or refreshes it before the call.
-  Refresh is serialized in-process, a rotated refresh token is persisted
+  Refresh is serialized in-process and across processes (a lock file
+  `.refresh-<id>.lock` in the config dir; the stored set is re-read after
+  taking it, so a token another process already refreshed is used, not
+  redeemed again; `doctor` never refreshes), a rotated refresh token is persisted
   before the new access token is used, and failures name
   `formless auth login` rather than silently falling back to an API key.
   A refresh token is only sent to the token endpoint that issued it. A
@@ -1421,9 +1430,14 @@ None ship by default (principle 1).
   registration when offered (else `oauth_client_id`) → authorization code
   with PKCE on a loopback callback and the `resource` indicator. Tokens are
   stored per server like the provider's (keychain + `0600` file), sent as
-  `Bearer`, refreshed when expired or on a 401 (rotation kept), and never
-  shown to the model or Tools; a server needing a login fails with the
-  command to run.
+  `Bearer`, refreshed when expired or on a 401 (rotation kept, serialized
+  across processes like the provider's), and never shown to the model or
+  Tools; a server needing a login fails with the command to run. A login
+  is bound to the server URL it was made for (a different URL under the
+  same name is refused), reuses its registered client and callback port
+  on the next login, is revoked on `mcp logout` when the authorization
+  server names a revocation endpoint, and is deleted when the server is
+  removed.
 - **Management** goes through the daemon (no client-only behaviour):
   `ListMcpServers`, `AddMcpServer {name, server}` (writes `config.toml`
   and lists the tools at once), `RemoveMcpServer` (its tools are retired,

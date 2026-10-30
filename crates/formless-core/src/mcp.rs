@@ -443,7 +443,7 @@ impl Connection {
         let mut bearer = if fixed_auth {
             None
         } else {
-            crate::mcp_auth::bearer(paths, server).await?
+            crate::mcp_auth::bearer(paths, server, url).await?
         };
         let mut refreshed = false;
         let mut attempt = 0u32;

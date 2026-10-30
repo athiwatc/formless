@@ -601,3 +601,158 @@ async fn a_401_forces_one_refresh_and_resends() {
     );
     delete_oauth_tokens(&paths, &cfg.auth);
 }
+
+/// The newer copy of a secret wins over an older one left in the other
+/// store, and logging out reports what it could not remove (#868).
+#[test]
+fn newer_copy_wins_and_delete_reports_leftovers() {
+    let paths = test_paths("dual");
+    let cfg = oauth_cfg("http://dual.example");
+    save_oauth_tokens(&paths, &cfg.auth, &tokens("first", "r1", now_epoch() + 600)).unwrap();
+    save_oauth_tokens(
+        &paths,
+        &cfg.auth,
+        &tokens("second", "r2", now_epoch() + 600),
+    )
+    .unwrap();
+    assert_eq!(
+        load_oauth_tokens(&paths, &cfg.auth).unwrap().access_token,
+        "second"
+    );
+    // A stale, untimestamped file copy loses to a newer keychain copy.
+    let file = std::fs::read_dir(&paths.config_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("oauth_tokens-")
+        })
+        .unwrap();
+    let wrapped: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert!(wrapped["saved_at"].as_i64().unwrap() > 0);
+    let mut stale = wrapped["v"].clone();
+    let text = stale.to_string().replace("second", "stale");
+    stale = serde_json::from_str(&text).unwrap();
+    std::fs::write(&file, stale.to_string()).unwrap();
+    let expect = if formless_core::auth::keychain_available() {
+        "second"
+    } else {
+        "stale"
+    };
+    assert_eq!(
+        load_oauth_tokens(&paths, &cfg.auth).unwrap().access_token,
+        expect
+    );
+    assert!(delete_oauth_tokens(&paths, &cfg.auth).is_empty());
+    assert!(load_oauth_tokens(&paths, &cfg.auth).is_none());
+}
+
+/// Logout says what stays in force: an API key, or a token from the
+/// environment (#866).
+#[test]
+fn logout_says_what_stays_in_force() {
+    let paths = test_paths("logout");
+    let mut cfg = oauth_cfg("http://logout.example");
+    cfg.auth.mode = "api_key".into();
+    let lines = formless_core::auth::logout_provider(&paths, &cfg).join("\n");
+    assert!(lines.contains("no OAuth tokens"), "{lines}");
+
+    let cfg = oauth_cfg("http://logout.example");
+    save_oauth_tokens(&paths, &cfg.auth, &tokens("a", "r", now_epoch() + 600)).unwrap();
+    let lines = formless_core::auth::logout_provider(&paths, &cfg).join("\n");
+    assert!(lines.contains("no revocation endpoint"), "{lines}");
+    assert!(lines.contains("Deleted the stored OAuth tokens"), "{lines}");
+    assert!(load_oauth_tokens(&paths, &cfg.auth).is_none());
+}
+
+const CHILD_ENV: &str = "FL_TEST_REFRESH_CHILD";
+
+/// Run only as a child of `two_processes_redeem_one_refresh_token_once`.
+#[tokio::test]
+async fn refresh_child() {
+    let Ok(spec) = std::env::var(CHILD_ENV) else {
+        return;
+    };
+    let parts: Vec<&str> = spec.split('|').collect();
+    let paths = Paths {
+        data_dir: parts[0].into(),
+        config_dir: parts[1].into(),
+        profile: parts[2].into(),
+    };
+    let token = resolve_provider_token(&paths, &oauth_cfg(parts[3]))
+        .await
+        .unwrap();
+    assert_eq!(token, "new-access");
+}
+
+/// Two processes finding the same expired token redeem the rotating
+/// refresh token once between them (#865).
+#[test]
+fn two_processes_redeem_one_refresh_token_once() {
+    let paths = test_paths("twoproc");
+    let (base, captured) = spawn_token_server();
+    let cfg = oauth_cfg(&base);
+    save_oauth_tokens(
+        &paths,
+        &cfg.auth,
+        &tokens("old-access", "old-refresh", now_epoch() - 10),
+    )
+    .unwrap();
+    let spec = format!(
+        "{}|{}|{}|{base}",
+        paths.data_dir.display(),
+        paths.config_dir.display(),
+        paths.profile
+    );
+    let exe = std::env::current_exe().unwrap();
+    let children: Vec<_> = (0..2)
+        .map(|_| {
+            std::process::Command::new(&exe)
+                .args(["--exact", "refresh_child", "--test-threads=1"])
+                .env(CHILD_ENV, &spec)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    let refreshes = captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| b.contains("grant_type=refresh_token"))
+        .count();
+    assert_eq!(refreshes, 1, "the refresh token must be redeemed once");
+    delete_oauth_tokens(&paths, &cfg.auth);
+}
+
+/// A stored MCP login made for one address is not sent to another
+/// server added later under the same name (#866).
+#[tokio::test]
+async fn mcp_login_is_bound_to_its_server_address() {
+    let paths = test_paths("mcpbind");
+    let record = json!({
+        "tokens": tokens("mcp-access", "mcp-refresh", now_epoch() + 600),
+        "client_id": "c",
+        "token_url": "http://as.example/token",
+        "server_url": "http://one.example/mcp",
+    });
+    formless_core::auth::save_named_secret(&paths, "mcp-oauth-srv", &record).unwrap();
+    let ok = formless_core::mcp_auth::bearer(&paths, "srv", "http://one.example/mcp")
+        .await
+        .unwrap();
+    assert_eq!(ok.as_deref(), Some("mcp-access"));
+    let err = formless_core::mcp_auth::bearer(&paths, "srv", "http://two.example/mcp")
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("was made for"), "{err:#}");
+    let lines = formless_core::mcp_auth::logout(&paths, "srv").join("\n");
+    assert!(lines.contains("no revocation endpoint"), "{lines}");
+    assert!(formless_core::auth::load_named_secret(&paths, "mcp-oauth-srv").is_none());
+}

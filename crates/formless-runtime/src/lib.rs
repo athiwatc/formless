@@ -7,7 +7,6 @@ pub mod sync;
 pub use caps::Capabilities;
 pub use sync::LockExt;
 
-use crate::sync::LockExt as _;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use rquickjs::{Context, Function, Runtime};

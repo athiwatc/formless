@@ -1674,18 +1674,20 @@ fn upgrade_command() -> &'static str {
     } else {
         // Downloaded first, so a failed download stops with an error
         // instead of piping nothing into sh (#834).
-        concat!(
-            "curl -fsSL ",
-            "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh",
-            " -o /tmp/formless-install.sh && sh /tmp/formless-install.sh"
-        )
+        INSTALL_COMMAND
     }
 }
 
 /// Where the install script is served: the repository's own file, the
 /// same URL the README gives.
+#[cfg_attr(not(test), allow(dead_code))]
 const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh";
+const INSTALL_COMMAND: &str = concat!(
+    "curl -fsSL ",
+    "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh",
+    " -o /tmp/formless-install.sh && sh /tmp/formless-install.sh"
+);
 
 /// `formless update`: what's newer than this build and what changed in
 /// each release, then how to upgrade (`--check` stops after the report).
@@ -2212,8 +2214,9 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
             Ok(())
         }
         AuthAction::Logout => {
-            formless_core::auth::delete_oauth_tokens(&paths, &cfg.provider.auth);
-            println!("Stored OAuth tokens deleted for this profile.");
+            for line in formless_core::auth::logout_provider(&paths, &cfg.provider) {
+                println!("{line}");
+            }
             Ok(())
         }
     }
@@ -2704,6 +2707,14 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             "absent"
         }
     );
+    // Secrets go to the OS keychain and a 0600 file; without a keychain
+    // only the file holds them (on Windows its ACL is the user's profile
+    // directory's, not 0600) (#868).
+    if formless_core::auth::keychain_available() {
+        say!("keychain:   available (secrets kept in it and in 0600 files)");
+    } else {
+        say!("keychain:   unavailable: file-only fallback in use (0600 files in the config dir)");
+    }
     let cfg = Config::load(&paths)?;
     if let Ok((n, bytes)) =
         Store::open(&paths.db_file()).and_then(|s| formless_core::artifacts::usage(&s))
@@ -2916,7 +2927,8 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
                 .unwrap_or_else(|| "(none)".into())
         );
     }
-    let credential = formless_core::auth::resolve_provider_token_blocking(&paths, &cfg.provider);
+    // Read-only: a diagnostic never redeems a refresh token (#865).
+    let credential = formless_core::auth::peek_provider_token(&paths, &cfg.provider);
     if let Err(error) = &credential {
         say!("auth error: {error:#}");
         if cfg.provider.is_configured() {
@@ -5018,7 +5030,9 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             println!("Logged in to '{server}'.");
         }
         McpAction::Logout { server } => {
-            formless_core::mcp_auth::logout(&paths, &server);
+            for line in formless_core::mcp_auth::logout(&paths, &server) {
+                println!("{line}");
+            }
             println!("Deleted stored OAuth tokens for '{server}'.");
         }
     }
