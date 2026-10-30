@@ -46,15 +46,21 @@ pub fn tool_verdict(v: &Value) -> (bool, String) {
     (v["deny"] != true, reason)
 }
 
+/// Most hook output kept (stdout and stderr each); the rest is read and
+/// dropped, so a chatty hook can't grow the daemon (#827).
+pub const MAX_HOOK_OUTPUT: usize = 64 * 1024;
+
 /// Run a hook command (no shell) with the payload on stdin. Exit 0
-/// allows; otherwise its output is the reason.
+/// allows; otherwise its output is the reason. The payload is written
+/// while the output is read, so a hook that echoes a large payload
+/// (`cat`, `jq`) can't deadlock on a full pipe (#827).
 pub async fn run_command(
     cmd: &str,
     args: &[String],
     payload: &Value,
     timeout: std::time::Duration,
 ) -> (bool, String) {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let child = tokio::process::Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::piped())
@@ -66,19 +72,65 @@ pub async fn run_command(
         Ok(c) => c,
         Err(e) => return (false, format!("hook command {cmd} failed to start: {e}")),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload.to_string().as_bytes()).await;
+    let body = payload.to_string().into_bytes();
+    let stdin = child.stdin.take();
+    let writer = async move {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&body).await;
+            // Dropped here: the hook sees end of input.
+        }
+    };
+    // Read everything, keep the first MAX_HOOK_OUTPUT bytes.
+    async fn capped<R: tokio::io::AsyncRead + Unpin>(r: Option<R>) -> Vec<u8> {
+        let Some(mut r) = r else {
+            return Vec::new();
+        };
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = MAX_HOOK_OUTPUT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+        }
+        kept
     }
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(out)) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let run = async {
+        let ((), out, err, status) =
+            tokio::join!(writer, capped(stdout), capped(stderr), child.wait());
+        (out, err, status)
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Ok((out, err, Ok(status))) => {
+            let mut text = String::from_utf8_lossy(&out).trim().to_string();
+            let err = String::from_utf8_lossy(&err).trim().to_string();
             if text.is_empty() {
                 text = err;
             }
-            (out.status.success(), text.chars().take(2000).collect())
+            (status.success(), text.chars().take(2000).collect())
         }
-        Ok(Err(e)) => (false, format!("hook command {cmd} failed: {e}")),
+        Ok((_, _, Err(e))) => (false, format!("hook command {cmd} failed: {e}")),
         Err(_) => (false, format!("hook command {cmd} timed out")),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pipe_tests {
+    /// `cat` given a payload far over a pipe buffer finishes, and its
+    /// echoed output is capped (#827).
+    #[tokio::test]
+    async fn an_echoing_hook_never_deadlocks() {
+        let payload = serde_json::json!({"arguments": "x".repeat(400 * 1024)});
+        let started = std::time::Instant::now();
+        let (ok, out) =
+            super::run_command("cat", &[], &payload, std::time::Duration::from_secs(20)).await;
+        assert!(ok, "{out}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(out.chars().count() <= 2000);
     }
 }

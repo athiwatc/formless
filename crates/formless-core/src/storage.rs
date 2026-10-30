@@ -1457,13 +1457,16 @@ impl Store {
         })?;
         for row in rows {
             let (name, kind, calls, failures, avg_ms) = row?;
-            if out.last().is_none_or(|s| s.name != name) {
-                out.push(formless_protocol::BuiltinStatInfo {
-                    name: name.clone(),
-                    ..Default::default()
-                });
-            }
-            let s = out.last_mut().unwrap();
+            let s = match out.last_mut() {
+                Some(s) if s.name == name => s,
+                _ => {
+                    out.push(formless_protocol::BuiltinStatInfo {
+                        name: name.clone(),
+                        ..Default::default()
+                    });
+                    out.last_mut().expect("just pushed")
+                }
+            };
             s.total_ms += avg_ms * calls as f64;
             s.calls += calls;
             s.failures += failures;

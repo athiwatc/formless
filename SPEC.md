@@ -3738,7 +3738,24 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   never optimised (§8.2). Promotion racing a retirement: retirement wins;
   the Candidate is discarded and logged.
 - **Two creators, same name:** serialised (§7.2). **Two approvers, same
-  modal:** first answer wins (§10.4).
+  modal:** first answer wins (§10.4). **Two clients starting a Run on one
+  Session** (two sends, a send and an edit): one Run starts; the other
+  start is refused "already running: run <id>" (code `busy`), and a send
+  that loses joins the running Run as a steer. A finishing Run removes
+  only its own controls. Changing the model during a Run is broadcast
+  to every attached client; the running Run keeps its model, the next
+  Run uses the new one (a working-folder change reaches it at its next
+  step, with a note in the transcript).
+- **A panic while a daemon lock is held** doesn't stop later requests:
+  locks are taken back from the poisoned state (reported once per site
+  on stderr), so one bug doesn't make every request fail.
+- **Hook commands** get their payload on stdin while their output is
+  read (a `cat` hook can't deadlock on a full pipe); at most 64 KB of
+  each output stream is kept.
+- **Bundle URLs** (`FetchToolBundle`): redirects are followed by the
+  daemon one hop at a time, each https only and resolving to public
+  addresses (pinned), at most 5; the body is read as a stream and
+  refused past 2 MB.
 - **Daemon already running, older/newer protocol:** client refuses with
   versions shown (§9.3). **Second daemon, same data dir:** refused (§9.4).
 - **SQLite corruption:** daemon stops, reports, points at the pre-migration

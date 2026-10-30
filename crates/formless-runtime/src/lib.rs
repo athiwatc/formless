@@ -3,8 +3,11 @@
 //! `__host(op, argsJson)` bridge, checked against declared Capabilities.
 
 pub mod caps;
+pub mod sync;
 pub use caps::Capabilities;
+pub use sync::LockExt;
 
+use crate::sync::LockExt as _;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use rquickjs::{Context, Function, Runtime};
@@ -533,7 +536,7 @@ fn names_host_exactly(domains: &[String], host: &str, port: u16) -> bool {
 /// Loopback, private, link-local, CGNAT, multicast, unspecified, reserved
 /// or otherwise not public (SPEC §7.4). IPv6 forms that carry an IPv4
 /// address (mapped, compatible, NAT64, 6to4) are judged by that address.
-fn non_public(ip: std::net::IpAddr) -> bool {
+pub fn non_public(ip: std::net::IpAddr) -> bool {
     use std::net::{IpAddr, Ipv4Addr};
     match ip {
         IpAddr::V4(v4) => {
@@ -987,7 +990,7 @@ impl State {
                         "dry run: the nested call to {name} was not made"
                     )));
                 }
-                let mut calls = self.calls.lock().unwrap();
+                let mut calls = self.calls.locked();
                 calls.next_id += 1;
                 let id = calls.next_id;
                 let name = a["name"].as_str().unwrap_or_default().to_string();
@@ -1086,7 +1089,7 @@ impl State {
                     // Reads see real values (and this run's writes); writes
                     // stay in memory.
                     HostMode::DryRun => {
-                        let mut kv = self.kv_overlay.lock().unwrap();
+                        let mut kv = self.kv_overlay.locked();
                         let k = (ns.to_string(), key.to_string());
                         match op {
                             "get" => match kv.get(&k) {
@@ -1110,7 +1113,7 @@ impl State {
                         }
                     }
                     HostMode::Smoke | HostMode::Replay => {
-                        let mut kv = self.kv_overlay.lock().unwrap();
+                        let mut kv = self.kv_overlay.locked();
                         let k = (ns.to_string(), key.to_string());
                         Ok(match op {
                             "get" => kv.get(&k).cloned().unwrap_or(Value::Null),
@@ -1194,7 +1197,7 @@ impl State {
             "stream_read" => self.stream_read(a),
             "stream_close" => {
                 if let Some(id) = a["id"].as_u64() {
-                    self.streams.lock().unwrap().remove(&id);
+                    self.streams.locked().remove(&id);
                 }
                 Ok(Value::Null)
             }
@@ -1532,7 +1535,7 @@ impl State {
 
     /// Nested calls not yet settled (running or queued).
     fn outstanding_calls(&self) -> usize {
-        let calls = self.calls.lock().unwrap();
+        let calls = self.calls.locked();
         calls.running + calls.queued.len()
     }
 
@@ -1540,7 +1543,7 @@ impl State {
     /// returning those that did; "interrupted" once cancelled.
     fn wait_settled(&self, wait: Option<std::time::Duration>) -> Result<Vec<Settled>, String> {
         let until = wait.map(|w| std::time::Instant::now() + w);
-        let rx = self.settled_rx.lock().unwrap();
+        let rx = self.settled_rx.locked();
         let mut done = Vec::new();
         loop {
             if self.cancel.load(Ordering::SeqCst) {
@@ -1566,7 +1569,7 @@ impl State {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.locked();
         calls.running -= done.len().min(calls.running);
         self.start_queued(&mut calls);
         Ok(done)
@@ -1714,7 +1717,7 @@ impl State {
         let resp = self.cancellable(move || send_request(req))?;
         let mut meta = Self::response_meta(&resp);
         let id = self.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
-        self.streams.lock().unwrap().insert(
+        self.streams.locked().insert(
             id,
             Stream {
                 resp,
@@ -1731,7 +1734,7 @@ impl State {
         let size = a["size"].as_u64().unwrap_or(65536).clamp(4, 1 << 20) as usize;
         // Taken out of the map while reading so a blocked read can run on a
         // cancellable thread; a cancelled read drops the stream.
-        let Some(mut s) = self.streams.lock().unwrap().remove(&id) else {
+        let Some(mut s) = self.streams.locked().remove(&id) else {
             // Smoke stub (id 0) or an already-closed stream: empty body.
             return Ok(json!({"data": "", "eof": true}));
         };
@@ -1755,7 +1758,7 @@ impl State {
         let (mut buf, eof) = match read {
             Ok(r) => r,
             Err(e) => {
-                self.streams.lock().unwrap().insert(id, s);
+                self.streams.locked().insert(id, s);
                 return Err(e);
             }
         };
@@ -1764,7 +1767,7 @@ impl State {
             s.carry = buf.split_off(cut);
         }
         let out = json!({"data": encode(&buf, s.enc), "eof": eof && s.carry.is_empty()});
-        self.streams.lock().unwrap().insert(id, s);
+        self.streams.locked().insert(id, s);
         Ok(out)
     }
 
@@ -2418,7 +2421,7 @@ mod tests {
     struct ProgressOps(Mutex<Vec<(Option<f64>, String)>>);
     impl HostOps for ProgressOps {
         fn progress(&self, fraction: Option<f64>, label: &str) {
-            self.0.lock().unwrap().push((fraction, label.to_string()));
+            self.0.locked().push((fraction, label.to_string()));
         }
     }
 
@@ -2430,7 +2433,7 @@ mod tests {
         );
         execute(&req, ops.clone()).unwrap();
         assert_eq!(
-            *ops.0.lock().unwrap(),
+            *ops.0.locked(),
             [
                 (Some(0.5), "half".into()),
                 (Some(1.0), String::new()),
