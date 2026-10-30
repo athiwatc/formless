@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use formless_protocol::*;
+use formless_runtime::LockExt as _;
 use formless_runtime::{new_overlay, Capabilities, ExecRequest, HostMode, HostOps, Overlay};
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
@@ -591,7 +592,7 @@ impl Daemon {
         cand: &CandidateData,
     ) {
         let promotion_id = uuid::Uuid::new_v4().to_string();
-        self.promotions.lock().unwrap().insert(
+        self.promotions.locked().insert(
             promotion_id.clone(),
             (attempt_id.to_string(), kind.to_string()),
         );

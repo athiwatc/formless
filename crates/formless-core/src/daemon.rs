@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use formless_protocol::*;
+use formless_runtime::LockExt as _;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -603,11 +604,11 @@ impl Daemon {
     /// Connected clients that receive events (and can answer approvals).
     /// The clients showing `session_id` (subscribed to it by id).
     fn session_clients(&self, session_id: &str) -> Vec<AttachedClient> {
-        let mut subs = self.subs.lock().unwrap();
+        let mut subs = self.subs.locked();
         subs.retain(|sub| !sub.tx.is_closed());
         subs.iter()
             .filter_map(|sub| {
-                let f = sub.filter.lock().unwrap();
+                let f = sub.filter.locked();
                 f.sessions
                     .as_ref()?
                     .contains(session_id)
@@ -630,7 +631,7 @@ impl Daemon {
     }
 
     pub fn subscriber_count(&self) -> usize {
-        let mut subs = self.subs.lock().unwrap();
+        let mut subs = self.subs.locked();
         subs.retain(|sub| !sub.tx.is_closed());
         subs.len()
     }
@@ -640,7 +641,7 @@ impl Daemon {
     /// and clients are told when that happens.
     pub(crate) fn config(&self) -> Result<Config> {
         let stamp = config_stamp(&self.paths);
-        let mut slot = self.config.lock().unwrap();
+        let mut slot = self.config.locked();
         if let Some((cached, cfg)) = slot.as_ref() {
             if *cached == stamp {
                 return Ok(cfg.clone());
@@ -819,9 +820,12 @@ impl Daemon {
         let free = self.readers.iter().find_map(|r| r.try_lock().ok());
         let guard = match free {
             Some(g) => g,
-            None => self.readers[0]
-                .lock()
-                .map_err(|_| anyhow!("store poisoned"))?,
+            // Recovered like every lock (#717); `readers` is never empty.
+            None => self
+                .readers
+                .first()
+                .ok_or_else(|| anyhow!("no store readers"))?
+                .locked(),
         };
         f(&guard)
     }
@@ -853,7 +857,7 @@ impl Daemon {
                         "expires_at": status.expires_at,
                     })
                 });
-                let mut running: Vec<String> = self.runs.lock().unwrap().keys().cloned().collect();
+                let mut running: Vec<String> = self.runs.locked().keys().cloned().collect();
                 running.sort();
                 let on_disk = build_id();
                 let stale = !on_disk.is_empty() && on_disk != self.build;
@@ -870,7 +874,7 @@ impl Daemon {
                     .lock()
                     .unwrap()
                     .values()
-                    .filter(|e| e.result.lock().unwrap().is_none())
+                    .filter(|e| e.result.locked().is_none())
                     .count());
                 resources["uptime_secs"] = json!(self.started.elapsed().as_secs());
                 // How full each client's queue is (SPEC §9.3).
@@ -883,7 +887,7 @@ impl Daemon {
                     .collect::<Vec<_>>());
                 Ok(json!({
                     "rate_limits": crate::provider::rate_limits(),
-                    "missing_models": *self.missing_models.lock().unwrap(),
+                    "missing_models": *self.missing_models.locked(),
                     "proxy": self.config().ok().and_then(|c| crate::provider::proxy_in_use(&c.provider)),
                     "resources": resources,
                     "protocol": PROTOCOL_VERSION,
@@ -1055,7 +1059,7 @@ impl Daemon {
                 })?;
                 // An unfinished last Run (interrupted/paused) gets a banner
                 // with Resume / Abandon in clients (SPEC §5.4).
-                let running = self.runs.lock().unwrap().contains_key(&id);
+                let running = self.runs.locked().contains_key(&id);
                 let last_run = last.filter(|_| !running).map(|(run_id, status, error)| {
                     json!({"run_id": run_id, "status": status, "error": error})
                 });
@@ -1064,7 +1068,7 @@ impl Daemon {
                 let (queued, plan) = queued;
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.lock().unwrap().contains(&id), "unfinished_run": last_run}),
+                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run}),
                 )
             }
             Request::ForkSession {
@@ -1088,7 +1092,7 @@ impl Daemon {
                 message_id,
                 content,
             } => {
-                if self.runs.lock().unwrap().contains_key(&session_id) {
+                if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow!(
                         "session has an active run; interrupt it before editing"
                     ));
@@ -1168,6 +1172,15 @@ impl Daemon {
                 let s = self
                     .with_store(|st| st.set_session_model(&id, model, reasoning_effort))?
                     .context("session not found")?;
+                // Every client on the Session sees it; a Run going now keeps
+                // the model it started with (#726).
+                if self.runs.locked().contains_key(&id) {
+                    self.broadcast(Event::Note {
+                        session_id: Some(id.clone()),
+                        text: "The model changed; the running Run keeps its model, the next Run uses the new one.".into(),
+                    });
+                }
+                self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
             Request::SendMessage {
@@ -1179,7 +1192,7 @@ impl Daemon {
                 // A retried send (same key) gets the first outcome (#891).
                 let key = client_msg_id.map(|k| format!("{session_id}\u{0}{k}"));
                 if let Some(k) = &key {
-                    let mut sent = self.sent_keys.lock().unwrap();
+                    let mut sent = self.sent_keys.locked();
                     sent.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(600));
                     if let Some((_, first)) = sent.get(k) {
                         return Ok(first.clone());
@@ -1204,7 +1217,7 @@ impl Daemon {
                 run_id,
                 path,
             } => {
-                if self.runs.lock().unwrap().contains_key(&session_id) {
+                if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow!(
                         "session has an active run; stop it before rewinding"
                     ));
@@ -1286,7 +1299,7 @@ impl Daemon {
                 model,
                 keep_original,
             } => {
-                if self.runs.lock().unwrap().contains_key(&session_id) {
+                if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow!(
                         "session has an active run; interrupt it before retrying"
                     ));
@@ -1335,7 +1348,7 @@ impl Daemon {
                     session_id: session_id.clone(),
                 });
                 if let Err(e) = self.start_run(session_id.clone()) {
-                    self.next_run_model.lock().unwrap().remove(&session_id);
+                    self.next_run_model.locked().remove(&session_id);
                     return Err(e);
                 }
                 Ok(json!({"model": model, "original_session": original}))
@@ -1362,16 +1375,16 @@ impl Daemon {
             } => {
                 self.with_store(|st| st.get_session(&session_id))?
                     .context("session not found")?;
-                let mut limits = self.step_limits.lock().unwrap();
+                let mut limits = self.step_limits.locked();
                 match max_steps.filter(|n| *n > 0) {
                     Some(n) => limits.insert(session_id.clone(), n),
                     None => limits.remove(&session_id),
                 };
-                let active = self.runs.lock().unwrap().contains_key(&session_id);
+                let active = self.runs.locked().contains_key(&session_id);
                 Ok(json!({"max_steps": max_steps.filter(|n| *n > 0), "active_run": active}))
             }
             Request::ResumeRun { session_id } => {
-                if self.runs.lock().unwrap().contains_key(&session_id) {
+                if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow!("a run is already active in this session"));
                 }
                 let (run_id, status) = self
@@ -1533,7 +1546,7 @@ impl Daemon {
                 Ok(serde_json::to_value(list)?)
             }
             Request::DisconnectRelayClient { cid } => {
-                let known = self.relay_clients.lock().unwrap().contains_key(&cid);
+                let known = self.relay_clients.locked().contains_key(&cid);
                 let sent = known
                     && self
                         .relay_kick
@@ -1751,14 +1764,14 @@ impl Daemon {
                     ApprovalScope::Session => {
                         let key = (session_id.clone().unwrap_or_default(), tool_id.clone());
                         revoke_in(
-                            &mut self.session_grants.lock().unwrap(),
+                            &mut self.session_grants.locked(),
                             &key,
                             capability.as_deref(),
                             |g| &mut g.0,
                         )
                     }
                     ApprovalScope::Hour => revoke_in(
-                        &mut self.timed_grants.lock().unwrap(),
+                        &mut self.timed_grants.locked(),
                         &tool_id,
                         capability.as_deref(),
                         |g| &mut g.0,
@@ -1780,7 +1793,7 @@ impl Daemon {
                 )
             }
             Request::CompactSession { session_id, focus } => {
-                if self.runs.lock().unwrap().contains_key(&session_id) {
+                if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow!(
                         "a Run is active in this Session; compact when it ends"
                     ));
@@ -1996,7 +2009,7 @@ impl Daemon {
                     "meta": meta,
                     "tests": tests,
                     "aliases": cfg.provider.aliases,
-                    "missing": *self.missing_models.lock().unwrap(),
+                    "missing": *self.missing_models.locked(),
                     "roles": roles,
                     "recent": recent,
                     "current": {"model": cfg.provider.model,
@@ -2228,7 +2241,7 @@ impl Daemon {
                 answers,
             } => {
                 // First answer wins; the others find it gone.
-                let tx = self.questions.lock().unwrap().remove(&question_id);
+                let tx = self.questions.locked().remove(&question_id);
                 let answered = tx.is_some_and(|tx| tx.send((answer, answers)).is_ok());
                 Ok(json!({"answered": answered}))
             }
@@ -2607,7 +2620,7 @@ impl Daemon {
                     .lock()
                     .unwrap()
                     .iter()
-                    .filter(|(_, e)| e.result.lock().unwrap().is_none())
+                    .filter(|(_, e)| e.result.locked().is_none())
                     .map(|(h, e)| {
                         let silent = now.saturating_sub(e.activity.load(Ordering::SeqCst));
                         (
@@ -2642,13 +2655,13 @@ impl Daemon {
             Request::CancelInvocation { handle } => {
                 let entry = self
                     .pending_get(&handle)
-                    .filter(|e| e.result.lock().unwrap().is_none())
+                    .filter(|e| e.result.locked().is_none())
                     .context("no running invocation with that handle")?;
                 entry.cancel.cancel();
                 Ok(json!({"cancelled": true}))
             }
             Request::RetryProviderRequest { session_id } => {
-                let runs = self.runs.lock().unwrap();
+                let runs = self.runs.locked();
                 let ctl = runs
                     .get(&session_id)
                     .context("no active run in this session")?;
@@ -2656,7 +2669,7 @@ impl Daemon {
                 Ok(json!({"retrying": true}))
             }
             Request::InterruptRun { session_id } => {
-                let runs = self.runs.lock().unwrap();
+                let runs = self.runs.locked();
                 if let Some(ctl) = runs.get(&session_id) {
                     ctl.cancel_flag.store(true, Ordering::SeqCst);
                     ctl.cancel.cancel();
@@ -2977,7 +2990,7 @@ impl Daemon {
                 promotion_id,
                 approved,
             } => {
-                let pending = self.promotions.lock().unwrap().remove(&promotion_id);
+                let pending = self.promotions.locked().remove(&promotion_id);
                 match pending {
                     Some((attempt_id, kind)) => {
                         let this = self.clone();
@@ -3002,7 +3015,7 @@ impl Daemon {
                 }
                 Ok(json!({"format": "formless.tools/1", "tools": tools}))
             }
-            Request::FetchToolBundle { url } => crate::import_url::fetch(&self.http, &url).await,
+            Request::FetchToolBundle { url } => crate::import_url::fetch(&url).await,
             Request::ImportTool { bundle } => {
                 let cfg = self.config()?;
                 if bundle["format"].as_str() == Some("formless.tools/1") {
@@ -3080,7 +3093,7 @@ impl Daemon {
                 prompt,
             } => self.compare_models(&session_id, models, prompt),
             Request::SetStepMode { session_id, on } => {
-                let mut set = self.step_sessions.lock().unwrap();
+                let mut set = self.step_sessions.locked();
                 if on {
                     set.insert(session_id.clone());
                 } else {
@@ -3249,10 +3262,10 @@ impl Daemon {
             } => {
                 // First answer wins (SPEC §10.4): removing the sender resolves
                 // it. A late or losing answer leaves nothing behind (#764).
-                let tx = self.approvals.lock().unwrap().remove(&approval_id);
+                let tx = self.approvals.locked().remove(&approval_id);
                 if tx.is_some() {
                     if remember_denial && !approved {
-                        self.deny_always.lock().unwrap().insert(approval_id.clone());
+                        self.deny_always.locked().insert(approval_id.clone());
                     }
                     if !paths.is_empty() {
                         self.approval_paths
@@ -3398,7 +3411,7 @@ impl Daemon {
         } else {
             "updated"
         });
-        let mut all = self.run_tool_changes.lock().unwrap();
+        let mut all = self.run_tool_changes.locked();
         let list = all.entry(run_id.to_string()).or_default();
         match list.iter_mut().find(|c| c.tool_id == tool_id) {
             Some(c) => {
@@ -3427,18 +3440,18 @@ impl Daemon {
             .retain(|(s, _), _| s != session_id);
         let _ = self.with_store(|st| st.clear_queued_messages(session_id));
         self.queue_changed(session_id);
-        if let Some(ctl) = self.runs.lock().unwrap().get(session_id) {
+        if let Some(ctl) = self.runs.locked().get(session_id) {
             ctl.cancel_flag.store(true, Ordering::SeqCst);
             ctl.cancel.cancel();
         }
-        for entry in self.pending.lock().unwrap().values() {
+        for entry in self.pending.locked().values() {
             if entry.session_id == session_id {
                 entry.abandoned.store(true, Ordering::SeqCst);
                 entry.notify.notify_waiters();
             }
         }
         for _ in 0..100 {
-            if !self.runs.lock().unwrap().contains_key(session_id) {
+            if !self.runs.locked().contains_key(session_id) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3476,7 +3489,7 @@ impl Daemon {
     ) -> Result<serde_json::Value> {
         self.with_store(|st| st.get_session(&session_id))?
             .context("session not found")?;
-        let busy = self.runs.lock().unwrap().contains_key(&session_id);
+        let busy = self.runs.locked().contains_key(&session_id);
         match (busy, mode) {
             (true, SendMode::Queue) => {
                 // Persisted, so a daemon restart does not lose it.
@@ -3506,7 +3519,7 @@ impl Daemon {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                if let Some(ctl) = self.runs.lock().unwrap().get(&session_id) {
+                if let Some(ctl) = self.runs.locked().get(&session_id) {
                     let _ = ctl.steer_tx.send(());
                 }
                 Ok(json!({"steered": true}))
@@ -3521,28 +3534,57 @@ impl Daemon {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                self.start_run(session_id)?;
-                Ok(json!({"started": true}))
+                match self.start_run(session_id.clone()) {
+                    Ok(()) => Ok(json!({"started": true})),
+                    // Another client's Run started first: the message (already
+                    // in the transcript) joins it at its next step (#726).
+                    Err(e) if e.to_string().starts_with("already running") => {
+                        if let Some(ctl) = self.runs.locked().get(&session_id) {
+                            let _ = ctl.steer_tx.send(());
+                        }
+                        Ok(json!({"steered": true}))
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     }
 
+    /// Start a Run for the Session; at most one at a time (#726): a second
+    /// starter (another client's send or edit) gets an "already running"
+    /// error naming the Run that won, and that Run's controls stay.
     fn start_run(self: &Arc<Self>, session_id: String) -> Result<()> {
+        if let Some(ctl) = self.runs.locked().get(&session_id) {
+            return Err(anyhow!("already running: run {}", ctl.run_id));
+        }
         self.close_dangling_tool_calls(&session_id)?;
         let run_id = self.with_store(|st| st.create_run(&session_id))?;
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<()>();
-        self.runs.lock().unwrap().insert(
-            session_id.clone(),
-            RunCtl {
-                run_id: run_id.clone(),
-                cancel: cancel.clone(),
-                cancel_flag: cancel_flag.clone(),
-                steer_tx,
-                retry: Arc::new(tokio::sync::Notify::new()),
-            },
-        );
+        {
+            let mut runs = self.runs.locked();
+            if let Some(ctl) = runs.get(&session_id) {
+                // Another starter won between the check and here.
+                let winner = ctl.run_id.clone();
+                drop(runs);
+                let _ = self.with_store(|st| {
+                    st.set_run_status(&run_id, "interrupted")?;
+                    st.set_run_error(&run_id, "another Run of this Session started first")
+                });
+                return Err(anyhow!("already running: run {winner}"));
+            }
+            runs.insert(
+                session_id.clone(),
+                RunCtl {
+                    run_id: run_id.clone(),
+                    cancel: cancel.clone(),
+                    cancel_flag: cancel_flag.clone(),
+                    steer_tx,
+                    retry: Arc::new(tokio::sync::Notify::new()),
+                },
+            );
+        }
         self.broadcast(Event::RunStarted {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
@@ -3657,11 +3699,15 @@ impl Daemon {
         if final_status != "paused" {
             self.record_run_status(&session_id, &run_id, final_status);
         }
-        // Locks a panicking Run may have poisoned are still taken.
-        self.runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&session_id);
+        // Locks a panicking Run may have poisoned are still taken. Only this
+        // Run's own entry goes: a newer Run of the Session keeps its
+        // controls (#726).
+        {
+            let mut runs = self.runs.locked();
+            if runs.get(&session_id).is_some_and(|c| c.run_id == run_id) {
+                runs.remove(&session_id);
+            }
+        }
         self.budget_waived
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4016,7 +4062,7 @@ impl Daemon {
             }
         }
         // The Session's model, or its role's provider + model (SPEC §4.5).
-        let once = self.next_run_model.lock().unwrap().remove(session_id);
+        let once = self.next_run_model.locked().remove(session_id);
         let target = self.target(&cfg, session_id, once.as_deref()).await?;
         let provider = {
             let (sid, rid, subs) = (
@@ -4696,7 +4742,7 @@ impl Daemon {
             });
             forks.push((fork.id.clone(), model.clone()));
         }
-        self.comparisons.lock().unwrap().insert(
+        self.comparisons.locked().insert(
             comparison_id.clone(),
             (session_id.to_string(), forks.clone()),
         );
@@ -4715,7 +4761,7 @@ impl Daemon {
     /// to the Session the comparison came from.
     fn comparison_run_ended(&self, session_id: &str) {
         let done = {
-            let mut all = self.comparisons.lock().unwrap();
+            let mut all = self.comparisons.locked();
             let Some(id) = all
                 .iter()
                 .find(|(_, (_, forks))| forks.iter().any(|(f, _)| f == session_id))
@@ -4724,7 +4770,7 @@ impl Daemon {
                 return;
             };
             let busy = {
-                let runs = self.runs.lock().unwrap();
+                let runs = self.runs.locked();
                 all[&id]
                     .1
                     .iter()
@@ -4795,9 +4841,7 @@ impl Daemon {
         let mut skipped = std::collections::HashSet::new();
         let count = calls.len();
         for (index, tc) in calls.iter_mut().enumerate() {
-            if !self.step_sessions.lock().unwrap().contains(session_id)
-                || self.subscriber_count() == 0
-            {
+            if !self.step_sessions.locked().contains(session_id) || self.subscriber_count() == 0 {
                 break;
             }
             let step_id = uuid::Uuid::new_v4().to_string();
@@ -4819,7 +4863,7 @@ impl Daemon {
                 _ = cancel.cancelled() => None,
                 d = rx => d.ok(),
             };
-            self.step_waiters.lock().unwrap().remove(&step_id);
+            self.step_waiters.locked().remove(&step_id);
             self.broadcast(Event::StepResolved {
                 session_id: session_id.to_string(),
                 step_id,
@@ -4837,7 +4881,7 @@ impl Daemon {
                     }
                 }
                 "all" => {
-                    self.step_sessions.lock().unwrap().remove(session_id);
+                    self.step_sessions.locked().remove(session_id);
                 }
                 _ => {}
             }
@@ -4863,7 +4907,7 @@ impl Daemon {
         // (SPEC §5.2), and each is still answered on its own.
         let held = self.held_calls(cfg, session_id, calls)?;
         if held.len() > 1 {
-            self.approval_batches.lock().unwrap().insert(
+            self.approval_batches.locked().insert(
                 session_id.to_string(),
                 (uuid::Uuid::new_v4().to_string(), held, 0),
             );
@@ -4871,14 +4915,14 @@ impl Daemon {
         let result = self
             .approve_each(cfg, session_id, run_id, calls, cancel, &mut denied)
             .await;
-        self.approval_batches.lock().unwrap().remove(session_id);
+        self.approval_batches.locked().remove(session_id);
         result.map(|()| denied)
     }
 
     /// This prompt's place in the Session's batch, if one is being asked:
     /// the next held call of this Tool.
     fn batch_position(&self, session_id: &str, tool_name: &str) -> Option<ApprovalBatch> {
-        let mut batches = self.approval_batches.lock().unwrap();
+        let mut batches = self.approval_batches.locked();
         let (batch_id, calls, next) = batches.get_mut(session_id)?;
         let at = (*next..calls.len()).find(|&i| calls[i].tool_name == tool_name)?;
         *next = at + 1;
@@ -4911,7 +4955,7 @@ impl Daemon {
                 });
             }
         }
-        let meta = self.grant_meta.lock().unwrap().clone();
+        let meta = self.grant_meta.locked().clone();
         let name_of = |id: &str| -> (String, Option<String>) {
             self.with_reader(|st| {
                 let name = st
@@ -4952,7 +4996,7 @@ impl Daemon {
         }
         let now = chrono::Utc::now();
         let timed: Vec<_> = {
-            let mut t = self.timed_grants.lock().unwrap();
+            let mut t = self.timed_grants.locked();
             t.retain(|_, g| g.2 > now);
             t.iter()
                 .map(|(k, v)| (k.clone(), v.0.to_specs(), v.2))
@@ -5431,7 +5475,7 @@ impl Daemon {
                 let handle = args["invocation_id"].as_str().unwrap_or_default();
                 match self.pending_get(handle) {
                     Some(entry) => {
-                        let done = entry.result.lock().unwrap().clone();
+                        let done = entry.result.locked().clone();
                         match done {
                             Some((_ok, text)) => {
                                 entry.delivered.store(true, Ordering::SeqCst);
@@ -5601,7 +5645,7 @@ impl Daemon {
         // (logged); with them on, an untrusted one is asked about once.
         if !h.trusted && !cfg.security.secure {
             let _ = self.with_store(|st| st.audit("approvals-off", "hook.run_unasked", &key));
-        } else if !h.trusted && !self.hook_approvals.lock().unwrap().contains(&key) {
+        } else if !h.trusted && !self.hook_approvals.locked().contains(&key) {
             let (ok, _) = self
                 .ask_user_approval(
                     session_id,
@@ -5618,7 +5662,7 @@ impl Daemon {
                 // Fail closed: an unapproved policy hook blocks its call.
                 return (false, format!("hook command not approved: {key}"));
             }
-            self.hook_approvals.lock().unwrap().insert(key.clone());
+            self.hook_approvals.locked().insert(key.clone());
         }
         crate::hooks::run_command(cmd, args, payload, timeout).await
     }
@@ -5816,12 +5860,12 @@ impl Daemon {
     }
 
     fn pending_get(&self, handle: &str) -> Option<Arc<PendingEntry>> {
-        self.pending.lock().unwrap().get(handle).cloned()
+        self.pending.locked().get(handle).cloned()
     }
 
     /// Drop a handle from memory and from the persisted record.
     fn forget_pending(&self, handle: &str) {
-        self.pending.lock().unwrap().remove(handle);
+        self.pending.locked().remove(handle);
         let _ = self.with_store(|st| st.remove_pending_handle(handle));
     }
 
@@ -5855,7 +5899,7 @@ impl Daemon {
     ) -> Option<(bool, String)> {
         let wait = async {
             loop {
-                if let Some(r) = entry.result.lock().unwrap().clone() {
+                if let Some(r) = entry.result.locked().clone() {
                     return r;
                 }
                 entry.notify.notified().await;
@@ -5956,7 +6000,7 @@ impl Daemon {
                     }
                     Err(e) => (false, format!("error: {e}")),
                 };
-                *entry2.result.lock().unwrap() = Some((ok, text));
+                *entry2.result.locked() = Some((ok, text));
                 entry2.notify.notify_waiters();
                 this.broadcast(Event::InvocationCompleted {
                     session_id: sid,
@@ -6003,7 +6047,7 @@ impl Daemon {
     /// this Session become system-note messages at the step boundary.
     fn deliver_completed_pending(&self, session_id: &str) {
         let mut ready: Vec<(String, Arc<PendingEntry>, String)> = {
-            let map = self.pending.lock().unwrap();
+            let map = self.pending.locked();
             map.iter()
                 .filter(|(_, e)| {
                     e.session_id == session_id
@@ -6053,7 +6097,7 @@ impl Daemon {
             .iter()
             .filter(|(_, e)| {
                 e.session_id == session_id
-                    && e.result.lock().unwrap().is_none()
+                    && e.result.locked().is_none()
                     && !e.delivered.load(Ordering::SeqCst)
                     && !e.abandoned.load(Ordering::SeqCst)
             })
@@ -6408,7 +6452,7 @@ impl Daemon {
         if !session_id.is_empty() {
             why["session_id"] = json!(session_id);
         }
-        let mut log = self.routing_log.lock().unwrap();
+        let mut log = self.routing_log.locked();
         log.push_back(why);
         while log.len() > 50 {
             log.pop_front();
@@ -6481,7 +6525,7 @@ impl Daemon {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             if let Ok(cfg) = self.config() {
                 let missing = self.missing_configured_models(&cfg).await;
-                if !missing.is_empty() && *self.missing_models.lock().unwrap() != missing {
+                if !missing.is_empty() && *self.missing_models.locked() != missing {
                     self.broadcast(Event::Note {
                         session_id: None,
                         text: format!(
@@ -6490,7 +6534,7 @@ impl Daemon {
                         ),
                     });
                 }
-                *self.missing_models.lock().unwrap() = missing;
+                *self.missing_models.locked() = missing;
             }
             tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
         }
@@ -6688,7 +6732,7 @@ impl Daemon {
         let Ok(stamp) = self.with_store(|st| st.modules_fingerprint()) else {
             return Arc::default();
         };
-        let mut cache = self.modules.lock().unwrap();
+        let mut cache = self.modules.locked();
         if let Some((cached, code)) = cache.as_ref() {
             if *cached == stamp {
                 return code.clone();
@@ -7306,7 +7350,7 @@ impl Daemon {
     fn purge_session(&self, id: &str) -> Result<()> {
         self.with_store(|st| crate::artifacts::remove_for_session(st, id))?;
         self.with_store(|st| st.delete_session(id))?;
-        self.contexts.lock().unwrap().remove(id);
+        self.contexts.locked().remove(id);
         Ok(())
     }
 
@@ -7331,7 +7375,7 @@ impl Daemon {
     /// A primary Run on a role counts as one task for that role's per-task
     /// routing (SPEC §4.6); a later edit or correction marks it bad.
     fn record_primary_task(&self, session_id: &str, run_id: &str, status: &str) {
-        let model = self.run_models.lock().unwrap().remove(run_id);
+        let model = self.run_models.locked().remove(run_id);
         if status == "interrupted" {
             return;
         }
@@ -7729,14 +7773,14 @@ impl Daemon {
     fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
         let mut l = cfg.limits.clone();
         // `/limit N` for this Run replaces `limits.run_steps`.
-        let per_run = self.step_limits.lock().unwrap().get(session_id).copied();
+        let per_run = self.step_limits.locked().get(session_id).copied();
         if let Some(n) = per_run {
             l.run_steps = Some(n.into());
         }
         if l.daily_usd.is_none() && l.run_usd.is_none() && l.run_steps.is_none() {
             return Ok(());
         }
-        if self.budget_waived.lock().unwrap().contains(session_id) {
+        if self.budget_waived.locked().contains(session_id) {
             return Ok(());
         }
         let run = self.usage_info(None, Some(run_id), cfg)?;
@@ -7796,7 +7840,7 @@ impl Daemon {
             } else {
                 format!("run:{run_id}:{name}")
             };
-            if used >= max * 0.8 && self.budget_warned.lock().unwrap().insert(key) {
+            if used >= max * 0.8 && self.budget_warned.locked().insert(key) {
                 self.broadcast(Event::Note {
                     session_id: Some(session_id.to_string()),
                     text: if source.is_empty() {
@@ -7994,7 +8038,7 @@ impl Daemon {
         &self,
         root: &std::path::Path,
     ) -> Result<Arc<(Vec<crate::files::FileEntry>, bool)>> {
-        if let Some((at, index)) = self.file_index.lock().unwrap().get(root) {
+        if let Some((at, index)) = self.file_index.locked().get(root) {
             if at.elapsed() < std::time::Duration::from_secs(FILE_INDEX_SECS) {
                 return Ok(index.clone());
             }
@@ -8002,7 +8046,7 @@ impl Daemon {
         let walk_root = root.to_path_buf();
         let index =
             Arc::new(tokio::task::spawn_blocking(move || crate::files::walk(&walk_root)).await?);
-        let mut cache = self.file_index.lock().unwrap();
+        let mut cache = self.file_index.locked();
         // A few roots at most: clients use their working directory.
         if cache.len() > 8 {
             cache.clear();
@@ -8504,7 +8548,7 @@ impl Daemon {
             }
         };
         // Overlap: the previous firing still queued or running.
-        let busy = self.runs.lock().unwrap().contains_key(&sid);
+        let busy = self.runs.locked().contains_key(&sid);
         let queued = self.with_reader(|st| st.queued_count(&sid)).unwrap_or(0);
         let skip = if job.overlap != "queue" && busy && queued > 0 {
             Some("skipped: the previous firing is still running".to_string())
@@ -8561,7 +8605,7 @@ impl Daemon {
     /// the user when it failed, and deliver the answer (SPEC §9.7).
     fn job_run_ended(self: &Arc<Self>, session_id: &str, run_id: &str, status: &str) {
         let (row, job_id) = {
-            let mut pending = self.job_pending.lock().unwrap();
+            let mut pending = self.job_pending.locked();
             match pending.get_mut(session_id) {
                 // A Run queued ahead of the job's own ended.
                 Some((_, _, ahead)) if *ahead > 0 => {
@@ -8684,7 +8728,7 @@ impl Daemon {
             _ = cancel.cancelled() => None,
             r = rx => r.ok(),
         };
-        self.questions.lock().unwrap().remove(&question_id);
+        self.questions.locked().remove(&question_id);
         self.broadcast(Event::UserQuestionClosed { question_id });
         let (answer, answers) = reply.context("interrupted before the user answered")?;
         if answers.is_empty() {
@@ -8711,8 +8755,8 @@ impl Daemon {
             })
             .collect::<Result<Vec<Value>>>()?;
         let mut out = json!({"answers": structured});
-        if legacy {
-            out["answer"] = json!(answers[0].summary());
+        if let (true, Some(first)) = (legacy, answers.first()) {
+            out["answer"] = json!(first.summary());
         }
         Ok(out.to_string())
     }
@@ -9465,7 +9509,7 @@ impl Daemon {
         if !needs {
             return true;
         }
-        self.denial_notes.lock().unwrap().remove(&info.name);
+        self.denial_notes.locked().remove(&info.name);
         // Access the user always denies is refused without asking (§10.3).
         let denied = self.remembered_denials(caps);
         if !denied.is_empty() {
@@ -9476,7 +9520,7 @@ impl Daemon {
                     &format!("{}: {}", info.name, denied.join(", ")),
                 )
             });
-            self.denial_notes.lock().unwrap().insert(
+            self.denial_notes.locked().insert(
                 info.name.clone(),
                 format!(
                     "the user always denies {}; don't attempt this access with any Tool, do the task another way or ask them",
@@ -9554,11 +9598,11 @@ impl Daemon {
         let session_code_key = format!("s\u{0}{session_id}\u{0}{}", info.id);
         let timed_code_key = format!("h\u{0}{}", info.id);
         if !fits(&session_code_key) {
-            self.session_grants.lock().unwrap().remove(&session_key);
+            self.session_grants.locked().remove(&session_key);
             code_changed.get_or_insert("session");
         }
         if !fits(&timed_code_key) {
-            self.timed_grants.lock().unwrap().remove(&info.id);
+            self.timed_grants.locked().remove(&info.id);
             code_changed.get_or_insert("hour");
         }
         if code_changed.is_some() {
@@ -9586,7 +9630,7 @@ impl Daemon {
         }
         // A time-limited grant counts until it ends; then it asks again.
         let timed_grant = {
-            let mut timed = self.timed_grants.lock().unwrap();
+            let mut timed = self.timed_grants.locked();
             if timed
                 .get(&info.id)
                 .is_some_and(|(_, _, until)| *until <= chrono::Utc::now())
@@ -9659,7 +9703,7 @@ impl Daemon {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
-        self.approvals.lock().unwrap().remove(&approval_id);
+        self.approvals.locked().remove(&approval_id);
         let by = self
             .approval_by
             .lock()
@@ -9720,7 +9764,7 @@ impl Daemon {
             } else {
                 ""
             };
-            self.grant_meta.lock().unwrap().insert(
+            self.grant_meta.locked().insert(
                 (scope, session.to_string(), info.id.clone()),
                 (now.clone(), by.clone()),
             );
@@ -9765,7 +9809,7 @@ impl Daemon {
             };
             let _ = self.with_store(|st| st.set_approval_by(&info.id, &grant, mem, &by));
             let _ = self.with_store(|st| st.audit("user", "tool.approve", &info.name));
-        } else if self.deny_always.lock().unwrap().remove(&approval_id) {
+        } else if self.deny_always.locked().remove(&approval_id) {
             // Always deny what was new on this prompt, for every Tool.
             let held = prior.as_ref().map(|(p, _)| p.clone()).unwrap_or_default();
             let new: Vec<String> = caps
@@ -9786,7 +9830,7 @@ impl Daemon {
                     &format!("{}: {}", info.name, new.join(", ")),
                 )
             });
-            self.denial_notes.lock().unwrap().insert(
+            self.denial_notes.locked().insert(
                 info.name.clone(),
                 format!(
                     "the user always denies {}; don't attempt this access with any Tool, do the task another way or ask them",
@@ -9861,7 +9905,7 @@ impl Daemon {
     /// The error a denied call returns to the agent, with the reason when
     /// the user always denies that access.
     fn denied_text(&self, name: &str) -> String {
-        match self.denial_notes.lock().unwrap().get(name) {
+        match self.denial_notes.locked().get(name) {
             Some(note) => format!("user denied approval for tool '{name}': {note}"),
             None => format!("user denied approval for tool '{name}'"),
         }
@@ -10358,7 +10402,7 @@ impl Daemon {
                 tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn)).await;
             let elapsed = dur(&started);
             let finish = |ok: bool, this: &Daemon| {
-                this.progress_sent.lock().unwrap().remove(&inv_id);
+                this.progress_sent.locked().remove(&inv_id);
                 this.broadcast(Event::ToolCallFinished {
                     session_id: session_id.clone(),
                     run_id: run_id.clone(),
@@ -10370,7 +10414,7 @@ impl Daemon {
             match outcome {
                 Ok(Ok(mut out)) => {
                     // Emitted artifact reference (streamed output, §7.5).
-                    if let Some((path, bytes)) = ops.emitted.lock().unwrap().take() {
+                    if let Some((path, bytes)) = ops.emitted.locked().take() {
                         let path = crate::artifacts::settle_emit(&ops.artifact_dir, &path);
                         let preview: String = out.output.to_string().chars().take(200).collect();
                         if let Ok(id) = self.with_store(|st| {
@@ -10620,7 +10664,7 @@ impl Daemon {
         let filter = Arc::new(StdMutex::new(EventFilter::default()));
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let kick = CancellationToken::new();
-        self.subs.lock().unwrap().push(Subscriber {
+        self.subs.locked().push(Subscriber {
             conn,
             tx: tx.clone(),
             filter: filter.clone(),
@@ -10631,7 +10675,7 @@ impl Daemon {
         let client = {
             let filter = filter.clone();
             move || {
-                let label = filter.lock().unwrap().label.clone();
+                let label = filter.locked().label.clone();
                 (conn, label.unwrap_or_else(|| "client".into()))
             }
         };
@@ -10683,7 +10727,7 @@ impl Daemon {
             tokio::spawn(async move {
                 while let Some((env, arrived)) = work_rx.recv().await {
                     if let Request::SendMessage { session_id, .. } = &env.request {
-                        let cut = interrupted.lock().unwrap().get(session_id).copied();
+                        let cut = interrupted.locked().get(session_id).copied();
                         if cut.is_some_and(|at| at > arrived) {
                             let resp = ServerMessage::err(
                                 env.id,
@@ -10753,7 +10797,7 @@ impl Daemon {
                     {
                         // Per connection, so handled here rather than in `handle`.
                         let before = {
-                            let mut f = filter.lock().unwrap();
+                            let mut f = filter.locked();
                             let before = f.sessions.take().unwrap_or_default();
                             *f = EventFilter {
                                 sessions: sessions.map(|s| s.into_iter().collect()),
@@ -10763,7 +10807,7 @@ impl Daemon {
                             before
                         };
                         // Both the Sessions it left and the ones it joined.
-                        let now = filter.lock().unwrap().sessions.clone().unwrap_or_default();
+                        let now = filter.locked().sessions.clone().unwrap_or_default();
                         self.broadcast_clients(before.union(&now));
                         ServerMessage::ok(env.id, json!({"subscribed": true, "conn": conn}))
                     } else if is_control(&env.request) {
@@ -10823,8 +10867,8 @@ impl Daemon {
         }
         drop(work_tx);
         // Gone from its Sessions: tell the clients still there.
-        self.subs.lock().unwrap().retain(|sub| sub.conn != conn);
-        let left = filter.lock().unwrap().sessions.take().unwrap_or_default();
+        self.subs.locked().retain(|sub| sub.conn != conn);
+        let left = filter.locked().sessions.take().unwrap_or_default();
         self.broadcast_clients(&left);
         // A kicked client gets nothing more: stop its work now. Otherwise
         // let queued requests finish (their replies are dropped if the
@@ -10950,12 +10994,12 @@ impl Daemon {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
-        self.approvals.lock().unwrap().remove(&approval_id);
+        self.approvals.locked().remove(&approval_id);
         // These prompts have no Tool to remember a denial or a folder for:
         // drop what an answer may have left (clients don't offer them, #764).
-        self.deny_always.lock().unwrap().remove(&approval_id);
-        self.approval_paths.lock().unwrap().remove(&approval_id);
-        self.approval_by.lock().unwrap().remove(&approval_id);
+        self.deny_always.locked().remove(&approval_id);
+        self.approval_paths.locked().remove(&approval_id);
+        self.approval_by.locked().remove(&approval_id);
         answer
     }
 
@@ -11171,8 +11215,8 @@ impl Daemon {
             .lock()
             .unwrap()
             .values()
-            .any(|e| e.result.lock().unwrap().is_none());
-        !held && self.runs.lock().unwrap().is_empty() && self.subscriber_count() == 0
+            .any(|e| e.result.locked().is_none());
+        !held && self.runs.locked().is_empty() && self.subscriber_count() == 0
     }
 
     async fn idle_watcher(self: Arc<Self>) {
@@ -11227,7 +11271,7 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .values()
-                .any(|e| e.result.lock().unwrap().is_none());
+                .any(|e| e.result.locked().is_none());
             // Stall warnings (SPEC §6.1): advisory only, never auto-kill.
             if let Ok(cfg) = self.config() {
                 let stall_ms = cfg.daemon.stall_warning_secs.saturating_mul(1000);
@@ -11240,7 +11284,7 @@ impl Daemon {
                     .map(|(h, e)| (h.clone(), e.clone()))
                     .collect();
                 for (handle, e) in entries {
-                    if e.result.lock().unwrap().is_some() {
+                    if e.result.locked().is_some() {
                         continue;
                     }
                     let silent_ms = now.saturating_sub(e.activity.load(Ordering::SeqCst));
@@ -11268,7 +11312,7 @@ impl Daemon {
             let busy = pending_running
                 || stay
                 || jobs_waiting
-                || !self.runs.lock().unwrap().is_empty()
+                || !self.runs.locked().is_empty()
                 || self.subscriber_count() > 0;
             if busy {
                 idle_since = None;
@@ -12001,7 +12045,7 @@ impl HostOps for NestedOps {
         // changes or the work is done.
         let key = self.parent_inv.clone().unwrap_or_default();
         {
-            let mut sent = self.daemon.progress_sent.lock().unwrap();
+            let mut sent = self.daemon.progress_sent.locked();
             let now = std::time::Instant::now();
             if let Some((at, last)) = sent.get(&key) {
                 let soon = now.duration_since(*at) < std::time::Duration::from_millis(200);
@@ -12255,12 +12299,13 @@ impl HostOps for NestedOps {
         // Written aside until registered, so reconcile never takes it (#1105).
         let emitting = crate::artifacts::emitting_dir(&self.artifact_dir);
         std::fs::create_dir_all(&emitting).map_err(|e| e.to_string())?;
-        let mut guard = self.emitted.lock().unwrap();
-        if guard.is_none() {
-            let path = emitting.join(format!("emit-{}.txt", uuid::Uuid::new_v4()));
-            *guard = Some((path, 0));
-        }
-        let (path, bytes) = guard.as_mut().unwrap();
+        let mut guard = self.emitted.locked();
+        let (path, bytes) = guard.get_or_insert_with(|| {
+            (
+                emitting.join(format!("emit-{}.txt", uuid::Uuid::new_v4())),
+                0,
+            )
+        });
         // One Invocation can't fill the disk (#604).
         let cap = self.cfg.tools.max_emit_bytes;
         if (*bytes as u64).saturating_add(chunk.len() as u64) > cap {
@@ -12849,7 +12894,7 @@ mod backpressure_tests {
         };
         send_all(&subs, delta()); // fills the queue
         send_all(&subs, delta()); // dropped, client kept
-        assert_eq!(subs.lock().unwrap().len(), 1);
+        assert_eq!(subs.locked().len(), 1);
         assert!(!kick.is_cancelled());
         send_all(
             &subs,
@@ -12858,10 +12903,7 @@ mod backpressure_tests {
                 text: "important".into(),
             },
         );
-        assert!(
-            subs.lock().unwrap().is_empty(),
-            "can't take what matters: gone"
-        );
+        assert!(subs.locked().is_empty(), "can't take what matters: gone");
         assert!(kick.is_cancelled(), "and its connection closes");
     }
 
@@ -12894,7 +12936,7 @@ mod backpressure_tests {
             matches!(told, ServerMessage::Event(Event::DeltasDropped { ref run_id, .. }) if run_id == "r"),
             "{told:?}"
         );
-        assert!(subs.lock().unwrap()[0].gap.is_none(), "told once");
+        assert!(subs.locked()[0].gap.is_none(), "told once");
         assert!(matches!(
             rx.try_recv().unwrap(),
             ServerMessage::Event(Event::MessageDelta { .. })
@@ -12938,7 +12980,7 @@ mod backpressure_tests {
                 .await
                 .unwrap();
         }
-        while daemon.subs.lock().unwrap().is_empty() {
+        while daemon.subs.locked().is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         for _ in 0..=CLIENT_QUEUE + 1 {
@@ -12951,7 +12993,7 @@ mod backpressure_tests {
             .await
             .expect("the kicked connection ended")
             .unwrap();
-        assert!(daemon.subs.lock().unwrap().is_empty());
+        assert!(daemon.subs.locked().is_empty());
         drop(client);
     }
 
@@ -13165,7 +13207,7 @@ mod widen_scope_tests {
         let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
         // Someone to ask.
         let (tx, mut rx) = mpsc::channel::<ServerMessage>(64);
-        daemon.subs.lock().unwrap().push(Subscriber {
+        daemon.subs.locked().push(Subscriber {
             conn: 1,
             tx,
             filter: Arc::new(StdMutex::new(EventFilter::default())),
@@ -13237,6 +13279,88 @@ mod widen_scope_tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+
+    /// A panic while holding a daemon lock doesn't take every later
+    /// request down with it (#717).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poisoned_lock_leaves_the_daemon_answering() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("fl-poison-{short}"));
+        let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let d = daemon.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = d.runs.lock().unwrap();
+            panic!("a bug while holding runs");
+        })
+        .join();
+        assert!(daemon.runs.is_poisoned());
+        daemon.handle(Request::Ping).await.unwrap();
+        let status = daemon.handle(Request::Status).await.unwrap();
+        assert!(status["running_sessions"].is_array(), "{status}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod run_start_tests {
+    use super::*;
+
+    /// One Run per Session: a second start is refused naming the winner,
+    /// and a finishing Run never removes a newer Run's controls (#726).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_start_is_atomic_and_cleanup_is_by_run() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("fl-rs-{short}"));
+        let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        // A Run holds the Session (inserted as start_run would).
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<()>();
+        daemon.runs.locked().insert(
+            sid.clone(),
+            RunCtl {
+                run_id: "newer".into(),
+                cancel: CancellationToken::new(),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                steer_tx,
+                retry: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        let e = daemon.start_run(sid.clone()).unwrap_err().to_string();
+        assert_eq!(e, "already running: run newer");
+        // A send that loses the race steers the running Run instead.
+        let r = daemon
+            .send_message(sid.clone(), "hi".into(), SendMode::Send)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        assert!(steer_rx.try_recv().is_ok(), "the running Run was steered");
+        // An older Run finishing leaves the newer one's controls alone.
+        daemon
+            .finish_run(sid.clone(), "older".into(), "completed")
+            .await;
+        assert_eq!(
+            daemon
+                .runs
+                .locked()
+                .get(&sid)
+                .map(|c| c.run_id.clone())
+                .as_deref(),
+            Some("newer")
+        );
+        daemon
+            .finish_run(sid.clone(), "newer".into(), "completed")
+            .await;
+        assert!(daemon.runs.locked().get(&sid).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use formless_runtime::LockExt as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -132,7 +133,7 @@ static RATE_LIMITS: std::sync::Mutex<Option<HashMap<String, Value>>> = std::sync
 
 /// What the endpoint's last response said about its rate limits.
 pub fn rate_limits() -> HashMap<String, Value> {
-    RATE_LIMITS.lock().unwrap().clone().unwrap_or_default()
+    RATE_LIMITS.locked().clone().unwrap_or_default()
 }
 
 fn note_rate_limits(base_url: &str, headers: &reqwest::header::HeaderMap) {
@@ -1142,11 +1143,11 @@ impl Provider {
                 sends += 1;
                 let mut b = body.clone();
                 b["model"] = json!(model);
-                if with_effort {
+                if let (true, Some(effort)) = (with_effort, effort) {
                     if self.cfg.responses() {
-                        b["reasoning"] = json!({"effort": effort.unwrap()});
+                        b["reasoning"] = json!({"effort": effort});
                     } else {
-                        b["reasoning_effort"] = json!(effort.unwrap());
+                        b["reasoning_effort"] = json!(effort);
                     }
                 }
                 let credential = self.credential().await?;

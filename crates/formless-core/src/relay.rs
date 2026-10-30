@@ -18,6 +18,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use formless_protocol::RelayClientInfo;
+use formless_runtime::LockExt as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -281,8 +282,8 @@ struct Forget(Arc<Daemon>);
 
 impl Drop for Forget {
     fn drop(&mut self) {
-        self.0.relay_clients.lock().unwrap().clear();
-        *self.0.relay_kick.lock().unwrap() = None;
+        self.0.relay_clients.locked().clear();
+        *self.0.relay_kick.locked() = None;
     }
 }
 
@@ -322,14 +323,14 @@ pub async fn connect_once(
     // The browsers on this link (`ListRelayClients`) and requests to close
     // one; both forgotten when the link ends.
     let (kick_tx, mut kick_rx) = mpsc::unbounded_channel::<String>();
-    *daemon.relay_kick.lock().unwrap() = Some(kick_tx);
+    *daemon.relay_kick.locked() = Some(kick_tx);
     let _forget = Forget(daemon.clone());
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             Some(cid) = kick_rx.recv() => {
                 clients.remove(&cid);
-                daemon.relay_clients.lock().unwrap().remove(&cid);
+                daemon.relay_clients.locked().remove(&cid);
                 let frame = json!({"relay": "disconnect", "cid": cid}).to_string();
                 if ws_write.send(Message::Text(frame)).await.is_err() {
                     return Ok(());
@@ -363,12 +364,12 @@ pub async fn connect_once(
                 match relay.as_deref() {
                     Some("client_close") => {
                         clients.remove(&cid);
-                        daemon.relay_clients.lock().unwrap().remove(&cid);
+                        daemon.relay_clients.locked().remove(&cid);
                         continue;
                     }
                     Some("client_open") => {
                         let user_agent: String = ua.unwrap_or_default().chars().take(200).collect();
-                        daemon.relay_clients.lock().unwrap().insert(
+                        daemon.relay_clients.locked().insert(
                             cid.clone(),
                             RelayClientInfo { cid: cid.clone(), user_agent, first_seen: now.clone(), last_seen: now },
                         );
@@ -376,7 +377,7 @@ pub async fn connect_once(
                     }
                     _ => {}
                 }
-                if let Some(c) = daemon.relay_clients.lock().unwrap().get_mut(&cid) {
+                if let Some(c) = daemon.relay_clients.locked().get_mut(&cid) {
                     c.last_seen = now;
                 }
                 let Some(f) = f else { continue };

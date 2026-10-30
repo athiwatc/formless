@@ -4,6 +4,7 @@
 //! Tools; executed by the server, never by the sandbox).
 
 use anyhow::{anyhow, Context, Result};
+use formless_runtime::LockExt as _;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -141,7 +142,7 @@ fn now_secs() -> u64 {
 fn route(msg: &Value, pending: &Pending, changed: &AtomicBool) -> Option<Value> {
     match (msg.get("id").and_then(Value::as_u64), msg.get("method")) {
         (Some(id), None) => {
-            if let Some(tx) = pending.lock().unwrap().remove(&id) {
+            if let Some(tx) = pending.locked().remove(&id) {
                 let out = match msg.get("error") {
                     Some(e) => Err(e["message"].as_str().unwrap_or("MCP error").to_string()),
                     None => Ok(msg["result"].clone()),
@@ -298,7 +299,7 @@ impl Connection {
             }
             alive.store(false, Ordering::SeqCst);
             // Fail whatever was waiting: the server is gone.
-            pending.lock().unwrap().clear();
+            pending.locked().clear();
         });
         Ok(conn)
     }
@@ -374,7 +375,7 @@ impl Connection {
                     }
                 }
                 alive.store(false, Ordering::SeqCst);
-                pending.lock().unwrap().clear();
+                pending.locked().clear();
             })
         };
         Ok(Self::new(
@@ -451,7 +452,7 @@ impl Connection {
                 .header("accept", "application/json, text/event-stream")
                 .header("mcp-protocol-version", PROTOCOL_VERSION)
                 .json(msg);
-            if let Some(id) = session.lock().unwrap().clone() {
+            if let Some(id) = session.locked().clone() {
                 req = req.header("mcp-session-id", id);
             }
             if let Some(token) = &bearer {
@@ -489,7 +490,7 @@ impl Connection {
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
         {
-            *session.lock().unwrap() = Some(id.to_string());
+            *session.locked() = Some(id.to_string());
         }
         let Some(want) = want else {
             return Ok(None);
@@ -536,7 +537,7 @@ impl Connection {
         impl Drop for CancelOnDrop {
             fn drop(&mut self) {
                 if let Some((conn, id)) = self.0.take() {
-                    conn.pending.lock().unwrap().remove(&id);
+                    conn.pending.locked().remove(&id);
                     tokio::spawn(async move {
                         let _ = conn
                             .notify(
@@ -561,7 +562,7 @@ impl Connection {
             }
         } else {
             let (tx, rx) = oneshot::channel();
-            self.pending.lock().unwrap().insert(id, tx);
+            self.pending.locked().insert(id, tx);
             self.write(&msg).await?;
             rx.await
                 .map_err(|_| anyhow!("MCP server stopped before answering"))?
@@ -620,7 +621,7 @@ impl Connection {
         self.alive.store(false, Ordering::SeqCst);
         match &self.io {
             Io::Stdio { child, .. } => {
-                if let Some(mut child) = child.lock().unwrap().take() {
+                if let Some(mut child) = child.locked().take() {
                     #[cfg(unix)]
                     if let Some(pid) = child.id() {
                         extern "C" {
@@ -700,7 +701,7 @@ impl Manager {
         }
         match Connection::start(paths, server, scfg).await {
             Ok(conn) => {
-                self.errors.lock().unwrap().remove(server);
+                self.errors.locked().remove(server);
                 conns.insert(server.to_string(), conn.clone());
                 Ok(conn)
             }
@@ -749,11 +750,11 @@ impl Manager {
     }
 
     pub fn last_error(&self, server: &str) -> Option<String> {
-        self.errors.lock().unwrap().get(server).cloned()
+        self.errors.locked().get(server).cloned()
     }
 
     pub fn set_error(&self, server: &str, error: Option<String>) {
-        let mut errors = self.errors.lock().unwrap();
+        let mut errors = self.errors.locked();
         match error {
             Some(e) => errors.insert(server.to_string(), e),
             None => errors.remove(server),

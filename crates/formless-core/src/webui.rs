@@ -6,6 +6,7 @@
 //! must name this server in `Host` (DNS rebinding), and state-changing ones
 //! must come from its own `Origin`; the same CSP as the hosted relay.
 
+use formless_runtime::LockExt as _;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +51,7 @@ impl WebUi {
     /// A fresh one-time login URL.
     pub fn login_url(&self) -> String {
         let token = random_hex();
-        self.tokens.lock().unwrap().insert(token.clone());
+        self.tokens.locked().insert(token.clone());
         format!("http://127.0.0.1:{}/#local={token}", self.port)
     }
 
@@ -87,7 +88,7 @@ impl WebUi {
                     .map(str::to_string)
             })
             .collect::<Vec<_>>();
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.sessions.locked();
         cookies.iter().any(|c| sessions.contains(c))
     }
 }
@@ -218,7 +219,7 @@ async fn auth(State(st): State<AppState>, headers: HeaderMap, body: String) -> R
     if !st.ui.host_ok(&headers) || !st.ui.origin_ok(&headers) {
         return forbidden();
     }
-    if !st.ui.tokens.lock().unwrap().remove(body.trim()) {
+    if !st.ui.tokens.locked().remove(body.trim()) {
         return secured(
             StatusCode::UNAUTHORIZED,
             "text/plain",
@@ -226,7 +227,7 @@ async fn auth(State(st): State<AppState>, headers: HeaderMap, body: String) -> R
         );
     }
     let session = random_hex();
-    st.ui.sessions.lock().unwrap().insert(session.clone());
+    st.ui.sessions.locked().insert(session.clone());
     let mut res = secured(StatusCode::NO_CONTENT, "text/plain", String::new());
     if let Ok(v) = format!("{COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/").parse() {
         res.headers_mut().insert(header::SET_COOKIE, v);
