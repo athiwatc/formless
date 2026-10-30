@@ -26,8 +26,32 @@ pub fn is_correction(text: &str) -> bool {
         "still broken",
         "still not working",
     ];
+    // Praise and reassurance that open like a correction (#831).
+    const NOT_CORRECTIONS: &[&str] = &[
+        "no, that was perfect",
+        "no, that's perfect",
+        "no, that was great",
+        "no, that's great",
+        "no, that was right",
+        "no, that's right",
+        "no, that works",
+        "no, that's fine",
+        "no, that was fine",
+        "you didn't need to",
+        "you didn't have to",
+    ];
     let t = text.trim().to_lowercase().replace('’', "'");
-    OPENINGS.iter().any(|o| t.starts_with(o))
+    if NOT_CORRECTIONS.iter().any(|p| t.starts_with(p)) {
+        return false;
+    }
+    // Whole words only: "wrongdoing" doesn't open with "wrong".
+    OPENINGS.iter().any(|o| {
+        t.starts_with(o)
+            && t[o.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric())
+    })
 }
 
 /// Roll finished Runs up (Runs still going are left out).
