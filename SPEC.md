@@ -584,9 +584,13 @@ task, with quality as a gate**.
 - **Opt-in spending limits.** `[limits]` `daily_usd` (all Sessions, per
   UTC day), `run_usd` and `run_steps` (per Run), all unset by default and
   settable from Settings. Dollar limits count only while every model used
-  has a `provider.prices` entry. Model calls made on the Run's behalf
-  (`llm.complete` from a Tool, each sub-agent step) count toward them and
-  toward usage, and are checked too. Before each model request the daemon
+  has a `provider.prices` entry; a Run on an unpriced model says so when
+  it starts, and `doctor` lists such models. Model calls made on the Run's
+  behalf (`llm.complete` from a Tool, each sub-agent step) count toward
+  them and toward usage, and are checked too, and so do the daemon's own
+  calls (compaction, the optimiser's generation and eval suites, approval
+  summaries, skill distilling), recorded by purpose (`UsageByDay {by:
+  "purpose"}`); the optimiser's `token_budget` uses their real tokens. Before each model request the daemon
   checks them: at 80% it posts a note ("Spending: …"), and at 100% it pauses
   the Run with a `budget:` error (explained category `budget`). The pause
   banner's Resume goes past the limits for that one Run. Raising or
@@ -3049,10 +3053,19 @@ run_tool = "network_policy"     # a registry Tool, or…
     `/usage`, and the web status-bar tooltip.
   - Cost is what the provider billed when it reports it (OpenRouter's
     `usage.cost`, stored per request), else it comes from
-    `provider.prices` (USD per million tokens, per model: `input`,
-    `output` and optional `cached_input`). It is shown only when every
-    request is reported or priced. Cache writes
-    (`cache_write_tokens`) are recorded too.
+    `provider.prices` of the provider that served the request (USD per
+    million tokens, per model: `input`, `output`, optional `cached_input`
+    and `cache_write_input`). Cache reads and writes are parts of the
+    prompt, each charged once at its own rate. A price is found by exact
+    id or with the aggregator prefix dropped on either side
+    (`anthropic/claude-x` ↔ `claude-x`). It is shown only when every
+    request is reported or priced; otherwise the usage line names the
+    unpriced models. `formless prices import [--provider NAME] [--all]
+    [--dry-run]` copies the endpoint's own `/models` prices (OpenRouter
+    publishes them) for the models in use, dated, and `doctor` flags
+    imported prices older than 90 days. Usage rows record their provider,
+    so `UsageByDay {by: "provider"}` works; rows stay when their Session
+    is deleted (spend history).
 - **Colour:** roles, statuses, list selections, borders, and approval
   prompts are colour-coded; the chat has a friendly empty state and
   `/help` lists the shortcuts. `NO_COLOR` disables all colour.
@@ -3533,7 +3546,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
-| `provider.prices` | {} | USD per million tokens per model (`input`, `output`, `cached_input`) for cost estimates (§10.6) |
+| `provider.prices` | {} | USD per million tokens per model (`input`, `output`, `cached_input`, `cache_write_input`; `retrieved_at` when imported with `formless prices import`) for cost estimates and dollar limits (§10.6) |
 | `tools.pending_threshold_secs` | 300 | Soft async handoff threshold (§6.2) |
 | `tools.default_memory_mb` | 256 | Default per-Invocation heap (§7.4) |
 | `tools.max_memory_mb` | 4096 | Daemon bound on declared memory (§7.4) |

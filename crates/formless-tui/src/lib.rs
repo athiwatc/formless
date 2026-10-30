@@ -14290,8 +14290,16 @@ fn usage_text(u: &formless_protocol::UsageInfo) -> String {
             100.0 * u.cached_tokens as f64 / u.prompt_tokens as f64
         ));
     }
-    if let Some(c) = u.cost {
-        s.push_str(&format!(" · ${c:.3}"));
+    if u.cache_write_tokens > 0 {
+        s.push_str(&format!(" · {} written to cache", k(u.cache_write_tokens)));
+    }
+    match u.cost {
+        Some(c) => s.push_str(&format!(" · ${c:.3}")),
+        // Said, so a dollar limit that can't count it isn't a surprise (#809).
+        None if !u.unpriced.is_empty() => {
+            s.push_str(&format!(" · no price for {}", u.unpriced.join(", ")))
+        }
+        None => {}
     }
     if u.memories > 0 {
         s.push_str(&format!(

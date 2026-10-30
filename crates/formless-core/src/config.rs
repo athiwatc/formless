@@ -230,6 +230,27 @@ pub const DEFAULT_PROVIDER: &str = "default";
 
 impl Config {
     /// A provider's settings by name (`default` or unset = `[provider]`).
+    /// USD for usage served by provider `provider` ("" or `default` for
+    /// the default one), priced from that provider's own table (#810); a
+    /// provider no longer configured falls back to the default's prices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_of(
+        &self,
+        provider: &str,
+        model: &str,
+        prompt: i64,
+        completion: i64,
+        cached: i64,
+        cache_write: i64,
+        reported: Option<f64>,
+    ) -> Option<f64> {
+        let p = match provider {
+            "" | DEFAULT_PROVIDER => &self.provider,
+            name => self.providers.get(name).unwrap_or(&self.provider),
+        };
+        p.cost_of(model, prompt, completion, cached, cache_write, reported)
+    }
+
     pub fn provider_cfg(&self, name: Option<&str>) -> Result<ProviderCfg> {
         match name.filter(|n| !n.is_empty() && *n != DEFAULT_PROVIDER) {
             None => Ok(self.provider.clone()),
@@ -346,14 +367,36 @@ pub struct ModelPrice {
     pub output: f64,
     /// Cached input; unset charges cached tokens at `input`.
     pub cached_input: Option<f64>,
+    /// Input written to the prompt cache (Anthropic bills 1.25× input);
+    /// unset charges it at `input` (#804).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_input: Option<f64>,
+    /// When the price was taken from the endpoint's `/models` listing
+    /// (RFC 3339), so `doctor` can say it may be stale (#809).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieved_at: Option<String>,
 }
 
 impl ModelPrice {
-    pub fn cost(&self, prompt: i64, completion: i64, cached: i64) -> f64 {
-        let fresh = (prompt - cached).max(0) as f64;
+    /// USD for one request. `cached` and `cache_write` are parts of
+    /// `prompt` (the provider layer normalises both reporting styles), so
+    /// each is charged once at its own rate.
+    pub fn cost(&self, prompt: i64, completion: i64, cached: i64, cache_write: i64) -> f64 {
+        let fresh = (prompt - cached - cache_write).max(0) as f64;
         let cached_rate = self.cached_input.unwrap_or(self.input);
-        (fresh * self.input + cached as f64 * cached_rate + completion as f64 * self.output) / 1e6
+        let write_rate = self.cache_write_input.unwrap_or(self.input);
+        (fresh * self.input
+            + cached as f64 * cached_rate
+            + cache_write as f64 * write_rate
+            + completion as f64 * self.output)
+            / 1e6
     }
+}
+
+/// A model id without its aggregator prefix (`anthropic/claude-x` →
+/// `claude-x`).
+fn bare_model(model: &str) -> &str {
+    model.rsplit_once('/').map_or(model, |(_, m)| m)
 }
 
 /// A yes/no environment variable: `1/true/yes/on` or `0/false/no/off`
@@ -882,13 +925,28 @@ impl ProviderCfg {
         prompt: i64,
         completion: i64,
         cached: i64,
+        cache_write: i64,
         reported: Option<f64>,
     ) -> Option<f64> {
         reported.or_else(|| {
-            self.prices
-                .get(model)
-                .map(|p| p.cost(prompt, completion, cached))
+            self.price_for(model)
+                .map(|p| p.cost(prompt, completion, cached, cache_write))
         })
+    }
+
+    /// The price for `model`: an exact entry, else one that matches once
+    /// aggregator prefixes are dropped on either side (#809). Deterministic:
+    /// the first such key in name order.
+    pub fn price_for(&self, model: &str) -> Option<&ModelPrice> {
+        if let Some(p) = self.prices.get(model) {
+            return Some(p);
+        }
+        let want = bare_model(model);
+        let mut keys: Vec<&String> = self.prices.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .find(|k| bare_model(k) == want)
+            .and_then(|k| self.prices.get(k))
     }
     pub fn context_for(&self, model: &str) -> u32 {
         self.model_context_tokens
