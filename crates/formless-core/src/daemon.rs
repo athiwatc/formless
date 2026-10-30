@@ -427,6 +427,8 @@ pub struct Daemon {
     /// Time-limited approvals by tool id: Capabilities, memory and when
     /// the grant ends (SPEC §10.3). In memory, never stored.
     timed_grants: StdMutex<HashMap<String, (Capabilities, u32, chrono::DateTime<chrono::Utc>)>>,
+    /// The code fingerprint each Session/hour grant was given for (#704).
+    grant_code: StdMutex<HashMap<String, String>>,
     /// The parallel batch a Session's approvals belong to while
     /// `approve_calls` asks: (batch id, held calls, next call to match).
     approval_batches: StdMutex<HashMap<String, (String, Vec<HeldCall>, usize)>>,
@@ -562,6 +564,7 @@ impl Daemon {
             run_tool_changes: StdMutex::new(Default::default()),
             session_grants: StdMutex::new(Default::default()),
             timed_grants: StdMutex::new(Default::default()),
+            grant_code: StdMutex::new(Default::default()),
             approval_batches: StdMutex::new(Default::default()),
             approval_by: StdMutex::new(Default::default()),
             approval_paths: StdMutex::new(Default::default()),
@@ -3244,23 +3247,26 @@ impl Daemon {
                 paths,
                 remember_denial,
             } => {
-                if remember_denial && !approved {
-                    self.deny_always.lock().unwrap().insert(approval_id.clone());
-                }
-                if !paths.is_empty() {
-                    self.approval_paths
-                        .lock()
-                        .unwrap()
-                        .insert(approval_id.clone(), paths);
-                }
-                // First answer wins (SPEC §10.4): removing the sender resolves it.
-                if let Some((_, label)) = current_client() {
-                    self.approval_by
-                        .lock()
-                        .unwrap()
-                        .insert(approval_id.clone(), label);
-                }
+                // First answer wins (SPEC §10.4): removing the sender resolves
+                // it. A late or losing answer leaves nothing behind (#764).
                 let tx = self.approvals.lock().unwrap().remove(&approval_id);
+                if tx.is_some() {
+                    if remember_denial && !approved {
+                        self.deny_always.lock().unwrap().insert(approval_id.clone());
+                    }
+                    if !paths.is_empty() {
+                        self.approval_paths
+                            .lock()
+                            .unwrap()
+                            .insert(approval_id.clone(), paths);
+                    }
+                    if let Some((_, label)) = current_client() {
+                        self.approval_by
+                            .lock()
+                            .unwrap()
+                            .insert(approval_id.clone(), label);
+                    }
+                }
                 let resolved = match tx {
                     Some(tx) => tx.send((approved, scope)).is_ok(),
                     None => false,
@@ -9507,16 +9513,66 @@ impl Daemon {
                 McpApproval::AskTool(d) => detail = Some(d),
             }
         }
+        // A grant holds only for the code it was given for (#704): a new
+        // version with other code (agent, import, optimiser, MCP sync) asks
+        // again, whatever its Capabilities.
+        let hash = code_hash(ver);
+        let stored_hash = self
+            .with_store(|st| st.approval_code_hash(&info.id))
+            .ok()
+            .flatten();
+        let mut code_changed = None;
         let prior = self
             .with_store(|st| st.get_approval(&info.id))
             .ok()
-            .flatten();
+            .flatten()
+            .filter(|_| match &stored_hash {
+                Some(h) if *h != hash => {
+                    code_changed = Some("stored");
+                    false
+                }
+                Some(_) => true,
+                None => {
+                    // From before fingerprints: this code becomes its own.
+                    let _ = self.with_store(|st| st.set_approval_code_hash(&info.id, &hash));
+                    true
+                }
+            });
         if let Some((approved, mem)) = &prior {
             if approved.covers(caps) && ver.memory_mb <= *mem {
                 return true;
             }
         }
         let session_key = (session_id.to_string(), info.id.clone());
+        let fits = |key: &str| {
+            self.grant_code
+                .lock()
+                .unwrap()
+                .get(key)
+                .is_none_or(|h| *h == hash)
+        };
+        let session_code_key = format!("s\u{0}{session_id}\u{0}{}", info.id);
+        let timed_code_key = format!("h\u{0}{}", info.id);
+        if !fits(&session_code_key) {
+            self.session_grants.lock().unwrap().remove(&session_key);
+            code_changed.get_or_insert("session");
+        }
+        if !fits(&timed_code_key) {
+            self.timed_grants.lock().unwrap().remove(&info.id);
+            code_changed.get_or_insert("hour");
+        }
+        if code_changed.is_some() {
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "daemon",
+                    "tool.grant_code_changed",
+                    &format!(
+                        "{} v{}: the code changed since it was approved",
+                        info.name, ver.version
+                    ),
+                )
+            });
+        }
         let session_grant = self
             .session_grants
             .lock()
@@ -9567,6 +9623,16 @@ impl Daemon {
             .unwrap()
             .insert(approval_id.clone(), tx);
         let preview: String = ver.code.lines().take(15).collect::<Vec<_>>().join("\n");
+        if code_changed.is_some() {
+            let note = format!(
+                "{} v{} has new code since you allowed it: review it before allowing again.",
+                info.name, ver.version
+            );
+            detail = Some(match detail.take() {
+                Some(d) => format!("{note} {d}"),
+                None => note,
+            });
+        }
         // New path grants can be widened to a folder or repository.
         let path_options = path_options(caps, prior.as_ref().map(|(p, _)| p));
         self.broadcast(Event::ApprovalRequested {
@@ -9608,13 +9674,41 @@ impl Daemon {
             .unwrap_or_default();
         // What a lasting grant covers: the call's Capabilities, with any
         // path the user widened to a folder (checked here, never trusted).
-        let widened = widen_paths(caps, &chosen);
+        // Only a lasting grant can be wider than this call: "once" runs the
+        // call as asked, so neither widens nor says it did (#765).
+        let lasting = approved && scope != ApprovalScope::Once;
+        let widened = if lasting {
+            let (widened, refused) = widen_paths(caps, &chosen);
+            for why in refused {
+                self.broadcast(Event::Note {
+                    session_id: Some(session_id.to_string()),
+                    text: format!(
+                        "The wider folder wasn't granted ({why}); only the asked-for path was."
+                    ),
+                });
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "daemon",
+                        "tool.widen_refused",
+                        &format!("{}: {why}", info.name),
+                    )
+                });
+            }
+            widened
+        } else {
+            caps.clone()
+        };
         if widened != *caps {
             let _ = self.with_store(|st| {
                 st.audit(
                     "user",
                     "tool.approve_widened",
-                    &format!("{}: {}", info.name, widened.to_specs().join(", ")),
+                    &format!(
+                        "{} ({}): {}",
+                        info.name,
+                        scope_name(scope),
+                        widened.to_specs().join(", ")
+                    ),
                 )
             });
         }
@@ -9643,6 +9737,10 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .insert(info.id.clone(), (grant, mem, until));
+            self.grant_code
+                .lock()
+                .unwrap()
+                .insert(timed_code_key.clone(), hash.clone());
             let _ = self.with_store(|st| st.audit("user", "tool.approve_hour", &info.name));
         } else if approved && scope == ApprovalScope::Session {
             // For this Session only; accumulates like a stored grant.
@@ -9654,6 +9752,10 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .insert(session_key, grant);
+            self.grant_code
+                .lock()
+                .unwrap()
+                .insert(session_code_key.clone(), hash.clone());
             let _ = self.with_store(|st| st.audit("user", "tool.approve_session", &info.name));
         } else if approved {
             // Accumulate: approving a new bound path keeps earlier ones.
@@ -10849,6 +10951,11 @@ impl Daemon {
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.lock().unwrap().remove(&approval_id);
+        // These prompts have no Tool to remember a denial or a folder for:
+        // drop what an answer may have left (clients don't offer them, #764).
+        self.deny_always.lock().unwrap().remove(&approval_id);
+        self.approval_paths.lock().unwrap().remove(&approval_id);
+        self.approval_by.lock().unwrap().remove(&approval_id);
         answer
     }
 
@@ -11367,11 +11474,14 @@ fn path_options(
 
 /// `caps` with each chosen path Capability widened to its chosen folder.
 /// A choice that isn't a folder above the requested path is ignored.
+/// `caps` with each picked path widened to its chosen folder, and why any
+/// pick was refused (told to the user, not only logged, #772).
 fn widen_paths(
     caps: &Capabilities,
     chosen: &std::collections::BTreeMap<String, String>,
-) -> Capabilities {
+) -> (Capabilities, Vec<String>) {
     let mut out = caps.clone();
+    let mut refused = Vec::new();
     for (spec, dir) in chosen {
         let (list, path) = if let Some(p) = spec.strip_prefix("fs:read:") {
             (&mut out.fs_read, p)
@@ -11390,10 +11500,13 @@ fn widen_paths(
                     list.push(dir);
                 }
             }
-            Err(e) => tracing::warn!("ignored a widened approval path: {e}"),
+            Err(e) => {
+                tracing::warn!("ignored a widened approval path: {e}");
+                refused.push(e);
+            }
         }
     }
-    out
+    (out, refused)
 }
 
 /// Is everything sensitive these Capabilities ask for either writing
@@ -12373,6 +12486,23 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     secret_file.then_some("a key or secrets file")
 }
 
+fn scope_name(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::Session => "session",
+        ApprovalScope::Hour => "hour",
+        _ => "always",
+    }
+}
+
+/// What a grant is given for: a Tool version's code and input schema
+/// (an MCP sync changing the schema counts too), fingerprinted.
+pub fn code_hash(ver: &formless_protocol::ToolVersionInfo) -> String {
+    use sha2::Digest;
+    let d = sha2::Sha256::digest(format!("{}\u{0}{}", ver.code, ver.input_schema));
+    d[..12].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// A MIME type from a file name's extension.
 pub fn guess_mime(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or_default().to_lowercase();
@@ -12557,7 +12687,7 @@ mod path_scope_tests {
 
         let root_s = root.display().to_string();
         let chosen = std::collections::BTreeMap::from([(write.capability.clone(), root_s.clone())]);
-        let widened = widen_paths(&caps, &chosen);
+        let (widened, _) = widen_paths(&caps, &chosen);
         assert_eq!(widened.fs_write, vec![root_s.clone()]);
         assert_eq!(widened.fs_read, caps.fs_read, "read stays the file");
         let sibling = Capabilities::parse(&[format!("fs:write:{root_s}/README.md")]).unwrap();
@@ -12568,7 +12698,9 @@ mod path_scope_tests {
         for bad in ["/", "/tmp/elsewhere"] {
             let chosen =
                 std::collections::BTreeMap::from([(write.capability.clone(), bad.to_string())]);
-            assert_eq!(widen_paths(&caps, &chosen), caps, "{bad}");
+            let (kept, refused) = widen_paths(&caps, &chosen);
+            assert_eq!(kept, caps, "{bad}");
+            assert!(!refused.is_empty(), "the refusal is said: {bad}");
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -12909,5 +13041,202 @@ mod internal_usage_tests {
             (rows[0].0.as_str(), rows[0].1.as_str()),
             ("compaction", "default")
         );
+    }
+}
+
+#[cfg(test)]
+mod grant_code_tests {
+    use super::*;
+
+    /// "Always" for v1 doesn't carry over to a v2 with other code, even with
+    /// the same Capabilities (#704); with nobody to ask, it fails closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_version_with_other_code_asks_again() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("fl-gc-{short}"));
+        let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        let mut cfg = Config::default();
+        cfg.security.secure = true;
+        cfg.save(&paths).unwrap();
+        let caps = Capabilities::parse(&["net:example.com".to_string()]).unwrap();
+        let schema = r#"{"type":"object"}"#;
+        let (info, sid) = {
+            let st = Store::open(&paths.db_file()).unwrap();
+            let (info, _) = st
+                .create_tool_version(
+                    "fetcher",
+                    "d",
+                    schema,
+                    "{}",
+                    "function run(){ return 1; }",
+                    &caps,
+                    64,
+                    "agent",
+                )
+                .unwrap();
+            st.set_approval(&info.id, &caps, 64).unwrap();
+            (info, st.create_session(None).unwrap().id)
+        };
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let cfg = daemon.config().unwrap();
+        let current = |d: &Arc<Daemon>| {
+            d.with_store(|st| st.get_tool_current(&info.id))
+                .unwrap()
+                .unwrap()
+        };
+        let (info1, v1) = current(&daemon);
+        let cancel = CancellationToken::new();
+        assert!(
+            daemon
+                .ensure_approval(&cfg, &sid, &info1, &v1, &caps, None, &cancel)
+                .await,
+            "v1 runs on its grant"
+        );
+        // v2: same Capabilities, other code (as an agent, import or optimiser would).
+        daemon
+            .with_store(|st| {
+                st.create_tool_version(
+                    "fetcher",
+                    "d",
+                    schema,
+                    "{}",
+                    "function run(){ return 2; }",
+                    &caps,
+                    64,
+                    "agent",
+                )
+            })
+            .unwrap();
+        let (info2, v2) = current(&daemon);
+        assert_ne!(code_hash(&v1), code_hash(&v2));
+        assert!(
+            !daemon
+                .ensure_approval(&cfg, &sid, &info2, &v2, &caps, None, &cancel)
+                .await,
+            "v2 needs a new answer (and nobody is here to give it)"
+        );
+        let rows = daemon
+            .with_store(|st| st.recent_audit(Some("tool.grant_code_changed"), 5))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod widen_scope_tests {
+    use super::*;
+
+    /// A folder picked with "once" neither widens nor is logged as
+    /// widened; with "always" the stored grant is the folder and the audit
+    /// says so (#765).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_lasting_answers_widen() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("fl-ws-{short}"));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        let mut cfg = Config::default();
+        cfg.security.secure = true;
+        cfg.save(&paths).unwrap();
+        let spec = format!("fs:write:{}", repo.join("src/a.rs").display());
+        let caps = Capabilities::parse(std::slice::from_ref(&spec)).unwrap();
+        let (info, sid) = {
+            let st = Store::open(&paths.db_file()).unwrap();
+            let (info, _) = st
+                .create_tool_version(
+                    "writer",
+                    "d",
+                    r#"{"type":"object"}"#,
+                    "{}",
+                    "function run(){}",
+                    &caps,
+                    64,
+                    "agent",
+                )
+                .unwrap();
+            (info, st.create_session(None).unwrap().id)
+        };
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        // Someone to ask.
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(64);
+        daemon.subs.lock().unwrap().push(Subscriber {
+            conn: 1,
+            tx,
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gap: None,
+        });
+        let cfg = daemon.config().unwrap();
+        let (info, ver) = daemon
+            .with_store(|st| st.get_tool_current(&info.id))
+            .unwrap()
+            .unwrap();
+        for scope in [ApprovalScope::Once, ApprovalScope::Always] {
+            let call = {
+                let (d, cfg, sid, info, ver, caps) = (
+                    daemon.clone(),
+                    cfg.clone(),
+                    sid.clone(),
+                    info.clone(),
+                    ver.clone(),
+                    caps.clone(),
+                );
+                tokio::spawn(async move {
+                    d.ensure_approval(
+                        &cfg,
+                        &sid,
+                        &info,
+                        &ver,
+                        &caps,
+                        None,
+                        &CancellationToken::new(),
+                    )
+                    .await
+                })
+            };
+            let id = loop {
+                if let Some(ServerMessage::Event(Event::ApprovalRequested {
+                    approval_id, ..
+                })) = rx.recv().await
+                {
+                    break approval_id;
+                }
+            };
+            daemon
+                .handle(Request::ApprovalDecision {
+                    approval_id: id,
+                    approved: true,
+                    scope,
+                    paths: std::collections::BTreeMap::from([(
+                        spec.clone(),
+                        repo.display().to_string(),
+                    )]),
+                    remember_denial: false,
+                })
+                .await
+                .unwrap();
+            assert!(call.await.unwrap());
+            let widened = daemon
+                .with_store(|st| st.recent_audit(Some("tool.approve_widened"), 5))
+                .unwrap();
+            let stored = daemon.with_store(|st| st.get_approval(&info.id)).unwrap();
+            match scope {
+                ApprovalScope::Once => {
+                    assert!(widened.is_empty(), "once never says it widened");
+                    assert!(stored.is_none(), "once stores nothing");
+                }
+                _ => {
+                    assert_eq!(widened.len(), 1);
+                    assert_eq!(stored.unwrap().0.fs_write, vec![repo.display().to_string()]);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

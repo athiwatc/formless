@@ -2580,18 +2580,31 @@ run_tool = "network_policy"     # a registry Tool, or…
   `pyproject.toml`, `go.mod`). `ApprovalRequested.path_options` lists
   them; the answer's `paths` maps a requested spec to the chosen folder.
   - **Read and write apart:** each Capability has its own pick (TUI: `r`
-    cycles read paths, `p` write paths; the web shows a select).
+    cycles a read path, `p` a write path, and `R`/`P` move to the next
+    one; the web shows a select per path).
+  - **Lasting answers only:** a wider folder belongs to an Always,
+    Session or Hour grant; "once" runs the call as asked, so clients
+    don't send picks with it and nothing is logged as widened.
   - **Checked by the daemon:** the folder must contain the requested
     path by whole components (`/proj` never covers `/proj-secrets`),
-    after resolving symlinks; `/` and the home folder (or above) are
-    never offered or accepted. Anything else is ignored and the exact
-    path is granted. A widened grant is logged as
-    `tool.approve_widened`.
+    after resolving symlinks on both sides (a file not written yet is
+    resolved through its parent); `/` and the home folder (or above) are
+    never offered or accepted. Anything else is refused: the exact path
+    is granted, the user is told in a note, and `tool.widen_refused` is
+    logged. A widened grant is logged as `tool.approve_widened` with its
+    scope.
   - **Compatible:** clients that send no `paths` grant the exact path,
     and stored grants keep working (a folder grant already covers what
     lies beneath it).
-- **Always deny.** Besides deny (this call), a prompt offers "always
-  deny" (TUI `N`, web button or `N`): the call's new sensitive
+- **Bound to the code.** A grant (stored, Session or hour) is for the
+  Tool version's code and input schema it was given for: a new version
+  with other code, from the agent, an import, the optimiser or an MCP
+  sync, asks again (its prompt says the code changed; logged
+  `tool.grant_code_changed`), even with the same Capabilities.
+- **Always deny.** Besides deny (this call), a Tool's prompt offers
+  "always deny" (TUI `N`, web button or `N`; not on prompts for an MCP
+  server or a harness change, which have no Tool to remember it for, and
+  only the answer that resolves a prompt counts): the call's new sensitive
   Capabilities are remembered (`denials` table, logged
   `tool.deny_always`) and every later call of any Tool that needs access
   they cover (a denied `net:example.com` covers its subdomains, a bare

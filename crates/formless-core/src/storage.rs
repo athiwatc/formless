@@ -350,7 +350,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 54;
+pub const SCHEMA_VERSION: i64 = 55;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -435,7 +435,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 54] = [
+const MIGRATIONS: [(i64, MigrationStep); 55] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -688,6 +688,9 @@ const MIGRATIONS: [(i64, MigrationStep); 54] = [
              CREATE INDEX IF NOT EXISTS idx_run_usage_run ON run_usage(run_id);",
         )?)
     }),
+    // A grant names the code it was given for (#704); older grants get
+    // theirs the first time they are used.
+    (55, |c| add_column(c, "approvals", "code_hash TEXT")),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -4131,10 +4134,38 @@ impl Store {
         )?)
     }
 
+    /// Store a grant for the Tool's current version: it holds only while
+    /// that code runs (#704).
     pub fn set_approval(&self, tool_id: &str, caps: &Capabilities, memory_mb: u32) -> Result<()> {
+        let hash = self
+            .get_tool_current(tool_id)?
+            .map(|(_, v)| crate::daemon::code_hash(&v));
         self.ex(
-            "INSERT INTO approvals(tool_id,capabilities,memory_mb,approved_at) VALUES(?1,?2,?3,?4) ON CONFLICT(tool_id) DO UPDATE SET capabilities=excluded.capabilities, memory_mb=excluded.memory_mb, approved_at=excluded.approved_at",
-            params![tool_id, serde_json::to_string(&caps.to_specs())?, memory_mb, now()],
+            "INSERT INTO approvals(tool_id,capabilities,memory_mb,approved_at,code_hash) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(tool_id) DO UPDATE SET capabilities=excluded.capabilities, memory_mb=excluded.memory_mb, approved_at=excluded.approved_at, code_hash=excluded.code_hash",
+            params![tool_id, serde_json::to_string(&caps.to_specs())?, memory_mb, now(), hash],
+        )?;
+        Ok(())
+    }
+
+    /// The code fingerprint a stored grant was given for (None: a grant
+    /// from before fingerprints, or no grant).
+    pub fn approval_code_hash(&self, tool_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT code_hash FROM approvals WHERE tool_id=?1",
+                params![tool_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten())
+    }
+
+    /// Record the fingerprint of a grant that predates them.
+    pub fn set_approval_code_hash(&self, tool_id: &str, hash: &str) -> Result<()> {
+        self.ex(
+            "UPDATE approvals SET code_hash=?2 WHERE tool_id=?1",
+            params![tool_id, hash],
         )?;
         Ok(())
     }
