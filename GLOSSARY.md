@@ -1,19 +1,23 @@
 # Formless
 
-A general-purpose agent harness that boots with a single tool-building tool and grows its own capabilities for any use case, rather than specialising in coding. It is centred on a daemon core that user interfaces connect to.
+A general-purpose agent harness that boots with a fixed set of built-in tools and builds every other capability it needs for any use case, rather than specialising in coding. It is centred on a daemon core that user interfaces connect to.
 
 ## Language
 
 **Formless**:
-A general-purpose agent harness that starts from a single bootstrap tool and builds the tools it needs for the task at hand.
+A general-purpose agent harness that starts from a fixed set of built-in tools and builds the tools it needs for the task at hand.
 _Avoid_: Coding agent, form library, chatbot
 
+**Built-in Tool**:
+A tool the daemon implements itself, always present: the registry primitives (`create_tool`, `find_tools`, `read_tool`, `test_tool`, `run_script`, …), the Pending Invocation handles, metrics and artifact reads, and the MCP, skills, memory, planning and user-facing ones. Built-ins have no versions, are excluded from Self-Optimisation, cannot be retired, cannot be called from `run_script`, and hold no Capabilities of their own. SPEC §7.1 lists them.
+_Avoid_: Native tool, system tool
+
 **Bootstrap Tool**:
-The one tool available at first boot, used to create every other tool. In Formless this is `create_tool`.
+`create_tool`, the built-in that writes every other tool. It is immutable, never optimised, and cannot be retired or widened.
 _Avoid_: Meta-tool, seed tool
 
 **Tool**:
-A persisted, versioned capability created through the Bootstrap Tool, with a name, description, input schema, and sandboxed script implementation.
+A persisted, versioned capability created with `create_tool`, with a name, description, input schema, and sandboxed script implementation.
 _Avoid_: Plugin, extension, function
 
 **Daemon Core**:

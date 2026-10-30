@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their arguments and what each one does — instead of claiming a fresh install
   exposes only `create_tool`. `create_tool` keeps a section of its own, now
   §5.2, and the subsections after it were renumbered.
+- `SPEC.md` and `GLOSSARY.md` say the same thing consistently: the intro,
+  Principle 1 and the Concepts table now describe the fixed boot set of
+  built-in Tools (SPEC §7.1) rather than "one tool at boot", the glossary
+  defines **Built-in Tool** and scopes **Bootstrap Tool** to `create_tool`,
+  and the description of the shipped system prompt quotes the built-ins it
+  actually names.
 
 ## [0.1.0] - 2026-10-30
 

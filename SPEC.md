@@ -1,10 +1,10 @@
 # Formless — Full Application Specification (v1)
 
 **Status:** Accepted (grilling session Q1–Q67). **Audience:** implementers of v1.
-**Companion docs:** [GLOSSARY.md](/Users/athiwat/RustroverProjects/formless/GLOSSARY.md) (canonical language — spec uses those terms exactly), ADRs in `docs/adr/`.
+**Companion docs:** [GLOSSARY.md](GLOSSARY.md) (canonical language — spec uses those terms exactly), ADRs in `docs/adr/`.
 
-Formless is a general-purpose agent harness that boots with a single Bootstrap
-Tool (`create_tool`) and builds every other Tool it needs, for any use case —
+Formless is a general-purpose agent harness that boots with a fixed set of
+built-in Tools (§7.1) and builds every other Tool it needs, for any use case —
 it does not specialise in coding. A Daemon Core owns the agent loop, Tools,
 Sessions, and state; a TUI (v1) and a headless CLI are clients of that core.
 The harness self-optimises its Tools, driven only by measured Tool Success
@@ -14,8 +14,11 @@ without redesign.
 
 ## 1. Principles
 
-1. **One tool at boot.** A fresh install exposes exactly `create_tool`.
-   Everything else is built, persisted, and reused. No starter Tools ship.
+1. **A fixed boot set.** A fresh install exposes only the built-in Tools of
+   §7.1: the registry primitives, the Pending Invocation handles, metrics and
+   artifact reads, and the MCP, skills, memory, planning and user-facing ones,
+   all implemented by the daemon. No starter *domain* Tool ships; everything
+   else is built, persisted, and reused.
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only
    by recorded Invocation outcomes. No silent or untested mutation, ever.
 3. **No time-based killing.** Runs and Invocations have no step/token/time
@@ -83,7 +86,8 @@ without redesign.
 
 | Term | Meaning in one line |
 |---|---|
-| Bootstrap Tool | The one tool at first boot: `create_tool`. Immutable, never optimised. |
+| Built-in Tool | A Tool the daemon implements itself, present from first boot (§7.1): never versioned, never optimised, never retirable. |
+| Bootstrap Tool | `create_tool`, the built-in that writes every other Tool. Immutable, never optimised. |
 | Tool | Persisted, versioned, sandboxed JS capability built via `create_tool`. |
 | Session | Resumable conversation + Run history; many run concurrently. |
 | Run | One unit of work in a Session (user message → final answer). Unlimited. |
@@ -1312,7 +1316,10 @@ pattern (§4.4).
   answers `started: false`. The TUI Proposals view states what `g` costs
   and shows "generating…". Applied
   proposals append to the bootstrap prompt in version order and can be
-  rolled back individually; the bootstrap text itself is never edited. It states: you have only `create_tool`; build small,
+  rolled back individually; the bootstrap text itself is never edited. It
+  states: you start with only the built-ins named there (`create_tool`,
+  `create_module`, `retire_tool`, `find_tools`, `read_tool`, `test_tool`,
+  `run_script`); build small,
   single-purpose, minimally-Capabilitied Tools on demand; validate/test each
   after creating it; stream large data; prefer retiring broken Tools and
   creating new versions over silent workarounds. Since v2.1 it also
