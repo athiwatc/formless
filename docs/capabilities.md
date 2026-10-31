@@ -51,6 +51,11 @@ Either way:
 | `harness:<scope>` | Read or change Formless itself: MCP servers, skills, models, providers, Roles, settings | `harness:mcp` | High: every change is shown to you with a diff and needs your OK |
 | `mcp:<server>` | Use an MCP server's tools | `mcp:github` | Whatever that server can do; each server is approved once |
 
+Static network scopes use a bare host, optionally with a port (for example
+`net:api.example.com:8443`). Hostnames are stored in lowercase; schemes,
+paths and empty `net:` or `process:` scopes are rejected when the Tool is
+created. Use an input-bound scope when the input contains a full URL.
+
 ### Scoped to the input
 
 `fs:read`, `fs:write` and `net` can be tied to a field of the Tool's input,

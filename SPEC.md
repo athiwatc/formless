@@ -1192,6 +1192,10 @@ pattern (§4.4).
   fetches ignore proxy settings (a proxy would resolve the name itself).
   IPv6 grants with a port use brackets: `net:[::1]:8080`. Denials name it: `denied: net:x resolves to 10.0.0.5, a private
   or local address; grant net:x itself to reach it`.
+- **Scope validation.** Empty `net:` and `process:` scopes are rejected.
+  Static `net:` hosts are canonicalized to lowercase (IDNA/IP spelling
+  follows URL host parsing); schemes, paths and whitespace are rejected
+  with the expected bare-host form. Input-bound hosts use the same form.
 - **Ports.** A `net` grant may carry a port (`net:api.example.com:8443`)
   and then allows that port only; a portless grant allows any. An
   input-bound URL with a non-default port binds to `host:port`, so the
