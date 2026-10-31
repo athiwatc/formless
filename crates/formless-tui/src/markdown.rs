@@ -11,7 +11,8 @@ use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 use ratatui::prelude::*;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::highlight::Highlighter;
 use super::ui::dim;
@@ -760,6 +761,9 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
     enum Piece {
         Word(Vec<Span<'static>>, usize),
         Space(Style),
+        /// A place to break with no space: between clusters of a script
+        /// written without spaces (Thai, CJK) (#786).
+        Soft,
         Break,
     }
     let mut pieces: Vec<Piece> = Vec::new();
@@ -780,8 +784,9 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
                 _ => pieces.push(Piece::Word(vec![s], w)),
             }
         };
-        for ch in span.content.chars() {
-            if ch == '\n' {
+        for g in span.content.graphemes(true) {
+            let ch = g.chars().next().unwrap_or(' ');
+            if g == "\n" || g == "\r\n" {
                 flush_word(&mut word, &mut pieces);
                 pieces.push(Piece::Break);
             } else if ch.is_whitespace() {
@@ -789,8 +794,17 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
                 if !matches!(pieces.last(), Some(Piece::Space(_))) {
                     pieces.push(Piece::Space(style));
                 }
+            } else if crate::text::unspaced(ch) {
+                // Each cluster is its own word, with break chances around it.
+                flush_word(&mut word, &mut pieces);
+                if matches!(pieces.last(), Some(Piece::Word(..))) {
+                    pieces.push(Piece::Soft);
+                }
+                word.push_str(g);
+                flush_word(&mut word, &mut pieces);
+                pieces.push(Piece::Soft);
             } else {
-                word.push(ch);
+                word.push_str(g);
             }
         }
         flush_word(&mut word, &mut pieces);
@@ -811,6 +825,7 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
                     space = Some(s);
                 }
             }
+            Piece::Soft => {}
             Piece::Word(parts, w) => {
                 let sp = usize::from(space.is_some());
                 if row_w > 0 && row_w + sp + w > avail {
@@ -850,8 +865,10 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
     let mut w = 0;
     for span in spans {
         let mut buf = String::new();
-        for ch in span.content.chars() {
-            let cw = ch.width().unwrap_or(0);
+        // By cluster, so a mark never starts a row and an emoji sequence
+        // is never cut (#786).
+        for g in span.content.graphemes(true) {
+            let cw = g.width();
             if w + cw > avail && w > 0 {
                 if !buf.is_empty() {
                     rows.last_mut()
@@ -861,7 +878,7 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
                 rows.push(Vec::new());
                 w = 0;
             }
-            buf.push(ch);
+            buf.push_str(g);
             w += cw;
         }
         if !buf.is_empty() {
@@ -880,14 +897,14 @@ fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     let mut w = 0;
     for span in spans {
         let mut buf = String::new();
-        for ch in span.content.chars() {
-            let cw = ch.width().unwrap_or(0);
+        for g in span.content.graphemes(true) {
+            let cw = g.width();
             if w + cw + 1 > max {
                 buf.push('…');
                 out.push(Span::styled(buf, span.style));
                 return out;
             }
-            buf.push(ch);
+            buf.push_str(g);
             w += cw;
         }
         out.push(Span::styled(buf, span.style));
@@ -991,6 +1008,38 @@ mod tests {
             .position(|l| l.trim_start().starts_with("b: "))
             .unwrap();
         assert!(out[b + 1].starts_with("     "), "hanging indent: {out:#?}");
+    }
+
+    /// Thai and Chinese wrap within the width, never starting a row with a
+    /// mark or cutting an emoji sequence (#786).
+    #[test]
+    fn unspaced_scripts_wrap_between_clusters() {
+        let marks = |c: char| matches!(c as u32, 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E);
+        let out = lines("สวัสดีครับวันนี้อากาศดีมากเลยนะครับ", 20);
+        assert!(out.len() > 1, "{out:?}");
+        for row in &out {
+            assert!(row.width() <= 20, "{row}");
+            let first = row.trim_start().chars().next().unwrap();
+            assert!(!marks(first), "row starts with a mark: {row}");
+        }
+        let out = lines("我喜欢用中文写很长的句子来测试换行", 20);
+        assert!(
+            out.len() > 1 && out.iter().all(|r| r.width() <= 20),
+            "{out:?}"
+        );
+        assert_eq!(
+            out.join("").replace(' ', ""),
+            "我喜欢用中文写很长的句子来测试换行"
+        );
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let rows = hard_wrap(vec![Span::raw(family.repeat(3))], 3);
+        for r in &rows {
+            let t: String = r.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(t, family, "{rows:?}");
+        }
+        let cut = truncate_spans(vec![Span::raw(format!("{family}{family}x"))], 4);
+        let t: String = cut.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(t, format!("{family}…"));
     }
 
     /// Unknown languages are plain text; `Diff` is a diff whatever its
