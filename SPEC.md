@@ -2058,7 +2058,13 @@ such as `read_file`, `read_text_file` and `file_read`.
   (`formless-<profile>` for others) and loads it; `--dry-run` prints the
   file and commands. Reinstalling a launchd agent unloads the old definition
   before replacing and loading its plist; a manager-reported load/unload
-  failure is surfaced even if launchctl exits zero. The service runs `formless daemon serve --stay`,
+  failure is surfaced even if launchctl exits zero. Service profile names
+  must be 1–64 ASCII letters, digits, `-` or `_`, starting with a letter or
+  digit. Paths are encoded for each manager: XML entities for launchd,
+  quoted argv/environment and literal `%%` specifiers for systemd, and
+  doubled `%` plus disabled delayed expansion for Windows batch files.
+  Control characters and invalid Windows filename characters are refused
+  before writing. The service runs `formless daemon serve --stay`,
   which never stops for being idle, so scheduled jobs (§9.7) fire on
   time. `uninstall-service` unloads and removes it; `formless doctor`
   shows whether it is installed, and the jobs warning suggests it.

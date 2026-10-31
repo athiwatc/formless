@@ -1946,15 +1946,7 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         DaemonAction::InstallService { dry_run } => {
             let plan = formless_core::service::plan_here(&paths)?;
             if dry_run {
-                println!(
-                    "# {} ({})\n{}",
-                    plan.file.display(),
-                    plan.manager,
-                    plan.contents
-                );
-                for c in &plan.enable {
-                    println!("$ {}", c.join(" "));
-                }
+                println!("{}", formless_core::service::dry_run(&plan));
                 return Ok(());
             }
             formless_core::service::install(&plan)?;
