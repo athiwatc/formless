@@ -154,33 +154,64 @@ pub fn plan(paths: &Paths, exe: &Path, home: &Path) -> Result<Plan> {
     }
 }
 
-fn run_all(cmds: &[Vec<String>]) -> Result<()> {
+fn run_command(c: &[String]) -> Result<(bool, String)> {
+    let (prog, args) = c.split_first().context("empty command")?;
+    let out = std::process::Command::new(prog)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {prog}"))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
+fn run_all_with(
+    cmds: &[Vec<String>],
+    run: &mut impl FnMut(&[String]) -> Result<(bool, String)>,
+) -> Result<()> {
     for c in cmds {
-        let (prog, args) = c.split_first().context("empty command")?;
-        let out = std::process::Command::new(prog)
-            .args(args)
-            .output()
-            .with_context(|| format!("run {prog}"))?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "`{}` failed: {}",
-                c.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+        let prog = c.first().context("empty command")?;
+        let (success, stderr) = run(c)?;
+        // Legacy launchctl load/unload can report failure while exiting 0.
+        // Preserve the manager's explanation instead of claiming success.
+        let launchctl_failure = Path::new(prog)
+            .file_name()
+            .is_some_and(|n| n == "launchctl")
+            && matches!(c.get(1).map(String::as_str), Some("load" | "unload"))
+            && (stderr.to_ascii_lowercase().contains("failed")
+                || stderr.to_ascii_lowercase().contains("error"));
+        if !success || launchctl_failure {
+            return Err(anyhow!("`{}` failed: {}", c.join(" "), stderr));
         }
     }
     Ok(())
 }
 
-/// Write the service file and load it. A daemon already running keeps
-/// going; the service's daemon takes over once it stops.
+fn run_all(cmds: &[Vec<String>]) -> Result<()> {
+    run_all_with(cmds, &mut run_command)
+}
+
+/// Write the service file and load it. Reinstalling a launchd agent unloads
+/// its old definition first, while its original plist is still in place.
 pub fn install(plan: &Plan) -> Result<()> {
+    install_with(plan, &mut run_command)
+}
+
+fn install_with(
+    plan: &Plan,
+    run: &mut impl FnMut(&[String]) -> Result<(bool, String)>,
+) -> Result<()> {
+    if plan.manager == "launchd" && plan.file.exists() {
+        run_all_with(&plan.disable, run)
+            .context("could not unload the previous launchd definition; its file is kept")?;
+    }
     if let Some(dir) = plan.file.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&plan.file, &plan.contents)
         .with_context(|| format!("write {}", plan.file.display()))?;
-    run_all(&plan.enable)
+    run_all_with(&plan.enable, run)
 }
 
 /// Unload the service, then remove its file. A failed unload keeps the
@@ -224,6 +255,77 @@ pub fn installed(paths: &Paths) -> Option<(&'static str, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reinstall_replaces_the_loaded_launchd_binary_path() {
+        let base = std::env::temp_dir().join(format!("fl-svc-{}", uuid::Uuid::new_v4()));
+        let mut p = Plan {
+            manager: "launchd",
+            file: base.join("agent.plist"),
+            contents: "/old/formless".into(),
+            enable: vec![vec!["launchctl".into(), "load".into()]],
+            disable: vec![vec!["launchctl".into(), "unload".into()]],
+        };
+        let mut loaded = None;
+        let mut observed = Vec::new();
+        let file = p.file.clone();
+        let mut fake_launchctl = |c: &[String]| -> Result<(bool, String)> {
+            observed.push((c[1].clone(), std::fs::read_to_string(&file)?));
+            match c[1].as_str() {
+                "load" => loaded = Some(std::fs::read_to_string(&file)?),
+                "unload" => loaded = None,
+                _ => unreachable!(),
+            }
+            Ok((true, String::new()))
+        };
+        install_with(&p, &mut fake_launchctl).unwrap();
+        p.contents = "/new/formless".into();
+        install_with(&p, &mut fake_launchctl).unwrap();
+        drop(fake_launchctl);
+        assert_eq!(loaded.as_deref(), Some("/new/formless"));
+        assert_eq!(
+            observed,
+            [
+                ("load".into(), "/old/formless".into()),
+                ("unload".into(), "/old/formless".into()),
+                ("load".into(), "/new/formless".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn zero_exit_launchctl_failures_are_errors_and_keep_the_previous_file() {
+        let base = std::env::temp_dir().join(format!("fl-svc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("agent.plist");
+        std::fs::write(&file, "previous definition").unwrap();
+        let p = Plan {
+            manager: "launchd",
+            file: file.clone(),
+            contents: "replacement".into(),
+            enable: vec![vec!["launchctl".into(), "load".into()]],
+            disable: vec![vec!["launchctl".into(), "unload".into()]],
+        };
+        for verb in ["load", "unload"] {
+            let stderr = format!("{verb} failed: 5: Input/output error");
+            let error = run_all_with(&[vec!["launchctl".into(), verb.into()]], &mut |_| {
+                Ok((true, stderr.clone()))
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains(&stderr));
+        }
+        let error = install_with(&p, &mut |_| {
+            Ok((true, "Unload failed: 5: Input/output error".into()))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Unload failed: 5: Input/output error"));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "previous definition"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn the_service_runs_serve_stay_with_this_profiles_dirs() {

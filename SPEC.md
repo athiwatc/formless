@@ -2056,7 +2056,9 @@ such as `read_file`, `read_text_file` and `file_read`.
   user unit (`~/.config/systemd/user/formless.service`) or a Windows
   logon task (running `<data>/formless-service.cmd`) for this profile
   (`formless-<profile>` for others) and loads it; `--dry-run` prints the
-  file and commands. The service runs `formless daemon serve --stay`,
+  file and commands. Reinstalling a launchd agent unloads the old definition
+  before replacing and loading its plist; a manager-reported load/unload
+  failure is surfaced even if launchctl exits zero. The service runs `formless daemon serve --stay`,
   which never stops for being idle, so scheduled jobs (§9.7) fire on
   time. `uninstall-service` unloads and removes it; `formless doctor`
   shows whether it is installed, and the jobs warning suggests it.
