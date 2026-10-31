@@ -53,7 +53,7 @@ async fn nested_errors_preserve_inner_detail_and_redact_recorded_and_returned_in
     let session = store.create_session(None).unwrap().id;
     let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
     let inner = "function explode(input) {\n  const marker = 'INNER_CONTEXT';\n  if (input.fail) {\n    throw new Error('INNER_FAILURE');\n  }\n  return {ok:true};\n}\nfunction run(input) { return explode(input); }";
-    let outer = "async function run(input) {\n  const marker = 'OUTER_CONTEXT';\n  if (!input.fail) return {ok:true};\n  return await tools.call('inner_diagnostic', {fail:true, inner_visible:'inner marker', api_key:input.api_key, password:'pw'});\n}";
+    let outer = "async function run(input) {\n  const marker = 'OUTER_CONTEXT';\n  if (!input.fail) return {ok:true};\n  return await Promise.all([1].map(async () => {\n    return await tools.call('inner_diagnostic', {fail:true, inner_visible:'inner marker', api_key:input.api_key, password:'pw'});\n  }));\n}";
     create(&daemon, &session, "inner_diagnostic", inner).await;
     create(&daemon, &session, "outer_diagnostic", outer).await;
     let secret = "sk-abcdefghijklmnop1234567890";
@@ -102,7 +102,11 @@ async fn nested_errors_preserve_inner_detail_and_redact_recorded_and_returned_in
         "{inner_detail}"
     );
     assert!(
-        outer_detail.contains("> 4 |   return await tools.call("),
+        outer_detail.contains("> 5 |     return await tools.call("),
+        "{outer_detail}"
+    );
+    assert!(
+        outer_detail.contains("<anonymous> (line 5)"),
         "{outer_detail}"
     );
     let own = outer_detail.strip_suffix(inner_detail).unwrap();
@@ -201,7 +205,17 @@ async fn nested_errors_preserve_inner_detail_and_redact_recorded_and_returned_in
     })
     .await
     .expect("mock-provider diagnostic Run did not complete");
+    let persisted_for_run: String = conn.query_row(
+        "SELECT i.error FROM invocations i JOIN tools t ON t.id=i.tool_id WHERE t.name='outer_diagnostic' AND i.run_id IS NOT NULL AND i.status='failure' ORDER BY i.created_at DESC LIMIT 1",
+        [], |row| row.get(0),
+    ).unwrap();
     let model_results = seen.lock().unwrap();
+    assert!(
+        model_results
+            .iter()
+            .any(|text| text.contains(&persisted_for_run)),
+        "provider-visible failure omitted or changed its complete persisted diagnostic"
+    );
     assert!(
         model_results
             .iter()
