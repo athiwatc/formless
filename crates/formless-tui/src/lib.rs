@@ -4132,6 +4132,9 @@ impl App {
                 self.notes.push(format!("optimiser {tool_name}: {text}"));
                 self.request(Pending::ListTools, Request::ListTools);
             }
+            Event::PromotionApprovalResolved { promotion_id } => {
+                self.promotions.retain(|p| p.approval_id != promotion_id);
+            }
             Event::PromotionApprovalRequested {
                 promotion_id,
                 tool_name,
@@ -18449,6 +18452,20 @@ mod tests {
         });
         assert!(app.approvals.is_empty());
         assert!(app.notes.iter().any(|n| n == "approval granted in web"));
+        for id in ["promotion-a", "promotion-b"] {
+            app.on_event(Event::PromotionApprovalRequested {
+                promotion_id: id.into(),
+                tool_name: "reader".into(),
+                reason: "widening".into(),
+                capabilities: vec![],
+                memory_mb: 64,
+            });
+        }
+        app.on_event(Event::PromotionApprovalResolved {
+            promotion_id: "promotion-a".into(),
+        });
+        assert_eq!(app.promotions.len(), 1);
+        assert_eq!(app.promotions[0].approval_id, "promotion-b");
     }
 
     #[test]

@@ -25,6 +25,29 @@ enum Prompt {
     },
 }
 
+fn remove_resolved_prompt(prompts: &mut VecDeque<Prompt>, ev: &Event) {
+    prompts.retain(|prompt| !match (prompt, ev) {
+        (
+            Prompt::Approval {
+                id,
+                promotion: true,
+            },
+            Event::PromotionApprovalResolved { promotion_id },
+        ) => id == promotion_id,
+        (
+            Prompt::Approval {
+                id,
+                promotion: false,
+            },
+            Event::ApprovalAnswered { approval_id, .. },
+        ) => id == approval_id,
+        (Prompt::Question { id, .. }, Event::UserQuestionClosed { question_id }) => {
+            id == question_id
+        }
+        _ => false,
+    });
+}
+
 /// The printed form of an event, if it has one. `streaming` says whether
 /// the answer is mid-stream (deltas are printed as they come).
 pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
@@ -110,6 +133,9 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             "{}Promotion of {tool_name} needs approval: {reason}. Type y to approve or n to deny.",
             end_stream(streaming)
         ),
+        Event::PromotionApprovalResolved { .. } => {
+            "The promotion approval prompt was resolved.".into()
+        }
         // The partial answer printed so far is void: say so on its own
         // line, so the re-sent answer never reads as its continuation (#890).
         Event::StreamRestarted { .. } => format!(
@@ -296,6 +322,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     say(&text);
                 }
             }
+            remove_resolved_prompt(&mut prompts, &ev);
             match ev {
                 Event::ApprovalRequested { approval_id, .. } => {
                     prompts.push_back(Prompt::Approval {
@@ -326,8 +353,6 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                         answers: Vec::new(),
                     });
                 }
-                Event::UserQuestionClosed { question_id } => prompts
-                    .retain(|p| !matches!(p, Prompt::Question { id, .. } if *id == question_id)),
                 _ => {}
             }
         }
@@ -474,6 +499,36 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_promotion_releases_the_next_plain_prompt() {
+        let mut prompts = VecDeque::from([
+            Prompt::Approval {
+                id: "p".into(),
+                promotion: true,
+            },
+            Prompt::Approval {
+                id: "next".into(),
+                promotion: false,
+            },
+        ]);
+        remove_resolved_prompt(
+            &mut prompts,
+            &Event::PromotionApprovalResolved {
+                promotion_id: "unrelated".into(),
+            },
+        );
+        assert_eq!(prompts.len(), 2);
+        remove_resolved_prompt(
+            &mut prompts,
+            &Event::PromotionApprovalResolved {
+                promotion_id: "p".into(),
+            },
+        );
+        assert!(
+            matches!(prompts.front(), Some(Prompt::Approval { id, promotion: false }) if id == "next")
+        );
+    }
 
     /// A restarted stream never prints as one run-on answer (#890).
     #[test]
