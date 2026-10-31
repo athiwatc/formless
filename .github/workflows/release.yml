@@ -185,7 +185,7 @@ jobs:
         with:
           path: assets
           merge-multiple: true
-      - name: Render Homebrew and AUR files
+      - name: Render Homebrew, AUR and winget files
         run: scripts/render-packaging.sh "${GITHUB_REF_NAME#v}" assets packaging-out
       # Notes `formless update` shows: the CHANGELOG section, then GitHub's
       # generated list of changes (#842).
@@ -203,6 +203,7 @@ jobs:
             assets/*.sha256
             packaging-out/aur/PKGBUILD
             packaging-out/homebrew/formless.rb
+            packaging-out/winget/*.yaml
       # Each channel runs only when its secret exists (packaging/README.md),
       # independently of the others; the summary says how each went.
       - name: Update the Homebrew tap

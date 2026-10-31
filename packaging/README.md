@@ -28,9 +28,10 @@ platform app-dirs (SPEC §9.4).
      pushes `ghcr.io/athiwatc/formless:<tag>` and `:latest` (`Dockerfile`,
      [docs/docker.md](../docs/docker.md)); nothing is published if that
      fails;
-   - renders the Homebrew formula and AUR `PKGBUILD` for the version
-     (`scripts/render-packaging.sh`, which fails on a missing checksum or
-     an unfilled placeholder) and attaches them to the GitHub Release,
+   - renders the Homebrew formula, AUR `PKGBUILD` and winget manifests
+     for the version (`scripts/render-packaging.sh`, which fails on a
+     missing checksum, an unfilled placeholder, a version that isn't
+     Cargo.toml's, or a Windows zip without the path the manifest names) and attaches them to the GitHub Release,
      whose notes (what `formless update` shows) are the version's
      `CHANGELOG.md` section (`scripts/release-notes.sh`) followed by
      GitHub's generated list of changes;
@@ -44,7 +45,7 @@ platform app-dirs (SPEC §9.4).
 | Where | Set up | Secret |
 |---|---|---|
 | Homebrew tap | Create the public repo `athiwatc/homebrew-tap` (with a `Formula/` folder). Users then run `brew install athiwatc/tap/formless`. | `HOMEBREW_TAP_TOKEN`: a fine-grained token with contents write on that repo |
-| winget | Submit the first version by hand (`wingetcreate new`, starting from the templates in `packaging/winget/`, or a PR to `microsoft/winget-pkgs`); later versions are automatic (winget-releaser builds them from the last published one). Users run `winget install athiwatc.formless`. | `WINGET_TOKEN`: a classic token with `public_repo`, for the fork the action opens PRs from |
+| winget | Submit the first version by hand: the release carries the rendered manifests (`athiwatc.formless*.yaml`, from the `packaging/winget/*.yaml.in` templates, with the version, URL, SHA-256 and the zip's nested `formless.exe` path checked against the real archive). On Windows, check them with `winget validate --manifest <folder>` and `winget install --manifest <folder>`, then submit with `wingetcreate submit <folder>` or a PR to `microsoft/winget-pkgs`; later versions are automatic (winget-releaser builds them from the last published one). Users run `winget install athiwatc.formless`. | `WINGET_TOKEN`: a classic token with `public_repo`, for the fork the action opens PRs from |
 | AUR | Create the `formless-bin` package on aur.archlinux.org with your SSH key. Users run `yay -S formless-bin`. | `AUR_SSH_KEY`: that SSH private key |
 | Docker | Nothing: the workflow's own token pushes to GHCR. Make the package public once in the repository's Packages settings. | — |
 

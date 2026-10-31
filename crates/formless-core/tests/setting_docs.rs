@@ -63,49 +63,137 @@ fn defaults_come_from_the_config_types() {
         .contains("nest"));
 }
 
-/// Every key `Config::default()` has (Option fields included, as nulls)
-/// is in SPEC §13, apart from a reviewed list of file-only blocks.
-#[test]
-fn every_config_key_is_documented() {
+/// File-only blocks: credentials and their mechanics, maps keyed by
+/// user-chosen names, and lists of user-written entries. SPEC §13's prose
+/// names the same list (checked below).
+const FILE_ONLY: &[&str] = &[
+    "provider.auth",
+    "provider.extra_headers",
+    "mcp.servers",
+    "hooks",
+    "providers",
+    "roles",
+];
+
+/// On a key boundary: `hooks` covers `hooks[].event`, not `hooks_extra`.
+fn file_only(key: &str) -> bool {
+    FILE_ONLY.iter().any(|p| {
+        key == *p
+            || key
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+    })
+}
+
+/// Every key of a configuration with every option set and one entry in
+/// every map and list (`*` for a user-chosen map key, `[]` for a list
+/// entry), so keys nested inside them are seen too (#851).
+fn shape_keys() -> Vec<String> {
     fn flatten(prefix: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+        let join = |k: &str| {
+            if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{prefix}.{k}")
+            }
+        };
         match v {
-            serde_json::Value::Object(m)
-                if !m.is_empty() && !prefix.is_empty() || prefix.is_empty() =>
-            {
+            serde_json::Value::Object(m) => {
+                assert!(
+                    !m.is_empty(),
+                    "{prefix} is empty in config::documented_shape(): give it an entry"
+                );
                 for (k, v) in m {
-                    let key = if prefix.is_empty() {
-                        k.clone()
-                    } else {
-                        format!("{prefix}.{k}")
-                    };
-                    flatten(&key, v, out);
+                    flatten(&join(k), v, out);
                 }
+            }
+            serde_json::Value::Array(a) => {
+                let first = a.first().unwrap_or_else(|| {
+                    panic!("{prefix} is empty in config::documented_shape(): give it an entry")
+                });
+                if first.is_object() {
+                    flatten(&format!("{prefix}[]"), first, out);
+                } else {
+                    out.push(prefix.to_string());
+                }
+            }
+            serde_json::Value::Null => {
+                panic!("{prefix} is unset in config::documented_shape(): set it")
             }
             _ => out.push(prefix.to_string()),
         }
     }
-    let defaults = serde_json::to_value(formless_core::Config::default()).unwrap();
+    let shape = serde_json::to_value(formless_core::config::documented_shape()).unwrap();
     let mut keys = Vec::new();
-    flatten("", &defaults, &mut keys);
-    // File-only blocks: credentials and their mechanics, maps keyed by
-    // user-chosen names, and lists of user-written entries.
-    let allowed = |k: &str| {
-        [
-            "provider.auth.",
-            "provider.extra_headers",
-            "mcp.servers",
-            "hooks",
-            "providers",
-            "roles",
-        ]
-        .iter()
-        .any(|p| k == p.trim_end_matches('.') || k.starts_with(p))
-    };
+    flatten("", &shape, &mut keys);
+    keys
+}
+
+/// Every key the configuration can hold is in SPEC §13, apart from the
+/// file-only blocks; a map of structs is documented by its row naming
+/// each field.
+#[test]
+fn every_config_key_is_documented() {
     let docs = setting_docs();
-    let missing: Vec<&String> = keys
-        .iter()
-        .filter(|k| !allowed(k))
-        .filter(|k| !docs.contains_key(k.as_str()))
-        .collect();
+    let keys = shape_keys();
+    let mut missing = Vec::new();
+    for key in keys.iter().filter(|k| !file_only(k)) {
+        if docs.contains_key(key.as_str()) {
+            continue;
+        }
+        // `provider.aliases.*`: a map of plain values, documented as a whole.
+        if let Some(map) = key.strip_suffix(".*") {
+            if docs.contains_key(map) {
+                continue;
+            }
+        }
+        // `provider.prices.*.input`: the map's row names the field.
+        if let Some((map, field)) = key.split_once(".*.") {
+            if docs
+                .get(map)
+                .is_some_and(|(meaning, _)| meaning.contains(field))
+            {
+                continue;
+            }
+        }
+        missing.push(key.clone());
+    }
     assert!(missing.is_empty(), "add these to SPEC §13: {missing:?}");
+
+    // The other way: no row for a key that no longer exists.
+    let exists = |doc: &str| {
+        keys.iter().any(|k| {
+            k == doc
+                || k.strip_prefix(doc)
+                    .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+        })
+    };
+    let stale: Vec<&String> = docs
+        .keys()
+        .filter(|d| !exists(d) && !file_only(d))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "SPEC §13 documents keys the config does not have: {stale:?}"
+    );
+
+    // The prose lists the same exceptions as this test.
+    let spec = include_str!("../../../SPEC.md");
+    let prose = spec
+        .split("the only exceptions are file-only blocks it lists (")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .expect("SPEC §13 lists the file-only blocks");
+    let listed: Vec<&str> = prose.split('`').skip(1).step_by(2).collect();
+    assert_eq!(
+        listed, FILE_ONLY,
+        "SPEC §13's file-only list and FILE_ONLY differ"
+    );
+}
+
+#[test]
+fn file_only_matches_on_key_boundaries() {
+    assert!(file_only("hooks") && file_only("hooks[].event"));
+    assert!(file_only("provider.auth.client_id") && file_only("providers.*.model"));
+    assert!(!file_only("hooks_extra") && !file_only("providers_v2") && !file_only("roles2.x"));
 }

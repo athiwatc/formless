@@ -1,5 +1,5 @@
 class Formless < Formula
-  desc "A tool-building AI agent harness: define a task, and the agent builds the tools it needs"
+  desc "Tool-building AI agent harness: the agent builds the tools a task needs"
   homepage "https://formless.athiwat.xyz"
   url "https://github.com/athiwatc/formless/archive/refs/tags/v0.1.0.tar.gz"
   # Fill this from the GitHub release asset when bumping versions:

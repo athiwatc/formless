@@ -23,9 +23,16 @@ fn the_renderer_fills_everything_or_fails() {
                 dir.join(out).to_str().unwrap(),
             ])
             .env("SRC_SHA", "b".repeat(64))
+            .env("MANIFEST", dir.join("Cargo.toml"))
             .output()
             .unwrap()
     };
+    // The packages must name the Cargo.toml version (#841).
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace.package]\nversion = \"9.8.7\"\n",
+    )
+    .unwrap();
     // No checksum file: a named failure, not a half-filled formula.
     let r = run("9.8.7", "o1");
     assert!(!r.status.success());
@@ -36,6 +43,27 @@ fn the_renderer_fills_everything_or_fails() {
     )
     .unwrap();
     let r = run("9.8.7", "o2");
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("windows-msvc.zip.sha256"),
+        "the Windows sum is required"
+    );
+    std::fs::write(
+        assets.join("formless-v9.8.7-x86_64-pc-windows-msvc.zip.sha256"),
+        format!("{}  x\n", "c".repeat(64)),
+    )
+    .unwrap();
+    // A version that is not Cargo.toml's is refused.
+    std::fs::write(
+        assets.join("formless-v9.9.9-x86_64-unknown-linux-gnu.tar.gz.sha256"),
+        format!("{}  x\n", "a".repeat(64)),
+    )
+    .unwrap();
+    let r = run("9.9.9", "o4");
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("does not match"),
+        "{r:?}"
+    );
+    let r = run("9.8.7", "o2");
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     let pkgbuild = std::fs::read_to_string(dir.join("o2/aur/PKGBUILD")).unwrap();
     assert!(pkgbuild.contains("pkgver=9.8.7") && pkgbuild.contains(&"a".repeat(64)));
@@ -45,6 +73,59 @@ fn the_renderer_fills_everything_or_fails() {
     );
     let formula = std::fs::read_to_string(dir.join("o2/homebrew/formless.rb")).unwrap();
     assert!(formula.contains("v9.8.7.tar.gz") && formula.contains(&"b".repeat(64)));
+    // brew audit: a description under 80 characters, no leading article.
+    let desc = formula
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("desc \""))
+        .unwrap()
+        .trim_end_matches('"');
+    assert!(
+        desc.len() < 80 && !desc.starts_with("A ") && !desc.starts_with("An "),
+        "{desc}"
+    );
+    let installer =
+        std::fs::read_to_string(dir.join("o2/winget/athiwatc.formless.installer.yaml")).unwrap();
+    assert!(installer.contains("PackageVersion: 9.8.7") && installer.contains(&"c".repeat(64)));
+    assert!(
+        installer.contains("RelativeFilePath: formless-v9.8.7-x86_64-pc-windows-msvc/formless.exe")
+    );
+    for f in [
+        "athiwatc.formless.yaml",
+        "athiwatc.formless.locale.en-US.yaml",
+    ] {
+        let m = std::fs::read_to_string(dir.join("o2/winget").join(f)).unwrap();
+        assert!(
+            m.contains("PackageVersion: 9.8.7") && !m.contains('@'),
+            "{m}"
+        );
+    }
+    // With the zip present, its layout must match the manifest.
+    if std::process::Command::new("zip").arg("-v").output().is_ok() {
+        let zip = assets.join("formless-v9.8.7-x86_64-pc-windows-msvc.zip");
+        let stage = dir.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("formless.exe"), "exe").unwrap();
+        let zip_it = |what: &str| {
+            let _ = std::fs::remove_file(&zip);
+            assert!(std::process::Command::new("zip")
+                .args(["-qr", zip.to_str().unwrap(), what])
+                .current_dir(&stage)
+                .status()
+                .unwrap()
+                .success());
+        };
+        zip_it("formless.exe");
+        let r = run("9.8.7", "o5");
+        assert!(
+            String::from_utf8_lossy(&r.stderr).contains("does not hold"),
+            "{r:?}"
+        );
+        let nested = stage.join("formless-v9.8.7-x86_64-pc-windows-msvc");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::rename(stage.join("formless.exe"), nested.join("formless.exe")).unwrap();
+        zip_it("formless-v9.8.7-x86_64-pc-windows-msvc");
+        assert!(run("9.8.7", "o6").status.success());
+    }
     assert!(!run("not-a-version", "o3").status.success());
     let _ = std::fs::remove_dir_all(dir);
 }

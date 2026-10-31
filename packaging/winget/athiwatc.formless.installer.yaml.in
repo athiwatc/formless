@@ -1,0 +1,16 @@
+# Winget installer manifest template, rendered by scripts/render-packaging.sh
+# from the release artifacts (version, URL, SHA-256, and the nested path
+# checked against the zip's listing).
+PackageIdentifier: athiwatc.formless
+PackageVersion: @VERSION@
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: formless-v@VERSION@-x86_64-pc-windows-msvc/formless.exe
+    PortableCommandAlias: formless
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/athiwatc/formless/releases/download/v@VERSION@/formless-v@VERSION@-x86_64-pc-windows-msvc.zip
+    InstallerSha256: @SHA256_WINDOWS@
+ManifestType: installer
+ManifestVersion: 1.6.0
