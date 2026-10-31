@@ -394,6 +394,10 @@ an empty listing just asks for one.
   attempt, max_attempts}`, and the TUI and web activity line count it down
   (`rate limited · retrying in 8s (2/5) · Esc to stop`); Esc interrupts
   the Run, including a wait in progress.
+  Re-sending a dropped stream starts fresh assembly state for that attempt:
+  content, reasoning, tool calls and their fragment modes, Responses call
+  indexes, partial SSE fields, usage, truncation and stop reasons are discarded
+  together. A Restart event clears any visible output from the lost attempt.
 - Hung request: after 300s the agent is told the request is still pending
   (same philosophy as Pending Invocations, §6.4); nothing is killed.
 - Malformed tool-calls from the model are fed back to the model as a
@@ -407,6 +411,9 @@ an empty listing just asks for one.
   continue the last call; a server that resends the whole name or
   arguments so far replaces instead of doubling them; a call already
   streamed as deltas isn't added again from `message.tool_calls`.
+  Incremental-versus-cumulative fragment modes are tracked independently for
+  each call's name and arguments; appending to one cannot change how the other
+  is assembled. Empty fragments do not select an incremental mode.
 - **Stops that aren't answers (#615).** A refusal (`delta.refusal`,
   `response.refusal.delta`, refusal content parts) is the answer text and
   `stop_reason = "refusal"`; a `content_filter` finish sets `stop_reason`.
@@ -2714,8 +2721,10 @@ run_tool = "network_policy"     # a registry Tool, or…
     call is made.
 - **Approval mode.** Approvals are **opt-in**: `security.secure`
   defaults to `false`, and then sensitive Tool calls run without asking.
-  Each such call is still audit-logged as `tool.run_unasked`, and so is a
-  hook command (`hook.run_unasked`). Remembered denials (below) apply in
+  Each bypassed approval decision is audit-logged as `tool.run_unasked`, and so
+  is a hook command's allow decision (`hook.run_unasked`). These records name
+  the Session and available Run; they do not assert that execution started or
+  succeeded. Remembered denials (below) apply in
   either mode. `security.secure = true` (or `formless --secure` /
   `FORMLESS_SECURE=1` when the daemon starts) turns prompts on; everything
   below about prompts, grants and failing closed describes that mode.
@@ -3834,6 +3843,11 @@ during its snapshot fetch, deduplicated by message id.
   type or a mistyped key is refused. It writes the file without
   environment overrides, audit-logs the change and broadcasts
   `SettingsChanged`. Changes are hot and apply from the next read.
+  Daemon edits use one serialized load/edit/save operation over the file-only
+  configuration. Effective settings and cached runtime limits refresh before
+  that operation releases its lock; environment overrides remain runtime-only.
+  Failed mutations or saves do not publish a changed configuration, and an
+  import that adds no configuration entries does not rewrite the file.
   Credentials, `base_url`, `extra_headers`, auth, the relay, MCP servers and
   hooks are never settable this way, locally or over the relay. The TUI
   (`/panes`) and the web Settings view (Edit) use `SetSetting`.
@@ -4018,6 +4032,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   TUI (`/audit [filter]`), the web Settings "Audit log" section (filter
   and "Older") and, for the agent, `read_metrics` (§8.9). Tool
   inputs/outputs recording follows §15 redaction.
+  New `*.run_unasked` details explicitly say `allow decision (approvals off)`.
+  Legacy rows with those action names also represent approval-bypass decisions,
+  including calls that subsequently failed to start or failed during execution;
+  they must not be read as evidence of successful execution.
 
 ## 15. Privacy and data lifecycle
 

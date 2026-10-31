@@ -585,8 +585,7 @@ pub struct Daemon {
     pub(crate) mcp: crate::mcp::Manager,
     /// Parsed config.toml, re-read only when the file changes.
     config: StdMutex<Option<(ConfigStamp, Config)>>,
-    /// Held while a request edits `config.toml`, so two edits never lose
-    /// each other's change.
+    /// Owned only by `with_config_edit`, including cache publication.
     config_edit: StdMutex<()>,
     /// `SendMessage` keys seen in the last 10 minutes and their outcome.
     sent_keys: StdMutex<HashMap<SendKey, SentEntry>>,
@@ -767,10 +766,15 @@ impl Daemon {
     /// modification time or size changed (one `stat` per call otherwise),
     /// and clients are told when that happens.
     pub(crate) fn config(&self) -> Result<Config> {
-        let stamp = config_stamp(&self.paths);
+        self.config_with_refresh(false)
+    }
+
+    // `force` also covers filesystems whose timestamp/size stamp did not change.
+    fn config_with_refresh(&self, force: bool) -> Result<Config> {
         let mut slot = self.config.locked();
+        let stamp = config_stamp(&self.paths);
         if let Some((cached, cfg)) = slot.as_ref() {
-            if *cached == stamp {
+            if !force && *cached == stamp {
                 return Ok(cfg.clone());
             }
         }
@@ -797,13 +801,27 @@ impl Daemon {
             cfg.tools.max_process_output_bytes,
             cfg.tools.max_log_bytes,
         );
-        let changed = slot.is_some();
+        let changed = force || slot.is_some();
         *slot = Some((stamp, cfg.clone()));
         drop(slot);
         if changed {
             self.broadcast(Event::SettingsChanged);
         }
         Ok(cfg)
+    }
+
+    /// The mutation returns whether it needs saving (imports can be no-ops).
+    /// All persistence and effective-cache publication stay inside one lock;
+    /// callers perform any asynchronous follow-up after this function returns.
+    fn with_config_edit(&self, edit: impl FnOnce(&mut Config) -> Result<bool>) -> Result<Config> {
+        let _edit = self.config_edit.locked();
+        let mut cfg = Config::load_file_only(&self.paths)?;
+        if edit(&mut cfg)? {
+            cfg.save(&self.paths)?;
+            self.config_with_refresh(true)
+        } else {
+            self.config()
+        }
     }
 
     /// A named provider (SPEC §4.5); `default`/unset is `[provider]`.
@@ -1889,17 +1907,12 @@ impl Daemon {
                 )
             })?)?),
             Request::SetSetting { key, value } => {
-                // One config edit at a time: load, change and save together (#1101).
-                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-                let mut cfg = Config::load_file_only(&self.paths)?;
-                cfg.set_key(&key, value.clone())?;
-                cfg.save(&self.paths)?;
-                drop(edit);
+                self.with_config_edit(|cfg| {
+                    cfg.set_key(&key, value.clone())?;
+                    Ok(true)
+                })?;
                 let _ = self
                     .with_store(|st| st.audit("user", "setting.set", &format!("{key} = {value}")));
-                // Hot: the next config() read sees the new file and
-                // broadcasts SettingsChanged.
-                let _ = self.config();
                 // Nothing settable needs a daemon restart; a few TUI keys
                 // apply when the TUI next starts.
                 let applies = if crate::config::ON_TUI_START.contains(&key.as_str()) {
@@ -2291,70 +2304,64 @@ impl Daemon {
                 {
                     return Err(anyhow::Error::new(RequestFailure::invalid( "provider names use letters, digits, '-' and '_' (and 'default' is [provider])")));
                 }
-                // One config edit at a time: load, change and save together (#1101).
-                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-                let mut cfg = Config::load_file_only(&self.paths)?;
-                let old_url = cfg.providers.get(&name).map(|p| p.base_url.clone());
-                let p = cfg.providers.entry(name.clone()).or_default();
-                p.base_url = base_url.trim_end_matches('/').to_string();
-                // A preset's endpoint gets its API style (Anthropic: native),
-                // also when an existing provider moves to another one.
-                if let Some(style) =
-                    crate::presets::restyle(old_url.as_deref(), &p.base_url, &p.api_style)
-                {
-                    p.api_style = style.to_string();
-                }
-                if let Some(m) = model {
-                    p.model = m;
-                }
-                if let Some(h) = headers {
-                    p.extra_headers = h.into_iter().collect();
-                }
-                if let Some(q) = query_params {
-                    p.query_params = q;
-                }
-                if let Some(h) = api_key_header {
-                    p.api_key_header = Some(h.trim().to_string()).filter(|h| !h.is_empty());
-                }
-                cfg.save(&self.paths)?;
-                drop(edit);
+                self.with_config_edit(|cfg| {
+                    let old_url = cfg.providers.get(&name).map(|p| p.base_url.clone());
+                    let p = cfg.providers.entry(name.clone()).or_default();
+                    p.base_url = base_url.trim_end_matches('/').to_string();
+                    // A preset's endpoint gets its API style (Anthropic: native),
+                    // also when an existing provider moves to another one.
+                    if let Some(style) =
+                        crate::presets::restyle(old_url.as_deref(), &p.base_url, &p.api_style)
+                    {
+                        p.api_style = style.to_string();
+                    }
+                    if let Some(m) = model {
+                        p.model = m;
+                    }
+                    if let Some(h) = headers {
+                        p.extra_headers = h.into_iter().collect();
+                    }
+                    if let Some(q) = query_params {
+                        p.query_params = q;
+                    }
+                    if let Some(h) = api_key_header {
+                        p.api_key_header = Some(h.trim().to_string()).filter(|h| !h.is_empty());
+                    }
+                    Ok(true)
+                })?;
                 if let Some(key) = api_key.filter(|k| !k.is_empty()) {
                     crate::config::save_provider_key(&self.paths, &name, &key)?;
                 }
                 let _ = self.with_store(|st| st.audit("user", "provider.upsert", &name));
-                let _ = self.config();
                 Ok(json!({"provider": name}))
             }
             Request::RemoveProvider { name } => {
-                // One config edit at a time: load, change and save together (#1101).
-                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-                let mut cfg = Config::load_file_only(&self.paths)?;
-                let users: Vec<&String> = cfg
-                    .roles
-                    .iter()
-                    .filter(|(_, r)| r.provider.as_deref() == Some(name.as_str()))
-                    .map(|(n, _)| n)
-                    .collect();
-                if !users.is_empty() {
-                    return Err(anyhow!(
-                        "provider '{name}' is used by role(s) {}; change or delete them first",
-                        users
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                if cfg.providers.remove(&name).is_none() {
-                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
-                        "no provider '{name}'"
-                    ))));
-                }
-                cfg.save(&self.paths)?;
-                drop(edit);
+                self.with_config_edit(|cfg| {
+                    let users: Vec<&String> = cfg
+                        .roles
+                        .iter()
+                        .filter(|(_, r)| r.provider.as_deref() == Some(name.as_str()))
+                        .map(|(n, _)| n)
+                        .collect();
+                    if !users.is_empty() {
+                        return Err(anyhow!(
+                            "provider '{name}' is used by role(s) {}; change or delete them first",
+                            users
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    if cfg.providers.remove(&name).is_none() {
+                        return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                            "no provider '{name}'"
+                        ))));
+                    }
+                    Ok(true)
+                })?;
                 crate::config::delete_provider_key(&self.paths, &name);
                 let _ = self.with_store(|st| st.audit("user", "provider.remove", &name));
-                let _ = self.config();
                 Ok(json!({"removed": name}))
             }
             Request::TestProvider { name } => {
@@ -2375,30 +2382,24 @@ impl Daemon {
                 }
                 let role: crate::config::RoleCfg =
                     serde_json::from_value(role).context("invalid role")?;
-                // One config edit at a time: load, change and save together (#1101).
-                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-                let mut cfg = Config::load_file_only(&self.paths)?;
-                cfg.provider_cfg(role.provider.as_deref())?;
-                cfg.roles.insert(name.clone(), role);
-                cfg.save(&self.paths)?;
-                drop(edit);
+                self.with_config_edit(|cfg| {
+                    cfg.provider_cfg(role.provider.as_deref())?;
+                    cfg.roles.insert(name.clone(), role);
+                    Ok(true)
+                })?;
                 let _ = self.with_store(|st| st.audit("user", "role.upsert", &name));
-                let _ = self.config();
                 Ok(json!({"role": name}))
             }
             Request::DeleteRole { name } => {
-                // One config edit at a time: load, change and save together (#1101).
-                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-                let mut cfg = Config::load_file_only(&self.paths)?;
-                if cfg.roles.remove(&name).is_none() {
-                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
-                        "no role '{name}'"
-                    ))));
-                }
-                cfg.save(&self.paths)?;
-                drop(edit);
+                self.with_config_edit(|cfg| {
+                    if cfg.roles.remove(&name).is_none() {
+                        return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                            "no role '{name}'"
+                        ))));
+                    }
+                    Ok(true)
+                })?;
                 let _ = self.with_store(|st| st.audit("user", "role.delete", &name));
-                let _ = self.config();
                 Ok(json!({"deleted": name}))
             }
             Request::ListHarnessChanges => {
@@ -2801,19 +2802,17 @@ impl Daemon {
                 tool,
                 enabled,
             } => {
-                // One config edit at a time: load, change and save together (#1101).
-                let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-                let mut cfg = self.config()?;
-                let server = cfg.mcp.servers.get_mut(&name).with_context(|| {
-                    RequestFailure::not_found(format!("no MCP server '{name}'"))
+                let cfg = self.with_config_edit(|cfg| {
+                    let server = cfg.mcp.servers.get_mut(&name).with_context(|| {
+                        RequestFailure::not_found(format!("no MCP server '{name}'"))
+                    })?;
+                    server.disabled_tools.retain(|t| t != &tool);
+                    if !enabled {
+                        server.disabled_tools.push(tool.clone());
+                        server.disabled_tools.sort();
+                    }
+                    Ok(true)
                 })?;
-                server.disabled_tools.retain(|t| t != &tool);
-                if !enabled {
-                    server.disabled_tools.push(tool.clone());
-                    server.disabled_tools.sort();
-                }
-                cfg.save(&self.paths)?;
-                drop(edit);
                 let action = if enabled {
                     "mcp.tool_enable"
                 } else {
@@ -6063,7 +6062,8 @@ impl Daemon {
         // With approvals off a hook command runs unasked like any Tool
         // (logged); with them on, an untrusted one is asked about once.
         if !h.trusted && !cfg.security.secure {
-            let _ = self.with_store(|st| st.audit("approvals-off", "hook.run_unasked", &key));
+            let _ = self.with_store(|st| st.audit("approvals-off", "hook.run_unasked",
+                &format!("allow decision (approvals off): {key} (session {session_id}, run {run_id}, event {})", payload["event"].as_str().unwrap_or("hook"))));
         } else if !h.trusted && !self.hook_approvals.locked().contains(&key) {
             let (ok, _) = self
                 .ask_user_approval(
@@ -6703,35 +6703,32 @@ impl Daemon {
         let mut failed: Vec<String> = Vec::new();
         // Config first (providers and Roles the Tools may name), then
         // modules (Tools load them), then the rest.
-        // One config edit at a time: load, change and save together (#1101).
-        let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-        let mut cfg = self.config()?;
         let incoming: Config = serde_json::from_value(bundle["config"].clone()).unwrap_or_default();
         let (mut providers, mut roles, mut servers) = (0, 0, 0);
-        for (k, v) in incoming.providers {
-            if !cfg.providers.contains_key(&k) {
-                cfg.providers.insert(k, v);
-                providers += 1;
+        self.with_config_edit(|cfg| {
+            for (k, v) in incoming.providers {
+                if !cfg.providers.contains_key(&k) {
+                    cfg.providers.insert(k, v);
+                    providers += 1;
+                }
             }
-        }
-        for (k, v) in incoming.roles {
-            if !cfg.roles.contains_key(&k) {
-                cfg.roles.insert(k, v);
-                roles += 1;
+            for (k, v) in incoming.roles {
+                if !cfg.roles.contains_key(&k) {
+                    cfg.roles.insert(k, v);
+                    roles += 1;
+                }
             }
-        }
-        for (k, v) in incoming.mcp.servers {
-            if !cfg.mcp.servers.contains_key(&k) {
-                cfg.mcp.servers.insert(k, v);
-                servers += 1;
+            for (k, v) in incoming.mcp.servers {
+                if !cfg.mcp.servers.contains_key(&k) {
+                    cfg.mcp.servers.insert(k, v);
+                    servers += 1;
+                }
             }
-        }
+            Ok(providers + roles + servers > 0)
+        })?;
         if providers + roles + servers > 0 {
-            cfg.save(&self.paths)?;
-            self.broadcast(Event::SettingsChanged);
             self.broadcast(Event::McpServersChanged);
         }
-        drop(edit);
         let mut modules = 0;
         for m in list("modules") {
             let (Some(name), Some(code)) = (m["name"].as_str(), m["code"].as_str()) else {
@@ -7962,13 +7959,10 @@ impl Daemon {
     async fn harness_apply(&self, op: &str, args: &Value) -> Result<Value> {
         let name = args["name"].as_str().unwrap_or_default().to_string();
         let edit_config = |f: &dyn Fn(&mut Config) -> Result<()>| -> Result<()> {
-            // One config edit at a time: load, change and save together (#1101).
-            let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-            let mut cfg = Config::load_file_only(&self.paths)?;
-            f(&mut cfg)?;
-            cfg.save(&self.paths)?;
-            drop(edit);
-            let _ = self.config();
+            self.with_config_edit(|cfg| {
+                f(cfg)?;
+                Ok(true)
+            })?;
             Ok(())
         };
         match op {
@@ -8175,21 +8169,18 @@ impl Daemon {
         if inv_op == "providers.upsert" {
             // Re-adding a provider the agent removed: no reachability check.
             let n = inv_args["name"].as_str().unwrap_or_default().to_string();
-            // One config edit at a time: load, change and save together (#1101).
-            let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-            let mut cfg = Config::load_file_only(&self.paths)?;
-            let p = cfg.providers.entry(n).or_default();
-            p.base_url = inv_args["base_url"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            p.model = inv_args["model"].as_str().unwrap_or_default().to_string();
-            if let Some(style) = inv_args["api_style"].as_str() {
-                p.api_style = style.to_string();
-            }
-            cfg.save(&self.paths)?;
-            drop(edit);
-            let _ = self.config();
+            self.with_config_edit(|cfg| {
+                let p = cfg.providers.entry(n).or_default();
+                p.base_url = inv_args["base_url"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                p.model = inv_args["model"].as_str().unwrap_or_default().to_string();
+                if let Some(style) = inv_args["api_style"].as_str() {
+                    p.api_style = style.to_string();
+                }
+                Ok(true)
+            })?;
         } else {
             self.harness_apply(inv_op, &inv_args).await?;
         }
@@ -10142,15 +10133,15 @@ impl Daemon {
             return false;
         }
         // Approvals are opt-in (`security.secure`); denials apply anyway.
-        // Each call that runs unasked is still on record (SPEC §10.3).
+        // Record the allow decision, not an execution or successful outcome.
         if !cfg.security.secure {
             let _ = self.with_store(|st| {
                 st.audit(
                     "approvals-off",
                     "tool.run_unasked",
-                    // Allowed at call time; the Session ties it to its Run (#848).
+                    // This precedes execution and remains truthful on startup failure.
                     &format!(
-                        "{}: {} (session {session_id})",
+                        "allow decision (approvals off): {}: {} (session {session_id})",
                         info.name,
                         caps.to_specs().join(", ")
                     ),
@@ -11584,12 +11575,10 @@ impl Daemon {
                 "MCP server names use letters, digits, '-' and '_' (no '__')"
             ));
         }
-        // One config edit at a time: load, change and save together (#1101).
-        let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-        let mut cfg = self.config()?;
-        cfg.mcp.servers.insert(name.to_string(), server);
-        cfg.save(&self.paths)?;
-        drop(edit);
+        let cfg = self.with_config_edit(|cfg| {
+            cfg.mcp.servers.insert(name.to_string(), server);
+            Ok(true)
+        })?;
         let _ = self.with_store(|st| st.audit(actor, "mcp.add", name));
         self.mcp.stop(name).await;
         let tools = self.sync_mcp_server(&cfg, name).await;
@@ -11601,16 +11590,14 @@ impl Daemon {
 
     /// Remove an MCP server; its tools are retired (metrics kept).
     pub(crate) async fn remove_mcp_server(&self, name: &str, actor: &str) -> Result<Value> {
-        // One config edit at a time: load, change and save together (#1101).
-        let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
-        let mut cfg = self.config()?;
-        if cfg.mcp.servers.remove(name).is_none() {
-            return Err(anyhow::Error::new(RequestFailure::not_found(format!(
-                "no MCP server '{name}'"
-            ))));
-        }
-        cfg.save(&self.paths)?;
-        drop(edit);
+        self.with_config_edit(|cfg| {
+            if cfg.mcp.servers.remove(name).is_none() {
+                return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                    "no MCP server '{name}'"
+                ))));
+            }
+            Ok(true)
+        })?;
         self.mcp.stop(name).await;
         // Its login goes with it: a server added later under the same name
         // must not inherit it (#866).
@@ -14465,6 +14452,71 @@ async fn summarize_in_chunks(
         provider.summarize(&merged, model),
     )
     .await
+}
+
+#[cfg(test)]
+mod config_edit_tests {
+    use super::*;
+
+    fn fixture(_env: &crate::credential_env::EnvGuard) -> (Paths, Daemon) {
+        let base = std::env::temp_dir().join(format!("fl-config-edit-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        (paths, daemon)
+    }
+
+    #[test]
+    fn forced_refresh_replaces_a_cache_with_a_matching_stamp() {
+        let env = crate::credential_env::EnvGuard::isolated();
+        let (paths, daemon) = fixture(&env);
+        let mut stale = Config::load(&paths).unwrap();
+        let expected = stale.tools.inline_limit;
+        stale.tools.inline_limit = expected + 1;
+        *daemon.config.locked() = Some((config_stamp(&paths), stale));
+        assert_eq!(daemon.config().unwrap().tools.inline_limit, expected + 1);
+        assert_eq!(
+            daemon.config_with_refresh(true).unwrap().tools.inline_limit,
+            expected
+        );
+        assert_eq!(daemon.config().unwrap().tools.inline_limit, expected);
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn a_save_error_cannot_publish_the_edited_cache() {
+        let env = crate::credential_env::EnvGuard::isolated();
+        let (paths, daemon) = fixture(&env);
+        let before = daemon.config().unwrap().tools.inline_limit;
+        let result = daemon.with_config_edit(|cfg| {
+            cfg.tools.inline_limit = before + 1;
+            // Force the atomic replacement to fail after load and mutation.
+            std::fs::remove_file(paths.config_file())?;
+            std::fs::create_dir(paths.config_file())?;
+            Ok(true)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            daemon
+                .config
+                .locked()
+                .as_ref()
+                .unwrap()
+                .1
+                .tools
+                .inline_limit,
+            before
+        );
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn only_the_config_edit_helper_owns_the_lock() {
+        let source = include_str!("daemon.rs");
+        assert_eq!(source.matches(concat!("self.", "config_edit")).count(), 1);
+    }
 }
 
 #[cfg(test)]
