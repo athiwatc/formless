@@ -13962,9 +13962,14 @@ mod run_start_tests {
     /// A second panic during cleanup cannot strand the queue (#1133).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_poisoned_tail_lock_and_tail_panic_still_start_the_queue() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let dir = std::env::temp_dir().join(format!("fl-tail-{}", uuid::Uuid::new_v4()));
         let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
-        Config::default().save(&paths).unwrap();
+        let mut cfg = Config::default();
+        // The injected naming panic still fires before this setting is read;
+        // later queued cleanup must not spawn model downloads in this fixture.
+        cfg.naming.enabled = false;
+        cfg.save(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(paths).unwrap());
         let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
         let run = daemon.with_store(|st| st.create_run(&sid)).unwrap();
@@ -14007,6 +14012,15 @@ mod run_start_tests {
                 .as_deref(),
             Some("paused")
         );
+        let pending = Arc::downgrade(&daemon);
+        drop(daemon);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while pending.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued cleanup outlived credential isolation");
         let _ = std::fs::remove_dir_all(dir);
     }
 
