@@ -1106,7 +1106,7 @@ impl Provider {
         &self,
         build: F,
         state: &mut AuthRecovery,
-    ) -> Result<reqwest::Response>
+    ) -> Result<(reqwest::Response, String)>
     where
         F: Fn(&str) -> reqwest::RequestBuilder,
     {
@@ -1118,8 +1118,15 @@ impl Provider {
             {
                 continue;
             }
-            return Ok(response);
+            return Ok((response, credential));
         }
+    }
+
+    fn redacted_error(&self, text: &str, credential: &str) -> String {
+        let mut known = vec![credential];
+        known.extend(self.cfg.extra_headers.values().map(String::as_str));
+        known.extend(self.cfg.query_params.values().map(String::as_str));
+        crate::secrets::redact_known(text, &known)
     }
 
     /// Route this provider's requests to a stable prompt cache (e.g. one
@@ -1332,7 +1339,7 @@ impl Provider {
         let mut all: Option<Value> = None;
         let mut after: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let resp = self
+            let (resp, credential) = self
                 .send_authenticated(
                     |credential| {
                         let mut req = self.http.get(url(&self.cfg.base_url, "models"));
@@ -1352,7 +1359,7 @@ impl Provider {
             if !status.is_success() {
                 return Err(anyhow!(
                     "GET /models failed: {status}: {}{}",
-                    resp.text().await.unwrap_or_default(),
+                    self.redacted_error(&resp.text().await.unwrap_or_default(), &credential),
                     auth.detail()
                 ));
             }
@@ -1662,7 +1669,8 @@ impl Provider {
                             return Ok((resp, recovered, model.clone(), permit));
                         }
                         server_wait = retry_after(resp.headers());
-                        let text = resp.text().await.unwrap_or_default();
+                        let raw_text = resp.text().await.unwrap_or_default();
+                        let text = self.redacted_error(&raw_text, &credential);
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
                         last_err = match server_wait {
@@ -1744,7 +1752,7 @@ impl Provider {
                         };
                     }
                     Err(e) => {
-                        last_err = e.to_string();
+                        last_err = self.redacted_error(&e.to_string(), &credential);
                         reason = "connection failed".to_string();
                     }
                 }
@@ -2484,7 +2492,7 @@ impl Provider {
                 }
                 return Err(anyhow!(
                     "POST /compact failed: {status}: {}{}",
-                    resp.text().await.unwrap_or_default(),
+                    self.redacted_error(&resp.text().await.unwrap_or_default(), &credential),
                     auth.detail()
                 ));
             }

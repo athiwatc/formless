@@ -746,7 +746,7 @@ pub fn parse_token_response(
     })
 }
 
-fn sanitized_oauth_error(body: &[u8]) -> String {
+fn sanitized_oauth_error(body: &[u8], submitted_secrets: &[&str]) -> String {
     let parsed: Option<Value> = serde_json::from_slice(body).ok();
     let mut parts = Vec::new();
     if let Some(value) = parsed {
@@ -762,7 +762,8 @@ fn sanitized_oauth_error(body: &[u8]) -> String {
     } else {
         parts.join(": ")
     };
-    text.chars()
+    crate::secrets::redact_known(&text, submitted_secrets)
+        .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(300)
         .collect()
@@ -875,11 +876,16 @@ async fn token_request(
         .build()
         .context("build OAuth HTTP client")?;
     let mut request = client.post(cfg.token_url.trim()).form(&params);
-    if let Ok(secret) = std::env::var("FORMLESS_OAUTH_CLIENT_SECRET") {
-        if !secret.is_empty() {
-            // Confidential-client authentication stays out of config.toml.
-            request = request.basic_auth(cfg.client_id.trim(), Some(secret));
-        }
+    let client_secret = std::env::var("FORMLESS_OAUTH_CLIENT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let basic_credential = client_secret.as_ref().map(|secret| {
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{secret}", cfg.client_id.trim()))
+    });
+    if let Some(secret) = &client_secret {
+        // Confidential-client authentication stays out of config.toml.
+        request = request.basic_auth(cfg.client_id.trim(), Some(secret));
     }
     let response = request.send().await.context("send OAuth token request")?;
     let status = response.status();
@@ -888,7 +894,26 @@ async fn token_request(
         .await
         .context("read OAuth token response")?;
     if !status.is_success() {
-        let detail = sanitized_oauth_error(&body);
+        let mut known: Vec<&str> = params
+            .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "refresh_token"
+                        | "code"
+                        | "code_verifier"
+                        | "client_secret"
+                        | "client_assertion"
+                        | "assertion"
+                        | "password"
+                        | "token"
+                )
+            })
+            .map(|(_, value)| value.as_str())
+            .collect();
+        known.extend(client_secret.as_deref());
+        known.extend(basic_credential.as_deref());
+        let detail = sanitized_oauth_error(&body, &known);
         if detail.is_empty() {
             bail!("OAuth token endpoint returned {status}");
         }
@@ -1290,4 +1315,19 @@ where
 
     exchange_code_blocking(&auth, &code, &redirect_uri, &verifier)
         .context("exchange OAuth authorization code")
+}
+
+#[cfg(test)]
+mod error_redaction_tests {
+    #[test]
+    fn echoed_opaque_credential_is_masked_before_error_truncation() {
+        let secret = "opaque-credential-phrase";
+        let padding = "z".repeat(300 - "invalid_grant: ".len() - 4);
+        let body = serde_json::json!({"error":"invalid_grant", "error_description":format!("{padding}{secret}")}).to_string();
+        let clean = super::sanitized_oauth_error(body.as_bytes(), &[secret]);
+        assert!(clean.starts_with("invalid_grant: "));
+        assert_eq!(clean.chars().count(), 300);
+        assert!(clean.ends_with("[RED"), "masking must precede the cutoff");
+        assert!(!clean.contains("opaq"));
+    }
 }

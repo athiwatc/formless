@@ -75,6 +75,35 @@ pub fn set_patterns(patterns: &[String]) -> Vec<String> {
     bad
 }
 
+/// Error endpoints can echo opaque credentials that have no recognizable
+/// pattern. Mask exact submitted values before scanning or truncating output.
+pub(crate) fn redact_known(text: &str, values: &[&str]) -> String {
+    let mut variants = Vec::new();
+    for value in values.iter().copied().filter(|v| !v.is_empty()) {
+        variants.push(value.to_string());
+        // Error bodies may quote a value as JSON or as submitted form data.
+        if let Ok(quoted) = serde_json::to_string(value) {
+            variants.push(quoted[1..quoted.len() - 1].to_string());
+        }
+        let mut encoded = reqwest::Url::parse("https://redaction.invalid/").expect("static URL");
+        encoded.query_pairs_mut().append_pair("v", value);
+        variants.push(
+            encoded
+                .query()
+                .unwrap_or_default()
+                .trim_start_matches("v=")
+                .to_string(),
+        );
+    }
+    variants.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    variants.dedup();
+    let mut clean = text.to_string();
+    for value in variants {
+        clean = clean.replace(&value, MARK);
+    }
+    redact(&clean).0
+}
+
 /// A long run of mixed-case letters and digits with no structure: an
 /// API key or token rather than a word, path or hash-like id in prose.
 pub fn looks_random(w: &str) -> bool {

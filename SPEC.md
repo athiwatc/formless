@@ -333,8 +333,12 @@ without redesign.
   compaction, and calls made by a managed operational probe. A failed forced
   refresh retains the original 401 and refresh-error context even when a
   later fallback returns a hard 400/403 or credential resolution fails, and
-  attempts configured fallback models; it does not replace the error or reset the refresh allowance per
-  model. API-key/fixed-token and explicit environment overrides do not redeem
+  attempts configured fallback models; it does not replace the error or reset
+  the refresh allowance per model. Error bodies are masked against exact
+  submitted credentials (including opaque access/refresh tokens, authorization
+  codes/verifiers and confidential client secrets) before truncation or
+  preservation in context. Status and OAuth error codes remain available.
+  API-key/fixed-token and explicit environment overrides do not redeem
   a stored refresh token. `doctor` remains read-only, including its fixed-token
   diagnostic probes; operational probes can use a managed Provider.
   A confidential OAuth client secret, when a provider requires one, is

@@ -175,6 +175,7 @@ struct Seen {
     refreshes: usize,
     calls: Vec<(String, String, String)>,
     fail_refresh: bool,
+    echo_credentials: bool,
     fallback_ok: bool,
     reject_new: bool,
     pages: bool,
@@ -217,9 +218,20 @@ async fn endpoint(
                 || (seen.drop_stream_once && body.contains("refresh_token=rotated-refresh"))
         );
         return if seen.fail_refresh {
+            let description = if seen.echo_credentials {
+                use base64::Engine;
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(credential.trim_start_matches("Basic "))
+                    .unwrap();
+                let basic = String::from_utf8(decoded).unwrap();
+                let secret = basic.split_once(':').unwrap().1;
+                format!("rejected opaque material [private-refresh] [{secret}] [{credential}]")
+            } else {
+                "refresh refused".into()
+            };
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error":"invalid_grant"})),
+                Json(json!({"error":"invalid_grant", "error_description": description})),
             )
                 .into_response()
         } else {
@@ -245,7 +257,15 @@ async fn endpoint(
     let good = (credential.ends_with("new-access") && !seen.reject_new)
         || (seen.fallback_ok && payload["model"] == "fallback");
     if !good {
-        return (StatusCode::UNAUTHORIZED, "original revoked credential").into_response();
+        let detail = if seen.echo_credentials {
+            format!(
+                "original revoked credential; echoed opaque value [{}]",
+                credential.trim_start_matches("Bearer ")
+            )
+        } else {
+            "original revoked credential".into()
+        };
+        return (StatusCode::UNAUTHORIZED, detail).into_response();
     }
     if seen.drop_stream_once && payload["stream"] == true {
         seen.stream_delivered = true;
@@ -762,6 +782,70 @@ async fn failed_refresh_context_survives_fallback_hard_error() {
         assert_eq!(seen.refreshes, 1);
         assert!(seen.calls.iter().any(|(_, _, model)| model == "fallback"));
         drop(seen);
+        server.close().await;
+    }
+}
+
+#[tokio::test]
+async fn provider_and_refresh_error_echoes_never_expose_opaque_submitted_credentials() {
+    use base64::Engine;
+    let env = credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let opaque = "echo [old-access] [private-refresh] [plain-client-phrase]";
+    assert_eq!(
+        formless_core::secrets::redact(opaque).0,
+        opaque,
+        "fixture credentials have no scanner-recognizable shape"
+    );
+    let client_secret = "plain-client-phrase";
+    env.set("FORMLESS_OAUTH_CLIENT_SECRET", client_secret);
+    for operation in ["chat", "models", "compact"] {
+        let server = Server::new(Seen {
+            fail_refresh: true,
+            echo_credentials: true,
+            ..Default::default()
+        })
+        .await;
+        let p = managed(&f, config(&server.base), "work").await;
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            match operation {
+                "chat" => complete(&p).await.unwrap_err().to_string(),
+                "models" => p.list_models().await.unwrap_err().to_string(),
+                _ => p
+                    .compact_server("input", "primary")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            }
+        })
+        .await
+        .expect("credential echo fixture timeout");
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("client:{client_secret}"));
+        for secret in [
+            "old-access",
+            "private-refresh",
+            client_secret,
+            basic.as_str(),
+        ] {
+            assert!(
+                !error.contains(secret),
+                "{operation}: opaque credential exposed in {error}"
+            );
+        }
+        assert!(
+            error.contains("401"),
+            "{operation}: status context retained: {error}"
+        );
+        assert!(
+            error.contains("invalid_grant"),
+            "{operation}: refresh error retained: {error}"
+        );
+        assert!(
+            error.contains("[REDACTED]"),
+            "{operation}: exact credential values masked"
+        );
+        assert_eq!(server.seen.lock().unwrap().refreshes, 1);
         server.close().await;
     }
 }
