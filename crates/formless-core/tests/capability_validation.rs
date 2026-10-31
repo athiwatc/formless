@@ -1,10 +1,14 @@
 //! Malformed scopes fail at the Tool creation gate, before approval or execution.
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::{Config, Paths, Store};
 use serde_json::json;
 use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_creation_validates_and_stores_canonical_scopes() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = std::env::temp_dir().join(format!("fl-scope-validation-{}", uuid::Uuid::new_v4()));
     let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
     Config::default().save(&paths).unwrap();

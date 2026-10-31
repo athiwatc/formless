@@ -2348,6 +2348,7 @@ mod secret_file_tests {
     /// leaves no temp; a symlink is not read through (#849).
     #[test]
     fn secret_writes_are_safe_under_concurrency_and_failure() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let dir = std::env::temp_dir().join(format!("fl-secret-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("api_key");
@@ -2404,6 +2405,7 @@ mod save_tests {
     /// written through the link; an unmergeable file is backed up (#1100, #1101).
     #[test]
     fn hooks_inline_tables_and_symlinks_survive_saves() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let base = std::env::temp_dir().join(format!("fl-cfghooks-{}", uuid::Uuid::new_v4()));
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         let original = "[provider]\n\
@@ -2457,6 +2459,7 @@ later_key = \"kept\"\n";
 
     #[test]
     fn saving_keeps_comments_order_and_unknown_keys() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let base = std::env::temp_dir().join(format!("fl-cfgsave-{}", uuid::Uuid::new_v4()));
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         let original = "# My Formless setup — keep this note\n\

@@ -1,5 +1,8 @@
 //! Model and file pickers: `ListModels` (SPEC §4.2) and `@` mentions (§5.6).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::routing::get;
 use formless_core::config::RoleCfg;
 use formless_core::{Config, Paths, Store};
@@ -21,7 +24,8 @@ fn paths(tag: &str) -> Paths {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_models_returns_provider_models_roles_and_recent() {
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "key-a");
     let app = axum::Router::new().route(
         "/models",
         get(|| async {
@@ -77,7 +81,8 @@ async fn list_models_returns_provider_models_roles_and_recent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_models_reports_an_unreachable_endpoint() {
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "key-a");
     let paths = paths("models-down");
     let mut cfg = Config::default();
     cfg.provider.base_url = "http://127.0.0.1:9".into();
@@ -95,8 +100,9 @@ async fn list_models_reports_an_unreachable_endpoint() {
 /// directories, which reach the model with the next message.
 #[tokio::test(flavor = "multi_thread")]
 async fn mentions_list_attach_and_reference_files() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::routing::post;
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    _env.set("FORMLESS_API_KEY", "key-a");
     let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
     let app = axum::Router::new().route(
         "/chat/completions",

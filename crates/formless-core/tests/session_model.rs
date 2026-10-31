@@ -1,13 +1,17 @@
 //! Sub-agents and llm.complete follow the Session's model and effort
 //! (SPEC §7.5/§7.6), not the daemon default.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::routing::post;
 use formless_core::{Paths, Store};
 use std::sync::{Arc, Mutex};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn llm_complete_uses_the_session_model_and_effort() {
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "test-key");
     let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
     let app = axum::Router::new().route(
         "/chat/completions",

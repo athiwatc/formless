@@ -1,6 +1,9 @@
 //! M1 acceptance tests (SPEC §18 M1, §19): storage/compaction round-trip,
 //! provider against a mock OpenAI-compatible server, daemon end-to-end.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::{
     response::IntoResponse,
     routing::{get, post},
@@ -24,6 +27,7 @@ fn temp_paths(tag: &str) -> Paths {
 
 #[test]
 fn storage_resume_is_byte_identical_and_compaction_flags() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("storage");
     let session_id;
     {
@@ -63,6 +67,7 @@ fn storage_resume_is_byte_identical_and_compaction_flags() {
 /// context with its result, so strict endpoints accept the Session again (#541).
 #[test]
 fn context_drops_stored_tool_calls_without_a_name() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("nameless");
     let store = Store::open(&paths.db_file()).unwrap();
     let s = store.create_session(None).unwrap();
@@ -124,6 +129,7 @@ fn context_drops_stored_tool_calls_without_a_name() {
 
 #[test]
 fn context_has_one_leading_system_message() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("onesystem");
     let store = Store::open(&paths.db_file()).unwrap();
     let s = store.create_session(None).unwrap();
@@ -154,6 +160,7 @@ fn context_has_one_leading_system_message() {
 
 #[test]
 fn provider_message_echoes_reasoning_only_on_tool_call_turns() {
+    let _env = credential_env::EnvGuard::isolated();
     let meta = json!({
         "tool_calls": [{"id": "1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
         "reasoning_content": "because reasons"
@@ -174,6 +181,7 @@ fn provider_message_echoes_reasoning_only_on_tool_call_turns() {
 
 #[test]
 fn fork_search_and_edit_message() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("forksearch");
     let store = Store::open(&paths.db_file()).unwrap();
     let s = store.create_session(Some("Orig".into())).unwrap();
@@ -275,6 +283,7 @@ fn mock_cfg(base: &str) -> ProviderCfg {
 
 #[tokio::test]
 async fn provider_models_probe_stream_and_effort_retry() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = mock_server().await;
     let cfg = mock_cfg(&base);
     let p = Provider::new(cfg.clone(), "k".into()).unwrap();
@@ -336,6 +345,7 @@ async fn mock_thinking_server() -> String {
 
 #[tokio::test]
 async fn probe_retries_without_tool_choice_when_thinking_mode_rejects_it() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = mock_thinking_server().await;
     let cfg = mock_cfg(&base);
     let probe = probe(&cfg, "k", "seek-1").await.unwrap();
@@ -345,6 +355,7 @@ async fn probe_retries_without_tool_choice_when_thinking_mode_rejects_it() {
 
 #[tokio::test]
 async fn probe_does_not_retry_on_other_provider_errors() {
+    let _env = credential_env::EnvGuard::isolated();
     // A permanent 400 unrelated to tool_choice must fail fast, not be
     // masked by the thinking-mode fallback (which would succeed here).
     let app = Router::new()
@@ -369,11 +380,12 @@ async fn probe_does_not_retry_on_other_provider_errors() {
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_end_to_end_run_persists_and_two_clients_share() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::daemon::Daemon;
     use formless_protocol::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let base = mock_server().await;
     let paths = temp_paths("daemon");
     let mut cfg = Config {
@@ -495,6 +507,7 @@ async fn daemon_end_to_end_run_persists_and_two_clients_share() {
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_idle_closes_after_grace() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::daemon::Daemon;
     let paths = temp_paths("idle");
     let mut cfg = Config::default();
@@ -513,6 +526,7 @@ async fn daemon_idle_closes_after_grace() {
 
 #[test]
 fn migrating_an_older_database_takes_a_backup_first() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::storage::SCHEMA_VERSION;
     let paths = temp_paths("migrate");
     let db = paths.db_file();
@@ -572,6 +586,7 @@ fn migrating_an_older_database_takes_a_backup_first() {
 
 #[test]
 fn queued_messages_survive_reopening_the_store() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("queue");
     let id = {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -597,6 +612,7 @@ fn queued_messages_survive_reopening_the_store() {
 
 #[test]
 fn context_cache_matches_a_full_build_through_every_change() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::storage::ContextCache;
     let paths = temp_paths("ctxcache");
     let store = Store::open(&paths.db_file()).unwrap();
@@ -638,6 +654,7 @@ fn context_cache_matches_a_full_build_through_every_change() {
 
 #[test]
 fn reader_connections_see_writes_and_cannot_write() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("reader");
     let store = Store::open(&paths.db_file()).unwrap();
     let reader = Store::open_reader(&paths.db_file()).unwrap();
@@ -653,6 +670,7 @@ fn reader_connections_see_writes_and_cannot_write() {
 
 #[test]
 fn concurrent_appends_get_distinct_ordered_seqs() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("seqs");
     let session = Store::open(&paths.db_file())
         .unwrap()
@@ -688,6 +706,7 @@ fn concurrent_appends_get_distinct_ordered_seqs() {
 
 #[test]
 fn real_prompt_size_drives_compaction_until_the_next_checkpoint() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::provider::Usage;
     use formless_core::storage::ContextCache;
     let paths = temp_paths("usage");
@@ -721,6 +740,7 @@ fn real_prompt_size_drives_compaction_until_the_next_checkpoint() {
 
 #[test]
 fn compaction_cuts_only_at_turn_boundaries() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::storage::ContextCache;
     let paths = temp_paths("turncut");
     let store = Store::open(&paths.db_file()).unwrap();
@@ -764,6 +784,7 @@ fn compaction_cuts_only_at_turn_boundaries() {
 /// records are opt-in and capped (#848).
 #[test]
 fn audit_hides_and_caps_unasked_records() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = formless_core::Store::open_in_memory().unwrap();
     store.audit("user", "tool.approve", "fetch: net").unwrap();
     for i in 0..(formless_core::storage::UNASKED_KEEP + 5) {

@@ -1531,6 +1531,7 @@ mod race_tests {
     /// discarded and logged (SPEC §16, #759).
     #[test]
     fn a_retired_tool_is_never_promoted() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let base = std::path::PathBuf::from(format!("/tmp/fl-race-{short}"));
         let paths = crate::Paths::from_dirs(base.join("d"), base.join("c")).unwrap();

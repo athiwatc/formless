@@ -628,9 +628,12 @@ pub fn non_public(ip: std::net::IpAddr) -> bool {
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // unique local
                 || (seg[0] & 0xffc0) == 0xfe80 // link-local
+                || (seg[0] & 0xffc0) == 0xfec0 // deprecated site-local
                 || (seg[0] == 0x64 && seg[1] == 0xff9b) // local-use NAT64
                 || (seg[0] == 0x2001 && seg[1] == 0) // Teredo
                 || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation
+                || (seg[0] == 0x2001 && seg[1] == 2 && seg[2] == 0) // benchmarking
+                || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0) // documentation
                 || (seg[0] == 0x100 && seg[1..4] == [0, 0, 0]) // discard-only
         }
     }
@@ -2282,16 +2285,146 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
     }
 }
 
+/// Recognize declarations for the returned object, not declarations belonging to
+/// nested properties or unused definitions. Alternative/conditional branches only
+/// contribute when they validate this output. Local references retain root context.
+fn declares_output_error(schema: &Value, output: &Value) -> bool {
+    const MAX_DEPTH: usize = 64;
+    const MAX_NODES: usize = 4096;
+    fn bounded(value: &Value, depth: usize, left: &mut usize) -> bool {
+        if depth > MAX_DEPTH || *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        match value {
+            Value::Array(values) => values.iter().all(|v| bounded(v, depth + 1, left)),
+            Value::Object(values) => values.values().all(|v| bounded(v, depth + 1, left)),
+            _ => true,
+        }
+    }
+    let mut remaining = MAX_NODES;
+    if !bounded(schema, 0, &mut remaining) {
+        return false;
+    }
+    // Offline compilation cannot turn inspecting Tool output into a network read.
+    let validators = jsonschema::options().offline().build_map(schema).ok();
+    struct Declarations<'a> {
+        root: &'a Value,
+        output: &'a Value,
+        validators: Option<jsonschema::ValidatorMap>,
+        left: usize,
+    }
+    impl Declarations<'_> {
+        fn reference(&self, node: &Value) -> Option<String> {
+            let reference = node.get("$ref")?.as_str()?;
+            // JSON Pointer references only: external resources and dynamic
+            // anchors cannot be resolved by guessing against the root document.
+            let pointer = reference.strip_prefix('#')?;
+            (pointer.is_empty() || pointer.starts_with('/'))
+                .then(|| self.root.pointer(pointer).map(|_| reference.to_string()))?
+        }
+        fn visit(&mut self, path: &str, stack: &mut Vec<String>) -> bool {
+            if self.left == 0 || stack.len() >= MAX_DEPTH || stack.iter().any(|p| p == path) {
+                return false;
+            }
+            self.left -= 1;
+            let Some(node) = self.root.pointer(path.strip_prefix('#').unwrap_or(path)) else {
+                return false;
+            };
+            stack.push(path.to_string());
+            let declared = node["properties"]
+                .as_object()
+                .is_some_and(|p| p.contains_key("error"));
+            let mut result = declared;
+            if let Some(reference) = self.reference(node) {
+                result |= self.visit(&reference, stack);
+            }
+            for keyword in ["allOf", "anyOf", "oneOf"] {
+                if let Some(branches) = node[keyword].as_array() {
+                    for index in 0..branches.len() {
+                        let branch = format!("{path}/{keyword}/{index}");
+                        if keyword == "allOf" || self.matches(&branch) {
+                            result |= self.visit(&branch, stack);
+                        }
+                    }
+                }
+            }
+            if node.get("if").is_some() {
+                if let Some(matches) = self.match_result(&format!("{path}/if")) {
+                    let selected = if matches { "then" } else { "else" };
+                    result |= self.visit(&format!("{path}/{selected}"), stack);
+                }
+            }
+            if let Some(dependencies) = node["dependentSchemas"].as_object() {
+                for key in dependencies.keys() {
+                    if self.output.get(key).is_some() {
+                        let escaped = key.replace('~', "~0").replace('/', "~1");
+                        result |= self.visit(&format!("{path}/dependentSchemas/{escaped}"), stack);
+                    }
+                }
+            }
+            stack.pop();
+            result
+        }
+        // Validators handle recursive object schemas, but a reference cycle that
+        // reapplies to the same instance can recurse forever. Refuse that graph
+        // before asking whether an alternative/condition matches.
+        fn acyclic(&self, path: &str, stack: &mut Vec<String>, left: &mut usize) -> bool {
+            if *left == 0 || stack.len() >= MAX_DEPTH || stack.iter().any(|p| p == path) {
+                return false;
+            }
+            *left -= 1;
+            let Some(node) = self.root.pointer(path.strip_prefix('#').unwrap_or(path)) else {
+                return false;
+            };
+            stack.push(path.to_string());
+            let mut safe = self
+                .reference(node)
+                .is_none_or(|p| self.acyclic(&p, stack, left));
+            for keyword in ["allOf", "anyOf", "oneOf"] {
+                if let Some(branches) = node[keyword].as_array() {
+                    safe &= (0..branches.len())
+                        .all(|i| self.acyclic(&format!("{path}/{keyword}/{i}"), stack, left));
+                }
+            }
+            for keyword in ["if", "then", "else", "not"] {
+                if node.get(keyword).is_some() {
+                    safe &= self.acyclic(&format!("{path}/{keyword}"), stack, left);
+                }
+            }
+            if let Some(dependencies) = node["dependentSchemas"].as_object() {
+                for key in dependencies.keys() {
+                    let escaped = key.replace('~', "~0").replace('/', "~1");
+                    safe &=
+                        self.acyclic(&format!("{path}/dependentSchemas/{escaped}"), stack, left);
+                }
+            }
+            stack.pop();
+            safe
+        }
+        fn match_result(&self, path: &str) -> Option<bool> {
+            let mut remaining = MAX_NODES;
+            if !self.acyclic(path, &mut Vec::new(), &mut remaining) {
+                return None;
+            }
+            Some(self.validators.as_ref()?.get(path)?.is_valid(self.output))
+        }
+        fn matches(&self, path: &str) -> bool {
+            self.match_result(path) == Some(true)
+        }
+    }
+    Declarations {
+        root: schema,
+        output,
+        validators,
+        left: MAX_NODES,
+    }
+    .visit("#", &mut Vec::new())
+}
+
 /// Undeclared `{error: <truthy>}` results report failure (§8.1). An error
 /// property explicitly declared in the output schema is ordinary domain data.
 fn reported_error(output: &Value, output_schema: Option<&Value>) -> Option<String> {
-    if output_schema.is_some_and(|s| {
-        s["properties"]
-            .as_object()
-            .is_some_and(|p| p.contains_key("error"))
-    }) {
-        return None;
-    }
     let e = output.as_object()?.get("error")?;
     let truthy = match e {
         Value::Null | Value::Bool(false) => false,
@@ -2299,7 +2432,10 @@ fn reported_error(output: &Value, output_schema: Option<&Value>) -> Option<Strin
         Value::Number(n) => n.as_f64() != Some(0.0),
         _ => true,
     };
-    truthy.then(|| match e {
+    if !truthy || output_schema.is_some_and(|schema| declares_output_error(schema, output)) {
+        return None;
+    }
+    Some(match e {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     })
@@ -2618,33 +2754,90 @@ mod tests {
         assert!(checked_address(&url("http://localhost/"), &["localhost".into()]).is_ok());
     }
 
-    /// Reserved and transition address families are not public (#1092).
+    /// IANA special-purpose families plus deprecated site-local addresses.
+    /// https://www.iana.org/assignments/iana-ipv6-special-registry/
+    /// https://www.iana.org/assignments/iana-ipv4-special-registry/
     #[test]
-    fn transition_and_reserved_addresses_are_not_public() {
+    fn special_purpose_registry_addresses_are_not_public() {
         use std::net::IpAddr;
-        for ip in [
-            "::a9fe:a9fe",         // IPv4-compatible 169.254.169.254
-            "64:ff9b::a9fe:a9fe",  // NAT64 of it
-            "64:ff9b::7f00:1",     // NAT64 of 127.0.0.1
-            "64:ff9b:1::1",        // local-use NAT64
-            "2002:a9fe:a9fe::1",   // 6to4 of it
-            "2001:0:4136:e378::1", // Teredo
-            "2001:db8::1",         // documentation
-            "100::1",              // discard-only
-            "240.0.0.1",           // reserved
-            "255.255.255.254",
-            "198.18.0.1", // benchmarking
-            "192.0.0.8",
+        for (name, prefix, ip) in [
+            ("This network", "0.0.0.0/8", "0.1.2.3"),
+            ("Private-use", "10.0.0.0/8", "10.1.2.3"),
+            ("Shared address space", "100.64.0.0/10", "100.64.0.1"),
+            ("Loopback", "127.0.0.0/8", "127.0.0.1"),
+            ("Link-local", "169.254.0.0/16", "169.254.169.254"),
+            ("Private-use", "172.16.0.0/12", "172.16.0.1"),
+            ("Private-use", "192.168.0.0/16", "192.168.0.1"),
+            ("Documentation TEST-NET-1", "192.0.2.0/24", "192.0.2.1"),
+            (
+                "Documentation TEST-NET-2",
+                "198.51.100.0/24",
+                "198.51.100.1",
+            ),
+            ("Documentation TEST-NET-3", "203.0.113.0/24", "203.0.113.1"),
+            ("Multicast", "224.0.0.0/4", "224.0.0.1"),
+            ("Limited broadcast", "255.255.255.255/32", "255.255.255.255"),
+            ("Loopback", "::1/128", "::1"),
+            ("Unspecified", "::/128", "::"),
+            ("Unique-local", "fc00::/7", "fd00::1"),
+            ("Link-local unicast", "fe80::/10", "fe80::1"),
+            ("Multicast", "ff00::/8", "ff00::1"),
+            ("IPv4-compatible private", "::/96", "::a9fe:a9fe"),
+            ("IPv4-mapped private", "::ffff:0:0/96", "::ffff:10.0.0.1"),
+            ("NAT64 private", "64:ff9b::/96", "64:ff9b::a9fe:a9fe"),
+            ("NAT64 loopback", "64:ff9b::/96", "64:ff9b::7f00:1"),
+            ("Local-use NAT64", "64:ff9b:1::/48", "64:ff9b:1::1"),
+            ("6to4 private", "2002::/16", "2002:a9fe:a9fe::1"),
+            ("Teredo", "2001::/32", "2001:0:4136:e378::1"),
+            ("Documentation", "2001:db8::/32", "2001:db8::1"),
+            ("Discard-only", "100::/64", "100::1"),
+            ("Reserved", "240.0.0.0/4", "240.0.0.1"),
+            ("Reserved upper end", "240.0.0.0/4", "255.255.255.254"),
+            ("Benchmarking", "198.18.0.0/15", "198.18.0.1"),
+            ("IETF protocol assignments", "192.0.0.0/24", "192.0.0.8"),
+            ("Deprecated site-local", "fec0::/10", "fec0::1"),
+            (
+                "Deprecated site-local upper end",
+                "fec0::/10",
+                "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            ),
+            ("Benchmarking", "2001:2::/48", "2001:2::1"),
+            (
+                "Benchmarking upper end",
+                "2001:2::/48",
+                "2001:2:0:ffff:ffff:ffff:ffff:ffff",
+            ),
+            ("Documentation", "3fff::/20", "3fff::1"),
+            (
+                "Documentation upper end",
+                "3fff::/20",
+                "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
+            ),
         ] {
-            assert!(non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+            assert!(
+                non_public(ip.parse::<IpAddr>().unwrap()),
+                "{name} ({prefix}): {ip}"
+            );
         }
-        for ip in ["64:ff9b::808:808", "2002:808:808::1", "198.20.0.1"] {
+        for ip in [
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            "198.20.0.1",
+            "2001:2:1::1",
+            "3fff:1000::1",
+            "3ffe:ffff::1",
+        ] {
             assert!(!non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
         }
         let url = |u: &str| reqwest::Url::parse(u).unwrap();
         for u in ["http://[64:ff9b::a9fe:a9fe]/", "http://[::a9fe:a9fe]/"] {
             let err = checked_address(&url(u), &["example.com".into()]).unwrap_err();
             assert!(err.starts_with("denied:"), "{err}");
+        }
+        for ip in ["fec0::1", "2001:2::1", "3fff::1"] {
+            let u = url(&format!("http://[{ip}]/"));
+            assert!(checked_address(&u, &[]).unwrap_err().starts_with("denied:"));
+            assert!(checked_address(&u, &[ip.to_string()]).is_ok());
         }
         assert!(checked_address(&url("http://[::a9fe:a9fe]/"), &["::a9fe:a9fe".into()]).is_ok());
     }
@@ -3151,6 +3344,52 @@ mod tests {
             }
         });
         (addr, rx, server)
+    }
+
+    #[test]
+    fn declared_error_fields_follow_only_applicable_output_schemas() {
+        let output = json!({"kind":"diagnostic", "error":"negative finding"});
+        let declaration = json!({"type":"object", "properties":{"error":{"type":"string"}}});
+        for schema in [
+            json!({"allOf":[declaration]}),
+            json!({"$defs":{"diagnostic":declaration}, "$ref":"#/$defs/diagnostic"}),
+            json!({"$defs":{"a/b~c":declaration}, "allOf":[{"$ref":"#/$defs/a~1b~0c"}]}),
+            json!({"anyOf":[{"type":"integer"}, declaration]}),
+            json!({"oneOf":[{"type":"integer"}, declaration]}),
+            json!({"if":{"properties":{"kind":{"const":"diagnostic"}}}, "then":declaration}),
+            json!({"if":{"properties":{"kind":{"const":"other"}}}, "else":declaration}),
+            json!({"dependentSchemas":{"kind":declaration}}),
+        ] {
+            assert!(reported_error(&output, Some(&schema)).is_none(), "{schema}");
+        }
+        for schema in [
+            json!({"properties":{"nested":declaration}}),
+            json!({"$defs":{"unused":declaration}}),
+            json!({"items":declaration}),
+            json!({"not":declaration}),
+            json!({"dependentSchemas":{"absent":declaration}}),
+            json!({"anyOf":[{"allOf":[{"properties":{"kind":{"const":"other"}}},declaration]}, {"type":"object"}]}),
+            json!({"oneOf":[{"allOf":[{"properties":{"kind":{"const":"other"}}},declaration]}, {"type":"object"}]}),
+            json!({"if":{"properties":{"kind":{"const":"other"}}}, "then":declaration}),
+            json!({"if":{"properties":{"kind":{"const":"diagnostic"}}}, "else":declaration}),
+            json!({"$ref":"#"}),
+            json!({"anyOf":[{"$ref":"#"}, {"type":"object"}]}),
+            json!({"$defs":{"a":{"$ref":"#/$defs/b"},"b":{"$ref":"#/$defs/a"}},"$ref":"#/$defs/a"}),
+            json!({"$ref":"https://schemas.example.invalid/output"}),
+            json!({"$ref":"file:///tmp/output-schema.json"}),
+        ] {
+            assert!(reported_error(&output, Some(&schema)).is_some(), "{schema}");
+        }
+        // An unusable condition must not select an else branch by guessing.
+        let cyclic = json!({"if":{"$ref":"#/if"}, "else":declaration});
+        assert!(reported_error(&output, Some(&cyclic)).is_some());
+        let mut deep = declaration;
+        for _ in 0..65 {
+            deep = json!({"allOf":[deep]});
+        }
+        assert!(reported_error(&output, Some(&deep)).is_some());
+        let wide = json!({"allOf": vec![json!({}); 4096]});
+        assert!(reported_error(&output, Some(&wide)).is_some());
     }
 
     #[test]

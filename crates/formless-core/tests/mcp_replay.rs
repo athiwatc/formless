@@ -1,6 +1,9 @@
 //! Replay answers a wrapper's nested MCP calls from recorded responses
 //! and never starts a server (SPEC §8.4).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::{Config, Paths, Store};
 use formless_runtime::{new_overlay, Capabilities};
 use serde_json::json;
@@ -8,6 +11,7 @@ use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_serves_recorded_mcp_responses() {
+    let _env = credential_env::EnvGuard::isolated();
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-mcprep-{short}"));
     let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();

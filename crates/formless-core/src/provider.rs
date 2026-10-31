@@ -2791,6 +2791,7 @@ mod tests {
     /// ones, and Ollama gets the context Formless budgets for (#622).
     #[test]
     fn extra_body_merges_and_ollama_gets_num_ctx() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let mut cfg = ProviderCfg {
             base_url: "http://localhost:11434/v1".into(),
             context_tokens: 32000,
@@ -2825,6 +2826,7 @@ mod tests {
 
     #[test]
     fn usage_reads_reported_cost_and_cache_writes() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let u = Usage::parse(&json!({"prompt_tokens": 9213, "completion_tokens": 3,
             "cost": 0.0020006,
             "prompt_tokens_details": {"cached_tokens": 9203, "cache_write_tokens": 10}}))
@@ -2840,6 +2842,7 @@ mod tests {
 
     #[test]
     fn responses_input_keeps_the_preamble_before_tool_calls() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let items = responses_input(&[json!({"role": "assistant", "content": "Let me check.",
             "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]})]);
         assert_eq!(items.len(), 2);
@@ -2853,6 +2856,7 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_mark_the_system_prompt_and_last_stable_text() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let msgs = [
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "q"}),
@@ -2874,6 +2878,7 @@ mod tests {
 
     #[test]
     fn model_windows_come_from_the_listing() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let w = parse_model_windows(&json!({"data": [
             {"id": "a", "context_length": 1_000_000},
             {"id": "b", "max_model_len": 32768},
@@ -2888,6 +2893,7 @@ mod tests {
 
     #[test]
     fn history_keeps_the_preamble_on_tool_call_turns() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let m = formless_protocol::MessageInfo {
             role: "assistant".into(),
             content: "Let me check the file first.".into(),
@@ -2913,6 +2919,7 @@ mod tests {
 
     #[test]
     fn gpt_family_gets_the_tool_use_addendum() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         for m in [
             "gpt-4.1",
             "openai/gpt-5-mini",
@@ -2936,6 +2943,7 @@ mod tests {
 
     #[test]
     fn detects_access_refusals() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         for t in [
             "I can't access files on your computer.",
             "I don\u{2019}t have access to the internet, but here is what I know.",
@@ -2955,6 +2963,7 @@ mod tests {
 
     #[test]
     fn retry_hints_are_parsed_from_headers() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         use reqwest::header::{HeaderMap, HeaderValue};
         let mut h = HeaderMap::new();
         assert_eq!(retry_after(&h), None);
@@ -2981,6 +2990,7 @@ mod tests {
 
     #[test]
     fn backoff_has_jitter_a_cap_and_honours_the_server() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let cfg = ProviderCfg {
             max_backoff_secs: 4,
             ..Default::default()
@@ -3131,6 +3141,7 @@ mod tests {
 
     #[test]
     fn unknown_param_needs_the_reasoning_param_named() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         // Rejections of the parameter itself.
         assert!(is_unknown_param(
             r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#
