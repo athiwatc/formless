@@ -2148,7 +2148,13 @@ such as `read_file`, `read_text_file` and `file_read`.
   state and global pending prompts before clearing the reconnecting banner.
   Events arriving during that read are reconciled without replaying live
   stream resets. Failed recovery reads keep the banner and retry reads
-  only. It notes how long it was away. It clears the old daemon's
+  only. If the previous Session was deleted, its text/files stay in that
+  Session's draft and never move into a replacement Session. A newer
+  RunPaused event retains its explanation and Resume banner over a stale
+  snapshot. An interrupted pre-send attachment upload restores the original
+  Session's text/files for review without automatically sending them; a
+  newer draft remains untouched until its input is empty. It notes how long
+  it was away. It clears the old daemon's
   approvals mode on disconnect and requests `Status` on every new
   connection, so Settings reports the attached daemon's mode. Until the
   reply arrives the mode is shown as unknown. The web already reconnects

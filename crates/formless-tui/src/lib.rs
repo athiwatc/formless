@@ -425,6 +425,9 @@ struct PendingSend {
     content: String,
     mode: SendMode,
     waiting: usize,
+    /// Keep bytes until SendMessage is actually issued, so an interrupted
+    /// attachment stage can restore the user's original draft.
+    attachments: Vec<(String, Vec<u8>)>,
 }
 
 /// An open `ask_user` call (SPEC §5.5); `answers` fills as the user
@@ -1360,6 +1363,7 @@ struct App {
     mention: Option<MentionPopup>,
     /// A message waiting for its `@` attachments before it is sent.
     pending_send: Option<PendingSend>,
+    interrupted_attachment_sends: std::collections::VecDeque<PendingSend>,
     sends: client::SendTracker,
     restored_send: Option<(String, String)>,
     /// Files and pasted images for the next message, shown as chips in
@@ -1689,6 +1693,7 @@ impl App {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            interrupted_attachment_sends: Default::default(),
             sends: Default::default(),
             restored_send: None,
             attachments: Vec::new(),
@@ -1881,6 +1886,11 @@ impl App {
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
         self.restore_unsent_draft();
+        if let Some(send) = self.pending_send.take() {
+            self.interrupted_attachment_sends.push_back(send);
+            self.notes.push("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.".into());
+        }
+        self.restore_attachment_drafts();
         self.sends.disconnected();
         self.clear_attention();
         self.client = None;
@@ -2010,13 +2020,7 @@ impl App {
         self.reconnect_read_failed(id);
         if self.current.as_deref() == Some(session_id.as_str()) {
             // Do not move an old Session's retained input into another Session.
-            let draft = Draft {
-                input: std::mem::take(&mut self.input),
-                attachments: std::mem::take(&mut self.attachments),
-            };
-            if !draft.input.is_empty() || !draft.attachments.is_empty() {
-                self.drafts.insert(session_id, draft);
-            }
+            self.stash_current_draft(&session_id);
             self.current = None;
             self.messages.clear();
             self.notes.push("The previous Session is no longer available; its draft is kept. Choose a Session or use /new once reconnected.".into());
@@ -2072,6 +2076,12 @@ impl App {
             return;
         };
         let events = std::mem::take(&mut self.reconnect_events);
+        let mut run_banner = result["unfinished_run"].as_object().map(|run| {
+            (
+                run["status"].as_str().unwrap_or_default().to_string(),
+                run["error"].as_str().unwrap_or_default().to_string(),
+            )
+        });
         let mut attention = Vec::<Event>::new();
         for event in pending.into_iter().chain(events.iter().cloned()) {
             if matches!(event, Event::ApprovalSummary { .. }) {
@@ -2090,13 +2100,36 @@ impl App {
             match event {
                 Event::RunStarted {
                     session_id: sid, ..
-                } if sid == &session_id => running = true,
-                Event::RunFinished {
-                    session_id: sid, ..
+                } if sid == &session_id => {
+                    running = true;
+                    run_banner = None;
                 }
-                | Event::RunPaused {
-                    session_id: sid, ..
-                } if sid == &session_id => running = false,
+                Event::RunFinished {
+                    session_id: sid,
+                    status,
+                    ..
+                } if sid == &session_id => {
+                    running = false;
+                    if status == "completed" {
+                        run_banner = None;
+                    } else if run_banner.is_none() {
+                        run_banner = Some((status.clone(), String::new()));
+                    }
+                }
+                Event::RunPaused {
+                    session_id: sid,
+                    error,
+                    explained,
+                    ..
+                } if sid == &session_id => {
+                    running = false;
+                    run_banner = Some((
+                        "paused".into(),
+                        explained
+                            .as_ref()
+                            .map_or_else(|| error.clone(), |why| why.message.clone()),
+                    ));
+                }
                 Event::QueueChanged {
                     session_id: sid,
                     queued: latest,
@@ -2135,16 +2168,7 @@ impl App {
             self.running_sessions.remove(&session_id);
             self.activity = None;
         }
-        self.run_banner = if running {
-            None
-        } else {
-            result["unfinished_run"].as_object().map(|run| {
-                (
-                    run["status"].as_str().unwrap_or_default().to_string(),
-                    run["error"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-        };
+        self.run_banner = if running { None } else { run_banner };
         self.clear_attention();
         self.finish_reconnect();
         if running && self.activity.is_none() {
@@ -2246,6 +2270,49 @@ impl App {
         }
     }
 
+    fn stash_current_draft(&mut self, session_id: &str) {
+        if !self.is_current(session_id) {
+            return;
+        }
+        let draft = Draft {
+            input: std::mem::take(&mut self.input),
+            attachments: std::mem::take(&mut self.attachments),
+        };
+        if !draft.input.is_empty() || !draft.attachments.is_empty() {
+            self.drafts.insert(session_id.to_string(), draft);
+        }
+    }
+
+    /// Recovery only fills empty inputs. If newer text occupies a Session's
+    /// composer, retain the interrupted action separately until it is empty.
+    fn restore_attachment_drafts(&mut self) {
+        let mut index = 0;
+        while index < self.interrupted_attachment_sends.len() {
+            let send = &self.interrupted_attachment_sends[index];
+            let current = self.is_current(&send.session_id);
+            let empty = if current {
+                self.input.is_empty()
+            } else {
+                self.drafts
+                    .get(&send.session_id)
+                    .is_none_or(|draft| draft.input.is_empty())
+            };
+            if !empty {
+                index += 1;
+                continue;
+            }
+            let send = self.interrupted_attachment_sends.remove(index).unwrap();
+            if current {
+                self.input.set(&send.content);
+                self.attachments.splice(0..0, send.attachments);
+            } else {
+                let draft = self.drafts.entry(send.session_id).or_default();
+                draft.input.set(&send.content);
+                draft.attachments.splice(0..0, send.attachments);
+            }
+        }
+    }
+
     fn fire(&mut self, req: Request) {
         if self.offline.is_some() {
             self.notes
@@ -2259,6 +2326,7 @@ impl App {
 
     fn drain_daemon(&mut self) {
         self.expire_pending();
+        self.restore_attachment_drafts();
         let Some(inbox) = self.inbox.take() else {
             return;
         };
@@ -2354,7 +2422,7 @@ impl App {
                                 if self.current.is_none() {
                                     if self.offline.is_some() {
                                         if let Some(first) = self.start_session() {
-                                            self.current = Some(first.id);
+                                            self.switch_session(first.id);
                                             self.begin_reconnect_snapshot();
                                         } else {
                                             self.finish_reconnect();
@@ -4777,12 +4845,20 @@ impl App {
                 self.sessions.retain(|s| s.id != id);
                 self.running_sessions.remove(&id);
                 if self.is_current(&id) {
+                    self.stash_current_draft(&id);
                     self.current = None;
                     self.messages.clear();
                     self.streaming.clear();
                     self.thinking.clear();
                     self.live_tools.clear();
                     self.activity = None;
+                    self.notes
+                        .push("Session deleted; its draft is kept with that Session.".into());
+                    if self.offline.is_some() {
+                        if let Some((request, _)) = self.reconnect_request.clone() {
+                            self.reconnect_session_missing(request);
+                        }
+                    }
                 }
             }
         }
@@ -4944,6 +5020,7 @@ impl App {
             content: text,
             mode,
             waiting: found.len() + held.len(),
+            attachments: held,
         });
     }
 
@@ -15370,6 +15447,7 @@ mod tests {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            interrupted_attachment_sends: Default::default(),
             sends: Default::default(),
             restored_send: None,
             attachments: Vec::new(),
@@ -15972,6 +16050,242 @@ mod tests {
             sent.try_recv().is_err(),
             "no old command or Session is recreated automatically"
         );
+    }
+
+    #[test]
+    fn deletion_during_reconnect_stashes_the_old_draft_before_replacement_selection() {
+        for replacement_has_draft in [false, true] {
+            let mut app = test_app();
+            app.input.set("private text from Session one");
+            let old_files = vec![("private.bin".into(), vec![1, 2, 3])];
+            app.attachments = old_files.clone();
+            if replacement_has_draft {
+                app.drafts.insert(
+                    "s2".into(),
+                    Draft {
+                        input: "Session two's draft".into(),
+                        attachments: vec![("two.bin".into(), vec![9])],
+                    },
+                );
+            }
+            app.daemon_lost();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let initial: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            let old_list = initial
+                .iter()
+                .find(|request| matches!(request.request, Request::ListSessions))
+                .unwrap()
+                .id;
+            let (old_snapshot, _) = app.reconnect_request.clone().unwrap();
+            tx.send(ServerMessage::Event(Event::SessionDeleted {
+                id: "s1".into(),
+            }))
+            .unwrap();
+            // Both already queued replies are now stale, including a list
+            // taken before deletion that still contains the old Session.
+            tx.send(ServerMessage::Response {
+                id: old_snapshot,
+                ok: true,
+                result: Some(reconnect_snapshot(false, vec![])),
+                error: None,
+            })
+            .unwrap();
+            tx.send(ServerMessage::Response {
+                id: old_list,
+                ok: true,
+                result: Some(serde_json::json!([{
+                    "id":"s1", "name":"stale", "created_at":"", "updated_at":""
+                }])),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.current.is_none() && app.offline.is_some());
+            assert!(app.input.is_empty() && app.attachments.is_empty());
+            assert_eq!(
+                app.drafts["s1"].input.expanded(),
+                "private text from Session one"
+            );
+            assert_eq!(app.drafts["s1"].attachments, old_files);
+            let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(fresh.request, Request::ListSessions));
+            tx.send(ServerMessage::Response {
+                id: fresh.id,
+                ok: true,
+                result: Some(serde_json::json!([{
+                    "id":"s2", "name":"replacement", "created_at":"", "updated_at":""
+                }])),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(app.current.as_deref(), Some("s2"));
+            let (snapshot, session) = app.reconnect_request.clone().unwrap();
+            assert_eq!(session, "s2");
+            tx.send(ServerMessage::Response {
+                id: snapshot,
+                ok: true,
+                result: Some(reconnect_snapshot(false, vec![])),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.offline.is_none());
+            assert_eq!(
+                app.input.expanded(),
+                if replacement_has_draft {
+                    "Session two's draft"
+                } else {
+                    ""
+                }
+            );
+            assert_eq!(
+                app.attachments,
+                if replacement_has_draft {
+                    vec![("two.bin".into(), vec![9])]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(app.drafts["s1"].attachments, old_files);
+            assert!(sent
+                .try_iter()
+                .map(|line| serde_json::from_str::<RequestEnvelope>(&line).unwrap())
+                .all(|request| !matches!(request.request, Request::SendMessage { .. })));
+        }
+    }
+
+    #[test]
+    fn a_pause_during_reconnect_preserves_its_resume_banner_and_explanation() {
+        for explained in [
+            None,
+            Some(ErrorExplained {
+                category: "server".into(),
+                message: "A readable pause explanation".into(),
+                action: Some("Try again".into()),
+                details: "raw provider failure".into(),
+            }),
+        ] {
+            let mut app = test_app();
+            app.daemon_lost();
+            let (client, _sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let (id, _) = app.reconnect_request.clone().unwrap();
+            let expected = explained
+                .as_ref()
+                .map_or("raw provider failure", |why| why.message.as_str())
+                .to_string();
+            tx.send(ServerMessage::Event(Event::RunPaused {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                error: "raw provider failure".into(),
+                explained,
+            }))
+            .unwrap();
+            tx.send(ServerMessage::Event(Event::RunFinished {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                status: "paused".into(),
+            }))
+            .unwrap();
+            // The read began while the Run was active, before its pause.
+            tx.send(ServerMessage::Response {
+                id,
+                ok: true,
+                result: Some(reconnect_snapshot(true, vec![])),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.offline.is_none() && !app.running());
+            assert_eq!(app.run_banner, Some(("paused".into(), expected.clone())));
+            assert_eq!(app.last_error.as_deref(), Some("raw provider failure"));
+            let screen = render(&mut app, 120, 30);
+            assert!(
+                screen.contains("/resume") && screen.contains(&expected),
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_interrupted_attachment_stage_restores_files_and_text_without_sending() {
+        for (switch_session, newer_input) in [(false, false), (true, true), (false, true)] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            let original_files = vec![
+                ("one.bin".into(), vec![1, 2]),
+                ("two.bin".into(), vec![3, 4]),
+            ];
+            app.attachments = original_files.clone();
+            app.input.set("send these files");
+            app.submit_chat(false);
+            let requests: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert_eq!(requests.len(), 2);
+            assert!(requests
+                .iter()
+                .all(|request| matches!(request.request, Request::AttachFile { .. })));
+            assert!(app.input.is_empty() && app.attachments.is_empty());
+            assert!(
+                app.sends.unsent("s1").is_none(),
+                "SendMessage has not yet been issued"
+            );
+            if switch_session {
+                app.switch_session("s2".into());
+            }
+            if newer_input {
+                app.input.set("a newer draft");
+                app.attachments = vec![("new.bin".into(), vec![9])];
+            }
+            // Only one attachment was acknowledged before the socket ended.
+            tx.send(ServerMessage::Response {
+                id: requests[0].id,
+                ok: true,
+                result: Some(serde_json::json!({"attached":true})),
+                error: None,
+            })
+            .unwrap();
+            drop(tx);
+            app.drain_daemon();
+            assert!(app.offline.is_some() && app.pending_send.is_none());
+            if switch_session {
+                assert_eq!(app.input.expanded(), "a newer draft");
+                assert_eq!(app.attachments, vec![("new.bin".into(), vec![9])]);
+                assert_eq!(app.drafts["s1"].input.expanded(), "send these files");
+                assert_eq!(app.drafts["s1"].attachments, original_files);
+            } else if newer_input {
+                assert_eq!(app.input.expanded(), "a newer draft");
+                assert_eq!(app.interrupted_attachment_sends.len(), 1);
+                app.input.clear();
+                app.drain_daemon(); // Restore for review, not as a send action.
+                assert_eq!(app.input.expanded(), "send these files");
+                assert!(app.attachments.starts_with(&original_files));
+                assert_eq!(
+                    app.attachments.last().unwrap(),
+                    &("new.bin".into(), vec![9])
+                );
+                assert!(app.interrupted_attachment_sends.is_empty());
+            } else {
+                assert_eq!(app.input.expanded(), "send these files");
+                assert_eq!(app.attachments, original_files);
+            }
+            assert!(sent
+                .try_iter()
+                .map(|line| serde_json::from_str::<RequestEnvelope>(&line).unwrap())
+                .all(|request| !matches!(request.request, Request::SendMessage { .. })));
+        }
     }
 
     #[test]
@@ -20355,6 +20669,7 @@ mod tests {
             content: "explain @a @b".into(),
             mode: SendMode::Send,
             waiting: 2,
+            attachments: Vec::new(),
         });
         app.mention_attached();
         assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
