@@ -1990,6 +1990,30 @@ pub fn delete_provider_key(paths: &Paths, name: &str) {
 /// Full reset (SPEC §15): keychain entry, config, and the entire data dir.
 /// Caller must stop the daemon first.
 pub fn reset_all(paths: &Paths) -> Result<Vec<String>> {
+    let gate = crate::profile_lock::ProfileLock::maintenance(paths, std::time::Duration::ZERO)?;
+    let guard = gate.freeze()?;
+    reset_all_guarded(paths, &guard)
+}
+
+/// Recursive removal requires a frozen namespace covering every affected path.
+pub fn reset_all_guarded(
+    paths: &Paths,
+    guard: &crate::profile_lock::MaintenanceGuard,
+) -> Result<Vec<String>> {
+    if !guard.covers(paths)? {
+        anyhow::bail!("profile is outside the frozen cleanup namespace");
+    }
+    if paths.profile == "default" {
+        let named: Vec<_> = paths
+            .list_profiles()
+            .into_iter()
+            .filter(|p| p.profile != "default")
+            .map(|p| p.profile)
+            .collect();
+        if !named.is_empty() {
+            anyhow::bail!("named profiles are preserved; remove them with `formless profiles rm NAME` or use `formless uninstall` first: {}", named.join(", "));
+        }
+    }
     let warnings = delete_secrets(paths);
     for dir in [&paths.data_dir, &paths.config_dir] {
         if dir.exists() {

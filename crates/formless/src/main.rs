@@ -1177,19 +1177,12 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
                     &name,
                 )?;
             }
-            if daemon_reachable(&target) {
-                let _ = formless_tui::client::request_once(&target, Request::Shutdown);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while daemon_reachable(&target) || target.lock_file().exists() {
-                    if std::time::Instant::now() > deadline {
-                        anyhow::bail!(
-                            "profile '{name}''s daemon did not stop; nothing was deleted"
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-            formless_core::config::reset_all(&target)?;
+            profile_maintenance(
+                &target,
+                || Ok(()),
+                || stop_daemon(&target),
+                |guard| formless_core::config::reset_all_guarded(&target, guard),
+            )?;
             println!("removed profile '{name}'");
             Ok(())
         }
@@ -1327,7 +1320,32 @@ fn run_cli(cli: Cli) -> Result<()> {
         // A daemon started from here inherits it (see `Config::apply_env`).
         std::env::set_var("FORMLESS_SECURE", "1");
     }
-    let paths = Paths::resolve(cli.profile.as_deref())?;
+    // Keep every ordinary command's family leased through its final write.
+    // Destructive commands resolve read-only and obtain an explicit freeze;
+    // `serve` already retains the same shared lease through its owner guard.
+    let destructive = matches!(
+        cli.cmd,
+        Some(
+            Cmd::Reset { .. }
+                | Cmd::Uninstall { .. }
+                | Cmd::Profiles {
+                    action: ProfilesAction::Rm { .. }
+                }
+        )
+    );
+    let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+    let _operation = if destructive || serving {
+        None
+    } else {
+        Some(formless_core::profile_lock::ProfileLock::hierarchy_shared(
+            &paths,
+        )?)
+    };
+    let paths = if destructive {
+        paths
+    } else {
+        Paths::resolve(cli.profile.as_deref())?
+    };
     match cli.cmd {
         None | Some(Cmd::Tui) if cli.plain => formless_tui::plain::run(paths),
         None | Some(Cmd::Tui) => formless_tui::run_with(
@@ -1503,6 +1521,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             if daemon_reachable(&paths) {
                 anyhow::bail!("stop the daemon first: formless daemon stop");
             }
+            eprintln!("restore: close TUIs and pause any login service that may restart the daemon; exclusive profile ownership is required");
             let saved = formless_core::housekeeping::restore(&paths, &file)?;
             println!("restored:  {}", file.display());
             println!("previous:  saved as {}", saved.display());
@@ -1982,7 +2001,19 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
                 println!("{}", formless_core::service::dry_run(&plan));
                 return Ok(());
             }
-            formless_core::service::install(&plan)?;
+            formless_core::service::handover(
+                &paths,
+                std::time::Duration::from_secs(60),
+                || {
+                    formless_tui::client::request_once_within(
+                        &paths,
+                        Request::Shutdown,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .map(|_| ())
+                },
+                || formless_core::service::install(&plan),
+            )?;
             println!("installed: {} ({})", plan.file.display(), plan.manager);
             println!("the daemon now starts at login and stays up, so jobs run on schedule");
             println!("remove it: formless daemon uninstall-service");
@@ -2258,20 +2289,8 @@ struct Problem {
 enum Fix {
     /// Leftovers of a daemon that is gone.
     RemoveStale(Vec<std::path::PathBuf>),
-    /// A daemon process that no longer answers: stop it, start a new one.
-    RestartStuck(u32),
     /// Secret files others can read.
     Chmod600(Vec<std::path::PathBuf>),
-}
-
-/// Whether `pid` is a live formless process (unix: `ps`).
-#[cfg(unix)]
-fn formless_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("formless"))
-        .unwrap_or(false)
 }
 
 /// The daemon and file checks `--fix` can act on.
@@ -2317,18 +2336,18 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     if !daemon_reachable(paths) {
         let sock = paths.socket_path();
         let lock = paths.lock_file();
-        let pid = std::fs::read_to_string(&lock)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        match pid {
-            Some(pid) if formless_pid_alive(pid) => out.push(Problem {
-                what: format!("the daemon (pid {pid}) is running but doesn't answer on its socket"),
-                next: Some(format!(
-                    "kill {pid}; then any formless command starts a new one"
-                )),
-                fix: Some(Fix::RestartStuck(pid)),
+        match formless_core::profile_lock::owner_held(paths) {
+            Ok(true) => out.push(Problem {
+                what: "the profile has a kernel owner but its daemon does not answer".into(),
+                next: Some("stop the daemon through its service manager or original binary; PID markers do not authenticate processes".into()),
+                fix: None,
             }),
-            _ => {
+            Err(e) => out.push(Problem {
+                what: format!("profile ownership is unknown: {e:#}"),
+                next: None,
+                fix: None,
+            }),
+            Ok(false) => {
                 let stale: Vec<std::path::PathBuf> =
                     [sock, lock].into_iter().filter(|p| p.exists()).collect();
                 if !stale.is_empty() {
@@ -2407,31 +2426,15 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
 fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
     match fix {
         Fix::RemoveStale(files) => {
+            let _owner = formless_core::profile_lock::ProfileLock::owner(paths)
+                .map_err(|e| format!("{e:#}"))?;
+            if formless_core::daemon::endpoint_occupied(paths).map_err(|e| format!("{e:#}"))? {
+                return Err("daemon became reachable; stale files were kept".into());
+            }
             for f in files {
                 std::fs::remove_file(f).map_err(|e| format!("{}: {e}", f.display()))?;
             }
             Ok("removed the stale files".into())
-        }
-        Fix::RestartStuck(pid) => {
-            let killed = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .map_err(|e| e.to_string())?;
-            if !killed.success() {
-                return Err(format!("could not stop pid {pid}"));
-            }
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                #[cfg(unix)]
-                if !formless_pid_alive(*pid) {
-                    break;
-                }
-            }
-            let _ = std::fs::remove_file(paths.lock_file());
-            #[cfg(unix)]
-            let _ = std::fs::remove_file(paths.socket_path());
-            formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
-            Ok(format!("stopped pid {pid} and started a new daemon"))
         }
         Fix::Chmod600(files) => {
             #[cfg(unix)]
@@ -2659,6 +2662,13 @@ fn storage_cmd(paths: &Paths, json: bool) -> Result<()> {
         ]);
     }
     tbl.print();
+    for copy in formless_core::housekeeping::list_restore_backups(paths) {
+        println!(
+            "recovery:  {} (before-restore; keeps {})",
+            copy.display(),
+            formless_core::housekeeping::RESTORE_BACKUPS_KEEP
+        );
+    }
     println!(
         "total:     {} in {}",
         human_bytes(u["total_bytes"].as_u64().unwrap_or(0)),
@@ -2765,15 +2775,36 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         Some(p) => say!("proxy:      {p} (provider.proxy or HTTPS_PROXY; NO_PROXY is honoured)"),
         None => say!("proxy:      none"),
     }
-    match formless_core::service::installed(&paths) {
-        Some((manager, file)) => say!(
-            "service:    starts at login ({manager}: {})",
-            file.display()
-        ),
-        None => {
-            say!("service:    not installed (formless daemon install-service starts it at login)")
+    match formless_core::service::status(&paths) {
+        Ok(service) => {
+            let registration = match service.registration {
+                formless_core::service::Registration::Registered => "registered".to_string(),
+                formless_core::service::Registration::NotRegistered => "not registered".to_string(),
+                formless_core::service::Registration::Unknown(why) => {
+                    format!("registration unknown ({why})")
+                }
+            };
+            say!(
+                "service:    {}; definition {} ({}: {})",
+                registration,
+                if service.file_present {
+                    "present"
+                } else {
+                    "missing"
+                },
+                service.manager,
+                service.file.display()
+            );
         }
+        Err(e) => say!("service:    status unknown ({e:#})"),
     }
+    let recovery = formless_core::housekeeping::list_restore_backups(&paths);
+    say!(
+        "recovery:   {} before-restore copies (keeps {}); {}",
+        recovery.len(),
+        formless_core::housekeeping::RESTORE_BACKUPS_KEEP,
+        formless_core::housekeeping::backup_dir(&paths).display()
+    );
     match formless_core::housekeeping::last_backup(&paths) {
         Some((file, at)) => {
             let age = at.elapsed().unwrap_or_default().as_secs();
@@ -6191,58 +6222,72 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
     }
     // What could not be removed; any of it makes the exit non-zero.
     let mut failed: Vec<String> = Vec::new();
-    for p in &profiles {
-        // The login service goes first: a service manager must not start
-        // the daemon again while its files are being deleted (#1079).
-        if let Ok(plan) = formless_core::service::plan_here(p) {
-            if plan.file.exists() || plan.manager == "Task Scheduler" {
-                match formless_core::service::uninstall(&plan) {
-                    Ok(()) => println!("removed the login service ({})", plan.manager),
-                    Err(e) if !plan.file.exists() && e.to_string().starts_with("not installed") => {
+    let base = paths.named("default");
+    let changed = profile_maintenance(
+        &base,
+        || {
+            // Stop/disable every known profile before the first deletion. A
+            // single failed preparation preserves all profile files and binary.
+            let mut errors = Vec::new();
+            for p in &profiles {
+                let prepared = (|| -> Result<()> {
+                    let plan = formless_core::service::plan_here(p)?;
+                    if let Err(error) = formless_core::service::disable(&plan) {
+                        let status = formless_core::service::status(p)?;
+                        if status.file_present
+                            || status.registration
+                                != formless_core::service::Registration::NotRegistered
+                        {
+                            return Err(error);
+                        }
                     }
-                    Err(e) => {
-                        failed.push(format!(
-                            "profile {}: the login service ({e:#}); nothing of this profile was deleted",
-                            p.profile
-                        ));
-                        continue;
-                    }
+                    stop_daemon(p)
+                })();
+                match prepared {
+                    Ok(()) => println!(
+                        "stopped profile {} and disabled its login service",
+                        p.profile
+                    ),
+                    Err(error) => errors.push(format!("{}: {error:#}", p.profile)),
                 }
             }
-        }
-        if !stop_daemon(p) {
-            failed.push(format!(
-                "profile {}: its daemon is still running (stop it with `formless daemon stop`); nothing of it was deleted",
-                p.profile
-            ));
-            continue;
-        }
-        let warnings = if keep_data {
-            let w = formless_core::config::delete_secrets(p);
-            println!(
-                "profile {}: deleted the API key, provider keys, OAuth and MCP logins and the relay secret; kept {} and {} (its config may still name providers whose keys are gone)",
-                p.profile,
-                p.data_dir.display(),
-                p.config_dir.display()
-            );
-            w
-        } else {
-            match formless_core::config::reset_all(p) {
-                Ok(w) => {
+            if !errors.is_empty() {
+                anyhow::bail!(
+                    "profile preparation failed; all profile files are preserved: {}",
+                    errors.join("; ")
+                );
+            }
+            Ok(())
+        },
+        || Ok(()),
+        |guard| {
+            erase_profiles(&base, &profiles, guard, |p, guard| {
+                let plan = formless_core::service::plan_here(p)?;
+                formless_core::service::remove_definition(&plan)?;
+                if keep_data {
+                    let warnings = formless_core::config::delete_secrets(p);
+                    println!(
+                        "profile {}: deleted credentials; kept {} and {}",
+                        p.profile,
+                        p.data_dir.display(),
+                        p.config_dir.display()
+                    );
+                    Ok(warnings)
+                } else {
+                    let warnings = formless_core::config::reset_all_guarded(p, guard)?;
                     println!("removed profile {}", p.profile);
-                    w
+                    Ok(warnings)
                 }
-                Err(e) => {
-                    failed.push(format!("profile {}: {e:#}", p.profile));
-                    continue;
-                }
-            }
-        };
-        for w in warnings {
-            failed.push(format!("profile {}: {w}", p.profile));
-        }
+            })
+        },
+    );
+    match changed {
+        Ok(warnings) => failed.extend(warnings),
+        Err(error) => failed.push(format!(
+            "{error:#}; profile cleanup did not complete; its binary is kept"
+        )),
     }
-    if let (Some(e), None, false) = (&exe, managed, keep_binary) {
+    if let (true, Some(e), None, false) = (failed.is_empty(), &exe, managed, keep_binary) {
         // install.sh puts completions and the man page under the
         // binary's prefix.
         let extras: Vec<std::path::PathBuf> = e
@@ -6299,20 +6344,87 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
     Ok(())
 }
 
-/// Ask a profile's daemon to stop and wait up to 10 s; true once its
-/// socket no longer answers.
-fn stop_daemon(paths: &Paths) -> bool {
-    if !daemon_reachable(paths) {
-        return true;
+/// Recheck under the exclusive family freeze: new profiles cannot appear
+/// after this point. Never recursively erase a parent after any child failed.
+fn erase_profiles(
+    base: &Paths,
+    expected: &[Paths],
+    guard: &formless_core::profile_lock::MaintenanceGuard,
+    mut erase: impl FnMut(&Paths, &formless_core::profile_lock::MaintenanceGuard) -> Result<Vec<String>>,
+) -> Result<Vec<String>> {
+    let names = |profiles: &[Paths]| {
+        profiles
+            .iter()
+            .map(|p| p.profile.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    if names(&base.list_profiles()) != names(expected) {
+        anyhow::bail!(
+            "profile inventory changed during preparation; nothing was deleted; retry uninstall"
+        );
     }
-    let _ = formless_tui::client::request_once(paths, Request::Shutdown);
-    for _ in 0..100 {
-        if !daemon_reachable(paths) {
-            return true;
+    let mut warnings = Vec::new();
+    // list_profiles is default first. Every named child must finish first;
+    // any error returns before the recursive default cleanup is reachable.
+    for p in expected.iter().rev() {
+        if !guard.covers(p)? {
+            anyhow::bail!(
+                "profile {} moved outside the frozen cleanup namespace",
+                p.profile
+            );
+        }
+        for warning in erase(p, guard)? {
+            warnings.push(format!("profile {}: {warning}", p.profile));
+        }
+    }
+    Ok(warnings)
+}
+
+/// Hold automatic launchers out from preparation through all destructive
+/// changes. Daemon constructors independently honor the owner lock, including
+/// service-manager restarts that do not pass through automatic launchers.
+fn profile_maintenance<T>(
+    paths: &Paths,
+    prepare: impl FnOnce() -> Result<()>,
+    stop: impl FnOnce() -> Result<()>,
+    change: impl FnOnce(&formless_core::profile_lock::MaintenanceGuard) -> Result<T>,
+) -> Result<T> {
+    let gate = formless_core::profile_lock::ProfileLock::maintenance(
+        paths,
+        std::time::Duration::from_secs(30),
+    )?;
+    prepare()?;
+    stop()?;
+    let guard = gate.freeze()?;
+    if formless_core::daemon::endpoint_occupied(paths)? {
+        anyhow::bail!("profile daemon became reachable; destructive changes were refused");
+    }
+    change(&guard)
+}
+
+/// Ask a profile's daemon to stop, waiting for both transport and kernel
+/// ownership to disappear. Unknown ownership is never an idle profile.
+fn stop_daemon(paths: &Paths) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut requested = false;
+    loop {
+        let occupied = formless_core::daemon::endpoint_occupied(paths)?;
+        if !occupied && !formless_core::profile_lock::owner_held(paths)? {
+            return Ok(());
+        }
+        if occupied && !requested {
+            formless_tui::client::request_once_within(
+                paths,
+                Request::Shutdown,
+                std::time::Duration::from_secs(5),
+            )?;
+            requested = true;
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("profile daemon did not release ownership; stop it through its service manager or original binary and retry");
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    false
 }
 
 /// The one confirmation for destructive commands (SPEC §12, #898): on a
@@ -6345,13 +6457,14 @@ fn reset_cmd(paths: Paths, force: bool) -> Result<()> {
             "reset",
         )?;
     }
-    if !stop_daemon(&paths) {
-        return Err(anyhow::anyhow!(
-            "the daemon is still running; stop it with `formless daemon stop`, then reset again"
-        ));
-    }
-    for w in formless_core::config::reset_all(&paths)? {
-        eprintln!("warning: {w}");
+    let warnings = profile_maintenance(
+        &paths,
+        || Ok(()),
+        || stop_daemon(&paths),
+        |guard| formless_core::config::reset_all_guarded(&paths, guard),
+    )?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
     }
     println!("reset complete");
     Ok(())
@@ -6381,6 +6494,230 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 
 #[cfg(test)]
 mod tests {
+    struct MaintenanceFixture(std::path::PathBuf);
+    impl MaintenanceFixture {
+        fn new() -> (Self, super::Paths) {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let base = std::env::temp_dir().join(format!(
+                "fl-maintenance-{}-{stamp}-{next}",
+                std::process::id()
+            ));
+            let paths = super::Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+            (Self(base), paths)
+        }
+    }
+    impl Drop for MaintenanceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn manager_fixture(paths: &super::Paths, operation: &str) -> super::Result<()> {
+        let out = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::maintenance_manager_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FORMLESS_TEST_MAINTENANCE_DATA", &paths.data_dir)
+            .env("FORMLESS_TEST_MAINTENANCE_CONFIG", &paths.config_dir)
+            .env("FORMLESS_TEST_MAINTENANCE_OPERATION", operation)
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("private manager fixture rejected {operation}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_inventory_change_preserves_default_and_new_child_before_any_erase() {
+        let (_fixture, base) = MaintenanceFixture::new();
+        std::fs::write(base.db_file(), "default sentinel").unwrap();
+        let initial = base.list_profiles();
+        let named = base.named("new-child");
+        let erased = std::cell::Cell::new(false);
+        let result = super::profile_maintenance(
+            &base,
+            || {
+                super::Paths::from_dirs(named.data_dir.clone(), named.config_dir.clone())?;
+                std::fs::write(named.config_file(), "new child sentinel")?;
+                Ok(())
+            },
+            || Ok(()),
+            |guard| {
+                super::erase_profiles(&base, &initial, guard, |_, _| {
+                    erased.set(true);
+                    Ok(Vec::new())
+                })
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("inventory changed"));
+        assert!(!erased.get());
+        assert_eq!(
+            std::fs::read_to_string(base.db_file()).unwrap(),
+            "default sentinel"
+        );
+        assert_eq!(
+            std::fs::read_to_string(named.config_file()).unwrap(),
+            "new child sentinel"
+        );
+    }
+
+    #[test]
+    fn uninstall_never_erases_parent_after_child_failure_and_preparation_failure_erases_nothing() {
+        let (_fixture, base) = MaintenanceFixture::new();
+        let named = base.named("child");
+        super::Paths::from_dirs(named.data_dir.clone(), named.config_dir.clone()).unwrap();
+        std::fs::write(base.db_file(), "default sentinel").unwrap();
+        std::fs::write(named.db_file(), "child sentinel").unwrap();
+        let initial = base.list_profiles();
+        let erased = std::cell::RefCell::new(Vec::new());
+        let result = super::profile_maintenance(
+            &base,
+            || Ok(()),
+            || Ok(()),
+            |guard| {
+                super::erase_profiles(&base, &initial, guard, |p, _| {
+                    erased.borrow_mut().push(p.profile.clone());
+                    anyhow::bail!("injected child erase failure")
+                })
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(*erased.borrow(), ["child"]);
+        assert_eq!(
+            std::fs::read_to_string(base.db_file()).unwrap(),
+            "default sentinel"
+        );
+        erased.borrow_mut().clear();
+        let result = super::profile_maintenance(
+            &base,
+            || manager_fixture(&base, "reject"),
+            || Ok(()),
+            |_| {
+                erased.borrow_mut().push("unexpected".into());
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(erased.borrow().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(named.db_file()).unwrap(),
+            "child sentinel"
+        );
+    }
+
+    #[test]
+    fn destructive_maintenance_holds_cross_process_locks_and_orders_disable_stop_erase() {
+        let (_fixture, paths) = MaintenanceFixture::new();
+        super::profile_maintenance(
+            &paths,
+            || manager_fixture(&paths, "disable"),
+            || manager_fixture(&paths, "stop"),
+            |_| manager_fixture(&paths, "erase"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(paths.config_dir.join("operations")).unwrap(),
+            "disable\nstop\nerase\n"
+        );
+        assert!(!formless_core::profile_lock::owner_held(&paths).unwrap());
+        assert!(formless_core::profile_lock::ProfileLock::launcher(
+            &paths,
+            std::time::Duration::ZERO
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn destructive_maintenance_preserves_data_when_service_or_owner_cannot_release() {
+        let (_fixture, paths) = MaintenanceFixture::new();
+        let sentinel = paths.db_file();
+        std::fs::write(&sentinel, "untouched data").unwrap();
+        let owner = formless_core::profile_lock::ProfileLock::owner(&paths).unwrap();
+        let result = super::profile_maintenance(
+            &paths,
+            || manager_fixture(&paths, "disable"),
+            || manager_fixture(&paths, "stop"),
+            |_| manager_fixture(&paths, "erase"),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "untouched data"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.config_dir.join("operations")).unwrap(),
+            "disable\nstop\n"
+        );
+        drop(owner);
+        std::fs::remove_file(paths.config_dir.join("operations")).unwrap();
+        let result = super::profile_maintenance(
+            &paths,
+            || manager_fixture(&paths, "reject"),
+            || manager_fixture(&paths, "stop"),
+            |_| manager_fixture(&paths, "erase"),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "untouched data"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.config_dir.join("operations")).unwrap(),
+            "reject\n"
+        );
+        assert!(formless_core::profile_lock::ProfileLock::owner(&paths).is_ok());
+    }
+
+    #[test]
+    #[ignore = "private subprocess manager fixture invoked by maintenance tests"]
+    fn maintenance_manager_fixture() {
+        use std::io::Write;
+        let paths = super::Paths {
+            data_dir: std::env::var_os("FORMLESS_TEST_MAINTENANCE_DATA")
+                .expect("private fixture data")
+                .into(),
+            config_dir: std::env::var_os("FORMLESS_TEST_MAINTENANCE_CONFIG")
+                .expect("private fixture config")
+                .into(),
+            profile: "default".into(),
+        };
+        let operation = std::env::var("FORMLESS_TEST_MAINTENANCE_OPERATION").unwrap();
+        assert!(
+            formless_core::profile_lock::ProfileLock::launcher(&paths, std::time::Duration::ZERO)
+                .is_err(),
+            "launch gate spans every subprocess stage"
+        );
+        if operation == "erase" {
+            assert!(
+                formless_core::profile_lock::ProfileLock::try_owner(&paths)
+                    .unwrap()
+                    .is_none(),
+                "destructive changes hold kernel ownership across processes"
+            );
+        }
+        let mut record = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.config_dir.join("operations"))
+            .unwrap();
+        writeln!(record, "{operation}").unwrap();
+        assert_ne!(
+            operation, "reject",
+            "injected private service-manager failure"
+        );
+    }
+
     /// Combinations that would silently drop a flag are refused by clap,
     /// and usage mistakes exit 2 (#896, #897).
     #[test]
