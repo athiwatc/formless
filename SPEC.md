@@ -3827,8 +3827,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   (`PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `*_OPTIONS`, `BASH_ENV`,
   interpreter paths, pagers and editors), which need that key's `env:`
   grant. Git under a sub-command grant (`process:git:status|log`) runs
-  with fsmonitor, pager, credential helpers, external diff and ssh
-  turned off; repository hooks and settings can still run, so `git`,
+  with fsmonitor, pager, credential helpers and ssh turned off. Scoped
+  `diff`, `log` and `show` also disable external diff and textconv drivers
+  (including when call arguments request them); repository hooks and other
+  settings can still run, so `git`,
   `find`, `tar`, build tools and versioned interpreters (`python3.11`)
   are flagged as broad when approved.
 - **Network:** `fetch` honours the `net` scope (domain allowlist when

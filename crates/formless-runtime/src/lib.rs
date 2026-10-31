@@ -1832,7 +1832,7 @@ impl State {
             );
         }
         let enc = enc_of(&a["encoding"])?;
-        let args: Vec<String> = a["args"]
+        let mut args: Vec<String> = a["args"]
             .as_array()
             .map(|v| {
                 v.iter()
@@ -1847,7 +1847,7 @@ impl State {
         let mut command = std::process::Command::new(cmd);
         // Git under a sub-command grant (`process:git:status|log`) runs
         // without the repository settings that start programs: fsmonitor,
-        // pager, credential helpers, external diff (#1099).
+        // pager, credential helpers, external diff and textconv (#1099, #1130).
         let base = std::path::Path::new(cmd)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1865,10 +1865,15 @@ impl State {
                 "-c",
                 "credential.helper=",
                 "-c",
-                "diff.external=",
-                "-c",
                 "core.sshCommand=false",
             ]);
+            if matches!(first_arg, Some("diff" | "log" | "show")) {
+                // These are sub-command options, not global git options.
+                // Put them after caller options so --ext-diff/--textconv
+                // cannot turn drivers back on, but before a path separator.
+                let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+                args.splice(end..end, ["--no-ext-diff".into(), "--no-textconv".into()]);
+            }
         }
         command
             .args(&args)
@@ -2567,6 +2572,85 @@ mod tests {
             "{}",
             e.message
         );
+    }
+
+    /// Patch commands stay useful without executing repository diff drivers.
+    #[test]
+    #[cfg(unix)]
+    fn scoped_git_patch_commands_disable_diff_drivers() {
+        struct Repo(PathBuf);
+        impl Drop for Repo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let repo =
+            Repo(std::env::temp_dir().join(format!("formless-git-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir_all(&repo.0).unwrap();
+        let root = repo.0.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("file.txt"), "before\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "file.txt diff=probe\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "before"]);
+        std::fs::write(root.join("file.txt"), "after\n").unwrap();
+        git(&["commit", "-qam", "after"]);
+        std::fs::write(root.join("file.txt"), "working\n").unwrap();
+        std::fs::write(
+            root.join("driver.sh"),
+            "#!/bin/sh\nprintf ran > driver-ran\ncat \"$1\"\n",
+        )
+        .unwrap();
+        git(&["config", "diff.probe.textconv", "sh ./driver.sh"]);
+        // Prove the fixture would execute a configured textconv driver.
+        git(&["diff", "--textconv"]);
+        assert!(root.join("driver-ran").exists());
+        std::fs::remove_file(root.join("driver-ran")).unwrap();
+        // An external driver must also stay disabled; executing this would fail.
+        git(&["config", "diff.external", "false"]);
+        for args in [
+            json!(["diff", "--ext-diff", "--textconv"]),
+            json!(["diff", "--ext-diff", "--textconv", "--", "file.txt"]),
+            json!(["log", "-1", "-p", "--ext-diff", "--textconv"]),
+            json!(["show", "--ext-diff", "--textconv"]),
+        ] {
+            let mut req = live(&format!(
+                "function run() {{ return process.run('git', {}, {{cwd: {}}}); }}",
+                args,
+                json!(root.to_str().unwrap())
+            ));
+            req.caps = Capabilities::parse(&[
+                "process:git:diff|log|show".into(),
+                format!("fs:read:{}", root.display()),
+            ])
+            .unwrap();
+            let out = execute(&req, Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(out["code"], json!(0), "{args}: {out}");
+            assert!(
+                out["stdout"].as_str().unwrap().contains("diff --git"),
+                "{args}: {out}"
+            );
+            assert!(!root.join("driver-ran").exists(), "{args} ran textconv");
+        }
     }
 
     /// A call's own env can't steer what runs without its env grant (#1098).
