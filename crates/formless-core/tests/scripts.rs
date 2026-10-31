@@ -71,7 +71,8 @@ async fn a_tool_named_call_cannot_replace_the_dispatcher() {
         "uses": ["call", "other", "__proto__"],
         "save_as": {"name":"call_both", "description":"Call both tools", "input_schema":{"type":"object"}, "output_schema":{"type":"array"}}
     })).await;
-    let out: Value = serde_json::from_str(&out).unwrap();
+    let out: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("script returned invalid JSON: {e}: {out}"));
     let expected = json!([
         {"tool":"call", "input":{"n":1}}, {"tool":"other", "input":{"n":2}},
         {"tool":"other", "input":{"n":3}}, {"tool":"__proto__", "input":{"n":4}}
