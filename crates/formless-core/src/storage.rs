@@ -2959,6 +2959,53 @@ impl Store {
         memory_mb: u32,
         author: &str,
     ) -> Result<(ToolInfo, i64)> {
+        // Look-up and insert under one write lock: two connections (the
+        // daemon and a CLI import) creating one name must serialise into
+        // versions of one Tool, not race on the unique name (SPEC §16).
+        if !self.conn.is_autocommit() {
+            return self.create_tool_version_locked(
+                name,
+                description,
+                input_schema,
+                output_schema,
+                code,
+                caps,
+                memory_mb,
+                author,
+            );
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let out = self.create_tool_version_locked(
+            name,
+            description,
+            input_schema,
+            output_schema,
+            code,
+            caps,
+            memory_mb,
+            author,
+        );
+        match &out {
+            Ok(_) => self.conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_tool_version_locked(
+        &self,
+        name: &str,
+        description: &str,
+        input_schema: &str,
+        output_schema: &str,
+        code: &str,
+        caps: &Capabilities,
+        memory_mb: u32,
+        author: &str,
+    ) -> Result<(ToolInfo, i64)> {
         let lower = name.to_lowercase();
         let existing: Option<(String, i64)> = self
             .conn

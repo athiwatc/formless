@@ -239,6 +239,7 @@ async fn prompt_fallback_buffers_json_and_probe_autodetects() {
     native.fallback_models.clear();
     let pr = probe(&native, "k", "good").await.unwrap();
     assert!(pr.tool_calling && pr.prompt_fallback, "{pr:?}");
+    assert!(pr.streaming, "the test reply streamed: {pr:?}");
 }
 
 #[tokio::test]

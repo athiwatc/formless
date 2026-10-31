@@ -239,6 +239,7 @@ pub fn documented_shape() -> Config {
     p.api_key_header = Some(s("api-key"));
     p.vision = Some(true);
     p.extra_headers.insert(s("*"), s("v"));
+    p.extra_body.insert(s("*"), serde_json::json!(1));
     p.aliases.insert(s("*"), s("m"));
     p.query_params.insert(s("*"), s("1"));
     p.model_context_tokens.insert(s("*"), 8192);
@@ -843,6 +844,12 @@ impl RelayCfg {
 pub struct ProviderCfg {
     pub base_url: String,
     pub extra_headers: HashMap<String, String>,
+    /// Vendor request fields merged into every request body (Ollama's
+    /// `options`, vLLM's `chat_template_kwargs`, OpenRouter's `provider`
+    /// routing). `model`, `messages`, `input`, `tools`, `stream` and
+    /// `system` are never overridden (#622).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, serde_json::Value>,
     /// Short names for model ids (`fast = "…"`), usable wherever a model
     /// is accepted; changing one changes everything that uses it.
     pub aliases: BTreeMap<String, String>,
@@ -974,6 +981,7 @@ impl Default for ProviderCfg {
         Self {
             base_url: String::new(),
             extra_headers: HashMap::new(),
+            extra_body: BTreeMap::new(),
             aliases: BTreeMap::new(),
             query_params: BTreeMap::new(),
             api_key_header: None,
