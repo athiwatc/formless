@@ -208,7 +208,37 @@ impl Paths {
     }
     #[cfg(windows)]
     pub fn pipe_name(&self) -> String {
-        format!(r"\\.\pipe\formless-{}", self.profile)
+        self.pipe_name_for()
+    }
+
+    /// The daemon's named pipe on Windows: the profile plus a hash of the
+    /// data dir, so two installs (or test harnesses) with the same profile
+    /// but different data dirs never share a daemon, like the Unix socket
+    /// that lives in the data dir (#830).
+    pub fn pipe_name_for(&self) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(self.data_dir.as_os_str().as_encoded_bytes());
+        let hash: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+        format!(r"\\.\pipe\formless-{}-{hash}", self.profile)
+    }
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::*;
+
+    #[test]
+    fn pipe_names_follow_the_data_dir() {
+        let p = |data: &str| Paths {
+            data_dir: data.into(),
+            config_dir: "/c".into(),
+            profile: "default".into(),
+        };
+        assert_eq!(p("/a/data").pipe_name_for(), p("/a/data").pipe_name_for());
+        assert_ne!(p("/a/data").pipe_name_for(), p("/b/data").pipe_name_for());
+        assert!(p("/a/data")
+            .pipe_name_for()
+            .starts_with(r"\\.\pipe\formless-default-"));
     }
 }
 

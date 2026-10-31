@@ -71,7 +71,9 @@ without redesign.
     dir, so every client finds the same path. The folder is created
     `0700` and must belong to the user; `formless doctor` reports it when
     it doesn't.
-- Windows: a named pipe with an ACL restricted to the owning user. It has
+- Windows: a named pipe, `\\.\pipe\formless-<profile>-<hash of the data
+  dir>`, so two data dirs never share a daemon, with an ACL restricted to
+  the owning user. It has
   a protected DACL granting access only to the current user's SID and
   SYSTEM, and remote clients are rejected. The auto-started daemon is
   detached (`DETACHED_PROCESS`, its own process group, no console
@@ -578,7 +580,9 @@ task, with quality as a gate**.
   each Tool call folded into `<details>` with its arguments and result
   (results over 4000 characters are cut). The HTML page is
   self-contained (inline styles, no scripts or external resources), and
-  any HTML in messages is shown as text. TUI `/export [json|md|html]`
+  any HTML in messages is shown as text; Markdown images become their
+  alt text and address as text (nothing is fetched when the page is
+  opened), and links keep only http(s), mailto and relative targets. TUI `/export [json|md|html]`
   (writes to the exports directory), the web "Export…" dialog and
   `/export`, and `formless sessions export ID --format md|html|json
   [-o FILE]`.
@@ -1715,8 +1719,10 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
   - A failed gate keeps the script result and reports `save_error`.
 - **Recurrence signal.**
   - Each script is fingerprinted: SHA-256 over its tokens, with
-    whitespace and comments dropped and string, template and number
-    literals blanked.
+    whitespace and comments dropped and string, template, regex and
+    number literals blanked; a template's `${…}` interpolations count as
+    code. Recurrence is keyed on the fingerprint plus the sorted `uses`
+    list.
   - Once one fingerprint has run successfully in
     `scripts.recurrence_threshold` (3) distinct Sessions, the
     `run_script` result carries a `hint` to save it.

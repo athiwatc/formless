@@ -9291,7 +9291,7 @@ impl Daemon {
             .map_err(|e| anyhow!("script panicked: {e}"));
         done.cancel();
         let elapsed_ms = started.elapsed().as_millis() as i64;
-        let hash = crate::scripts::fingerprint(source);
+        let hash = crate::scripts::recurrence_key(source, &uses);
         let record = |status: &str, error: &str, saved: &str| {
             let _ = self.with_store(|st| {
                 st.record_script(
