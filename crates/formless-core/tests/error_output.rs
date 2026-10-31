@@ -1,4 +1,7 @@
 //! Declared error fields are domain data, across live and replay Invocations.
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::{Config, Paths, Store};
 use formless_runtime::{new_overlay, Capabilities};
 use serde_json::{json, Value};
@@ -6,6 +9,7 @@ use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn declared_error_outputs_succeed_and_nested_calls_resolve() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = std::env::temp_dir().join(format!("fl-error-output-{}", uuid::Uuid::new_v4()));
     let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
     Config::default().save(&paths).unwrap();
@@ -77,6 +81,7 @@ async fn declared_error_outputs_succeed_and_nested_calls_resolve() {
 /// nested Tool, and in the recorded success metrics.
 #[tokio::test(flavor = "multi_thread")]
 async fn composed_error_declarations_remain_domain_data() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = std::env::temp_dir().join(format!("fl-composed-error-{}", uuid::Uuid::new_v4()));
     let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
     Config::default().save(&paths).unwrap();

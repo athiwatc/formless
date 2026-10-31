@@ -3,6 +3,9 @@
 //! `uses` list up front, records its nested Invocations under it, and can
 //! be saved as a Tool.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::daemon::Daemon;
 use formless_core::storage::Store;
 use formless_core::{Config, Paths};
@@ -34,7 +37,11 @@ fn seed(store: &Store, name: &str, code: &str, caps: &[&str]) -> String {
 }
 
 /// A daemon with `slow_double` (300 ms, returns n*2) in the registry.
-fn setup(tag: &str, cfg: Config) -> (Paths, Store, String, Arc<Daemon>) {
+fn setup(
+    _env: &credential_env::EnvGuard,
+    tag: &str,
+    cfg: Config,
+) -> (Paths, Store, String, Arc<Daemon>) {
     let paths = temp_paths(tag);
     cfg.save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -55,7 +62,8 @@ async fn script(daemon: &Arc<Daemon>, session: &str, args: Value) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tool_named_call_cannot_replace_the_dispatcher() {
-    let (_paths, store, session, daemon) = setup("call-name", Config::default());
+    let env = credential_env::EnvGuard::isolated();
+    let (_paths, store, session, daemon) = setup(&env, "call-name", Config::default());
     // These are legal registry names, including the special JS object key.
     for name in ["call", "other", "__proto__"] {
         formless_core::tools::validate_name(name).unwrap();
@@ -88,7 +96,8 @@ async fn a_tool_named_call_cannot_replace_the_dispatcher() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scripts_fan_out_in_parallel_and_return_only_the_result() {
-    let (paths, _store, session, daemon) = setup("fan", Config::default());
+    let env = credential_env::EnvGuard::isolated();
+    let (paths, _store, session, daemon) = setup(&env, "fan", Config::default());
     let started = std::time::Instant::now();
     let out = script(
         &daemon,
@@ -125,7 +134,8 @@ async fn scripts_fan_out_in_parallel_and_return_only_the_result() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scripts_have_no_ambient_authority_and_only_reach_their_uses() {
-    let (_paths, store, session, daemon) = setup("authority", Config::default());
+    let env = credential_env::EnvGuard::isolated();
+    let (_paths, store, session, daemon) = setup(&env, "authority", Config::default());
     seed(&store, "other", "function run(){ return 'reached'; }", &[]);
     let out = script(
         &daemon,
@@ -184,7 +194,8 @@ async fn scripts_have_no_ambient_authority_and_only_reach_their_uses() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_script_that_forgets_await_fails() {
-    let (_paths, _store, session, daemon) = setup("noawait", Config::default());
+    let env = credential_env::EnvGuard::isolated();
+    let (_paths, _store, session, daemon) = setup(&env, "noawait", Config::default());
     let out = script(
         &daemon,
         &session,
@@ -196,9 +207,10 @@ async fn a_script_that_forgets_await_fails() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scripts_ask_approval_for_their_uses_before_running() {
+    let env = credential_env::EnvGuard::isolated();
     let mut cfg = Config::default();
     cfg.security.secure = true;
-    let (paths, store, session, daemon) = setup("approve", cfg);
+    let (paths, store, session, daemon) = setup(&env, "approve", cfg);
     seed(&store, "pinger", "function run(){ return 1; }", &["net"]);
     // No client is attached to answer, so the approval fails closed and
     // nothing runs: not even the Tool that needs no approval.
@@ -221,7 +233,8 @@ async fn scripts_ask_approval_for_their_uses_before_running() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_saved_script_becomes_a_composing_tool() {
-    let (_paths, store, session, daemon) = setup("save", Config::default());
+    let env = credential_env::EnvGuard::isolated();
+    let (_paths, store, session, daemon) = setup(&env, "save", Config::default());
     let out = script(
         &daemon,
         &session,
@@ -256,9 +269,10 @@ async fn a_saved_script_becomes_a_composing_tool() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_same_script_across_sessions_is_flagged_for_saving() {
+    let env = credential_env::EnvGuard::isolated();
     let mut cfg = Config::default();
     cfg.scripts.recurrence_threshold = 2;
-    let (_paths, store, first, daemon) = setup("recur", cfg);
+    let (_paths, store, first, daemon) = setup(&env, "recur", cfg);
     let run = |session: String, n: i64| {
         let daemon = daemon.clone();
         async move {
@@ -285,9 +299,10 @@ async fn the_same_script_across_sessions_is_flagged_for_saving() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_script_past_its_timeout_is_stopped() {
+    let env = credential_env::EnvGuard::isolated();
     let mut cfg = Config::default();
     cfg.scripts.timeout_secs = 1;
-    let (_paths, _store, session, daemon) = setup("timeout", cfg);
+    let (_paths, _store, session, daemon) = setup(&env, "timeout", cfg);
     let started = std::time::Instant::now();
     let out = script(
         &daemon,
