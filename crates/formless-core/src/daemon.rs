@@ -511,6 +511,9 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(paths: Paths) -> Result<Self> {
         let store = Store::open(&paths.db_file())?;
+        // A damaged database stops the daemon with the backup to restore,
+        // instead of failing wherever it first bites (SPEC §16).
+        store.check_integrity(&paths.db_file())?;
         // Deprecated global auto (SPEC §4.6): rewrite the file once and
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();

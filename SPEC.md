@@ -3876,7 +3876,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   live in chat; Esc is the stop. Creation attempts are audit-logged.
 - **Candidate for a retired/deleted Tool:** cancelled; retired Tools are
   never optimised (§8.2). Promotion racing a retirement: retirement wins;
-  the Candidate is discarded and logged.
+  the Candidate is discarded and logged (`tool.promote_discarded`).
 - **Two creators, same name:** serialised (§7.2). **Two approvers, same
   modal:** first answer wins (§10.4). **Two clients starting a Run on one
   Session** (two sends, a send and an edit): one Run starts; the other
@@ -3899,7 +3899,12 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 - **Daemon already running, older/newer protocol:** client refuses with
   versions shown (§9.3). **Second daemon, same data dir:** refused (§9.4).
 - **SQLite corruption:** daemon stops, reports, points at the pre-migration
-  backup; never reinitialises silently. **Disk full:** writes fail loudly;
+  backup; never reinitialises silently. Opening checks the file's header
+  and schema, and the daemon runs `PRAGMA quick_check` at start; any
+  failure names the newest backup (a pre-migration `*.bak` beside the
+  database or a daily one in `backups/`) and the `formless restore FILE`
+  command, and leaves the file untouched. The §16 checklist at the top of
+  `crates/formless-core/tests/edge_cases.rs` maps each bullet to its test. **Disk full:** writes fail loudly;
   the Run pauses; no partial Tool version is ever visible.
 - **Huge Tool output / huge file:** streamed to artifact (§9.6); context
   receives preview only. **JS infinite loop:** burns its own sandbox thread

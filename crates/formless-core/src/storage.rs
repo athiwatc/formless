@@ -733,6 +733,61 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Whether `e` says the database file itself is damaged (corrupt, or not a
+/// database at all), and how.
+fn corrupt_detail(e: &anyhow::Error) -> Option<String> {
+    e.chain()
+        .find_map(|c| match c.downcast_ref::<rusqlite::Error>()? {
+            rusqlite::Error::SqliteFailure(f, msg)
+                if matches!(
+                    f.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ) =>
+            {
+                Some(msg.clone().unwrap_or_else(|| f.to_string()))
+            }
+            _ => None,
+        })
+}
+
+/// The newest backup of `file`: a pre-migration copy beside it or a daily
+/// one in `backups/`.
+pub fn newest_backup(file: &Path) -> Option<PathBuf> {
+    let dir = file.parent()?;
+    let name = file.file_name()?.to_string_lossy().into_owned();
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for d in [dir.to_path_buf(), dir.join("backups")] {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let ours = (n.starts_with(&name) && n.ends_with(".bak"))
+                || (n.starts_with("formless-") && n.ends_with(".db"));
+            if let (true, Ok(m)) = (ours, e.metadata().and_then(|m| m.modified())) {
+                found.push((m, e.path()));
+            }
+        }
+    }
+    found.sort();
+    found.pop().map(|(_, p)| p)
+}
+
+/// The error for a damaged database: what is wrong, that nothing was
+/// replaced, and which backup to restore (§16).
+fn damaged(file: &Path, detail: &str) -> anyhow::Error {
+    let next = match newest_backup(file) {
+        Some(b) => format!(
+            "Stop the daemon and restore the newest backup: formless restore {}",
+            b.display()
+        ),
+        None => {
+            "No backup was found next to it; keep the file for recovery (sqlite3 .recover).".into()
+        }
+    };
+    anyhow!(
+        "the database {} is damaged ({detail}). Formless stopped and left it untouched. {next}",
+        file.display()
+    )
+}
+
 /// Consistent copy (WAL included) next to the database, named after the
 /// version it holds and the time it was taken.
 fn backup_before_migration(conn: &Connection, file: &Path, version: i64) -> Result<PathBuf> {
@@ -832,14 +887,52 @@ impl Store {
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
-        conn.execute_batch(PRAGMAS)?;
-        conn.set_prepared_statement_cache_capacity(STMT_CACHE);
-        migrate(&conn, Some(file))?;
+        // An existing file that isn't a SQLite database is reported, never
+        // replaced by a fresh one (SPEC §16).
+        if std::fs::metadata(file).is_ok_and(|m| m.len() > 0) {
+            let mut head = [0u8; 16];
+            let read = std::fs::File::open(file)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head));
+            if read.is_err() || &head != b"SQLite format 3\0" {
+                return Err(damaged(file, "its header is not a SQLite database's"));
+            }
+        }
+        let opened = (|| -> Result<Connection> {
+            let conn =
+                Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
+            conn.execute_batch(PRAGMAS)?;
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                r.get::<_, i64>(0)
+            })?;
+            conn.set_prepared_statement_cache_capacity(STMT_CACHE);
+            migrate(&conn, Some(file))?;
+            Ok(conn)
+        })();
+        let conn = opened.map_err(|e| match corrupt_detail(&e) {
+            Some(detail) => damaged(file, &detail),
+            None => e,
+        })?;
         Ok(Self {
             conn,
             rewrites: Default::default(),
         })
+    }
+
+    /// `PRAGMA quick_check`: every page and index readable. Run once when
+    /// the daemon starts (§16); a failure is reported like an unreadable
+    /// file.
+    pub fn check_integrity(&self, file: &Path) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA quick_check")?;
+        let found: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(|e| damaged(file, &e.to_string()))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|e| damaged(file, &e.to_string()))?;
+        if found.len() == 1 && found[0] == "ok" {
+            return Ok(());
+        }
+        let detail: Vec<&str> = found.iter().take(3).map(String::as_str).collect();
+        Err(damaged(file, &detail.join("; ")))
     }
 
     /// An extra connection for reads only (the database must already be
