@@ -35,6 +35,18 @@ fn connect_stream(paths: &Paths) -> Result<(Box<dyn Read + Send>, Box<dyn Write 
 }
 
 impl DaemonClient {
+    #[cfg(test)]
+    pub(crate) fn recording() -> (Self, mpsc::Receiver<String>) {
+        let (write_tx, rx) = mpsc::channel();
+        (
+            Self {
+                write_tx,
+                next_id: AtomicU64::new(1),
+            },
+            rx,
+        )
+    }
+
     pub fn connect(paths: &Paths) -> Result<(Self, mpsc::Receiver<ServerMessage>)> {
         let (reader, mut writer) = connect_stream(paths)?;
         let (msg_tx, msg_rx) = mpsc::channel::<ServerMessage>();

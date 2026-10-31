@@ -2084,7 +2084,10 @@ such as `read_file`, `read_text_file` and `file_read`.
   reconnecting to the daemon… (Ns)" in the status bar, and tries again
   every 2 s, starting a daemon itself after 6 s. Enter keeps the typed
   message instead of sending it into nothing. Once connected it reloads
-  the Session and notes how long it was away. The web already reconnects
+  the Session and notes how long it was away. It clears the old daemon's
+  approvals mode on disconnect and requests `Status` on every new
+  connection, so Settings reports the attached daemon's mode. Until the
+  reply arrives the mode is shown as unknown. The web already reconnects
   on its own.
 - **Resource use.** `Status.resources` has the daemon's memory (RSS),
   CPU % and CPU time (from `ps`; absent on Windows), the database and

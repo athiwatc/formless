@@ -144,6 +144,8 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// Refresh the approvals mode of this connection without opening a pager.
+    DaemonMode,
     /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
     Revoked,
     /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
@@ -1654,16 +1656,18 @@ impl App {
             self.notes
                 .push(format!("Warning: {warning} Or type /restart-daemon."));
         }
-        // The approvals the running daemon enforces, for Settings (#847).
-        self.daemon_secure =
-            client::request_once_within(&self.paths, Request::Status, Duration::from_secs(5))
-                .ok()
-                .and_then(|v| v["secure"].as_bool());
         let (client, inbox) = DaemonClient::connect(&self.paths)?;
+        self.attach_daemon(client, inbox);
+        Ok(())
+    }
+
+    /// Initial connection and reconnect both refresh connection-specific state.
+    fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
+        self.daemon_secure = None;
         self.client = Some(client);
         self.inbox = Some(inbox);
+        self.request(Pending::DaemonMode, Request::Status);
         self.request(Pending::ListSessions, Request::ListSessions);
-        Ok(())
     }
 
     /// `/restart-daemon`: replace the daemon and reconnect to the new one,
@@ -1677,6 +1681,7 @@ impl App {
         }
         self.client = None;
         self.inbox = None;
+        self.daemon_secure = None;
         // A new connection numbers its requests from 1 again: nothing from
         // the old one may resolve against them (#884).
         self.pending.clear();
@@ -1716,6 +1721,7 @@ impl App {
     fn daemon_lost(&mut self) {
         self.client = None;
         self.inbox = None;
+        self.daemon_secure = None;
         self.pending.clear();
         self.pending_since.clear();
         self.activity = None;
@@ -1743,10 +1749,8 @@ impl App {
             DaemonClient::connect(&self.paths)
         };
         if let Ok((client, inbox)) = connected {
-            self.client = Some(client);
-            self.inbox = Some(inbox);
+            self.attach_daemon(client, inbox);
             self.offline = None;
-            self.request(Pending::ListSessions, Request::ListSessions);
             if let Some(id) = self.current.clone() {
                 self.switch_session(id);
             }
@@ -1850,6 +1854,7 @@ impl App {
                     }
                     let Some(result) = result else { continue };
                     match kind {
+                        Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
                                 self.sessions = v;
@@ -7475,10 +7480,11 @@ impl App {
                     settings::rows(&cfg, &self.providers_info, self.show_thinking, &self.paths);
                 // Show what the running daemon enforces, not what this
                 // process would (#847).
-                if let Some(running) = self.daemon_secure {
-                    if let Some(r) = rows.iter_mut().find(|r| r.key == "security.secure") {
-                        r.value = settings::approvals_text(running, cfg.security.secure);
-                    }
+                if let Some(r) = rows.iter_mut().find(|r| r.key == "security.secure") {
+                    r.value = match self.daemon_secure {
+                        Some(running) => settings::approvals_text(running, cfg.security.secure),
+                        None => "daemon mode unknown".into(),
+                    };
                 }
                 rows
             }
@@ -15016,6 +15022,51 @@ mod tests {
             "kept while offline"
         );
         assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
+    }
+
+    #[test]
+    fn attaching_each_replacement_daemon_refreshes_its_approvals_mode() {
+        let mut app = test_app();
+        let cfg = Config::default();
+        cfg.save(&app.paths).unwrap();
+        for secure in [true, false] {
+            app.daemon_lost();
+            assert_eq!(app.daemon_secure, None);
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let status: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(status.request, Request::Status));
+            assert_eq!(app.daemon_secure, None, "unknown until this daemon replies");
+            tx.send(ServerMessage::Response {
+                id: status.id,
+                ok: true,
+                result: Some(serde_json::json!({"secure": secure})),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(app.daemon_secure, Some(secure));
+            let row = app
+                .settings_rows()
+                .into_iter()
+                .find(|r| r.key == "security.secure")
+                .unwrap();
+            assert_eq!(
+                row.value,
+                settings::approvals_text(secure, cfg.security.secure)
+            );
+        }
+        app.daemon_lost();
+        assert_eq!(app.daemon_secure, None);
+        assert_eq!(
+            app.settings_rows()
+                .into_iter()
+                .find(|r| r.key == "security.secure")
+                .unwrap()
+                .value,
+            "daemon mode unknown"
+        );
     }
 
     #[test]
