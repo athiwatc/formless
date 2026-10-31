@@ -142,7 +142,7 @@ impl View {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Pending {
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
@@ -221,6 +221,10 @@ enum Pending {
     Forget,
     ListAudit,
     SessionUsage,
+    GapUsage {
+        session_id: String,
+    },
+    GapInvocations,
     ListInvocations,
     GetArtifact,
     GenerateProposal,
@@ -2747,6 +2751,22 @@ impl App {
                                 styled: Vec::new(),
                             });
                         }
+                        Pending::GapUsage { session_id } => {
+                            if let Ok(usage) = serde_json::from_value::<formless_protocol::UsageInfo>(
+                                result["last_run"].clone(),
+                            ) {
+                                // A newer streamed update wins over this in-flight snapshot.
+                                if usage.context_tokens > 0 {
+                                    self.context_fill
+                                        .entry(session_id.clone())
+                                        .or_insert((usage.context_used, usage.context_tokens));
+                                }
+                                self.run_usage.entry(session_id).or_insert(usage);
+                            }
+                        }
+                        Pending::GapInvocations => {
+                            self.invocations = serde_json::from_value(result).unwrap_or_default();
+                        }
                         Pending::SessionUsage => {
                             let get = |k: &str| {
                                 serde_json::from_value::<formless_protocol::UsageInfo>(
@@ -3874,11 +3894,56 @@ impl App {
                     self.notes.push("provider stream dropped; retrying".into());
                 }
             }
-            // The live text has a gap; the finished message replaces it.
-            Event::DeltasDropped { session_id, .. } => {
-                if self.is_current(&session_id) {
-                    self.notes
-                        .push("display fell behind; the full answer shows when it's done".into());
+            Event::DeltasDropped {
+                session_id,
+                kinds,
+                model,
+                ..
+            } => {
+                use formless_protocol::DroppedEventKind as K;
+                let here = self.is_current(&session_id);
+                self.notes.push(format!("display fell behind{}; some live text, reasoning or progress is unavailable; final answers remain in the transcript",
+                    if here || session_id.is_empty() { String::new() } else { format!(" in Session {}", truncate_chars(&session_id, 8)) }));
+                if kinds.contains(&K::RunUsage) {
+                    self.run_usage.remove(&session_id);
+                    self.context_fill.remove(&session_id);
+                    if !self.pending.values().any(
+                        |p| matches!(p, Pending::GapUsage { session_id: id } if id == &session_id),
+                    ) {
+                        self.request(
+                            Pending::GapUsage {
+                                session_id: session_id.clone(),
+                            },
+                            Request::SessionUsage {
+                                session_id: session_id.clone(),
+                            },
+                        );
+                    }
+                }
+                if here
+                    && (kinds.contains(&K::ToolProgress) || kinds.contains(&K::InvocationActivity))
+                {
+                    for call in &mut self.live_tools {
+                        if call.status == "running" {
+                            call.progress = Some((None, "progress updates skipped".into()));
+                            call.stalled_secs = None;
+                        }
+                    }
+                }
+                if kinds.contains(&K::InvocationActivity)
+                    && !self
+                        .pending
+                        .values()
+                        .any(|p| matches!(p, Pending::GapInvocations))
+                {
+                    self.request(Pending::GapInvocations, Request::ListInvocations);
+                }
+                if kinds.contains(&K::ModelPullProgress) {
+                    self.pull_status = None;
+                    self.notes.push(format!(
+                        "download progress unavailable for {}; /models checks installed models",
+                        model.as_deref().unwrap_or("model")
+                    ));
                 }
             }
             Event::ReasoningDelta {
@@ -15244,6 +15309,117 @@ mod tests {
             queued: vec![],
         });
         assert_eq!(app.queued.len(), 1);
+    }
+
+    #[test]
+    fn dropped_progress_refreshes_durable_usage_and_marks_transient_progress_unknown() {
+        use formless_protocol::{DroppedEventKind as K, UsageInfo};
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.run_usage.insert("s1".into(), UsageInfo::default());
+        app.on_event(Event::ToolCallStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            tool_name: "import".into(),
+            version: 1,
+            arguments: "{}".into(),
+            depth: 0,
+        });
+        app.live_tools[0].progress = Some((Some(0.9), "stale".into()));
+        app.live_tools[0].stalled_secs = Some(60);
+        let gap = || Event::DeltasDropped {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            kinds: vec![K::RunUsage, K::ToolProgress, K::InvocationActivity],
+            handle: None,
+            model: None,
+        };
+        app.on_event(gap());
+        app.on_event(gap());
+        assert!(!app.run_usage.contains_key("s1"));
+        assert_eq!(
+            app.live_tools[0].progress,
+            Some((None, "progress updates skipped".into()))
+        );
+        assert_eq!(app.live_tools[0].stalled_secs, None);
+        let requests: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .collect();
+        assert_eq!(
+            requests.len(),
+            2,
+            "duplicate warnings share in-flight refreshes"
+        );
+        for req in requests {
+            let result = match req.request {
+                Request::SessionUsage { session_id } => {
+                    assert_eq!(session_id, "s1");
+                    serde_json::json!({"last_run": UsageInfo { steps: 3, ..UsageInfo::default() }})
+                }
+                Request::ListInvocations => serde_json::json!([]),
+                other => panic!("unexpected gap refresh: {other:?}"),
+            };
+            tx.send(ServerMessage::Response {
+                id: req.id,
+                ok: true,
+                result: Some(result),
+                error: None,
+            })
+            .unwrap();
+        }
+        app.drain_daemon();
+        assert_eq!(app.run_usage["s1"].steps, 3);
+        assert!(app
+            .notes
+            .iter()
+            .any(|n| n.contains("progress is unavailable")));
+        // An in-flight snapshot must never overwrite a newer streamed value.
+        app.on_event(gap());
+        let requests: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .collect();
+        app.on_event(Event::RunUsage {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+            usage: UsageInfo {
+                steps: 9,
+                ..UsageInfo::default()
+            },
+        });
+        for req in requests {
+            let result = if matches!(req.request, Request::SessionUsage { .. }) {
+                serde_json::json!({"last_run": UsageInfo { steps: 4, ..UsageInfo::default() }})
+            } else {
+                serde_json::json!([])
+            };
+            tx.send(ServerMessage::Response {
+                id: req.id,
+                ok: true,
+                result: Some(result),
+                error: None,
+            })
+            .unwrap();
+        }
+        app.drain_daemon();
+        assert_eq!(app.run_usage["s1"].steps, 9);
+        app.pull_status = Some("stale 90%".into());
+        app.on_event(Event::DeltasDropped {
+            session_id: String::new(),
+            run_id: String::new(),
+            kinds: vec![K::ModelPullProgress],
+            handle: None,
+            model: Some("model".into()),
+        });
+        assert!(app.pull_status.is_none());
+        assert!(app
+            .notes
+            .iter()
+            .any(|n| n.contains("download progress unavailable for model")));
     }
 
     #[test]

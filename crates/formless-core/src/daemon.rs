@@ -3,7 +3,7 @@ use formless_protocol::*;
 use formless_runtime::LockExt as _;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -30,9 +30,9 @@ struct Subscriber {
     filter: Arc<StdMutex<EventFilter>>,
     /// Cancelled to disconnect a client whose queue overflowed.
     kick: CancellationToken,
-    /// (session, run) whose answer deltas this client missed, until it
-    /// has been told with `DeltasDropped`.
-    gap: Option<(String, String)>,
+    /// Coalesced dropped kinds per Run/Invocation/model, bounded independently
+    /// of the output queue. Every scope must be remembered or the client closes.
+    gaps: BTreeMap<GapScope, BTreeSet<DroppedEventKind>>,
 }
 
 /// Messages queued per client before it counts as stuck.
@@ -87,18 +87,100 @@ fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
     }
 }
 
-/// Live output a slow client can miss without losing anything that
-/// matters: the settled message, the result and the state come later.
-fn droppable(ev: &Event) -> bool {
-    matches!(
-        ev,
-        Event::MessageDelta { .. }
-            | Event::ReasoningDelta { .. }
-            | Event::ToolProgress { .. }
-            | Event::RunUsage { .. }
-            | Event::InvocationActivity { .. }
-            | Event::ModelPullProgress { .. }
-    )
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GapScope {
+    session_id: String,
+    run_id: String,
+    handle: Option<String>,
+    model: Option<String>,
+}
+
+/// Only updates with an observable gap classification can be dropped.
+fn droppable_scope(ev: &Event) -> Option<(GapScope, DroppedEventKind)> {
+    use DroppedEventKind as K;
+    let (session, run, handle, model, kind) = match ev {
+        Event::MessageDelta {
+            session_id, run_id, ..
+        } => (
+            session_id.as_str(),
+            run_id.as_str(),
+            None,
+            None,
+            K::MessageDelta,
+        ),
+        Event::ReasoningDelta {
+            session_id, run_id, ..
+        } => (
+            session_id.as_str(),
+            run_id.as_str(),
+            None,
+            None,
+            K::ReasoningDelta,
+        ),
+        Event::ToolProgress {
+            session_id, run_id, ..
+        } => (
+            session_id.as_str(),
+            run_id.as_str(),
+            None,
+            None,
+            K::ToolProgress,
+        ),
+        Event::RunUsage {
+            session_id, run_id, ..
+        } => (
+            session_id.as_str(),
+            run_id.as_str(),
+            None,
+            None,
+            K::RunUsage,
+        ),
+        Event::InvocationActivity { session_id, handle } => (
+            session_id.as_str(),
+            "",
+            Some(handle.clone()),
+            None,
+            K::InvocationActivity,
+        ),
+        Event::ModelPullProgress { model, .. } => {
+            ("", "", None, Some(model.clone()), K::ModelPullProgress)
+        }
+        _ => return None,
+    };
+    Some((
+        GapScope {
+            session_id: session.into(),
+            run_id: run.into(),
+            handle,
+            model,
+        },
+        kind,
+    ))
+}
+
+/// Fill available queue space with one coalesced warning per affected scope.
+/// Called under the subscriber lock by broadcasters and by the writer after
+/// each dequeue, so draining a quiet queue cannot strand its final warning.
+fn flush_gaps(sub: &mut Subscriber) {
+    while let Some((scope, kinds)) = sub.gaps.first_key_value() {
+        let warning = Event::DeltasDropped {
+            session_id: scope.session_id.clone(),
+            run_id: scope.run_id.clone(),
+            kinds: kinds.iter().copied().collect(),
+            handle: scope.handle.clone(),
+            model: scope.model.clone(),
+        };
+        if sub.tx.try_send(ServerMessage::Event(warning)).is_err() {
+            break;
+        }
+        sub.gaps.pop_first();
+    }
+}
+
+fn flush_connection_gaps(subs: &Subs, conn: u64) {
+    if let Some(sub) = subs.locked().iter_mut().find(|sub| sub.conn == conn) {
+        flush_gaps(sub);
+    }
 }
 
 /// Read one `\n`-terminated line of at most `max` bytes (None at EOF).
@@ -342,23 +424,17 @@ fn send_all(subs: &Subs, ev: Event) {
             {
                 return true;
             }
-            // A gap is told before anything else, once there is room.
-            if let Some((session_id, run_id)) = sub.gap.clone() {
-                let told = ServerMessage::Event(Event::DeltasDropped { session_id, run_id });
-                if sub.tx.try_send(told).is_ok() {
-                    sub.gap = None;
-                }
-            }
+            flush_gaps(sub);
             match sub.tx.try_send(ServerMessage::Event(ev.clone())) {
                 Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) if droppable(&ev) => {
-                    if let Event::MessageDelta {
-                        session_id, run_id, ..
-                    } = &ev
-                    {
-                        sub.gap
-                            .get_or_insert_with(|| (session_id.clone(), run_id.clone()));
+                Err(mpsc::error::TrySendError::Full(_)) if droppable_scope(&ev).is_some() => {
+                    let (scope, kind) = droppable_scope(&ev).expect("classified droppable update");
+                    if sub.gaps.len() == CLIENT_QUEUE && !sub.gaps.contains_key(&scope) {
+                        tracing::warn!("client {} exceeded {CLIENT_QUEUE} pending gap scopes; disconnecting it", sub.conn);
+                        sub.kick.cancel();
+                        return false;
                     }
+                    sub.gaps.entry(scope).or_default().insert(kind);
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -836,7 +912,8 @@ impl Daemon {
                 let key = crate::config::provider_key(&self.paths, n).unwrap_or_default();
                 Ok(Provider::with_key(pcfg, key, self.http.clone())
                     .with_name(n)
-                    .with_usage_hook(self.usage_hook()))
+                    .with_usage_hook(self.usage_hook())
+                    .with_breaker_note_hook(self.provider_breaker_note_hook()))
             }
         }
     }
@@ -924,8 +1001,22 @@ impl Daemon {
             Provider::for_profile_with(cfg.provider.clone(), self.paths.clone(), self.http.clone())
                 .await?
                 .with_name(crate::config::DEFAULT_PROVIDER)
-                .with_usage_hook(self.usage_hook()),
+                .with_usage_hook(self.usage_hook())
+                .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
+    }
+
+    fn provider_breaker_note_hook(&self) -> crate::provider::NoteHook {
+        let subs = self.subs.clone();
+        Arc::new(move |text| {
+            send_all(
+                &subs,
+                Event::Note {
+                    session_id: None,
+                    text,
+                },
+            )
+        })
     }
 
     /// Records the usage of the daemon's own model calls (compaction, the
@@ -11317,7 +11408,7 @@ impl Daemon {
             tx: tx.clone(),
             filter: filter.clone(),
             kick: kick.clone(),
-            gap: None,
+            gaps: BTreeMap::new(),
         });
         // Requests run as this client, for attribution (SPEC §10.4).
         let client = {
@@ -11340,6 +11431,7 @@ impl Daemon {
         // one message each, answered only to the client that asked.
         let writer = tokio::spawn({
             let kick = kick.clone();
+            let subs = self.subs.clone();
             async move {
                 loop {
                     let msg = tokio::select! {
@@ -11349,6 +11441,7 @@ impl Daemon {
                             None => break,
                         },
                     };
+                    flush_connection_gaps(&subs, conn);
                     let Ok(mut line) = serde_json::to_string(&msg) else {
                         continue;
                     };
@@ -13561,7 +13654,7 @@ mod backpressure_tests {
             tx,
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: kick.clone(),
-            gap: None,
+            gaps: BTreeMap::new(),
         }]));
         let delta = || Event::MessageDelta {
             session_id: "s".into(),
@@ -13593,7 +13686,7 @@ mod backpressure_tests {
             tx,
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
-            gap: None,
+            gaps: BTreeMap::new(),
         }]));
         let delta = |d: &str| Event::MessageDelta {
             session_id: "s".into(),
@@ -13613,11 +13706,225 @@ mod backpressure_tests {
             matches!(told, ServerMessage::Event(Event::DeltasDropped { ref run_id, .. }) if run_id == "r"),
             "{told:?}"
         );
-        assert!(subs.locked()[0].gap.is_none(), "told once");
+        assert!(subs.locked()[0].gaps.is_empty(), "told once");
         assert!(matches!(
             rx.try_recv().unwrap(),
             ServerMessage::Event(Event::MessageDelta { .. })
         ));
+    }
+
+    fn subscriber(capacity: usize) -> (Subs, mpsc::Receiver<ServerMessage>, CancellationToken) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let kick = CancellationToken::new();
+        let subs = Arc::new(StdMutex::new(vec![Subscriber {
+            conn: 1,
+            tx,
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: kick.clone(),
+            gaps: BTreeMap::new(),
+        }]));
+        (subs, rx, kick)
+    }
+
+    #[test]
+    fn concurrent_runs_coalesce_usage_and_delta_gaps_without_swallowing_either_run() {
+        let (subs, mut rx, kick) = subscriber(3);
+        for _ in 0..3 {
+            send_all(
+                &subs,
+                Event::MessageDelta {
+                    session_id: "initial".into(),
+                    run_id: "initial".into(),
+                    delta: "queued".into(),
+                },
+            );
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = ["session-a", "session-b"]
+            .into_iter()
+            .map(|session| {
+                let subs = subs.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..20 {
+                        send_all(
+                            &subs,
+                            Event::RunUsage {
+                                session_id: session.into(),
+                                run_id: "run".into(),
+                                usage: UsageInfo::default(),
+                            },
+                        );
+                        send_all(
+                            &subs,
+                            Event::MessageDelta {
+                                session_id: session.into(),
+                                run_id: "run".into(),
+                                delta: "missed".into(),
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(subs.locked()[0].gaps.len(), 2);
+        // Use exactly the writer's dequeue hook, with no further broadcast.
+        for _ in 0..3 {
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                ServerMessage::Event(Event::MessageDelta { .. })
+            ));
+            flush_connection_gaps(&subs, 1);
+        }
+        let mut announced = BTreeMap::new();
+        while let Ok(msg) = rx.try_recv() {
+            let ServerMessage::Event(Event::DeltasDropped {
+                session_id,
+                run_id,
+                kinds,
+                ..
+            }) = msg
+            else {
+                panic!("unexpected queued event: {msg:?}")
+            };
+            assert_eq!(run_id, "run");
+            assert_eq!(
+                kinds,
+                [DroppedEventKind::MessageDelta, DroppedEventKind::RunUsage]
+            );
+            assert!(announced.insert(session_id, kinds).is_none());
+            flush_connection_gaps(&subs, 1);
+        }
+        assert_eq!(
+            announced.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["session-a", "session-b"]
+        );
+        assert!(subs.locked()[0].gaps.is_empty());
+        assert!(!kick.is_cancelled());
+    }
+
+    #[test]
+    fn all_six_droppable_kinds_have_scoped_warnings_on_a_quiet_queue() {
+        let (subs, mut rx, kick) = subscriber(1);
+        send_all(
+            &subs,
+            Event::Note {
+                session_id: None,
+                text: "queued".into(),
+            },
+        );
+        let events = [
+            Event::MessageDelta {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                delta: "text".into(),
+            },
+            Event::ReasoningDelta {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                delta: "reasoning".into(),
+            },
+            Event::ToolProgress {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                tool_name: "tool".into(),
+                depth: 0,
+                fraction: Some(0.5),
+                label: "half".into(),
+            },
+            Event::RunUsage {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                usage: UsageInfo::default(),
+            },
+            Event::InvocationActivity {
+                session_id: "s".into(),
+                handle: "invocation".into(),
+            },
+            Event::ModelPullProgress {
+                model: "model".into(),
+                status: "pulling".into(),
+                completed: Some(1),
+                total: Some(2),
+                done: false,
+                error: None,
+            },
+        ];
+        for _ in 0..10 {
+            for ev in &events {
+                send_all(&subs, ev.clone());
+            }
+        }
+        assert_eq!(
+            subs.locked()[0].gaps.len(),
+            3,
+            "four Run kinds and two non-Run scopes"
+        );
+        let mut kinds_seen = BTreeSet::new();
+        let mut warnings = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if let ServerMessage::Event(Event::DeltasDropped {
+                session_id,
+                run_id,
+                kinds,
+                handle,
+                model,
+            }) = msg
+            {
+                warnings += 1;
+                for kind in &kinds {
+                    kinds_seen.insert(*kind);
+                }
+                if kinds.contains(&DroppedEventKind::InvocationActivity) {
+                    assert_eq!(handle.as_deref(), Some("invocation"));
+                    assert_eq!(session_id, "s");
+                    assert!(run_id.is_empty());
+                }
+                if kinds.contains(&DroppedEventKind::ModelPullProgress) {
+                    assert_eq!(model.as_deref(), Some("model"));
+                    assert!(session_id.is_empty() && run_id.is_empty());
+                }
+            }
+            flush_connection_gaps(&subs, 1);
+        }
+        assert_eq!(
+            warnings, 3,
+            "60 dropped messages coalesce into three scoped warnings"
+        );
+        assert_eq!(kinds_seen.len(), 6);
+        assert!(subs.locked()[0].gaps.is_empty());
+        assert!(!kick.is_cancelled());
+    }
+
+    #[test]
+    fn pending_gap_scopes_are_bounded_and_overflow_is_never_silent() {
+        let (subs, _rx, kick) = subscriber(1);
+        let delta = |run| Event::MessageDelta {
+            session_id: "s".into(),
+            run_id: format!("r{run}"),
+            delta: "x".into(),
+        };
+        send_all(&subs, delta(0));
+        for run in 0..CLIENT_QUEUE {
+            send_all(&subs, delta(run));
+        }
+        assert_eq!(subs.locked()[0].gaps.len(), CLIENT_QUEUE);
+        send_all(&subs, delta(0));
+        assert!(
+            !kick.is_cancelled(),
+            "repeated existing scope consumes no extra entry"
+        );
+        send_all(&subs, delta(CLIENT_QUEUE));
+        assert!(kick.is_cancelled());
+        assert!(
+            subs.locked().is_empty(),
+            "unrepresentable gap closes the connection"
+        );
     }
 
     /// A client that never reads is kicked once its queue fills, and its
@@ -14017,7 +14324,7 @@ mod widen_scope_tests {
             tx,
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
-            gap: None,
+            gaps: BTreeMap::new(),
         });
         let cfg = daemon.config().unwrap();
         let (info, ver) = daemon
@@ -14510,7 +14817,7 @@ mod live_snapshot_tests {
             tx: events,
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
-            gap: None,
+            gaps: BTreeMap::new(),
         });
         daemon.promotions.locked().insert(
             "promo".into(),
@@ -14568,3 +14875,7 @@ mod live_snapshot_tests {
         let _ = std::fs::remove_dir_all(base);
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_provider_breaker_tests.rs"]
+mod provider_breaker_tests;
