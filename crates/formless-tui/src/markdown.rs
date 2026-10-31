@@ -556,7 +556,9 @@ impl Renderer {
             format!("╭─ {lang} [{index}]")
         };
         self.emit(vec![Span::styled(label, dim(color))]);
-        let diff = matches!(lang, "diff" | "patch");
+        let diff = ["diff", "patch"]
+            .iter()
+            .any(|d| lang.eq_ignore_ascii_case(d));
         if diff {
             // Coloured, with long unchanged context collapsed.
             let code_w = avail.saturating_sub(2).max(8);
@@ -579,7 +581,9 @@ impl Renderer {
             let spans = if let Some(h) = &mut hl {
                 h.line(&raw)
             } else {
-                vec![Span::styled(raw.clone(), fg(color, Color::Yellow))]
+                // A language the highlighter doesn't know: plain text in
+                // the default colour, not solid yellow (#877).
+                vec![Span::raw(raw.clone())]
             };
             // Code never wraps (it would break indentation): long lines
             // end in `…`, and `/pager code N` shows them in full.
@@ -987,6 +991,26 @@ mod tests {
             .position(|l| l.trim_start().starts_with("b: "))
             .unwrap();
         assert!(out[b + 1].starts_with("     "), "hanging indent: {out:#?}");
+    }
+
+    /// Unknown languages are plain text; `Diff` is a diff whatever its
+    /// case (#877).
+    #[test]
+    fn unknown_languages_are_plain_and_diff_ignores_case() {
+        let out = render("```brainfuck\n+[-]\n```", true, "", 40);
+        let code = out
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content == "+[-]")
+            .unwrap();
+        assert_eq!(code.style.fg, None, "default colour, not yellow");
+        let out = render("```Diff\n+added\n```", true, "", 40);
+        let added = out
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content == "+added")
+            .unwrap();
+        assert_eq!(added.style.fg, Some(Color::Green));
     }
 
     /// An image inside a link keeps both addresses, and inline HTML shows

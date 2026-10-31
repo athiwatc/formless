@@ -2478,6 +2478,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   lines longer than the pane end in `…`. `/pager code [N]` opens the last
   answer's Nth code block (default the last) unwrapped in the pager, with
   line numbers and ←/→ to scroll sideways.
+  Known languages are syntax-coloured by a small tokenizer that carries
+  block comments (nested in Rust) and multi-line strings (Python `"""`,
+  JS/Go backticks, Rust raw strings) across lines and tells a JS regex
+  from a comment; `diff`/`patch` (any case) are coloured as diffs; other
+  languages are plain text in the default colour.
   Each block's top border names its language and its index in the
   message (`╭─ rust [2]`), which is the number `/copy code 2` and
   `/pager code 2` use. `tui.code_line_numbers` adds dim line numbers.
