@@ -2132,6 +2132,8 @@ such as `read_file`, `read_text_file` and `file_read`.
   message to an empty draft on timeout/disconnect without overwriting
   a newer draft. A late success retracts the untouched restored retry
   draft, so Enter cannot accidentally send it again as a new action.
+  Buffered replies are consumed before disconnect cleanup: an accepted
+  send acknowledged immediately before EOF is never restored for retry.
 - A client that falls behind loses live deltas first; it is told with
   `DeltasDropped {session_id, run_id}` once there is room, and the
   answer's `MessageComplete` carries the whole text (plain mode notes the

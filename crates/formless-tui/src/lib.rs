@@ -1844,9 +1844,7 @@ impl App {
                 }
             }
         }
-        if lost {
-            self.daemon_lost();
-        } else {
+        if !lost {
             self.inbox = Some(inbox);
         }
         for msg in msgs {
@@ -3293,6 +3291,12 @@ impl App {
                 }
                 ServerMessage::Event(ev) => self.on_event(ev),
             }
+        }
+        // EOF can follow an acknowledgement already queued by the reader.
+        // Consume those replies before clearing request identities or restoring
+        // an unacknowledged draft, otherwise an accepted send becomes retryable.
+        if lost {
+            self.daemon_lost();
         }
     }
 
@@ -15065,6 +15069,72 @@ mod tests {
             "kept while offline"
         );
         assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
+    }
+
+    #[test]
+    fn buffered_send_acknowledgement_before_eof_does_not_restore_an_accepted_send() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("accepted once");
+        app.submit_chat(false);
+        let first: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let first_key = serde_json::to_value(&first.request).unwrap()["client_msg_id"].clone();
+        tx.send(ServerMessage::Response {
+            id: first.id,
+            ok: true,
+            result: Some(serde_json::json!({"started": true})),
+            error: None,
+        })
+        .unwrap();
+        drop(tx); // The reader delivered the acknowledgement, then saw EOF.
+        app.drain_daemon();
+        assert!(app.offline.is_some() && app.inbox.is_none());
+        assert_eq!(app.input.expanded(), "");
+        assert_eq!(app.sends.unsent(app.current.as_deref().unwrap()), None);
+        assert!(app.pending.is_empty());
+
+        // A later deliberate send of identical text is a new action.
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.offline = None;
+        app.input.set("accepted once");
+        app.submit_chat(false);
+        let next: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_ne!(
+            serde_json::to_value(&next.request).unwrap()["client_msg_id"],
+            first_key
+        );
+    }
+
+    #[test]
+    fn eof_without_a_send_acknowledgement_restores_only_an_empty_draft() {
+        for newer_draft in [None, Some("new draft")] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel::<ServerMessage>();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("unacknowledged send");
+            app.submit_chat(false);
+            let _: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            if let Some(text) = newer_draft {
+                app.input.set(text);
+            }
+            drop(tx);
+            app.drain_daemon();
+            assert!(app.offline.is_some() && app.inbox.is_none());
+            assert_eq!(
+                app.input.expanded(),
+                newer_draft.unwrap_or("unacknowledged send")
+            );
+            assert_eq!(
+                app.sends.unsent(app.current.as_deref().unwrap()),
+                Some("unacknowledged send")
+            );
+        }
     }
 
     #[test]
