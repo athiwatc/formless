@@ -30,6 +30,7 @@ pub mod runs;
 pub mod scripts;
 pub mod secrets;
 pub mod service;
+pub mod setup_draft;
 pub mod skills;
 pub mod storage;
 pub mod tools;
