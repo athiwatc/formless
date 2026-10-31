@@ -3535,6 +3535,12 @@ wait behind a FIFO gate until the preceding question closes; cancellation also
 cancels queued waits. Web clients additionally queue question events across
 Sessions. Closing a queued question cannot dismiss an unrelated settings dialog.
 
+Persisted assistant `meta.stop_reason` and `meta.truncated` markers are visible
+in Web transcript history, including after reopening a Session: output-token and
+context-window limits, model pauses, refusals and content filters get explanatory
+notes; unknown stop reasons are shown explicitly. Existing provider placeholder
+notes do not get a duplicate label, and normal completions get no stop label.
+
 Web approval and promotion decisions remain pending locally until the daemon
 confirms resolution; failures report that the decision was not delivered and
 remain answerable. Recap and rating controls are rebuilt from current Run state

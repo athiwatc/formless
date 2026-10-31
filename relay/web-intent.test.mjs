@@ -196,7 +196,7 @@ test('hostile persisted Markdown has bounded nesting and preserves readable text
 });
 test('live MessageComplete → RunRecap → RunFinished updates recap/rating outside cached body', async () => {
   const transcript = node('div'), cached = new Map();
-  const c = setup(['renderHistory', 'messageBody', 'rateButtons', 'onEvent'], {
+  const c = setup(['renderHistory', 'messageBody', 'rateButtons', 'onEvent', 'assistantStopNote'], {
     h: node, notifyFor() {}, renderPlan() {}, refreshSessions() {}, renderStatus() {}, renderComposer() {}, renderLive() {}, scrollToBottom() {}, renderRunBanner() {}, setActivity() {},
     markdown: text => node('p', null, text), speaker: () => 'assistant', clock: () => '',
     recapBlock: r => node('recap', null, r.label), tr: x => x,
@@ -279,4 +279,32 @@ test('local and relay reconnect rebuild pending prompts/running and reject stale
     assert.deepEqual(Array.from(c.S.approvals, a => a.id), ['arrived-live']);
     assert.equal(c.S.pendingQuestion, null);
   }
+});
+
+test('persisted assistant stop reasons render explanatory notes when Session is reopened', () => {
+  const c = setup(['assistantStopNote']);
+  for (const [reason, expected] of [
+    ['max_tokens', /output token limit/], ['model_context_window_exceeded', /context window is full/],
+    ['pause_turn', /paused its turn/], ['refusal', /refused/], ['content_filter', /content filter/], ['other_reason', /ended early \(other_reason\)/],
+  ]) {
+    assert.match(c.assistantStopNote({ meta: JSON.stringify({ stop_reason: reason }) }), expected);
+  }
+  assert.match(c.assistantStopNote({ meta: '{"truncated":true}' }), /output token limit/);
+  assert.equal(c.assistantStopNote({ meta: '{"placeholder":true,"stop_reason":"refusal"}' }), null);
+  assert.equal(c.assistantStopNote({ meta: '{}' }), null);
+  assert.equal(c.assistantStopNote({ meta: 'invalid' }), null);
+
+  const transcript = node('div');
+  const view = setup(['renderHistory', 'messageBody', 'rateButtons', 'assistantStopNote'], {
+    h: node, isRunning: () => false, markdown: text => node('p', null, text), speaker: () => 'assistant', clock: () => '',
+    renderLive() {}, scrollToBottom() {}, tr: x => x,
+  });
+  view.$ = () => transcript;
+  vm.runInContext('const rendered = new Map(); const WHO = { assistant: "Formless" };', view);
+  view.S.daemonOnline = true;
+  view.S.messages = [{ id: 'persisted', role: 'assistant', content: 'partial output', meta: '{"truncated":true,"stop_reason":"max_tokens"}' }];
+  view.renderHistory();
+  assert.match(plainText(transcript), /partial output/);
+  assert.match(plainText(transcript), /answer was cut off/);
+  assert.equal(all(transcript).filter(n => n.attrs.class === 'muted stop-note').length, 1);
 });

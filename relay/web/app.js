@@ -1687,6 +1687,22 @@
     popover.querySelector("button").focus();
   }
 
+  function assistantStopNote(message) {
+    let meta;
+    try { meta = JSON.parse(message.meta || "{}"); } catch (_) { return null; }
+    if (meta.placeholder) return null; // Already shown as a provider stop note.
+    const reason = typeof meta.stop_reason === "string" && meta.stop_reason
+      ? meta.stop_reason : meta.truncated === true ? "max_tokens" : null;
+    if (!reason) return null;
+    const notes = {
+      max_tokens: "The answer was cut off at the model's output token limit.",
+      model_context_window_exceeded: "The answer stopped because the model's context window is full.",
+      pause_turn: "The model paused its turn; ask it to continue.",
+      refusal: "The model refused this request.",
+      content_filter: "The provider's content filter stopped this answer.",
+    };
+    return notes[reason] || "The answer ended early (" + reason + ").";
+  }
   function renderHistory() {
     const box = $("transcript");
     box.replaceChildren();
@@ -1736,6 +1752,8 @@
           // An empty refusal/filter stop: the daemon's note, not the model's words.
           if (placeholder) n.append(h("div", { class: "muted stop-note" }, m.content));
           else if (m.content) n.append(markdown(m.content));
+          const stopNote = assistantStopNote(m);
+          if (stopNote) n.append(h("div", { class: "muted stop-note" }, stopNote));
           let calls = [];
           try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
           calls.forEach((c) => n.append(toolCallChip(c)));
