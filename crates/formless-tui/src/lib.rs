@@ -499,8 +499,15 @@ struct ApprovalReq {
 }
 
 enum WizardJob {
-    Models(Result<Vec<String>, String>),
-    Probe(Result<ProbeResult, String>),
+    Models(u64, Result<Vec<String>, String>),
+    Probe(u64, Result<ProbeResult, String>),
+}
+
+#[derive(Debug, PartialEq)]
+enum WizardKeyUpdate {
+    Preserve,
+    Save(String),
+    ConfirmClear,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -537,11 +544,23 @@ struct Wizard {
     streaming: bool,
     /// Ctrl+R: show the API key in full while typing it.
     reveal_key: bool,
+    reveal_until: Option<Instant>,
+    generation: u64,
+    /// Endpoint under which the current key/model were entered.
+    credential_endpoint: String,
+    /// Only an explicitly re-opened setup can return to an existing Session.
+    can_cancel: bool,
+    confirm_key_change: bool,
+    key_change_confirmed: bool,
+    draft_changed: Option<Instant>,
+    saved_draft: Option<serde_json::Value>,
     jobs: mpsc::Receiver<WizardJob>,
     job_tx: mpsc::Sender<WizardJob>,
 }
 
 const EFFORTS: [Option<&str>; 4] = [None, Some("low"), Some("medium"), Some("high")];
+const KEY_REVEAL_TIME: Duration = Duration::from_secs(10);
+const WIZARD_DRAFT_DELAY: Duration = Duration::from_millis(300);
 
 impl Wizard {
     fn new(cfg: &Config) -> Self {
@@ -553,7 +572,7 @@ impl Wizard {
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
-                "Saved setup found. Re-enter your API key to restore it (Esc to choose another provider).".into(),
+                "Saved setup found. Enter a replacement API key, or press Enter to reuse its stored key when available (Esc to choose another provider).".into(),
             )
         } else {
             (
@@ -588,6 +607,14 @@ impl Wizard {
             prompt_fallback: false,
             streaming: true,
             reveal_key: false,
+            reveal_until: None,
+            generation: 0,
+            credential_endpoint: cfg.provider.base_url.trim().to_string(),
+            can_cancel: false,
+            confirm_key_change: false,
+            key_change_confirmed: false,
+            draft_changed: None,
+            saved_draft: None,
             jobs,
             job_tx,
         }
@@ -623,6 +650,7 @@ impl Wizard {
             self.preset_idx = formless_core::presets::PRESETS.len();
         }
         self.base_url = d["base_url"].as_str().unwrap_or_default().to_string();
+        self.credential_endpoint = self.base_url.trim().to_string();
         if let Some(m) = d["model"].as_str().filter(|m| !m.is_empty()) {
             self.saved_model = m.to_string();
         }
@@ -691,13 +719,20 @@ impl Wizard {
 
     /// The key as shown: `••••abcd`, or in full after Ctrl+R (#396).
     fn shown_key(&self) -> String {
-        if self.reveal_key {
-            return self.api_key.clone();
+        let key = self.api_key.trim();
+        if self.step == WizardStep::ApiKey
+            && self.reveal_key
+            && self
+                .reveal_until
+                .is_some_and(|until| Instant::now() < until)
+        {
+            return key.to_string();
         }
-        let n = self.api_key.chars().count();
-        let tail: String = self.api_key.chars().skip(n.saturating_sub(4)).collect();
-        if n > 8 {
-            format!("{}{tail}", "•".repeat(n - 4))
+        let n = key.chars().count();
+        let visible = 4.min(n / 2);
+        let tail: String = key.chars().skip(n - visible).collect();
+        if visible > 0 {
+            format!("{}{tail}", "•".repeat(n - visible))
         } else {
             "•".repeat(n)
         }
@@ -706,9 +741,68 @@ impl Wizard {
         self.picker.choice().unwrap_or_default()
     }
 
+    fn hide_key(&mut self) {
+        self.reveal_key = false;
+        self.reveal_until = None;
+    }
+
+    fn invalidate_jobs(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.hide_key();
+        self.confirm_key_change = false;
+        self.key_change_confirmed = false;
+    }
+
+    fn clear_provider_state(&mut self) {
+        self.invalidate_jobs();
+        self.api_key.clear();
+        self.saved_model.clear();
+        self.picker = picker::ModelPicker::loading();
+        self.effort_idx = 0;
+        self.prompt_fallback = false;
+        self.streaming = true;
+    }
+
+    /// Trimming is Unicode-aware. Embedded whitespace almost always means a
+    /// bad paste; report it before sending a credential to any endpoint.
+    fn normalize_key(&mut self) -> bool {
+        self.hide_key();
+        self.api_key = self.api_key.trim().to_string();
+        if self.api_key.chars().any(char::is_whitespace) {
+            self.status =
+                "The API key contains whitespace inside it. Remove it before continuing.".into();
+            false
+        } else {
+            true
+        }
+    }
+
+    fn bind_custom_endpoint(&mut self) {
+        let endpoint = self.base_url.trim().to_string();
+        if endpoint != self.credential_endpoint {
+            self.clear_provider_state();
+        }
+        self.base_url = endpoint.clone();
+        self.credential_endpoint = endpoint;
+    }
+
+    fn key_update(&self, previous_endpoint: &str, has_credential: bool) -> WizardKeyUpdate {
+        let key = self.api_key.trim();
+        if !key.is_empty() {
+            WizardKeyUpdate::Save(key.to_string())
+        } else if previous_endpoint.trim() == self.base_url.trim() || !has_credential {
+            WizardKeyUpdate::Preserve
+        } else if self.key_change_confirmed {
+            WizardKeyUpdate::Save(String::new())
+        } else {
+            WizardKeyUpdate::ConfirmClear
+        }
+    }
+
     /// The API-key step, with the preset's key page and any key found in
     /// the environment.
     fn enter_api_key_step(&mut self) {
+        self.hide_key();
         self.step = WizardStep::ApiKey;
         let mut status = String::from("Enter your API key (stored in the OS keychain).");
         if let Some(p) = self.preset {
@@ -724,6 +818,12 @@ impl Wizard {
 
     /// List the endpoint's models in the background (`FetchModels`).
     fn fetch_models(&mut self) {
+        if !self.normalize_key() {
+            self.step = WizardStep::ApiKey;
+            return;
+        }
+        self.invalidate_jobs();
+        let generation = self.generation;
         self.step = WizardStep::FetchModels;
         self.status = format!("Fetching models from {}…", self.base_url.trim());
         let (tx, mut cfg) = (self.job_tx.clone(), Config::default());
@@ -734,6 +834,7 @@ impl Wizard {
         let (pcfg, key) = (cfg.provider.clone(), self.api_key.clone());
         std::thread::spawn(move || {
             let _ = tx.send(WizardJob::Models(
+                generation,
                 list_models_blocking(&pcfg, &key).map_err(|e| e.to_string()),
             ));
         });
@@ -742,13 +843,23 @@ impl Wizard {
     /// Apply the highlighted preset (or go to the custom URL step).
     fn choose_preset(&mut self) {
         let Some(p) = formless_core::presets::PRESETS.get(self.preset_idx) else {
+            if self.preset.is_some() {
+                self.clear_provider_state();
+                self.credential_endpoint.clear();
+            }
             self.preset = None;
             self.step = WizardStep::BaseUrl;
             self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
             return;
         };
+        if self.preset.map(|old| old.id) != Some(p.id)
+            || self.credential_endpoint != p.base_url.trim()
+        {
+            self.clear_provider_state();
+        }
         self.preset = Some(p);
         self.base_url = p.base_url.to_string();
+        self.credential_endpoint = p.base_url.trim().to_string();
         if self.saved_model.is_empty() {
             self.saved_model = p.default_model.to_string();
         }
@@ -792,12 +903,13 @@ fn load_seen(paths: &Paths) -> Seen {
 /// The tour's sample task: small, and it makes the agent build a Tool.
 const TOUR_TASK: &str = "Build a Tool that counts the words, lines and characters of a text, then use it on: \"The quick brown fox jumps over the lazy dog.\"";
 
+#[cfg(test)]
 fn wizard_draft_file(paths: &Paths) -> std::path::PathBuf {
-    paths.config_dir.join("setup-draft.json")
+    formless_core::setup_draft::file(paths)
 }
 
 fn load_wizard_draft(paths: &Paths) -> Option<serde_json::Value> {
-    serde_json::from_str(&std::fs::read_to_string(wizard_draft_file(paths)).ok()?).ok()
+    formless_core::setup_draft::load(paths)
 }
 
 /// Something answers on a local server's port (a quick TCP check).
@@ -5689,6 +5801,7 @@ impl App {
                 match Config::load(&self.paths) {
                     Ok(cfg) => {
                         let mut w = Wizard::new(&cfg);
+                        w.can_cancel = cfg.provider.is_configured();
                         if w.step == WizardStep::PickPreset {
                             w.offer_local();
                         }
@@ -6032,9 +6145,27 @@ impl App {
     fn wizard_poll(&mut self) {
         let mut finish = false;
         if let Some(w) = &mut self.wizard {
+            if w.reveal_until.is_some_and(|until| Instant::now() >= until) {
+                w.hide_key();
+            }
             while let Ok(job) = w.jobs.try_recv() {
+                let current = match &job {
+                    WizardJob::Models(generation, _) => {
+                        *generation == w.generation && w.step == WizardStep::FetchModels
+                    }
+                    WizardJob::Probe(generation, _) => {
+                        *generation == w.generation && w.step == WizardStep::Probing
+                    }
+                };
+                if !current {
+                    continue;
+                }
+                // An operation settles once; duplicate deliveries cannot
+                // override its outcome or finish a subsequently edited flow.
+                w.generation = w.generation.wrapping_add(1);
+                w.draft_changed = Some(Instant::now());
                 match job {
-                    WizardJob::Models(Ok(models)) if !models.is_empty() => {
+                    WizardJob::Models(_, Ok(models)) if !models.is_empty() => {
                         let items = models
                             .into_iter()
                             .map(|id| picker::ModelItem {
@@ -6048,7 +6179,7 @@ impl App {
                         w.step = WizardStep::PickModel;
                         w.status = "Pick a model: type to filter, Up/Down, Enter.".into();
                     }
-                    WizardJob::Models(Err(e)) if w.retry_fetch => {
+                    WizardJob::Models(_, Err(e)) if w.retry_fetch => {
                         w.step = WizardStep::Failed;
                         w.status = format!(
                             "Can't reach {} ({e}). Start the server, then press Enter to retry (Esc for another provider).",
@@ -6058,7 +6189,7 @@ impl App {
                     // Why the listing failed decides what comes next (#744):
                     // a rejected key goes back to the key, anything else says
                     // what happened and lets a model name be typed.
-                    WizardJob::Models(Err(e)) => {
+                    WizardJob::Models(_, Err(e)) => {
                         let why = wizard_explain(&e, &w.base_url, "");
                         if why.category == "auth" {
                             w.enter_api_key_step();
@@ -6075,23 +6206,23 @@ impl App {
                             );
                         }
                     }
-                    WizardJob::Models(_) => {
+                    WizardJob::Models(_, _) => {
                         w.picker = picker::ModelPicker::new(Vec::new());
                         w.picker.query = w.saved_model.clone();
                         w.step = WizardStep::PickModel;
                         w.status =
                             "The endpoint listed no models; type a model name, then Enter.".into();
                     }
-                    WizardJob::Probe(Ok(r)) if r.tool_calling => {
+                    WizardJob::Probe(_, Ok(r)) if r.tool_calling => {
                         w.prompt_fallback = r.prompt_fallback;
                         w.streaming = r.streaming;
                         finish = true;
                     }
-                    WizardJob::Probe(Ok(_)) => {
+                    WizardJob::Probe(_, Ok(_)) => {
                         w.step = WizardStep::Failed;
                         w.status = "This endpoint/model supports neither native nor prompt-based tool-calling. Press Enter to pick another model.".into();
                     }
-                    WizardJob::Probe(Err(e)) => {
+                    WizardJob::Probe(_, Err(e)) => {
                         let why = wizard_explain(&e, &w.base_url, &w.model());
                         if why.category == "auth" {
                             w.enter_api_key_step();
@@ -6117,11 +6248,26 @@ impl App {
                 }
             }
         }
+        self.flush_wizard_draft(false);
     }
 
     fn wizard_finish(&mut self) -> Result<()> {
-        let w = self.wizard.take().expect("wizard");
-        let mut cfg = Config::load(&self.paths)?;
+        let w = self.wizard.as_mut().expect("wizard");
+        if !w.normalize_key() {
+            w.step = WizardStep::ApiKey;
+            return Ok(());
+        }
+        let mut cfg = Config::load_file_only(&self.paths)?;
+        let key_update = w.key_update(
+            &cfg.provider.base_url,
+            formless_core::config::load_api_key(&self.paths).is_some(),
+        );
+        if key_update == WizardKeyUpdate::ConfirmClear {
+            w.confirm_key_change = true;
+            w.step = WizardStep::Failed;
+            w.status = "This endpoint uses no new key. Enter to confirm removing the previous endpoint's stored key, or Esc to go back. Nothing has been saved yet.".into();
+            return Ok(());
+        }
         cfg.provider.base_url = w.base_url.trim().to_string();
         if let Some(p) = w.preset {
             cfg.provider.api_style = p.api_style.to_string();
@@ -6132,8 +6278,11 @@ impl App {
             cfg.provider.tool_mode = "prompt".into();
         }
         cfg.save(&self.paths)?;
-        save_api_key(&self.paths, &w.api_key)?;
-        let _ = std::fs::remove_file(wizard_draft_file(&self.paths));
+        if let WizardKeyUpdate::Save(key) = key_update {
+            save_api_key(&self.paths, &key)?;
+        }
+        let w = self.wizard.take().expect("wizard");
+        let _ = formless_core::setup_draft::discard(&self.paths);
         // A guided first task, offered once (#393).
         if !self.seen.tour_offered {
             self.seen.tour_offered = true;
@@ -6161,26 +6310,76 @@ impl App {
     }
 
     fn wizard_key(&mut self, key: KeyEvent) {
+        let before = self.wizard.as_ref().map(Wizard::draft);
         self.wizard_step_key(key);
-        // Keep where the user got to (never the key), so quitting halfway
-        // resumes there next time (#397).
-        if let Some(w) = &self.wizard {
-            let _ = std::fs::create_dir_all(&self.paths.config_dir);
-            let _ = std::fs::write(wizard_draft_file(&self.paths), w.draft().to_string());
+        if let Some(w) = &mut self.wizard {
+            if before.as_ref() != Some(&w.draft()) {
+                w.draft_changed = Some(Instant::now());
+            }
         }
     }
 
+    fn flush_wizard_draft(&mut self, force: bool) {
+        let Some(w) = &mut self.wizard else { return };
+        if !w
+            .draft_changed
+            .is_some_and(|at| force || at.elapsed() >= WIZARD_DRAFT_DELAY)
+        {
+            return;
+        }
+        let draft = w.draft();
+        if w.saved_draft.as_ref() != Some(&draft) {
+            match formless_core::setup_draft::save(&self.paths, &draft) {
+                Ok(()) => w.saved_draft = Some(draft),
+                Err(e) => self
+                    .notes
+                    .push(format!("could not save setup progress: {e}")),
+            }
+        }
+        w.draft_changed = None;
+    }
+
     fn wizard_step_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc
+            && self
+                .wizard
+                .as_ref()
+                .is_some_and(|w| w.can_cancel && w.step == WizardStep::PickPreset)
+        {
+            self.wizard = None;
+            let _ = formless_core::setup_draft::discard(&self.paths);
+            self.notes
+                .push("Setup cancelled; your existing setup is unchanged.".into());
+            return;
+        }
+        if key.code == KeyCode::Enter && self.wizard.as_ref().is_some_and(|w| w.confirm_key_change)
+        {
+            if let Some(w) = &mut self.wizard {
+                w.confirm_key_change = false;
+                w.key_change_confirmed = true;
+            }
+            if let Err(e) = self.wizard_finish() {
+                if let Some(w) = &mut self.wizard {
+                    w.status = format!("Saving config failed: {e}");
+                }
+            }
+            return;
+        }
         let Some(w) = &mut self.wizard else { return };
         let presets = formless_core::presets::PRESETS.len();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+R shows the key while typing it (#396).
         if ctrl && key.code == KeyCode::Char('r') {
-            w.reveal_key = !w.reveal_key;
+            if w.step == WizardStep::ApiKey {
+                w.reveal_key = !w.reveal_key;
+                w.reveal_until = w.reveal_key.then(|| Instant::now() + KEY_REVEAL_TIME);
+            }
             return;
         }
         // Esc goes back one step everywhere, keeping what was typed (#395).
         if key.code == KeyCode::Esc {
+            let cancelled = matches!(w.step, WizardStep::FetchModels | WizardStep::Probing);
+            w.invalidate_jobs();
             let local = w.preset.is_some_and(|p| p.local);
             let (step, status) = match w.step {
                 WizardStep::PickPreset => return,
@@ -6195,6 +6394,9 @@ impl App {
                 }
                 WizardStep::FetchModels | WizardStep::PickModel => {
                     w.enter_api_key_step();
+                    if cancelled {
+                        w.status = format!("Cancelled pending request. {}", w.status);
+                    }
                     return;
                 }
                 WizardStep::PickEffort => (WizardStep::PickModel, "Pick a model."),
@@ -6204,11 +6406,18 @@ impl App {
             };
             w.retry_fetch = false;
             w.step = step;
-            w.status = status.into();
+            w.status = if cancelled {
+                format!("Cancelled pending request. {status}")
+            } else {
+                status.into()
+            };
             return;
         }
         if ctrl {
             return;
+        }
+        if key.code == KeyCode::Enter {
+            w.hide_key();
         }
         match w.step {
             WizardStep::PickPreset => match key.code {
@@ -6225,7 +6434,10 @@ impl App {
                 _ => {}
             },
             WizardStep::BaseUrl => match key.code {
-                KeyCode::Enter if !w.base_url.trim().is_empty() => w.enter_api_key_step(),
+                KeyCode::Enter if !w.base_url.trim().is_empty() => {
+                    w.bind_custom_endpoint();
+                    w.enter_api_key_step();
+                }
                 KeyCode::Char(c) => w.base_url.push(c),
                 KeyCode::Backspace => {
                     w.base_url.pop();
@@ -6234,9 +6446,24 @@ impl App {
             },
             WizardStep::ApiKey => match key.code {
                 KeyCode::Enter => {
+                    if !w.normalize_key() {
+                        return;
+                    }
                     if w.api_key.is_empty() {
                         if let Some((_, k)) = w.preset.and_then(formless_core::presets::env_key) {
                             w.api_key = k;
+                        }
+                    }
+                    if w.api_key.is_empty() {
+                        // A saved credential belongs to the on-disk endpoint,
+                        // not whichever provider the wizard has since selected.
+                        if let Ok(saved) = Config::load_file_only(&self.paths) {
+                            if !saved.provider.base_url.trim().is_empty()
+                                && saved.provider.base_url.trim() == w.base_url.trim()
+                            {
+                                w.api_key = formless_core::config::load_api_key(&self.paths)
+                                    .unwrap_or_default();
+                            }
                         }
                     }
                     w.retry_fetch = false;
@@ -6263,6 +6490,12 @@ impl App {
                 KeyCode::Up => w.effort_idx = w.effort_idx.saturating_sub(1),
                 KeyCode::Down => w.effort_idx = (w.effort_idx + 1).min(EFFORTS.len() - 1),
                 KeyCode::Enter => {
+                    if !w.normalize_key() {
+                        w.step = WizardStep::ApiKey;
+                        return;
+                    }
+                    w.invalidate_jobs();
+                    let generation = w.generation;
                     w.step = WizardStep::Probing;
                     w.status = "Probing endpoint (connectivity + streaming + tool-calling)…".into();
                     let tx = w.job_tx.clone();
@@ -6277,6 +6510,7 @@ impl App {
                     let (key2, model) = (w.api_key.clone(), w.model());
                     std::thread::spawn(move || {
                         let _ = tx.send(WizardJob::Probe(
+                            generation,
                             probe_blocking(&pcfg, &key2, &model).map_err(|e| e.to_string()),
                         ));
                     });
@@ -11433,6 +11667,7 @@ impl App {
     /// setup wizard still quits at once.
     fn ctrl_c(&mut self) {
         if self.wizard.is_some() {
+            self.flush_wizard_draft(true);
             self.should_quit = true;
             return;
         }
@@ -14446,7 +14681,11 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     }
     text.push(Line::raw(""));
     text.push(Line::styled(
-        "Enter continue · Esc back · Ctrl+C quit",
+        if w.can_cancel {
+            "Enter continue · Esc back (at Provider: cancel) · Ctrl+C quit"
+        } else {
+            "Enter continue · Esc back · Ctrl+C quit"
+        },
         ui::dim(color),
     ));
     let width = area.width.min(84);
@@ -14598,6 +14837,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         }
         Ok(())
     })();
+    app.flush_wizard_draft(true);
     app.save_drafts();
     if app.enhanced_keys {
         let _ = stdout().execute(crossterm::event::PopKeyboardEnhancementFlags);
@@ -14698,6 +14938,10 @@ mod credential_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     fn test_app() -> App {
         let short = std::time::SystemTime::now()
@@ -15374,7 +15618,9 @@ mod tests {
         let mut w = Wizard::new(&Config::default());
         w.api_key = "sk-1234567890abcd".into();
         assert_eq!(w.shown_key(), format!("{}abcd", "•".repeat(13)));
+        w.step = WizardStep::ApiKey;
         w.reveal_key = true;
+        w.reveal_until = Some(Instant::now() + KEY_REVEAL_TIME);
         assert_eq!(w.shown_key(), "sk-1234567890abcd");
         // A draft never holds the key, and resumes at the key step.
         w.preset = formless_core::presets::find("openrouter");
@@ -15609,6 +15855,330 @@ mod tests {
     /// unreachable endpoint says so; only an empty list just asks for a
     /// model name (#744).
     #[test]
+    fn wizard_ignores_cancelled_jobs_and_old_provider_results() {
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "https://openrouter.ai/api/v1".into();
+        cfg.provider.model = "provider-a-model".into();
+        let mut w = Wizard::new(&cfg);
+        w.api_key = "provider-a-key".into();
+        w.step = WizardStep::FetchModels;
+        w.generation = 7;
+        let tx = w.job_tx.clone();
+        app.wizard = Some(w);
+        app.wizard_key(key(KeyCode::Esc));
+        assert!(app.wizard.as_ref().unwrap().status.contains("Cancelled"));
+        let w = app.wizard.as_mut().unwrap();
+        w.preset_idx = 0; // OpenAI, without starting a fetch.
+        w.choose_preset();
+        let expected = w.base_url.clone();
+        let generation = w.generation;
+        // Even at a new operation's expected step, the old generation loses.
+        w.step = WizardStep::FetchModels;
+        tx.send(WizardJob::Models(
+            7,
+            Ok(vec!["wrong-provider-model".into()]),
+        ))
+        .unwrap();
+        app.wizard_poll();
+        let w = app.wizard.as_ref().unwrap();
+        assert_eq!(w.step, WizardStep::FetchModels);
+        assert_eq!(w.base_url, expected);
+        assert!(w.api_key.is_empty());
+        tx.send(WizardJob::Models(
+            generation,
+            Ok(vec!["current-model".into()]),
+        ))
+        .unwrap();
+        app.wizard_poll();
+        assert_eq!(app.wizard.as_ref().unwrap().model(), "current-model");
+
+        let w = app.wizard.as_mut().unwrap();
+        w.step = WizardStep::Probing;
+        w.api_key = "invalid internal whitespace".into(); // No accidental save on a test failure.
+        let generation = w.generation;
+        app.wizard_key(key(KeyCode::Esc));
+        let probe = || ProbeResult {
+            models: vec![],
+            streaming: true,
+            tool_calling: true,
+            prompt_fallback: false,
+        };
+        tx.send(WizardJob::Probe(generation, Ok(probe()))).unwrap();
+        app.wizard_poll();
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickEffort);
+        assert!(!app.paths.config_file().exists());
+        // Matching generation alone is insufficient after backing out.
+        let generation = app.wizard.as_ref().unwrap().generation;
+        tx.send(WizardJob::Probe(generation, Ok(probe()))).unwrap();
+        app.wizard_poll();
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickEffort);
+    }
+
+    #[test]
+    fn wizard_credentials_and_models_are_bound_to_the_provider_endpoint() {
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "https://openrouter.ai/api/v1".into();
+        cfg.provider.model = "saved-model".into();
+        let mut w = Wizard::new(&cfg);
+        w.api_key = "provider-a-key".into();
+        w.choose_preset(); // Selecting the same preset preserves deliberate input.
+        assert_eq!(w.api_key, "provider-a-key");
+        assert_eq!(w.saved_model, "saved-model");
+        w.preset_idx = formless_core::presets::PRESETS.len();
+        w.choose_preset();
+        assert!(w.api_key.is_empty() && w.saved_model.is_empty());
+        assert!(
+            w.jobs.try_recv().is_err(),
+            "no request was sent with the old key"
+        );
+        w.base_url = "https://custom.example/v1".into();
+        w.bind_custom_endpoint();
+        w.enter_api_key_step();
+        assert!(w.api_key.is_empty());
+        w.api_key = "custom-key".into();
+        w.saved_model = "custom-model".into();
+        w.base_url = "https://different.example/v1".into();
+        w.bind_custom_endpoint();
+        assert!(w.api_key.is_empty() && w.saved_model.is_empty());
+    }
+
+    #[test]
+    fn cancelling_reopened_setup_preserves_config_credentials_and_client() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "https://openrouter.ai/api/v1".into();
+        cfg.provider.model = "saved-model".into();
+        cfg.save(&app.paths).unwrap();
+        // This private fallback fixture never touches a live OS keychain.
+        formless_core::config::write_secret_file(&app.paths.key_fallback_file(), "stored-key")
+            .unwrap();
+        let config = std::fs::read(app.paths.config_file()).unwrap();
+        let credential = std::fs::read(app.paths.key_fallback_file()).unwrap();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.slash("setup");
+        assert!(app.wizard.as_ref().unwrap().can_cancel);
+        for _ in 0..3 {
+            app.wizard_key(key(KeyCode::Esc));
+            if app.wizard.is_none() {
+                break;
+            }
+        }
+        assert!(app.wizard.is_none());
+        assert!(!app.should_quit);
+        assert!(app.client.is_some());
+        assert!(
+            sent.try_recv().is_err(),
+            "cancel never reconfigures/restarts the daemon"
+        );
+        assert_eq!(std::fs::read(app.paths.config_file()).unwrap(), config);
+        assert_eq!(
+            std::fs::read(app.paths.key_fallback_file()).unwrap(),
+            credential
+        );
+        app.wizard = Some(Wizard::new(&Config::default()));
+        app.wizard_key(key(KeyCode::Esc));
+        assert!(
+            app.wizard.is_some(),
+            "first-run setup retains its original exit behavior"
+        );
+    }
+
+    #[test]
+    fn an_empty_setup_key_preserves_only_the_same_endpoints_credential() {
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "https://saved.example/v1".into();
+        let mut w = Wizard::new(&cfg);
+        assert_eq!(
+            w.key_update(&cfg.provider.base_url, true),
+            WizardKeyUpdate::Preserve
+        );
+        w.base_url = "http://localhost:11434/v1".into();
+        assert_eq!(
+            w.key_update(&cfg.provider.base_url, true),
+            WizardKeyUpdate::ConfirmClear
+        );
+        assert_eq!(
+            w.key_update(&cfg.provider.base_url, false),
+            WizardKeyUpdate::Preserve
+        );
+        w.key_change_confirmed = true;
+        assert_eq!(
+            w.key_update(&cfg.provider.base_url, true),
+            WizardKeyUpdate::Save(String::new())
+        );
+        w.api_key = "  replacement-key\u{a0}".into();
+        assert_eq!(
+            w.key_update(&cfg.provider.base_url, true),
+            WizardKeyUpdate::Save("replacement-key".into())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_key_enter_reuses_a_saved_key_only_for_its_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env = credential_env::EnvGuard::isolated();
+        for changed_endpoint in [false, true] {
+            let mut app = test_app();
+            let saved_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut cfg = Config::default();
+            cfg.provider.base_url = format!("http://{}/v1", saved_listener.local_addr().unwrap());
+            cfg.provider.model = "fixture-model".into();
+            cfg.save(&app.paths).unwrap();
+            formless_core::config::write_secret_file(
+                &app.paths.key_fallback_file(),
+                "synthetic-saved-key",
+            )
+            .unwrap();
+            let mut w = Wizard::new(&cfg);
+            assert!(w.api_key.is_empty());
+            let listener = if changed_endpoint {
+                w.base_url = format!("http://{}/v1", other_listener.local_addr().unwrap());
+                w.bind_custom_endpoint();
+                drop(saved_listener);
+                other_listener
+            } else {
+                drop(other_listener);
+                saved_listener
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("model request did not reach the fixture")
+                        .unwrap();
+                let mut headers = Vec::new();
+                let mut buffer = [0; 1024];
+                while !headers.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                        .await
+                        .expect("model request headers stalled")
+                        .unwrap();
+                    assert!(n > 0, "model request ended before its headers");
+                    headers.extend_from_slice(&buffer[..n]);
+                    assert!(headers.len() < 16 * 1024);
+                }
+                let body = r#"{"data":[{"id":"fixture-model"}]}"#;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8(headers).unwrap().to_ascii_lowercase()
+            });
+            app.wizard = Some(w);
+            app.wizard_key(key(KeyCode::Enter));
+            let headers = server.await.unwrap();
+            assert!(headers.starts_with("get /v1/models "));
+            assert_eq!(
+                headers.contains("authorization: bearer synthetic-saved-key"),
+                !changed_endpoint,
+            );
+            if changed_endpoint {
+                assert!(!headers.contains("authorization:"));
+                assert!(app.wizard.as_ref().unwrap().api_key.is_empty());
+            } else {
+                assert_eq!(app.wizard.as_ref().unwrap().api_key, "synthetic-saved-key");
+            }
+            // Receive the final worker result before releasing the credential
+            // guard; no fetch/probe task can outlive its fixture environment.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.wizard.as_ref().unwrap().step == WizardStep::FetchModels {
+                    app.wizard_poll();
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("model worker did not finish");
+            assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickModel);
+            assert_eq!(app.wizard.as_ref().unwrap().model(), "fixture-model");
+        }
+    }
+
+    #[test]
+    fn wizard_trims_keys_warns_on_internal_whitespace_and_limits_reveal() {
+        let mut w = Wizard::new(&Config::default());
+        w.step = WizardStep::ApiKey;
+        w.api_key = "\u{a0} \tboundary-key\u{2003} ".into();
+        assert!(w.normalize_key());
+        assert_eq!(w.api_key, "boundary-key");
+        assert!(w.shown_key().ends_with("-key"));
+        for (key, shown) in [
+            ("x", "•"),
+            ("ab", "•b"),
+            ("abcd", "••cd"),
+            ("abcdefgh", "••••efgh"),
+        ] {
+            w.api_key = key.into();
+            assert_eq!(w.shown_key(), shown);
+        }
+        w.api_key = "internal\u{a0}space".into();
+        w.fetch_models(); // Invalid paste never starts a background request.
+        assert_eq!(w.step, WizardStep::ApiKey);
+        assert!(w.status.contains("whitespace inside"));
+        assert!(w.jobs.try_recv().is_err());
+        w.api_key = "synthetic-key".into();
+        let mut app = test_app();
+        app.wizard = Some(w);
+        app.wizard_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.wizard.as_ref().unwrap().shown_key(), "synthetic-key");
+        app.wizard.as_mut().unwrap().api_key = "invalid inside".into();
+        app.wizard_key(key(KeyCode::Enter));
+        assert!(
+            !app.wizard.as_ref().unwrap().reveal_key,
+            "Enter always re-hides the key"
+        );
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::ApiKey);
+        app.wizard.as_mut().unwrap().step = WizardStep::PickEffort;
+        app.wizard_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.wizard.as_ref().unwrap().step,
+            WizardStep::ApiKey,
+            "probe validates the key before spawning work"
+        );
+        app.wizard.as_mut().unwrap().api_key = "synthetic-key".into();
+        app.wizard_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.wizard.as_mut().unwrap().reveal_until = Some(Instant::now() - Duration::from_secs(1));
+        app.wizard_poll();
+        assert!(!app.wizard.as_ref().unwrap().reveal_key);
+        assert_ne!(app.wizard.as_ref().unwrap().shown_key(), "synthetic-key");
+        app.wizard_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.wizard_key(key(KeyCode::Esc));
+        assert!(!app.wizard.as_ref().unwrap().reveal_key);
+        app.wizard_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(
+            !app.wizard.as_ref().unwrap().reveal_key,
+            "no reveal outside the key step"
+        );
+    }
+
+    #[test]
+    fn wizard_draft_writes_are_coalesced_and_key_pastes_do_not_rewrite_them() {
+        let mut app = test_app();
+        let mut w = Wizard::new(&Config::default());
+        w.step = WizardStep::BaseUrl;
+        app.wizard = Some(w);
+        app.paste("https://example.com/v1");
+        assert!(
+            !wizard_draft_file(&app.paths).exists(),
+            "paste schedules one coalesced write"
+        );
+        app.wizard.as_mut().unwrap().draft_changed = Some(Instant::now() - WIZARD_DRAFT_DELAY);
+        app.flush_wizard_draft(false);
+        assert!(load_wizard_draft(&app.paths).is_some());
+        app.wizard_key(key(KeyCode::Enter));
+        app.flush_wizard_draft(true);
+        let before = std::fs::read(wizard_draft_file(&app.paths)).unwrap();
+        app.paste("synthetic-secret");
+        app.flush_wizard_draft(true);
+        assert_eq!(
+            std::fs::read(wizard_draft_file(&app.paths)).unwrap(),
+            before
+        );
+        assert!(!String::from_utf8_lossy(&before).contains("synthetic-secret"));
+    }
+
+    #[test]
     fn wizard_failures_say_why() {
         let mut app = test_app();
         let mut w = Wizard::new(&Config::default());
@@ -15616,16 +16186,19 @@ mod tests {
         w.step = WizardStep::FetchModels;
         let tx = w.job_tx.clone();
         app.wizard = Some(w);
-        tx.send(WizardJob::Models(Err(
-            "401 Unauthorized: invalid api key".into()
-        )))
+        tx.send(WizardJob::Models(
+            0,
+            Err("401 Unauthorized: invalid api key".into()),
+        ))
         .unwrap();
         app.wizard_poll();
         let w = app.wizard.as_ref().unwrap();
         assert_eq!(w.step, WizardStep::ApiKey);
         assert!(w.status.contains("API key was rejected"), "{}", w.status);
 
-        tx.send(WizardJob::Models(Err("404 Not Found: no route".into())))
+        app.wizard.as_mut().unwrap().step = WizardStep::FetchModels;
+        app.wizard.as_mut().unwrap().generation = 0;
+        tx.send(WizardJob::Models(0, Err("404 Not Found: no route".into())))
             .unwrap();
         app.wizard_poll();
         let w = app.wizard.as_ref().unwrap();
@@ -15636,7 +16209,9 @@ mod tests {
             w.status
         );
 
-        tx.send(WizardJob::Models(Ok(Vec::new()))).unwrap();
+        app.wizard.as_mut().unwrap().step = WizardStep::FetchModels;
+        app.wizard.as_mut().unwrap().generation = 0;
+        tx.send(WizardJob::Models(0, Ok(Vec::new()))).unwrap();
         app.wizard_poll();
         assert!(app
             .wizard

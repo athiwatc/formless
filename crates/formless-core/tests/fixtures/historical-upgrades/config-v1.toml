@@ -1,0 +1,11 @@
+[daemon]
+idle_grace_secs = 60
+
+[provider]
+base_url = "http://127.0.0.1:9/v1"
+model = "historical-fixture-model"
+context_tokens = 8192
+max_retries = 0
+
+[optimiser]
+cooldown_secs = 3600

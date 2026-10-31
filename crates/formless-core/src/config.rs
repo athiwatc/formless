@@ -1696,7 +1696,14 @@ impl Config {
             },
             Err(_) => fresh,
         };
-        write_atomic(&file, text.as_bytes()).with_context(|| format!("write {}", file.display()))
+        write_atomic(&file, text.as_bytes())
+            .with_context(|| format!("write {}", file.display()))?;
+        // A saved config supersedes any unfinished TUI setup, including when
+        // setup completed through the CLI or a daemon setting update.
+        if let Err(e) = crate::setup_draft::discard(paths) {
+            tracing::warn!("could not remove superseded setup draft: {e}");
+        }
+        Ok(())
     }
     fn apply_env(&mut self) -> Result<()> {
         if let Some(secure) = env_flag("FORMLESS_SECURE")? {
@@ -1931,8 +1938,9 @@ pub fn load_api_key(paths: &Paths) -> Option<String> {
     }
     if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &keyring_user(paths)) {
         if let Ok(k) = entry.get_password() {
-            if !k.is_empty() {
-                return Some(k);
+            let key = k.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
             }
         }
     }
