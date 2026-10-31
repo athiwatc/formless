@@ -4060,6 +4060,17 @@ without an approver fails closed.
 
 ## 19. Testing strategy (summary)
 
+Test waits for daemon subscriptions and pipe creation have a ten-second
+absolute timeout with a diagnostic naming the missing event. Test-running
+CI jobs have an explicit job timeout. The Windows transport gate parses a
+successful Ping payload and inspects the created pipe DACL: only the current
+user and SYSTEM receive allow ACEs. Subprocess fixtures are ignored by the
+normal test run and explicitly selected by their spawning tests. The PR CI
+assertion inventory reports tests without direct assertion macros for review
+(including deliberate no-panic rendering checks). Historical
+database rehearsals fail when their required fixture path is missing; storage
+latency smoke checks enforce a generous 100 ms per-operation ceiling.
+
 - Unit: schema validation, capability path containment, metrics math and
   trigger/promotion bars, compaction checkpoint round-trip.
 - Integration: daemon against a **mock OpenAI-compatible server** (scripted
