@@ -10691,12 +10691,10 @@ impl Daemon {
         let text = self.with_store(|st| {
             let (_s, prev_up_to) = st.latest_checkpoint(session_id)?.unwrap_or_default();
             let msgs = st.list_messages(session_id)?;
-            Ok(msgs
-                .iter()
-                .filter(|m| m.seq > prev_up_to && m.seq <= compact_up_to)
-                .map(|m| format!("{}: {}", m.role, m.content))
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(compaction_text(
+                msgs.iter()
+                    .filter(|m| m.seq > prev_up_to && m.seq <= compact_up_to),
+            ))
         })?;
         let cmodel = cfg
             .compaction
@@ -10731,23 +10729,12 @@ impl Daemon {
                         session_id: Some(session_id.to_string()),
                         text: format!("Server-side compaction unavailable ({e}); using daemon-side compaction."),
                     });
-                    counted(
-                        "compaction",
-                        session_id,
-                        "",
-                        provider.summarize(&input, &cmodel),
-                    )
-                    .await?
+                    summarize_in_chunks(provider, &input, &cmodel, context_tokens, session_id)
+                        .await?
                 }
             }
         } else {
-            counted(
-                "compaction",
-                session_id,
-                "",
-                provider.summarize(&input, &cmodel),
-            )
-            .await?
+            summarize_in_chunks(provider, &input, &cmodel, context_tokens, session_id).await?
         };
         let summary = if previous.is_empty() || condense {
             summary
@@ -13159,6 +13146,127 @@ mod internal_usage_tests {
     /// The daemon's own calls (here a compaction summary) are recorded
     /// with their purpose and serving provider, so usage views and the
     /// daily limit see them; calls outside `counted` are not (#806).
+    async fn compaction_daemon(
+        reply: Value,
+    ) -> (Arc<Daemon>, Arc<std::sync::atomic::AtomicUsize>, String) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = reply.clone();
+                async move { axum::Json(reply) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        std::env::set_var("FORMLESS_API_KEY", "k");
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let dir = std::env::temp_dir().join(format!("fl-cmp-{short}"));
+        let paths = crate::Paths {
+            data_dir: dir.join("d"),
+            config_dir: dir.join("c"),
+            profile: format!("test-cmp-{short}"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.provider.base_url = base;
+        cfg.provider.model = "m".into();
+        cfg.provider.max_retries = 0;
+        cfg.save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let sid = daemon
+            .with_store(|st| Ok(st.create_session(None)?.id))
+            .unwrap();
+        (daemon, calls, sid)
+    }
+
+    /// A summary cut off at the output limit, or empty, makes no
+    /// checkpoint: the turns stay (#619).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncated_summary_is_not_checkpointed() {
+        for reply in [
+            json!({"choices": [{"message": {"content": "half a summ"}, "finish_reason": "length"}]}),
+            json!({"choices": [{"message": {"content": "  "}, "finish_reason": "stop"}]}),
+        ] {
+            let (daemon, _, sid) = compaction_daemon(reply).await;
+            let last = daemon
+                .with_store(|st| {
+                    st.append_message(&sid, "user", "hello")?;
+                    Ok(st.append_message(&sid, "assistant", "hi")?.seq)
+                })
+                .unwrap();
+            let cfg = daemon.config().unwrap();
+            let provider = daemon.provider(&cfg).await.unwrap();
+            let err = daemon
+                .compact(&provider, &cfg, &sid, "m", 100_000, last, None)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("nothing was compacted"),
+                "{err:#}"
+            );
+            assert!(daemon
+                .with_store(|st| st.latest_checkpoint(&sid))
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    /// A history bigger than the summary's context is summarised in parts,
+    /// then merged; tool calls and results are part of what is summarised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_histories_are_summarised_in_parts() {
+        let ok =
+            json!({"choices": [{"message": {"content": "## Goal\nx"}, "finish_reason": "stop"}]});
+        let (daemon, calls, sid) = compaction_daemon(ok).await;
+        let last = daemon
+            .with_store(|st| {
+                let mut last = 0;
+                for i in 0..40 {
+                    last = st
+                        .append_message(&sid, "user", &format!("turn {i} {}", "word ".repeat(150)))?
+                        .seq;
+                }
+                Ok(last)
+            })
+            .unwrap();
+        let cfg = daemon.config().unwrap();
+        let provider = daemon.provider(&cfg).await.unwrap();
+        daemon
+            .compact(&provider, &cfg, &sid, "m", 4000, last, None)
+            .await
+            .unwrap();
+        let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(n >= 3, "parts plus a merge, got {n} calls");
+        assert!(daemon
+            .with_store(|st| st.latest_checkpoint(&sid))
+            .unwrap()
+            .is_some());
+
+        let call = formless_protocol::MessageInfo {
+            role: "assistant".into(),
+            content: String::new(),
+            meta: Some(json!({"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "grep", "arguments": "{\"q\":\"TODO\"}"}}]}).to_string()),
+            ..daemon.with_store(|st| Ok(st.list_messages(&sid)?.remove(0))).unwrap()
+        };
+        let result = formless_protocol::MessageInfo {
+            role: "tool".into(),
+            content: "3 matches".into(),
+            meta: Some(json!({"tool_call_id": "c1", "name": "grep"}).to_string()),
+            ..call.clone()
+        };
+        let text = compaction_text([call, result].iter());
+        assert!(
+            text.contains("assistant called grep({\"q\":\"TODO\"})"),
+            "{text}"
+        );
+        assert!(text.contains("result of grep: 3 matches"), "{text}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn counted_calls_are_recorded_by_purpose() {
         let app = axum::Router::new().route(
@@ -13498,4 +13606,121 @@ mod run_start_tests {
 /// one URL with different credentials may see different models (#770).
 fn windows_key(provider: &Provider) -> String {
     format!("{}\n{}", provider.name(), provider.settings().base_url)
+}
+
+/// What compaction summarises: each message with its role, and for the
+/// agent's tool calls and their results the Tool's name, arguments and
+/// (capped) result, which the plain message text leaves out (#619).
+fn compaction_text<'a>(msgs: impl Iterator<Item = &'a formless_protocol::MessageInfo>) -> String {
+    const CAP: usize = 2000;
+    let cap = |s: &str| -> String {
+        if s.chars().count() > CAP {
+            format!(
+                "{}… [{} more chars]",
+                s.chars().take(CAP).collect::<String>(),
+                s.chars().count() - CAP
+            )
+        } else {
+            s.to_string()
+        }
+    };
+    let mut out = Vec::new();
+    for m in msgs {
+        let meta: Value = m
+            .meta
+            .as_deref()
+            .and_then(|t| serde_json::from_str(t).ok())
+            .unwrap_or(Value::Null);
+        match m.role.as_str() {
+            "tool" => {
+                let name = meta["name"].as_str().unwrap_or("tool");
+                let failed = if meta["is_error"] == true {
+                    " (failed)"
+                } else {
+                    ""
+                };
+                out.push(format!("result of {name}{failed}: {}", cap(&m.content)));
+            }
+            role => {
+                if !m.content.trim().is_empty() {
+                    out.push(format!("{role}: {}", m.content));
+                }
+                for call in meta["tool_calls"].as_array().into_iter().flatten() {
+                    let f = &call["function"];
+                    out.push(format!(
+                        "{role} called {}({})",
+                        f["name"].as_str().unwrap_or("?"),
+                        cap(f["arguments"].as_str().unwrap_or_default())
+                    ));
+                }
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// Summarise `input`, in pieces when it is bigger than half the context
+/// the summary is made in, then merge the pieces' summaries (#619).
+async fn summarize_in_chunks(
+    provider: &Provider,
+    input: &str,
+    model: &str,
+    context_tokens: u32,
+    session_id: &str,
+) -> Result<String> {
+    let budget = (context_tokens as usize / 2).max(1000);
+    if crate::storage::estimate_tokens(input) <= budget {
+        return counted(
+            "compaction",
+            session_id,
+            "",
+            provider.summarize(input, model),
+        )
+        .await;
+    }
+    let mut chunks: Vec<String> = vec![String::new()];
+    for line in input.lines() {
+        let last = chunks.last_mut().expect("one chunk");
+        if !last.is_empty()
+            && crate::storage::estimate_tokens(last) + crate::storage::estimate_tokens(line)
+                > budget
+        {
+            chunks.push(String::new());
+        }
+        let last = chunks.last_mut().expect("one chunk");
+        if !last.is_empty() {
+            last.push('\n');
+        }
+        // A single line longer than the budget is cut to it.
+        let room = budget * 4;
+        last.push_str(&line.chars().take(room).collect::<String>());
+    }
+    let mut parts = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let framed = format!(
+            "Part {} of {} of the conversation, in order:\n{chunk}",
+            i + 1,
+            chunks.len()
+        );
+        parts.push(
+            counted(
+                "compaction",
+                session_id,
+                "",
+                provider.summarize(&framed, model),
+            )
+            .await?,
+        );
+    }
+    let merged = format!(
+        "Summaries of consecutive parts of one conversation, in order. Merge them into one:\n\n{}",
+        parts.join("\n\n")
+    );
+    counted(
+        "compaction",
+        session_id,
+        "",
+        provider.summarize(&merged, model),
+    )
+    .await
 }

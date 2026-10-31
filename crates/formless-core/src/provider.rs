@@ -90,9 +90,17 @@ pub fn looks_like_access_refusal(text: &str) -> bool {
     PATTERNS.iter().any(|p| t.contains(p))
 }
 
+/// What a compaction summary must keep, so later steps can carry on
+/// without the turns it replaces (#619).
 const SUMMARIZE_PROMPT: &str = "Summarise the following conversation excerpt \
-faithfully and compactly, preserving facts, decisions, names, and open \
-threads. Output only the summary.";
+faithfully and compactly; later steps will see only your summary, not the \
+excerpt. Use these sections, leaving out any that would be empty:\n\
+## Goal — what the user wants.\n\
+## Decisions — what was decided or agreed, and why.\n\
+## Changes — files, Tools and settings created or changed (exact names and paths).\n\
+## Facts — identifiers, values, commands, errors and results worth keeping verbatim.\n\
+## Open — what is unfinished, pending or was asked and not yet answered.\n\
+Keep it under about 600 words. Output only the summary.";
 
 fn url(base: &str, path: &str) -> String {
     format!("{}/{path}", base.trim_end_matches('/'))
@@ -1113,6 +1121,19 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<(String, Option<Usage>)> {
+        let (text, usage, _) = self.complete_full(messages, model, effort).await?;
+        Ok((text, usage))
+    }
+
+    /// A one-shot completion, its usage, and whether it stopped at the
+    /// output limit (`finish_reason: length`, an incomplete Responses
+    /// reply, Anthropic `max_tokens`) (#619).
+    pub async fn complete_full(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<(String, Option<Usage>, bool)> {
         let out = self
             .complete_with_usage_inner(messages, model, effort)
             .await?;
@@ -1125,7 +1146,7 @@ impl Provider {
         messages: &[Value],
         model: &str,
         effort: Option<&str>,
-    ) -> Result<(String, Option<Usage>)> {
+    ) -> Result<(String, Option<Usage>, bool)> {
         if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
             let (resp, _, _) = self.post_provider(&mut body, None, true).await?;
@@ -1134,7 +1155,8 @@ impl Provider {
                 return Err(anyhow!("provider error: {why}"));
             }
             let usage = Usage::parse(&v["usage"]);
-            return Ok((crate::anthropic::response_parts(&v).0, usage));
+            let cut = v["stop_reason"] == "max_tokens";
+            return Ok((crate::anthropic::response_parts(&v).0, usage, cut));
         }
         let mut body = if self.cfg.responses() {
             json!({"model": model, "input": responses_input(messages), "stream": false})
@@ -1145,14 +1167,17 @@ impl Provider {
         let v: Value = resp.json().await.context("parse chat completion")?;
         let usage = Usage::parse(&v["usage"]);
         if self.cfg.responses() {
-            return Ok((responses_text(&v), usage));
+            let cut = v["status"] == "incomplete";
+            return Ok((responses_text(&v), usage, cut));
         }
+        let cut = v["choices"][0]["finish_reason"] == "length";
         Ok((
             v["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
             usage,
+            cut,
         ))
     }
 
@@ -2024,16 +2049,27 @@ impl Provider {
         Err(anyhow!("/compact response has no summary/output/content"))
     }
 
+    /// A compaction summary of `text`. A reply cut off at the output limit
+    /// or with nothing in it is an error, so no checkpoint is made from it
+    /// (#619).
     pub async fn summarize(&self, text: &str, model: &str) -> Result<String> {
-        self.complete(
-            &[
-                json!({"role": "system", "content": SUMMARIZE_PROMPT}),
-                json!({"role": "user", "content": text}),
-            ],
-            model,
-            None,
-        )
-        .await
+        let (summary, _, cut) = self
+            .complete_full(
+                &[
+                    json!({"role": "system", "content": SUMMARIZE_PROMPT}),
+                    json!({"role": "user", "content": text}),
+                ],
+                model,
+                None,
+            )
+            .await?;
+        if cut {
+            bail!("the summary was cut off at the model's output limit; nothing was compacted");
+        }
+        if summary.trim().is_empty() {
+            bail!("the model returned an empty summary; nothing was compacted");
+        }
+        Ok(summary)
     }
 }
 

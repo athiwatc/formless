@@ -3283,6 +3283,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   background and ends with the usual compaction notice (or a note if it
   fails). It's refused while a Run is active and when nothing is new
   since the last checkpoint.
+- **What is summarised, and when it fails:** each message with its role,
+  plus the agent's tool calls (name and arguments) and their results
+  (each capped at 2,000 characters). The summariser is asked for set
+  sections (Goal, Decisions, Changes, Facts, Open) in about 600 words.
+  Input bigger than half the context is summarised in parts, in order,
+  and the parts merged. A summary cut off at the output limit
+  (`finish_reason: length`, an incomplete Responses reply, Anthropic
+  `max_tokens`) or empty fails the compaction: no checkpoint is saved and
+  the turns stay.
 - Preference order: **server-side compaction if the endpoint explicitly
   supports it, otherwise daemon-side summarisation** (the common path) using
   the Session model or an optional separate compaction model. Server-side is
