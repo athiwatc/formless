@@ -192,7 +192,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 |---|---|
 | Language | Rust, edition 2021, one workspace |
 | Terminal UI | [ratatui](https://ratatui.rs/) |
-| Tool sandbox | [QuickJS-NG](https://quickjs-ng.github.io/) via [`rquickjs`](https://github.com/DelSkayn/rquickjs) |
+| Tool sandbox | [QuickJS-NG](https://quickjs-ng.github.io/quickjs/) via [`rquickjs`](https://github.com/DelSkayn/rquickjs) |
 | Async runtime | [Tokio](https://tokio.rs/) |
 | Local storage | SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite) |
 | HTTP and streaming | [`reqwest`](https://docs.rs/reqwest) with rustls |

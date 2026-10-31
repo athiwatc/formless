@@ -115,6 +115,30 @@ mod tests {
         assert_eq!(opus.1, vec![17, 18, 19, 20]);
     }
 
+    #[test]
+    fn lowercase_expansion_does_not_shift_suffix_highlights() {
+        let candidate = "İstanbul-gpt";
+        let (score, positions) = fuzzy_match("gpt", candidate).unwrap();
+        assert_eq!(positions, vec![9, 10, 11]);
+        let highlighted: String = candidate
+            .chars()
+            .enumerate()
+            .filter_map(|(i, ch)| positions.contains(&i).then_some(ch))
+            .collect();
+        assert_eq!(highlighted, "gpt");
+        // Expanding lowercase must not add a character to the length penalty.
+        assert_eq!(score, fuzzy_match("gpt", "Istanbul-gpt").unwrap().0);
+    }
+
+    #[test]
+    fn ascii_scores_remain_stable() {
+        assert_eq!(fuzzy_match("gpt", "gpt"), Some((21, vec![0, 1, 2])));
+        assert_eq!(
+            fuzzy_match("gpt", "openai/gpt-4o"),
+            Some((20, vec![7, 8, 9]))
+        );
+    }
+
     /// Positions index the original string; NFC and NFD match each other
     /// (#789).
     #[test]
