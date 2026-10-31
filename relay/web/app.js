@@ -412,8 +412,18 @@
 
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
+  const askQueue = [];
   /** Promise-based prompt/confirm: resolves the text (input) or true, or null. */
   function ask(opts) {
+    return new Promise((resolve) => {
+      askQueue.push({ opts, resolve });
+      if (!askResolve) showNextAsk();
+    });
+  }
+  function showNextAsk() {
+    if (!askQueue.length) return;
+    const { opts, resolve } = askQueue.shift();
+    askResolve = resolve;
     rememberFocus("ask-backdrop");
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
@@ -427,14 +437,15 @@
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
     $("ask-backdrop").classList.remove("hidden");
     const first = opts.body && opts.body.querySelector("input");
-    setTimeout(() => (opts.input ? input.select() : (first || ok).focus()), 0);
-    return new Promise((resolve) => (askResolve = resolve));
+    setTimeout(() => { if (askResolve === resolve) { if (opts.input) input.select(); else (first || ok).focus(); } }, 0);
   }
   function closeAsk(value) {
     $("ask-backdrop").classList.add("hidden");
     restoreFocus("ask-backdrop");
-    if (askResolve) askResolve(value);
+    const resolve = askResolve;
     askResolve = null;
+    if (resolve) resolve(value);
+    showNextAsk();
   }
   $("ask-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -577,7 +588,10 @@
     const out = {};
     for (const part of location.hash.replace(/^#/, "").split("&")) {
       const i = part.indexOf("=");
-      if (i > 0) out[part.slice(0, i)] = decodeURIComponent(part.slice(i + 1));
+      if (i > 0) {
+        try { out[part.slice(0, i)] = decodeURIComponent(part.slice(i + 1)); }
+        catch (_) { out.malformed = true; }
+      }
     }
     return out;
   }
@@ -2340,7 +2354,7 @@
     box.replaceChildren();
     const d = S.toolDetail;
     if (!d || d.tool.id !== S.selectedTool) {
-      box.append(h("p", { class: "placeholder" }, S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
+      box.append(h("p", { class: "placeholder" }, S.selectedTool ? "Loading Tool details…" : S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
     } else {
       renderToolDetail(box, d);
     }
@@ -3128,9 +3142,13 @@
     else note("Saved " + key + " (in effect now).");
     refreshSettings();
   }
+  let auditSeq = 0;
   async function loadAudit(older) {
+    const seq = ++auditSeq;
+    const filter = S.auditFilter || null;
     const before = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1].created_at : null;
-    const page = (await request({ type: "list_audit", filter: S.auditFilter || null, limit: 50, before }).catch(() => null)) || [];
+    const page = (await request({ type: "list_audit", filter, limit: 50, before }).catch(() => null)) || [];
+    if (seq !== auditSeq || filter !== (S.auditFilter || null)) return;
     S.audit = older ? (S.audit || []).concat(page) : page;
     S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
     renderView();
@@ -3504,7 +3522,7 @@
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
-    if (!S.auditPages || S.auditPages === 1) S.audit = (await request({ type: "list_audit", filter: S.auditFilter || null, limit: 50 }).catch(() => null)) || [];
+    if (!S.auditPages || S.auditPages === 1) await loadAudit(false);
     try {
       S.settings = await request({ type: "get_settings" });
     } catch (e) {
@@ -3534,19 +3552,27 @@
       selectTool(t.id, true);
     }
   }
+  let toolSeq = 0;
   async function selectTool(id, quiet) {
+    const seq = ++toolSeq;
     S.selectedTool = id;
+    renderView();
     if (!quiet && S.editingCode && S.editingCode.toolId !== id) S.editingCode = null;
     const d = await act({ type: "get_tool", id });
+    if (seq !== toolSeq || S.selectedTool !== id) return;
     if (d) S.toolDetail = d;
     renderView();
   }
 
   /** Open a session; `stay` keeps the current view (initial load). */
+  let sessionSeq = 0;
   async function openSession(id, stay) {
+    const seq = ++sessionSeq;
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    S.messages = [];
+    renderHistory();
     S.runTools = null;
     renderRunTools();
     request({ type: "context_usage", session_id: id }).then((r) => {
@@ -3560,6 +3586,7 @@
     }).catch(() => {});
     rendered.clear(); // a reload may carry edited messages
     renderChips();
+    if (attachmentDrafts[id]) { $("input").value = attachmentDrafts[id]; delete attachmentDrafts[id]; autosize(); }
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
     S.others = [];
@@ -3581,8 +3608,11 @@
     S.recap = null;
     S.follow = true;
     const r = await act({ type: "get_session", id });
-    if (r && S.current === id) {
-      S.messages = r.messages || [];
+    if (seq !== sessionSeq || S.current !== id) return;
+    if (r) {
+      const live = S.messages;
+      const ids = new Set((r.messages || []).map((m) => m.id));
+      S.messages = (r.messages || []).concat(live.filter((m) => !ids.has(m.id)));
       S.unfinished = r.unfinished_run || null;
       renderRunBanner();
       S.queued = r.queued_items || [];
@@ -4184,6 +4214,7 @@
     return c.run(rest.join(" "));
   }
 
+  const attachmentDrafts = {};
   async function submit(queued) {
     const input = $("input");
     const text = input.value.trim();
@@ -4195,6 +4226,8 @@
     }
     if (!S.current) await newSession();
     if (!S.current) return;
+    const sid = S.current;
+    const mode = queued ? "queue" : isRunning() ? "steer" : "send";
     input.value = "";
     autosize();
     S.follow = true;
@@ -4202,16 +4235,15 @@
       const id = S.editMessageId;
       S.editMessageId = null;
       renderComposer();
-      await act({ type: "edit_message", session_id: S.current, message_id: id, content: text });
+      await act({ type: "edit_message", session_id: sid, message_id: id, content: text });
       return;
     }
     askNotifyPermission();
-    const mode = queued ? "queue" : isRunning() ? "steer" : "send";
     // `@path` mentions are attached first (the daemon resolves them in its
     // working directory); words that aren't files are left as text.
     closeMentions();
     const toolNames = new Set((S.tools || []).map((t) => t.name));
-    const already = mentionAttached[S.current] || new Set();
+    const already = mentionAttached[sid] || new Set();
     // A typed or pasted @path is never sent unseen (#863): it becomes a
     // chip first, and this Send stops so the chips can be checked.
     const fresh = [];
@@ -4219,41 +4251,42 @@
       // Tools are named for the agent; chosen files are attached already.
       if (toolNames.has(path) || already.has(path)) continue;
       try {
-        const a = await request({ type: "attach_path", session_id: S.current, path });
-        (mentionAttached[S.current] = mentionAttached[S.current] || new Set()).add(path);
-        (S.chips[S.current] = S.chips[S.current] || []).push(a);
+        const a = await request({ type: "attach_path", session_id: sid, path });
+        (mentionAttached[sid] = mentionAttached[sid] || new Set()).add(path);
+        (S.chips[sid] = S.chips[sid] || []).push(a);
         fresh.push(a.name);
       } catch (e) {
         if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
       }
     }
     if (fresh.length) {
-      input.value = text;
-      autosize();
-      renderChips();
+      if (S.current === sid) { input.value = text; autosize(); renderChips(); }
+      else attachmentDrafts[sid] = text;
       note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
       return;
     }
     // One key per user action (#891): pressing Send again after a reply
     // was lost reuses it, so the daemon doesn't send the message twice.
-    const same = S.unsent && S.unsent.session === S.current && S.unsent.text === text;
+    const same = S.unsent && S.unsent.session === sid && S.unsent.text === text;
     const key = same ? S.unsent.key
       : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
-    S.unsent = { session: S.current, text, key };
-    const r = await act({ type: "send_message", session_id: S.current, content: text, mode, client_msg_id: key });
-    if (r) S.unsent = null;
+    S.unsent = { session: sid, text, key };
+    const r = await act({ type: "send_message", session_id: sid, content: text, mode, client_msg_id: key });
+    if (r && S.unsent && S.unsent.key === key) S.unsent = null;
     // The attachments went with it.
-    if (r) { delete S.chips[S.current]; delete mentionAttached[S.current]; renderChips(); }
+    if (r) { delete S.chips[sid]; delete mentionAttached[sid]; renderChips(); }
     if (r && mode === "steer") note("steering the current run");
   }
   function stop() {
     if (S.current && isRunning()) act({ type: "interrupt_run", session_id: S.current });
   }
+  let searchSeq = 0;
   async function search(q) {
+    const seq = ++searchSeq;
     q = q.trim();
     if (!q) { renderSearch(null); return; }
     const hits = await act({ type: "search_sessions", query: q, limit: 50 });
-    if (hits) renderSearch(hits, q);
+    if (seq === searchSeq && hits) renderSearch(hits, q);
   }
 
   function autosize() {
@@ -4510,7 +4543,7 @@
         if (i >= 0) S.tools[i] = ev.tool; else S.tools.push(ev.tool);
         if (ev.tool.id === S.selectedTool || ev.tool.id === S.metricTool) {
           clearTimeout(toolRefresh);
-          toolRefresh = setTimeout(() => selectTool(ev.tool.id, true), 300);
+          toolRefresh = setTimeout(() => { if (S.selectedTool === ev.tool.id) selectTool(ev.tool.id, true); }, 300);
         }
         renderView();
         break;
@@ -4893,8 +4926,8 @@
   $("export-session").onclick = () => pickExport(S.current);
   $("show-thinking").onchange = (e) => setThinking(e.target.checked);
   $("search-form").addEventListener("submit", (e) => { e.preventDefault(); search($("search").value); });
-  $("search").addEventListener("search", () => { if (!$("search").value) renderSearch(null); });
-  $("search").addEventListener("input", () => { if (!$("search").value) renderSearch(null); });
+  $("search").addEventListener("search", () => { if (!$("search").value) search(""); });
+  $("search").addEventListener("input", () => { if (!$("search").value) search(""); });
   $("import-tool").onclick = async () => {
     const bundle = await pickJson();
     if (bundle && (await act({ type: "import_tool", bundle }, "Imported — the Tool needs first-run approval"))) refreshTools();
@@ -4963,12 +4996,13 @@
     }
   }
   async function attachFiles(files) {
-    if (!S.current) { note("Open a session first", true); return; }
+    const sid = S.current;
+    if (!sid) { note("Open a session first", true); return; }
     for (const file of files) {
-      const r = await uploadFile(S.current, file);
+      const r = await uploadFile(sid, file);
       if (r) {
-        (S.chips[S.current] = S.chips[S.current] || []).push(r);
-        renderChips();
+        (S.chips[sid] = S.chips[sid] || []).push(r);
+        if (S.current === sid) renderChips();
       }
     }
   }
@@ -5112,6 +5146,12 @@
   // fragment: sign in with it instead of ignoring it.
   window.addEventListener("hashchange", () => {
     const frag = hashParams();
+    if (frag.malformed) {
+      history.replaceState(null, "", location.pathname);
+      $("pair-error").textContent = "That link does not look right. Copy the pairing or Session link again.";
+      showPair();
+      return;
+    }
     // A Session link pasted into an open, connected tab: just open it.
     // The fragment never stays in the address bar (#908). A Session link
     // with a key opens here only when that key is this tab's room.
@@ -5150,6 +5190,12 @@
 
   (function init() {
     const frag = hashParams();
+    if (frag.malformed) {
+      history.replaceState(null, "", location.pathname);
+      $("pair-error").textContent = "That link does not look right. Copy the pairing or Session link again.";
+      showPair();
+      return;
+    }
     // A Session link (#s=…) opens that Session once connected.
     S.linkedSession = frag.s || null;
     if (document.querySelector('meta[name="formless-local"]')) {

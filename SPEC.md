@@ -3524,6 +3524,19 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### Relay and Web frontend (v2)
 
+The Web client treats each user action as belonging to the Session selected
+when it starts: attachment uploads, mentioned paths, send mode and completion
+cleanup keep that Session id across asynchronous work. Newly mentioned files
+still require review before sending; if the user switched Sessions while they
+attached, their original message is retained for review on returning. Dialogs
+queue in arrival order, preserving text already entered in an active dialog.
+Malformed URL-fragment values cannot prevent pairing or link handling: each pair
+is decoded independently, valid pairs remain available, and malformed links show
+pairing guidance. Tool selection, search and audit loads discard superseded
+responses; clearing search invalidates outstanding results. Opening a Session
+clears the previous transcript immediately and merges live messages received
+during its snapshot fetch, deduplicated by message id.
+
 - `formless relay enable|disable|status` controls the hosted Relay: the
   daemon dials out to `relay.url` (default
   `wss://formless.athiwat.xyz`) and browsers meet it there — no inbound
