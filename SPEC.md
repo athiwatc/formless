@@ -3961,6 +3961,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   each access; `..` and symlink escapes outside the granted roots are denied.
   A not-yet-existing path resolves through its deepest existing ancestor;
   a dangling symlink, or `..` in the missing part, is refused.
+  If a missing path or ancestor becomes a regular file or directory during
+  resolution, canonicalisation is retried once at that same path before
+  appending any missing tail. Permission, symlink-loop and other resolution
+  errors fail closed; only genuinely missing entries permit walking up to an
+  existing ancestor. A failed retry does not fall back to a broader ancestor.
 - **Process:** `process.run` execs the named binary directly (no shell, no
   string interpolation); only commands in the Tool's declared scope run. A
   bare grant (`process:ls`) matches the bare name or a path to the same
