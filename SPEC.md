@@ -2260,7 +2260,10 @@ such as `read_file`, `read_text_file` and `file_read`.
   in and migrates it. Backup and pre-restore filenames include fixed-width
   fractional UTC seconds and a unique suffix, preserving distinct restore
   points even within the same second; existing backup destinations are
-  never replaced. `formless doctor` shows the last backup's age.
+  never replaced. If post-restore migration fails, the error identifies the
+  safety copy; the copied database remains at its last completed schema
+  version, and the safety copy can be restored even from this state.
+  `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no
   filesystem path, because transcripts also reach remote web clients.

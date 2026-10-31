@@ -294,14 +294,26 @@ pub fn restore(paths: &Paths, file: &Path) -> Result<PathBuf> {
     let stamp = backup_stamp();
     let saved = dir.join(format!("before-restore-{stamp}.db"));
     if db.exists() {
-        Store::open(&db)?.backup_into(&saved)?;
+        // Snapshot the current file without migrating it. A previous restore
+        // may have left an older database whose migration fails; the safety
+        // copy must still be usable to recover from that state.
+        let current =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        current
+            .execute("VACUUM INTO ?1", [saved.to_string_lossy().as_ref()])
+            .with_context(|| format!("back up current database to {}", saved.display()))?;
     }
     for suffix in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
     std::fs::copy(file, &db).with_context(|| format!("copy into {}", db.display()))?;
     // Opening migrates an older backup to this build's schema.
-    Store::open(&db)?;
+    Store::open(&db).with_context(|| {
+        format!(
+            "restored database migration failed; original database saved at {}",
+            saved.display()
+        )
+    })?;
     Ok(saved)
 }
 
@@ -385,9 +397,26 @@ mod tests {
         assert!(!first.exists());
         // Changes after the backup are undone by restoring it.
         store.create_session(Some("later".into())).unwrap();
+        // Retain real sidecars containing the later row, then put them back
+        // after closing to simulate leftovers from the replaced database.
+        let sidecars: Vec<_> = ["-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let path = PathBuf::from(format!("{}{suffix}", paths.db_file().display()));
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
         drop(store);
+        for (path, bytes) in &sidecars {
+            std::fs::write(path, bytes).unwrap();
+        }
         let saved = restore(&paths, all.last().unwrap()).unwrap();
         assert!(saved.exists());
+        assert!(
+            sidecars.iter().all(|(path, _)| !path.exists()),
+            "stale sidecars are removed"
+        );
         let saved_again = restore(&paths, all.last().unwrap()).unwrap();
         assert_ne!(saved, saved_again);
         assert!(
@@ -408,6 +437,115 @@ mod tests {
         std::fs::write(&junk, "hello").unwrap();
         assert!(restore(&paths, &junk).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn restore_refuses_corrupt_foreign_and_newer_databases_without_touching_live_data() {
+        let base = std::env::temp_dir().join(format!("fl-hk-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        let store = Store::open(&paths.db_file()).unwrap();
+        store.create_session(Some("untouched".into())).unwrap();
+        drop(store);
+        let before = std::fs::read(paths.db_file()).unwrap();
+        let refused = |file: &Path, reason: &str| {
+            let error = restore(&paths, file).unwrap_err().to_string();
+            assert!(error.contains(reason), "wrong refusal: {error}");
+            assert_eq!(std::fs::read(paths.db_file()).unwrap(), before);
+            assert!(
+                !backup_dir(&paths).exists(),
+                "refusal must not make a safety copy"
+            );
+        };
+
+        let corrupt = base.join("corrupt.db");
+        let conn = rusqlite::Connection::open(&corrupt).unwrap();
+        conn.execute_batch("CREATE TABLE sessions(id TEXT); INSERT INTO sessions VALUES('bad');")
+            .unwrap();
+        let page: usize = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name='sessions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let size: usize = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        let mut bytes = std::fs::read(&corrupt).unwrap();
+        // Damage the leaf page's freeblock pointer while leaving SQLite's
+        // header/schema readable: integrity_check returns a real corruption
+        // report, rather than failing to open or parse the database.
+        let offset = (page - 1) * size;
+        bytes[offset + 1..offset + 3].copy_from_slice(&[0xff, 0xff]);
+        std::fs::write(&corrupt, bytes).unwrap();
+        refused(&corrupt, "failed its integrity check");
+
+        let foreign = base.join("foreign.db");
+        let conn = rusqlite::Connection::open(&foreign).unwrap();
+        conn.execute_batch("CREATE TABLE unrelated(id TEXT);")
+            .unwrap();
+        drop(conn);
+        refused(&foreign, "is not a Formless database");
+
+        let newer = base.join("newer.db");
+        let conn = rusqlite::Connection::open(&newer).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE sessions(id TEXT); PRAGMA user_version={};",
+            crate::storage::SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+        drop(conn);
+        refused(&newer, "newer than this build");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn failed_restore_migration_keeps_a_restorable_safety_copy() {
+        let base = std::env::temp_dir().join(format!("fl-hk-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        let store = Store::open(&paths.db_file()).unwrap();
+        store.create_session(Some("original".into())).unwrap();
+        drop(store);
+        let old = base.join("old.db");
+        let store = Store::open(&old).unwrap();
+        store
+            .create_session(Some("from broken backup".into()))
+            .unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&old).unwrap();
+        // Step 51 completes; step 52 fails because it needs run_usage.
+        conn.execute_batch("DROP TABLE run_usage; PRAGMA user_version=50;")
+            .unwrap();
+        drop(conn);
+        let error = restore(&paths, &old).unwrap_err();
+        assert!(format!("{error:#}").contains("migrate database to v52"));
+        let saved: Vec<_> = std::fs::read_dir(backup_dir(&paths))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1);
+        assert!(error.to_string().contains(&saved[0].display().to_string()));
+        let conn = rusqlite::Connection::open(paths.db_file()).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            51
+        );
+        assert_eq!(
+            conn.query_row("SELECT name FROM sessions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "from broken backup"
+        );
+        drop(conn);
+        // Recovery works through the public restore path even though the
+        // current database still cannot be migrated.
+        let failed_copy = restore(&paths, &saved[0]).unwrap();
+        assert!(failed_copy.exists());
+        let store = Store::open(&paths.db_file()).unwrap();
+        assert_eq!(store.list_sessions().unwrap()[0].name, "original");
+        drop(store);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
