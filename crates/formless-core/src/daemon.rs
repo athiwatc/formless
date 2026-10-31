@@ -586,7 +586,8 @@ pub struct Daemon {
     /// and Sessions allowed past the limits for their next Run (Resume
     /// from a budget pause).
     budget_warned: StdMutex<std::collections::HashSet<String>>,
-    budget_waived: StdMutex<std::collections::HashSet<String>>,
+    budget_waived: Arc<StdMutex<std::collections::HashSet<String>>>,
+    budget_admission: Arc<crate::budget::Admission>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
     /// or next Run (cleared when it ends).
     step_limits: StdMutex<HashMap<String, u32>>,
@@ -756,7 +757,8 @@ impl Daemon {
             uploads: StdMutex::new(HashMap::new()),
             relay_kick: StdMutex::new(None),
             budget_warned: StdMutex::new(Default::default()),
-            budget_waived: StdMutex::new(Default::default()),
+            budget_waived: Arc::new(StdMutex::new(Default::default())),
+            budget_admission: Arc::new(Default::default()),
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
@@ -923,6 +925,7 @@ impl Daemon {
                 Ok(Provider::with_key(pcfg, key, self.http.clone())
                     .with_name(n)
                     .with_usage_hook(self.usage_hook())
+                    .with_request_hook(self.request_hook(cfg))
                     .with_breaker_note_hook(self.provider_breaker_note_hook()))
             }
         }
@@ -1012,6 +1015,7 @@ impl Daemon {
                 .await?
                 .with_name(crate::config::DEFAULT_PROVIDER)
                 .with_usage_hook(self.usage_hook())
+                .with_request_hook(self.request_hook(cfg))
                 .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
     }
@@ -1029,27 +1033,73 @@ impl Daemon {
         })
     }
 
-    /// Records the usage of the daemon's own model calls (compaction, the
-    /// optimiser, approval summaries, skill distilling) made inside
-    /// [`counted`]; Run steps, sub-agents and `llm.complete` record
-    /// themselves (#806).
+    /// Admission applies to every request through either provider factory.
+    /// Attribution is resolved in the active task, not at Provider construction.
+    fn request_hook(&self, cfg: &Config) -> crate::provider::RequestHook {
+        let admission = self.budget_admission.clone();
+        let store = self.store.clone();
+        let waived = self.budget_waived.clone();
+        let cfg = cfg.clone();
+        Arc::new(move || {
+            // Read task-local attribution when polled in the caller's scope,
+            // never when the Provider is constructed or on a spawned task.
+            let owner = USAGE_FOR
+                .try_with(Clone::clone)
+                .unwrap_or_else(|_| UsageFor {
+                    source: "internal",
+                    session_id: String::new(),
+                    run_id: String::new(),
+                });
+            let (admission, store, cfg, waived) = (
+                admission.clone(),
+                store.clone(),
+                cfg.clone(),
+                waived.clone(),
+            );
+            Box::pin(async move {
+                let waived = waived.locked().contains(&owner.session_id);
+                let lease = admission
+                    .enter(&store, &cfg, &owner.run_id, waived)
+                    .await
+                    .map_err(|e| anyhow::Error::new(RequestFailure::budget(e.to_string())))?;
+                Ok(Box::new(lease) as crate::provider::RequestLease)
+            })
+        })
+    }
+
+    /// Every factory-created model request records once, inside its admission
+    /// lease. Explicit scopes preserve Run/nested/internal source attribution.
     fn usage_hook(&self) -> crate::provider::UsageHook {
         let store = self.store.clone();
+        let admission = self.budget_admission.clone();
         Arc::new(
             move |provider: &str, model: &str, u: &crate::provider::Usage| {
-                let Ok(f) = USAGE_FOR.try_with(Clone::clone) else {
-                    return;
-                };
-                if let Ok(st) = store.lock() {
-                    let _ = st.record_usage_full(
-                        &f.session_id,
-                        &f.run_id,
-                        provider,
-                        model,
-                        u,
-                        f.source,
-                    );
+                let owner = USAGE_FOR
+                    .try_with(Clone::clone)
+                    .unwrap_or_else(|_| UsageFor {
+                        source: "internal",
+                        session_id: String::new(),
+                        run_id: String::new(),
+                    });
+                let result = store
+                    .lock()
+                    .map_err(|_| anyhow!("usage store is unavailable"))
+                    .and_then(|st| {
+                        st.record_usage_full(
+                            &owner.session_id,
+                            &owner.run_id,
+                            provider,
+                            model,
+                            u,
+                            owner.source,
+                        )
+                    });
+                if result.is_err() {
+                    // Do not admit another paid request against stale totals after
+                    // a failed commit, even though cancellation must release locks.
+                    admission.accounting_failed();
                 }
+                result.context("commit model usage before releasing budget admission")
             },
         )
     }
@@ -4761,34 +4811,39 @@ impl Daemon {
                 let (last_byte2, got_bytes2) = (last_byte.clone(), got_bytes.clone());
                 last_byte.store(epoch_ms(), Ordering::SeqCst);
                 got_bytes.store(false, Ordering::SeqCst);
-                let chat_fut = provider.chat_stream(
-                    &ctx,
-                    &defs,
-                    &model,
-                    effort.as_deref(),
-                    cancel,
-                    move |kind, delta| {
-                        last_byte2.store(epoch_ms(), Ordering::SeqCst);
-                        got_bytes2.store(true, Ordering::SeqCst);
-                        let ev = match kind {
-                            DeltaKind::Bytes => return,
-                            DeltaKind::Content => Event::MessageDelta {
-                                session_id: sid.clone(),
-                                run_id: rid.clone(),
-                                delta: delta.to_string(),
-                            },
-                            DeltaKind::Reasoning => Event::ReasoningDelta {
-                                session_id: sid.clone(),
-                                run_id: rid.clone(),
-                                delta: delta.to_string(),
-                            },
-                            DeltaKind::Restart => Event::StreamRestarted {
-                                session_id: sid.clone(),
-                                run_id: rid.clone(),
-                            },
-                        };
-                        send_all(&subs, ev);
-                    },
+                let chat_fut = counted(
+                    "run",
+                    session_id,
+                    run_id,
+                    provider.chat_stream(
+                        &ctx,
+                        &defs,
+                        &model,
+                        effort.as_deref(),
+                        cancel,
+                        move |kind, delta| {
+                            last_byte2.store(epoch_ms(), Ordering::SeqCst);
+                            got_bytes2.store(true, Ordering::SeqCst);
+                            let ev = match kind {
+                                DeltaKind::Bytes => return,
+                                DeltaKind::Content => Event::MessageDelta {
+                                    session_id: sid.clone(),
+                                    run_id: rid.clone(),
+                                    delta: delta.to_string(),
+                                },
+                                DeltaKind::Reasoning => Event::ReasoningDelta {
+                                    session_id: sid.clone(),
+                                    run_id: rid.clone(),
+                                    delta: delta.to_string(),
+                                },
+                                DeltaKind::Restart => Event::StreamRestarted {
+                                    session_id: sid.clone(),
+                                    run_id: rid.clone(),
+                                },
+                            };
+                            send_all(&subs, ev);
+                        },
+                    ),
                 );
                 let mut chat_fut = std::pin::pin!(chat_fut);
                 let sent_at = tokio::time::Instant::now();
@@ -4848,18 +4903,6 @@ impl Daemon {
                 Ok(r) => {
                     self.record_model_outcome(&r.model_used, true, started);
                     let _ = self.with_store(|st| st.bump_run_steps(run_id));
-                    if let Some(usage) = &r.usage {
-                        let _ = self.with_store(|st| {
-                            st.record_usage_full(
-                                session_id,
-                                run_id,
-                                provider.name(),
-                                &r.model_used,
-                                usage,
-                                "run",
-                            )
-                        });
-                    }
                     if let Ok(mut usage) = self.usage_info(None, Some(run_id), &cfg) {
                         usage.context_used = r.usage.as_ref().map_or(0, |u| u.prompt_tokens as i64);
                         usage.context_tokens = i64::from(context_tokens);
@@ -7537,33 +7580,27 @@ impl Daemon {
                     self.check_budget(session_id, run_id, &cfg)?;
                     // Rebuilt each step: find_tools/create_tool load new Tools.
                     let defs = sub_defs()?;
-                    let result = provider
-                        .chat_stream(
+                    let result = counted(
+                        "agent",
+                        session_id,
+                        run_id,
+                        provider.chat_stream(
                             &messages,
                             &defs,
                             &model,
                             session_effort.as_deref(),
                             cancel,
                             |_, _| {},
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await?;
                     step += 1;
                     if let Some(u) = &result.usage {
-                        let _ = self.with_store(|st| {
-                            st.record_usage_full(
-                                session_id,
-                                run_id,
-                                provider.name(),
-                                &model,
-                                u,
-                                "agent",
-                            )
-                        });
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
                         task_cost = task_cost
                             .zip(cfg.cost_of(
                                 provider.name(),
-                                &model,
+                                &result.model_used,
                                 u.prompt_tokens as i64,
                                 u.completion_tokens as i64,
                                 u.cached_tokens as i64,
@@ -11458,7 +11495,14 @@ impl Daemon {
             None => input,
         };
         let summary = if cfg.compaction.server_side {
-            match provider.compact_server(&input, &cmodel).await {
+            match counted(
+                "compaction",
+                session_id,
+                "",
+                provider.compact_server(&input, &cmodel),
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     self.broadcast(Event::Note {
@@ -13117,30 +13161,20 @@ impl HostOps for NestedOps {
             messages.push(json!({"role": "system", "content": sys}));
         }
         messages.push(json!({"role": "user", "content": prompt}));
-        let (text, usage) = self.block_cancellable(provider.complete_with_usage(
-            &messages,
-            &model,
-            effort.as_deref(),
+        let result = self.block_cancellable(counted(
+            "llm",
+            &self.session_id,
+            &self.run_id,
+            provider.complete_result(&messages, &model, effort.as_deref()),
         ))?;
-        if let Some(u) = &usage {
-            let _ = self.daemon.with_store(|st| {
-                st.record_usage_full(
-                    &self.session_id,
-                    &self.run_id,
-                    provider.name(),
-                    &model,
-                    u,
-                    "llm",
-                )
-            });
-        }
+        let usage = result.usage;
         // A Tool's own model calls count toward its Cost per Success, and
         // as its model use (§10.4).
         if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
             let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
             let cost = self.cfg.cost_of(
                 provider.name(),
-                &model,
+                &result.model_used,
                 u.prompt_tokens as i64,
                 u.completion_tokens as i64,
                 u.cached_tokens as i64,
@@ -13152,7 +13186,7 @@ impl HostOps for NestedOps {
                 st.add_invocation_model_use(inv, tokens, cost)
             });
         }
-        Ok(text)
+        Ok(result.text)
     }
 
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
@@ -14390,7 +14424,7 @@ mod internal_usage_tests {
         )
         .await
         .unwrap();
-        // Not counted: Run steps record themselves.
+        // Unscoped factory calls are recorded as internal work.
         provider.summarize("again", "m").await.unwrap();
         let tokens = daemon
             .with_store(|st| st.internal_tokens_today("compaction"))
@@ -14399,10 +14433,14 @@ mod internal_usage_tests {
         let rows = daemon
             .with_store(|st| st.usage_grouped(None, "purpose"))
             .unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(
             (rows[0].0.as_str(), rows[0].1.as_str()),
             ("compaction", "default")
+        );
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1.as_str()),
+            ("internal", "default")
         );
     }
 }
@@ -15173,3 +15211,7 @@ mod live_snapshot_tests {
 #[cfg(test)]
 #[path = "daemon_provider_breaker_tests.rs"]
 mod provider_breaker_tests;
+
+#[cfg(test)]
+#[path = "budget_tests.rs"]
+mod budget_admission_tests;

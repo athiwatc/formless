@@ -204,13 +204,29 @@ pub struct Provider {
     /// Told of every request's reported usage (model, usage), so the
     /// daemon's own calls are counted too (#806).
     on_usage: Option<UsageHook>,
+    on_request: Option<RequestHook>,
     /// The configured provider's name (`default` or a `[providers.<name>]`
     /// key), for pricing usage from its own table (#810).
     name: String,
 }
 
 pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
-pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) + Send + Sync>;
+pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) -> Result<()> + Send + Sync>;
+/// Lifetime lease acquired before a model request and dropped after accounting.
+pub type RequestLease = Box<dyn std::any::Any + Send>;
+pub type RequestHook = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RequestLease>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone)]
+pub struct CompletionResult {
+    pub text: String,
+    pub usage: Option<Usage>,
+    pub output_limited: bool,
+    pub model_used: String,
+}
 
 /// Shared, bounded per-provider/model circuit breakers. An acquired permit
 /// remains live through body parsing, so one half-open probe includes streaming.
@@ -928,6 +944,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
@@ -950,6 +967,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         }
@@ -981,6 +999,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
@@ -1039,10 +1058,23 @@ impl Provider {
         &self.name
     }
 
-    fn report_usage(&self, model: &str, usage: Option<&Usage>) {
-        if let (Some(hook), Some(u)) = (&self.on_usage, usage) {
-            hook(&self.name, model, u);
+    pub fn with_request_hook(mut self, hook: RequestHook) -> Self {
+        self.on_request = Some(hook);
+        self
+    }
+
+    async fn request_lease(&self) -> Result<Option<RequestLease>> {
+        match &self.on_request {
+            Some(hook) => hook().await.map(Some),
+            None => Ok(None),
         }
+    }
+
+    fn report_usage(&self, model: &str, usage: Option<&Usage>) -> Result<()> {
+        if let (Some(hook), Some(u)) = (&self.on_usage, usage) {
+            hook(&self.name, model, u)?;
+        }
+        Ok(())
     }
 
     fn breaker_key(&self, model: &str, credential: &str) -> String {
@@ -1326,10 +1358,22 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<(String, Option<Usage>, bool)> {
+        let out = self.complete_result(messages, model, effort).await?;
+        Ok((out.text, out.usage, out.output_limited))
+    }
+
+    /// Completion including the final serving identity, for pricing and metrics.
+    pub async fn complete_result(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<CompletionResult> {
+        let _lease = self.request_lease().await?;
         let out = self
             .complete_with_usage_inner(messages, model, effort)
             .await?;
-        self.report_usage(model, out.1.as_ref());
+        self.report_usage(&out.model_used, out.usage.as_ref())?;
         Ok(out)
     }
 
@@ -1338,47 +1382,64 @@ impl Provider {
         messages: &[Value],
         model: &str,
         effort: Option<&str>,
-    ) -> Result<(String, Option<Usage>, bool)> {
-        if self.cfg.anthropic() {
+    ) -> Result<CompletionResult> {
+        let (v, served) = if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
-            let (resp, _, _, permit) = self.post_provider(&mut body, None, true).await?;
-            let v = completed_json(resp, permit, "parse Messages response").await?;
+            let (resp, _, served, permit) = self.post_provider(&mut body, None, true).await?;
+            (
+                completed_json(resp, permit, "parse Messages response").await?,
+                served,
+            )
+        } else {
+            let mut body = if self.cfg.responses() {
+                json!({"model": model, "input": responses_input(messages), "stream": false})
+            } else {
+                json!({"model": model, "messages": messages, "stream": false})
+            };
+            self.post_chat_served(&mut body, effort).await?
+        };
+        let usage = Usage::parse(&v["usage"]);
+        let (text, output_limited) = if self.cfg.anthropic() {
             if let Some(why) = crate::anthropic::unusable_stop(&v) {
                 return Err(anyhow!("provider error: {why}"));
             }
-            let usage = Usage::parse(&v["usage"]);
-            let cut = v["stop_reason"] == "max_tokens";
-            return Ok((crate::anthropic::response_parts(&v).0, usage, cut));
-        }
-        let mut body = if self.cfg.responses() {
-            json!({"model": model, "input": responses_input(messages), "stream": false})
+            (
+                crate::anthropic::response_parts(&v).0,
+                v["stop_reason"] == "max_tokens",
+            )
+        } else if self.cfg.responses() {
+            (responses_text(&v), v["status"] == "incomplete")
         } else {
-            json!({"model": model, "messages": messages, "stream": false})
+            (
+                v["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                v["choices"][0]["finish_reason"] == "length",
+            )
         };
-        let v = self.post_chat(&mut body, effort).await?;
-        let usage = Usage::parse(&v["usage"]);
-        if self.cfg.responses() {
-            let cut = v["status"] == "incomplete";
-            return Ok((responses_text(&v), usage, cut));
-        }
-        let cut = v["choices"][0]["finish_reason"] == "length";
-        Ok((
-            v["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+        Ok(CompletionResult {
+            text,
             usage,
-            cut,
-        ))
+            output_limited,
+            model_used: served,
+        })
     }
 
     /// POST /chat/completions with bounded retries (SPEC §4.4). Returns the
     /// fully parsed JSON on success. If a 400 looks like an unknown-parameter
     /// rejection and reasoning_effort was set, retries once without it and
     /// flags `dropped` via the returned marker in ChatResult paths.
-    async fn post_chat(&self, body: &mut Value, effort: Option<&str>) -> Result<Value> {
-        let (resp, _, _, permit) = self.post_provider(body, effort, true).await?;
-        completed_json(resp, permit, "parse chat completion").await
+    async fn post_chat_served(
+        &self,
+        body: &mut Value,
+        effort: Option<&str>,
+    ) -> Result<(Value, String)> {
+        let (resp, _, served, permit) = self.post_provider(body, effort, true).await?;
+        Ok((
+            completed_json(resp, permit, "parse chat completion").await?,
+            served,
+        ))
     }
 
     async fn post_provider(
@@ -1603,6 +1664,10 @@ impl Provider {
         cancel: &CancellationToken,
         on_delta: F,
     ) -> Result<ChatResult> {
+        let _lease = tokio::select! {
+            _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
+            lease = self.request_lease() => lease?,
+        };
         let out = self
             .chat_stream_inner(messages, tools, model, effort, cancel, on_delta)
             .await?;
@@ -1611,7 +1676,7 @@ impl Provider {
         } else {
             &out.model_used
         };
-        self.report_usage(served, out.usage.as_ref());
+        self.report_usage(served, out.usage.as_ref())?;
         Ok(out)
     }
 
@@ -2252,6 +2317,7 @@ impl Provider {
     /// Server-side compaction (SPEC §11): POST {base_url}/compact with
     /// {model, input}; accepts {summary}|{output}|{content} responses.
     pub async fn compact_server(&self, text: &str, model: &str) -> Result<String> {
+        let _lease = self.request_lease().await?;
         let body = json!({"model": model, "input": text});
         let credential = self.credential().await?;
         let permit = self.breaker_permit(model, &credential).ok_or_else(|| {
@@ -2283,6 +2349,7 @@ impl Provider {
             ));
         }
         let v = completed_json(resp, permit, "parse /compact").await?;
+        self.report_usage(model, Usage::parse(&v["usage"]).as_ref())?;
         for key in ["summary", "output", "content"] {
             if let Some(s) = v[key].as_str() {
                 if !s.is_empty() {
@@ -2810,6 +2877,7 @@ fn is_tool_choice_rejection(text: &str) -> bool {
 }
 
 async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) -> Result<bool> {
+    let _lease = p.request_lease().await?;
     if p.cfg.anthropic() {
         let mut b = crate::anthropic::body(
             model,
@@ -2822,8 +2890,9 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         if forced {
             b["tool_choice"] = json!({"type": "any"});
         }
-        let (resp, _, _, permit) = p.post_provider(&mut b, None, false).await?;
+        let (resp, _, served, permit) = p.post_provider(&mut b, None, false).await?;
         let v = completed_json(resp, permit, "parse probe response").await?;
+        p.report_usage(&served, Usage::parse(&v["usage"]).as_ref())?;
         return Ok(!crate::anthropic::response_parts(&v).1.is_empty());
     }
     let mut body = if p.cfg.responses() {
@@ -2849,8 +2918,9 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         }
         b
     };
-    let (resp, _, _, permit) = p.post_provider(&mut body, None, false).await?;
+    let (resp, _, served, permit) = p.post_provider(&mut body, None, false).await?;
     let v = completed_json(resp, permit, "parse probe response").await?;
+    p.report_usage(&served, Usage::parse(&v["usage"]).as_ref())?;
     if p.cfg.responses() {
         return Ok(!responses_tool_calls(&v).is_empty());
     }
