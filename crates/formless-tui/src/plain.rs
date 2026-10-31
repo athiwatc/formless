@@ -7,7 +7,7 @@ use crate::client::DaemonClient;
 use anyhow::Result;
 use formless_core::{Config, Paths};
 use formless_protocol::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -48,6 +48,54 @@ fn remove_resolved_prompt(prompts: &mut VecDeque<Prompt>, ev: &Event) {
     });
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum GapRefresh {
+    Usage,
+    Invocations,
+}
+
+fn gap_requests(ev: &Event) -> Vec<(GapRefresh, Request)> {
+    let mut requests = Vec::new();
+    if let Event::DeltasDropped {
+        session_id, kinds, ..
+    } = ev
+    {
+        if kinds.contains(&DroppedEventKind::RunUsage) && !session_id.is_empty() {
+            requests.push((
+                GapRefresh::Usage,
+                Request::SessionUsage {
+                    session_id: session_id.clone(),
+                },
+            ));
+        }
+        if kinds.contains(&DroppedEventKind::InvocationActivity) {
+            requests.push((GapRefresh::Invocations, Request::ListInvocations));
+        }
+    }
+    requests
+}
+
+fn gap_result(kind: GapRefresh, result: &serde_json::Value) -> String {
+    match kind {
+        GapRefresh::Usage => {
+            match serde_json::from_value::<UsageInfo>(result["last_run"].clone()) {
+                Ok(usage) => format!("Recorded usage: {}.", crate::usage_text(&usage)),
+                Err(_) => "No recorded Run usage is available yet.".into(),
+            }
+        }
+        GapRefresh::Invocations => {
+            match serde_json::from_value::<Vec<InvocationInfo>>(result.clone()) {
+                Ok(list) => format!(
+                    "Recorded tools: {} running, {} stalled.",
+                    list.len(),
+                    list.iter().filter(|i| i.stalled).count()
+                ),
+                Err(_) => "Recorded tool activity could not be refreshed.".into(),
+            }
+        }
+    }
+}
+
 /// The printed form of an event, if it has one. `streaming` says whether
 /// the answer is mid-stream (deltas are printed as they come).
 pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
@@ -70,7 +118,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
         }
         // Scripted output is never silently wrong (#1096).
         Event::DeltasDropped { .. } => {
-            eprintln!("\n[output fell behind: some live text was skipped; the full answer is in the transcript]");
+            eprintln!("\n[display fell behind: live text, reasoning or progress updates were skipped; final answers remain in the transcript; recorded usage and tool activity are refreshed when affected]");
             return None;
         }
         Event::ToolCallStarted {
@@ -290,10 +338,29 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let mut prompts: VecDeque<Prompt> = VecDeque::new();
     let mut streaming = false;
     let mut running = false;
+    let mut gap_refreshes: HashMap<u64, GapRefresh> = HashMap::new();
     loop {
         while let Ok(msg) = rx.try_recv() {
-            if let ServerMessage::Response { id, ok, error, .. } = &msg {
+            if let ServerMessage::Response {
+                id,
+                ok,
+                error,
+                result,
+                ..
+            } = &msg
+            {
                 sends.borrow_mut().answered(*id);
+                if let Some(kind) = gap_refreshes.remove(id) {
+                    if *ok {
+                        if streaming {
+                            println!();
+                            streaming = false;
+                        }
+                        if let Some(result) = result {
+                            say(&gap_result(kind, result));
+                        }
+                    }
+                }
                 if !ok {
                     say(&format!(
                         "Daemon: {}",
@@ -308,6 +375,11 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             let mine = ev.session_id().is_none_or(|s| s == session.id);
             if !mine && !matches!(ev, Event::ApprovalRequested { .. }) {
                 continue;
+            }
+            for (kind, request) in gap_requests(&ev) {
+                if !gap_refreshes.values().any(|pending| *pending == kind) {
+                    gap_refreshes.insert(client.send(request), kind);
+                }
             }
             match &ev {
                 Event::RunStarted { .. } => running = true,
@@ -499,6 +571,36 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gap_recovery_requests_and_prints_recorded_usage_and_activity() {
+        let ev = Event::DeltasDropped {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            kinds: vec![
+                DroppedEventKind::RunUsage,
+                DroppedEventKind::InvocationActivity,
+                DroppedEventKind::ToolProgress,
+            ],
+            handle: None,
+            model: None,
+        };
+        let requests = gap_requests(&ev);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(&requests[0].1, Request::SessionUsage { session_id } if session_id == "s")
+        );
+        assert!(matches!(requests[1].1, Request::ListInvocations));
+        let text = gap_result(
+            GapRefresh::Usage,
+            &serde_json::json!({"last_run": UsageInfo { steps: 3, ..UsageInfo::default() }}),
+        );
+        assert!(text.contains("Recorded usage: 3 steps"));
+        assert_eq!(
+            gap_result(GapRefresh::Invocations, &serde_json::json!([])),
+            "Recorded tools: 0 running, 0 stalled."
+        );
+    }
 
     #[test]
     fn resolved_promotion_releases_the_next_plain_prompt() {
