@@ -14939,6 +14939,10 @@ mod credential_env;
 mod tests {
     use super::*;
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
     fn test_app() -> App {
         let short = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
