@@ -1197,6 +1197,10 @@ pattern (§4.4).
   fetches ignore proxy settings (a proxy would resolve the name itself).
   IPv6 grants with a port use brackets: `net:[::1]:8080`. Denials name it: `denied: net:x resolves to 10.0.0.5, a private
   or local address; grant net:x itself to reach it`.
+- **Scope validation.** Empty `net:` and `process:` scopes are rejected.
+  Static `net:` hosts are canonicalized to lowercase (IDNA/IP spelling
+  follows URL host parsing); schemes, paths and whitespace are rejected
+  with the expected bare-host form. Input-bound hosts use the same form.
 - **Ports.** A `net` grant may carry a port (`net:api.example.com:8443`)
   and then allows that port only; a portless grant allows any. An
   input-bound URL with a non-default port binds to `host:port`, so the
@@ -1280,6 +1284,14 @@ pattern (§4.4).
     - Values live in the `tool_kv` table (schema v23). They are never
       exported in bundles, and purging a Tool deletes its own namespace.
     - Smoke tests and replay use an in-memory store that is thrown away.
+  - Rejected Promises still unhandled when `run` completes fail the
+    Invocation with the rejection message, including floating nested calls
+    and async timer callbacks. A rejection handled before completion is
+    allowed.
+  - Console formatting preserves `undefined`, BigInt (`n` suffix) and Error
+    names/messages, and replaces circular references with `[Circular]`.
+    A return value that cannot be JSON-serialized fails the Invocation with
+    `return value is not JSON-serializable`, for both sync and async `run`.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
@@ -1680,7 +1692,9 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
 - **No ambient authority, and no Capabilities.**
   - Inside the script, `tools` holds the Tools in `uses` as async
     functions (`await tools.search_repo({…})`) plus `tools.call(name,
-    input)`, which also returns a Promise.
+    input)`, which also returns a Promise. `tools.call` is always the
+    dispatcher, even when `uses` contains a Tool named `call`: invoke that
+    Tool as `tools.call("call", input)`.
   - Also available: `console`, timers, `sleep`, `JSON`, `cryptoRandom()`,
     `randomBytes()` and `requireModule` (§7.6).
   - Absent: `fetch`, `fetchChunks`, `fs`, `process`, `env`, `clipboard`,
@@ -1929,7 +1943,13 @@ it says.
   - `find_tools` before `create_tool`
   - least-privilege Capabilities (only scoped `fs:read:` for a read)
   - streaming (`*Chunks`) for large files
-  - throwing on failure, never `return {error}`
+  - throwing on failure; a returned `{error}` counts as failure unless
+    the output schema declares an `error` property for domain data. Declarations
+    may be supplied through local JSON Pointer references, `allOf`, or matching
+    `anyOf`/`oneOf` and conditional branches; nested properties and unused
+    definitions do not declare the output field. Inspection is bounded to
+    64 levels and 4096 schema values, with cyclic or unresolved branches
+    conservatively retaining the failure heuristic; no external schema is fetched
   - no hardcoded task paths, and a real input schema
   - reusing a loaded Tool
   - `env:` for API keys
@@ -2106,7 +2126,12 @@ such as `read_file`, `read_text_file` and `file_read`.
 - **Errors and limits.** A failed response may carry `result: {"code":
   …}` (`protocol_mismatch`, `unsupported`, `bad_request`, `not_found`,
   `busy`, `budget`, `invalid`, `internal`); clients branch on the code,
-  the `error` text is for people. A request that did what was asked with
+  the `error` text is for people. Codes originate at the failure site and
+  survive diagnostic context wrappers; changing or quoting error prose
+  never changes its classification. Missing resource lookups use
+  `not_found`; validation sites such as malformed ratings and empty
+  template names use `invalid`. Errors without an explicit classification
+  remain uncoded. A request that did what was asked with
   a degraded part (a model listing that failed) succeeds and names it in
   its result's `error`. Every reader (daemon, TUI, relay pump, web
   bridge) refuses a line over `MAX_FRAME_BYTES` (32 MB) while reading;
@@ -2116,7 +2141,14 @@ such as `read_file`, `read_text_file` and `file_read`.
   per-connection queue; an interrupt cancels a `SendMessage` for that
   Session still queued behind a slow request (it fails with "interrupted
   before it started"). `SendMessage.client_msg_id` makes a retried send
-  return the first outcome instead of sending twice (kept 10 minutes).
+  on the same connection and Session return the first outcome instead of sending
+  twice (kept 10 minutes, removed when that connection closes). A different
+  connection using the same key performs its own send. A key is claimed before
+  execution; concurrent retries wait for the in-flight outcome, including errors.
+  Losing a response/waiter does not cancel the claimed send or lose its outcome.
+  After reconnecting, retrying an unacknowledged send can repeat an uncertain
+  prior send: action ids deduplicate only within the original connection.
+  Cached failures preserve the same machine-readable error code and message.
 - A client that falls behind loses live deltas first; it is told with
   `DeltasDropped {session_id, run_id}` once there is room, and the
   answer's `MessageComplete` carries the whole text (plain mode notes the
@@ -2223,6 +2255,11 @@ UTC seconds and a unique suffix. A failed checkpoint or receipt write disables
 reuse rather than sacrificing a backup or hiding the migration error.
 
 ### 9.5 Crash recovery
+
+- Finishing a Run isolates comparison and job bookkeeping from unrelated
+  finish-tail failures. A panic in naming, recap, or `run_end` hooks is
+  logged and surfaced as a note, and still drains the next queued message.
+  This applies after a Run panic as well as normal completion.
 
 - The daemon never idle-closes mid-Run (§9.1) but can crash/be killed. On
   restart, affected Runs are marked **Interrupted**; the in-flight Invocation
@@ -3547,6 +3584,48 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### Relay and Web frontend (v2)
 
+`GetSession` includes the selected Session's `running` and global `pending_events`:
+all outstanding approval/question events across Sessions and promotion prompts.
+Resolving or cancelling a prompt removes it from subsequent snapshots. Local
+and Relay Web reconnects discard stale interactive/streaming state and seed the
+current Session from this snapshot; events received during the fetch are replayed
+as state only, without re-running notifications or resetting live streaming text,
+so the snapshot cannot revive an answered prompt or erase a new one.
+`PromotionApprovalResolved` closes the matching prompt in every client when any
+client resolves it, including while a browser's snapshot request is in flight.
+Concurrent `ask_user` calls in the same Session, including nested sub-agents,
+wait behind a FIFO gate until the preceding question closes; cancellation also
+cancels queued waits. Web clients additionally queue question events across
+Sessions. Closing a queued question cannot dismiss an unrelated settings dialog.
+
+Persisted assistant `meta.stop_reason` and `meta.truncated` markers are visible
+in Web transcript history, including after reopening a Session: output-token and
+context-window limits, model pauses, refusals and content filters get explanatory
+notes; unknown stop reasons are shown explicitly. Existing provider placeholder
+notes do not get a duplicate label, and normal completions get no stop label.
+
+Web approval and promotion decisions remain pending locally until the daemon
+confirms resolution; failures report that the decision was not delivered and
+remain answerable. Recap and rating controls are rebuilt from current Run state
+outside the cached message body, so live completion and rating changes appear
+immediately and only the current last answer has controls. Markdown formatting
+is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
+per formatted message. Content beyond these limits is displayed verbatim as
+plain text, preserving access to persisted messages without recursive parsing.
+
+The Web client treats each user action as belonging to the Session selected
+when it starts: attachment uploads, mentioned paths, send mode and completion
+cleanup keep that Session id across asynchronous work. Newly mentioned files
+still require review before sending; if the user switched Sessions while they
+attached, their original message is retained for review on returning. Dialogs
+queue in arrival order, preserving text already entered in an active dialog.
+Malformed URL-fragment values cannot prevent pairing or link handling: each pair
+is decoded independently, valid pairs remain available, and malformed links show
+pairing guidance. Tool selection, search and audit loads discard superseded
+responses; clearing search invalidates outstanding results. Opening a Session
+clears the previous transcript immediately and merges live messages received
+during its snapshot fetch, deduplicated by message id.
+
 - `formless relay enable|disable|status` controls the hosted Relay: the
   daemon dials out to `relay.url` (default
   `wss://formless.athiwat.xyz`) and browsers meet it there — no inbound
@@ -3850,8 +3929,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   (`PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `*_OPTIONS`, `BASH_ENV`,
   interpreter paths, pagers and editors), which need that key's `env:`
   grant. Git under a sub-command grant (`process:git:status|log`) runs
-  with fsmonitor, pager, credential helpers, external diff and ssh
-  turned off; repository hooks and settings can still run, so `git`,
+  with fsmonitor, pager, credential helpers and ssh turned off. Scoped
+  `diff`, `log` and `show` also disable external diff and textconv drivers
+  (including when call arguments request them); repository hooks and other
+  settings can still run, so `git`,
   `find`, `tar`, build tools and versioned interpreters (`python3.11`)
   are flagged as broad when approved.
 - **Network:** `fetch` honours the `net` scope (domain allowlist when
@@ -4056,7 +4137,8 @@ yield the key (`relay`).
 ### v2.2 — Built-ins for self-expansion
 
 `find_tools` / `read_tool` / `test_tool` and lazy Tool listing (§7.1);
-honest outcomes (throw on failure, returned `{error}` counts as failure)
+honest outcomes (throw on failure; returned `{error}` counts as failure
+unless the output schema declares an `error` property for domain data)
 and inconclusive-after-stub smoke tests; async `run`; binary encodings,
 `fs` append/stat/mkdir/remove/rename, `process.run` options, response
 headers, truly streamed `fetchChunks`, scope-checked redirects (§7.5);

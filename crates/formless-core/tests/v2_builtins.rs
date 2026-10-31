@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 fn exec(code: &str, input: Value, caps: &[&str], mode: HostMode) -> Result<Value, ExecError> {
     let req = ExecRequest {
+        output_schema: None,
         code: code.to_string(),
         input,
         caps: Capabilities::parse(&caps.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
