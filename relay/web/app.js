@@ -4934,13 +4934,38 @@
   };
   $("notes-close").onclick = () => $("notes-panel").classList.add("hidden");
   // Attachments (SPEC §5.6): stored by the daemon, sent with the next message.
+  /** Upload `file` in pieces (#909): the daemon checks the size first, then
+   * each piece is read, encoded and sent on its own, so neither side holds
+   * the whole file several times over, and no relay message is near its
+   * limit. A failure part-way attaches nothing. */
+  async function uploadFile(sessionId, file) {
+    const name = file.name || "pasted-image.png";
+    let begun;
+    try {
+      begun = await request({ type: "attach_begin", session_id: sessionId, name, bytes: file.size, mime: file.type || null });
+    } catch (e) {
+      note(name + ": " + e.message, true);
+      return null;
+    }
+    const step = begun.chunk_bytes;
+    try {
+      for (let index = 0, at = 0; at < file.size; index++, at += step) {
+        const piece = new Uint8Array(await file.slice(at, at + step).arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < piece.length; i += 0x8000) bin += String.fromCharCode.apply(null, piece.subarray(i, i + 0x8000));
+        await request({ type: "attach_chunk", upload_id: begun.upload_id, index, data_b64: btoa(bin) });
+      }
+      return await request({ type: "attach_finish", upload_id: begun.upload_id });
+    } catch (e) {
+      request({ type: "attach_abort", upload_id: begun.upload_id }).catch(() => {});
+      note(name + " wasn't attached: " + e.message, true);
+      return null;
+    }
+  }
   async function attachFiles(files) {
     if (!S.current) { note("Open a session first", true); return; }
     for (const file of files) {
-      const buf = new Uint8Array(await file.arrayBuffer());
-      let bin = "";
-      for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-      const r = await act({ type: "attach_file", session_id: S.current, name: file.name || "pasted-image.png", data_b64: btoa(bin), mime: file.type || null });
+      const r = await uploadFile(S.current, file);
       if (r) {
         (S.chips[S.current] = S.chips[S.current] || []).push(r);
         renderChips();

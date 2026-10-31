@@ -251,3 +251,94 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }
+
+/// Chunked uploads (#909): checked before any byte, taken in order,
+/// attached only when complete; a partial or out-of-order upload attaches
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn chunked_uploads_attach_only_when_complete() {
+    let (paths, sid) = setup("chunks");
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let max = formless_core::daemon::MAX_ATTACHMENT_BYTES as u64;
+    let err = daemon
+        .handle(Request::AttachBegin {
+            session_id: sid.clone(),
+            name: "big.bin".into(),
+            bytes: max + 1,
+            mime: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("larger than 20 MB"), "{err:#}");
+
+    // Out of order: refused.
+    let up = daemon
+        .handle(Request::AttachBegin {
+            session_id: sid.clone(),
+            name: "a.txt".into(),
+            bytes: 6,
+            mime: None,
+        })
+        .await
+        .unwrap();
+    let id = up["upload_id"].as_str().unwrap().to_string();
+    let err = daemon
+        .handle(Request::AttachChunk {
+            upload_id: id.clone(),
+            index: 1,
+            data_b64: b64(b"abc"),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("piece 0 was expected"),
+        "{err:#}"
+    );
+    // Half sent, then finish: incomplete, nothing attached.
+    daemon
+        .handle(Request::AttachChunk {
+            upload_id: id.clone(),
+            index: 0,
+            data_b64: b64(b"abc"),
+        })
+        .await
+        .unwrap();
+    let err = daemon
+        .handle(Request::AttachFinish {
+            upload_id: id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("incomplete"), "{err:#}");
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert!(
+        store.pending_attachments(&sid).unwrap().is_empty(),
+        "nothing half-attached"
+    );
+    let uploads = paths.data_dir.join("artifacts/.uploads");
+    assert_eq!(
+        std::fs::read_dir(&uploads).map(|d| d.count()).unwrap_or(0),
+        0,
+        "part file removed"
+    );
+
+    // An abandoned upload is never attached, and abort cleans it.
+    let up = daemon
+        .handle(Request::AttachBegin {
+            session_id: sid.clone(),
+            name: "b.txt".into(),
+            bytes: 3,
+            mime: None,
+        })
+        .await
+        .unwrap();
+    let id = up["upload_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        daemon
+            .handle(Request::AttachAbort { upload_id: id })
+            .await
+            .unwrap()["aborted"],
+        true
+    );
+    assert!(store.pending_attachments(&sid).unwrap().is_empty());
+}
