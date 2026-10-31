@@ -382,6 +382,19 @@ pub(crate) struct RunCtl {
 /// A client's reply to an `ask_user` call: free text, structured answers.
 type QuestionReply = (String, Vec<QuestionAnswer>);
 
+// The connection is part of the identity; a key from another client is a new
+// action. Direct internal handle() callers share the explicit None identity.
+#[cfg(test)]
+#[path = "daemon_send_dedupe_tests.rs"]
+mod send_dedupe_tests;
+
+type SendKey = (Option<u64>, String, String);
+type SendOutcome = std::result::Result<Value, String>;
+struct SentEntry {
+    at: std::time::Instant,
+    outcome: tokio::sync::watch::Receiver<Option<SendOutcome>>,
+}
+
 pub struct Daemon {
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
@@ -487,7 +500,7 @@ pub struct Daemon {
     /// each other's change.
     config_edit: StdMutex<()>,
     /// `SendMessage` keys seen in the last 10 minutes and their outcome.
-    sent_keys: StdMutex<HashMap<String, (std::time::Instant, Value)>>,
+    sent_keys: StdMutex<HashMap<SendKey, SentEntry>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -1234,24 +1247,75 @@ impl Daemon {
                 mode,
                 client_msg_id,
             } => {
-                // A retried send (same key) gets the first outcome (#891).
-                let key = client_msg_id.map(|k| format!("{session_id}\u{0}{k}"));
-                if let Some(k) = &key {
+                let Some(key) = client_msg_id else {
+                    return self.send_message(session_id, content, mode).await;
+                };
+                let who = current_client();
+                let key = (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key);
+                // Claim before executing. A concurrent duplicate gets the same
+                // receiver even while the first send has not finished yet.
+                let (mut outcome, owner) = {
                     let mut sent = self.sent_keys.locked();
-                    sent.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(600));
-                    if let Some((_, first)) = sent.get(k) {
-                        return Ok(first.clone());
+                    sent.retain(|_, entry| {
+                        entry.outcome.borrow().is_none()
+                            || entry.at.elapsed() < std::time::Duration::from_secs(600)
+                    });
+                    if let Some(entry) = sent.get(&key) {
+                        (entry.outcome.clone(), None)
+                    } else {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        sent.insert(
+                            key.clone(),
+                            SentEntry {
+                                at: std::time::Instant::now(),
+                                outcome: rx.clone(),
+                            },
+                        );
+                        (rx, Some(tx))
                     }
+                };
+                if let Some(tx) = owner {
+                    let this = self.clone();
+                    // A dropped reply/waiter must not cancel a send after it
+                    // appended the message. Preserve attribution in this task.
+                    tokio::spawn(async move {
+                        use futures_util::FutureExt;
+                        let execute = async {
+                            match std::panic::AssertUnwindSafe(
+                                this.send_message(session_id, content, mode),
+                            )
+                            .catch_unwind()
+                            .await
+                            {
+                                Ok(result) => result.map_err(|e| e.to_string()),
+                                Err(panic) => {
+                                    let why = panic_text(&panic);
+                                    tracing::error!("panic while handling SendMessage: {why}");
+                                    Err(format!("internal error while handling SendMessage: {why}"))
+                                }
+                            }
+                        };
+                        let result = match who {
+                            Some(who) => CLIENT.scope(who, execute).await,
+                            None => execute.await,
+                        };
+                        if let Some(entry) = this.sent_keys.locked().get_mut(&key) {
+                            entry.at = std::time::Instant::now();
+                        }
+                        let _ = tx.send(Some(result));
+                    });
                 }
-                let out = self.send_message(session_id, content, mode).await?;
-                if let Some(k) = key {
-                    self.sent_keys
-                        .lock()
-                        .unwrap()
-                        .insert(k, (std::time::Instant::now(), out.clone()));
+                loop {
+                    if let Some(result) = outcome.borrow().clone() {
+                        return result.map_err(anyhow::Error::msg);
+                    }
+                    outcome
+                        .changed()
+                        .await
+                        .context("internal error: SendMessage outcome was lost")?;
                 }
-                Ok(out)
             }
+
             Request::RunFiles { session_id, run_id } => {
                 let run_id = self.files_run(&session_id, run_id)?;
                 let files = self.run_file_infos(&run_id, true)?;
@@ -11205,6 +11269,9 @@ impl Daemon {
             worker.abort();
         }
         let _ = worker.await;
+        self.sent_keys
+            .locked()
+            .retain(|(client, _, _), _| *client != Some(conn));
         writer.abort();
         let _ = writer.await;
     }
