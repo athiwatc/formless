@@ -1302,6 +1302,15 @@ fn run_cli(cli: Cli) -> Result<()> {
         render_man(&mut std::io::stdout())?;
         return Ok(());
     }
+    if matches!(
+        cli.cmd,
+        Some(Cmd::Daemon {
+            action: DaemonAction::InstallService { dry_run: true }
+        })
+    ) {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        return daemon_cmd(paths, DaemonAction::InstallService { dry_run: true });
+    }
     if cli.secure {
         // A daemon started from here inherits it (see `Config::apply_env`).
         std::env::set_var("FORMLESS_SECURE", "1");
@@ -1946,15 +1955,7 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         DaemonAction::InstallService { dry_run } => {
             let plan = formless_core::service::plan_here(&paths)?;
             if dry_run {
-                println!(
-                    "# {} ({})\n{}",
-                    plan.file.display(),
-                    plan.manager,
-                    plan.contents
-                );
-                for c in &plan.enable {
-                    println!("$ {}", c.join(" "));
-                }
+                println!("{}", formless_core::service::dry_run(&plan));
                 return Ok(());
             }
             formless_core::service::install(&plan)?;
