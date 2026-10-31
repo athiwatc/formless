@@ -7,6 +7,10 @@ permissions:
   contents: write
   packages: write
 jobs:
+  # No release workflow runs exist as of 2026-10-31, so build (60m) and
+  # smoke/install (30m) limits are provisional, not measured 2x baselines.
+  # Re-size each job from its first green cold build before treating the
+  # duration-sizing acceptance criterion as complete.
   # Before any build (#842): the tag must name the Cargo.toml version, or
   # the binaries would report another version than their release.
   version-check:
@@ -17,6 +21,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-check.sh "$GITHUB_REF_NAME"
   build:
+    timeout-minutes: 60
     needs: version-check
     strategy:
       fail-fast: false
@@ -77,6 +82,7 @@ jobs:
   # bullseye so they run on glibc 2.31 and newer (Debian 11+, Ubuntu 20.04+,
   # RHEL/Rocky 9+), not on whatever ubuntu-latest ships.
   linux:
+    timeout-minutes: 60
     needs: version-check
     runs-on: ubuntu-latest
     container: rust:1-bullseye
@@ -110,6 +116,7 @@ jobs:
           path: dist/*
   # Install each package in a clean system and run it.
   linux-install-test:
+    timeout-minutes: 30
     needs: linux
     strategy:
       fail-fast: false
@@ -135,6 +142,7 @@ jobs:
   # ghcr.io/athiwatc/formless (docs/docker.md): built, run and checked
   # before anything is pushed. linux/amd64 only (docs/docker.md).
   docker:
+    timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/v')
     needs: version-check
     runs-on: ubuntu-latest

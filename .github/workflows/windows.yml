@@ -7,10 +7,15 @@ on:
 
 jobs:
   pipe:
+    # First green cold-cache job: 10m43s; ceil(2 x 643 / 60) = 22 minutes.
+    # https://github.com/athiwatc/formless/actions/runs/39622878988/job/119300605255
+    timeout-minutes: 22
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Assertion inventory (review aid)
+        run: python scripts/test-assertion-inventory.py
       - name: Named pipe security and round trip
         run: cargo test -p formless-core --test windows_pipe

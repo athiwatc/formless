@@ -424,14 +424,18 @@ async fn running_invocations_are_listed_abandoned_and_cancelled() {
                 .await
         }
     });
-    let list = loop {
-        let v = daemon.handle(Request::ListInvocations).await.unwrap();
-        let list: Vec<InvocationInfo> = serde_json::from_value(v).unwrap();
-        if !list.is_empty() {
-            break list;
+    let list = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let v = daemon.handle(Request::ListInvocations).await.unwrap();
+            let list: Vec<InvocationInfo> = serde_json::from_value(v).unwrap();
+            if !list.is_empty() {
+                break list;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    };
+    })
+    .await
+    .expect("pending invocation never appeared within 10 seconds");
     assert_eq!(
         (list[0].tool_name.as_str(), list[0].session_id.as_str()),
         ("slowpoke", sid.as_str())

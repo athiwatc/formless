@@ -452,16 +452,20 @@ async fn relay_browsers_are_listed_and_can_be_disconnected() {
     ))
     .await
     .unwrap();
-    let list = loop {
-        let v = daemon
-            .handle(formless_protocol::Request::ListRelayClients)
-            .await
-            .unwrap();
-        if !v.as_array().unwrap().is_empty() {
-            break v;
+    let list = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let v = daemon
+                .handle(formless_protocol::Request::ListRelayClients)
+                .await
+                .unwrap();
+            if !v.as_array().unwrap().is_empty() {
+                break v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    })
+    .await
+    .expect("relay client never registered within 10 seconds");
     assert_eq!(list[0]["cid"], "c1");
     assert!(list[0]["user_agent"].as_str().unwrap().contains("iPhone"));
 
