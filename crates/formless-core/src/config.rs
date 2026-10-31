@@ -1211,6 +1211,9 @@ pub struct ToolsCfg {
     /// Invocation, and everything one Invocation `emit`s.
     #[serde(default = "default_max_read_bytes")]
     pub max_read_bytes: u64,
+    /// Finite network deadlines for Tool fetch/fetchChunks, in seconds.
+    pub fetch_connect_timeout_secs: u64,
+    pub fetch_timeout_secs: u64,
     #[serde(default = "default_max_process_output_bytes")]
     pub max_process_output_bytes: u64,
     #[serde(default = "default_max_log_bytes")]
@@ -1305,6 +1308,8 @@ impl Default for ToolsCfg {
             max_sleep_secs: default_max_sleep_secs(),
             max_random_bytes: default_max_random_bytes(),
             max_read_bytes: default_max_read_bytes(),
+            fetch_connect_timeout_secs: 10,
+            fetch_timeout_secs: 60,
             max_process_output_bytes: default_max_process_output_bytes(),
             max_log_bytes: default_max_log_bytes(),
             max_emit_bytes: default_max_emit_bytes(),

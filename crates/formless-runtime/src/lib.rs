@@ -113,6 +113,30 @@ pub fn set_limits(max_sleep_ms: u64, max_random_bytes: u64) {
 static MAX_READ_BYTES: AtomicU64 = AtomicU64::new(64 << 20);
 static MAX_PROCESS_OUTPUT: AtomicU64 = AtomicU64::new(16 << 20);
 static MAX_LOG_BYTES: AtomicU64 = AtomicU64::new(1 << 20);
+static FETCH_CONNECT_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
+static FETCH_TIMEOUT_MS: AtomicU64 = AtomicU64::new(60_000);
+
+/// Finite Tool fetch deadlines, shared by literal-IP and DNS-pinned clients.
+/// Zero cannot disable them. The upper bound avoids overflowing clock deadlines.
+pub fn set_fetch_timeouts(connect_ms: u64, total_ms: u64) {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    FETCH_CONNECT_TIMEOUT_MS.store(connect_ms.clamp(1, DAY_MS), Ordering::Relaxed);
+    FETCH_TIMEOUT_MS.store(total_ms.clamp(1, DAY_MS), Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FetchTimeouts {
+    connect_ms: u64,
+    total_ms: u64,
+}
+impl FetchTimeouts {
+    fn configured() -> Self {
+        Self {
+            connect_ms: FETCH_CONNECT_TIMEOUT_MS.load(Ordering::Relaxed),
+            total_ms: FETCH_TIMEOUT_MS.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Set the native caps: `tools.max_read_bytes`,
 /// `tools.max_process_output_bytes`, `tools.max_log_bytes`.
@@ -662,24 +686,34 @@ struct FetchRequest {
     body: Option<Vec<u8>>,
     /// Granted hosts (empty = unscoped `net`).
     scope: Vec<String>,
+    timeouts: FetchTimeouts,
 }
 
 /// A client for fetches. Redirects are off: [`send_request`] follows
 /// them itself so it can scope-check every hop. Proxies are off too: a
 /// proxy would resolve the name itself, so the checked address would not
 /// be the one connected to (#1093).
-fn client_builder() -> reqwest::blocking::ClientBuilder {
+fn client_builder(timeouts: FetchTimeouts) -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(None)
+        .connect_timeout(std::time::Duration::from_millis(timeouts.connect_ms))
+        .timeout(std::time::Duration::from_millis(timeouts.total_ms))
         .no_proxy()
 }
 
 /// One blocking client for IP-literal fetches (connection pool and TLS
 /// sessions survive between calls).
-fn http_client() -> &'static reqwest::blocking::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| client_builder().build().expect("build HTTP client"))
+fn http_client(timeouts: FetchTimeouts) -> Result<reqwest::blocking::Client, String> {
+    static CLIENT: Mutex<Option<(FetchTimeouts, reqwest::blocking::Client)>> = Mutex::new(None);
+    let mut slot = CLIENT.locked();
+    if let Some((_, client)) = slot.as_ref().filter(|(limits, _)| *limits == timeouts) {
+        return Ok(client.clone());
+    }
+    let client = client_builder(timeouts)
+        .build()
+        .map_err(|e| fetch_error(&e))?;
+    *slot = Some((timeouts, client.clone()));
+    Ok(client)
 }
 
 /// A client that connects only to `addrs` for `host` (tried in order; TLS
@@ -688,12 +722,13 @@ fn http_client() -> &'static reqwest::blocking::Client {
 fn pinned_client(
     host: &str,
     addrs: &[std::net::SocketAddr],
+    timeouts: FetchTimeouts,
 ) -> Result<reqwest::blocking::Client, String> {
-    type Key = (String, Vec<std::net::SocketAddr>);
+    type Key = (String, Vec<std::net::SocketAddr>, FetchTimeouts);
     static PINNED: std::sync::Mutex<Vec<(Key, reqwest::blocking::Client)>> =
         std::sync::Mutex::new(Vec::new());
     const KEEP: usize = 32;
-    let key = (host.to_string(), addrs.to_vec());
+    let key = (host.to_string(), addrs.to_vec(), timeouts);
     let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(i) = pinned.iter().position(|(k, _)| *k == key) {
         let hit = pinned.remove(i);
@@ -701,7 +736,7 @@ fn pinned_client(
         pinned.push(hit);
         return Ok(client);
     }
-    let client = client_builder()
+    let client = client_builder(timeouts)
         .resolve_to_addrs(host, addrs)
         .build()
         .map_err(|e| e.to_string())?;
@@ -712,35 +747,88 @@ fn pinned_client(
     Ok(client)
 }
 
+/// Return before blocking work on cancellation. The work itself must carry
+/// finite native I/O deadlines; cancelling cannot forcibly terminate a thread.
+fn cancellable_work<T: Send + 'static>(
+    cancel: &AtomicBool,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if cancel.load(Ordering::SeqCst) => {
+                return Err("interrupted".into())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("host call thread panicked".into())
+            }
+        }
+    }
+}
+
+/// Preserve the error chain and distinguish deadline expiry from connection
+/// failure, including reqwest timeout errors wrapped in a body's io::Error.
+fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut timeout = false;
+    let mut connect = false;
+    let mut parts = Vec::new();
+    let mut next = Some(error);
+    while let Some(e) = next {
+        if let Some(e) = e.downcast_ref::<reqwest::Error>() {
+            timeout |= e.is_timeout();
+            connect |= e.is_connect();
+        }
+        if let Some(e) = e.downcast_ref::<std::io::Error>() {
+            timeout |= e.kind() == std::io::ErrorKind::TimedOut;
+        }
+        parts.push(e.to_string());
+        next = e.source();
+    }
+    let kind = if timeout {
+        "fetch timed out"
+    } else if connect {
+        "fetch connection failed"
+    } else {
+        "fetch failed"
+    };
+    format!("{kind}: {}", parts.join(": "))
+}
+
 /// Send a fetch, following up to 10 redirects. Every hop is scope-checked,
 /// so a scoped Tool can never be bounced to a host it was not granted.
 /// Like reqwest's own policy: 303 (and 301/302 after a POST) become a
 /// bodiless GET, and credentials are not sent on to another host.
 fn send_request(mut req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
     use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION};
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(req.timeouts.total_ms);
     for _ in 0..=10 {
         let pinned = checked_address(&req.url, &req.scope)?;
         let client = match req.url.host_str() {
-            Some(host) if !pinned.is_empty() => pinned_client(host, &pinned)?,
-            _ => http_client().clone(),
+            Some(host) if !pinned.is_empty() => pinned_client(host, &pinned, req.timeouts)?,
+            _ => http_client(req.timeouts)?,
         };
-        let mut builder = client.request(req.method.clone(), req.url.clone());
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("fetch timed out: tools.fetch_timeout_secs total deadline expired".into());
+        }
+        // Request-level timeout is forwarded to async reqwest and stays active
+        // through the whole body, even when a peer trickles bytes forever.
+        let mut builder = client
+            .request(req.method.clone(), req.url.clone())
+            .timeout(remaining);
         for (k, v) in &req.headers {
             builder = builder.header(k, v);
         }
         if let Some(body) = &req.body {
             builder = builder.body(body.clone());
         }
-        let resp = builder.send().map_err(|e| {
-            use std::error::Error as _;
-            let mut msg = e.to_string();
-            let mut src = e.source();
-            while let Some(s) = src {
-                msg = format!("{msg}: {s}");
-                src = s.source();
-            }
-            msg
-        })?;
+        let resp = builder.send().map_err(|e| fetch_error(&e))?;
         let status = resp.status().as_u16();
         let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
         let (true, Some(location)) = (matches!(status, 301 | 302 | 303 | 307 | 308), location)
@@ -1598,30 +1686,13 @@ impl State {
         Ok(done)
     }
 
-    /// Run blocking work on its own thread, returning early with
-    /// "interrupted" once the Invocation is cancelled. The abandoned thread
-    /// finishes (or fails) on its own; its result is discarded.
+    /// Return early on cancellation; fetch workers still finish under their
+    /// finite request deadline, releasing the response and socket themselves.
     fn cancellable<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(work());
-        });
-        loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(25)) {
-                Ok(result) => return result,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if self.cancel.load(Ordering::SeqCst) {
-                        return Err("interrupted".into());
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("host call thread panicked".into());
-                }
-            }
-        }
+        cancellable_work(&self.cancel, work)
     }
 
     fn build_request(
@@ -1648,6 +1719,7 @@ impl State {
             headers,
             body,
             scope,
+            timeouts: FetchTimeouts::configured(),
         })
     }
 
@@ -1709,7 +1781,7 @@ impl State {
             (&mut resp)
                 .take(cap + 1)
                 .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| fetch_error(&e))?;
             if bytes.len() as u64 > cap {
                 return Err(over_limit(
                     "fetch",
@@ -1768,7 +1840,7 @@ impl State {
                 let mut chunk = vec![0u8; size - buf.len()];
                 let n = match s.resp.read(&mut chunk) {
                     Ok(n) => n,
-                    Err(e) => return Ok((s, Err(e.to_string()))),
+                    Err(e) => return Ok((s, Err(fetch_error(&e)))),
                 };
                 if n == 0 {
                     eof = true;
@@ -2909,6 +2981,176 @@ mod tests {
         let req = live("async function run() { const p = Promise.reject(new Error('later handled')); await tools.call('t', {}); p.catch(() => {}); return 7; }");
         let out = execute(&req, Arc::new(SlowOps)).unwrap();
         assert_eq!(out.output, json!(7));
+    }
+
+    /// The peer remains connected until the request's own deadline closes it.
+    /// Both literal-IP (shared client) and hostname (pinned client) paths run.
+    #[test]
+    fn fetch_deadlines_bound_headers_bodies_and_trickling_peers() {
+        for host in ["127.0.0.1", "localhost"] {
+            for body in [false, true] {
+                let (addr, accepted, server) = stalled_http_peer(body, false);
+                let req = timeout_request(host, addr, 150);
+                let started = std::time::Instant::now();
+                let result = send_request(req).and_then(|mut response| {
+                    let mut bytes = Vec::new();
+                    response
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| fetch_error(&e))?;
+                    Ok(())
+                });
+                accepted
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let error = result.unwrap_err();
+                assert!(
+                    error.starts_with("fetch timed out:"),
+                    "{host}, body={body}: {error}"
+                );
+                assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                server.join().unwrap();
+            }
+        }
+        let (addr, accepted, server) = stalled_http_peer(true, true);
+        let req = timeout_request("127.0.0.1", addr, 150);
+        let started = std::time::Instant::now();
+        let mut response = send_request(req).unwrap();
+        accepted
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let error = response.read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(
+            fetch_error(&error).starts_with("fetch timed out:"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(response);
+        server.join().unwrap();
+        // Connection refusal remains recognizable instead of being labelled
+        // as the same error as an endpoint that connects and then stalls.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let error = send_request(timeout_request("127.0.0.1", addr, 150))
+            .err()
+            .unwrap();
+        assert!(error.starts_with("fetch connection failed:"), "{error}");
+    }
+
+    #[test]
+    fn cancelled_fetch_worker_exits_under_its_native_deadline() {
+        for body in [false, true] {
+            let (addr, accepted, server) = stalled_http_peer(body, false);
+            let req = timeout_request("127.0.0.1", addr, 200);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = cancel.clone();
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let caller = std::thread::spawn(move || {
+                cancellable_work(&flag, move || {
+                    let result = send_request(req).and_then(|mut response| {
+                        response
+                            .read_to_end(&mut Vec::new())
+                            .map_err(|e| fetch_error(&e))?;
+                        Ok(())
+                    });
+                    // A completion signal from inside the abandoned worker, not
+                    // merely the caller returning or a sleep that hopes it stopped.
+                    completed_tx.send(result.clone()).unwrap();
+                    result
+                })
+            });
+            accepted
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            cancel.store(true, Ordering::SeqCst);
+            assert_eq!(caller.join().unwrap().unwrap_err(), "interrupted");
+            let error = completed_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err();
+            assert!(error.starts_with("fetch timed out:"), "{error}");
+            server.join().unwrap();
+        }
+    }
+
+    fn timeout_request(host: &str, addr: std::net::SocketAddr, total_ms: u64) -> FetchRequest {
+        FetchRequest {
+            method: reqwest::Method::GET,
+            url: reqwest::Url::parse(&format!("http://{host}:{}/", addr.port())).unwrap(),
+            headers: Vec::new(),
+            body: None,
+            scope: vec![host.into()],
+            timeouts: FetchTimeouts {
+                connect_ms: 100,
+                total_ms,
+            },
+        }
+    }
+
+    fn stalled_http_peer(
+        body: bool,
+        trickle: bool,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fetch never connected"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                assert_eq!(socket.read(&mut byte).unwrap(), 1);
+                request.push(byte[0]);
+                assert!(request.len() < 16384);
+            }
+            if body {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+                    .unwrap();
+            }
+            tx.send(()).unwrap();
+            if trickle {
+                while std::time::Instant::now() < deadline {
+                    if socket.write_all(b"x").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                panic!("trickling request did not close under its total deadline");
+            } else {
+                // Deadline expiry drops the client's connection, not just its
+                // Invocation's reference to a still-blocked worker.
+                let mut byte = [0];
+                assert_eq!(
+                    socket.read(&mut byte).unwrap(),
+                    0,
+                    "fetch socket never closed"
+                );
+            }
+        });
+        (addr, rx, server)
     }
 
     #[test]
