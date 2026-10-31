@@ -3702,6 +3702,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
+| `provider.image_max_px` | 1568 | Longest side, in pixels, of an attached image sent to a vision model; bigger ones are scaled down once per Session and the encoded image kept for later steps (0: never scale). An image that can't be sent (gone, unreadable, over 8 MB) leaves a marker for the model and a note for the user (§4.2) |
+| `provider.image_detail` | auto | The `detail` asked of vision models for attached images: `auto`, `low` or `high`; images go to Chat Completions as `image_url` parts and to the Responses API as `input_image` parts (§4.2) |
 | `provider.prices` | {} | USD per million tokens per model (`input`, `output`, `cached_input`, `cache_write_input`; `retrieved_at` when imported with `formless prices import`) for cost estimates and dollar limits (§10.6) |
 | `tools.pending_threshold_secs` | 300 | Soft async handoff threshold (§6.2) |
 | `tools.default_memory_mb` | 256 | Default per-Invocation heap (§7.4) |

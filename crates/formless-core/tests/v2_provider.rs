@@ -1597,3 +1597,122 @@ async fn cache_breakpoints_follow_the_attempted_model() {
         "complete() marks Claude too: {body}"
     );
 }
+
+/// Images reach vision models on both APIs, scaled down once, and an
+/// image that can't be sent leaves a marker for the model (#616).
+#[tokio::test]
+async fn images_reach_both_apis_and_dropped_ones_are_marked() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let sse = |s: &std::sync::Arc<std::sync::Mutex<Vec<Value>>>| {
+        let s = s.clone();
+        move |Json(body): Json<Value>| {
+            s.lock().unwrap().push(body);
+            async move {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                    .into_response()
+            }
+        }
+    };
+    let responses = {
+        let s = seen.clone();
+        move |Json(body): Json<Value>| {
+            s.lock().unwrap().push(body);
+            async move {
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n".into_response()
+            }
+        }
+    };
+    let app = Router::new()
+        .route("/chat/completions", post(sse(&seen)))
+        .route("/responses", post(responses));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = std::env::temp_dir().join(format!("fl-img-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.png");
+    image::RgbImage::from_pixel(3000, 2000, image::Rgb([10, 200, 30]))
+        .save(&big)
+        .unwrap();
+    let msg = |path: &std::path::Path| json!({"role": "user", "content": "look", "_attachments": [{"path": path.to_str().unwrap(), "mime": "image/png", "name": "big.png"}]});
+    let mut c = cfg(&base);
+    c.fallback_models.clear();
+    c.vision = Some(true);
+    c.image_max_px = 800;
+    c.image_detail = "low".into();
+    let p = Provider::new(c.clone(), "k".into()).unwrap();
+    p.chat_stream(
+        &[msg(&big)],
+        &[],
+        "good",
+        None,
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    let body = seen.lock().unwrap().last().unwrap().clone();
+    let image = &body["messages"][0]["content"][1]["image_url"];
+    assert_eq!(image["detail"], "low");
+    let url = image["url"].as_str().unwrap();
+    assert!(
+        url.starts_with("data:image/jpeg;base64,"),
+        "scaled and re-encoded"
+    );
+    let bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &url[url.find(',').unwrap() + 1..],
+    )
+    .unwrap();
+    let small = image::load_from_memory(&bytes).unwrap();
+    assert_eq!((small.width(), small.height()), (800, 533));
+
+    // Responses: the same image as an input_image part.
+    let mut r = c.clone();
+    r.api_style = "responses".into();
+    let p = Provider::new(r, "k".into()).unwrap();
+    p.chat_stream(
+        &[msg(&big)],
+        &[],
+        "good",
+        None,
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    let body = seen.lock().unwrap().last().unwrap().clone();
+    let parts = body["input"][0]["content"].as_array().unwrap().clone();
+    assert!(
+        parts
+            .iter()
+            .any(|p| p["type"] == "input_text" && p["text"] == "look"),
+        "{parts:?}"
+    );
+    assert!(
+        parts.iter().any(|p| p["type"] == "input_image"
+            && p["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/jpeg")),
+        "{parts:?}"
+    );
+
+    // A missing file: the model is told, nothing silently vanishes.
+    let p = Provider::new(c, "k".into()).unwrap();
+    p.chat_stream(
+        &[msg(&dir.join("gone.png"))],
+        &[],
+        "good",
+        None,
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    let body = seen.lock().unwrap().last().unwrap().clone();
+    let text = body["messages"][0]["content"][1]["text"].as_str().unwrap();
+    assert!(text.contains("big.png could not be attached"), "{text}");
+    let _ = std::fs::remove_dir_all(dir);
+}

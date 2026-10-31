@@ -462,6 +462,27 @@ pub fn responses_input(messages: &[Value]) -> Vec<Value> {
             }
             continue;
         }
+        // Content parts (text and images from attachments) (#616).
+        if let Some(parts) = m["content"].as_array() {
+            let converted: Vec<Value> = parts
+                .iter()
+                .filter_map(|p| match p["type"].as_str() {
+                    Some("text") => Some(json!({"type": if role == "assistant" { "output_text" } else { "input_text" }, "text": p["text"]})),
+                    Some("image_url") => {
+                        let mut img = json!({"type": "input_image", "image_url": p["image_url"]["url"]});
+                        if let Some(d) = p["image_url"]["detail"].as_str() {
+                            img["detail"] = json!(d);
+                        }
+                        Some(img)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !converted.is_empty() {
+                out.push(json!({"role": role, "content": converted}));
+            }
+            continue;
+        }
         let text = m["content"].as_str().unwrap_or_default();
         if text.is_empty() {
             continue;
@@ -1078,11 +1099,10 @@ impl Provider {
     /// a vision model on Chat Completions; otherwise only the reference
     /// line in the text remains. The marker never reaches the endpoint.
     pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
-        use base64::Engine;
         // Prompt-mode tools ride on Chat Completions text; the native
-        // Messages path keeps image blocks either way.
-        let vision = !self.cfg.responses()
-            && (!self.cfg.prompt_tools() || self.cfg.anthropic())
+        // Messages path keeps image blocks either way. The Responses API
+        // takes images as `input_image` parts (#616).
+        let vision = (!self.cfg.prompt_tools() || self.cfg.anthropic())
             && self.cfg.vision.unwrap_or_else(|| is_vision_model(model));
         messages
             .iter()
@@ -1100,12 +1120,21 @@ impl Provider {
                     let (Some(path), Some(mime)) = (a["path"].as_str(), a["mime"].as_str()) else {
                         continue;
                     };
-                    match std::fs::read(path) {
-                        Ok(bytes) if bytes.len() <= MAX_IMAGE_BYTES => {
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                            parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}));
+                    let name = a["name"].as_str().unwrap_or(path);
+                    match encoded_image(path, mime, self.cfg.image_max_px) {
+                        Ok(url) => {
+                            let mut image = json!({"url": url});
+                            if self.cfg.image_detail != "auto" && !self.cfg.image_detail.is_empty() {
+                                image["detail"] = json!(self.cfg.image_detail);
+                            }
+                            parts.push(json!({"type": "image_url", "image_url": image}));
                         }
-                        _ => {}
+                        // Never silently: the model is told and so is the
+                        // user (#616).
+                        Err(why) => {
+                            parts.push(json!({"type": "text", "text": format!("[image {name} could not be attached: {why}]")}));
+                            self.note(format!("The image {name} wasn't sent to the model: {why}."));
+                        }
                     }
                 }
                 m["content"] = json!(parts);
@@ -2090,6 +2119,63 @@ fn with_prompt_tools(messages: &[Value], tools: &[Value]) -> Vec<Value> {
 
 /// Largest image sent inline to a vision model.
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// An attachment as a `data:` URL for a vision model: scaled down to
+/// `max_px` on its longest side, encoded once and kept, so later steps
+/// don't read, scale and encode it again (#616). The error says why it
+/// can't be sent.
+fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<String, String> {
+    use base64::Engine;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32), String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (path.to_string(), max_px);
+    if let Some(url) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(url.clone());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "the file is gone".to_string())?;
+    let (bytes, mime) = match image::load_from_memory(&bytes) {
+        Ok(img) if max_px > 0 && img.width().max(img.height()) > max_px => {
+            let small = img.thumbnail(max_px, max_px);
+            let mut out = Vec::new();
+            // PNG keeps transparency; anything else becomes JPEG.
+            let (format, mime) = if small.color().has_alpha() {
+                (image::ImageFormat::Png, "image/png")
+            } else {
+                (image::ImageFormat::Jpeg, "image/jpeg")
+            };
+            let small = if format == image::ImageFormat::Jpeg {
+                image::DynamicImage::ImageRgb8(small.to_rgb8())
+            } else {
+                small
+            };
+            small
+                .write_to(&mut std::io::Cursor::new(&mut out), format)
+                .map_err(|e| format!("it couldn't be scaled down ({e})"))?;
+            (out, mime.to_string())
+        }
+        Ok(_) => (bytes, mime.to_string()),
+        Err(_) if bytes.len() <= MAX_IMAGE_BYTES => (bytes, mime.to_string()),
+        Err(_) => return Err("it isn't an image this build can read".into()),
+    };
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "it is larger than {} MB",
+            MAX_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    let url = format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if c.len() >= 64 {
+        c.clear();
+    }
+    c.insert(key, url.clone());
+    Ok(url)
+}
 
 /// A guess at whether a model accepts image input, from its name.
 pub fn is_vision_model(model: &str) -> bool {

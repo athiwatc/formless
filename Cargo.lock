@@ -1349,6 +1349,7 @@ dependencies = [
  "futures-util",
  "hkdf",
  "ignore",
+ "image",
  "jsonschema",
  "keyring",
  "pulldown-cmark",
