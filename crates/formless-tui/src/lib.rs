@@ -2209,6 +2209,8 @@ impl App {
                     | Request::ListModules
                     | Request::ContextUsage { .. }
                     | Request::RunMetrics { .. }
+                    | Request::SessionUsage { .. }
+                    | Request::ListInvocations
                     | Request::Subscribe { .. }
             )
         {
@@ -16226,6 +16228,81 @@ mod tests {
             sent.try_recv().is_err(),
             "no old command or Session is recreated automatically"
         );
+    }
+
+    #[test]
+    fn reconnect_gap_reads_preserve_newer_live_usage_in_either_reply_order() {
+        use formless_protocol::{DroppedEventKind as K, UsageInfo};
+        for session_reply_first in [false, true] {
+            let mut app = test_app();
+            app.daemon_lost();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let _: Vec<_> = sent.try_iter().collect();
+            let (snapshot, _) = app.reconnect_request.clone().unwrap();
+            app.on_event(Event::DeltasDropped {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                kinds: vec![K::RunUsage, K::InvocationActivity],
+                handle: None,
+                model: None,
+            });
+            let reads: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert_eq!(reads.len(), 2, "gap recovery remains available offline");
+            app.on_event(Event::RunUsage {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                usage: UsageInfo {
+                    steps: 9,
+                    context_used: 200,
+                    context_tokens: 2000,
+                    ..UsageInfo::default()
+                },
+            });
+            let session_reply = || ServerMessage::Response {
+                id: snapshot,
+                ok: true,
+                result: Some(reconnect_snapshot(false, vec![])),
+                error: None,
+            };
+            if session_reply_first {
+                tx.send(session_reply()).unwrap();
+            }
+            for read in reads {
+                let result = match read.request {
+                    Request::SessionUsage { session_id } => {
+                        assert_eq!(session_id, "s1");
+                        serde_json::json!({"last_run": UsageInfo {
+                            steps: 3,
+                            context_used: 100,
+                            context_tokens: 1000,
+                            ..UsageInfo::default()
+                        }})
+                    }
+                    Request::ListInvocations => serde_json::json!([]),
+                    other => panic!("unexpected recovery action: {other:?}"),
+                };
+                tx.send(ServerMessage::Response {
+                    id: read.id,
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                })
+                .unwrap();
+            }
+            if !session_reply_first {
+                tx.send(session_reply()).unwrap();
+            }
+            app.drain_daemon();
+            assert!(app.offline.is_none());
+            assert_eq!(app.run_usage["s1"].steps, 9);
+            assert_eq!(app.context_fill["s1"], (200, 2000));
+            assert!(sent.try_recv().is_err(), "recovery never replays commands");
+        }
     }
 
     #[test]
