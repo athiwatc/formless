@@ -46,7 +46,7 @@ async fn internal_provider_factories_broadcast_unattributed_breaker_notes() {
         tx,
         filter: Arc::new(StdMutex::new(EventFilter::default())),
         kick: CancellationToken::new(),
-        gap: None,
+        gaps: Default::default(),
     });
     for name in [None, Some("work")] {
         let provider = daemon.provider_named(&cfg, name).await.unwrap();
