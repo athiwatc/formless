@@ -122,16 +122,47 @@ fn escape(s: &str) -> String {
 }
 
 /// Markdown to HTML with any raw HTML in it shown as text, so a message
-/// can't add markup or scripts to the page.
+/// can't add markup or scripts to the page. Images become their alt text
+/// and address as text (an `<img>` would fetch from wherever it points
+/// when the file is opened), and links keep only http(s) and mailto
+/// destinations (#826).
 fn md_html(s: &str) -> String {
-    let parser = Parser::new_ext(s, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH).map(
-        |e| match e {
-            Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
-            e => e,
-        },
-    );
+    use pulldown_cmark::{Tag, TagEnd};
+    let mut in_image: Option<String> = None;
+    let mut dropped_link = Vec::new();
+    let mut events = Vec::new();
+    for e in Parser::new_ext(s, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH) {
+        match e {
+            Event::Html(t) | Event::InlineHtml(t) => events.push(Event::Text(t)),
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                events.push(Event::Text("[image: ".into()));
+                in_image = Some(dest_url.to_string());
+            }
+            Event::End(TagEnd::Image) => {
+                let url = in_image.take().unwrap_or_default();
+                events.push(Event::Text(format!("] ({url})").into()));
+            }
+            Event::Start(Tag::Link { ref dest_url, .. }) => {
+                let lower = dest_url.trim().to_ascii_lowercase();
+                let safe = ["http://", "https://", "mailto:", "#"]
+                    .iter()
+                    .any(|p| lower.starts_with(p))
+                    || !lower.contains(':');
+                dropped_link.push(!safe);
+                if safe {
+                    events.push(e);
+                }
+            }
+            Event::End(TagEnd::Link) => {
+                if dropped_link.pop() != Some(true) {
+                    events.push(e);
+                }
+            }
+            e => events.push(e),
+        }
+    }
     let mut out = String::new();
-    html::push_html(&mut out, parser);
+    html::push_html(&mut out, events.into_iter());
     out
 }
 
@@ -243,5 +274,32 @@ mod tests {
         assert!(page.contains("<strong>3</strong>"));
         assert!(page.contains("<summary>Tool: grep</summary>"));
         assert!(!page.contains("http"), "no external resources");
+    }
+
+    /// Tool output is attacker-controlled: an exported page must not fetch
+    /// an image or carry a script link (#826).
+    #[test]
+    fn exports_neither_fetch_nor_script() {
+        let page = html(
+            "t",
+            &[msg(
+                "assistant",
+                "![pixel](https://attacker.example/pixel) [click](javascript:alert(1)) [data](data:text/html,x) [ok](https://example.com) [rel](notes.md)",
+                None,
+            )],
+        );
+        assert!(!page.contains("<img"), "{page}");
+        assert!(!page.contains("src="), "{page}");
+        assert!(
+            !page.to_lowercase().contains("href=\"javascript:"),
+            "{page}"
+        );
+        assert!(!page.contains("href=\"data:"), "{page}");
+        assert!(
+            page.contains("[image: pixel] (https://attacker.example/pixel)"),
+            "{page}"
+        );
+        assert!(page.contains("click") && page.contains("href=\"https://example.com\""));
+        assert!(page.contains("href=\"notes.md\""), "relative links stay");
     }
 }
