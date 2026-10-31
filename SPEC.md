@@ -2096,7 +2096,9 @@ such as `read_file`, `read_text_file` and `file_read`.
   user unit (`~/.config/systemd/user/formless.service`) or a Windows
   logon task (running `<data>/formless-service.cmd`) for this profile
   (`formless-<profile>` for others) and loads it; `--dry-run` prints the
-  file and commands. Reinstalling a launchd agent unloads the old definition
+  file and commands without creating data/config directories, loading
+  config/credentials, starting a daemon or executing a service manager.
+  Reinstalling a launchd agent unloads the old definition
   before replacing and loading its plist; a manager-reported load/unload
   failure is surfaced even if launchctl exits zero. Service profile names
   must be 1–64 ASCII letters, digits, `-` or `_`, starting with a letter or

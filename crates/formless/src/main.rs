@@ -1302,6 +1302,15 @@ fn run_cli(cli: Cli) -> Result<()> {
         render_man(&mut std::io::stdout())?;
         return Ok(());
     }
+    if matches!(
+        cli.cmd,
+        Some(Cmd::Daemon {
+            action: DaemonAction::InstallService { dry_run: true }
+        })
+    ) {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        return daemon_cmd(paths, DaemonAction::InstallService { dry_run: true });
+    }
     if cli.secure {
         // A daemon started from here inherits it (see `Config::apply_env`).
         std::env::set_var("FORMLESS_SECURE", "1");
