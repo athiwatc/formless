@@ -38,17 +38,56 @@ pub fn enclosing_root(start: &Path) -> Option<(PathBuf, String)> {
     project
 }
 
-/// Folders too broad to grant in one click: `/` and the home folder, and
-/// anything above home.
-fn too_broad(dir: &Path) -> bool {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    dir.parent().is_none() || home.is_some_and(|h| h.starts_with(dir))
+/// BaseDirs uses the native user-profile API on Windows and a user database
+/// fallback on Unix without HOME. A relative or unresolvable result cannot
+/// safely establish which wider folders should be offered.
+fn home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().and_then(|dirs| canonical_home(dirs.home_dir()))
+}
+
+fn canonical_home(home: &Path) -> Option<PathBuf> {
+    if !home.is_absolute() {
+        return None;
+    }
+    home.canonicalize().ok().filter(|home| home.is_dir())
+}
+
+fn canonical_scope(path: &Path) -> Result<PathBuf, String> {
+    formless_runtime::caps::canonical_path(path.to_str().ok_or("path is not valid UTF-8")?)
+}
+
+/// Folders too broad to grant in one click: a filesystem root, home or an
+/// ancestor of home. Fail closed for widening if either side is unresolved.
+fn too_broad(
+    dir: &Path,
+    home: Option<&Path>,
+    canonicalize: &impl Fn(&Path) -> Result<PathBuf, String>,
+) -> bool {
+    let Ok(dir) = canonicalize(dir) else {
+        return true;
+    };
+    let Some(home) = home.and_then(|home| canonicalize(home).ok()) else {
+        return true;
+    };
+    dir.parent().is_none() || home.starts_with(dir)
 }
 
 /// The scopes to offer for a path Capability's path, narrowest first:
 /// the path itself, its folder, then the repository or project root above
 /// it. Never `/` or the home folder.
 pub fn choices(path: &str) -> Vec<PathChoice> {
+    choices_with_home(path, home_dir().as_deref())
+}
+
+fn choices_with_home(path: &str, home: Option<&Path>) -> Vec<PathChoice> {
+    choices_with(path, home, canonical_scope)
+}
+
+fn choices_with(
+    path: &str,
+    home: Option<&Path>,
+    canonicalize: impl Fn(&Path) -> Result<PathBuf, String>,
+) -> Vec<PathChoice> {
     let p = Path::new(path);
     let mut out = vec![PathChoice {
         path: path.to_string(),
@@ -56,7 +95,7 @@ pub fn choices(path: &str) -> Vec<PathChoice> {
         label: String::new(),
     }];
     let folder = if p.is_dir() { Some(p) } else { p.parent() };
-    if let Some(dir) = folder.filter(|d| *d != p && !too_broad(d)) {
+    if let Some(dir) = folder.filter(|d| *d != p && !too_broad(d, home, &canonicalize)) {
         out.push(PathChoice {
             path: dir.to_string_lossy().into_owned(),
             kind: "folder".into(),
@@ -65,7 +104,7 @@ pub fn choices(path: &str) -> Vec<PathChoice> {
     }
     if let Some((root, label)) = folder.and_then(enclosing_root) {
         let known = out.iter().any(|c| Path::new(&c.path) == root);
-        if !known && !too_broad(&root) {
+        if !known && !too_broad(&root, home, &canonicalize) {
             out.push(PathChoice {
                 path: root.to_string_lossy().into_owned(),
                 kind: if VCS.iter().any(|(_, k)| *k == label) {
@@ -81,43 +120,35 @@ pub fn choices(path: &str) -> Vec<PathChoice> {
     out
 }
 
-/// `p` with symlinks resolved, also when it doesn't exist yet (a file
-/// about to be written): its nearest existing parent is resolved and the
-/// rest kept.
-fn canonical_lenient(p: &Path) -> PathBuf {
-    if let Ok(c) = p.canonicalize() {
-        return c;
-    }
-    let mut rest = Vec::new();
-    let mut cur = p;
-    while let Some(parent) = cur.parent() {
-        if let Some(name) = cur.file_name() {
-            rest.push(name.to_os_string());
-        }
-        if let Ok(c) = parent.canonicalize() {
-            let mut out = c;
-            for part in rest.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        cur = parent;
-    }
-    p.to_path_buf()
-}
-
 /// Accept a chosen scope for `requested` only when it is the path itself
 /// or a folder above it (whole components, so `/proj` never covers
 /// `/proj-secrets`) and not too broad. Returns the canonical folder.
 pub fn validate(requested: &str, chosen: &str) -> Result<String, String> {
-    let chosen_p = formless_runtime::caps::canonical_path(chosen)?;
+    validate_with_home(requested, chosen, home_dir().as_deref())
+}
+
+fn validate_with_home(
+    requested: &str,
+    chosen: &str,
+    home: Option<&Path>,
+) -> Result<String, String> {
+    validate_with(requested, chosen, home, canonical_scope)
+}
+
+fn validate_with(
+    requested: &str,
+    chosen: &str,
+    home: Option<&Path>,
+    canonicalize: impl Fn(&Path) -> Result<PathBuf, String>,
+) -> Result<String, String> {
+    let chosen_p = canonicalize(Path::new(chosen))?;
     // Both sides resolved, so a symlink on the way (macOS /tmp, a linked
     // home or repo) doesn't make a real parent look foreign (#772).
-    let requested_p = canonical_lenient(Path::new(requested));
+    let requested_p = canonicalize(Path::new(requested))?;
     if !requested_p.starts_with(&chosen_p) {
         return Err(format!("{chosen} does not contain {requested}"));
     }
-    if chosen_p != requested_p && too_broad(&chosen_p) {
+    if chosen_p != requested_p && too_broad(&chosen_p, home, &canonicalize) {
         return Err(format!(
             "{chosen} is too broad to grant from an approval prompt"
         ));
@@ -192,6 +223,83 @@ mod tests {
         assert_eq!(c.last().unwrap().kind, "project");
         assert_eq!(c.last().unwrap().label, "Cargo.toml");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn injected_windows_home_blocks_widening_without_home_environment() {
+        // Forward-slash Windows paths keep component boundaries on every
+        // host. Inject their already-canonical forms too, so this test never
+        // depends on a real C: drive, filesystem profile or process HOME.
+        let canonical = |path: &Path| Ok(path.to_path_buf());
+        let home = Path::new("C:/Users/Alice");
+        let requested = "C:/Users/Alice/project/src/main.rs";
+        for chosen in ["C:/", "C:/Users", "C:/Users/Alice"] {
+            let error = validate_with(requested, chosen, Some(home), canonical).unwrap_err();
+            assert!(error.contains("too broad"), "{chosen}: {error}");
+        }
+        assert!(validate_with(requested, "C:/Users/Alice/project", Some(home), canonical).is_ok());
+        // Parent comparison must be by component, never a string prefix.
+        assert!(validate_with(
+            "C:/Users/Alice-secrets/file",
+            "C:/Users/Alice",
+            Some(home),
+            canonical
+        )
+        .is_err());
+        let choices = choices_with("C:/Users/Alice/new.txt", Some(home), canonical);
+        assert_eq!(choices.len(), 1, "home is not a wider folder choice");
+        let choices = choices_with("C:/Users/new.txt", Some(home), canonical);
+        assert_eq!(choices.len(), 1, "an ancestor of home is not a choice");
+        let choices = choices_with(requested, Some(home), canonical);
+        assert!(choices
+            .iter()
+            .any(|choice| choice.path == "C:/Users/Alice/project/src"));
+    }
+
+    #[test]
+    fn an_unknown_home_disables_widening_but_keeps_the_exact_request() {
+        assert!(canonical_home(Path::new("relative/home")).is_none());
+        let root = tmp("unknown-home");
+        let requested = root.join("src/new.rs");
+        let requested = requested.to_str().unwrap();
+        assert_eq!(choices_with_home(requested, None).len(), 1);
+        assert!(validate_with_home(requested, root.to_str().unwrap(), None)
+            .unwrap_err()
+            .contains("too broad"));
+        assert!(validate_with_home(requested, requested, None).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_and_chosen_scope_are_both_canonicalized() {
+        let root = tmp("linked-home");
+        let home = root.join("Users/Alice");
+        std::fs::create_dir_all(home.join("project")).unwrap();
+        let alias = root.join("home-link");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        assert_eq!(canonical_home(&alias), Some(home.canonicalize().unwrap()));
+        let requested = home.join("project/new.rs");
+        for chosen in [&home, &alias, &root.join("Users")] {
+            assert!(validate_with_home(
+                requested.to_str().unwrap(),
+                chosen.to_str().unwrap(),
+                Some(&alias)
+            )
+            .unwrap_err()
+            .contains("too broad"));
+        }
+        assert_eq!(
+            choices_with_home(alias.join("new.rs").to_str().unwrap(), Some(&home)).len(),
+            1
+        );
+        assert!(validate_with_home(
+            requested.to_str().unwrap(),
+            home.join("project").to_str().unwrap(),
+            Some(&alias)
+        )
+        .is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
