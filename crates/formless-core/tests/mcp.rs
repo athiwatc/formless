@@ -12,11 +12,13 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 #[test]
+#[ignore = "subprocess fixture, invoked explicitly by MCP integration tests"]
 fn fake_mcp_server() {
     let _env = credential_env::EnvGuard::isolated();
-    if std::env::var("FL_FAKE_MCP").is_err() {
-        return;
-    }
+    assert!(
+        std::env::var("FL_FAKE_MCP").is_ok(),
+        "fixture requires FL_FAKE_MCP"
+    );
     let log = std::env::var("FL_FAKE_LOG").unwrap_or_default();
     let out = std::sync::Arc::new(std::sync::Mutex::new(std::io::stdout()));
     let send = {
@@ -137,6 +139,7 @@ pub fn fake_server(paths: &Paths) -> (McpCfg, std::path::PathBuf) {
             .to_string_lossy()
             .into_owned(),
         args: vec![
+            "--ignored".into(),
             "--exact".into(),
             "fake_mcp_server".into(),
             "--nocapture".into(),

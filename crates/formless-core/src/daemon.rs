@@ -778,6 +778,13 @@ impl Daemon {
                 "security.secret_patterns: {bad:?} is not a valid regular expression; ignored"
             );
         }
+        formless_runtime::set_fetch_timeouts(
+            cfg.tools
+                .fetch_connect_timeout_secs
+                .max(1)
+                .saturating_mul(1000),
+            cfg.tools.fetch_timeout_secs.max(1).saturating_mul(1000),
+        );
         formless_runtime::set_io_limits(
             cfg.tools.max_read_bytes,
             cfg.tools.max_process_output_bytes,

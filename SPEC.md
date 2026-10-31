@@ -173,7 +173,10 @@ without redesign.
   resend without it, with a note to the user: rejected replayed thinking
   (the Session's stored blocks are then dropped), thinking, an output
   limit (lowered to the one the error names), `cache_control` (also on
-  Chat Completions) or an image. Tools are native, or with
+  Chat Completions) or an image. Merely mentioning an image does not
+  resend a request with no image left to remove. Each recovery kind is
+  applied at most once per request, and exhausting the total resend cap
+  reports the final HTTP status and error body. Tools are native, or with
   `tool_mode = "prompt"` described in the `system` prompt and parsed from
   the text; the probe forces a call with `tool_choice: {type: "any"}`.
   The listing is read page by page (`has_more` / `after_id`), and its
@@ -1299,6 +1302,9 @@ pattern (§4.4).
     names/messages, and replaces circular references with `[Circular]`.
     A return value that cannot be JSON-serialized fails the Invocation with
     `return value is not JSON-serializable`, for both sync and async `run`.
+    Root functions, symbols and `toJSON` methods returning `undefined` are
+    rejected rather than silently becoming null; an absent `run` return
+    deliberately becomes null. A result's `toJSON` is invoked only once.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
@@ -3875,6 +3881,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.max_tool_depth` | 8 | How deep `tools.call` composition may nest (cycle guard, §7.6) |
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
+| `tools.fetch_connect_timeout_secs` | 10 | Tool `fetch`/`fetchChunks` connection deadline, clamped to 1–86400 seconds; applies to shared and DNS-pinned clients. DNS admission/resolution waits on each hop are bounded by the smaller of this budget and the remaining total deadline |
+| `tools.fetch_timeout_secs` | 60 | Total Tool HTTP deadline across DNS waits, redirects and response-body reads, clamped to 1–86400 seconds; trickling data does not reset it. Cancellation returns promptly and HTTP workers retain this deadline. OS DNS uses one fixed pool of four workers with at most sixteen queued lookups: expired queued work is skipped and late results discarded. OS lookups cannot be forcibly cancelled; a stalled lookup may retain one of those four fixed workers, while fetch callers still stop waiting at their deadlines. Timeout errors say `fetch timed out`, distinct from connection failures |
 | `tools.max_read_bytes` | 67108864 | Largest `fs.read` or `fetch` body (64 MB): larger fails as a resource error pointing to `fs.readChunks` / `fetchChunks` (§7.5) |
 | `tools.max_process_output_bytes` | 16777216 | `process.run` keeps this much of stdout and of stderr (16 MB); the rest is read and dropped, and the result says `truncated: true` |
 | `tools.max_log_bytes` | 1048576 | All `log` lines of one Invocation (1 MB); later lines are dropped after one marker line |
@@ -4198,6 +4206,17 @@ without an approver fails closed.
 - Every §16 edge case has an automated test or scripted demonstration.
 
 ## 19. Testing strategy (summary)
+
+Test waits for daemon subscriptions and pipe creation have a ten-second
+absolute timeout with a diagnostic naming the missing event. Test-running
+CI jobs have an explicit job timeout. The Windows transport gate parses a
+successful Ping payload and inspects the created pipe DACL: only the current
+user and SYSTEM receive allow ACEs. Subprocess fixtures are ignored by the
+normal test run and explicitly selected by their spawning tests. The PR CI
+assertion inventory reports tests without direct assertion macros for review
+(including deliberate no-panic rendering checks). Historical
+database rehearsals fail when their required fixture path is missing; storage
+latency smoke checks enforce a generous 100 ms per-operation ceiling.
 
 - Unit: schema validation, capability path containment, metrics math and
   trigger/promotion bars, compaction checkpoint round-trip.

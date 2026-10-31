@@ -130,9 +130,13 @@ async fn agent_changes_are_approved_with_a_diff_logged_and_undoable() {
         .unwrap();
     let (rd, mut w) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
-    while daemon.subscriber_count() == 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while daemon.subscriber_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("no subscriber registered within 10 seconds");
     let call = tokio::spawn({
         let (d, s) = (daemon.clone(), sid.clone());
         async move {

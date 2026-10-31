@@ -139,9 +139,8 @@ fn session_summary_is_maintained_by_triggers() {
 #[test]
 #[ignore = "needs FORMLESS_BENCH_DB pointing at a copy of a real database"]
 fn migrates_a_real_database() {
-    let Ok(path) = std::env::var("FORMLESS_BENCH_DB") else {
-        return;
-    };
+    let path = std::env::var("FORMLESS_BENCH_DB")
+        .expect("set FORMLESS_BENCH_DB to a copy of a historical database");
     let path = PathBuf::from(path);
     let started = std::time::Instant::now();
     let store = Store::open(&path).unwrap();
@@ -258,7 +257,13 @@ fn write_and_read_latency() {
         for _ in 0..iters {
             f();
         }
-        println!("{label:44} {:?}/op", t.elapsed() / iters as u32);
+        let per_op = t.elapsed() / iters as u32;
+        println!("{label:44} {per_op:?}/op");
+        // A deliberately generous smoke ceiling, not a machine-specific benchmark.
+        assert!(
+            per_op < std::time::Duration::from_millis(100),
+            "{label}: {per_op:?}/op exceeds 100 ms"
+        );
     }
 
     time("append_message", 400, || {
