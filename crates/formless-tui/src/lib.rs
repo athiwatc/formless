@@ -1433,7 +1433,10 @@ impl App {
 
     fn new(paths: Paths) -> Result<Self> {
         let cfg = Config::load(&paths)?;
-        theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
+        let chosen = theme::from_config(&cfg.tui.theme, &cfg.tui.colors);
+        // Overrides that would be hard to read are used, with a note.
+        let theme_warnings = theme::contrast_warnings(&chosen);
+        theme::set(chosen);
         markdown::set_line_numbers(cfg.tui.code_line_numbers);
         let image_proto = images::detect(&cfg.tui.inline_images);
         let has_credential = has_provider_credential(&paths, &cfg.provider);
@@ -1482,7 +1485,7 @@ impl App {
             mouse_capture: true,
             proposal_generating: false,
             running_sessions: Default::default(),
-            notes: Vec::new(),
+            notes: theme_warnings,
             notes_seen: 0,
             toasts: Vec::new(),
             pending: HashMap::new(),
@@ -14339,6 +14342,16 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     }
     app.load_drafts();
     enable_raw_mode()?;
+    // `auto` asks the terminal for its background when COLORFGBG says
+    // nothing; a terminal that doesn't answer costs at most 150 ms (#883).
+    if Config::load(&app.paths)
+        .is_ok_and(|c| !matches!(c.tui.theme.as_str(), "light" | "dark" | "high-contrast"))
+        && std::env::var_os("COLORFGBG").is_none()
+    {
+        if let Some(bg) = theme::query_background(Duration::from_millis(150)) {
+            theme::set_kind(theme::kind_for_background(bg));
+        }
+    }
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
     out.execute(crossterm::event::EnableMouseCapture)?;

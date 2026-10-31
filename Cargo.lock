@@ -1410,6 +1410,7 @@ dependencies = [
  "formless-protocol",
  "formless-runtime",
  "image",
+ "libc",
  "pulldown-cmark",
  "qrcode",
  "ratatui",
