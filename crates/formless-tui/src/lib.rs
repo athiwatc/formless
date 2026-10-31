@@ -13817,6 +13817,9 @@ fn draw_approval(
     ));
 
     let area = f.area();
+    // Names, paths and summaries come from Tools and models: their bidi
+    // controls are shown, never obeyed (#791).
+    let lines: Vec<Line<'static>> = lines.into_iter().map(text::escape_bidi_line).collect();
     let content_w = lines
         .iter()
         .chain(&footer)

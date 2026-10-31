@@ -2537,6 +2537,16 @@ run_tool = "network_policy"     # a registry Tool, or…
     text in those scripts wraps between clusters, never inside one.
   - Key releases (the Windows console, kitty's event types) are ignored;
     in the web client no key handler acts while an IME is composing.
+- **Unicode matching and direction.** Fuzzy pickers, `@` file mentions,
+  search snippets and web search highlights match on folded text that
+  keeps each character's original position: case folding never shifts a
+  highlight (`İstanbul`), and NFC and NFD spellings match each other
+  (macOS file names are NFD). In the web client each message paragraph
+  takes its direction from its own text, so Arabic and Hebrew answers are
+  right-aligned beside left-aligned English, and Session names are
+  isolated from the time beside them. Approval prompts in both clients
+  show bidi control characters as `⟨U+202E⟩` instead of obeying them, so
+  a name can't display reversed.
 
 ### 10.3 Approvals (modal)
 

@@ -2053,6 +2053,17 @@
     }
     return out;
   }
+  /** Bidi controls in what a prompt shows (Tool names, paths, summaries)
+   * are written out as `⟨U+202E⟩`, never obeyed, so `report\u202Efdp.exe`
+   * can't pass for `reportexe.pdf` (#791). */
+  const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+  function showBidi(root) {
+    const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      if (BIDI.test(n.data)) n.data = n.data.replace(BIDI, (c) => "⟨U+" + c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0") + "⟩");
+      BIDI.lastIndex = 0;
+    }
+  }
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
@@ -2098,6 +2109,7 @@
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
+    showBidi(body);
     $("modal-once").classList.toggle("hidden", promo);
     $("modal-session").classList.toggle("hidden", promo);
     $("modal-hour").classList.toggle("hidden", promo);
@@ -2940,11 +2952,35 @@
     }
   }
   /** Wrap the words' first occurrences in an element's own text in <mark>. */
+  /** `text` folded for matching with, per folded UTF-16 unit, the offset
+   * of the original character it came from (#789): decomposed, marks
+   * dropped, lower-cased one character at a time, so `İ` stays one
+   * letter and NFC/NFD spellings match each other. */
+  function foldMap(text) {
+    let folded = "";
+    const from = [];
+    let at = 0;
+    for (const ch of text) {
+      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2);
+      for (let k = 0; k < f.length; k++) from.push(at);
+      folded += f;
+      at += ch.length;
+    }
+    from.push(at);
+    return { folded, from };
+  }
   function markWords(el, words) {
+    const keys = words.map((w) => foldMap(w).folded).filter((w) => w);
     for (const node of [...el.childNodes].filter((n) => n.nodeType === 3)) {
       const text = node.textContent;
-      const lower = text.toLowerCase();
-      const spans = words.map((w) => [lower.indexOf(w), w.length]).filter(([i]) => i >= 0).sort((a, b) => a[0] - b[0]);
+      const { folded, from } = foldMap(text);
+      // Offsets in the original text: where the match's first folded unit
+      // came from, up to where the one after its last starts.
+      const spans = keys
+        .map((w) => [folded.indexOf(w), w.length])
+        .filter(([i]) => i >= 0)
+        .map(([i, n]) => [from[i], from[i + n] - from[i]])
+        .sort((a, b) => a[0] - b[0]);
       if (!spans.length) continue;
       const parts = [];
       let at = 0;

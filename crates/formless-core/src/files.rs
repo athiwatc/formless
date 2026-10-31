@@ -200,4 +200,23 @@ mod tests {
         );
         assert_eq!(mentions("@a @a"), vec!["a"]);
     }
+
+    /// macOS lists names in NFD; a query typed in NFC finds them, and the
+    /// other way round (#789).
+    #[test]
+    fn search_ignores_unicode_normal_form() {
+        let e = |p: &str| FileEntry {
+            path: p.into(),
+            dir: false,
+            bytes: 1,
+        };
+        let nfd = [e("src/cafe\u{301}.rs"), e("src/other.rs")];
+        let hit = search(&nfd, "café.rs", 5);
+        assert_eq!(
+            hit.first().map(|f| f.path.as_str()),
+            Some("src/cafe\u{301}.rs")
+        );
+        let nfc = [e("src/café.rs")];
+        assert_eq!(search(&nfc, "cafe\u{301}.rs", 5).len(), 1);
+    }
 }

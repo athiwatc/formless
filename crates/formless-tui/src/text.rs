@@ -60,3 +60,58 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     }
     format!("{}…", take_width(s, max.saturating_sub(1)))
 }
+
+/// Bidirectional formatting controls (embeddings, overrides, isolates and
+/// marks): invisible, yet able to reorder what is shown around them.
+pub(crate) fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `s` with every bidi control shown as `⟨U+202E⟩`, so a name like
+/// `report\u{202E}fdp.exe` in an approval can't display reversed (#791).
+pub(crate) fn escape_bidi(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(is_bidi_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if is_bidi_control(c) {
+                    format!("⟨U+{:04X}⟩", c as u32)
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect(),
+    )
+}
+
+/// [`escape_bidi`] over every span of a line.
+pub(crate) fn escape_bidi_line(line: ratatui::text::Line<'static>) -> ratatui::text::Line<'static> {
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|s| ratatui::text::Span::styled(escape_bidi(&s.content).into_owned(), s.style))
+        .collect::<Vec<_>>();
+    ratatui::text::Line { spans, ..line }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bidi_controls_are_shown_not_obeyed() {
+        assert_eq!(
+            escape_bidi("report\u{202E}fdp.exe"),
+            "report⟨U+202E⟩fdp.exe"
+        );
+        assert_eq!(escape_bidi("a\u{2066}b\u{2069}"), "a⟨U+2066⟩b⟨U+2069⟩");
+        assert!(matches!(
+            escape_bidi("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Arabic text itself is untouched.
+        assert_eq!(escape_bidi("مرحبا"), "مرحبا");
+    }
+}
