@@ -66,6 +66,51 @@ test('overlapping asks preserve typed text and both settle in FIFO order', async
   c.closeAsk('answer');
   assert.equal(await second, 'answer');
 });
+test('secret prompts mask their field and ordinary prompts reset the input type', async () => {
+  const c = setup(['ask', 'showNextAsk', 'closeAsk']);
+  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
+  const secret = c.ask({ title: 'Connection URL', input: true, secret: true });
+  assert.equal(c.$('ask-input').type, 'password');
+  c.closeAsk('hidden'); await secret;
+  const plain = c.ask({ title: 'Name', input: true });
+  assert.equal(c.$('ask-input').type, 'text'); assert.equal(c.$('ask-input').value, '');
+  c.closeAsk('name'); await plain;
+});
+test('passwordless PostgreSQL argv authenticates through the actual pg constructor fallback', () => {
+  const base = new URL('../crates/formless-core/tests/fixtures/postgres-env/', import.meta.url);
+  const cases = JSON.parse(readFileSync(new URL('cases.json', base), 'utf8'));
+  const parserModule = { exports: {} };
+  vm.runInNewContext(readFileSync(new URL('pg-connection-string.cjs', base), 'utf8'), {
+    module: parserModule, URL,
+    require: () => { throw new Error('fixture must not read files or connect'); },
+  });
+  for (const fixture of cases) {
+    const env = { PGPASSWORD: fixture.daemon_password };
+    if (fixture.literal_password !== null) env.PGPASSWORD = fixture.literal_password;
+    const module = { exports: {} };
+    vm.runInNewContext(readFileSync(new URL('pg-connection-parameters.cjs', base), 'utf8'), {
+      module, process: { env },
+      require: name => {
+        if (name === 'pg-connection-string') return parserModule.exports;
+        if (name === './defaults') return { user: 'default-user', database: null, host: 'localhost', port: 5432, password: null, ssl: false };
+        if (name === 'dns') return { lookup() { throw new Error('no network in constructor fixture'); } };
+        throw new Error('unexpected dependency ' + name);
+      },
+    });
+    // The pinned MCP package passes argv[0] to new pg.Pool({connectionString}).
+    // A fake Pool observes that exact constructor boundary without starting it.
+    class FakePool {
+      constructor(config) { this.parameters = new module.exports(config); }
+    }
+    const fakePackage = argv => new FakePool({ connectionString: argv[0] });
+    const pool = fakePackage([fixture.argument]);
+    assert.equal(new URL(fixture.argument).password, '');
+    assert.equal(pool.parameters.password, fixture.effective_password);
+    assert.equal(pool.parameters.user, 'u');
+    assert.equal(pool.parameters.database, 'db');
+    assert.equal(pool.parameters.host, 'h');
+  }
+});
 test('file upload remains in original Session after switching', async () => {
   const wait = deferred(), calls = [];
   const c = setup(['attachFiles'], { uploadFile: async (sid, file) => { calls.push(sid); await wait.promise; return { name: file.name }; } });
@@ -344,6 +389,49 @@ test('relay daemon_offline clears live state and rejects pending requests withou
   assert.equal(c.S.channel, null); assert.equal(c.S.approvals.length, 0);
   assert.equal(c.S.running.size, 0); assert.equal(c.S.streaming, '');
   assert.equal(rejected, 1); assert.equal(c.S.pending.size, 0);
+});
+
+test('catalog Add masks credentials and waits for command and exposure confirmation', async () => {
+  let table; const calls = [], prompts = [];
+  const c = setup(['showMcpCatalog'], {
+    h: node, modal: (_, body) => { table = body; return () => {}; }, refreshSettings() {},
+    act: async req => {
+      calls.push(req.type);
+      if (req.type === 'mcp_catalog') return [{ id: 'postgres', title: 'Postgres', description: '', target: 'npx -y package@1.2.3 {url}', execution_warning: 'Downloads and runs code from npm/PyPI on first use.', params: [{ name: 'url', kind: 'secret', description: 'Connection URL' }] }];
+      if (req.type === 'preview_mcp_catalog') return { target: 'npx -y package@1.2.3 postgresql://u:REDACTED@h/db', execution_warning: 'Downloads and runs code from npm/PyPI on first use.', warnings: ['canonical folder exposes credentials'] };
+      assert.equal(prompts.length, 3); assert.equal(req.params.confirm_run, true); assert.equal(req.params.confirm_exposure, true);
+      return { added: 'postgres', tools: 1 };
+    },
+    ask: async opts => { prompts.push(opts); return opts.input ? 'postgresql://u:pw@h/db' : true; },
+  });
+  await c.showMcpCatalog();
+  assert.match(plainText(table), /package@1.2.3/); assert.match(plainText(table), /Downloads and runs code/);
+  await all(table).find(n => n.tag === 'button').attrs.onclick();
+  assert.equal(prompts[0].secret, true);
+  assert.match(prompts[1].text, /REDACTED/); assert.equal(prompts[2].title, 'Confirm folder exposure');
+  assert.deepEqual(calls, ['mcp_catalog', 'preview_mcp_catalog', 'add_mcp_from_catalog']);
+});
+
+test('import dialog discloses plaintext storage and sends only a reference plus skip choice', async () => {
+  for (const skipSecrets of [true, false]) {
+    let table, imported;
+    const c = setup(['showMcpImport'], {
+      h: (tag, attrs, ...kids) => Object.assign(node(tag, attrs, ...kids), tag === 'input' ? { checked: !!attrs.checked } : {}),
+      modal: (_, body) => { table = body; }, refreshSettings() {},
+      act: async req => {
+        if (req.type === 'mcp_import_candidates') return [{ candidate_id: 'opaque', name: 'db', source: 'Cursor', target: 'db-command', env: ['K'], headers: ['Authorization'], missing_env: [] }];
+        imported = req; return { added: 'db', disabled: true };
+      },
+      ask: async opts => {
+        assert.match(plainText(opts.body), /plaintext config.toml/); assert.match(plainText(opts.body), /Skip secrets/);
+        all(opts.body).find(n => n.tag === 'input').checked = skipSecrets; return true;
+      },
+    });
+    await c.showMcpImport();
+    await all(table).find(n => n.tag === 'button').attrs.onclick({ target: { replaceWith() {} } });
+    assert.equal(imported.type, 'import_mcp_candidate'); assert.equal(imported.candidate_id, 'opaque');
+    assert.equal(imported.skip_secrets, skipSecrets); assert.equal(imported.server, undefined);
+  }
 });
 
 test('persisted assistant stop reasons render explanatory notes when Session is reopened', () => {
