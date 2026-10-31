@@ -783,6 +783,18 @@ pasting paths.
   the extension when not given). The file waits for the Session's next
   user message, whether sent, steered or queued, and is recorded in that
   message's metadata.
+- **Chunked uploads** (#909): `AttachBegin {session_id, name, bytes,
+  mime?}` checks the size against the limit before any byte is sent and
+  returns `{upload_id, chunk_bytes, max_bytes}` (256 KB pieces, well under
+  the relay's 1 MB message limit once encoded and encrypted);
+  `AttachChunk {upload_id, index, data_b64}` takes the pieces in order
+  from 0 into a part file; `AttachFinish {upload_id}` attaches it only
+  when the pieces add up to the declared size; `AttachAbort` drops it.
+  Uploads untouched for two minutes, and any left at a restart, are
+  removed without ever being attached. Each piece is its own request, so
+  over the relay it is sealed under that browser's channel with its own
+  sequence number. The web client uploads every file this way, reading
+  one piece at a time.
 - **`DetachFile {session_id, id}`** takes a pending attachment back
   before the message goes (`id` is its id, or a referenced path).
   The web client shows pending attachments as chips above the composer,

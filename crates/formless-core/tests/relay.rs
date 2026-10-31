@@ -664,3 +664,116 @@ async fn relay_handshake_is_confirmed_and_idempotent() {
     shutdown.cancel();
     link.await.unwrap().unwrap();
 }
+
+/// The largest attachment crosses the relay in pieces: every frame stays
+/// far below the relay's 1 MB message limit, and the file arrives whole
+/// (#909).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_largest_attachment_crosses_the_relay_in_pieces() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let paths = temp_paths("relayupload");
+    let sid = formless_core::Store::open(&paths.db_file())
+        .unwrap()
+        .create_session(None)
+        .unwrap()
+        .id;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let secret = generate_relay_secret();
+    let key = key_from_secret(&secret).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let link = tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let wrap = |f: String| Message::Text(serde_json::json!({"cid": "u", "f": f}).to_string());
+    let bh = new_hello();
+    ws.send(wrap(hello_frame(&bh))).await.unwrap();
+    let reply: serde_json::Value = loop {
+        if let Some(Ok(Message::Text(t))) = ws.next().await {
+            break serde_json::from_str(&t).unwrap();
+        }
+    };
+    let dh = parse_hello(reply["f"].as_str().unwrap()).unwrap();
+    ws.send(wrap(confirm_frame(&key, &bh, &dh))).await.unwrap();
+    let mut chan = Channel::new(&key, &bh, &dh, Side::Browser);
+    let mut next_id = 0u64;
+    let mut call = |chan: &mut Channel, request: serde_json::Value| {
+        next_id += 1;
+        let line =
+            serde_json::json!({"id": next_id, "protocol": 1, "request": request}).to_string();
+        (next_id, chan.seal(&line).unwrap())
+    };
+    async fn answer(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        chan: &mut Channel,
+        id: u64,
+    ) -> serde_json::Value {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let Message::Text(t) = msg else { continue };
+            let frame: serde_json::Value = serde_json::from_str(&t).unwrap();
+            let Some(f) = frame["f"].as_str() else {
+                continue;
+            };
+            let Ok(line) = chan.open(f) else { continue };
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["kind"] == "response" && v["id"] == id {
+                assert_eq!(v["ok"], true, "{v}");
+                return v["result"].clone();
+            }
+        }
+    }
+    let size = formless_core::daemon::MAX_ATTACHMENT_BYTES;
+    let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let (id, f) = call(
+        &mut chan,
+        serde_json::json!({"type": "attach_begin", "session_id": sid, "name": "big.bin", "bytes": size}),
+    );
+    ws.send(wrap(f)).await.unwrap();
+    let begun = answer(&mut ws, &mut chan, id).await;
+    let upload = begun["upload_id"].as_str().unwrap().to_string();
+    let step = begun["chunk_bytes"].as_u64().unwrap() as usize;
+    let mut biggest = 0;
+    for (index, piece) in data.chunks(step).enumerate() {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, piece);
+        let (id, f) = call(
+            &mut chan,
+            serde_json::json!({"type": "attach_chunk", "upload_id": upload, "index": index, "data_b64": b64}),
+        );
+        let frame = serde_json::json!({"cid": "u", "f": f}).to_string();
+        biggest = biggest.max(frame.len());
+        ws.send(Message::Text(frame)).await.unwrap();
+        answer(&mut ws, &mut chan, id).await;
+    }
+    assert!(
+        biggest < 1_000_000,
+        "every relay frame stays under 1 MB: {biggest}"
+    );
+    let (id, f) = call(
+        &mut chan,
+        serde_json::json!({"type": "attach_finish", "upload_id": upload}),
+    );
+    ws.send(wrap(f)).await.unwrap();
+    let att = answer(&mut ws, &mut chan, id).await;
+    assert_eq!(att["bytes"], size);
+    let pending = formless_core::Store::open(&paths.db_file())
+        .unwrap()
+        .pending_attachments(&sid)
+        .unwrap();
+    let stored = std::fs::read(pending[0]["path"].as_str().unwrap()).unwrap();
+    assert!(stored == data, "the file arrives whole");
+    shutdown.cancel();
+    link.await.unwrap().unwrap();
+}

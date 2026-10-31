@@ -1592,6 +1592,31 @@ pub enum Request {
         #[serde(default)]
         mime: Option<String>,
     },
+    /// Start a chunked attachment upload of `bytes` bytes (SPEC §5.6,
+    /// #909): `{upload_id, chunk_bytes, max_bytes}`. Large files go in
+    /// pieces so no single message (or relay frame) holds the whole file.
+    AttachBegin {
+        session_id: String,
+        name: String,
+        bytes: u64,
+        #[serde(default)]
+        mime: Option<String>,
+    },
+    /// One piece of an upload, in order from 0: `{received}`.
+    AttachChunk {
+        upload_id: String,
+        index: u64,
+        data_b64: String,
+    },
+    /// Finish an upload whose pieces add up to its size: the attachment,
+    /// as `AttachFile` returns it. Until then nothing is attached.
+    AttachFinish {
+        upload_id: String,
+    },
+    /// Drop an unfinished upload: `{aborted}`.
+    AttachAbort {
+        upload_id: String,
+    },
     /// Files under `root` (default: the daemon's working directory) for `@`
     /// mentions (SPEC §5.6): `{root, query, files: [{path, dir, bytes}],
     /// truncated}`,

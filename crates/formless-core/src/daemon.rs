@@ -399,6 +399,8 @@ pub struct Daemon {
     /// while the link is up; SPEC §12).
     pub(crate) relay_clients: StdMutex<std::collections::BTreeMap<String, RelayClientInfo>>,
     pub(crate) relay_kick: StdMutex<Option<mpsc::UnboundedSender<String>>>,
+    /// Chunked attachment uploads in progress (#909).
+    uploads: StdMutex<HashMap<String, Upload>>,
     /// Spending warnings already given ("run:<id>:<limit>", "day:<date>"),
     /// and Sessions allowed past the limits for their next Run (Resume
     /// from a budget pause).
@@ -514,6 +516,8 @@ impl Daemon {
         // A damaged database stops the daemon with the backup to restore,
         // instead of failing wherever it first bites (SPEC §16).
         store.check_integrity(&paths.db_file())?;
+        // Uploads don't survive a restart: their pieces are never attached.
+        let _ = std::fs::remove_dir_all(paths.data_dir.join("artifacts").join(".uploads"));
         // Deprecated global auto (SPEC §4.6): rewrite the file once and
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
@@ -556,6 +560,7 @@ impl Daemon {
             next_conn: AtomicU64::new(1),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
+            uploads: StdMutex::new(HashMap::new()),
             relay_kick: StdMutex::new(None),
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: StdMutex::new(Default::default()),
@@ -1585,6 +1590,25 @@ impl Daemon {
             } => {
                 let r = self.attach_file(&session_id, &name, &data_b64, mime)?;
                 Ok(r)
+            }
+            Request::AttachBegin {
+                session_id,
+                name,
+                bytes,
+                mime,
+            } => self.attach_begin(&session_id, &name, bytes, mime),
+            Request::AttachChunk {
+                upload_id,
+                index,
+                data_b64,
+            } => self.attach_chunk(&upload_id, index, &data_b64),
+            Request::AttachFinish { upload_id } => self.attach_finish(&upload_id),
+            Request::AttachAbort { upload_id } => {
+                let gone = self.uploads.locked().remove(&upload_id);
+                if let Some(u) = &gone {
+                    let _ = std::fs::remove_file(&u.part);
+                }
+                Ok(json!({"aborted": gone.is_some()}))
             }
             Request::ListFiles {
                 root,
@@ -8022,6 +8046,122 @@ impl Daemon {
         })
     }
 
+    /// Start a chunked upload: checked against the limit before any byte
+    /// is sent, written to a part file as pieces arrive, attached only on
+    /// finish (#909). Unfinished uploads expire.
+    fn attach_begin(
+        &self,
+        session_id: &str,
+        name: &str,
+        bytes: u64,
+        mime: Option<String>,
+    ) -> Result<Value> {
+        self.with_store(|st| st.get_session(session_id))?
+            .context("session not found")?;
+        if bytes as usize > MAX_ATTACHMENT_BYTES {
+            bail!(
+                "attachment is larger than {} MB",
+                MAX_ATTACHMENT_BYTES / 1024 / 1024
+            );
+        }
+        self.expire_uploads();
+        let dir = self.paths.data_dir.join("artifacts").join(".uploads");
+        std::fs::create_dir_all(&dir)?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let part = dir.join(format!("{id}.part"));
+        std::fs::File::create(&part)?;
+        self.uploads.locked().insert(
+            id.clone(),
+            Upload {
+                session_id: session_id.to_string(),
+                name: name.to_string(),
+                mime,
+                expected: bytes,
+                received: 0,
+                next: 0,
+                part,
+                touched: std::time::Instant::now(),
+            },
+        );
+        Ok(
+            json!({"upload_id": id, "chunk_bytes": UPLOAD_CHUNK_BYTES, "max_bytes": MAX_ATTACHMENT_BYTES}),
+        )
+    }
+
+    fn attach_chunk(&self, upload_id: &str, index: u64, data_b64: &str) -> Result<Value> {
+        use base64::Engine;
+        use std::io::Write;
+        if data_b64.len() / 4 * 3 > UPLOAD_CHUNK_BYTES + 3 {
+            bail!("a piece may be at most {UPLOAD_CHUNK_BYTES} bytes");
+        }
+        let piece = base64::engine::general_purpose::STANDARD
+            .decode(data_b64.trim())
+            .context("piece is not valid base64")?;
+        let mut uploads = self.uploads.locked();
+        let u = uploads
+            .get_mut(upload_id)
+            .context("no such upload (finished, aborted or expired)")?;
+        if index != u.next {
+            bail!("piece {index} arrived when piece {} was expected", u.next);
+        }
+        if u.received + piece.len() as u64 > u.expected {
+            let part = u.part.clone();
+            uploads.remove(upload_id);
+            let _ = std::fs::remove_file(part);
+            bail!("the pieces add up to more than the size the upload declared");
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&u.part)?
+            .write_all(&piece)?;
+        u.received += piece.len() as u64;
+        u.next += 1;
+        u.touched = std::time::Instant::now();
+        Ok(json!({"received": u.received}))
+    }
+
+    fn attach_finish(&self, upload_id: &str) -> Result<Value> {
+        let u = self
+            .uploads
+            .locked()
+            .remove(upload_id)
+            .context("no such upload (finished, aborted or expired)")?;
+        if u.received != u.expected {
+            let _ = std::fs::remove_file(&u.part);
+            bail!(
+                "the upload is incomplete ({} of {} bytes); nothing was attached",
+                u.received,
+                u.expected
+            );
+        }
+        let mut head = vec![0u8; 4096.min(u.received as usize)];
+        {
+            use std::io::Read;
+            std::fs::File::open(&u.part)?.read_exact(&mut head)?;
+        }
+        self.store_attachment(
+            &u.session_id,
+            &u.name,
+            u.mime,
+            &head,
+            Some(&u.part),
+            None,
+            u.received as usize,
+        )
+    }
+
+    /// Uploads untouched for two minutes are dropped with their part files.
+    fn expire_uploads(&self) {
+        let mut uploads = self.uploads.locked();
+        uploads.retain(|_, u| {
+            let live = u.touched.elapsed() < UPLOAD_TTL;
+            if !live {
+                let _ = std::fs::remove_file(&u.part);
+            }
+            live
+        });
+    }
+
     /// Store an attachment as a Session artifact and hold it for the
     /// Session's next user message.
     fn attach_file(
@@ -8050,31 +8190,52 @@ impl Daemon {
                 MAX_ATTACHMENT_BYTES / 1024 / 1024
             ));
         }
+        let len = bytes.len();
+        self.store_attachment(session_id, name, mime, &bytes, None, Some(&bytes), len)
+    }
+
+    /// Keep an attachment: `head` is its first bytes (for the type), and
+    /// it is either a finished upload's part file (moved into place) or
+    /// `bytes` (written).
+    #[allow(clippy::too_many_arguments)]
+    fn store_attachment(
+        &self,
+        session_id: &str,
+        name: &str,
+        mime: Option<String>,
+        head: &[u8],
+        part: Option<&std::path::Path>,
+        bytes: Option<&[u8]>,
+        len: usize,
+    ) -> Result<Value> {
         let full_name = attachment_name(name);
         let name = cap_name(&full_name, 120);
         // What the bytes are, not what the client or the name claims (#855).
         let claimed = mime.filter(|m| !m.is_empty());
-        let mime = resolve_mime(claimed.as_deref(), &name, &bytes);
+        let mime = resolve_mime(claimed.as_deref(), &name, head);
         let dir = self.paths.data_dir.join("artifacts");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}-{name}", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&path, &bytes)?;
+        match (part, bytes) {
+            (Some(p), _) => std::fs::rename(p, &path)?,
+            (None, Some(b)) => std::fs::write(&path, b)?,
+            (None, None) => bail!("nothing to store"),
+        }
         let path_s = path.to_string_lossy().into_owned();
         let id = self.with_store(|st| {
             st.save_artifact(
                 Some(session_id),
                 &path_s,
                 &format!("attachment: {name}"),
-                bytes.len() as i64,
+                len as i64,
             )
         })?;
-        let mut att =
-            json!({"id": id, "name": name, "mime": mime, "bytes": bytes.len(), "path": path_s});
+        let mut att = json!({"id": id, "name": name, "mime": mime, "bytes": len, "path": path_s});
         if full_name != name {
             att["full_name"] = json!(full_name);
         }
         self.with_store(|st| st.add_pending_attachment(session_id, &att))?;
-        Ok(json!({"id": id, "name": name, "mime": mime, "bytes": bytes.len()}))
+        Ok(json!({"id": id, "name": name, "mime": mime, "bytes": len}))
     }
 
     /// Delete a held attachment's stored copy (its file and artifact row);
@@ -12496,6 +12657,25 @@ pub fn builtin_outcome(name: &str, text: &str) -> (bool, &'static str) {
 /// Largest attachment accepted (SPEC §5.6).
 /// Largest file an attachment may be (SPEC §5.6).
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Largest piece of a chunked upload: well under the relay's 1 MB message
+/// limit once encoded and encrypted (#909).
+pub const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+
+/// How long an upload may sit between pieces before it is dropped.
+const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A chunked attachment upload in progress.
+struct Upload {
+    session_id: String,
+    name: String,
+    mime: Option<String>,
+    expected: u64,
+    received: u64,
+    next: u64,
+    part: std::path::PathBuf,
+    touched: std::time::Instant,
+}
 /// `@`-mentioned text files up to this size are attached; larger ones and
 /// directories go as a reference (SPEC §5.6).
 const MAX_MENTION_INLINE_BYTES: usize = 256 * 1024;
