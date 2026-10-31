@@ -169,6 +169,8 @@ pub fn redact(value: &Value) -> Value {
                     || lk.contains("secret")
                     || lk.contains("password")
                     || lk.contains("passwd")
+                    || lk.contains("passphrase")
+                    || lk == "pwd"
                     || lk.contains("credential")
                     || lk.contains("cookie")
                     || lk.contains("authorization")

@@ -463,6 +463,7 @@ fn error_line(e: &str) -> Option<u32> {
         })
     };
     after("eval_script:")
+        .or_else(|| after("formless-tool.js:"))
         .or_else(|| after(">:"))
         .or_else(|| after("line "))
 }
@@ -689,10 +690,16 @@ pub struct Daemon {
     build: String,
     /// When this daemon started (for `uptime_secs`).
     started: std::time::Instant,
+    // Last: store/readers and other owned state drop before kernel ownership.
+    _ownership: crate::profile_lock::ProfileLock,
 }
 
 impl Daemon {
     pub fn new(paths: Paths) -> Result<Self> {
+        let ownership = crate::profile_lock::ProfileLock::owner(&paths)?;
+        if endpoint_occupied(&paths)? {
+            bail!("a daemon is already running for this data dir");
+        }
         let store = Store::open(&paths.db_file())?;
         // A damaged database stops the daemon with the backup to restore,
         // instead of failing wherever it first bites (SPEC §16).
@@ -793,6 +800,7 @@ impl Daemon {
             shutdown: CancellationToken::new(),
             build: build_id(),
             started: std::time::Instant::now(),
+            _ownership: ownership,
         })
     }
 
@@ -11204,8 +11212,14 @@ impl Daemon {
                         ExecErrorKind::Js => ("failure", ""),
                     };
                     // Where in the Tool's code, and on what input (§7.1).
-                    let message = if e.kind == ExecErrorKind::Js {
-                        crate::errors::tool_error_detail(&e.message, &ver.code, &input)
+                    let message = if e.kind == ExecErrorKind::Js || e.nested.is_some() {
+                        crate::errors::tool_failure_detail(
+                            &name,
+                            &e.message,
+                            &ver.code,
+                            &input,
+                            e.nested.as_ref(),
+                        )
                     } else {
                         e.message
                     };
@@ -12067,6 +12081,8 @@ impl Daemon {
     }
 
     pub async fn serve(self: Arc<Self>) -> Result<()> {
+        // Claim the transport before PID publication or any startup loop.
+        let listener = self.claim_listener()?;
         std::fs::write(self.paths.lock_file(), std::process::id().to_string())?;
         let swept = crate::config::sweep_secret_temps(&self.paths);
         if swept > 0 {
@@ -12126,7 +12142,7 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.job_loop().await })
         };
-        let result = self.accept_loop().await;
+        let result = self.accept_loop(listener).await;
         logs.abort();
         artifact_gc.abort();
         backups.abort();
@@ -12137,20 +12153,36 @@ impl Daemon {
         relay.abort();
         optimiser.abort();
         watcher.abort();
-        let _ = std::fs::remove_file(self.paths.lock_file());
+        if std::fs::read_to_string(self.paths.lock_file())
+            .ok()
+            .as_deref()
+            == Some(std::process::id().to_string().as_str())
+        {
+            let _ = std::fs::remove_file(self.paths.lock_file());
+        }
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(self.paths.socket_path());
         result
     }
 
     #[cfg(unix)]
-    async fn accept_loop(self: &Arc<Self>) -> Result<()> {
+    fn claim_listener(&self) -> Result<tokio::net::UnixListener> {
         let sock = self.paths.socket_path();
-        if daemon_reachable(&self.paths) {
-            return Err(anyhow!("a daemon is already running for this data dir"));
-        }
         self.paths.prepare_socket_dir()?;
-        let _ = std::fs::remove_file(&sock);
-        let listener = tokio::net::UnixListener::bind(&sock)
-            .with_context(|| format!("bind {}", sock.display()))?;
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => bail!("a daemon is already running for this data dir"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(&sock)
+                    .with_context(|| format!("remove stale {}", sock.display()))?;
+            }
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
+        }
+        tokio::net::UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))
+    }
+
+    #[cfg(unix)]
+    async fn accept_loop(self: &Arc<Self>, listener: tokio::net::UnixListener) -> Result<()> {
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
@@ -12161,29 +12193,45 @@ impl Daemon {
                 }
             }
         }
-        let _ = std::fs::remove_file(&sock);
         Ok(())
     }
 
     #[cfg(windows)]
-    async fn accept_loop(self: &Arc<Self>) -> Result<()> {
+    fn claim_listener(&self) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        self.pipe_instance(true)
+    }
+
+    #[cfg(windows)]
+    fn pipe_instance(
+        &self,
+        first: bool,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
         use tokio::net::windows::named_pipe::ServerOptions;
-        let name = self.paths.pipe_name();
-        // Owner-only DACL and no remote clients (SPEC §2.3/§14), the named
-        // pipe counterpart of the 0600 Unix socket.
         let security = crate::win_pipe::OwnerOnly::new()?;
+        // SAFETY: OwnerOnly owns valid SECURITY_ATTRIBUTES for this call.
+        Ok(unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(self.paths.pipe_name(), security.as_raw())
+        }?)
+    }
+
+    #[cfg(windows)]
+    async fn accept_loop(
+        self: &Arc<Self>,
+        mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+    ) -> Result<()> {
         loop {
-            let server = unsafe {
-                ServerOptions::new()
-                    .reject_remote_clients(true)
-                    .create_with_security_attributes_raw(&name, security.as_raw())
-            }?;
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 r = server.connect() => {
                     r?;
+                    // Keep the connected instance open while creating its replacement.
+                    let next = self.pipe_instance(false)?;
                     let this = self.clone();
                     tokio::spawn(async move { this.handle_conn(server).await });
+                    server = next;
                 }
             }
         }
@@ -12461,6 +12509,39 @@ pub fn daemon_reachable(paths: &Paths) -> bool {
         .is_ok()
 }
 
+/// Inspect the transport without treating denied/unknown access as idle.
+pub fn endpoint_occupied(paths: &Paths) -> Result<bool> {
+    #[cfg(unix)]
+    let connected = std::os::unix::net::UnixStream::connect(paths.socket_path()).map(|_| ());
+    #[cfg(windows)]
+    let connected = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(paths.pipe_name())
+        .map(|_| ());
+    match connected {
+        Ok(()) => Ok(true),
+        #[cfg(windows)]
+        Err(error)
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) =>
+        {
+            Ok(true)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => {
+            Err(error).context("cannot establish whether this profile's endpoint is occupied")
+        }
+    }
+}
+
 /// Why connecting to this profile's daemon failed, in words a user can act
 /// on (SPEC §9.1): someone else's socket, a stale one, or no daemon at all
 /// for this profile.
@@ -12600,10 +12681,7 @@ fn spawn_daemon_child(paths: &Paths) -> Result<std::process::Child> {
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     let child = cmd.spawn().context("spawn daemon")?;
-    // Claim the start at once (serve rewrites the same pid): a second
-    // client that arrives during a slow first start waits for this daemon
-    // instead of spawning another.
-    let _ = std::fs::write(paths.lock_file(), child.id().to_string());
+    // Only the child that owns the profile may publish its PID.
     Ok(child)
 }
 
@@ -12613,39 +12691,6 @@ fn libc_setsid() -> i32 {
         fn setsid() -> i32;
     }
     unsafe { setsid() }
-}
-
-/// Whether a daemon start is in progress: the lock file is fresher than
-/// `within` (a stale one, e.g. from before a reboot, may name a reused pid)
-/// and names a live process.
-fn daemon_starting(paths: &Paths, within: std::time::Duration) -> bool {
-    let fresh = std::fs::metadata(paths.lock_file())
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < within);
-    if !fresh {
-        return false;
-    }
-    let Some(pid) = std::fs::read_to_string(paths.lock_file())
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-    else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        // Signal 0 only checks that the process exists.
-        unsafe { kill(pid, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
 }
 
 /// The last `n` lines of the daemon log, for start-up errors.
@@ -12663,6 +12708,15 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
     if daemon_reachable(paths) {
         return Ok(());
     }
+    let timeout = Config::load(paths)
+        .map(|c| c.daemon.start_timeout_secs)
+        .unwrap_or(60)
+        .max(1);
+    let _launcher =
+        crate::profile_lock::ProfileLock::launcher(paths, std::time::Duration::from_secs(timeout))?;
+    if daemon_reachable(paths) {
+        return Ok(());
+    }
     // Another user's socket: starting our own daemon would only fail on it.
     #[cfg(unix)]
     if let Err(e) = std::os::unix::net::UnixStream::connect(paths.socket_path()) {
@@ -12670,11 +12724,7 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
             return Err(anyhow!(explain_connect_error(paths, &e)));
         }
     }
-    let timeout = Config::load(paths)
-        .map(|c| c.daemon.start_timeout_secs)
-        .unwrap_or(60)
-        .max(1);
-    let mut child = if daemon_starting(paths, std::time::Duration::from_secs(timeout)) {
+    let mut child = if crate::profile_lock::owner_held(paths)? {
         None
     } else {
         Some(spawn_daemon_child(paths)?)
@@ -12686,12 +12736,19 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
         }
         if let Some(c) = child.as_mut() {
             if let Ok(Some(status)) = c.try_wait() {
+                if crate::profile_lock::owner_held(paths)? {
+                    child = None;
+                    continue;
+                }
                 return Err(anyhow!(
                     "daemon exited during start-up ({status}); last log lines from {}:\n{}",
                     paths.log_file().display(),
                     log_tail(paths, 10)
                 ));
             }
+        }
+        if child.is_none() && !crate::profile_lock::owner_held(paths)? {
+            child = Some(spawn_daemon_child(paths)?);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -13463,6 +13520,57 @@ fn harness_target(op: &str, args: &Value) -> String {
 #[cfg(test)]
 mod path_scope_tests {
     use super::*;
+
+    #[test]
+    fn duplicate_constructor_is_rejected_before_database_config_or_upload_mutations() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::env::temp_dir().join(format!("fl-new-owner-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        let _owner = crate::profile_lock::ProfileLock::owner(&paths).unwrap();
+        std::fs::write(paths.db_file(), "deliberately not SQLite").unwrap();
+        let upload = paths.data_dir.join("artifacts/.uploads/pending");
+        std::fs::create_dir_all(upload.parent().unwrap()).unwrap();
+        std::fs::write(&upload, "pending bytes").unwrap();
+        std::fs::write(paths.lock_file(), "unchanged marker").unwrap();
+        let error = Daemon::new(paths.clone()).err().unwrap();
+        assert!(error.to_string().contains("owned"));
+        assert_eq!(
+            std::fs::read_to_string(paths.db_file()).unwrap(),
+            "deliberately not SQLite"
+        );
+        assert_eq!(std::fs::read_to_string(upload).unwrap(), "pending bytes");
+        assert_eq!(
+            std::fs::read_to_string(paths.lock_file()).unwrap(),
+            "unchanged marker"
+        );
+        assert!(!paths.config_file().exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_endpoint_blocks_constructor_before_any_database_mutation() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::env::temp_dir().join(format!("fl-old-owner-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        paths.prepare_socket_dir().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(paths.socket_path()).unwrap();
+        assert!(!crate::profile_lock::owner_held(&paths).unwrap());
+        std::fs::write(paths.db_file(), "original bytes").unwrap();
+        let error = Daemon::new(paths.clone()).err().unwrap();
+        assert!(error.to_string().contains("already running"));
+        assert_eq!(
+            std::fs::read_to_string(paths.db_file()).unwrap(),
+            "original bytes"
+        );
+        assert!(
+            !crate::profile_lock::owner_held(&paths).unwrap(),
+            "failed construction releases kernel ownership"
+        );
+        drop(listener);
+        std::fs::remove_file(paths.socket_path()).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn approvals_offer_and_apply_wider_path_grants() {
