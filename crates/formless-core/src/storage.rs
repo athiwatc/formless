@@ -5770,7 +5770,7 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                     .as_str()
                     .is_some_and(crate::daemon::is_raster_image)
                 {
-                    images.push(json!({"path": a["path"], "mime": a["mime"]}));
+                    images.push(json!({"path": a["path"], "mime": a["mime"], "name": name}));
                 }
             }
             let mut msg = json!({"role": "user", "content": content});

@@ -22,6 +22,7 @@ zeroize.workspace = true
 unicode-segmentation.workspace = true
 unicode-normalization.workspace = true
 regex.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 zip.workspace = true
 sha2.workspace = true
 hkdf.workspace = true

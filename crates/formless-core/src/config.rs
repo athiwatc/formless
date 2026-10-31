@@ -898,6 +898,11 @@ pub struct ProviderCfg {
     /// from the model name (see `provider::is_vision_model`).
     #[serde(default)]
     pub vision: Option<bool>,
+    /// Longest side, in pixels, of an image sent to a vision model; larger
+    /// ones are scaled down once per Session (#616).
+    pub image_max_px: u32,
+    /// The `detail` asked of vision models: `auto`, `low` or `high`.
+    pub image_detail: String,
     /// Prices in USD per million tokens, per model, for the cost estimate
     /// in the status line (SPEC §10.6). Unset models show no cost.
     #[serde(default)]
@@ -982,6 +987,8 @@ impl Default for ProviderCfg {
             base_url: String::new(),
             extra_headers: HashMap::new(),
             extra_body: BTreeMap::new(),
+            image_max_px: 1568,
+            image_detail: "auto".into(),
             aliases: BTreeMap::new(),
             query_params: BTreeMap::new(),
             api_key_header: None,
