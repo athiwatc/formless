@@ -1,7 +1,10 @@
 // Local stand-in for the Cloudflare Worker, for developing the Web frontend
-// without deploying: serves web/ with the production security headers and
-// implements the same relay room semantics (one daemon per room, per-client
-// routing for ?mux=1 daemons, daemon_online/offline notices). No dependencies.
+// without deploying. It runs the Worker's own code (#836): every relay room
+// is worker.js's RelayRoom over a small in-memory stand-in for the Durable
+// Object, and every HTTP request goes through worker.js's fetch handler
+// (/health, /push/key, the static web/ assets with their security
+// headers). Only the Node shell lives here: the WebSocket framing, the
+// static file reader and the mock provider. No dependencies.
 //
 //   node relay/dev.mjs [--port 8787] [--mock-provider]
 //
@@ -13,26 +16,16 @@
 // profile at it: provider.base_url = "http://127.0.0.1:8787/mock/v1",
 // relay.url = "ws://127.0.0.1:8787".
 import { createServer } from "node:http";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SECURITY_HEADERS } from "./worker.js";
+import worker, { RelayRoom, SECURITY_HEADERS } from "./worker.js";
 
 // Plain ws:// to this machine is allowed here only: production pages may
 // connect to their own origin alone (#907).
-const DEV_HEADERS = {
-  ...SECURITY_HEADERS,
-  "content-security-policy": SECURITY_HEADERS["content-security-policy"]
-    .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*"),
-};
-import { loadVapid, sendPush, validSubscription } from "./push.mjs";
-
-// Web Push as in worker.js: VAPID_PUBLIC_KEY / VAPID_PRIVATE_JWK from the
-// environment (node relay/vapid-keys.mjs makes them).
-const pushConfig = await loadVapid(process.env);
-if (pushConfig.state === "misconfigured") console.log("relay: push is off: " + pushConfig.reason);
-const vapid = pushConfig.vapid || null;
+const DEV_CSP = SECURITY_HEADERS["content-security-policy"]
+  .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*");
 
 const args = process.argv.slice(2);
 const port = Number(args[args.indexOf("--port") + 1]) || 8787;
@@ -40,32 +33,67 @@ const mock = args.includes("--mock-provider");
 const webRoot = fileURLToPath(new URL("./web/", import.meta.url));
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 
+// The Worker's environment: the process's (VAPID keys, PUSH_HOSTS), a
+// push service on 127.0.0.1 allowed for the tests, and the static assets.
+const env = {
+  ...process.env,
+  ALLOW_LOCAL_PUSH: "1",
+  ASSETS: {
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      const rel = path === "/" ? "index.html" : normalize(decodeURIComponent(path)).replace(/^[/\\]+/, "");
+      const file = join(webRoot, rel);
+      if (!file.startsWith(webRoot)) return new Response("not found", { status: 404 });
+      try {
+        return new Response(await readFile(file), { headers: { "content-type": TYPES[extname(file)] || "application/octet-stream" } });
+      } catch (_) {
+        return new Response("not found", { status: 404 });
+      }
+    },
+  },
+};
+
 // ------------------------------------------------------------ websockets
+/** Biggest message accepted from a peer. */
+const MAX_MESSAGE = 64 * 1024 * 1024;
+
 function wsAccept(req, socket) {
   const accept = createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n");
   const conn = { socket, open: true, onText: () => {}, onClose: () => {} };
   let buf = Buffer.alloc(0);
   let fragments = [];
+  let pending = 0;
   socket.on("data", (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     for (;;) {
       if (buf.length < 2) return;
       const fin = buf[0] & 0x80, op = buf[0] & 0x0f, masked = buf[1] & 0x80;
+      // RFC 6455: a client's frames are masked; anything else is a
+      // protocol error.
+      if (!masked) return closeWith(conn, 1002, "unmasked frame");
       let len = buf[1] & 0x7f, off = 2;
       if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+      else if (len === 127) {
+        if (buf.length < 10) return;
+        const big = buf.readBigUInt64BE(2);
+        if (big > BigInt(MAX_MESSAGE)) return closeWith(conn, 1009, "message too big");
+        len = Number(big); off = 10;
+      }
+      if (pending + len > MAX_MESSAGE) return closeWith(conn, 1009, "message too big");
       const maskOff = off;
-      if (masked) off += 4;
+      off += 4;
       if (buf.length < off + len) return;
       const payload = Buffer.from(buf.subarray(off, off + len));
-      if (masked) for (let i = 0; i < len; i++) payload[i] ^= buf[maskOff + (i % 4)];
+      for (let i = 0; i < len; i++) payload[i] ^= buf[maskOff + (i % 4)];
       buf = buf.subarray(off + len);
-      if (op === 0x8) return close(conn);
+      // A close is answered with a close before the socket ends.
+      if (op === 0x8) { sendFrame(conn, 0x8, payload.subarray(0, 2)); return close(conn); }
       if (op === 0x9) { sendFrame(conn, 0xa, payload); continue; }
       if (op === 0x1 || op === 0x0) {
         fragments.push(payload);
-        if (fin) { const text = Buffer.concat(fragments).toString("utf8"); fragments = []; conn.onText(text); }
+        pending += len;
+        if (fin) { const text = Buffer.concat(fragments).toString("utf8"); fragments = []; pending = 0; conn.onText(text); }
       }
     }
   });
@@ -82,8 +110,6 @@ function sendFrame(conn, op, payload) {
     : Buffer.concat([Buffer.from([0x80 | op, 127]), (() => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(len)); return b; })()]);
   conn.socket.write(Buffer.concat([head, payload]));
 }
-const sendText = (conn, text) => sendFrame(conn, 0x1, Buffer.from(text, "utf8"));
-/** Close with a status code the browser sees (4001: kicked by the daemon). */
 function closeWith(conn, code, reason) {
   const body = Buffer.concat([Buffer.from([code >> 8, code & 255]), Buffer.from(reason, "utf8")]);
   sendFrame(conn, 0x8, body);
@@ -97,71 +123,58 @@ function close(conn) {
 }
 
 // ----------------------------------------------------------------- rooms
-const rooms = new Map(); // room -> { daemon, mux, clients:Map<cid, conn> }
-function joinRoom(room, role, conn, reject, mux, ua) {
-  const r = rooms.get(room) || { daemon: null, mux: false, clients: new Map(), subs: new Map() };
-  rooms.set(room, r);
-  const notifyDaemon = (kind, cid) => {
-    const c = r.clients.get(cid);
-    if (r.daemon && r.mux) sendText(r.daemon, JSON.stringify({ relay: kind, cid, ...(c && c.ua ? { ua: c.ua } : {}) }));
-  };
-  if (role === "daemon") {
-    if (r.daemon) return reject();
-    r.daemon = conn;
-    r.mux = mux;
-    for (const cid of r.clients.keys()) notifyDaemon("client_open", cid);
-    for (const c of r.clients.values()) sendText(c, JSON.stringify({ relay: "daemon_online" }));
-    conn.onText = (t) => {
-      if (t.startsWith('{"relay":"disconnect"')) {
-        let ctl = null;
-        try { ctl = JSON.parse(t); } catch (_) {}
-        const c = ctl && r.clients.get(ctl.cid);
-        if (c && ctl.code === 4002) closeWith(c, 4002, "link integrity failure");
-        else if (c) closeWith(c, 4001, "disconnected by the daemon");
-        return;
-      }
-      if (t.startsWith('{"relay":"push"')) {
-        if (!vapid) return;
-        for (const [endpoint, sub] of r.subs) {
-          sendPush(sub, vapid).then((status) => {
-            console.log("relay: push → " + status);
-            if (status === 404 || status === 410) r.subs.delete(endpoint);
-          }).catch((e) => console.log("relay: push failed: " + e.message));
-        }
-        return;
-      }
-      let routed = null;
-      if (r.mux) { try { routed = JSON.parse(t); } catch (_) {} }
-      if (routed && typeof routed.cid === "string" && typeof routed.f === "string") {
-        const c = r.clients.get(routed.cid);
-        if (c) sendText(c, routed.f);
-        return;
-      }
-      for (const c of r.clients.values()) sendText(c, t);
+/** The Durable Object state RelayRoom uses: tagged sockets and storage. */
+class DevState {
+  constructor() {
+    this.webSockets = [];
+    this.data = new Map();
+    const data = this.data;
+    this.storage = {
+      async list({ prefix }) { return new Map([...data].filter(([k]) => k.startsWith(prefix))); },
+      async put(k, v) { data.set(k, v); },
+      async delete(k) { data.delete(k); },
     };
-    conn.onClose = () => {
-      r.daemon = null;
-      for (const c of r.clients.values()) sendText(c, JSON.stringify({ relay: "daemon_offline" }));
-    };
-  } else {
-    const cid = randomUUID();
-    conn.ua = (ua || "").slice(0, 200);
-    r.clients.set(cid, conn);
-    notifyDaemon("client_open", cid);
-    sendText(conn, JSON.stringify({ relay: r.daemon ? "daemon_online" : "daemon_offline" }));
-    conn.onText = (t) => {
-      if (t.startsWith('{"relay"')) {
-        let ctl = null;
-        try { ctl = JSON.parse(t); } catch (_) {}
-        if (ctl && ctl.relay === "push_subscribe" && validSubscription(ctl.sub, true, process.env.PUSH_HOSTS) && r.subs.size < 10) r.subs.set(ctl.sub.endpoint, ctl.sub);
-        if (ctl && ctl.relay === "push_unsubscribe") r.subs.delete(ctl.endpoint);
-        return;
-      }
-      if (r.daemon) sendText(r.daemon, r.mux ? JSON.stringify({ cid, f: t }) : t);
-    };
-    conn.onClose = () => { r.clients.delete(cid); notifyDaemon("client_close", cid); };
   }
-  console.log("relay: " + role + " joined " + room.slice(0, 8) + "… (" + r.clients.size + " client(s), daemon " + (r.daemon ? "online" : "offline") + ")");
+  acceptWebSocket(ws, tags) { ws.tags = tags; this.webSockets.push(ws); }
+  getWebSockets(tag) { return this.webSockets.filter((ws) => !tag || ws.tags.includes(tag)); }
+}
+
+/** A Node connection as the WebSocket a Durable Object hands RelayRoom. */
+function roomSocket(conn) {
+  let att = null;
+  return {
+    get readyState() { return conn.open ? 1 : 3; },
+    send(text) { sendFrame(conn, 0x1, Buffer.from(text, "utf8")); },
+    close(code, reason) { closeWith(conn, code || 1000, reason || ""); },
+    serializeAttachment(a) { att = a; },
+    deserializeAttachment() { return att; },
+  };
+}
+
+const rooms = new Map(); // room id -> { state, room }
+function joinRoom(id, role, mux, ua, req, socket) {
+  let r = rooms.get(id);
+  if (!r) {
+    const state = new DevState();
+    r = { state, room: new RelayRoom(state, env) };
+    rooms.set(id, r);
+  }
+  const refused = r.room.refuse(role);
+  if (refused) {
+    socket.end("HTTP/1.1 " + refused[0] + " Conflict\r\n\r\n");
+    return;
+  }
+  const conn = wsAccept(req, socket);
+  const ws = roomSocket(conn);
+  r.room.admit(ws, role, mux, ua);
+  conn.onText = (text) => r.room.webSocketMessage(ws, text).catch((e) => console.log("relay: " + e.message));
+  conn.onClose = () => {
+    r.state.webSockets = r.state.webSockets.filter((w) => w !== ws);
+    r.room.webSocketClose(ws);
+    // An empty room with nothing stored is forgotten.
+    if (!r.state.webSockets.length && !r.state.data.size) rooms.delete(id);
+  };
+  console.log("relay: " + role + " joined " + id.slice(0, 8) + "… (" + r.state.getWebSockets("client").length + " client(s))");
 }
 
 // --------------------------------------------------------- mock provider
@@ -241,37 +254,19 @@ const server = createServer(async (req, res) => {
     for await (const chunk of req) raw += chunk;
     return mockChat(JSON.parse(raw || "{}"), res);
   }
-  if (url.pathname === "/health") {
-    res.writeHead(200, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ ok: true, service: "formless-relay-dev", version: 2 }));
-  }
-  if (url.pathname === "/push/key") {
-    res.writeHead(vapid ? 200 : 404, { "content-type": "application/json" });
-    return res.end(vapid ? JSON.stringify({ key: vapid.publicKey }) : "{}");
-  }
-  const rel = url.pathname === "/" ? "index.html" : normalize(url.pathname).replace(/^[/\\]+/, "");
-  const file = join(webRoot, rel);
-  if (!file.startsWith(webRoot)) { res.writeHead(404); return res.end("not found"); }
-  try {
-    const data = await readFile(file);
-    res.writeHead(200, { "content-type": TYPES[extname(file)] || "application/octet-stream", ...DEV_HEADERS });
-    res.end(data);
-  } catch (_) {
-    res.writeHead(404);
-    res.end("not found");
-  }
+  // Everything else is the Worker's: /health, /push/key and the assets.
+  const response = await worker.fetch(new Request("http://localhost" + req.url, { method: req.method, headers: req.headers }), env);
+  const headers = Object.fromEntries(response.headers);
+  if (headers["content-security-policy"]) headers["content-security-policy"] = DEV_CSP;
+  res.writeHead(response.status, headers);
+  res.end(Buffer.from(await response.arrayBuffer()));
 });
 server.on("upgrade", (req, socket) => {
-  const m = new URL(req.url, "http://localhost").pathname.match(/^\/relay\/([a-f0-9]{32})$/);
+  const url = new URL(req.url, "http://localhost");
+  const m = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
   if (!m) return socket.destroy();
-  const params = new URL(req.url, "http://localhost").searchParams;
-  const role = params.get("role") === "daemon" ? "daemon" : "client";
-  const r = rooms.get(m[1]);
-  if (role === "daemon" && r && r.daemon) {
-    socket.end("HTTP/1.1 409 Conflict\r\n\r\n");
-    return;
-  }
-  joinRoom(m[1], role, wsAccept(req, socket), () => socket.destroy(), params.get("mux") === "1", req.headers["user-agent"]);
+  const role = url.searchParams.get("role") === "daemon" ? "daemon" : "client";
+  joinRoom(m[1], role, url.searchParams.get("mux") === "1", req.headers["user-agent"] || "", req, socket);
 });
 server.listen(port, "127.0.0.1", () => {
   console.log("formless dev relay on http://127.0.0.1:" + port + (mock ? " (mock provider at /mock/v1)" : ""));

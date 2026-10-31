@@ -75,14 +75,25 @@ export class RelayRoom {
     }
     const url = new URL(request.url);
     const role = url.searchParams.get("role") === "daemon" ? "daemon" : "client";
-    if (role === "daemon" && this.sockets("daemon").length > 0) {
-      return new Response("a daemon is already connected to this room", { status: 409 });
-    }
+    const refused = this.refuse(role);
+    if (refused) return new Response(refused[1], { status: refused[0] });
     const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
+    this.admit(pair[1], role, url.searchParams.get("mux") === "1", request.headers.get("User-Agent") || "");
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  /** Why `role` can't join right now, as [status, text], or null. */
+  refuse(role) {
+    if (role === "daemon" && this.sockets("daemon").length > 0) {
+      return [409, "a daemon is already connected to this room"];
+    }
+    return null;
+  }
+
+  /** Admit an accepted server-side socket: the Worker's own, or the one
+   * relay/dev.mjs wraps around a Node socket, so both run this code (#836). */
+  admit(server, role, mux, userAgent) {
     if (role === "daemon") {
-      const mux = url.searchParams.get("mux") === "1";
       this.state.acceptWebSocket(server, [role]);
       server.serializeAttachment({ role: role, mux: mux });
       if (mux) {
@@ -92,7 +103,7 @@ export class RelayRoom {
     } else {
       const cid = crypto.randomUUID();
       // The User-Agent only labels this browser in the daemon's device list.
-      const ua = (request.headers.get("User-Agent") || "").slice(0, 200);
+      const ua = (userAgent || "").slice(0, 200);
       this.state.acceptWebSocket(server, [role, cid]);
       server.serializeAttachment({ role: role, cid: cid, ua: ua });
       const daemon = this.muxDaemon();
@@ -100,7 +111,6 @@ export class RelayRoom {
       const online = this.sockets("daemon").length > 0;
       try { server.send(JSON.stringify({ relay: online ? "daemon_online" : "daemon_offline" })); } catch (_) {}
     }
-    return new Response(null, { status: 101, webSocket: client });
   }
 
   /** A plain-text control frame for the room itself, if this is one. */
@@ -147,7 +157,9 @@ export class RelayRoom {
       return;
     }
     if (ctl && att.role === "client") {
-      if (ctl.relay === "push_subscribe" && validSubscription(ctl.sub, false, this.env.PUSH_HOSTS)) {
+      // ALLOW_LOCAL_PUSH: only dev.mjs sets it, for a push service on
+      // 127.0.0.1 in its tests.
+      if (ctl.relay === "push_subscribe" && validSubscription(ctl.sub, this.env.ALLOW_LOCAL_PUSH === "1", this.env.PUSH_HOSTS)) {
         const subs = await this.state.storage.list({ prefix: "push:" });
         if (subs.size < MAX_SUBSCRIPTIONS) await this.state.storage.put(await this.subKey(ctl.sub.endpoint), ctl.sub);
       } else if (ctl.relay === "push_unsubscribe" && typeof ctl.endpoint === "string") {
