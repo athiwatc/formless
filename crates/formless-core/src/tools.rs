@@ -168,6 +168,9 @@ pub fn redact(value: &Value) -> Value {
                     || lk.contains("token")
                     || lk.contains("secret")
                     || lk.contains("password")
+                    || lk.contains("passwd")
+                    || lk.contains("credential")
+                    || lk.contains("cookie")
                     || lk.contains("authorization")
                 {
                     out.insert(k.clone(), json!("[redacted]"));
@@ -178,13 +181,11 @@ pub fn redact(value: &Value) -> Value {
             Value::Object(out)
         }
         Value::Array(a) => Value::Array(a.iter().map(redact).collect()),
-        Value::String(s) => {
-            if s.to_lowercase().starts_with("bearer ") || (s.len() > 32 && s.starts_with("sk-")) {
-                json!("[redacted]")
-            } else {
-                value.clone()
-            }
-        }
+        // Secrets inside free text, URLs and file contents too (#709).
+        Value::String(s) => match crate::secrets::redact(s) {
+            (_, None) => value.clone(),
+            (clean, Some(_)) => json!(clean),
+        },
         _ => value.clone(),
     }
 }

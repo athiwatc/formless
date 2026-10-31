@@ -21,6 +21,7 @@ rand.workspace = true
 zeroize.workspace = true
 unicode-segmentation.workspace = true
 unicode-normalization.workspace = true
+regex.workspace = true
 zip.workspace = true
 sha2.workspace = true
 hkdf.workspace = true

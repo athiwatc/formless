@@ -3709,6 +3709,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
 | `security.trusted_hosts` | [] | Hosts whose `net:` grants need no approval (`api.example.com`, `*.github.com`); config.toml only (§10.3) |
 | `security.secure` | false | Ask before sensitive Tool calls; off runs them unasked (logged). `--secure` / `FORMLESS_SECURE` turn it on at daemon start (§10.3) |
+| `security.secret_patterns` | [] | Extra secret shapes (regular expressions) blanked wherever Formless stores or quotes text, beside the built-in ones; config.toml only (§15) |
 | `security.trusted_paths` | [] | Folders where writes need no approval; config.toml only (§10.3) |
 | `security.trust_writes` | true | false keeps writes in trusted folders asking (§10.3) |
 | `tools.approval_summaries` | true | Ask the model, once per Tool version, for a plain-language summary shown on approval prompts (§10.3) |
@@ -3824,6 +3825,14 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
+  One scanner (`secrets`) does this everywhere: memory notes, recorded
+  inputs, outputs and errors, stored artifacts, and the code quoted to the
+  provider for approval summaries. It looks for secret shapes (provider
+  key prefixes, JWTs, private keys, bearer tokens, `password = …`,
+  `token=…`, `cookie: …` assignments, long random-looking tokens) rather
+  than key names, plus `security.secret_patterns`. A Tool result holding
+  one is still sent to the model, with a one-time note per Tool and kind
+  in the Run.
   Recorded payloads never leave the data dir except redacted, to the user's
   own endpoint, for optimisation.
 - **Uninstalling.** `formless uninstall [--keep-data] [--keep-binary]

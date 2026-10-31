@@ -28,6 +28,7 @@ pub mod relay;
 pub mod routing;
 pub mod runs;
 pub mod scripts;
+pub mod secrets;
 pub mod service;
 pub mod skills;
 pub mod storage;
