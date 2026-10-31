@@ -1944,7 +1944,12 @@ it says.
   - least-privilege Capabilities (only scoped `fs:read:` for a read)
   - streaming (`*Chunks`) for large files
   - throwing on failure; a returned `{error}` counts as failure unless
-    the output schema declares an `error` property for domain data
+    the output schema declares an `error` property for domain data. Declarations
+    may be supplied through local JSON Pointer references, `allOf`, or matching
+    `anyOf`/`oneOf` and conditional branches; nested properties and unused
+    definitions do not declare the output field. Inspection is bounded to
+    64 levels and 4096 schema values, with cyclic or unresolved branches
+    conservatively retaining the failure heuristic; no external schema is fetched
   - no hardcoded task paths, and a real input schema
   - reusing a loaded Tool
   - `env:` for API keys
