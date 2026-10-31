@@ -60,11 +60,12 @@ fn make_snippet(content: &str, needle_lower: &str) -> String {
         .map(|c| if c == '\n' { ' ' } else { c })
         .collect();
     let chars: Vec<char> = flat.chars().collect();
-    let lower: String = flat.to_lowercase();
-    let byte_at = lower.find(needle_lower).unwrap_or(0);
-    let char_at = lower[..byte_at].chars().count();
-    let start = char_at.saturating_sub(40);
-    let end = (char_at + needle_lower.chars().count() + 60).min(chars.len());
+    // Found in a folded copy that keeps each char's original index, so
+    // the snippet centres on the match whatever case folding or Unicode
+    // normal form did to the length (#789).
+    let found = crate::fuzzy::find_folded(&flat, needle_lower).unwrap_or(0..0);
+    let start = found.start.saturating_sub(40);
+    let end = (found.end + 60).min(chars.len());
     let core: String = chars[start..end].iter().collect();
     format!(
         "{}{}{}",
@@ -5619,4 +5620,24 @@ pub fn fts_query(text: &str) -> Option<String> {
         .map(|w| format!("\"{w}\"*"))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::make_snippet;
+
+    /// The snippet centres on the match even when folding changes the
+    /// text's length, typed in either normal form (#789).
+    #[test]
+    fn snippets_centre_on_folded_matches() {
+        let text = format!("{}İstanbul trip{}", "x".repeat(100), "y".repeat(100));
+        for needle in ["i\u{307}stanbul", "istanbul"] {
+            let s = make_snippet(&text, needle);
+            assert!(s.contains("İstanbul trip"), "{needle}: {s}");
+            let before = s.split("İstanbul").next().unwrap().trim_start_matches('…');
+            assert_eq!(before.chars().count(), 40, "{needle}: {s}");
+        }
+        let s = make_snippet("a café here", "cafe\u{301}");
+        assert!(s.contains("café"), "{s}");
+    }
 }

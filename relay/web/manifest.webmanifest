@@ -1,5 +1,7 @@
 {
   "name": "Formless",
+  "lang": "en",
+  "dir": "auto",
   "short_name": "Formless",
   "description": "An agent that builds the Tools a task needs and keeps them.",
   "start_url": "/",

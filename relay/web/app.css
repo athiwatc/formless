@@ -625,3 +625,14 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 3px; 
 .ed-bracket { background: color-mix(in srgb, var(--accent) 35%, transparent); border-radius: 2px; }
 .ed-err { background: var(--err-soft); }
 .ed-status { font-size: 12px; margin-top: 4px; font-family: var(--mono); }
+
+/* Right-to-left text (#791): each paragraph of a message takes its
+   direction from its own first strong letter, so an Arabic or Hebrew
+   answer is right-aligned and an English one beside it stays left; names
+   in lists are isolated so they never reorder the time next to them. */
+.bubble, .md p, .md li, .md h1, .md h2, .md h3, .md h4, .md blockquote, .md td, .md th {
+  unicode-bidi: plaintext;
+  text-align: start;
+}
+.session .name, .session .preview, .tag, .detail-text { unicode-bidi: plaintext; }
+.session .when { unicode-bidi: isolate; }
