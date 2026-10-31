@@ -2202,11 +2202,20 @@ such as `read_file`, `read_text_file` and `file_read`.
   draft, so Enter cannot accidentally send it again as a new action.
   Buffered replies are consumed before disconnect cleanup: an accepted
   send acknowledged immediately before EOF is never restored for retry.
-- A client that falls behind loses live deltas first; it is told with
-  `DeltasDropped {session_id, run_id}` once there is room, and the
-  answer's `MessageComplete` carries the whole text (plain mode notes the
-  gap on stderr). Only when it can't take an event that matters is it
-  disconnected, and then all of its connection's tasks end.
+- A client that falls behind loses live updates first; all six droppable kinds
+  (`MessageDelta`, `ReasoningDelta`, `ToolProgress`, `RunUsage`,
+  `InvocationActivity`, `ModelPullProgress`) are observable with `DeltasDropped`.
+  Its original `session_id`/`run_id` fields remain; additive `kinds` lists the
+  skipped kinds, and optional `handle`/`model` identifies updates without a Run.
+  An absent Session or Run is represented by an empty original field. Gaps are
+  coalesced per Session/Run (or Session/Invocation, or model), so simultaneous
+  Runs never overwrite each other's warning. Each client keeps at most 4096
+  pending scopes; if another distinct scope cannot be remembered it disconnects
+  instead of silently losing the warning. Once the writer drains its queue it
+  schedules the pending warnings, even if no further event is broadcast.
+  The answer's `MessageComplete` carries the whole text; plain/TUI/web clients
+  warn about skipped text or progress. When a non-droppable event cannot be
+  queued the client disconnects and all its connection's tasks end.
 - Each connection may `Subscribe {sessions, deltas}`: only the listed
   Sessions' transcript and live events (and token deltas only if
   `deltas`) reach it. Tool/module/proposal events, approvals, the Session
