@@ -3102,7 +3102,7 @@ async fn a_panicking_run_frees_its_session() {
         .route("/chat/completions", post(|| async { sse_text("fine") }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     write_cfg(&paths, &base, 30, false, 128_000);
     let server = start_daemon(&paths).await;
     let mut c = Client::connect(&paths).await;
@@ -3214,5 +3214,15 @@ async fn a_panicking_run_frees_its_session() {
     .expect("panicking job never resolved");
     assert_eq!(history[0]["status"], "paused", "{history}");
     assert!(history[0]["finished_at"].is_string(), "{history}");
-    server.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(10), c.rpc(Request::Shutdown))
+        .await
+        .expect("panicking Run fixture did not acknowledge shutdown");
+    drop(c);
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("panicking Run fixture did not stop")
+        .unwrap()
+        .unwrap();
+    provider.abort();
+    let _ = provider.await;
 }
