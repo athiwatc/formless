@@ -2528,6 +2528,15 @@ run_tool = "network_policy"     # a registry Tool, or…
     `[pasted N lines #k]` and are sent in full; Backspace removes one as
     a unit.
   - The chat scrolls with PgUp/PgDn and the mouse wheel.
+  - Text is handled as the reader sees it (here and in the Tool
+    editor): the cursor, Backspace and Delete step over whole grapheme
+    clusters (a Thai letter with its marks, an emoji sequence, a flag),
+    rows and the cursor column are measured in screen columns (CJK is
+    two wide, combining marks none), and in scripts written without
+    spaces (Thai, Chinese, Japanese) a word step is one cluster. Chat
+    text in those scripts wraps between clusters, never inside one.
+  - Key releases (the Windows console, kitty's event types) are ignored;
+    in the web client no key handler acts while an IME is composing.
 
 ### 10.3 Approvals (modal)
 

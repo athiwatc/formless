@@ -50,6 +50,14 @@
     },
   };
 
+  // While an IME is composing (Japanese, Chinese, Korean…), Enter and
+  // other keys confirm candidates: no shortcut, palette, mention or form
+  // handler may act on them (#792). One capture-phase guard on window
+  // runs before every other keydown handler.
+  window.addEventListener("keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) e.stopImmediatePropagation();
+  }, true);
+
   // ---------------------------------------------------------------- state
   const S = {
     ws: null,

@@ -50,16 +50,12 @@ pub(crate) fn bar(rate: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-/// Fit `s` into exactly `width` columns (char-based), with an ellipsis.
+/// Fit `s` into exactly `width` screen columns, with an ellipsis when
+/// cut (#785).
 pub(crate) fn pad(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    if n > width {
-        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    } else {
-        format!("{s}{}", " ".repeat(width - n))
-    }
+    let out = crate::text::truncate(s, width);
+    let w = crate::text::width(&out);
+    format!("{out}{}", " ".repeat(width.saturating_sub(w)))
 }
 
 pub(crate) fn relative_time(ts: &str, now: DateTime<Utc>) -> String {

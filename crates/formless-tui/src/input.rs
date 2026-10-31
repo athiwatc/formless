@@ -40,8 +40,20 @@ impl From<&str> for InputLine {
     }
 }
 
-fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+use crate::text;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// A cluster that is part of a word. Clusters of scripts written without
+/// spaces (Thai, CJK) are words of their own, so a word step moves one
+/// cluster there instead of across the whole sentence (#786).
+fn is_word(g: &str) -> bool {
+    g.chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn unspaced(g: &str) -> bool {
+    g.chars().next().is_some_and(text::unspaced)
 }
 
 impl InputLine {
@@ -103,18 +115,22 @@ impl InputLine {
         }
     }
 
+    /// Cursor steps are whole grapheme clusters: a letter with its marks,
+    /// an emoji sequence, a flag (#784).
     fn prev_boundary(&self, i: usize) -> usize {
-        self.text[..i]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(j, _)| j)
+        text::prev_cluster(&self.text, i)
     }
 
     fn next_boundary(&self, i: usize) -> usize {
-        self.text[i..]
-            .chars()
-            .next()
-            .map_or(self.text.len(), |c| i + c.len_utf8())
+        text::next_cluster(&self.text, i)
+    }
+
+    fn cluster_before(&self, i: usize) -> &str {
+        &self.text[self.prev_boundary(i)..i]
+    }
+
+    fn cluster_after(&self, i: usize) -> &str {
+        &self.text[i..self.next_boundary(i)]
     }
 
     pub fn left(&mut self) {
@@ -126,20 +142,29 @@ impl InputLine {
     }
 
     fn word_start_before(&self, mut i: usize) -> usize {
-        while i > 0 && !is_word(self.text[..i].chars().next_back().unwrap()) {
+        while i > 0 && !is_word(self.cluster_before(i)) {
             i = self.prev_boundary(i);
         }
-        while i > 0 && is_word(self.text[..i].chars().next_back().unwrap()) {
+        if i > 0 && unspaced(self.cluster_before(i)) {
+            return self.prev_boundary(i);
+        }
+        while i > 0 && is_word(self.cluster_before(i)) && !unspaced(self.cluster_before(i)) {
             i = self.prev_boundary(i);
         }
         i
     }
 
     fn word_end_after(&self, mut i: usize) -> usize {
-        while i < self.text.len() && !is_word(self.text[i..].chars().next().unwrap()) {
+        while i < self.text.len() && !is_word(self.cluster_after(i)) {
             i = self.next_boundary(i);
         }
-        while i < self.text.len() && is_word(self.text[i..].chars().next().unwrap()) {
+        if i < self.text.len() && unspaced(self.cluster_after(i)) {
+            return self.next_boundary(i);
+        }
+        while i < self.text.len()
+            && is_word(self.cluster_after(i))
+            && !unspaced(self.cluster_after(i))
+        {
             i = self.next_boundary(i);
         }
         i
@@ -239,9 +264,9 @@ impl InputLine {
         !self.text[self.cursor..].contains('\n')
     }
 
-    /// Up/Down inside a multi-line input, keeping the column.
+    /// Up/Down inside a multi-line input, keeping the screen column.
     pub fn vertical(&mut self, down: bool) {
-        let col = self.text[self.line_start()..self.cursor].chars().count();
+        let col = text::width(&self.text[self.line_start()..self.cursor]);
         let target = if down {
             if self.on_last_line() {
                 return;
@@ -258,11 +283,12 @@ impl InputLine {
             .find('\n')
             .map_or(self.text.len(), |i| target + i);
         let mut c = target;
-        for _ in 0..col {
-            if c >= line_end {
+        while c < line_end {
+            let next = self.next_boundary(c);
+            if text::width(&self.text[target..next]) > col {
                 break;
             }
-            c = self.next_boundary(c);
+            c = next;
         }
         self.cursor = c;
     }
@@ -336,26 +362,28 @@ impl InputLine {
         self.search = None;
     }
 
-    /// The rows to draw for `width` columns, and the cursor's (row, col).
+    /// The rows to draw for `width` columns, and the cursor's (row, col),
+    /// both in screen columns: a wide CJK character takes two, a Thai mark
+    /// none (#785).
     pub fn layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
         let width = width.max(1);
         let mut rows = Vec::new();
         let mut cursor = (0, 0);
         let mut offset = 0;
         for line in self.text.split('\n') {
-            let chars: Vec<(usize, char)> = line.char_indices().collect();
             let mut row = String::new();
             let mut col = 0;
-            for &(i, c) in &chars {
-                if col == width {
+            for (i, g) in line.grapheme_indices(true) {
+                let w = text::width(g);
+                if col + w > width && col > 0 {
                     rows.push(std::mem::take(&mut row));
                     col = 0;
                 }
                 if offset + i == self.cursor {
                     cursor = (rows.len(), col);
                 }
-                row.push(c);
-                col += 1;
+                row.push_str(g);
+                col += w;
             }
             if offset + line.len() == self.cursor {
                 if col == width {
@@ -497,5 +525,69 @@ mod tests {
             InputLine::default().layout(4),
             (vec![String::new()], (0, 0))
         );
+    }
+
+    /// Steps and deletions take whole clusters (#784).
+    #[test]
+    fn edits_whole_grapheme_clusters() {
+        let mut i = InputLine::from("สวัสดี");
+        for _ in 0..4 {
+            i.left();
+        }
+        assert_eq!(i.cursor, 0, "four clusters: ส วั ส ดี");
+        i.end();
+        i.backspace();
+        assert_eq!(&*i, "สวัส", "ดี goes as one");
+
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let mut i = InputLine::from(format!("a{family}b").as_str());
+        i.left();
+        i.left();
+        assert_eq!(i.cursor, 1, "one step over the whole family");
+        i.right();
+        i.backspace();
+        assert_eq!(&*i, "ab");
+
+        for s in ["🇹🇭x", "e\u{301}x"] {
+            let mut i = InputLine::from(s);
+            i.home();
+            i.right();
+            assert_eq!(&i.text[i.cursor..], "x", "{s}: never inside the cluster");
+            i.home();
+            i.delete();
+            assert_eq!(&*i, "x");
+        }
+    }
+
+    /// Layout counts screen columns (#785).
+    #[test]
+    fn layout_counts_columns() {
+        let i = InputLine::from("你好世界你好");
+        let (rows, cursor) = i.layout(6);
+        assert_eq!(rows, ["你好世", "界你好", ""]);
+        assert_eq!(cursor, (2, 0));
+        let (rows, cursor) = i.layout(7);
+        assert_eq!(rows, ["你好世", "界你好"]);
+        assert_eq!(cursor, (1, 6));
+        let i = InputLine::from("สวัสดีครับ");
+        let (rows, cursor) = i.layout(10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cursor, (0, 7), "display width, not 10 chars");
+        // Up/Down keep the screen column.
+        let mut i = at("表a\nabc", "表".len());
+        i.vertical(true);
+        assert_eq!(i.cursor, "表a\nab".len());
+    }
+
+    /// Ctrl+W in Thai takes one cluster, not the whole sentence (#786).
+    #[test]
+    fn word_steps_in_unspaced_scripts() {
+        let mut i = InputLine::from("ช่วยสรุปไฟล์นี้");
+        i.delete_word_back();
+        assert!(!i.is_empty());
+        assert_eq!(&*i, "ช่วยสรุปไฟล์", "the last cluster, นี้");
+        let mut i = InputLine::from("hello 世界");
+        i.delete_word_back();
+        assert_eq!(&*i, "hello 世");
     }
 }

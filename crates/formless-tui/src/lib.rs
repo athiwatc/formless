@@ -15,11 +15,12 @@ mod picker;
 pub mod plain;
 pub mod qr;
 mod settings;
+mod text;
 mod theme;
 mod ui;
 
 use anyhow::Result;
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -856,13 +857,57 @@ impl EditorState {
     fn text(&self) -> String {
         self.chars.iter().collect()
     }
+    /// The char index of the cluster boundary before/after `i`: the cursor
+    /// never rests inside a letter with its marks or an emoji (#784).
+    fn cluster_step(&self, i: usize, forward: bool) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
+        let text = self.text();
+        let mut at = 0;
+        for g in text.graphemes(true) {
+            let n = g.chars().count();
+            if forward && at >= i {
+                return at + n;
+            }
+            if !forward && at + n >= i {
+                return at;
+            }
+            at += n;
+        }
+        if forward {
+            self.chars.len()
+        } else {
+            0
+        }
+    }
+    fn left(&mut self) {
+        self.cursor = self.cluster_step(self.cursor, false);
+    }
+    fn right(&mut self) {
+        self.cursor = self.cluster_step(self.cursor, true).min(self.chars.len());
+    }
+    fn backspace(&mut self) {
+        let start = self.cluster_step(self.cursor, false);
+        self.chars.drain(start..self.cursor);
+        self.cursor = start;
+    }
+    fn delete(&mut self) {
+        let end = self.cluster_step(self.cursor, true).min(self.chars.len());
+        self.chars.drain(self.cursor..end);
+    }
+    /// The cursor's screen column on its line.
+    fn cursor_col(&self) -> usize {
+        let start = self.chars[..self.cursor]
+            .iter()
+            .rposition(|c| *c == '\n')
+            .map_or(0, |i| i + 1);
+        text::width(&self.chars[start..self.cursor].iter().collect::<String>())
+    }
     fn move_vertical(&mut self, down: bool) {
-        // Column = chars since previous newline; target line start found by scans.
-        let mut col = 0usize;
+        // Keep the screen column; target line start found by scans.
+        let col = self.cursor_col();
         let mut i = self.cursor;
         while i > 0 && self.chars[i - 1] != '\n' {
             i -= 1;
-            col += 1;
         }
         if down {
             let mut j = self.cursor;
@@ -877,7 +922,7 @@ impl EditorState {
             while end < self.chars.len() && self.chars[end] != '\n' {
                 end += 1;
             }
-            self.cursor = (start + col).min(end);
+            self.cursor = self.at_col(start, end, col);
         } else {
             if i == 0 {
                 return;
@@ -887,8 +932,21 @@ impl EditorState {
             while start > 0 && self.chars[start - 1] != '\n' {
                 start -= 1;
             }
-            self.cursor = (start + col).min(prev_end);
+            self.cursor = self.at_col(start, prev_end, col);
         }
+    }
+    /// The last cluster boundary in `start..end` at or before `col`.
+    fn at_col(&self, start: usize, end: usize, col: usize) -> usize {
+        let mut c = start;
+        while c < end {
+            let next = self.cluster_step(c, true).min(end);
+            let w = text::width(&self.chars[start..next].iter().collect::<String>());
+            if w > col || next == c {
+                break;
+            }
+            c = next;
+        }
+        c
     }
 }
 
@@ -1032,13 +1090,11 @@ fn stable_prefix_len(text: &str) -> usize {
     stable
 }
 
+/// `s` on one line in at most `max` screen columns (the `…` included),
+/// cut between clusters (#785).
 fn truncate_chars(s: &str, max: usize) -> String {
     let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        format!("{}…", flat.chars().take(max).collect::<String>())
-    }
+    text::truncate(&flat, max)
 }
 
 /// Render persisted assistant tool-call metadata as display lines.
@@ -6227,19 +6283,10 @@ impl App {
                 ed.chars.insert(ed.cursor + 1, ' ');
                 ed.cursor += 2;
             }
-            KeyCode::Backspace => {
-                if ed.cursor > 0 {
-                    ed.cursor -= 1;
-                    ed.chars.remove(ed.cursor);
-                }
-            }
-            KeyCode::Delete => {
-                if ed.cursor < ed.chars.len() {
-                    ed.chars.remove(ed.cursor);
-                }
-            }
-            KeyCode::Left => ed.cursor = ed.cursor.saturating_sub(1),
-            KeyCode::Right => ed.cursor = (ed.cursor + 1).min(ed.chars.len()),
+            KeyCode::Backspace => ed.backspace(),
+            KeyCode::Delete => ed.delete(),
+            KeyCode::Left => ed.left(),
+            KeyCode::Right => ed.right(),
             KeyCode::Up => ed.move_vertical(false),
             KeyCode::Down => ed.move_vertical(true),
             KeyCode::Home => {
@@ -6261,6 +6308,11 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        // Terminals that report key releases (the Windows console, kitty's
+        // event types) would otherwise act on every key twice (#792).
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.ctrl_c();
             return;
@@ -8751,9 +8803,9 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
     }
     let tip = " Tab ⇥ ";
     if used + tip.len() < area.width as usize {
-        spans.push(Span::raw(
-            " ".repeat(area.width as usize - used - tip.chars().count()),
-        ));
+        spans.push(Span::raw(" ".repeat(
+            (area.width as usize).saturating_sub(used + text::width(tip)),
+        )));
         spans.push(Span::styled(tip, ui::dim(app.color)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -9033,7 +9085,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = left;
     let tip = format!("{} ", keys::line(app.view, width.saturating_sub(used + 3)));
     if tip.len() > 1 {
-        spans.push(Span::raw(" ".repeat(width - used - tip.chars().count())));
+        spans.push(Span::raw(
+            " ".repeat(width.saturating_sub(used + text::width(&tip))),
+        ));
         spans.push(Span::styled(tip, ui::dim(app.color)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -13883,7 +13937,8 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
 
     let before = &ed.chars[..ed.cursor];
     let cursor_line = before.iter().filter(|c| **c == '\n').count();
-    let cursor_col = before.iter().rev().take_while(|c| **c != '\n').count();
+    // Screen columns, so the cursor sits where ratatui drew the cell (#785).
+    let cursor_col = ed.cursor_col();
     let text = ed.text();
     let line_total = text.split('\n').count();
     let gutter_w = line_total.to_string().len() as u16 + 2;
@@ -15233,6 +15288,42 @@ mod tests {
         app.slash("edit");
         assert_eq!(app.editing_id.as_deref(), Some("u2"));
         assert_eq!(app.input, "second");
+    }
+
+    /// The Tool editor moves and deletes whole clusters and reports the
+    /// screen column (#784, #785).
+    #[test]
+    fn editor_works_in_grapheme_clusters() {
+        let ed = |s: &str, cursor: usize| EditorState {
+            tool_id: "t".into(),
+            name: "n".into(),
+            chars: s.chars().collect(),
+            cursor,
+            mode: EditMode::Code,
+        };
+        let mut e = ed("สวัสดี", 6);
+        e.left();
+        e.left();
+        e.left();
+        e.left();
+        assert_eq!(e.cursor, 0);
+        e.cursor = 6;
+        e.backspace();
+        assert_eq!(e.text(), "สวัส");
+        let family = "a👨\u{200d}👩\u{200d}👧\u{200d}👦b";
+        let mut e = ed(family, family.chars().count() - 1);
+        e.backspace();
+        assert_eq!(e.text(), "ab");
+        for s in ["🇹🇭x", "e\u{301}x"] {
+            let mut e = ed(s, 0);
+            e.right();
+            assert_eq!(e.chars[e.cursor..].iter().collect::<String>(), "x", "{s}");
+            e.cursor = 0;
+            e.delete();
+            assert_eq!(e.text(), "x");
+        }
+        let e = ed("表a", 2);
+        assert_eq!(e.cursor_col(), 3, "表 is two columns");
     }
 
     #[test]
@@ -18622,6 +18713,25 @@ mod tests {
         assert!(!app.should_quit, "an expired first press only re-arms");
         app.key(ctrl_c);
         assert!(app.should_quit);
+    }
+
+    /// Releases are ignored; presses insert once and repeats repeat (#792).
+    #[test]
+    fn key_releases_do_nothing() {
+        let mut app = test_app();
+        let ev = |c, kind| KeyEvent::new_with_kind(KeyCode::Char(c), KeyModifiers::NONE, kind);
+        for c in "สวัสดี".chars() {
+            app.key(ev(c, KeyEventKind::Release));
+        }
+        assert!(app.input.is_empty(), "releases insert nothing");
+        for c in "สวัสดี".chars() {
+            app.key(ev(c, KeyEventKind::Press));
+            app.key(ev(c, KeyEventKind::Release));
+        }
+        assert_eq!(&*app.input, "สวัสดี");
+        app.key(ev('!', KeyEventKind::Press));
+        app.key(ev('!', KeyEventKind::Repeat));
+        assert!(app.input.ends_with("!!"));
     }
 
     #[test]
