@@ -1,5 +1,8 @@
 //! Session search uses an FTS5 index (SPEC §5.1).
 
+#[path = "support/historical.rs"]
+mod historical;
+
 use formless_core::storage::fts_query;
 use formless_core::Store;
 
@@ -61,18 +64,12 @@ fn existing_messages_are_indexed_on_upgrade() {
     let db = std::path::PathBuf::from(format!("/tmp/fl-ftsm-{short}/f.db"));
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     {
-        let store = Store::open(&db).unwrap();
-        let s = store.create_session(None).unwrap().id;
-        store
-            .append_message(&s, "user", "remember the quarterly invoice")
-            .unwrap();
-    }
-    {
-        // As a v23 database left it: no index yet.
-        let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute_batch(
-            "DROP TRIGGER messages_fts_ai; DROP TRIGGER messages_fts_ad; DROP TRIGGER messages_fts_au;
-             DROP TABLE messages_fts; PRAGMA user_version=23;",
+        let old = historical::create(&db, 23);
+        old.execute_batch(
+            "INSERT INTO sessions(id,name,created_at,updated_at)
+             VALUES('history-fts','Old Session','2020-01-01','2020-01-01');
+             INSERT INTO messages(id,session_id,seq,role,content,created_at)
+             VALUES('history-message','history-fts',1,'user','remember the quarterly invoice','2020-01-01');",
         )
         .unwrap();
     }
