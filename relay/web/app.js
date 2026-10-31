@@ -4504,6 +4504,33 @@
     }
   }
 
+  function reconcileDropped(ev) {
+    const kinds = new Set(ev.kinds || ["message_delta"]);
+    const id = ev.session_id;
+    const here = id === S.current;
+    note((id && !here ? "Session " + sessionName(id) + ": " : "") + "live text, reasoning or progress updates were skipped; final answers remain in the transcript");
+    if (kinds.has("run_usage") && id) {
+      delete (S.usage || {})[id];
+      renderStatus();
+      const pending = S.gapUsage || (S.gapUsage = new Set());
+      if (!pending.has(id)) {
+        pending.add(id);
+        request({ type: "session_usage", session_id: id }).then((r) => {
+          // A streamed update received during the request is fresher.
+          if (r.last_run && !(S.usage || {})[id]) (S.usage || (S.usage = {}))[id] = r.last_run;
+          renderStatus();
+        }).catch(() => note("usage refresh failed; /usage retries recorded usage"))
+          .finally(() => pending.delete(id));
+      }
+    }
+    if (here && (kinds.has("tool_progress") || kinds.has("invocation_activity"))) {
+      for (const tool of S.liveTools || []) if (tool.status === "running") tool.progress = { fraction: null, label: "progress updates skipped" };
+      renderLive();
+    }
+    if (kinds.has("invocation_activity")) refreshRunning();
+    if (kinds.has("model_pull_progress")) setActivity("download progress unavailable for " + (ev.model || "model") + "; /models checks installed models");
+  }
+
   function onEvent(ev) {
     if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
@@ -4511,6 +4538,9 @@
     notifyFor(ev);
     const here = ev.session_id === S.current;
     switch (ev.type) {
+      case "deltas_dropped":
+        reconcileDropped(ev);
+        break;
       case "run_started":
         S.running.add(ev.session_id);
         if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; }
