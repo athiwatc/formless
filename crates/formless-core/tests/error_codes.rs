@@ -39,6 +39,25 @@ async fn resource_and_validation_errors_have_stable_codes_over_a_connection() {
     let (read, mut write) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(read).lines();
     let cases = vec![
+        // Both the first failed send and a cached retry retain the typed code.
+        (
+            Request::SendMessage {
+                session_id: "missing".into(),
+                content: "hello".into(),
+                mode: formless_protocol::SendMode::Send,
+                client_msg_id: Some("cached-error".into()),
+            },
+            codes::NOT_FOUND,
+        ),
+        (
+            Request::SendMessage {
+                session_id: "missing".into(),
+                content: "retry".into(),
+                mode: formless_protocol::SendMode::Send,
+                client_msg_id: Some("cached-error".into()),
+            },
+            codes::NOT_FOUND,
+        ),
         (
             Request::DeleteSessionTemplate {
                 name: "missing".into(),

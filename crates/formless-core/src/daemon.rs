@@ -450,6 +450,38 @@ pub(crate) struct RunCtl {
 /// A client's reply to an `ask_user` call: free text, structured answers.
 type QuestionReply = (String, Vec<QuestionAnswer>);
 
+// The connection is part of the identity; a key from another client is a new
+// action. Direct internal handle() callers share the explicit None identity.
+#[cfg(test)]
+#[path = "daemon_send_dedupe_tests.rs"]
+mod send_dedupe_tests;
+
+type SendKey = (Option<u64>, String, String);
+type SendOutcome = std::result::Result<Value, CachedSendFailure>;
+#[derive(Clone, Debug)]
+struct CachedSendFailure {
+    code: Option<&'static str>,
+    message: String,
+}
+impl CachedSendFailure {
+    fn capture(error: anyhow::Error) -> Self {
+        Self {
+            code: error.downcast_ref::<RequestFailure>().map(|e| e.code),
+            message: error.to_string(),
+        }
+    }
+    fn into_error(self) -> anyhow::Error {
+        match self.code {
+            Some(code) => RequestFailure::new(code, self.message).into(),
+            None => anyhow::Error::msg(self.message),
+        }
+    }
+}
+struct SentEntry {
+    at: std::time::Instant,
+    outcome: tokio::sync::watch::Receiver<Option<SendOutcome>>,
+}
+
 pub struct Daemon {
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
@@ -458,6 +490,8 @@ pub struct Daemon {
     readers: Vec<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
+    /// Outstanding interactive prompts, replayable after a client reconnects.
+    pending_attention: StdMutex<Vec<Event>>,
     /// Ids for client connections.
     next_conn: AtomicU64,
     #[cfg(test)]
@@ -523,6 +557,8 @@ pub struct Daemon {
     grant_meta: StdMutex<HashMap<(ApprovalScope, String, String), (String, String)>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
+    /// FIFO question gate shared by main and nested calls in each Session.
+    question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
     startup_warnings: Vec<String>,
     /// The model each active Run resolved to (per-task routing, §4.6).
@@ -553,7 +589,7 @@ pub struct Daemon {
     /// each other's change.
     config_edit: StdMutex<()>,
     /// `SendMessage` keys seen in the last 10 minutes and their outcome.
-    sent_keys: StdMutex<HashMap<String, (std::time::Instant, Value)>>,
+    sent_keys: StdMutex<HashMap<SendKey, SentEntry>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -627,6 +663,7 @@ impl Daemon {
             readers,
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
+            pending_attention: StdMutex::new(Vec::new()),
             next_conn: AtomicU64::new(1),
             #[cfg(test)]
             panic_in_finish_tail: AtomicBool::new(false),
@@ -656,6 +693,7 @@ impl Daemon {
             denial_notes: StdMutex::new(Default::default()),
             grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
+            question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
@@ -889,7 +927,29 @@ impl Daemon {
         )
     }
 
+    fn remove_attention(&self, id: &str) {
+        self.pending_attention.locked().retain(|ev| match ev {
+            Event::ApprovalRequested { approval_id, .. } => approval_id != id,
+            Event::UserQuestion { question_id, .. } => question_id != id,
+            Event::PromotionApprovalRequested { promotion_id, .. } => promotion_id != id,
+            _ => true,
+        });
+    }
+
     pub(crate) fn broadcast(&self, ev: Event) {
+        match &ev {
+            Event::ApprovalRequested { .. }
+            | Event::UserQuestion { .. }
+            | Event::PromotionApprovalRequested { .. } => {
+                self.pending_attention.locked().push(ev.clone())
+            }
+            Event::ApprovalAnswered { approval_id, .. } => self.remove_attention(approval_id),
+            Event::UserQuestionClosed { question_id } => self.remove_attention(question_id),
+            Event::PromotionApprovalResolved { promotion_id } => {
+                self.remove_attention(promotion_id)
+            }
+            _ => {}
+        }
         if matches!(
             ev,
             Event::ApprovalRequested { .. }
@@ -1161,7 +1221,8 @@ impl Daemon {
                 let (queued, plan) = queued;
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run}),
+                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
+                        "pending_events": self.pending_attention.locked().clone() }),
                 )
             }
             Request::ForkSession {
@@ -1282,24 +1343,79 @@ impl Daemon {
                 mode,
                 client_msg_id,
             } => {
-                // A retried send (same key) gets the first outcome (#891).
-                let key = client_msg_id.map(|k| format!("{session_id}\u{0}{k}"));
-                if let Some(k) = &key {
+                let Some(key) = client_msg_id else {
+                    return self.send_message(session_id, content, mode).await;
+                };
+                let who = current_client();
+                let key = (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key);
+                // Claim before executing. A concurrent duplicate gets the same
+                // receiver even while the first send has not finished yet.
+                let (mut outcome, owner) = {
                     let mut sent = self.sent_keys.locked();
-                    sent.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(600));
-                    if let Some((_, first)) = sent.get(k) {
-                        return Ok(first.clone());
+                    sent.retain(|_, entry| {
+                        entry.outcome.borrow().is_none()
+                            || entry.at.elapsed() < std::time::Duration::from_secs(600)
+                    });
+                    if let Some(entry) = sent.get(&key) {
+                        (entry.outcome.clone(), None)
+                    } else {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        sent.insert(
+                            key.clone(),
+                            SentEntry {
+                                at: std::time::Instant::now(),
+                                outcome: rx.clone(),
+                            },
+                        );
+                        (rx, Some(tx))
                     }
+                };
+                if let Some(tx) = owner {
+                    let this = self.clone();
+                    // A dropped reply/waiter must not cancel a send after it
+                    // appended the message. Preserve attribution in this task.
+                    tokio::spawn(async move {
+                        use futures_util::FutureExt;
+                        let execute = async {
+                            match std::panic::AssertUnwindSafe(
+                                this.send_message(session_id, content, mode),
+                            )
+                            .catch_unwind()
+                            .await
+                            {
+                                Ok(result) => result.map_err(CachedSendFailure::capture),
+                                Err(panic) => {
+                                    let why = panic_text(&panic);
+                                    tracing::error!("panic while handling SendMessage: {why}");
+                                    Err(CachedSendFailure::capture(
+                                        RequestFailure::internal(format!(
+                                            "internal error while handling SendMessage: {why}"
+                                        ))
+                                        .into(),
+                                    ))
+                                }
+                            }
+                        };
+                        let result = match who {
+                            Some(who) => CLIENT.scope(who, execute).await,
+                            None => execute.await,
+                        };
+                        if let Some(entry) = this.sent_keys.locked().get_mut(&key) {
+                            entry.at = std::time::Instant::now();
+                        }
+                        let _ = tx.send(Some(result));
+                    });
                 }
-                let out = self.send_message(session_id, content, mode).await?;
-                if let Some(k) = key {
-                    self.sent_keys
-                        .lock()
-                        .unwrap()
-                        .insert(k, (std::time::Instant::now(), out.clone()));
+                loop {
+                    if let Some(result) = outcome.borrow().clone() {
+                        return result.map_err(CachedSendFailure::into_error);
+                    }
+                    outcome.changed().await.context(RequestFailure::internal(
+                        "internal error: SendMessage outcome was lost",
+                    ))?;
                 }
-                Ok(out)
             }
+
             Request::RunFiles { session_id, run_id } => {
                 let run_id = self.files_run(&session_id, run_id)?;
                 let files = self.run_file_infos(&run_id, true)?;
@@ -2379,6 +2495,7 @@ impl Daemon {
             } => {
                 // First answer wins; the others find it gone.
                 let tx = self.questions.locked().remove(&question_id);
+                self.remove_attention(&question_id);
                 let answered = tx.is_some_and(|tx| tx.send((answer, answers)).is_ok());
                 Ok(json!({"answered": answered}))
             }
@@ -3151,8 +3268,12 @@ impl Daemon {
                 approved,
             } => {
                 let pending = self.promotions.locked().remove(&promotion_id);
+                self.remove_attention(&promotion_id);
                 match pending {
                     Some((attempt_id, kind)) => {
+                        self.broadcast(Event::PromotionApprovalResolved {
+                            promotion_id: promotion_id.clone(),
+                        });
                         let this = self.clone();
                         tokio::spawn(async move {
                             this.resume_promotion(attempt_id, kind, approved).await;
@@ -3436,6 +3557,7 @@ impl Daemon {
                 // First answer wins (SPEC §10.4): removing the sender resolves
                 // it. A late or losing answer leaves nothing behind (#764).
                 let tx = self.approvals.locked().remove(&approval_id);
+                self.remove_attention(&approval_id);
                 if tx.is_some() {
                     if remember_denial && !approved {
                         self.deny_always.locked().insert(approval_id.clone());
@@ -9126,6 +9248,26 @@ impl Daemon {
         cancel: &CancellationToken,
     ) -> Result<String> {
         let questions = parse_questions(args)?;
+        let gate = {
+            let mut gates = self.question_gates.locked();
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(session_id).and_then(std::sync::Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(session_id.to_string(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        // Tokio's mutex queues in arrival order. Keep the guard until the
+        // question is answered/closed, including across nested sub-agents.
+        let _question = tokio::select! {
+            _ = cancel.cancelled() => bail!("interrupted before asking the user"),
+            guard = gate.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            bail!("interrupted before asking the user");
+        }
         // A single top-level question is the original form: its result
         // keeps the plain `answer` field.
         let legacy = args.get("questions").is_none();
@@ -10153,6 +10295,7 @@ impl Daemon {
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.locked().remove(&approval_id);
+        self.remove_attention(&approval_id);
         let by = self
             .approval_by
             .lock()
@@ -11370,6 +11513,9 @@ impl Daemon {
             worker.abort();
         }
         let _ = worker.await;
+        self.sent_keys
+            .locked()
+            .retain(|(client, _, _), _| *client != Some(conn));
         writer.abort();
         let _ = writer.await;
     }
@@ -11493,6 +11639,7 @@ impl Daemon {
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.locked().remove(&approval_id);
+        self.remove_attention(&approval_id);
         // These prompts have no Tool to remember a denial or a folder for:
         // drop what an answer may have left (clients don't offer them, #764).
         self.deny_always.locked().remove(&approval_id);
@@ -14203,4 +14350,148 @@ async fn summarize_in_chunks(
         provider.summarize(&merged, model),
     )
     .await
+}
+
+#[cfg(test)]
+mod live_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_snapshot_tracks_running_and_only_outstanding_approvals() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::path::PathBuf::from(format!("/tmp/fl-live-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            data_dir: base.join("d"),
+            config_dir: base.join("c"),
+            profile: "live-test".into(),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let sid = daemon
+            .with_store(|st| Ok(st.create_session(None)?.id))
+            .unwrap();
+        let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
+        daemon.runs.locked().insert(
+            sid.clone(),
+            RunCtl {
+                run_id: "in-flight".into(),
+                cancel: CancellationToken::new(),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                steer_tx,
+                retry: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        let (tx, rx) = oneshot::channel();
+        daemon.approvals.locked().insert("pending".into(), tx);
+        for session in [&sid, &"other-session".to_string()] {
+            daemon.broadcast(Event::ApprovalRequested {
+                approval_id: if session == &sid { "pending" } else { "other" }.into(),
+                session_id: session.clone(),
+                tool_name: "reader".into(),
+                version: 1,
+                capabilities: vec!["fs:read:/project".into()],
+                memory_mb: 64,
+                detail: None,
+                already_allowed: vec![],
+                code_preview: None,
+                tool_id: None,
+                batch: None,
+                path_options: Default::default(),
+            });
+        }
+        let snapshot = daemon
+            .handle(Request::GetSession { id: sid.clone() })
+            .await
+            .unwrap();
+        assert_eq!(snapshot["running"], true);
+        assert_eq!(snapshot["pending_events"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot["pending_events"][0]["approval_id"], "pending");
+        // A second client answers while the browser is disconnected.
+        let decision = daemon
+            .handle(Request::ApprovalDecision {
+                approval_id: "pending".into(),
+                approved: true,
+                scope: ApprovalScope::Once,
+                paths: Default::default(),
+                remember_denial: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision["resolved"], true);
+        assert!(rx.await.unwrap().0);
+        daemon.runs.locked().remove(&sid);
+        let snapshot = daemon
+            .handle(Request::GetSession { id: sid.clone() })
+            .await
+            .unwrap();
+        assert_eq!(snapshot["running"], false);
+        assert_eq!(snapshot["pending_events"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["pending_events"][0]["approval_id"], "other");
+        // A decision in another client broadcasts resolution before a delayed
+        // snapshot can revive the promotion prompt in this client.
+        let (events, mut received) = mpsc::channel(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: events,
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gap: None,
+        });
+        daemon.promotions.locked().insert(
+            "promo".into(),
+            ("missing-attempt".into(), "widening".into()),
+        );
+        daemon.broadcast(Event::PromotionApprovalRequested {
+            promotion_id: "promo".into(),
+            tool_name: "reader".into(),
+            reason: "widening".into(),
+            capabilities: vec![],
+            memory_mb: 64,
+        });
+        let before = daemon
+            .handle(Request::GetSession { id: sid.clone() })
+            .await
+            .unwrap();
+        assert!(before["pending_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["promotion_id"] == "promo"));
+        let decision = daemon
+            .handle(Request::PromotionDecision {
+                promotion_id: "promo".into(),
+                approved: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision["resolved"], true);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            ServerMessage::Event(Event::PromotionApprovalRequested { .. })
+        ));
+        assert!(
+            matches!(received.try_recv().unwrap(), ServerMessage::Event(Event::PromotionApprovalResolved { promotion_id }) if promotion_id == "promo")
+        );
+        let after = daemon
+            .handle(Request::GetSession { id: sid })
+            .await
+            .unwrap();
+        assert!(!after["pending_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["promotion_id"] == "promo"));
+        let pending = Arc::downgrade(&daemon);
+        drop(daemon);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while pending.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("promotion task outlived credential isolation");
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
