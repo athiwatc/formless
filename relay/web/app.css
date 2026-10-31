@@ -636,3 +636,6 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 3px; 
 }
 .session .name, .session .preview, .tag, .detail-text { unicode-bidi: plaintext; }
 .session .when { unicode-bidi: isolate; }
+
+/* Large or deeply nested Markdown remains readable without expensive parsing. */
+.md pre.md-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
