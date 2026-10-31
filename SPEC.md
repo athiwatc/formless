@@ -2210,6 +2210,11 @@ such as `read_file`, `read_text_file` and `file_read`.
 
 ### 9.5 Crash recovery
 
+- Finishing a Run isolates comparison and job bookkeeping from unrelated
+  finish-tail failures. A panic in naming, recap, or `run_end` hooks is
+  logged and surfaced as a note, and still drains the next queued message.
+  This applies after a Run panic as well as normal completion.
+
 - The daemon never idle-closes mid-Run (§9.1) but can crash/be killed. On
   restart, affected Runs are marked **Interrupted**; the in-flight Invocation
   is recorded `interrupted — outcome unknown` and is **never automatically

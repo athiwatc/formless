@@ -392,6 +392,8 @@ pub struct Daemon {
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Ids for client connections.
     next_conn: AtomicU64,
+    #[cfg(test)]
+    panic_in_finish_tail: AtomicBool,
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
@@ -558,6 +560,8 @@ impl Daemon {
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             next_conn: AtomicU64::new(1),
+            #[cfg(test)]
+            panic_in_finish_tail: AtomicBool::new(false),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
@@ -3733,6 +3737,37 @@ impl Daemon {
     /// free the Session, report what changed, resolve comparisons and jobs,
     /// run `run_end` hooks, and start the next queued message.
     async fn finish_run(self: &Arc<Self>, session_id: String, run_id: String, final_status: &str) {
+        use futures_util::FutureExt;
+        // run_panicked reaches this outside run_loop's unwind boundary too.
+        // Whatever a tail step does, the queue drain remains reachable.
+        if let Err(p) =
+            std::panic::AssertUnwindSafe(self.finish_run_tail(&session_id, &run_id, final_status))
+                .catch_unwind()
+                .await
+        {
+            self.finish_tail_failed(&session_id, "Run finish", &p);
+        }
+        self.start_next_queued_message(session_id);
+    }
+
+    fn finish_tail_failed(&self, session_id: &str, step: &str, p: &Box<dyn std::any::Any + Send>) {
+        let why = panic_text(p);
+        tracing::error!("{step} for session {session_id} panicked: {why}");
+        self.broadcast(Event::Note {
+            session_id: Some(session_id.to_string()),
+            text: format!("Internal error in {step}: {why}; continuing Run cleanup"),
+        });
+    }
+
+    fn finish_tail_step(&self, session_id: &str, step: &str, f: impl FnOnce()) {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            self.finish_tail_failed(session_id, step, &p);
+        }
+    }
+
+    async fn finish_run_tail(self: &Arc<Self>, session_id: &str, run_id: &str, final_status: &str) {
+        let session_id = session_id.to_string();
+        let run_id = run_id.to_string();
         if final_status != "paused" {
             self.record_run_status(&session_id, &run_id, final_status);
         }
@@ -3758,6 +3793,14 @@ impl Daemon {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&run_id);
+        // Resolve these independently before optional effects, so a naming or
+        // hook panic cannot leave comparisons/jobs waiting on a finished Run.
+        self.finish_tail_step(&session_id, "comparison completion", || {
+            self.comparison_run_ended(&session_id);
+        });
+        self.finish_tail_step(&session_id, "job completion", || {
+            self.job_run_ended(&session_id, &run_id, final_status);
+        });
         let files = self.run_file_infos(&run_id, false).unwrap_or_default();
         if let Some(recap) = self.run_recap(&session_id, &run_id, changes.as_deref(), &files) {
             self.broadcast(Event::RunRecap {
@@ -3786,8 +3829,6 @@ impl Daemon {
             status: final_status.to_string(),
         });
         self.maybe_name_session(&session_id);
-        self.comparison_run_ended(&session_id);
-        self.job_run_ended(&session_id, &run_id, final_status);
         self.maybe_auto_skill(&session_id, &run_id, final_status);
         self.record_primary_task(&session_id, &run_id, final_status);
         // run_end hooks (SPEC §9.8): automation, results only logged.
@@ -3810,6 +3851,13 @@ impl Daemon {
                     }
                 }
             }
+        }
+    }
+
+    fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
+        // A stale finisher must not take a newer Run's queued message.
+        if self.runs.locked().contains_key(&session_id) {
+            return;
         }
         // Queued messages start fresh Runs, in order (SPEC §5.3).
         let next = self
@@ -3834,6 +3882,10 @@ impl Daemon {
     /// timeout, and nothing awaits it, so Runs and requests never wait on
     /// the model. The result lands as a SessionUpdated event.
     fn maybe_name_session(self: &Arc<Self>, session_id: &str) {
+        #[cfg(test)]
+        if self.panic_in_finish_tail.swap(false, Ordering::SeqCst) {
+            panic!("injected session naming panic");
+        }
         let Ok(cfg) = self.config() else {
             return;
         };
@@ -13730,6 +13782,57 @@ mod poison_tests {
 #[cfg(test)]
 mod run_start_tests {
     use super::*;
+
+    /// A second panic during cleanup cannot strand the queue (#1133).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poisoned_tail_lock_and_tail_panic_still_start_the_queue() {
+        let dir = std::env::temp_dir().join(format!("fl-tail-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        let run = daemon.with_store(|st| st.create_run(&sid)).unwrap();
+        daemon
+            .with_store(|st| st.enqueue_message(&sid, "queued after tail panic"))
+            .unwrap();
+        let d = daemon.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = d.comparisons.lock().unwrap();
+            panic!("poisoned comparison bookkeeping");
+        })
+        .join();
+        assert!(daemon.comparisons.is_poisoned());
+        daemon.panic_in_finish_tail.store(true, Ordering::SeqCst);
+        // Exercise the same path used after a run_loop panic, with a second
+        // panic injected into its finish tail.
+        daemon.run_panicked(&sid, &run, "first panic").await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let runs = daemon
+                    .with_reader(|st| st.run_metrics_for(Some(&sid), 10, None))
+                    .unwrap();
+                if runs.len() == 2 && !daemon.runs.locked().contains_key(&sid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued Run never started and finished");
+        assert_eq!(daemon.with_reader(|st| st.queued_count(&sid)).unwrap(), 0);
+        let msgs = daemon.with_reader(|st| st.list_messages(&sid)).unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m.role == "user" && m.content == "queued after tail panic"));
+        assert_eq!(
+            daemon
+                .with_reader(|st| st.run_status(&run))
+                .unwrap()
+                .as_deref(),
+            Some("paused")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// One Run per Session: a second start is refused naming the winner,
     /// and a finishing Run never removes a newer Run's controls (#726).
