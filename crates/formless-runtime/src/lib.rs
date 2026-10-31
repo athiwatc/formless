@@ -10,7 +10,7 @@ pub use sync::LockExt;
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
-use rquickjs::{Context, Function, Runtime};
+use rquickjs::{context::EvalOptions, Context, Function, Runtime};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -222,6 +222,15 @@ pub struct ExecOutcome {
     pub logs: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NestedToolError {
+    pub tool: String,
+    pub detail: String,
+}
+
+/// The only eval filename whose frames refer directly to ExecRequest.code.
+pub const TOOL_SOURCE_NAME: &str = "formless-tool.js";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecErrorKind {
     Js,
@@ -240,6 +249,8 @@ pub struct ExecError {
     pub after_stub: bool,
     /// `log` lines (and a dry run's would-be effects) before it failed.
     pub logs: Vec<String>,
+    /// A propagated tools.call rejection, separate from this Tool's stack.
+    pub nested: Option<NestedToolError>,
 }
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -390,17 +401,27 @@ globalThis.process = {
 // tools.call returns a Promise settled from the event loop, so
 // Promise.all runs nested Tools in parallel (SPEC §7.6, §7.12).
 const __pendingCalls = new Map();
+const __nestedErrors = new WeakMap();
+const __nestedError = (e) => e && (typeof e === "object" || typeof e === "function") ? (__nestedErrors.get(e) || null) : null;
 globalThis.tools = {
   call: (name, input) => new Promise((resolve, reject) => {
-    const id = __call("tools_call", { name: String(name), input: input || {} });
-    __pendingCalls.set(id, { resolve, reject });
+    const callsite = new Error("nested tools.call");
+    const target = String(name);
+    const id = __call("tools_call", { name: target, input: input || {} });
+    __pendingCalls.set(id, { resolve, reject, name: target, stack: callsite.stack });
   }),
 };
 globalThis.__settleCall = (id, r) => {
   const p = __pendingCalls.get(id);
   if (!p) return;
   __pendingCalls.delete(id);
-  if (r.ok) p.resolve(r.value); else p.reject(new Error(r.error));
+  if (r.ok) p.resolve(r.value);
+  else {
+    const error = new Error(r.error);
+    error.stack = p.stack;
+    __nestedErrors.set(error, { tool: p.name, detail: String(r.error) });
+    p.reject(error);
+  }
 };
 globalThis.clipboard = {
   read: () => __call("clipboard_read", {}),
@@ -2279,6 +2300,7 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
             message: "interrupted".into(),
             after_stub: false,
             logs: Vec::new(),
+            nested: None,
         };
     }
     let low = msg.to_lowercase();
@@ -2298,6 +2320,7 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
         message: msg.to_string(),
         after_stub: false,
         logs: Vec::new(),
+        nested: None,
     }
 }
 
@@ -2524,7 +2547,7 @@ const RUNNER: &str = r#"
   (function () {
     // QuickJS throws null when it cannot even allocate the out-of-memory
     // error, so a null exception is reported as out of memory.
-    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || "") }); };
+    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || ""), nested: __nestedError(e) }); };
     const done = (v) => {
       try {
         const encoded = JSON.stringify(v === undefined ? null : v);
@@ -2541,6 +2564,25 @@ const RUNNER: &str = r#"
     } catch (e) { fail(e); }
   })();
 "#;
+
+fn nested_error<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    reason: rquickjs::Value<'js>,
+) -> Option<NestedToolError> {
+    let getter: Function<'js> = ctx.eval("__nestedError").ok()?;
+    let value: rquickjs::Value<'js> = match getter.call((reason,)) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = ctx.catch();
+            return None;
+        }
+    };
+    let object = value.as_object()?;
+    Some(NestedToolError {
+        tool: object.get("tool").ok()?,
+        detail: object.get("detail").ok()?,
+    })
+}
 
 /// Execute one Tool Invocation. Blocking; run on a dedicated thread.
 pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, ExecError> {
@@ -2572,8 +2614,13 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     // Keep promise identities alive until completion (a raw pointer/hash could
     // be reused after GC). Clear persistent handles before Runtime is dropped,
     // including on early error paths, as required by rquickjs::Persistent.
+    #[derive(Clone)]
+    struct Rejection {
+        message: String,
+        reason: rquickjs::Persistent<rquickjs::Value<'static>>,
+    }
     type Rejections = std::rc::Rc<
-        std::cell::RefCell<HashMap<rquickjs::Persistent<rquickjs::Value<'static>>, String>>,
+        std::cell::RefCell<HashMap<rquickjs::Persistent<rquickjs::Value<'static>>, Rejection>>,
     >;
     struct ClearRejections(Rejections);
     impl Drop for ClearRejections {
@@ -2595,7 +2642,13 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
                     .and_then(|e| e.message())
                     .or_else(|| reason.as_string().and_then(|s| s.to_string().ok()))
                     .unwrap_or_else(|| format!("{reason:?}"));
-                rejected.borrow_mut().insert(promise, message);
+                rejected.borrow_mut().insert(
+                    promise,
+                    Rejection {
+                        message,
+                        reason: rquickjs::Persistent::save(&ctx, reason),
+                    },
+                );
             }
         },
     )));
@@ -2630,9 +2683,18 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         g.set("__host", host).map_err(|e| err(&e))?;
         g.set("__input_json", req.input.to_string())
             .map_err(|e| err(&e))?;
-        ctx.eval::<(), _>(PRELUDE).map_err(|e| err(&e))?;
-        ctx.eval::<(), _>(req.code.as_str()).map_err(|e| err(&e))?;
-        ctx.eval::<(), _>(RUNNER).map_err(|e| err(&e))
+        let mut host_options = EvalOptions::default();
+        host_options.filename = Some("formless-host.js".into());
+        ctx.eval_with_options::<(), _>(PRELUDE, host_options)
+            .map_err(|e| err(&e))?;
+        let mut tool_options = EvalOptions::default();
+        tool_options.filename = Some(TOOL_SOURCE_NAME.into());
+        ctx.eval_with_options::<(), _>(req.code.as_str(), tool_options)
+            .map_err(|e| err(&e))?;
+        let mut runner_options = EvalOptions::default();
+        runner_options.filename = Some("formless-runner.js".into());
+        ctx.eval_with_options::<(), _>(RUNNER, runner_options)
+            .map_err(|e| err(&e))
     })?;
     // Event loop: drain the job queue (an async run() settles through it),
     // then fire due timers, waiting until the next one or a nested call's
@@ -2693,13 +2755,30 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
              tools.call returns a Promise, await every call"
         )));
     }
-    if let Some(message) = unhandled.borrow().values().next() {
-        return Err(err(&format!("unhandled Promise rejection: {message}")));
+    let rejection = unhandled.borrow().values().next().cloned();
+    if let Some(rejection) = rejection {
+        let mut message = format!("unhandled Promise rejection: {}", rejection.message);
+        let nested = ctx.with(|ctx| {
+            let reason = rejection.reason.clone().restore(&ctx).ok()?;
+            if let Some(stack) = reason
+                .as_exception()
+                .and_then(|exception| exception.stack())
+            {
+                message.push('\n');
+                message.push_str(&stack);
+            }
+            nested_error(&ctx, reason)
+        });
+        let mut error = err(&message);
+        error.nested = nested;
+        return Err(error);
     }
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
     let logs = state.logs.lock().map(|g| g.clone()).unwrap_or_default();
     if !parsed["ok"].as_bool().unwrap_or(false) {
-        return Err(err(&parsed["error"].as_str().unwrap_or("tool error")));
+        let mut error = err(&parsed["error"].as_str().unwrap_or("tool error"));
+        error.nested = serde_json::from_value(parsed["nested"].clone()).ok();
+        return Err(error);
     }
     let output = parsed["value"].clone();
     if let Some(msg) = reported_error(&output, req.output_schema.as_ref()) {
@@ -3177,6 +3256,43 @@ mod tests {
         );
         let out = execute(&req, Arc::new(SlowOps)).unwrap();
         assert_eq!(out.output, json!("bad tool"));
+    }
+
+    #[test]
+    fn propagated_nested_errors_keep_callee_detail_and_original_caller_stack() {
+        for body in [
+            "await tools.call('bad', {});",
+            "try { await tools.call('bad', {}); } catch (e) { throw e; }",
+        ] {
+            let req = live(&format!("async function run() {{\n  {body}\n}}"));
+            let error = execute(&req, Arc::new(SlowOps)).unwrap_err();
+            let nested = error
+                .nested
+                .as_ref()
+                .expect("nested rejection context was lost");
+            assert_eq!(nested.tool, "bad");
+            assert_eq!(nested.detail, "bad tool");
+            assert!(
+                error.message.contains("run (formless-tool.js:2:"),
+                "{}",
+                error.message
+            );
+        }
+        let req = live("async function run() { try { await tools.call('bad', {}); } catch (_) {} throw new Error('different failure'); }");
+        let error = execute(&req, Arc::new(SlowOps)).unwrap_err();
+        assert!(
+            error.nested.is_none(),
+            "caught failure leaked into unrelated error"
+        );
+        assert!(error.message.starts_with("different failure"));
+        let req = live("async function run() {\n tools.call('bad', {}); await tools.call('t', {}); return {};\n}");
+        let error = execute(&req, Arc::new(SlowOps)).unwrap_err();
+        assert_eq!(error.nested.as_ref().unwrap().tool, "bad");
+        assert!(
+            error.message.contains("run (formless-tool.js:2:"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
