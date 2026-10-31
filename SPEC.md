@@ -2269,6 +2269,10 @@ such as `read_file`, `read_text_file` and `file_read`.
   separate launcher gate; installation stops a running daemon and waits for its
   ownership to release before loading the service. A second daemon cannot alter
   the owner's PID marker, socket, uploads or recovery state.
+  Reset, profile removal and full uninstall keep the launcher gate through
+  shutdown and hold ownership through destructive changes. Full uninstall asks
+  the service manager to disable registration even if the definition is missing;
+  an unknown manager/ownership state preserves the profile and binary.
   `formless profiles list [--json]` shows
   each profile (default first), whether its daemon runs, when it was last
   used and its data dir, and marks the current one. `formless profiles rm
