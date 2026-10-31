@@ -461,3 +461,33 @@ test('persisted assistant stop reasons render explanatory notes when Session is 
   assert.match(plainText(transcript), /answer was cut off/);
   assert.equal(all(transcript).filter(n => n.attrs.class === 'muted stop-note').length, 1);
 });
+
+test('dropped updates refresh durable usage and mark transient progress unavailable', async () => {
+  const replies = [], notes = [];
+  let running = 0;
+  const c = setup(['reconcileDropped'], {
+    S: { current: 'A', usage: { A: { steps: 1 } }, liveTools: [{ status: 'running', progress: { fraction: 0.9, label: 'stale' } }] },
+    note: s => notes.push(s), sessionName: id => id, renderStatus() {}, renderLive() {},
+    refreshRunning() { running++; }, setActivity(s) { notes.push(s); },
+    request(r) { const d = deferred(); replies.push({ r, d }); return d.promise; },
+  });
+  const gap = { session_id: 'A', run_id: 'run', kinds: ['run_usage', 'tool_progress', 'invocation_activity'] };
+  c.reconcileDropped(gap);
+  c.reconcileDropped(gap);
+  assert.equal(c.S.usage.A, undefined);
+  assert.equal(c.S.liveTools[0].progress.fraction, null);
+  assert.match(c.S.liveTools[0].progress.label, /skipped/);
+  assert.equal(replies.length, 1, 'duplicate usage refresh is coalesced');
+  assert.equal(running, 2);
+  replies[0].d.resolve({ last_run: { steps: 3 } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(c.S.usage.A.steps, 3);
+  c.reconcileDropped(gap);
+  c.S.usage.A = { steps: 9 }; // New streamed state wins over older snapshot.
+  replies[1].d.resolve({ last_run: { steps: 4 } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(c.S.usage.A.steps, 9);
+  c.reconcileDropped({ session_id: '', run_id: '', kinds: ['model_pull_progress'], model: 'model' });
+  assert.ok(notes.some(n => /download progress unavailable for model/.test(n)));
+  assert.ok(notes.some(n => /live text, reasoning or progress updates were skipped/.test(n)));
+});

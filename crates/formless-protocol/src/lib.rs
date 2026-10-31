@@ -25,6 +25,7 @@ pub const FEATURES: &[&str] = &[
     "ask_user",
     "approval_batches",
     "unsupported_error",
+    "dropped_event_kinds",
 ];
 
 /// The highest version both peers speak, if any.
@@ -2140,6 +2141,22 @@ pub enum ServerMessage {
     Event(Event),
 }
 
+/// Live update categories that a slow subscriber may miss. Repeated drops
+/// of one kind in one scope coalesce until the warning can be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DroppedEventKind {
+    MessageDelta,
+    ReasoningDelta,
+    ToolProgress,
+    RunUsage,
+    InvocationActivity,
+    ModelPullProgress,
+    /// Preserve a warning when a newer peer adds another live category.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -2167,12 +2184,18 @@ pub enum Event {
         run_id: String,
         message: MessageInfo,
     },
-    /// Some live answer deltas were dropped for this client (it fell
-    /// behind): the text shown so far has a gap, and `MessageComplete`
-    /// carries the whole answer (#1096).
+    /// Live text or progress updates were skipped for this subscriber.
+    /// Empty Session/Run strings denote a global or non-Run scope. Optional
+    /// metadata is additive: older peers still understand the original fields.
     DeltasDropped {
         session_id: String,
         run_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kinds: Vec<DroppedEventKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// The provider stream dropped and the request is being re-sent:
     /// clients discard the partial answer and reasoning shown so far.
@@ -2501,7 +2524,6 @@ impl Event {
             | Event::MessageDelta { session_id, .. }
             | Event::ReasoningDelta { session_id, .. }
             | Event::MessageComplete { session_id, .. }
-            | Event::DeltasDropped { session_id, .. }
             | Event::StreamRestarted { session_id, .. }
             | Event::ProviderStalled { session_id, .. }
             | Event::ProviderRetrying { session_id, .. }
@@ -2531,6 +2553,9 @@ impl Event {
             | Event::SubagentStep { session_id, .. }
             | Event::SubagentFinished { session_id, .. }
             | Event::SessionClients { session_id, .. } => Some(session_id),
+            Event::DeltasDropped { session_id, .. } => {
+                (!session_id.is_empty()).then_some(session_id.as_str())
+            }
             Event::Note { session_id, .. } => session_id.as_deref(),
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
@@ -2671,6 +2696,36 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_event_metadata_is_additive_and_global_scope_remains_global() {
+        let old: Event = serde_json::from_value(
+            serde_json::json!({"type":"deltas_dropped", "session_id":"s", "run_id":"r"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(old, Event::DeltasDropped { kinds, handle: None, model: None, .. } if kinds.is_empty())
+        );
+        let future: Event = serde_json::from_value(serde_json::json!({"type":"deltas_dropped", "session_id":"s", "run_id":"r", "kinds":["future_live_kind"]})).unwrap();
+        assert!(
+            matches!(future, Event::DeltasDropped { kinds, .. } if kinds == [DroppedEventKind::Unknown])
+        );
+        let event = Event::DeltasDropped {
+            session_id: String::new(),
+            run_id: String::new(),
+            kinds: vec![DroppedEventKind::ModelPullProgress],
+            handle: None,
+            model: Some("model".into()),
+        };
+        assert_eq!(event.session_id(), None);
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["kinds"], serde_json::json!(["model_pull_progress"]));
+        assert!(value.get("handle").is_none());
+        let decoded: Event = serde_json::from_value(value).unwrap();
+        assert!(
+            matches!(decoded, Event::DeltasDropped { model: Some(model), .. } if model == "model")
+        );
+    }
 
     #[test]
     fn programs_that_run_others_are_flagged_broad() {

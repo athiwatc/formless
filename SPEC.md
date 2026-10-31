@@ -387,6 +387,26 @@ an empty listing just asks for one.
 
 ### 4.4 Provider failure handling
 
+Circuit breakers are scoped to the normalized endpoint (host case, default
+port and trailing slash), configured provider name and a non-reversible
+credential digest, plus the model actually serving the request. Missing models
+open immediately; transport failures, rate limits, server errors and failed
+streams count toward the threshold. User-caused request rejections do not count.
+Only a completed response closes a breaker; receiving HTTP headers does not.
+Breaker notices use a dedicated global hook, independent of a Run's Session
+warning hook. Image-attachment warnings stay with the originating Session;
+overriding that warning hook cannot hide global breaker transitions.
+After cooldown exactly one request owns the half-open probe through response
+completion, while concurrent callers skip it. A failed probe immediately
+reopens with doubled cooldown; cancellation releases probe ownership without
+counting a user failure. If every configured model is open, the request fails
+clearly until another probe is eligible. Breaker changes are global provider
+notes, including internal calls, and never attributed to an unrelated Session.
+The process-wide breaker cache holds at most 1024 identities, evicting the
+least recently used inactive entry; active requests cannot be evicted. If all
+1024 entries have active requests, a new identity is refused temporarily rather
+than growing the map or losing an in-flight probe.
+
 - 429 / 5xx / dropped stream: automatic retry with exponential backoff,
   bounded (default 5 attempts). Exhaustion ⇒ the Run **pauses** and the error
   is surfaced in the TUI; a Run never silently fails.
@@ -2241,11 +2261,20 @@ such as `read_file`, `read_text_file` and `file_read`.
   draft, so Enter cannot accidentally send it again as a new action.
   Buffered replies are consumed before disconnect cleanup: an accepted
   send acknowledged immediately before EOF is never restored for retry.
-- A client that falls behind loses live deltas first; it is told with
-  `DeltasDropped {session_id, run_id}` once there is room, and the
-  answer's `MessageComplete` carries the whole text (plain mode notes the
-  gap on stderr). Only when it can't take an event that matters is it
-  disconnected, and then all of its connection's tasks end.
+- A client that falls behind loses live updates first; all six droppable kinds
+  (`MessageDelta`, `ReasoningDelta`, `ToolProgress`, `RunUsage`,
+  `InvocationActivity`, `ModelPullProgress`) are observable with `DeltasDropped`.
+  Its original `session_id`/`run_id` fields remain; additive `kinds` lists the
+  skipped kinds, and optional `handle`/`model` identifies updates without a Run.
+  An absent Session or Run is represented by an empty original field. Gaps are
+  coalesced per Session/Run (or Session/Invocation, or model), so simultaneous
+  Runs never overwrite each other's warning. Each client keeps at most 4096
+  pending scopes; if another distinct scope cannot be remembered it disconnects
+  instead of silently losing the warning. Once the writer drains its queue it
+  schedules the pending warnings, even if no further event is broadcast.
+  The answer's `MessageComplete` carries the whole text; plain/TUI/web clients
+  warn about skipped text or progress. When a non-droppable event cannot be
+  queued the client disconnects and all its connection's tasks end.
 - Each connection may `Subscribe {sessions, deltas}`: only the listed
   Sessions' transcript and live events (and token deltas only if
   `deltas`) reach it. Tool/module/proposal events, approvals, the Session
