@@ -4531,12 +4531,19 @@ impl Daemon {
                     _ => None,
                 };
                 let content = placeholder.map_or_else(|| result.content.clone(), str::to_string);
-                let meta = match (&result.stop_reason, served) {
+                let stored_stop = result
+                    .stop_reason
+                    .as_deref()
+                    .or(result.truncated.then_some("max_tokens"));
+                let meta = match (stored_stop, served) {
                     (Some(stop), served) => {
                         let mut m: Value = served
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_else(|| json!({}));
                         m["stop_reason"] = json!(stop);
+                        if result.truncated || stop == "model_context_window_exceeded" {
+                            m["truncated"] = json!(true);
+                        }
                         if placeholder.is_some() {
                             m["placeholder"] = json!(true);
                         }

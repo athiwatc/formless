@@ -410,7 +410,11 @@ an empty listing just asks for one.
   Neither is ever stored as an empty answer: the note says why, and an
   empty one becomes "(The provider's content filter stopped this
   answer.)". A Responses answer stopped by `max_output_tokens` keeps its
-  partial text with `truncated`, like Chat's `length`.
+  partial text with `truncated`, like Chat's `length`. Final output-limit
+  and context-window partials persist `meta.truncated: true`; output-limit
+  partials also persist `stop_reason: "max_tokens"`. When building later
+  provider context, append a `[harness note]` explaining the cut-off, or
+  substitute that note when the partial is empty.
 - **Rate limits.** The `x-ratelimit-*` (and `anthropic-ratelimit-*`)
   headers of each endpoint's latest response are kept: `RateLimits`,
   `Status.rate_limits`; `/usage` adds "41/50 requests left, resets …".
