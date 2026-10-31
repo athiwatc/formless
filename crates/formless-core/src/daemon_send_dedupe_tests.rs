@@ -1,7 +1,19 @@
 use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-fn fixture() -> (Arc<Daemon>, String, std::path::PathBuf) {
+async fn release_fixture(_env: &crate::credential_env::EnvGuard, daemon: Arc<Daemon>) {
+    let pending = Arc::downgrade(&daemon);
+    drop(daemon);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pending.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("send fixture left daemon tasks running");
+}
+
+fn fixture(_env: &crate::credential_env::EnvGuard) -> (Arc<Daemon>, String, std::path::PathBuf) {
     let base = std::path::PathBuf::from(format!("/tmp/fl-send-{}", uuid::Uuid::new_v4()));
     let paths = Paths {
         data_dir: base.join("d"),
@@ -40,7 +52,8 @@ fn send(sid: &str, content: &str) -> Request {
 
 #[tokio::test]
 async fn concurrent_same_identity_waits_for_claim_and_survives_lost_first_waiter() {
-    let (daemon, sid, base) = fixture();
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (daemon, sid, base) = fixture(&env);
     let mut first = Box::pin(CLIENT.scope((42, "test".into()), daemon.handle(send(&sid, "first"))));
     // The claim is installed before execution; both calls must wait for the
     // same detached send rather than checking an empty cache independently.
@@ -83,13 +96,14 @@ async fn concurrent_same_identity_waits_for_claim_and_survives_lost_first_waiter
             ["conn"],
         42
     );
-    drop(daemon);
+    release_fixture(&env, daemon).await;
     let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test]
 async fn concurrent_failure_is_cached_and_replayed() {
-    let (daemon, _sid, base) = fixture();
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (daemon, _sid, base) = fixture(&env);
     let (first, second) = CLIENT
         .scope((42, "test".into()), async {
             tokio::join!(
@@ -111,11 +125,15 @@ async fn concurrent_failure_is_cached_and_replayed() {
             .borrow(),
         Some(Err(_))
     ));
-    drop(daemon);
+    release_fixture(&env, daemon).await;
     let _ = std::fs::remove_dir_all(base);
 }
 
-async fn framed_client(daemon: Arc<Daemon>, sid: String) -> (Value, Value) {
+async fn framed_client(
+    _env: &crate::credential_env::EnvGuard,
+    daemon: Arc<Daemon>,
+    sid: String,
+) -> (Value, Value) {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let connection = tokio::spawn(daemon.clone().handle_conn(server));
     let (read, mut write) = tokio::io::split(client);
@@ -166,10 +184,11 @@ async fn framed_client(daemon: Arc<Daemon>, sid: String) -> (Value, Value) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_framed_connections_with_same_key_each_append_once() {
-    let (daemon, sid, base) = fixture();
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (daemon, sid, base) = fixture(&env);
     let (left, right) = tokio::join!(
-        framed_client(daemon.clone(), sid.clone()),
-        framed_client(daemon.clone(), sid.clone())
+        framed_client(&env, daemon.clone(), sid.clone()),
+        framed_client(&env, daemon.clone(), sid.clone())
     );
     assert_eq!(left.0, left.1);
     assert_eq!(right.0, right.1);
@@ -192,6 +211,6 @@ async fn two_framed_connections_with_same_key_each_append_once() {
         daemon.sent_keys.locked().is_empty(),
         "closed clients' dedupe state was retained"
     );
-    drop(daemon);
+    release_fixture(&env, daemon).await;
     let _ = std::fs::remove_dir_all(base);
 }

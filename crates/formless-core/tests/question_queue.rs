@@ -1,5 +1,7 @@
 //! Concurrent main/nested ask_user calls share one FIFO gate per Session.
 #![cfg(unix)]
+#[path = "support/env.rs"]
+mod credential_env;
 use formless_core::{daemon::Daemon, Config, Paths, Store};
 use formless_protocol::{Event, Request, ServerMessage};
 use serde_json::json;
@@ -8,6 +10,7 @@ use tokio::io::AsyncBufReadExt;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_questions_are_presented_and_answered_in_call_order() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = std::path::PathBuf::from(format!("/tmp/fl-qq-{}", uuid::Uuid::new_v4()));
     let paths = Paths {
         data_dir: base.join("d"),
@@ -119,10 +122,20 @@ async fn concurrent_questions_are_presented_and_answered_in_call_order() {
     assert_eq!(first, r#"{"answer":"first answer"}"#);
     assert_eq!(second, r#"{"answer":"second answer"}"#);
     daemon.handle(Request::Shutdown).await.unwrap();
+    drop(lines);
     tokio::time::timeout(Duration::from_secs(10), server)
         .await
         .expect("daemon never stopped")
         .unwrap()
         .unwrap();
+    let pending = Arc::downgrade(&daemon);
+    drop(daemon);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pending.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("question daemon tasks outlived credential isolation");
     let _ = std::fs::remove_dir_all(base);
 }

@@ -1,5 +1,7 @@
 //! Request-site classifications survive the real daemon transport (#1139).
 #![cfg(unix)]
+#[path = "support/env.rs"]
+mod credential_env;
 
 use formless_core::{Config, Paths};
 use formless_protocol::{codes, Request, RequestEnvelope, ServerMessage, PROTOCOL_VERSION};
@@ -8,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn resource_and_validation_errors_have_stable_codes_over_a_connection() {
+    let _env = credential_env::EnvGuard::isolated();
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let root = std::env::temp_dir().join(format!("fl-ec-{short}"));
     let paths = Paths {
@@ -152,8 +155,22 @@ async fn resource_and_validation_errors_have_stable_codes_over_a_connection() {
         assert_eq!(reply.error_code(), Some(code), "{reply:?}");
         assert!(matches!(reply, ServerMessage::Response { ok: false, .. }));
     }
-    server.abort();
-    let _ = server.await;
+    daemon.handle(Request::Shutdown).await.unwrap();
+    drop(lines);
+    drop(write);
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("daemon never stopped")
+        .unwrap()
+        .unwrap();
+    let pending = Arc::downgrade(&daemon);
     drop(daemon);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pending.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon tasks outlived credential isolation");
     let _ = std::fs::remove_dir_all(root);
 }
