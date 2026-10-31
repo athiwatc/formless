@@ -389,6 +389,9 @@ h3 { font-size: 15px; margin: 22px 0 8px; }
 
 /* Modal + toasts */
 .backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, .5); display: grid; place-items: center; padding: 16px; }
+/* Prompts can open from a body-appended review modal. Preserve the existing
+   ask-over-approval order while keeping that review list behind its prompt. */
+#ask-backdrop { z-index: 41; }
 .modal { width: 100%; max-width: 520px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; box-shadow: var(--shadow); }
 .modal.alert { border-color: var(--err); }
 .modal h2 { margin-bottom: 12px; }

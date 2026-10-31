@@ -1531,6 +1531,8 @@ None ship by default (principle 1).
   Catalog lists and Add review show its command/URL and warn that stdio entries
   download and run registry code on first use; Add requires explicit execution
   consent. The pinned spec is retained in config and the installation audit.
+  Secret and consent prompts remain usable above an open catalog/import list;
+  cancelling a prompt returns to that list without adding a server.
   Parameters distinguish paths, URLs and secrets. Secrets use masked inputs;
   URL passwords, configured env/header values and known secrets are redacted
   from server targets, security overviews, approval details, errors and
