@@ -412,8 +412,20 @@
 
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
+  let askTag = null;
+  const askQueue = [];
   /** Promise-based prompt/confirm: resolves the text (input) or true, or null. */
   function ask(opts) {
+    return new Promise((resolve) => {
+      askQueue.push({ opts, resolve });
+      if (!askResolve) showNextAsk();
+    });
+  }
+  function showNextAsk() {
+    if (!askQueue.length) return;
+    const { opts, resolve } = askQueue.shift();
+    askResolve = resolve;
+    askTag = opts.tag || null;
     rememberFocus("ask-backdrop");
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
@@ -427,14 +439,22 @@
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
     $("ask-backdrop").classList.remove("hidden");
     const first = opts.body && opts.body.querySelector("input");
-    setTimeout(() => (opts.input ? input.select() : (first || ok).focus()), 0);
-    return new Promise((resolve) => (askResolve = resolve));
+    setTimeout(() => { if (askResolve === resolve) { if (opts.input) input.select(); else (first || ok).focus(); } }, 0);
   }
   function closeAsk(value) {
     $("ask-backdrop").classList.add("hidden");
     restoreFocus("ask-backdrop");
-    if (askResolve) askResolve(value);
+    const resolve = askResolve;
     askResolve = null;
+    askTag = null;
+    if (resolve) resolve(value);
+    showNextAsk();
+  }
+  function cancelAsk(tag) {
+    for (let i = askQueue.length - 1; i >= 0; i--) {
+      if (askQueue[i].opts.tag === tag) askQueue.splice(i, 1)[0].resolve(null);
+    }
+    if (askTag === tag) closeAsk(null);
   }
   $("ask-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -577,7 +597,10 @@
     const out = {};
     for (const part of location.hash.replace(/^#/, "").split("&")) {
       const i = part.indexOf("=");
-      if (i > 0) out[part.slice(0, i)] = decodeURIComponent(part.slice(i + 1));
+      if (i > 0) {
+        try { out[part.slice(0, i)] = decodeURIComponent(part.slice(i + 1)); }
+        catch (_) { out.malformed = true; }
+      }
     }
     return out;
   }
@@ -762,7 +785,11 @@
     if (!SAFE_URL.test(url)) return kids;
     return h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, kids);
   }
-  function inline(text) {
+  // Keep persisted or streaming model text from creating unbounded recursive
+  // work. Excess text remains readable verbatim instead of being discarded.
+  const MD_DEPTH = 32, MD_INLINE_CHARS = 4096, MD_FORMAT_CHARS = 128 * 1024;
+  function inline(text, depth = 0) {
+    if (depth >= MD_DEPTH || text.length > MD_INLINE_CHARS) return [text];
     const out = [];
     const re = new RegExp(INLINE.source, "g");
     let last = 0;
@@ -770,13 +797,13 @@
     while ((m = re.exec(text))) {
       if (m.index > last) out.push(text.slice(last, m.index));
       if (m[2] != null) out.push(h("code", null, m[1].length > 1 ? m[2].trim() : m[2]));
-      else if (m[3] != null || m[4] != null) out.push(h("strong", null, inline(m[3] != null ? m[3] : m[4])));
-      else if (m[5] != null) out.push(h("del", null, inline(m[5])));
-      else if (m[6] != null || m[7] != null) out.push(h("em", null, inline(m[6] != null ? m[6] : m[7])));
+      else if (m[3] != null || m[4] != null) out.push(h("strong", null, inline(m[3] != null ? m[3] : m[4], depth + 1)));
+      else if (m[5] != null) out.push(h("del", null, inline(m[5], depth + 1)));
+      else if (m[6] != null || m[7] != null) out.push(h("em", null, inline(m[6] != null ? m[6] : m[7], depth + 1)));
       // Remote images are blocked by the CSP (img-src 'self' data:), so an
       // image is shown as a labelled link instead.
       else if (m[9] != null) out.push(link(m[9], h("span", { class: "img-link" }, "🖼 " + (m[8] || "image"))));
-      else if (m[11] != null) out.push(link(m[11], inline(m[10])));
+      else if (m[11] != null) out.push(link(m[11], inline(m[10], depth + 1)));
       else if (m[12] != null) out.push(link(m[12], m[12].replace(/^mailto:/i, "")));
       else if (m[13] != null) out.push(link(m[13], m[13]));
       else if (m[14] != null) out.push(h("span", { class: "math" }, m[14]));
@@ -1047,7 +1074,8 @@
   }
 
   /** Append the block structure of `lines` to `root`. */
-  function blocks(lines, root) {
+  function blocks(lines, root, depth = 0) {
+    if (depth >= MD_DEPTH) { root.append(h("pre", { class: "md-plain" }, lines.join("\n"))); return root; }
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
@@ -1099,11 +1127,11 @@
         const alert = buf[0] && buf[0].trim().match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$/i);
         const q = h("blockquote", { class: alert ? "callout " + alert[1].toLowerCase() : null });
         if (alert) { buf.shift(); q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()])); }
-        blocks(buf, q);
+        blocks(buf, q, depth + 1);
         root.append(q);
         continue;
       }
-      if (ITEM.test(line)) { i = list(lines, i, root); continue; }
+      if (ITEM.test(line)) { i = list(lines, i, root, depth); continue; }
       const p = h("p");
       p.append(...inline(line.trim()));
       i++;
@@ -1114,7 +1142,7 @@
   }
 
   /** A (possibly nested) list starting at lines[i]; returns the next index. */
-  function list(lines, i, root) {
+  function list(lines, i, root, depth = 0) {
     const first = lines[i].match(ITEM);
     const base = indentOf(first[1]);
     const ordered = /\d/.test(first[2]);
@@ -1148,7 +1176,7 @@
         li.className = "task";
         li.append(h("input", { type: "checkbox", disabled: true, checked: task[1] !== " ", "aria-label": task[1] !== " " ? "done" : "not done" }));
       }
-      blocks(body, li);
+      blocks(body, li, depth + 1);
       el.append(li);
       // Blank line before a sibling item makes the list loose.
       if (i > 0 && !lines[i - 1].trim() && i < lines.length && ITEM.test(lines[i])) loose = true;
@@ -1159,7 +1187,10 @@
   }
 
   function markdown(text) {
-    return blocks(String(text || "").replace(/\r\n?/g, "\n").split("\n"), h("div", { class: "md bubble" }));
+    text = String(text || "");
+    const root = h("div", { class: "md bubble" });
+    if (text.length > MD_FORMAT_CHARS) { root.append(h("pre", { class: "md-plain" }, text)); return root; }
+    return blocks(text.replace(/\r\n?/g, "\n").split("\n"), root);
   }
 
   // ------------------------------------------------------------- chat
@@ -1656,6 +1687,22 @@
     popover.querySelector("button").focus();
   }
 
+  function assistantStopNote(message) {
+    let meta;
+    try { meta = JSON.parse(message.meta || "{}"); } catch (_) { return null; }
+    if (meta.placeholder) return null; // Already shown as a provider stop note.
+    const reason = typeof meta.stop_reason === "string" && meta.stop_reason
+      ? meta.stop_reason : meta.truncated === true ? "max_tokens" : null;
+    if (!reason) return null;
+    const notes = {
+      max_tokens: "The answer was cut off at the model's output token limit.",
+      model_context_window_exceeded: "The answer stopped because the model's context window is full.",
+      pause_turn: "The model paused its turn; ask it to continue.",
+      refusal: "The model refused this request.",
+      content_filter: "The provider's content filter stopped this answer.",
+    };
+    return notes[reason] || "The answer ended early (" + reason + ").";
+  }
   function renderHistory() {
     const box = $("transcript");
     box.replaceChildren();
@@ -1705,14 +1752,19 @@
           // An empty refusal/filter stop: the daemon's note, not the model's words.
           if (placeholder) n.append(h("div", { class: "muted stop-note" }, m.content));
           else if (m.content) n.append(markdown(m.content));
+          const stopNote = assistantStopNote(m);
+          if (stopNote) n.append(h("div", { class: "muted stop-note" }, stopNote));
           let calls = [];
           try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
           calls.forEach((c) => n.append(toolCallChip(c)));
-          if (m === lastAnswer && !isRunning()) {
-            if (S.recap) n.append(recapBlock(S.recap));
-            n.append(rateButtons());
-          }
         }));
+        // Run state changes after MessageComplete. Keep its controls outside
+        // the cached body so recap/rating and the last-answer target stay live.
+        if (m === lastAnswer && !isRunning()) {
+          const body = turn.body;
+          if (S.recap) body.append(recapBlock(S.recap));
+          body.append(rateButtons());
+        }
       }
     }
     box.append(h("div", { id: "live", class: "turn" }));
@@ -2107,6 +2159,10 @@
     $("modal-backdrop").classList.toggle("hidden", !req || S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
+    for (const id of ["modal-approve", "modal-once", "modal-session", "modal-hour", "modal-deny", "modal-deny-always"]) {
+      const button = $(id);
+      if (button) button.disabled = !!req.deciding;
+    }
     $("modal-title").textContent = promo ? "Promotion approval" : "Approval required";
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
@@ -2160,22 +2216,40 @@
   }
   /** The agent's open question in a dialog; Cancel keeps it pending (the
    * status bar and `a` bring it back). */
+  function queueQuestion(ev) {
+    const questions = S.questions = S.questions || [];
+    if (questions.some((q) => q.id === ev.question_id)) return;
+    const qs = ev.questions && ev.questions.length ? ev.questions
+      : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
+    questions.push({ id: ev.question_id, session_id: ev.session_id, qs });
+    S.pendingQuestion = questions[0];
+    S.questionId = S.pendingQuestion.id;
+    showQuestion();
+  }
+  function removeQuestion(id) {
+    S.questions = (S.questions || []).filter((q) => q.id !== id);
+    cancelAsk("question:" + id);
+    S.pendingQuestion = S.questions[0] || null;
+    S.questionId = S.pendingQuestion && S.pendingQuestion.id;
+    renderStatus();
+    showQuestion();
+  }
   function showQuestion() {
     const q = S.pendingQuestion;
     if (!q || S.questionOpen) return;
     S.questionOpen = true;
     renderStatus();
     const body = questionForm(q.qs);
-    ask({ title: "The agent asks", body, ok: "Answer" }).then((done) => {
+    ask({ title: "The agent asks", body, ok: "Answer", tag: "question:" + q.id }).then(async (done) => {
       S.questionOpen = false;
-      if (!S.pendingQuestion || S.pendingQuestion.id !== q.id || !done) return renderStatus();
+      if (!S.pendingQuestion || S.pendingQuestion.id !== q.id) { renderStatus(); showQuestion(); return; }
+      if (!done) return renderStatus();
       const answers = readQuestionForm(body, q.qs);
       if (answers.every((a) => !a.selected.length && !a.text)) return renderStatus();
-      S.pendingQuestion = null;
-      S.questionId = null;
-      renderStatus();
       const answer = answers.map((a) => a.selected.concat(a.text ? [a.text] : []).join(", ")).join("; ");
-      act({ type: "answer_question", question_id: q.id, answer, answers });
+      const result = await act({ type: "answer_question", question_id: q.id, answer, answers });
+      if (result && result.answered) removeQuestion(q.id);
+      else renderStatus();
     });
   }
   /** `a` or the status bar: the oldest pending approval, else the open
@@ -2213,9 +2287,10 @@
     else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
     else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   });
-  function decide(approved, scope, rememberDenial) {
+  async function decide(approved, scope, rememberDenial) {
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
+    if (!head || head.deciding) return;
     if (approved && head && head.kind !== "promotion" && scope !== "once") {
       const broad = (head.capabilities || []).filter((c) => !(head.already || []).includes(c) && isBroad(c));
       if (broad.length && head.broadConfirm !== (scope || "always")) {
@@ -2225,16 +2300,35 @@
         return;
       }
     }
-    const req = S.approvals.shift();
-    if (!req) return;
+    const req = head;
+    req.deciding = true;
+    renderApproval();
+    let result;
+    try {
+      result = await request(req.kind === "promotion"
+        ? { type: "promotion_decision", promotion_id: req.id, approved }
+        : { type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: scope === "once" ? {} : pickedPaths(req), remember_denial: !!rememberDenial });
+    } catch (e) {
+      toast("Decision was not delivered: " + e.message + ". Try again.", true);
+      note("Decision was not delivered: " + e.message, true);
+      return;
+    } finally {
+      req.deciding = false;
+      renderApproval();
+      renderStatus();
+    }
+    S.approvals = S.approvals.filter((a) => a !== req);
+    if (!result || !result.resolved) {
+      note("That approval is no longer pending; no decision was applied.");
+      renderApproval();
+      renderStatus();
+      return;
+    }
     // A batch's later prompts show how each earlier call was answered.
     if (req.batch) {
       const answers = (S.batchAnswers = S.batchAnswers || {})[req.batch.batch_id] = S.batchAnswers[req.batch.batch_id] || {};
       answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
     }
-    if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
-    // A wider folder is a lasting grant's; "once" allows only this call (#765).
-    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: scope === "once" ? {} : pickedPaths(req), remember_denial: !!rememberDenial });
     prefs.set("seen.approvalHelp", true);
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
@@ -2340,7 +2434,7 @@
     box.replaceChildren();
     const d = S.toolDetail;
     if (!d || d.tool.id !== S.selectedTool) {
-      box.append(h("p", { class: "placeholder" }, S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
+      box.append(h("p", { class: "placeholder" }, S.selectedTool ? "Loading Tool details…" : S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
     } else {
       renderToolDetail(box, d);
     }
@@ -3128,9 +3222,13 @@
     else note("Saved " + key + " (in effect now).");
     refreshSettings();
   }
+  let auditSeq = 0;
   async function loadAudit(older) {
+    const seq = ++auditSeq;
+    const filter = S.auditFilter || null;
     const before = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1].created_at : null;
-    const page = (await request({ type: "list_audit", filter: S.auditFilter || null, limit: 50, before }).catch(() => null)) || [];
+    const page = (await request({ type: "list_audit", filter, limit: 50, before }).catch(() => null)) || [];
+    if (seq !== auditSeq || filter !== (S.auditFilter || null)) return;
     S.audit = older ? (S.audit || []).concat(page) : page;
     S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
     renderView();
@@ -3504,7 +3602,7 @@
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
-    if (!S.auditPages || S.auditPages === 1) S.audit = (await request({ type: "list_audit", filter: S.auditFilter || null, limit: 50 }).catch(() => null)) || [];
+    if (!S.auditPages || S.auditPages === 1) await loadAudit(false);
     try {
       S.settings = await request({ type: "get_settings" });
     } catch (e) {
@@ -3534,19 +3632,96 @@
       selectTool(t.id, true);
     }
   }
+  let toolSeq = 0;
   async function selectTool(id, quiet) {
+    const seq = ++toolSeq;
     S.selectedTool = id;
+    renderView();
     if (!quiet && S.editingCode && S.editingCode.toolId !== id) S.editingCode = null;
     const d = await act({ type: "get_tool", id });
+    if (seq !== toolSeq || S.selectedTool !== id) return;
     if (d) S.toolDetail = d;
     renderView();
   }
 
+  function addApproval(ev) {
+    const kind = ev.type === "promotion_approval_requested" ? "promotion" : "tool";
+    const id = kind === "promotion" ? ev.promotion_id : ev.approval_id;
+    const existing = S.approvals.find((a) => a.kind === kind && a.id === id);
+    if (existing) { if (ev.summary) existing.summary = ev.summary; return; }
+    S.approvals.push({ kind, id, tool_id: ev.tool_id || null, tool_name: ev.tool_name,
+      version: ev.version, reason: ev.reason, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb,
+      detail: ev.detail || null, summary: ev.summary, already: ev.already_allowed || [],
+      code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
+      pathOptions: ev.path_options || [], picks: {} });
+  }
+  function clearQuestions() {
+    const questions = S.questions || [];
+    S.questions = [];
+    S.pendingQuestion = null;
+    S.questionId = null;
+    for (const q of questions) cancelAsk("question:" + q.id);
+  }
+  function clearLiveState() {
+    ++sessionSeq; // invalidate a snapshot requested on the old connection
+    S.sessionSnapshot = null;
+    S.approvals = [];
+    clearQuestions();
+    S.running.clear();
+    S.activity = null;
+    S.streaming = "";
+    S.thinking = "";
+    S.liveTools = [];
+    renderApproval();
+  }
+  function applySessionLiveState(id, result, liveEvents) {
+    if (typeof result.running !== "boolean" || !Array.isArray(result.pending_events)) return;
+    if (result.running) S.running.add(id); else S.running.delete(id);
+    // Reduce authoritative global attention plus racing events as data. Replaying
+    // onEvent would notify twice and erase already-received streaming text.
+    const pending = new Map();
+    for (const ev of result.pending_events.concat(liveEvents)) {
+      switch (ev.type) {
+        case "approval_requested": pending.set("tool:" + ev.approval_id, ev); break;
+        case "user_question": pending.set("question:" + ev.question_id, ev); break;
+        case "promotion_approval_requested": pending.set("promotion:" + ev.promotion_id, ev); break;
+        case "approval_answered": pending.delete("tool:" + ev.approval_id); break;
+        case "user_question_closed": pending.delete("question:" + ev.question_id); break;
+        case "promotion_approval_resolved": pending.delete("promotion:" + ev.promotion_id); break;
+        case "approval_summary": {
+          const req = pending.get("tool:" + ev.approval_id);
+          if (req) pending.set("tool:" + ev.approval_id, { ...req, summary: ev.summary });
+          break;
+        }
+        case "run_started": S.running.add(ev.session_id); break;
+        case "run_finished": case "run_paused": S.running.delete(ev.session_id); break;
+      }
+    }
+    S.approvals = S.approvals.filter((a) => pending.has(a.kind + ":" + a.id));
+    const questions = S.questions || [];
+    S.questions = questions.filter((q) => pending.has("question:" + q.id));
+    S.pendingQuestion = S.questions[0] || null;
+    S.questionId = S.pendingQuestion && S.pendingQuestion.id;
+    for (const q of questions) if (!pending.has("question:" + q.id)) cancelAsk("question:" + q.id);
+    for (const ev of pending.values()) {
+      if (ev.type === "user_question") queueQuestion(ev);
+      else addApproval(ev);
+    }
+    showQuestion();
+    renderApproval();
+    renderComposer();
+    renderStatus();
+  }
   /** Open a session; `stay` keeps the current view (initial load). */
+  let sessionSeq = 0;
   async function openSession(id, stay) {
+    const seq = ++sessionSeq;
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    const snapshot = S.sessionSnapshot = { events: [] };
+    S.messages = [];
+    renderHistory();
     S.runTools = null;
     renderRunTools();
     request({ type: "context_usage", session_id: id }).then((r) => {
@@ -3560,6 +3735,7 @@
     }).catch(() => {});
     rendered.clear(); // a reload may carry edited messages
     renderChips();
+    if (attachmentDrafts[id]) { $("input").value = attachmentDrafts[id]; delete attachmentDrafts[id]; autosize(); }
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
     S.others = [];
@@ -3581,9 +3757,16 @@
     S.recap = null;
     S.follow = true;
     const r = await act({ type: "get_session", id });
-    if (r && S.current === id) {
-      S.messages = r.messages || [];
-      S.unfinished = r.unfinished_run || null;
+    if (seq !== sessionSeq || S.current !== id) return;
+    S.sessionSnapshot = null;
+    if (r) {
+      applySessionLiveState(id, r, snapshot.events);
+      const live = S.messages;
+      const ids = new Set((r.messages || []).map((m) => m.id));
+      S.messages = (r.messages || []).concat(live.filter((m) => !ids.has(m.id)));
+      if (!snapshot.events.some((ev) => ev.session_id === id && ["run_started", "run_finished", "run_paused"].includes(ev.type))) {
+        S.unfinished = r.unfinished_run || null;
+      }
       renderRunBanner();
       S.queued = r.queued_items || [];
       renderQueue();
@@ -4184,6 +4367,7 @@
     return c.run(rest.join(" "));
   }
 
+  const attachmentDrafts = {};
   async function submit(queued) {
     const input = $("input");
     const text = input.value.trim();
@@ -4195,6 +4379,8 @@
     }
     if (!S.current) await newSession();
     if (!S.current) return;
+    const sid = S.current;
+    const mode = queued ? "queue" : isRunning() ? "steer" : "send";
     input.value = "";
     autosize();
     S.follow = true;
@@ -4202,16 +4388,15 @@
       const id = S.editMessageId;
       S.editMessageId = null;
       renderComposer();
-      await act({ type: "edit_message", session_id: S.current, message_id: id, content: text });
+      await act({ type: "edit_message", session_id: sid, message_id: id, content: text });
       return;
     }
     askNotifyPermission();
-    const mode = queued ? "queue" : isRunning() ? "steer" : "send";
     // `@path` mentions are attached first (the daemon resolves them in its
     // working directory); words that aren't files are left as text.
     closeMentions();
     const toolNames = new Set((S.tools || []).map((t) => t.name));
-    const already = mentionAttached[S.current] || new Set();
+    const already = mentionAttached[sid] || new Set();
     // A typed or pasted @path is never sent unseen (#863): it becomes a
     // chip first, and this Send stops so the chips can be checked.
     const fresh = [];
@@ -4219,41 +4404,42 @@
       // Tools are named for the agent; chosen files are attached already.
       if (toolNames.has(path) || already.has(path)) continue;
       try {
-        const a = await request({ type: "attach_path", session_id: S.current, path });
-        (mentionAttached[S.current] = mentionAttached[S.current] || new Set()).add(path);
-        (S.chips[S.current] = S.chips[S.current] || []).push(a);
+        const a = await request({ type: "attach_path", session_id: sid, path });
+        (mentionAttached[sid] = mentionAttached[sid] || new Set()).add(path);
+        (S.chips[sid] = S.chips[sid] || []).push(a);
         fresh.push(a.name);
       } catch (e) {
         if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
       }
     }
     if (fresh.length) {
-      input.value = text;
-      autosize();
-      renderChips();
+      if (S.current === sid) { input.value = text; autosize(); renderChips(); }
+      else attachmentDrafts[sid] = text;
       note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
       return;
     }
     // One key per user action (#891): pressing Send again after a reply
     // was lost reuses it, so the daemon doesn't send the message twice.
-    const same = S.unsent && S.unsent.session === S.current && S.unsent.text === text;
+    const same = S.unsent && S.unsent.session === sid && S.unsent.text === text;
     const key = same ? S.unsent.key
       : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
-    S.unsent = { session: S.current, text, key };
-    const r = await act({ type: "send_message", session_id: S.current, content: text, mode, client_msg_id: key });
-    if (r) S.unsent = null;
+    S.unsent = { session: sid, text, key };
+    const r = await act({ type: "send_message", session_id: sid, content: text, mode, client_msg_id: key });
+    if (r && S.unsent && S.unsent.key === key) S.unsent = null;
     // The attachments went with it.
-    if (r) { delete S.chips[S.current]; delete mentionAttached[S.current]; renderChips(); }
+    if (r) { delete S.chips[sid]; delete mentionAttached[sid]; renderChips(); }
     if (r && mode === "steer") note("steering the current run");
   }
   function stop() {
     if (S.current && isRunning()) act({ type: "interrupt_run", session_id: S.current });
   }
+  let searchSeq = 0;
   async function search(q) {
+    const seq = ++searchSeq;
     q = q.trim();
     if (!q) { renderSearch(null); return; }
     const hits = await act({ type: "search_sessions", query: q, limit: 50 });
-    if (hits) renderSearch(hits, q);
+    if (seq === searchSeq && hits) renderSearch(hits, q);
   }
 
   function autosize() {
@@ -4319,6 +4505,9 @@
   }
 
   function onEvent(ev) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
+      S.sessionSnapshot.events.push(ev);
+    }
     notifyFor(ev);
     const here = ev.session_id === S.current;
     switch (ev.type) {
@@ -4433,16 +4622,10 @@
           setActivity(isRunning() ? "waiting for model" : null);
         }
         break;
-      case "user_question": {
+      case "user_question":
         if (here) setActivity("awaiting your answer");
-        S.questionId = ev.question_id;
-        // An older daemon sends only the single-question form.
-        const qs = ev.questions && ev.questions.length ? ev.questions
-          : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
-        S.pendingQuestion = { id: ev.question_id, qs };
-        showQuestion();
+        queueQuestion(ev);
         break;
-      }
       case "run_usage":
         (S.usage = S.usage || {})[ev.session_id] = ev.usage;
         if (ev.usage.context_tokens > 0) (S.contextFill = S.contextFill || {})[ev.session_id] = { used: ev.usage.context_used, size: ev.usage.context_tokens };
@@ -4467,7 +4650,7 @@
       }
       case "user_question_closed":
         // Answered elsewhere (or the Run stopped): close our prompt.
-        if (S.questionId === ev.question_id) { S.questionId = null; S.pendingQuestion = null; if (S.questionOpen) closeAsk(null); renderStatus(); }
+        removeQuestion(ev.question_id);
         break;
       case "approval_summary": {
         const req = S.approvals.find((a) => a.id === ev.approval_id);
@@ -4475,15 +4658,18 @@
         break;
       }
       case "approval_requested":
-        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_id: ev.tool_id || null, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
-          already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
-          pathOptions: ev.path_options || [], picks: {} });
+        addApproval(ev);
         if (here) setActivity("awaiting your approval");
         renderApproval();
         break;
       case "promotion_approval_requested":
-        S.approvals.push({ kind: "promotion", id: ev.promotion_id, tool_name: ev.tool_name, reason: ev.reason, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb });
+        addApproval(ev);
         renderApproval();
+        break;
+      case "promotion_approval_resolved":
+        S.approvals = S.approvals.filter((a) => a.kind !== "promotion" || a.id !== ev.promotion_id);
+        renderApproval();
+        renderStatus();
         break;
       case "session_updated": {
         const i = S.sessions.findIndex((s) => s.id === ev.session.id);
@@ -4510,7 +4696,7 @@
         if (i >= 0) S.tools[i] = ev.tool; else S.tools.push(ev.tool);
         if (ev.tool.id === S.selectedTool || ev.tool.id === S.metricTool) {
           clearTimeout(toolRefresh);
-          toolRefresh = setTimeout(() => selectTool(ev.tool.id, true), 300);
+          toolRefresh = setTimeout(() => { if (S.selectedTool === ev.tool.id) selectTool(ev.tool.id, true); }, 300);
         }
         renderView();
         break;
@@ -4702,7 +4888,14 @@
         const was = S.daemonOnline;
         S.daemonOnline = online;
         if (online && !was) startHandshake();
-        if (!online && was) { S.channel = null; clearTimeout(S.handshakeTimer); note("daemon went offline", true); }
+        if (!online && was) {
+          S.channel = null;
+          clearTimeout(S.handshakeTimer);
+          clearLiveState();
+          for (const p of S.pending.values()) p.reject(new Error("daemon went offline"));
+          S.pending.clear();
+          note("daemon went offline", true);
+        }
         renderChrome();
         renderHistory();
         return;
@@ -4755,8 +4948,7 @@
       }
       S.daemonOnline = false;
       S.channel = null;
-      S.running.clear();
-      S.activity = null;
+      clearLiveState();
       for (const p of S.pending.values()) p.reject(new Error("relay connection closed"));
       S.pending.clear();
       if (!$("app").classList.contains("hidden")) renderAll();
@@ -4820,7 +5012,7 @@
       const wasOpen = S.channel != null;
       S.daemonOnline = false;
       S.channel = null;
-      S.running.clear();
+      clearLiveState();
       for (const p of S.pending.values()) p.reject(new Error("local daemon connection closed"));
       S.pending.clear();
       if (S.userClosed) return;
@@ -4893,8 +5085,8 @@
   $("export-session").onclick = () => pickExport(S.current);
   $("show-thinking").onchange = (e) => setThinking(e.target.checked);
   $("search-form").addEventListener("submit", (e) => { e.preventDefault(); search($("search").value); });
-  $("search").addEventListener("search", () => { if (!$("search").value) renderSearch(null); });
-  $("search").addEventListener("input", () => { if (!$("search").value) renderSearch(null); });
+  $("search").addEventListener("search", () => { if (!$("search").value) search(""); });
+  $("search").addEventListener("input", () => { if (!$("search").value) search(""); });
   $("import-tool").onclick = async () => {
     const bundle = await pickJson();
     if (bundle && (await act({ type: "import_tool", bundle }, "Imported — the Tool needs first-run approval"))) refreshTools();
@@ -4963,12 +5155,13 @@
     }
   }
   async function attachFiles(files) {
-    if (!S.current) { note("Open a session first", true); return; }
+    const sid = S.current;
+    if (!sid) { note("Open a session first", true); return; }
     for (const file of files) {
-      const r = await uploadFile(S.current, file);
+      const r = await uploadFile(sid, file);
       if (r) {
-        (S.chips[S.current] = S.chips[S.current] || []).push(r);
-        renderChips();
+        (S.chips[sid] = S.chips[sid] || []).push(r);
+        if (S.current === sid) renderChips();
       }
     }
   }
@@ -5112,6 +5305,12 @@
   // fragment: sign in with it instead of ignoring it.
   window.addEventListener("hashchange", () => {
     const frag = hashParams();
+    if (frag.malformed) {
+      history.replaceState(null, "", location.pathname);
+      $("pair-error").textContent = "That link does not look right. Copy the pairing or Session link again.";
+      showPair();
+      return;
+    }
     // A Session link pasted into an open, connected tab: just open it.
     // The fragment never stays in the address bar (#908). A Session link
     // with a key opens here only when that key is this tab's room.
@@ -5150,6 +5349,12 @@
 
   (function init() {
     const frag = hashParams();
+    if (frag.malformed) {
+      history.replaceState(null, "", location.pathname);
+      $("pair-error").textContent = "That link does not look right. Copy the pairing or Session link again.";
+      showPair();
+      return;
+    }
     // A Session link (#s=…) opens that Session once connected.
     S.linkedSession = frag.s || null;
     if (document.querySelector('meta[name="formless-local"]')) {

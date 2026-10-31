@@ -3102,7 +3102,7 @@ async fn a_panicking_run_frees_its_session() {
         .route("/chat/completions", post(|| async { sse_text("fine") }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     write_cfg(&paths, &base, 30, false, 128_000);
     let server = start_daemon(&paths).await;
     let mut c = Client::connect(&paths).await;
@@ -3149,5 +3149,80 @@ async fn a_panicking_run_frees_its_session() {
     })
     .await;
     assert_eq!(c.run_to_finish().await, "fine", "the Session works again");
-    server.abort();
+
+    c.send(Request::CompareModels {
+        session_id: id.clone(),
+        models: vec!["alpha".into(), "beta".into()],
+        prompt: Some("compare panic-now-7c1".into()),
+    })
+    .await;
+    let results = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let line = c.lines.next_line().await.unwrap().expect("daemon closed");
+            if let Ok(ServerMessage::Event(Event::ComparisonReady {
+                session_id,
+                results,
+                ..
+            })) = serde_json::from_str::<ServerMessage>(&line)
+            {
+                assert_eq!(session_id, id);
+                break results;
+            }
+        }
+    })
+    .await
+    .expect("panicking comparison never resolved");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.status == "paused"), "{results:?}");
+
+    let job = c
+        .rpc(Request::AddJob {
+            prompt: "job panic-now-7c1".into(),
+            session_id: None,
+            cron: Some("0 0 1 1 *".into()),
+            at: None,
+            overlap: None,
+            deliver: None,
+        })
+        .await;
+    let job_id = job["id"].as_str().unwrap().to_string();
+    let fired = c.rpc(Request::RunJobNow { id: job_id.clone() }).await;
+    assert!(
+        fired["status"].as_str().unwrap().starts_with("started"),
+        "{fired}"
+    );
+    let history = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows = c
+                .rpc(Request::JobRuns {
+                    id: job_id.clone(),
+                    limit: Some(10),
+                })
+                .await;
+            if rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["status"] != "running")
+            {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("panicking job never resolved");
+    assert_eq!(history[0]["status"], "paused", "{history}");
+    assert!(history[0]["finished_at"].is_string(), "{history}");
+    tokio::time::timeout(std::time::Duration::from_secs(10), c.rpc(Request::Shutdown))
+        .await
+        .expect("panicking Run fixture did not acknowledge shutdown");
+    drop(c);
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("panicking Run fixture did not stop")
+        .unwrap()
+        .unwrap();
+    provider.abort();
+    let _ = provider.await;
 }
