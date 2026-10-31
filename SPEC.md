@@ -1179,9 +1179,14 @@ pattern (§4.4).
   exactly the paths/hosts it was called with, never a project directory
   baked in at creation.
 - **Private addresses (#603).** Every `fetch` hop resolves the host once
-  and refuses loopback, private, link-local, CGNAT, unique-local,
+  and refuses loopback, private, link-local, deprecated site-local, CGNAT,
+  unique-local,
   multicast, unspecified, reserved (`240/4`), benchmarking, documentation,
-  Teredo and discard addresses; IPv6 forms that carry an IPv4 address
+  Teredo and discard addresses. The registry-entry test table
+  [`special_purpose_registry_addresses_are_not_public`](crates/formless-runtime/src/lib.rs)
+  covers the blocked special-purpose families,
+  including IPv6 `fec0::/10`, `2001:2::/48` and `3fff::/20`.
+  IPv6 forms that carry an IPv4 address
   (mapped, compatible, NAT64 `64:ff9b::/96`, 6to4) are judged by that
   address. The exception is a grant that names that host or IP exactly
   (and its port, if the grant has one): `net:localhost` /
@@ -2208,6 +2213,15 @@ such as `read_file`, `read_text_file` and `file_read`.
    `invocations(tool_id) WHERE status='running'`, `artifacts(session_id)`
    and `audit(created_at)`.
 
+Schema upgrades snapshot the database before any step, then commit each step
+and its version bump together. A failure leaves the last completed version
+and preserves existing rows. A small atomic receipt binds the failed database's
+SHA-256 fingerprint to its original pre-upgrade snapshot and that snapshot's
+SHA-256. An unchanged retry reuses this verified recovery point; a changed
+source or missing/damaged snapshot gets a fresh copy. Names include fractional
+UTC seconds and a unique suffix. A failed checkpoint or receipt write disables
+reuse rather than sacrificing a backup or hiding the migration error.
+
 ### 9.5 Crash recovery
 
 - The daemon never idle-closes mid-Run (§9.1) but can crash/be killed. On
@@ -2247,7 +2261,8 @@ such as `read_file`, `read_text_file` and `file_read`.
   `/gc run`, web Clean up… which shows the dry run before "Free"):
   artifacts past their retention, `/rewind` snapshots older than 30
   days, MCP logs cut to their last 1 MB, all but the two newest
-  pre-migration copies, and the database's free pages (VACUUM). Each row
+  pre-migration copies by their recorded timestamp (not schema version),
+  and the database's free pages (VACUUM). Each row
   says how many items and bytes; a real run is audit-logged.
 - **Backups.** The daemon copies the database (`VACUUM INTO`, consistent
   under WAL) to `<data>/backups/formless-<UTC time>.db` when the newest is
@@ -2256,7 +2271,13 @@ such as `read_file`, `read_text_file` and `file_read`.
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
   the current database as `backups/before-restore-<time>.db`, copies it
-  in and migrates it. `formless doctor` shows the last backup's age.
+  in and migrates it. Backup and pre-restore filenames include fixed-width
+  fractional UTC seconds and a unique suffix, preserving distinct restore
+  points even within the same second; existing backup destinations are
+  never replaced. If post-restore migration fails, the error identifies the
+  safety copy; the copied database remains at its last completed schema
+  version, and the safety copy can be restored even from this state.
+  `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no
   filesystem path, because transcripts also reach remote web clients.
@@ -2573,7 +2594,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   search snippets and web search highlights match on folded text that
   keeps each character's original position: case folding never shifts a
   highlight (`İstanbul`), and NFC and NFD spellings match each other
-  (macOS file names are NFD). In the web client each message paragraph
+  (macOS file names are NFD). Fuzzy match positions count original
+  Unicode characters, including when a match follows `İ`, rather than
+  indices into a lowercased copy. In the web client each message paragraph
   takes its direction from its own text, so Arabic and Hebrew answers are
   right-aligned beside left-aligned English, and Session names are
   isolated from the time beside them. Approval prompts in both clients
@@ -2854,7 +2877,7 @@ run_tool = "network_policy"     # a registry Tool, or…
     real run, but nothing is recorded as an Invocation.
   - **Result:** `{ok, result?, error?, effects, logs}`, where `effects`
     are the would-be effects in order ("write 12 bytes to /tmp/x", "run
-    touch /tmp/y", "send POST https://…"). They are kept even when the
+    touch /tmp/y", "send POST https://example.com/endpoint"). They are kept even when the
     run fails.
   - **Where:** `formless tools run NAME --dry-run`, Ctrl+D in the TUI run
     editor, and the "Dry run" box in the web's Try it form.
@@ -4081,5 +4104,11 @@ latency smoke checks enforce a generous 100 ms per-operation ceiling.
 - No test may require a real provider key; all provider behaviour is mocked
   or pointed at a local compatible endpoint.
 
-
-
+Credential-sensitive tests share a per-binary environment guard. It holds a
+lock for the full test body (including awaited work), saves and clears inherited
+`FORMLESS_API_KEY*` and OAuth credential overrides, and restores them on exit or
+panic. Helpers borrow the caller's guard rather than reacquiring it; key-absence
+and fallback tests use the same lock as setters. Tests pin hostile inherited
+credentials, named-provider/file overrides, unwind restoration and contrasting
+parallel mock keys. A source check rejects bare environment mutation outside the
+shared helper.

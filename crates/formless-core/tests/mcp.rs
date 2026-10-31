@@ -2,6 +2,9 @@
 //! server: run with FL_FAKE_MCP=1, `fake_mcp_server` speaks JSON-RPC on
 //! stdin/stdout instead of testing anything.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::config::{McpCfg, McpServerCfg};
 use formless_core::mcp::{call_result, registry_name, split_name, sync_registry, Manager};
 use formless_core::{Paths, Store};
@@ -11,6 +14,7 @@ use std::io::{BufRead, Write};
 #[test]
 #[ignore = "subprocess fixture, invoked explicitly by MCP integration tests"]
 fn fake_mcp_server() {
+    let _env = credential_env::EnvGuard::isolated();
     assert!(
         std::env::var("FL_FAKE_MCP").is_ok(),
         "fixture requires FL_FAKE_MCP"
@@ -159,6 +163,7 @@ pub fn fake_server(paths: &Paths) -> (McpCfg, std::path::PathBuf) {
 
 #[test]
 fn registry_names_round_trip_and_are_function_safe() {
+    let _env = credential_env::EnvGuard::isolated();
     let n = registry_name("my server", "do.thing");
     assert_eq!(n, "mcp__my_server__do_thing");
     assert_eq!(split_name(&n), Some(("my_server", "do_thing")));
@@ -180,7 +185,8 @@ fn registry_names_round_trip_and_are_function_safe() {
 
 #[tokio::test]
 async fn stdio_servers_list_call_cancel_restart_and_stay_isolated() {
-    std::env::set_var("FL_DAEMON_SECRET", "leak");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FL_DAEMON_SECRET", "leak");
     let paths = temp_paths("mcpstdio");
     let (cfg, log) = fake_server(&paths);
     let mcp = Manager::default();
@@ -287,6 +293,7 @@ async fn stdio_servers_list_call_cancel_restart_and_stay_isolated() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_registers_and_runs_mcp_tools() {
+    let _env = credential_env::EnvGuard::isolated();
     use std::sync::Arc;
     let paths = temp_paths("mcpdaemon");
     let (mcp, _) = fake_server(&paths);
@@ -374,6 +381,7 @@ fn answer(id: &Value, method: &str, params: &Value) -> Value {
 /// headers sent, transient 503s retried.
 #[tokio::test]
 async fn streamable_http_servers_work() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{http::HeaderMap, response::IntoResponse, routing::post, Json, Router};
     let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let app = Router::new().route(
@@ -441,6 +449,7 @@ async fn streamable_http_servers_work() {
 /// `endpoint` event; messages are POSTed to the announced endpoint.
 #[tokio::test]
 async fn legacy_sse_servers_work() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         extract::State,
         response::IntoResponse,
@@ -515,6 +524,7 @@ async fn legacy_sse_servers_work() {
 /// resource indicator, an authorized call, and refresh on expiry.
 #[tokio::test(flavor = "multi_thread")]
 async fn oauth_protected_servers_log_in_and_refresh() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         extract::{Query, State},
         http::{HeaderMap, StatusCode},
@@ -687,6 +697,7 @@ async fn oauth_protected_servers_log_in_and_refresh() {
 /// state, restart re-lists, remove retires the tools and edits config.
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_servers_are_managed_through_the_daemon() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_protocol::Request;
     use std::sync::Arc;
     let paths = temp_paths("mcpmanage");
@@ -806,6 +817,7 @@ async fn mcp_servers_are_managed_through_the_daemon() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn trusted_read_only_mcp_tools_skip_per_tool_approval() {
+    let _env = credential_env::EnvGuard::isolated();
     use std::sync::Arc;
     let paths = temp_paths("mcptrust");
     let (mut mcp, _) = fake_server(&paths);
@@ -843,6 +855,7 @@ async fn trusted_read_only_mcp_tools_skip_per_tool_approval() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_resources_and_prompts() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_protocol::Request;
     use std::sync::Arc;
     let paths = temp_paths("mcpres");
@@ -942,6 +955,7 @@ async fn mcp_resources_and_prompts() {
 /// point (compaction), so its cached prefix survives.
 #[test]
 fn dropped_mcp_tools_leave_session_listings_alone_until_compaction() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::mcp::McpTool;
     use formless_core::tools::tool_definitions;
     let store = Store::open_in_memory().unwrap();
@@ -1000,6 +1014,7 @@ fn dropped_mcp_tools_leave_session_listings_alone_until_compaction() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_calls_are_measured_with_error_classes() {
+    let _env = credential_env::EnvGuard::isolated();
     use std::sync::Arc;
     let paths = temp_paths("mcpmetrics");
     let (mcp, _) = fake_server(&paths);

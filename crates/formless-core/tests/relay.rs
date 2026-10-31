@@ -2,6 +2,9 @@
 //! root key, each browser connection derives a fresh session key, frames
 //! cannot be replayed or reflected, and the room is a one-way hash.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::config::{generate_relay_secret, RelayCfg};
 use formless_core::relay::{
     browser_url, confirm_frame, confirm_tag, hello_frame, key_from_secret, new_hello, parse_hello,
@@ -18,6 +21,7 @@ fn pair(key: &[u8; 32]) -> (Channel, Channel) {
 
 #[test]
 fn relay_crypto_round_trips_and_room_is_one_way() {
+    let _env = credential_env::EnvGuard::isolated();
     let secret = generate_relay_secret();
     let key = key_from_secret(&secret).unwrap();
     let (mut browser, mut daemon) = pair(&key);
@@ -46,6 +50,7 @@ fn relay_crypto_round_trips_and_room_is_one_way() {
 
 #[test]
 fn relay_frames_cannot_be_replayed_or_reflected() {
+    let _env = credential_env::EnvGuard::isolated();
     let key = key_from_secret(&generate_relay_secret()).unwrap();
     let (mut browser, mut daemon) = pair(&key);
     let approve = browser.seal("approve").unwrap();
@@ -90,6 +95,7 @@ fn relay_frames_cannot_be_replayed_or_reflected() {
 
 #[test]
 fn relay_urls_use_room_and_fragment_secret() {
+    let _env = credential_env::EnvGuard::isolated();
     let secret = generate_relay_secret();
     let key = key_from_secret(&secret).unwrap();
     let ws = relay_ws_url("wss://formless.athiwat.xyz/", &secret).unwrap();
@@ -113,6 +119,7 @@ fn relay_urls_use_room_and_fragment_secret() {
 
 #[test]
 fn web_settings_summary_mirrors_tui_and_omits_secrets() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = std::env::temp_dir().join(format!(
         "fl-settings-{}",
         std::time::SystemTime::now()
@@ -160,6 +167,7 @@ fn temp_paths(tag: &str) -> formless_core::Paths {
 /// routed back by client id, and only attached browsers are subscribers.
 #[tokio::test]
 async fn relay_gives_each_browser_its_own_connection() {
+    let _env = credential_env::EnvGuard::isolated();
     use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;
@@ -278,6 +286,7 @@ async fn relay_gives_each_browser_its_own_connection() {
 /// while events are being broadcast, and is not kept alive as a subscriber.
 #[tokio::test]
 async fn relay_link_is_silent_without_browsers() {
+    let _env = credential_env::EnvGuard::isolated();
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::time::Duration;
@@ -320,6 +329,7 @@ async fn relay_link_is_silent_without_browsers() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn waiting_questions_ask_the_relay_for_a_push() {
+    let _env = credential_env::EnvGuard::isolated();
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::time::Duration;
@@ -393,6 +403,7 @@ async fn waiting_questions_ask_the_relay_for_a_push() {
 /// disconnected one by one (SPEC §12).
 #[tokio::test]
 async fn relay_browsers_are_listed_and_can_be_disconnected() {
+    let _env = credential_env::EnvGuard::isolated();
     use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;
@@ -499,6 +510,7 @@ async fn relay_browsers_are_listed_and_can_be_disconnected() {
 /// its cap; only a link that lasted resets it; waits are jittered (#906).
 #[test]
 fn relay_backoff_resets_only_after_a_stable_link_and_is_jittered() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::relay::{jittered, next_backoff};
     use std::time::Duration;
     let mut ceiling = 1_000;
@@ -517,12 +529,13 @@ fn relay_backoff_resets_only_after_a_stable_link_and_is_jittered() {
 /// Plain ws:// to another machine, or no scheme at all, is refused (#907).
 #[test]
 fn relay_url_must_be_wss_or_loopback() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::config::RelayCfg;
     let cfg = |url: &str| RelayCfg {
         enabled: true,
         url: url.into(),
     };
-    std::env::remove_var("FORMLESS_RELAY_ALLOW_INSECURE");
+    _env.remove("FORMLESS_RELAY_ALLOW_INSECURE");
     assert!(cfg("wss://formless.athiwat.xyz").check().is_ok());
     assert!(cfg("ws://127.0.0.1:8787").check().is_ok());
     assert!(cfg("ws://localhost:8787").check().is_ok());
@@ -537,6 +550,7 @@ fn relay_url_must_be_wss_or_loopback() {
 /// a source check, since nothing observable shows a zeroed buffer.
 #[test]
 fn relay_key_material_is_zeroized() {
+    let _env = credential_env::EnvGuard::isolated();
     let src = include_str!("../src/relay.rs");
     assert!(
         src.contains("-> Result<Zeroizing<[u8; 32]>>"),
@@ -561,6 +575,7 @@ fn relay_key_material_is_zeroized() {
 /// hello never replaces a live channel (#904).
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_handshake_is_confirmed_and_idempotent() {
+    let _env = credential_env::EnvGuard::isolated();
     use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;
@@ -674,6 +689,7 @@ async fn relay_handshake_is_confirmed_and_idempotent() {
 /// (#909).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_largest_attachment_crosses_the_relay_in_pieces() {
+    let _env = credential_env::EnvGuard::isolated();
     use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;

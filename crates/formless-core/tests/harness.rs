@@ -2,6 +2,9 @@
 //! own harness, every change approved with a diff, logged and undoable.
 #![cfg(unix)]
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::{Config, Paths, Store};
 use formless_protocol::{
     ApprovalScope, Event, Request, RequestEnvelope, ServerMessage, PROTOCOL_VERSION,
@@ -12,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[test]
 fn harness_scopes_parse_and_only_read_is_free() {
+    let _env = credential_env::EnvGuard::isolated();
     let read = Capabilities::parse(&["harness:read".into()]).unwrap();
     assert!(!read.is_sensitive());
     let roles = Capabilities::parse(&["harness:roles".into()]).unwrap();
@@ -63,7 +67,8 @@ async fn make_tool(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_changes_are_approved_with_a_diff_logged_and_undoable() {
-    std::env::set_var(
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set(
         "FORMLESS_API_KEY_SECRETPROV",
         "sk-very-secret-value-1234567890",
     );
@@ -210,6 +215,7 @@ async fn agent_changes_are_approved_with_a_diff_logged_and_undoable() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_self_escalation_and_no_keys() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp("harn2");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();

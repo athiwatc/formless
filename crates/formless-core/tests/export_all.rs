@@ -1,6 +1,9 @@
 //! `formless export-all` / `import-all` (SPEC §15): everything for a new
 //! machine in one bundle, without secrets.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::{Config, Paths, Store};
 use formless_protocol::Request;
 use formless_runtime::Capabilities;
@@ -15,6 +18,7 @@ fn temp_paths(tag: &str) -> Paths {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn everything_moves_to_a_new_machine_without_secrets() {
+    let _env = credential_env::EnvGuard::isolated();
     let from = temp_paths("expall");
     let mut cfg = Config::default();
     cfg.naming.enabled = false;
@@ -157,6 +161,7 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
 /// still deleted, and an unreadable config is reported (#1080).
 #[test]
 fn orphaned_named_secrets_are_deleted_and_bad_configs_reported() {
+    let _env = credential_env::EnvGuard::isolated();
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-secrets-{short}"));
     let paths = formless_core::Paths {
@@ -188,19 +193,20 @@ fn orphaned_named_secrets_are_deleted_and_bad_configs_reported() {
 /// named providers read theirs too (#1083).
 #[test]
 fn key_files_are_trimmed_named_and_work_for_named_providers() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::config::key_from_file_env;
     let dir = std::env::temp_dir().join(format!("fl-keyfile-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let good = dir.join("key");
     std::fs::write(&good, "\u{feff}  sk-file-key \n").unwrap();
-    std::env::set_var("FORMLESS_TEST_KEYFILE_GOOD", &good);
+    _env.set("FORMLESS_TEST_KEYFILE_GOOD", &good);
     assert_eq!(
         key_from_file_env("FORMLESS_TEST_KEYFILE_GOOD"),
         Some(Ok("sk-file-key".into()))
     );
     let empty = dir.join("empty");
     std::fs::write(&empty, " \n").unwrap();
-    std::env::set_var("FORMLESS_TEST_KEYFILE_EMPTY", &empty);
+    _env.set("FORMLESS_TEST_KEYFILE_EMPTY", &empty);
     let e = key_from_file_env("FORMLESS_TEST_KEYFILE_EMPTY")
         .unwrap()
         .unwrap_err();
@@ -208,7 +214,7 @@ fn key_files_are_trimmed_named_and_work_for_named_providers() {
         e.contains("FORMLESS_TEST_KEYFILE_EMPTY") && e.contains("empty"),
         "{e}"
     );
-    std::env::set_var("FORMLESS_TEST_KEYFILE_MISSING", dir.join("nope"));
+    _env.set("FORMLESS_TEST_KEYFILE_MISSING", dir.join("nope"));
     let e = key_from_file_env("FORMLESS_TEST_KEYFILE_MISSING")
         .unwrap()
         .unwrap_err();
@@ -220,7 +226,7 @@ fn key_files_are_trimmed_named_and_work_for_named_providers() {
         config_dir: dir.join("c"),
         profile: "keyfile".into(),
     };
-    std::env::set_var("FORMLESS_API_KEY_FILETESTPROV_FILE", &good);
+    _env.set("FORMLESS_API_KEY_FILETESTPROV_FILE", &good);
     assert_eq!(
         formless_core::config::provider_key(&paths, "filetestprov").as_deref(),
         Some("sk-file-key")

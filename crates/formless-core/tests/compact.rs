@@ -1,5 +1,8 @@
 //! `/compact` on demand (SPEC §11).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::routing::post;
 use formless_core::{Config, Paths, Store};
 use formless_protocol::Request;
@@ -7,7 +10,8 @@ use std::sync::{Arc, Mutex};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compact_session_summarises_everything_with_the_users_focus() {
-    std::env::set_var("FORMLESS_API_KEY", "k");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "k");
     let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
     let app = axum::Router::new().route(
         "/chat/completions",

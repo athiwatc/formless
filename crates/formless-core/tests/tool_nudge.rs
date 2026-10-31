@@ -1,5 +1,8 @@
 //! Pushing models to build Tools instead of refusing (#237, SPEC §5.2).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::routing::post;
 use formless_core::{Config, Paths, Store};
 use formless_protocol::Request;
@@ -43,8 +46,13 @@ async fn mock(answers: Vec<&'static str>) -> (String, Seen) {
     (base, seen)
 }
 
-async fn run_once(model: &str, nudge: bool, answers: Vec<&'static str>) -> (Seen, Store, String) {
-    std::env::set_var("FORMLESS_API_KEY", "k");
+async fn run_once(
+    _env: &credential_env::EnvGuard,
+    model: &str,
+    nudge: bool,
+    answers: Vec<&'static str>,
+) -> (Seen, Store, String) {
+    _env.set("FORMLESS_API_KEY", "k");
     let (base, seen) = mock(answers).await;
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let dir = std::path::PathBuf::from(format!("/tmp/fl-nudge-{short}"));
@@ -101,7 +109,9 @@ fn system(body: &serde_json::Value) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_is_nudged_once_towards_building_a_tool() {
+    let _env = credential_env::EnvGuard::isolated();
     let (seen, store, sid) = run_once(
+        &_env,
         "gpt-4.1",
         true,
         vec![
@@ -126,14 +136,15 @@ async fn a_refusal_is_nudged_once_towards_building_a_tool() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn other_families_and_the_off_switch_are_left_alone() {
-    let (seen, _, _) = run_once("claude-sonnet-4", true, vec!["Here you go."]).await;
+    let _env = credential_env::EnvGuard::isolated();
+    let (seen, _, _) = run_once(&_env, "claude-sonnet-4", true, vec!["Here you go."]).await;
     let bodies = seen.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1);
     let sys = system(&bodies[0]);
     assert!(!sys.contains("Tool use rule:"));
     assert!(sys.contains("never ask the user to do a step a Tool could do"));
 
-    let (seen, _, _) = run_once("gpt-4.1", false, vec!["I can't access files."]).await;
+    let (seen, _, _) = run_once(&_env, "gpt-4.1", false, vec!["I can't access files."]).await;
     let bodies = seen.lock().unwrap().clone();
     assert_eq!(bodies.len(), 1, "no nudge when off");
     assert!(!system(&bodies[0]).contains("Tool use rule:"));
