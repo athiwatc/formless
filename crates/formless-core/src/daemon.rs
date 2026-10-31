@@ -79,6 +79,17 @@ impl RequestFailure {
     }
 }
 
+/// Admission refusals and local accounting errors provide no model-quality
+/// observation. Preserve real provider faults, even if their prose says budget.
+fn is_model_failure(error: &anyhow::Error) -> bool {
+    !error
+        .downcast_ref::<RequestFailure>()
+        .is_some_and(|e| e.code == codes::BUDGET)
+        && error
+            .downcast_ref::<crate::provider::UsageAccountingFailure>()
+            .is_none()
+}
+
 /// Unknown errors remain uncoded rather than guessing from their prose.
 fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
     match e.downcast_ref::<RequestFailure>() {
@@ -1099,7 +1110,7 @@ impl Daemon {
                     // a failed commit, even though cancellation must release locks.
                     admission.accounting_failed();
                 }
-                result.context("commit model usage before releasing budget admission")
+                result.context(crate::provider::UsageAccountingFailure)
             },
         )
     }
@@ -4915,7 +4926,7 @@ impl Daemon {
                     r
                 }
                 Err(e) => {
-                    if !cancel.is_cancelled() {
+                    if !cancel.is_cancelled() && is_model_failure(&e) {
                         self.record_model_outcome(&model, false, started);
                     }
                     return Err(e);

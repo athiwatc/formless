@@ -212,6 +212,11 @@ pub struct Provider {
 
 pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
 pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) -> Result<()> + Send + Sync>;
+/// A local persistence failure is not evidence that the serving model failed.
+#[derive(Debug, thiserror::Error)]
+#[error("commit model usage before releasing budget admission")]
+pub(crate) struct UsageAccountingFailure;
+
 /// Lifetime lease acquired before a model request and dropped after accounting.
 pub type RequestLease = Box<dyn std::any::Any + Send>;
 pub type RequestHook = Arc<
