@@ -1,6 +1,9 @@
 //! M3 acceptance tests (SPEC §18 M3): replay isolation, promotion bar,
 //! widening approval, give-up, rollback.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::storage::Store;
 use formless_core::Paths;
 use formless_runtime::{execute, Capabilities, ExecErrorKind, ExecRequest, HostMode, NoHostOps};
@@ -31,6 +34,7 @@ fn run_mode(
 
 #[test]
 fn replay_mode_touches_no_real_files_network_or_secrets() {
+    let _env = credential_env::EnvGuard::isolated();
     let dir = format!("/tmp/fl-m3-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     std::fs::create_dir_all(&dir).unwrap();
     // Write-then-read works inside the overlay, nothing lands on disk.
@@ -88,6 +92,7 @@ fn replay_mode_touches_no_real_files_network_or_secrets() {
 
 #[test]
 fn trigger_window_and_replay_set_sampling() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = Store::open_in_memory().unwrap();
     let caps = Capabilities::default();
     let (info, _v) = store
@@ -343,6 +348,7 @@ impl Client {
 
 #[cfg(unix)]
 async fn start_daemon_m3(
+    _env: &credential_env::EnvGuard,
     tag: &str,
     tool_name: &str,
 ) -> (
@@ -353,7 +359,7 @@ async fn start_daemon_m3(
 ) {
     use formless_core::daemon::Daemon;
     use formless_core::Config;
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let workdir = format!("/tmp/fl-{tag}w-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     std::fs::create_dir_all(&workdir).unwrap();
     let base = mock_optimiser_server(workdir.clone()).await;
@@ -390,8 +396,9 @@ async fn start_daemon_m3(
 #[cfg(unix)]
 #[tokio::test]
 async fn optimiser_promotes_only_on_replay_win_and_rollback_restores() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_protocol::Request;
-    let (paths, tool_id, workdir, server) = start_daemon_m3("m3p", "halver").await;
+    let (paths, tool_id, workdir, server) = start_daemon_m3(&_env, "m3p", "halver").await;
     let mut client = Client::connect(&paths).await;
     client
         .send(Request::RunOptimiser {
@@ -433,8 +440,9 @@ async fn optimiser_promotes_only_on_replay_win_and_rollback_restores() {
 #[cfg(unix)]
 #[tokio::test]
 async fn widening_candidate_requires_approval_and_deny_blocks() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_protocol::Request;
-    let (paths, tool_id, _workdir, server) = start_daemon_m3("m3w", "widener").await;
+    let (paths, tool_id, _workdir, server) = start_daemon_m3(&_env, "m3w", "widener").await;
     let mut client = Client::connect(&paths).await;
     client
         .send(Request::RunOptimiser {
@@ -459,8 +467,9 @@ async fn widening_candidate_requires_approval_and_deny_blocks() {
 #[cfg(unix)]
 #[tokio::test]
 async fn three_failed_candidates_flag_needs_attention_and_stop() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_protocol::Request;
-    let (paths, tool_id, _workdir, server) = start_daemon_m3("m3h", "hopeless").await;
+    let (paths, tool_id, _workdir, server) = start_daemon_m3(&_env, "m3h", "hopeless").await;
     let mut client = Client::connect(&paths).await;
     for _ in 0..3 {
         client
@@ -489,9 +498,10 @@ async fn three_failed_candidates_flag_needs_attention_and_stop() {
 #[cfg(unix)]
 #[test]
 fn process_children_do_not_inherit_daemon_secrets() {
-    std::env::set_var("FORMLESS_TEST_SECRET", "leak-1");
-    std::env::set_var("FL_M3_OTHER_SECRET", "leak-2");
-    std::env::set_var("FL_M3_GRANTED", "visible");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_TEST_SECRET", "leak-1");
+    _env.set("FL_M3_OTHER_SECRET", "leak-2");
+    _env.set("FL_M3_GRANTED", "visible");
     let out = run_mode(
         "function run(i){ return process.run('printenv', []).stdout; }",
         json!({}),
@@ -548,6 +558,7 @@ fn run_cancelled(
 #[cfg(unix)]
 #[test]
 fn cancel_stops_a_running_process_and_its_children() {
+    let _env = credential_env::EnvGuard::isolated();
     let marker = format!("/tmp/fl-m3-kill-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     // The shell's child would create the marker after 1s if it survived.
     let script = format!("sleep 1 && touch {marker} & sleep 30");
@@ -567,6 +578,7 @@ fn cancel_stops_a_running_process_and_its_children() {
 
 #[test]
 fn cancel_stops_a_fetch_that_never_answers() {
+    let _env = credential_env::EnvGuard::isolated();
     // Accepts connections but never replies.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -585,6 +597,7 @@ fn cancel_stops_a_fetch_that_never_answers() {
 
 #[test]
 fn timers_are_asynchronous_ordered_and_clearable() {
+    let _env = credential_env::EnvGuard::isolated();
     let code = r#"
       async function run(i) {
         const order = [];
@@ -612,6 +625,7 @@ fn timers_are_asynchronous_ordered_and_clearable() {
 
 #[test]
 fn cancel_interrupts_sleep_promptly() {
+    let _env = credential_env::EnvGuard::isolated();
     let (err, took) = run_cancelled(
         "function run(i){ for (;;) sleep(60000); }",
         &[],

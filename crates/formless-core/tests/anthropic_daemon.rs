@@ -2,6 +2,9 @@
 //! results reach the API flagged `is_error`, and a provider repointed to
 //! another preset's endpoint takes that preset's API style.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::routing::post;
 use formless_core::{Config, Paths, Store};
 use formless_protocol::Request;
@@ -30,6 +33,7 @@ fn sse(events: &[Value]) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_tool_results_are_sent_with_is_error() {
+    let _env = credential_env::EnvGuard::isolated();
     let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
     let app = axum::Router::new().route(
         "/messages",
@@ -76,7 +80,7 @@ async fn failed_tool_results_are_sent_with_is_error() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    std::env::set_var("FORMLESS_API_KEY", "k");
+    _env.set("FORMLESS_API_KEY", "k");
     let paths = temp("anth-err");
     let mut cfg = Config::default();
     cfg.provider.base_url = base;
@@ -120,6 +124,7 @@ async fn failed_tool_results_are_sent_with_is_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repointing_a_provider_rederives_its_api_style() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp("anth-style");
     let mut cfg = Config::default();
     cfg.naming.enabled = false;
@@ -213,8 +218,13 @@ fn answer(thinking: bool, text: &str, stop: &str) -> (u16, String) {
     (200, sse(&ev))
 }
 
-async fn run_turns(base: String, tag: &str, turns: &[&str]) -> (Store, String) {
-    std::env::set_var("FORMLESS_API_KEY", "k");
+async fn run_turns(
+    _env: &credential_env::EnvGuard,
+    base: String,
+    tag: &str,
+    turns: &[&str],
+) -> (Store, String) {
+    _env.set("FORMLESS_API_KEY", "k");
     let paths = temp(tag);
     let mut cfg = Config::default();
     cfg.provider.base_url = base;
@@ -256,12 +266,13 @@ async fn run_turns(base: String, tag: &str, turns: &[&str]) -> (Store, String) {
 /// is not resent (#1090).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paused_turn_resumes_with_its_thinking() {
+    let _env = credential_env::EnvGuard::isolated();
     let (base, seen) = scripted(vec![
         answer(true, "part", "pause_turn"),
         answer(false, " rest", "end_turn"),
     ])
     .await;
-    let (store, sid) = run_turns(base, "anth-pause", &["go"]).await;
+    let (store, sid) = run_turns(&_env, base, "anth-pause", &["go"]).await;
     assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
     let bodies = seen.lock().unwrap().clone();
     assert_eq!(bodies.len(), 2);
@@ -269,7 +280,7 @@ async fn a_paused_turn_resumes_with_its_thinking() {
     assert!(resent.contains("sig-1"), "{resent}");
 
     let (base, seen) = scripted(vec![answer(false, "", "pause_turn")]).await;
-    let (store, sid) = run_turns(base, "anth-pause-empty", &["go"]).await;
+    let (store, sid) = run_turns(&_env, base, "anth-pause-empty", &["go"]).await;
     assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
     assert_eq!(
         seen.lock().unwrap().len(),
@@ -282,6 +293,7 @@ async fn a_paused_turn_resumes_with_its_thinking() {
 /// and says why, instead of failing the Run (#1091).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_context_compaction_keeps_the_partial_answer() {
+    let _env = credential_env::EnvGuard::isolated();
     let fail = (
         400,
         json!({"type": "error", "error": {"type": "invalid_request_error", "message": "nope"}})
@@ -295,7 +307,7 @@ async fn a_failed_context_compaction_keeps_the_partial_answer() {
         fail,
     ])
     .await;
-    let (store, sid) = run_turns(base, "anth-ctx", &["one", "two", "three", "four"]).await;
+    let (store, sid) = run_turns(&_env, base, "anth-ctx", &["one", "two", "three", "four"]).await;
     assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
     let msgs = store.list_messages(&sid).unwrap();
     let last = msgs.iter().rev().find(|m| m.role == "assistant").unwrap();
