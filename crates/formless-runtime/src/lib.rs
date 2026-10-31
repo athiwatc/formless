@@ -3,6 +3,7 @@
 //! `__host(op, argsJson)` bridge, checked against declared Capabilities.
 
 pub mod caps;
+mod dns;
 pub mod sync;
 pub use caps::Capabilities;
 pub use sync::LockExt;
@@ -646,8 +647,9 @@ pub fn non_public(ip: std::net::IpAddr) -> bool {
 fn checked_address(
     url: &reqwest::Url,
     scope: &[String],
+    deadline: std::time::Instant,
+    resolve: &dyn Fn(&str, u16, std::time::Instant) -> Result<Vec<std::net::SocketAddr>, String>,
 ) -> Result<Vec<std::net::SocketAddr>, String> {
-    use std::net::ToSocketAddrs;
     let host = url
         .host_str()
         .unwrap_or_default()
@@ -657,11 +659,12 @@ fn checked_address(
     let literal = host.parse::<std::net::IpAddr>().ok();
     let addrs: Vec<std::net::SocketAddr> = match literal {
         Some(ip) => vec![std::net::SocketAddr::new(ip, port)],
-        None => (host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| format!("cannot resolve {host}: {e}"))?
-            .collect(),
+        None => resolve(&host, port, deadline)?,
     };
+    if addrs.is_empty() {
+        // Never hand an empty pinned set to reqwest and let it resolve again.
+        return Err(format!("cannot resolve {host}: no addresses returned"));
+    }
     let exact = names_host_exactly(scope, &host, port);
     if let Some(bad) = addrs.iter().find(|a| non_public(a.ip())) {
         if !exact {
@@ -806,12 +809,22 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
 /// so a scoped Tool can never be bounced to a host it was not granted.
 /// Like reqwest's own policy: 303 (and 301/302 after a POST) become a
 /// bodiless GET, and credentials are not sent on to another host.
-fn send_request(mut req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
+fn send_request(req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
+    send_request_with_resolver(req, &dns::resolve)
+}
+
+fn send_request_with_resolver(
+    mut req: FetchRequest,
+    resolve: &dyn Fn(&str, u16, std::time::Instant) -> Result<Vec<std::net::SocketAddr>, String>,
+) -> Result<reqwest::blocking::Response, String> {
     use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION};
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(req.timeouts.total_ms);
     for _ in 0..=10 {
-        let pinned = checked_address(&req.url, &req.scope)?;
+        let dns_deadline = deadline.min(
+            std::time::Instant::now() + std::time::Duration::from_millis(req.timeouts.connect_ms),
+        );
+        let pinned = checked_address(&req.url, &req.scope, dns_deadline, resolve)?;
         let client = match req.url.host_str() {
             Some(host) if !pinned.is_empty() => pinned_client(host, &pinned, req.timeouts)?,
             _ => http_client(req.timeouts)?,
@@ -2510,7 +2523,13 @@ const RUNNER: &str = r#"
     // error, so a null exception is reported as out of memory.
     const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || "") }); };
     const done = (v) => {
-      try { globalThis.__result_json = JSON.stringify({ ok: true, value: v === undefined ? null : v }); }
+      try {
+        const encoded = JSON.stringify(v === undefined ? null : v);
+        if (typeof encoded !== "string") throw new Error("JSON.stringify produced no JSON value");
+        // Serialize the Tool's value once: wrapping it and stringifying again
+        // would either omit non-values or run a stateful toJSON twice.
+        globalThis.__result_json = '{"ok":true,"value":' + encoded + '}';
+      }
       catch (e) { fail(new Error("return value is not JSON-serializable: " + String((e && e.message) || e))); }
     };
     try {
@@ -2696,6 +2715,56 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checked_address(
+        url: &reqwest::Url,
+        scope: &[String],
+    ) -> Result<Vec<std::net::SocketAddr>, String> {
+        super::checked_address(
+            url,
+            scope,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            &dns::resolve,
+        )
+    }
+
+    #[test]
+    fn bounded_dns_keeps_all_address_checks_and_literal_ip_bypass() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let literal = reqwest::Url::parse("http://127.0.0.1:1234/").unwrap();
+        let never_resolve =
+            |_: &str, _: u16, _: std::time::Instant| -> Result<Vec<std::net::SocketAddr>, String> {
+                panic!("literal addresses must not enter the resolver pool")
+            };
+        assert!(
+            super::checked_address(&literal, &["127.0.0.1".into()], deadline, &never_resolve,)
+                .unwrap()
+                .is_empty()
+        );
+        let named = reqwest::Url::parse("http://sub.example.com:1234/").unwrap();
+        let mixed = |_: &str, _: u16, _: std::time::Instant| {
+            Ok(vec![
+                "1.1.1.1:1234".parse().unwrap(),
+                "127.0.0.1:1234".parse().unwrap(),
+            ])
+        };
+        assert!(
+            super::checked_address(&named, &["example.com".into()], deadline, &mixed)
+                .unwrap_err()
+                .starts_with("denied:")
+        );
+        assert_eq!(
+            super::checked_address(&named, &["sub.example.com".into()], deadline, &mixed)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            super::checked_address(&named, &[], deadline, &|_, _, _| Ok(Vec::new()))
+                .unwrap_err()
+                .contains("no addresses returned")
+        );
+    }
 
     /// Records `progress` calls.
     struct ProgressOps(Mutex<Vec<(Option<f64>, String)>>);
@@ -3143,6 +3212,9 @@ mod tests {
             for body in [
                 "return {id: 9007199254740993n};",
                 "const x = {}; x.self = x; return x;",
+                "return function () {};",
+                "return Symbol('not JSON');",
+                "return {toJSON() { return undefined; }};",
             ] {
                 let req = live(&format!("{prefix}function run() {{ {body} }}"));
                 let e = execute(&req, Arc::new(NoHostOps)).unwrap_err();
@@ -3153,6 +3225,24 @@ mod tests {
                 );
                 assert!(!e.message.contains("never settled"), "{}", e.message);
             }
+        }
+    }
+
+    #[test]
+    fn return_serialization_calls_to_json_once_and_preserves_absent_returns() {
+        for prefix in ["", "async "] {
+            let req = live(&format!(
+                "{prefix}function run() {{ let calls = 0; return {{toJSON() {{ if (++calls > 1) throw new Error('serialized twice'); return {{calls}}; }} }}; }}"
+            ));
+            assert_eq!(
+                execute(&req, Arc::new(NoHostOps)).unwrap().output,
+                json!({"calls": 1})
+            );
+            let req = live(&format!("{prefix}function run() {{ return undefined; }}"));
+            assert_eq!(
+                execute(&req, Arc::new(NoHostOps)).unwrap().output,
+                json!(null)
+            );
         }
     }
 
