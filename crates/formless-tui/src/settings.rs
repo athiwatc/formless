@@ -429,12 +429,15 @@ pub struct Field {
 pub enum FormKind {
     Provider,
     Role,
+    McpCatalog,
 }
 
 /// Add or edit a provider or Role.
 pub struct Form {
     pub kind: FormKind,
+    catalog: Option<&'static formless_core::mcp_catalog::Entry>,
     pub title: String,
+    pub review: Vec<String>,
     pub fields: Vec<Field>,
     pub idx: usize,
     pub error: Option<String>,
@@ -477,6 +480,8 @@ impl Form {
         };
         Form {
             kind: FormKind::Provider,
+            catalog: None,
+            review: Vec::new(),
             title: if existing.is_some() {
                 format!("Edit provider {}", get("name"))
             } else {
@@ -542,6 +547,8 @@ impl Form {
         };
         Form {
             kind: FormKind::Role,
+            catalog: None,
+            review: Vec::new(),
             title: match name {
                 Some(n) => format!("Edit role {n}"),
                 None => "Add role".into(),
@@ -563,6 +570,54 @@ impl Form {
                 ),
             ],
             idx: if name.is_some() { 1 } else { 0 },
+            error: None,
+        }
+    }
+
+    pub fn mcp(
+        entry: &'static formless_core::mcp_catalog::Entry,
+        params: &serde_json::Map<String, Value>,
+    ) -> Self {
+        use formless_core::mcp_catalog::{target, ParamKind, CODE_WARNING};
+        let mut fields = vec![field(
+            "Server name",
+            entry.id,
+            false,
+            "A local name for this server",
+        )];
+        for p in entry.params {
+            let secret = p.kind == ParamKind::Secret;
+            fields.push(field(
+                p.name,
+                if secret {
+                    ""
+                } else {
+                    params.get(p.name).and_then(Value::as_str).unwrap_or("")
+                },
+                secret,
+                p.description,
+            ));
+        }
+        fields.push(field(
+            "Confirm",
+            "",
+            false,
+            "Type ADD to run; broad folders require EXPOSE followed by the canonical path",
+        ));
+        Form {
+            kind: FormKind::McpCatalog,
+            catalog: Some(entry),
+            title: format!("Add MCP: {}", entry.title),
+            review: vec![
+                target(entry),
+                if entry.command.is_empty() {
+                    "Connects to this URL.".into()
+                } else {
+                    CODE_WARNING.into()
+                },
+            ],
+            fields,
+            idx: 1,
             error: None,
         }
     }
@@ -597,6 +652,41 @@ impl Form {
                     headers: pairs(&self.fields[4].input.to_string())?,
                     query_params: pairs(&self.value(5))?.or_else(|| Some(Default::default())),
                     api_key_header: Some(self.value(6)),
+                })
+            }
+            FormKind::McpCatalog => {
+                let entry = self.catalog.ok_or("missing catalog entry")?;
+                let mut params = serde_json::Map::new();
+                for (i, p) in entry.params.iter().enumerate() {
+                    params.insert(p.name.into(), json!(self.value(i + 1)));
+                }
+                let preview = formless_core::mcp_catalog::catalog_preview(entry, &params)
+                    .map_err(|e| e.to_string())?;
+                let confirmation = self.value(self.fields.len() - 1);
+                if !preview["warnings"].as_array().unwrap().is_empty() {
+                    let path = formless_core::mcp_catalog::normalize_directory(
+                        params["path"].as_str().unwrap_or(""),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let expected = format!("EXPOSE {}", path.display());
+                    if confirmation != expected {
+                        return Err(format!(
+                            "{}; type {expected} in Confirm",
+                            preview["warnings"][0].as_str().unwrap_or_default()
+                        ));
+                    }
+                } else if confirmation != "ADD" {
+                    return Err(format!(
+                        "Review {} then type ADD in Confirm",
+                        preview["target"].as_str().unwrap_or_default()
+                    ));
+                }
+                params.insert("confirm_run".into(), json!(true));
+                params.insert("confirm_exposure".into(), json!(true));
+                Ok(Request::AddMcpFromCatalog {
+                    id: entry.id.into(),
+                    name: Some(name),
+                    params,
                 })
             }
             FormKind::Role => {
@@ -701,5 +791,45 @@ mod approvals_row_tests {
         assert_eq!(super::approvals_text(true, true), "on: sensitive calls ask");
         let t = super::approvals_text(false, true);
         assert!(t.starts_with("off") && t.contains("/restart-daemon"), "{t}");
+    }
+}
+
+#[cfg(test)]
+mod mcp_review_tests {
+    use super::*;
+
+    #[test]
+    fn credential_url_uses_a_masked_form_and_execution_needs_confirmation() {
+        let entry = formless_core::mcp_catalog::find("postgres").unwrap();
+        let mut form = Form::mcp(entry, &Default::default());
+        assert!(form.fields[1].masked);
+        form.fields[1].input = InputLine::from("postgresql://u:pw@h/db");
+        assert!(form.request().is_err());
+        assert!(form.review.join(" ").contains("server-postgres@0.6.2"));
+        assert!(form.review.join(" ").contains("Downloads and runs code"));
+        let last = form.fields.len() - 1;
+        form.fields[last].input = InputLine::from("ADD");
+        let Request::AddMcpFromCatalog { params, .. } = form.request().unwrap() else {
+            panic!("wrong request")
+        };
+        assert_eq!(params["confirm_run"], true);
+        assert_eq!(params["url"], "postgresql://u:pw@h/db");
+    }
+
+    #[test]
+    fn home_folder_needs_the_named_exposure_confirmation() {
+        let entry = formless_core::mcp_catalog::find("filesystem").unwrap();
+        let mut form = Form::mcp(entry, &Default::default());
+        form.fields[1].input = InputLine::from("~");
+        let last = form.fields.len() - 1;
+        form.fields[last].input = InputLine::from("ADD");
+        let error = form.request().unwrap_err();
+        let path = formless_core::mcp_catalog::normalize_directory("~").unwrap();
+        assert!(error.contains(&format!("EXPOSE {}", path.display())));
+        form.fields[last].input = InputLine::from(format!("EXPOSE {}", path.display()).as_str());
+        let Request::AddMcpFromCatalog { params, .. } = form.request().unwrap() else {
+            panic!("wrong request")
+        };
+        assert_eq!(params["confirm_exposure"], true);
     }
 }

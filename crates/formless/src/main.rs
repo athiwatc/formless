@@ -765,6 +765,15 @@ enum McpAction {
         /// A catalog server's setting, `key=value` (e.g. `path=~/notes`)
         #[arg(long = "param")]
         params: Vec<String>,
+        /// Read a secret catalog parameter from a named environment variable (key=ENV).
+        #[arg(long = "param-env")]
+        param_env: Vec<String>,
+        /// Confirm downloading/running the displayed pinned catalog command.
+        #[arg(long)]
+        yes: bool,
+        /// Confirm exposing the displayed root/home/credential directory.
+        #[arg(long)]
+        confirm_exposure: bool,
         /// Remote server URL (Streamable HTTP or HTTP+SSE)
         #[arg(long)]
         url: Option<String>,
@@ -800,6 +809,9 @@ enum McpAction {
         /// Add every server found without asking
         #[arg(long)]
         yes: bool,
+        /// Copy env/header values to plaintext config.toml; default skips secrets.
+        #[arg(long)]
+        copy_secrets: bool,
     },
     /// The end of a stdio server's stderr log
     Log {
@@ -1465,6 +1477,18 @@ fn run_cli(cli: Cli) -> Result<()> {
             println!(
                 "config:    {} providers, {} Roles, {} MCP servers added",
                 r["providers"], r["roles"], r["mcp_servers"]
+            );
+            println!("review:    MCP servers are disabled and untrusted; inspect commands before enabling.");
+            for server in r["mcp_review"].as_array().into_iter().flatten() {
+                println!(
+                    "  {}: {}",
+                    server["name"].as_str().unwrap_or_default(),
+                    server["target"].as_str().unwrap_or_default()
+                );
+            }
+            println!(
+                "Tool capability families: {}",
+                r["tool_capability_families"]
             );
             for b in r["blanked"].as_array().into_iter().flatten() {
                 println!("fill in:   {}", b.as_str().unwrap_or_default());
@@ -4763,6 +4787,9 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
         McpAction::Add {
             name,
             params,
+            param_env,
+            yes,
+            confirm_exposure,
             url,
             headers,
             env_keys,
@@ -4770,13 +4797,75 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
         } => {
             if url.is_none() && command.is_empty() {
                 // A catalog server by id.
-                let params: serde_json::Map<String, serde_json::Value> = params
+                let mut params: serde_json::Map<String, serde_json::Value> = params
                     .iter()
                     .map(|p| {
                         let (k, v) = p.split_once('=').context("--param takes key=value")?;
                         Ok((k.trim().to_string(), serde_json::json!(v.trim())))
                     })
                     .collect::<Result<_>>()?;
+                let catalog = daemon(Request::McpCatalog)?;
+                let entry = catalog
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|e| {
+                        e["id"]
+                            .as_str()
+                            .is_some_and(|id| id.eq_ignore_ascii_case(&name))
+                    })
+                    .context("unknown catalog entry")?;
+                for param in entry["params"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["kind"] == "secret")
+                {
+                    let key = param["name"].as_str().unwrap_or_default();
+                    if params.contains_key(key) {
+                        bail!("secret parameters must use a masked prompt or --param-env {key}=ENV, not --param");
+                    }
+                    let value = if let Some(source) = param_env
+                        .iter()
+                        .find_map(|p| p.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))
+                    {
+                        std::env::var(source)
+                            .context("parameter environment variable is missing")?
+                    } else {
+                        read_masked_mcp_parameter(key)?
+                    };
+                    params.insert(key.to_string(), serde_json::json!(value));
+                }
+                let preview = daemon(Request::PreviewMcpCatalog {
+                    id: name.clone(),
+                    params: params.clone(),
+                })?;
+                println!(
+                    "command: {}",
+                    preview["target"].as_str().unwrap_or_default()
+                );
+                if let Some(warning) = preview["execution_warning"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                {
+                    println!("{warning}");
+                }
+                if !yes && !confirm("Add this reviewed server and run its command?")? {
+                    return Ok(());
+                }
+                params.insert("confirm_run".into(), serde_json::json!(true));
+                for warning in preview["warnings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str())
+                {
+                    println!("exposure: {warning}");
+                    if !confirm_exposure && !confirm(warning)? {
+                        return Ok(());
+                    }
+                }
+                params.insert("confirm_exposure".into(), serde_json::json!(true));
                 let r = daemon(Request::AddMcpFromCatalog {
                     id: name.clone(),
                     name: None,
@@ -4864,13 +4953,21 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
         }
         McpAction::Catalog => {
             let list = daemon(Request::McpCatalog)?;
-            let mut tbl = Table::new(&["ID", "SERVER", "WHAT IT DOES", "NEEDS"]);
+            let mut tbl = Table::new(&["ID", "SERVER", "WHAT IT DOES", "COMMAND / URL", "NEEDS"]);
             for e in list.as_array().into_iter().flatten() {
                 let mut needs: Vec<String> = e["params"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|p| p["name"].as_str().map(|n| format!("--param {n}=…")))
+                    .filter_map(|p| {
+                        p["name"].as_str().map(|n| {
+                            if p["kind"] == "secret" {
+                                format!("--param-env {n}=ENV (or masked prompt)")
+                            } else {
+                                format!("--param {n}=…")
+                            }
+                        })
+                    })
                     .collect();
                 needs.extend(
                     e["env_keys"]
@@ -4894,13 +4991,24 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                     ),
                     c(e["title"].as_str().unwrap_or_default()),
                     t(e["description"].as_str().unwrap_or_default(), Tone::Dim),
+                    c(e["target"].as_str().unwrap_or_default()),
                     c(needs.join(" ")),
                 ]);
             }
             tbl.print();
+            println!("{}", formless_core::mcp_catalog::CODE_WARNING);
+            // The summary table fits the terminal; review commands must remain
+            // complete even when its command column was shortened.
+            for entry in list.as_array().into_iter().flatten() {
+                println!(
+                    "{}: {}",
+                    entry["id"].as_str().unwrap_or_default(),
+                    entry["target"].as_str().unwrap_or_default()
+                );
+            }
             println!("add one with: formless mcp add ID [--param key=value]");
         }
-        McpAction::Import { yes } => {
+        McpAction::Import { yes, copy_secrets } => {
             let cwd = std::env::current_dir()
                 .ok()
                 .map(|d| d.to_string_lossy().into_owned());
@@ -4928,6 +5036,18 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                 if !env.is_empty() {
                     println!("  env: {}", env.join(", "));
                 }
+                println!(
+                    "  env/header keys with values: {} / {}",
+                    cand["env"], cand["headers"]
+                );
+                println!(
+                    "  {}",
+                    if copy_secrets {
+                        "Values will be copied into plaintext config.toml (--copy-secrets)."
+                    } else {
+                        "Skipping secret values; set env/header values yourself. Use --copy-secrets only to accept plaintext config.toml storage."
+                    }
+                );
                 for m in cand["missing_env"].as_array().into_iter().flatten() {
                     println!(
                         "  not imported: {} (a placeholder; set it yourself)",
@@ -4951,11 +5071,17 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                     false
                 };
                 if add {
-                    let r = daemon(Request::AddMcpServer {
-                        name: name.clone(),
-                        server: cand["server"].clone(),
+                    let r = daemon(Request::ImportMcpCandidate {
+                        candidate_id: cand["candidate_id"]
+                            .as_str()
+                            .context("missing candidate reference")?
+                            .into(),
+                        skip_secrets: !copy_secrets,
                     })?;
                     println!("  added:   {name}");
+                    println!(
+                        "  disabled and untrusted; review command before enabling in config.toml"
+                    );
                     report(&r);
                 }
             }
@@ -5470,6 +5596,47 @@ fn print_bundle_preview(fetched: &serde_json::Value) {
 }
 
 /// A yes/no question on the terminal; no terminal means no.
+fn read_masked_mcp_parameter(name: &str) -> Result<String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        bail!("{name} needs a masked terminal prompt or --param-env {name}=ENV");
+    }
+    print!("{name} (hidden): ");
+    std::io::stdout().flush()?;
+    crossterm::terminal::enable_raw_mode()?;
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+    let restore = Restore;
+    let mut value = String::new();
+    loop {
+        if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            if key.kind == crossterm::event::KeyEventKind::Release {
+                continue;
+            }
+            use crossterm::event::{KeyCode, KeyModifiers};
+            match key.code {
+                KeyCode::Enter => break,
+                KeyCode::Esc => bail!("parameter entry cancelled"),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    bail!("parameter entry cancelled")
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => value.push(c),
+                _ => {}
+            }
+        }
+    }
+    drop(restore);
+    println!();
+    Ok(value)
+}
+
 fn confirm(question: &str) -> Result<bool> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {

@@ -1486,6 +1486,16 @@ pub enum Request {
     },
     /// The curated catalog of popular MCP servers.
     McpCatalog,
+    PreviewMcpCatalog {
+        id: String,
+        #[serde(default)]
+        params: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Resolve an opaque, reviewed daemon-side candidate reference again.
+    ImportMcpCandidate {
+        candidate_id: String,
+        skip_secrets: bool,
+    },
     /// Add a catalog server: `params` fill its placeholders (e.g. `path`);
     /// `name` defaults to the catalog id.
     AddMcpFromCatalog {

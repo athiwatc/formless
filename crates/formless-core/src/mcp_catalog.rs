@@ -1,7 +1,7 @@
 //! A small curated catalog of popular MCP servers, and importing servers
 //! already configured in other apps (SPEC §7.9).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,9 +19,23 @@ pub struct Entry {
     pub args: &'static [&'static str],
     /// http: the endpoint (OAuth via `formless mcp login`).
     pub url: &'static str,
-    pub params: &'static [(&'static str, &'static str)],
+    pub params: &'static [Param],
     pub env_keys: &'static [&'static str],
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamKind {
+    Path,
+    Secret,
+    Url,
+}
+pub struct Param {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub kind: ParamKind,
+}
+pub const CODE_WARNING: &str = "Downloads and runs code from npm/PyPI on first use.";
 
 pub const CATALOG: &[Entry] = &[
     Entry {
@@ -29,9 +43,17 @@ pub const CATALOG: &[Entry] = &[
         title: "Filesystem",
         description: "Read, write and search files in one folder",
         command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-filesystem", "{path}"],
+        args: &[
+            "-y",
+            "@modelcontextprotocol/server-filesystem@2.1.0",
+            "{path}",
+        ],
         url: "",
-        params: &[("path", "The folder the server may use")],
+        params: &[Param {
+            name: "path",
+            description: "The folder the server may use",
+            kind: ParamKind::Path,
+        }],
         env_keys: &[],
     },
     Entry {
@@ -50,9 +72,13 @@ pub const CATALOG: &[Entry] = &[
         title: "Git",
         description: "Read and search a local git repository",
         command: "uvx",
-        args: &["mcp-server-git", "--repository", "{path}"],
+        args: &["mcp-server-git==2026.10.28", "--repository", "{path}"],
         url: "",
-        params: &[("path", "The repository folder")],
+        params: &[Param {
+            name: "path",
+            description: "The repository folder",
+            kind: ParamKind::Path,
+        }],
         env_keys: &[],
     },
     Entry {
@@ -60,7 +86,7 @@ pub const CATALOG: &[Entry] = &[
         title: "Fetch",
         description: "Fetch web pages as Markdown",
         command: "uvx",
-        args: &["mcp-server-fetch"],
+        args: &["mcp-server-fetch==2026.10.28"],
         url: "",
         params: &[],
         env_keys: &[],
@@ -70,7 +96,7 @@ pub const CATALOG: &[Entry] = &[
         title: "Browser (Playwright)",
         description: "Drive a real browser: open pages, click, fill forms, take snapshots",
         command: "npx",
-        args: &["-y", "@playwright/mcp@latest"],
+        args: &["-y", "@playwright/mcp@0.0.84"],
         url: "",
         params: &[],
         env_keys: &[],
@@ -80,9 +106,13 @@ pub const CATALOG: &[Entry] = &[
         title: "PostgreSQL",
         description: "Read-only queries and schema inspection",
         command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-postgres", "{url}"],
+        args: &["-y", "@modelcontextprotocol/server-postgres@0.6.2", "{url}"],
         url: "",
-        params: &[("url", "A connection URL, e.g. postgresql://localhost/mydb")],
+        params: &[Param {
+            name: "url",
+            description: "A connection URL, e.g. postgresql://localhost/mydb",
+            kind: ParamKind::Secret,
+        }],
         env_keys: &[],
     },
     Entry {
@@ -90,7 +120,7 @@ pub const CATALOG: &[Entry] = &[
         title: "Slack",
         description: "Read channels and post messages with a bot token",
         command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-slack"],
+        args: &["-y", "@modelcontextprotocol/server-slack@2025.4.25"],
         url: "",
         params: &[],
         env_keys: &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"],
@@ -100,7 +130,7 @@ pub const CATALOG: &[Entry] = &[
         title: "Knowledge graph memory",
         description: "A persistent knowledge graph the agent can store and query",
         command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-memory"],
+        args: &["-y", "@modelcontextprotocol/server-memory@2.0.1"],
         url: "",
         params: &[],
         env_keys: &[],
@@ -110,7 +140,7 @@ pub const CATALOG: &[Entry] = &[
         title: "Time",
         description: "Current time and time-zone conversions",
         command: "uvx",
-        args: &["mcp-server-time"],
+        args: &["mcp-server-time==2026.10.28"],
         url: "",
         params: &[],
         env_keys: &[],
@@ -161,13 +191,14 @@ pub fn catalog_json() -> Value {
             "description": e.description,
             "transport": if e.url.is_empty() { "stdio" } else { "http" },
             "target": target(e),
-            "params": e.params.iter().map(|(n, d)| json!({"name": n, "description": d})).collect::<Vec<_>>(),
+            "execution_warning": if e.url.is_empty() { CODE_WARNING } else { "" },
+            "params": e.params.iter().map(|p| json!({"name": p.name, "description": p.description, "kind": p.kind})).collect::<Vec<_>>(),
             "env_keys": e.env_keys,
         }))
         .collect::<Vec<_>>())
 }
 
-fn target(e: &Entry) -> String {
+pub fn target(e: &Entry) -> String {
     if e.url.is_empty() {
         std::iter::once(e.command)
             .chain(e.args.iter().copied())
@@ -178,42 +209,227 @@ fn target(e: &Entry) -> String {
     }
 }
 
-/// The server config for a catalog entry, with its `{param}`s filled.
-pub fn server_config(e: &Entry, params: &Map<String, Value>) -> Result<McpServerCfg> {
-    let fill = |s: &str| -> Result<String> {
-        let mut out = s.to_string();
-        for (name, _) in e.params {
-            let key = format!("{{{name}}}");
-            if out.contains(&key) {
-                let v = params
-                    .get(*name)
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| anyhow!("{} needs {name}: {}", e.id, param_hint(e, name)))?;
-                out = out.replace(&key, v);
-            }
-        }
-        Ok(out)
-    };
-    let mut cfg = McpServerCfg::default();
-    if e.url.is_empty() {
-        cfg.transport = "stdio".into();
-        cfg.command = e.command.to_string();
-        cfg.args = e.args.iter().map(|a| fill(a)).collect::<Result<_>>()?;
-        cfg.env_keys = e.env_keys.iter().map(|k| k.to_string()).collect();
+/// Path checks happen in the daemon as well as in local review forms.
+pub fn normalize_directory(raw: &str) -> Result<PathBuf> {
+    let home = directories::BaseDirs::new().map(|d| {
+        d.home_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| d.home_dir().to_path_buf())
+    });
+    let expanded = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        home.context("no home directory")?
+            .join(raw.get(2..).unwrap_or(""))
     } else {
-        cfg.transport = "http".into();
-        cfg.url = fill(e.url)?;
+        PathBuf::from(raw)
+    };
+    let path = expanded
+        .canonicalize()
+        .map_err(|_| anyhow!("path must name an existing accessible directory"))?;
+    if !path.is_dir() {
+        return Err(anyhow!("path must be a directory"));
+    }
+    Ok(path)
+}
+
+pub fn path_exposure(path: &Path) -> Option<String> {
+    let home = directories::BaseDirs::new().map(|d| {
+        d.home_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| d.home_dir().to_path_buf())
+    });
+    let broad = path.parent().is_none() || home.as_ref().is_some_and(|h| h.starts_with(path));
+    let credential = [".ssh", ".aws", ".gnupg", ".kube", ".config"]
+        .iter()
+        .any(|name| {
+            path.file_name().is_some_and(|n| n == *name)
+                || path.join(name).exists()
+                || home.as_ref().is_some_and(|h| {
+                    let known = h.join(name);
+                    let known = known.canonicalize().unwrap_or(known);
+                    path.starts_with(&known) || known.starts_with(path)
+                })
+        });
+    (broad || credential).then(|| format!("{} exposes a filesystem root, home, or credential folder; confirm this exposure explicitly", path.display()))
+}
+
+fn prepare(e: &Entry, params: &Map<String, Value>) -> Result<(McpServerCfg, Vec<String>)> {
+    let mut values = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for p in e.params {
+        let value = params
+            .get(p.name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("{} needs {}: {}", e.id, p.name, p.description))?;
+        let value = match p.kind {
+            ParamKind::Path => {
+                let path = normalize_directory(value)?;
+                if let Some(warning) = path_exposure(&path) {
+                    warnings.push(warning);
+                }
+                path.to_string_lossy().into_owned()
+            }
+            ParamKind::Secret | ParamKind::Url => {
+                reqwest::Url::parse(value).map_err(|_| anyhow!("{} needs a valid URL", p.name))?;
+                value.to_string()
+            }
+        };
+        values.insert(p.name, value);
+    }
+    let fill = |s: &str| {
+        values
+            .iter()
+            .fold(s.to_string(), |s, (k, v)| s.replace(&format!("{{{k}}}"), v))
+    };
+    let cfg = if e.url.is_empty() {
+        McpServerCfg {
+            transport: "stdio".into(),
+            command: e.command.into(),
+            args: e.args.iter().map(|a| fill(a)).collect(),
+            env_keys: e.env_keys.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    } else {
+        McpServerCfg {
+            transport: "http".into(),
+            url: fill(e.url),
+            ..Default::default()
+        }
+    };
+    Ok((cfg, warnings))
+}
+
+pub fn server_config(e: &Entry, params: &Map<String, Value>) -> Result<McpServerCfg> {
+    let (cfg, warnings) = prepare(e, params)?;
+    if !warnings.is_empty() && params.get("confirm_exposure").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(anyhow!(
+            "{}; set confirm_exposure=true only after reviewing it",
+            warnings.join("; ")
+        ));
     }
     Ok(cfg)
 }
 
-fn param_hint(e: &Entry, name: &str) -> &'static str {
-    e.params
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map_or("", |(_, d)| d)
+pub fn catalog_preview(e: &Entry, params: &Map<String, Value>) -> Result<Value> {
+    let (cfg, warnings) = prepare(e, params)?;
+    Ok(json!({"target": safe_target(&cfg), "warnings": warnings,
+        "execution_warning": if e.url.is_empty() { CODE_WARNING } else { "" }}))
+}
+
+fn safe_url(raw: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(raw) {
+        if url.password().is_some() {
+            let _ = url.set_password(Some("REDACTED"));
+        }
+        let pairs: Vec<_> = url
+            .query_pairs()
+            .map(|(k, v)| {
+                let secret = [
+                    "password",
+                    "token",
+                    "secret",
+                    "key",
+                    "credential",
+                    "authorization",
+                ]
+                .iter()
+                .any(|s| k.to_ascii_lowercase().contains(s));
+                (
+                    k.into_owned(),
+                    if secret {
+                        "REDACTED".into()
+                    } else {
+                        v.into_owned()
+                    },
+                )
+            })
+            .collect();
+        if !pairs.is_empty() {
+            url.query_pairs_mut().clear().extend_pairs(pairs);
+        }
+        return url.to_string();
+    }
+    raw.to_string()
+}
+
+/// Redact known literal secrets even when too short for the general scanner.
+pub fn redact_server_text(cfg: &McpServerCfg, text: &str) -> String {
+    let mut out = text.to_string();
+    for value in cfg.args.iter().chain(std::iter::once(&cfg.url)) {
+        if let Ok(url) = reqwest::Url::parse(value) {
+            out = out.replace(value, &safe_url(value));
+            if let Some(password) = url.password().filter(|p| !p.is_empty()) {
+                out = out.replace(password, "[REDACTED]");
+                let bytes = password.as_bytes();
+                let mut decoded = Vec::new();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' && i + 2 < bytes.len() {
+                        if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                                decoded.push(byte);
+                                i += 3;
+                                continue;
+                            }
+                        }
+                    }
+                    decoded.push(bytes[i]);
+                    i += 1;
+                }
+                if let Ok(secret) = String::from_utf8(decoded) {
+                    if !secret.is_empty() {
+                        out = out.replace(&secret, "[REDACTED]");
+                    }
+                }
+            }
+            for (key, secret) in url.query_pairs() {
+                if !secret.is_empty()
+                    && [
+                        "password",
+                        "token",
+                        "secret",
+                        "key",
+                        "credential",
+                        "authorization",
+                    ]
+                    .iter()
+                    .any(|s| key.to_ascii_lowercase().contains(s))
+                {
+                    out = out.replace(secret.as_ref(), "[REDACTED]");
+                }
+            }
+        }
+    }
+    for value in cfg
+        .env
+        .values()
+        .chain(cfg.headers.values())
+        .filter(|v| !v.is_empty())
+    {
+        out = out.replace(value, "[REDACTED]");
+    }
+    for key in &cfg.env_keys {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                out = out.replace(&value, "[REDACTED]");
+            }
+        }
+    }
+    crate::secrets::redact(&out).0
+}
+
+pub fn safe_target(cfg: &McpServerCfg) -> String {
+    let target = if cfg.transport == "http" {
+        cfg.url.clone()
+    } else {
+        std::iter::once(cfg.command.clone())
+            .chain(cfg.args.clone())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    redact_server_text(cfg, &target)
 }
 
 /// A server found in another app's config, ready to add.
@@ -223,6 +439,7 @@ pub struct Candidate {
     pub source: String,
     pub file: PathBuf,
     pub name: String,
+    pub original_name: String,
     pub server: McpServerCfg,
     /// Environment values that could not be imported (`${input:…}`
     /// placeholders): set them before use.
@@ -236,17 +453,12 @@ impl Candidate {
             "file": self.file.display().to_string(),
             "name": self.name,
             "transport": self.server.transport,
-            "target": if self.server.transport == "http" {
-                self.server.url.clone()
-            } else {
-                std::iter::once(self.server.command.clone())
-                    .chain(self.server.args.clone())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            },
+            "target": safe_target(&self.server),
+            "original_name": self.original_name,
             "env": self.server.env.keys().collect::<Vec<_>>(),
+            "headers": self.server.headers.keys().collect::<Vec<_>>(),
+            "secret_storage": "Literal env/header values are stored in plaintext config.toml unless skipped.",
             "missing_env": self.missing_env,
-            "server": serde_json::to_value(&self.server).unwrap_or_default(),
         })
     }
 }
@@ -295,6 +507,7 @@ pub fn candidates(files: &[(String, PathBuf)]) -> Vec<Candidate> {
                     source: source.clone(),
                     file: file.clone(),
                     name: sanitize_name(name),
+                    original_name: name.clone(),
                     server,
                     missing_env,
                 });
@@ -418,14 +631,17 @@ mod tests {
 
     #[test]
     fn catalog_entries_fill_their_params() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let fs = find("filesystem").unwrap();
         let err = server_config(fs, &Map::new()).unwrap_err().to_string();
         assert!(err.contains("needs path"), "{err}");
         let mut p = Map::new();
-        p.insert("path".into(), json!("/work"));
+        let path = std::env::temp_dir().canonicalize().unwrap();
+        p.insert("path".into(), json!(path));
+        p.insert("confirm_exposure".into(), json!(true));
         let cfg = server_config(fs, &p).unwrap();
         assert_eq!(cfg.command, "npx");
-        assert_eq!(cfg.args.last().unwrap(), "/work");
+        assert_eq!(cfg.args.last().unwrap().as_str(), path.to_str().unwrap());
         let gh = server_config(find("GitHub").unwrap(), &Map::new()).unwrap();
         assert_eq!(gh.transport, "http");
         let slack = server_config(find("slack").unwrap(), &Map::new()).unwrap();
@@ -439,6 +655,7 @@ mod tests {
 
     #[test]
     fn servers_import_from_claude_cursor_and_vscode_shapes() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let dir = std::env::temp_dir().join(format!("fl-mcpimp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let claude = dir.join("claude.json");
@@ -465,6 +682,8 @@ mod tests {
         let files = got.iter().find(|c| c.name == "files").unwrap();
         assert_eq!(files.server.args, ["-y", "@x/fs", "/tmp"]);
         assert_eq!(files.server.env.get("A").map(String::as_str), Some("1"));
+        let public = files.to_json();
+        assert!(public.get("server").is_none());
         let remote = got.iter().find(|c| c.name == "remote-api").unwrap();
         assert_eq!(remote.server.transport, "http");
         assert_eq!(remote.missing_env, ["Authorization"]);
@@ -472,5 +691,104 @@ mod tests {
         assert_eq!(git.source, "VS Code (project)");
         assert_eq!(git.missing_env, ["T"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_stdio_catalog_package_has_an_exact_version() {
+        for entry in CATALOG.iter().filter(|e| !e.command.is_empty()) {
+            assert!(!entry.args.iter().any(|a| a.contains("@latest")));
+            let spec = entry.args.iter().find(|a| **a != "-y").unwrap();
+            let version = if entry.command == "npx" {
+                spec.rsplit_once('@').map(|(_, v)| v)
+            } else {
+                spec.split_once("==").map(|(_, v)| v)
+            }
+            .expect("package must be pinned");
+            assert!(
+                version.split('.').count() >= 3
+                    && version.chars().all(|c| c.is_ascii_digit() || c == '.'),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_url_passwords_and_import_values_never_appear_in_public_review() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let postgres = server_config(
+            find("postgres").unwrap(),
+            &Map::from_iter([("url".into(), json!("postgresql://u:pw@h/db"))]),
+        )
+        .unwrap();
+        assert!(!safe_target(&postgres).contains("pw"));
+        assert!(
+            !redact_server_text(&postgres, "password pw and postgresql://u:pw@h/db").contains("pw")
+        );
+        let encoded = McpServerCfg {
+            args: vec!["postgresql://u:a%20b@h/db?password=xyz".into()],
+            ..Default::default()
+        };
+        let safe = redact_server_text(
+            &encoded,
+            "a b a%20b xyz postgresql://u:a%20b@h/db?password=xyz",
+        );
+        assert!(!safe.contains("a b") && !safe.contains("a%20b") && !safe.contains("xyz"));
+        let candidate = Candidate {
+            source: "test".into(),
+            file: PathBuf::from("config.json"),
+            name: "server".into(),
+            original_name: "server".into(),
+            missing_env: vec![],
+            server: McpServerCfg {
+                env: BTreeMap::from([("K".into(), "s3cr3t".into())]),
+                headers: BTreeMap::from([("Authorization".into(), "header-secret".into())]),
+                ..postgres
+            },
+        };
+        let public = candidate.to_json().to_string();
+        assert!(
+            !public.contains("s3cr3t")
+                && !public.contains("header-secret")
+                && !public.contains("pw")
+        );
+        assert!(public.contains("plaintext config.toml") && public.contains("Authorization"));
+    }
+
+    #[test]
+    fn directories_are_canonical_and_broad_exposure_requires_confirmation() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let root = std::env::temp_dir().join(format!("fl-catalog-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        let path = root.canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            let link = root.join("alias");
+            std::os::unix::fs::symlink(root.join(".ssh"), &link).unwrap();
+            assert_eq!(
+                normalize_directory(link.to_str().unwrap()).unwrap(),
+                path.join(".ssh")
+            );
+        }
+        let mut params = Map::from_iter([("path".into(), json!(path))]);
+        let error = server_config(find("filesystem").unwrap(), &params)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("credential") && error.contains(path.to_str().unwrap()));
+        params.insert("confirm_exposure".into(), json!(true));
+        assert_eq!(
+            server_config(find("filesystem").unwrap(), &params)
+                .unwrap()
+                .args
+                .last()
+                .unwrap(),
+            path.to_str().unwrap()
+        );
+        assert!(normalize_directory(root.join("missing").to_str().unwrap()).is_err());
+        std::fs::write(root.join("file"), "file").unwrap();
+        assert!(normalize_directory(root.join("file").to_str().unwrap()).is_err());
+        let home = normalize_directory("~").unwrap();
+        assert!(path_exposure(&home).is_some());
+        assert!(path_exposure(home.ancestors().last().unwrap()).is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

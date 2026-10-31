@@ -2997,7 +2997,15 @@ impl App {
                                     .as_array()
                                     .into_iter()
                                     .flatten()
-                                    .filter_map(|p| p["name"].as_str().map(|n| format!("{n}=…")))
+                                    .filter_map(|p| {
+                                        p["name"].as_str().map(|n| {
+                                            if p["kind"] == "secret" {
+                                                format!("{n} (masked form)")
+                                            } else {
+                                                format!("{n}=…")
+                                            }
+                                        })
+                                    })
                                     .collect();
                                 lines.push(format!(
                                     "{} {:<12} {} — {}{}",
@@ -3015,10 +3023,19 @@ impl App {
                                         )
                                     }
                                 ));
+                                lines.push(format!(
+                                    "  {}",
+                                    e["target"].as_str().unwrap_or_default()
+                                ));
+                                if let Some(w) =
+                                    e["execution_warning"].as_str().filter(|s| !s.is_empty())
+                                {
+                                    lines.push(format!("  {w}"));
+                                }
                             }
                             lines.push(String::new());
                             lines.push(
-                                "/mcp add ID [key=value] adds one; ✓ = already added.".into(),
+                                "/mcp add ID [key=value] opens command review and masked inputs; ✓ = already added.".into(),
                             );
                             self.pager = Some(Pager {
                                 title: "MCP server catalog".into(),
@@ -3029,6 +3046,13 @@ impl App {
                             });
                         }
                         Pending::McpAdded => {
+                            if self
+                                .settings_form
+                                .as_ref()
+                                .is_some_and(|f| f.kind == settings::FormKind::McpCatalog)
+                            {
+                                self.settings_form = None;
+                            }
                             let name = result["added"].as_str().unwrap_or_default();
                             match result["error"].as_str() {
                                 Some(e) => self
@@ -3075,6 +3099,9 @@ impl App {
                                             }
                                         ));
                                     }
+                                    for c in &found {
+                                        self.notes.push(format!("{} value keys: env {} / headers {}. Default skips values; --copy-secrets stores them in plaintext config.toml.", c["name"], c["env"], c["headers"]));
+                                    }
                                     if found.iter().any(|c| c["exists"] != true) {
                                         self.notes.push(
                                             "/mcp import NAME adds one (check its command first)"
@@ -3082,8 +3109,11 @@ impl App {
                                         );
                                     }
                                 }
-                                Some(name) => {
-                                    match found.iter().find(|c| c["name"] == name.as_str()) {
+                                Some(pick) => {
+                                    let (name, copy_secrets) = pick
+                                        .strip_suffix(" --copy-secrets")
+                                        .map_or((pick.as_str(), false), |n| (n, true));
+                                    match found.iter().find(|c| c["name"] == name) {
                                         Some(c) if c["exists"] == true => {
                                             self.notes.push(format!("{name} is already configured"))
                                         }
@@ -3092,11 +3122,16 @@ impl App {
                                                 "adding {name}: {}",
                                                 c["target"].as_str().unwrap_or_default()
                                             ));
+                                            self.notes.push(format!("Keys with values: env {} / headers {}. {}", c["env"], c["headers"], if copy_secrets { "Copying values into plaintext config.toml." } else { "Skipping secrets; set values yourself. --copy-secrets opts into plaintext config.toml storage." }));
+                                            self.notes.push("Imported server stays disabled/untrusted until reviewed and enabled in config.toml".into());
                                             self.request(
                                                 Pending::McpAdded,
-                                                Request::AddMcpServer {
-                                                    name: name.clone(),
-                                                    server: c["server"].clone(),
+                                                Request::ImportMcpCandidate {
+                                                    candidate_id: c["candidate_id"]
+                                                        .as_str()
+                                                        .unwrap_or_default()
+                                                        .into(),
+                                                    skip_secrets: !copy_secrets,
                                                 },
                                             );
                                         }
@@ -5782,15 +5817,9 @@ impl App {
                     .filter_map(|w| w.split_once('='))
                     .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
                     .collect();
-                self.notes.push(format!("adding MCP server {id}…"));
-                self.request(
-                    Pending::McpAdded,
-                    Request::AddMcpFromCatalog {
-                        id,
-                        name: None,
-                        params,
-                    },
-                );
+                if let Some(entry) = formless_core::mcp_catalog::find(&id) {
+                    self.settings_form = Some(settings::Form::mcp(entry, &params));
+                } else { self.notes.push("Unknown catalog entry; see /mcp catalog".into()); }
             }
             "mcp import" => {
                 let cwd = Some(self.work_dir().to_string_lossy().into_owned());
@@ -7565,7 +7594,12 @@ impl App {
                 KeyCode::Enter => match form.request() {
                     Ok(req) => {
                         form.error = None;
-                        self.request(Pending::SaveProviderOrRole, req);
+                        let pending = if form.kind == settings::FormKind::McpCatalog {
+                            Pending::McpAdded
+                        } else {
+                            Pending::SaveProviderOrRole
+                        };
+                        self.request(pending, req);
                     }
                     Err(e) => form.error = Some(e),
                 },
@@ -12538,6 +12572,13 @@ fn setting_help(key: &str) -> Option<String> {
 
 fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
     let mut lines = vec![Line::raw("")];
+    let width = f.area().width.saturating_sub(6).min(66).max(1) as usize;
+    for text in &form.review {
+        let chars: Vec<char> = text.chars().collect();
+        for part in chars.chunks(width) {
+            lines.push(Line::raw(part.iter().collect::<String>()));
+        }
+    }
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
         let text = if field.masked {
@@ -16362,6 +16403,20 @@ mod tests {
         app.paste(&big);
         assert_eq!(app.input, "[pasted 30 lines #1]");
         assert_eq!(app.input.take(), big);
+    }
+
+    #[test]
+    fn mcp_catalog_review_shows_pinned_code_and_masks_connection_secrets() {
+        let mut app = test_app();
+        let entry = formless_core::mcp_catalog::find("postgres").unwrap();
+        let mut form = settings::Form::mcp(entry, &Default::default());
+        form.fields[1].input = input::InputLine::from("postgresql://u:SecretForMcpOnly@h/db");
+        app.settings_form = Some(form);
+        let screen = render(&mut app, 160, 60);
+        assert!(screen.contains("server-postgres@0.6.2"), "{screen}");
+        assert!(screen.contains("Downloads and runs code"), "{screen}");
+        assert!(!screen.contains("SecretForMcpOnly"));
+        assert!(screen.contains("••••"));
     }
 
     #[test]

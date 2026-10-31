@@ -1523,6 +1523,17 @@ None ship by default (principle 1).
   re-sync retires (or brings back) the registry Tool. CLI `formless mcp
   tools NAME` / `mcp tool NAME TOOL --on|--off`; TUI `/mcp tools NAME`,
   `/mcp tool NAME TOOL on|off`; web Tools dialog with checkboxes.
+- **Catalog safety.** Every packaged stdio entry pins an exact npm/PyPI version.
+  Catalog lists and Add review show its command/URL and warn that stdio entries
+  download and run registry code on first use; Add requires explicit execution
+  consent. The pinned spec is retained in config and the installation audit.
+  Parameters distinguish paths, URLs and secrets. Secrets use masked inputs;
+  URL passwords, configured env/header values and known secrets are redacted
+  from server targets, errors and stderr-log views. Servers that require a
+  credential URL argument retain it in config, but never in list output.
+  Path parameters expand `~`, resolve symlinks and require an existing directory.
+  Filesystem roots, home and credential folders/ancestors require a second
+  confirmation that names the canonical folder and exposure.
 - **Catalog.** A small curated list of popular servers ships in the binary
   (`mcp_catalog.rs`: filesystem, GitHub, git, fetch, Playwright,
   PostgreSQL, Slack, memory, time, Sentry, Linear, Notion): `McpCatalog`,
@@ -1533,14 +1544,27 @@ None ship by default (principle 1).
   k=v]` (no command or URL means a catalog id); TUI `/mcp catalog`, `/mcp
   add ID [k=v]`; web Catalog dialog. Nothing is added without the user
   choosing it.
+  Secret parameters use a masked terminal/form input or CLI `--param-env
+  name=ENV`; they are rejected as literal CLI `--param` values. Noninteractive
+  catalog adds require `--yes`; broad path exposure has a separate
+  `--confirm-exposure` confirmation. The TUI review form requires `ADD`, or
+  `EXPOSE <canonical folder>` for broad folder exposure.
 - **Import.** `McpImportCandidates {cwd?}` reads Claude Desktop's
   `claude_desktop_config.json`, Cursor's `~/.cursor/mcp.json` and the
   project's `.cursor/mcp.json` and `.vscode/mcp.json` (comments allowed),
   and returns each server with its source, command or URL, env names and
   any `${…}` placeholder values it could not import, flagged when a
-  server of that name exists. Adding goes through `AddMcpServer`. CLI
-  `formless mcp import [--yes]` shows each command and asks; TUI `/mcp
-  import` lists them and `/mcp import NAME` adds one; web Import dialog.
+  server of that name exists. Candidate JSON never contains env/header values.
+  Adding uses a ten-minute opaque daemon-side candidate reference, re-reading
+  its source file and original name and rejecting changes since review.
+  Clients disclose each env/header key with a value and explain plaintext
+  `config.toml` storage; skipping values is the default and leaves env names
+  available for manual setup. CLI `formless mcp import [--yes] [--copy-secrets]`
+  shows this notice even with `--yes`; TUI `/mcp import NAME [--copy-secrets]`
+  and the web Import dialog offer the same choice. Imported servers start
+  disabled and untrusted, including import-all bundles; review their commands
+  before enabling them in config. Import-all reports server review targets
+  and successful imported Tool capability counts by family.
 - **The agent** may extend itself with the built-ins `add_mcp_server
   {name, transport, command?, args?, url?, env_keys?, reason}` and
   `remove_mcp_server {name, reason}`. Each raises an approval modal that

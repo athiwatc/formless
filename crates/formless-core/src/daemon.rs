@@ -587,6 +587,8 @@ pub struct Daemon {
     config: StdMutex<Option<(ConfigStamp, Config)>>,
     /// Owned only by `with_config_edit`, including cache publication.
     config_edit: StdMutex<()>,
+    mcp_import_candidates:
+        StdMutex<HashMap<String, (std::time::Instant, crate::mcp_catalog::Candidate)>>,
     /// `SendMessage` keys seen in the last 10 minutes and their outcome.
     sent_keys: StdMutex<HashMap<SendKey, SentEntry>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
@@ -705,6 +707,7 @@ impl Daemon {
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
             config_edit: StdMutex::new(()),
+            mcp_import_candidates: StdMutex::new(HashMap::new()),
             sent_keys: StdMutex::new(HashMap::new()),
             mcp: Default::default(),
             modules: StdMutex::new(None),
@@ -2757,7 +2760,11 @@ impl Daemon {
                     .unwrap_or_default();
                 let all: Vec<&str> = text.lines().collect();
                 let n = lines.unwrap_or(50).clamp(1, 1000);
-                let tail = all[all.len().saturating_sub(n)..].to_vec();
+                let server = &cfg.mcp.servers[&name];
+                let tail = all[all.len().saturating_sub(n)..]
+                    .iter()
+                    .map(|line| crate::mcp_catalog::redact_server_text(server, line))
+                    .collect::<Vec<_>>();
                 Ok(json!({"name": name, "file": file.display().to_string(), "lines": tail}))
             }
             Request::ListMcpTools { name } => {
@@ -2827,12 +2834,73 @@ impl Daemon {
                 }
                 Ok(list)
             }
+            Request::PreviewMcpCatalog { id, params } => {
+                let entry = crate::mcp_catalog::find(&id).context("unknown catalog entry")?;
+                crate::mcp_catalog::catalog_preview(entry, &params)
+            }
+            Request::ImportMcpCandidate {
+                candidate_id,
+                skip_secrets,
+            } => {
+                let candidate = self
+                    .mcp_import_candidates
+                    .locked()
+                    .get(&candidate_id)
+                    .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(600))
+                    .map(|(_, c)| c.clone())
+                    .context("candidate expired; list and review imports again")?;
+                let current = crate::mcp_catalog::candidates(&[(
+                    candidate.source.clone(),
+                    candidate.file.clone(),
+                )])
+                .into_iter()
+                .find(|c| c.original_name == candidate.original_name)
+                .context("candidate no longer exists; review imports again")?;
+                if current != candidate {
+                    bail!("candidate changed; list and review imports again");
+                }
+                let name = current.name.clone();
+                if self.config()?.mcp.servers.contains_key(&name) {
+                    bail!("server already configured");
+                }
+                let mut server = current.server;
+                let value_keys = json!({"env":server.env.keys().collect::<Vec<_>>(), "headers":server.headers.keys().collect::<Vec<_>>()});
+                if skip_secrets {
+                    server.env_keys.extend(server.env.keys().cloned());
+                    server.env_keys.sort();
+                    server.env_keys.dedup();
+                    server.env.clear();
+                    server.headers.clear();
+                }
+                server.disabled = true;
+                server.trusted = false;
+                let mut out = self.add_mcp_server(&name, server, "user").await?;
+                out["disabled"] = json!(true);
+                out["trusted"] = json!(false);
+                out["secret_keys"] = value_keys;
+                out["secret_storage"] = json!(if skip_secrets {
+                    "Values skipped; set environment/header values yourself before enabling."
+                } else {
+                    "Literal env/header values copied to plaintext config.toml."
+                });
+                self.mcp_import_candidates.locked().remove(&candidate_id);
+                Ok(out)
+            }
             Request::AddMcpFromCatalog { id, name, params } => {
                 let entry = crate::mcp_catalog::find(&id).with_context(|| {
                     RequestFailure::not_found(format!(
                         "no catalog server '{id}' (see `formless mcp catalog`)"
                     ))
                 })?;
+                if entry.url.is_empty()
+                    && params.get("confirm_run").and_then(Value::as_bool) != Some(true)
+                {
+                    bail!(
+                        "review {} and confirm_run=true: {}",
+                        crate::mcp_catalog::target(entry),
+                        crate::mcp_catalog::CODE_WARNING
+                    );
+                }
                 let server = crate::mcp_catalog::server_config(entry, &params)?;
                 let name = name
                     .map(|n| n.trim().to_string())
@@ -2842,6 +2910,18 @@ impl Daemon {
                     return Err(anyhow!("an MCP server named '{name}' already exists"));
                 }
                 let mut out = self.add_mcp_server(&name, server, "user").await?;
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "user",
+                        if out["error"].is_null() {
+                            "mcp.catalog_install"
+                        } else {
+                            "mcp.catalog_install_failed"
+                        },
+                        &format!("{name}: {}", crate::mcp_catalog::target(entry)),
+                    )
+                });
+                out["package_spec"] = json!(crate::mcp_catalog::target(entry));
                 out["env_keys"] = json!(entry.env_keys);
                 out["needs_login"] = json!(!entry.url.is_empty());
                 Ok(out)
@@ -2853,10 +2933,18 @@ impl Daemon {
                     .context("no home directory")?;
                 let project = cwd.map(std::path::PathBuf::from);
                 let files = crate::mcp_catalog::sources(&home, project.as_deref());
+                let mut references = self.mcp_import_candidates.locked();
+                references.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(600));
+                if references.len() > 1024 {
+                    references.clear();
+                }
                 let list: Vec<Value> = crate::mcp_catalog::candidates(&files)
                     .iter()
                     .map(|c| {
                         let mut v = c.to_json();
+                        let id = uuid::Uuid::new_v4().to_string();
+                        references.insert(id.clone(), (std::time::Instant::now(), c.clone()));
+                        v["candidate_id"] = json!(id);
                         v["exists"] = json!(cfg.mcp.servers.contains_key(&c.name));
                         v
                     })
@@ -6698,6 +6786,7 @@ impl Daemon {
         // modules (Tools load them), then the rest.
         let incoming: Config = serde_json::from_value(bundle["config"].clone()).unwrap_or_default();
         let (mut providers, mut roles, mut servers) = (0, 0, 0);
+        let mut server_review = Vec::new();
         self.with_config_edit(|cfg| {
             for (k, v) in incoming.providers {
                 if !cfg.providers.contains_key(&k) {
@@ -6711,8 +6800,11 @@ impl Daemon {
                     roles += 1;
                 }
             }
-            for (k, v) in incoming.mcp.servers {
+            for (k, mut v) in incoming.mcp.servers {
                 if !cfg.mcp.servers.contains_key(&k) {
+                    v.disabled = true;
+                    v.trusted = false;
+                    server_review.push(json!({"name":k, "target":crate::mcp_catalog::safe_target(&v), "disabled":true, "trusted":false}));
                     cfg.mcp.servers.insert(k, v);
                     servers += 1;
                 }
@@ -6747,9 +6839,22 @@ impl Daemon {
         }
         let cfg = self.config()?;
         let mut tools = 0;
+        let mut capability_families = std::collections::BTreeMap::<String, usize>::new();
         for t in list("tools") {
             match self.import_one_tool(&t, &cfg).await {
-                Ok(_) => tools += 1,
+                Ok(_) => {
+                    tools += 1;
+                    for cap in t["capabilities"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        *capability_families
+                            .entry(cap.split(':').next().unwrap_or(cap).to_string())
+                            .or_default() += 1;
+                    }
+                }
                 Err(e) => failed.push(format!("tool {}: {e}", t["name"].as_str().unwrap_or("?"))),
             }
         }
@@ -6825,6 +6930,8 @@ impl Daemon {
             "tools": tools, "modules": modules, "skills": skills, "memories": memories,
             "jobs": jobs, "sessions": sessions, "providers": providers, "roles": roles,
             "mcp_servers": servers, "blanked": bundle["blanked"], "failed": failed,
+            "mcp_review": server_review, "tool_capability_families": capability_families,
+            "review_notice": "MCP servers are disabled and untrusted; inspect each command before enabling. Jobs are paused and Skills disabled.",
         }))
     }
 
@@ -11730,21 +11837,17 @@ impl Daemon {
             out.push(McpServerInfo {
                 name: name.clone(),
                 transport: if http { "http" } else { "stdio" }.into(),
-                target: if http {
-                    s.url.clone()
-                } else {
-                    std::iter::once(s.command.clone())
-                        .chain(s.args.clone())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                },
+                target: crate::mcp_catalog::safe_target(s),
                 disabled: s.disabled,
                 running: self.mcp.is_running(name).await,
                 tool_count: tools
                     .iter()
                     .filter(|t| t.name.to_lowercase().starts_with(&prefix))
                     .count(),
-                last_error: self.mcp.last_error(name),
+                last_error: self
+                    .mcp
+                    .last_error(name)
+                    .map(|e| crate::mcp_catalog::redact_server_text(s, &e)),
                 logged_in: http && crate::mcp_auth::has_login(&self.paths, name),
                 state: String::new(),
                 disabled_tools: s.disabled_tools.clone(),
@@ -11761,14 +11864,23 @@ impl Daemon {
         if cfg.mcp.servers.get(name).is_none_or(|s| s.disabled) {
             return Ok(0);
         }
-        let conn = self.mcp.connection(&self.paths, &cfg.mcp, name).await?;
-        let mut tools = conn.list_tools().await?;
-        // Tools the user turned off are left out (and so retired).
-        if let Some(s) = cfg.mcp.servers.get(name) {
-            tools.retain(|t| !s.disabled_tools.contains(&t.name));
+        let result: Result<usize> = async {
+            let conn = self.mcp.connection(&self.paths, &cfg.mcp, name).await?;
+            let mut tools = conn.list_tools().await?;
+            // Tools the user turned off are left out (and so retired).
+            if let Some(s) = cfg.mcp.servers.get(name) {
+                tools.retain(|t| !s.disabled_tools.contains(&t.name));
+            }
+            self.with_store(|st| crate::mcp::sync_registry(st, name, &tools))?;
+            Ok(tools.len())
         }
-        self.with_store(|st| crate::mcp::sync_registry(st, name, &tools))?;
-        Ok(tools.len())
+        .await;
+        result.map_err(|e| {
+            anyhow!(crate::mcp_catalog::redact_server_text(
+                &cfg.mcp.servers[name],
+                &format!("{e:#}")
+            ))
+        })
     }
 
     /// Apply artifact retention at start and then hourly.

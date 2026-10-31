@@ -431,6 +431,7 @@
     $("ask-text").textContent = opts.text || "";
     $("ask-body").replaceChildren(...(opts.body ? [opts.body] : []));
     const input = $("ask-input");
+    input.type = opts.secret ? "password" : "text";
     input.classList.toggle("hidden", !opts.input);
     input.value = opts.value || "";
     input.placeholder = opts.placeholder || "";
@@ -3406,14 +3407,22 @@
     if (!list) return;
     let close = null;
     const rows = list.map((e) => h("tr", null,
-      h("td", null, h("strong", null, e.title), h("div", { class: "muted" }, e.description), h("div", { class: "muted" }, h("code", null, e.target))),
+      h("td", null, h("strong", null, e.title), h("div", { class: "muted" }, e.description), h("div", { class: "muted" }, h("code", null, e.target)), h("div", { class: "muted" }, e.execution_warning || "")),
       h("td", null, e.added ? h("span", { class: "muted" }, "added") : h("button", { class: "btn small", type: "button", onclick: async () => {
         const params = {};
         for (const p of e.params) {
-          const v = await ask({ title: e.title + ": " + p.name, text: p.description, input: true });
+          const v = await ask({ title: e.title + ": " + p.name, text: p.description, input: true, secret: p.kind === "secret" });
           if (v == null || !v.trim()) return;
           params[p.name] = v.trim();
         }
+        const preview = await act({ type: "preview_mcp_catalog", id: e.id, params });
+        if (!preview) return;
+        if (!(await ask({ title: "Review MCP command", text: preview.target + "\n" + (preview.execution_warning || "Connects to this URL."), ok: "Add and run" }))) return;
+        params.confirm_run = true;
+        for (const warning of preview.warnings || []) {
+          if (!(await ask({ title: "Confirm folder exposure", text: warning, danger: true, ok: "Expose this folder" }))) return;
+        }
+        params.confirm_exposure = true;
         const r = await act({ type: "add_mcp_from_catalog", id: e.id, params }, null, 120000);
         if (!r) return;
         note("added " + r.added + (r.error ? " — failed to start: " + r.error : " · " + r.tools + " tools"), !!r.error);
@@ -3433,9 +3442,14 @@
       h("td", null, h("strong", null, c.name), h("div", { class: "muted" }, "from " + c.source), h("div", null, h("code", null, c.target)),
         c.missing_env.length ? h("div", { class: "error" }, "not imported (placeholders): " + c.missing_env.join(", ")) : null),
       h("td", null, c.exists ? h("span", { class: "muted" }, "added") : h("button", { class: "btn small", type: "button", onclick: async (ev) => {
-        const r = await act({ type: "add_mcp_server", name: c.name, server: c.server }, null, 120000);
+        const skip = h("input", { type: "checkbox", checked: true });
+        const body = h("div", null,
+          h("p", null, "Keys with values: env " + (c.env || []).join(", ") + "; headers " + (c.headers || []).join(", ") + ". Copying values stores them in plaintext config.toml."),
+          h("label", null, skip, " Skip secrets; I'll set env/header values myself"));
+        if (!(await ask({ title: "Import " + c.name, text: c.target + "\nStarts disabled and untrusted; review before enabling.", body, ok: "Import disabled" }))) return;
+        const r = await act({ type: "import_mcp_candidate", candidate_id: c.candidate_id, skip_secrets: skip.checked }, null, 120000);
         if (!r) return;
-        ev.target.replaceWith(h("span", { class: "muted" }, r.error ? "added (failed to start)" : "added"));
+        ev.target.replaceWith(h("span", { class: "muted" }, "imported disabled and untrusted"));
         refreshSettings();
       } }, "Add"))));
     modal("Import MCP servers", h("div", null, h("p", { class: "muted" }, "Check each command before adding it: it runs on the daemon's machine."), h("table", { class: "table" }, h("tbody", null, rows))));
