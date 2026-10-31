@@ -801,7 +801,11 @@ pasting paths.
   fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
   root once and caches it for 30 s. The walk respects `.gitignore`, skips
   hidden directories and `target`, `node_modules`, `dist`, `build`,
-  `__pycache__` and `venv`, and stops at 200,000 entries. An empty query
+  `__pycache__` and `venv`, and stops at 200,000 entries. Directory
+  symlinks are followed only when their canonical target stays inside
+  the canonical walk root and does not enter hidden/build directories;
+  loops are skipped. Linked directories have size zero and their
+  in-root children can be completed through the link's path. An empty query
   lists the top level, and `dir/` lists that directory, so paths complete
   step by step. Tab or Enter inserts `@path`. On send, each `@path`
   mention that names an existing file or directory goes through
@@ -2835,7 +2839,10 @@ run_tool = "network_policy"     # a registry Tool, or…
     path by whole components (`/proj` never covers `/proj-secrets`),
     after resolving symlinks on both sides (a file not written yet is
     resolved through its parent); `/` and the home folder (or above) are
-    never offered or accepted. Anything else is refused: the exact path
+    never offered or accepted as wider scopes. Home comes from the OS
+    directory API, with canonical forms compared on both sides, including
+    on Windows without `HOME`. If home cannot be resolved safely, wider
+    choices are omitted and widening is refused. Anything else is refused: the exact path
     is granted, the user is told in a note, and `tool.widen_refused` is
     logged. A widened grant is logged as `tool.approve_widened` with its
     scope.
