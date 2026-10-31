@@ -2303,6 +2303,14 @@ source or missing/damaged snapshot gets a fresh copy. Names include fractional
 UTC seconds and a unique suffix. A failed checkpoint or receipt write disables
 reuse rather than sacrificing a backup or hiding the migration error.
 
+Upgrade rehearsals build genuine historical schema prefixes 1, 3, 17, 23,
+38 and 46 from pinned migration SQL, seed only columns present at that
+checkpoint, and upgrade to the build's current schema. They check retained
+rows, memory/search/Sessions-summary/usage backfills, and the old-version
+recovery snapshot. A whole-profile rehearsal also preserves an old-format
+config, private fallback key and registered artifact while the upgraded
+daemon answers Status. Reopening an upgraded profile needs no new snapshot.
+
 ### 9.5 Crash recovery
 
 - Finishing a Run isolates comparison and job bookkeeping from unrelated

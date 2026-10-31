@@ -3,6 +3,8 @@
 
 #[path = "support/env.rs"]
 mod credential_env;
+#[path = "support/historical.rs"]
+mod historical;
 
 use axum::{
     response::IntoResponse,
@@ -531,18 +533,17 @@ fn migrating_an_older_database_takes_a_backup_first() {
     let paths = temp_paths("migrate");
     let db = paths.db_file();
     {
-        let store = Store::open(&db).unwrap();
-        store.create_session(Some("keep me".into())).unwrap();
+        let old = historical::create(&db, 3);
+        old.execute_batch(
+            "INSERT INTO sessions(id,name,created_at,updated_at)
+             VALUES('historical-session','keep me','2020-01-01','2020-01-01');",
+        )
+        .unwrap();
     }
-    // Pretend the file was written by an older build.
     let user_version = |c: &rusqlite::Connection| -> i64 {
         c.query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap()
     };
-    {
-        let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute_batch("PRAGMA user_version=3;").unwrap();
-    }
     let store = Store::open(&db).unwrap();
     assert_eq!(store.list_sessions().unwrap()[0].name, "keep me");
     let backups: Vec<_> = std::fs::read_dir(db.parent().unwrap())
