@@ -1197,6 +1197,10 @@ pattern (§4.4).
   fetches ignore proxy settings (a proxy would resolve the name itself).
   IPv6 grants with a port use brackets: `net:[::1]:8080`. Denials name it: `denied: net:x resolves to 10.0.0.5, a private
   or local address; grant net:x itself to reach it`.
+- **Scope validation.** Empty `net:` and `process:` scopes are rejected.
+  Static `net:` hosts are canonicalized to lowercase (IDNA/IP spelling
+  follows URL host parsing); schemes, paths and whitespace are rejected
+  with the expected bare-host form. Input-bound hosts use the same form.
 - **Ports.** A `net` grant may carry a port (`net:api.example.com:8443`)
   and then allows that port only; a portless grant allows any. An
   input-bound URL with a non-default port binds to `host:port`, so the
@@ -1280,6 +1284,14 @@ pattern (§4.4).
     - Values live in the `tool_kv` table (schema v23). They are never
       exported in bundles, and purging a Tool deletes its own namespace.
     - Smoke tests and replay use an in-memory store that is thrown away.
+  - Rejected Promises still unhandled when `run` completes fail the
+    Invocation with the rejection message, including floating nested calls
+    and async timer callbacks. A rejection handled before completion is
+    allowed.
+  - Console formatting preserves `undefined`, BigInt (`n` suffix) and Error
+    names/messages, and replaces circular references with `[Circular]`.
+    A return value that cannot be JSON-serialized fails the Invocation with
+    `return value is not JSON-serializable`, for both sync and async `run`.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
@@ -1680,7 +1692,9 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
 - **No ambient authority, and no Capabilities.**
   - Inside the script, `tools` holds the Tools in `uses` as async
     functions (`await tools.search_repo({…})`) plus `tools.call(name,
-    input)`, which also returns a Promise.
+    input)`, which also returns a Promise. `tools.call` is always the
+    dispatcher, even when `uses` contains a Tool named `call`: invoke that
+    Tool as `tools.call("call", input)`.
   - Also available: `console`, timers, `sleep`, `JSON`, `cryptoRandom()`,
     `randomBytes()` and `requireModule` (§7.6).
   - Absent: `fetch`, `fetchChunks`, `fs`, `process`, `env`, `clipboard`,
@@ -1929,7 +1943,13 @@ it says.
   - `find_tools` before `create_tool`
   - least-privilege Capabilities (only scoped `fs:read:` for a read)
   - streaming (`*Chunks`) for large files
-  - throwing on failure, never `return {error}`
+  - throwing on failure; a returned `{error}` counts as failure unless
+    the output schema declares an `error` property for domain data. Declarations
+    may be supplied through local JSON Pointer references, `allOf`, or matching
+    `anyOf`/`oneOf` and conditional branches; nested properties and unused
+    definitions do not declare the output field. Inspection is bounded to
+    64 levels and 4096 schema values, with cyclic or unresolved branches
+    conservatively retaining the failure heuristic; no external schema is fetched
   - no hardcoded task paths, and a real input schema
   - reusing a loaded Tool
   - `env:` for API keys
@@ -3860,8 +3880,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   (`PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `*_OPTIONS`, `BASH_ENV`,
   interpreter paths, pagers and editors), which need that key's `env:`
   grant. Git under a sub-command grant (`process:git:status|log`) runs
-  with fsmonitor, pager, credential helpers, external diff and ssh
-  turned off; repository hooks and settings can still run, so `git`,
+  with fsmonitor, pager, credential helpers and ssh turned off. Scoped
+  `diff`, `log` and `show` also disable external diff and textconv drivers
+  (including when call arguments request them); repository hooks and other
+  settings can still run, so `git`,
   `find`, `tar`, build tools and versioned interpreters (`python3.11`)
   are flagged as broad when approved.
 - **Network:** `fetch` honours the `net` scope (domain allowlist when
@@ -4066,7 +4088,8 @@ yield the key (`relay`).
 ### v2.2 — Built-ins for self-expansion
 
 `find_tools` / `read_tool` / `test_tool` and lazy Tool listing (§7.1);
-honest outcomes (throw on failure, returned `{error}` counts as failure)
+honest outcomes (throw on failure; returned `{error}` counts as failure
+unless the output schema declares an `error` property for domain data)
 and inconclusive-after-stub smoke tests; async `run`; binary encodings,
 `fs` append/stat/mkdir/remove/rename, `process.run` options, response
 headers, truly streamed `fetchChunks`, scope-checked redirects (§7.5);

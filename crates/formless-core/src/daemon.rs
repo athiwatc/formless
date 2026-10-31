@@ -6030,6 +6030,7 @@ impl Daemon {
                 .join(format!("formless-dry-run-{}", uuid::Uuid::new_v4())),
         });
         let req = ExecRequest {
+            output_schema: serde_json::from_str(&ver.output_schema).ok(),
             code: ver.code.clone(),
             input,
             caps,
@@ -7055,6 +7056,7 @@ impl Daemon {
             serde_json::to_string(name)?
         );
         let req = ExecRequest {
+            output_schema: None,
             code: probe,
             input: json!({}),
             caps: Capabilities::default(),
@@ -7368,6 +7370,7 @@ impl Daemon {
         // Smoke test in the stubbed sandbox with a schema-minimal input.
         // Input-bound scopes stay as templates: the runtime stubs them.
         let req = ExecRequest {
+            output_schema: Some(d.output_schema.clone()),
             code: d.code.clone(),
             input: toolreg::minimal_input(&d.input_schema),
             caps: d.caps.clone(),
@@ -9690,6 +9693,7 @@ impl Daemon {
             });
         }
         let req = ExecRequest {
+            output_schema: None,
             code: code.clone(),
             input: input.clone(),
             caps: Capabilities::default(),
@@ -9881,6 +9885,7 @@ impl Daemon {
             artifact_dir: self.paths.data_dir.join("artifacts"),
         });
         let req = ExecRequest {
+            output_schema: Some(d.output_schema.clone()),
             code: d.code.clone(),
             input,
             caps,
@@ -10878,6 +10883,7 @@ impl Daemon {
                 artifact_dir: self.paths.data_dir.join("artifacts"),
             });
             let req = ExecRequest {
+                output_schema: serde_json::from_str(&ver.output_schema).ok(),
                 code: ver.code.clone(),
                 input: input.clone(),
                 caps,

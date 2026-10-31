@@ -22,7 +22,8 @@ const STRIPPED: &[&str] = &[
 /// Tool code for a script: `source` becomes the body of an async
 /// `run(input)`, so it may `await` and `return` at its top level. Inside
 /// it, `tools` holds only the Tools in `uses`, each an async function
-/// (`await tools.name(input)`), plus `tools.call(name, input)`. The same
+/// (`await tools.name(input)`), plus `tools.call(name, input)`. A Tool named `call` uses the dispatcher
+/// spelling `tools.call("call", input)` instead of a shorthand. The same
 /// code is what `save_as` saves as a Tool.
 pub fn script_code(source: &str, uses: &[String]) -> String {
     let uses = serde_json::to_string(uses).unwrap_or_else(|_| "[]".into());
@@ -36,8 +37,8 @@ pub fn script_code(source: &str, uses: &[String]) -> String {
          \x20 const call = (name, input) => allowed.has(String(name))\n\
          \x20   ? t.call(name, input)\n\
          \x20   : Promise.reject(new Error(\"'\" + name + \"' is not in this script's uses list\"));\n\
-         \x20 const out = {{ call }};\n\
-         \x20 for (const n of __uses) out[n] = (input) => t.call(n, input);\n\
+         \x20 const out = Object.create(null, {{ call: {{ value: call, enumerable: true }} }});\n\
+         \x20 for (const n of __uses) if (n !== \"call\") out[n] = (input) => t.call(n, input);\n\
          \x20 return out;\n\
          }}\n\
          async function run(input) {{\n\
