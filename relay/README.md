@@ -31,6 +31,7 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
 | `dev.mjs` | Local stand-in for the Worker, for frontend work |
 | `push.mjs` | Payload-free Web Push signed with VAPID (shared by the Worker and `dev.mjs`) |
 | `vapid-keys.mjs` | Makes the VAPID key pair for push |
+| `conformance.mjs` | `node relay/conformance.mjs [BASE]` (one HTTP and room-frame matrix; starts `dev.mjs` without BASE, or checks e.g. `wrangler dev`) |
 | `room.test.mjs` | `node relay/room.test.mjs` (room teardown, disconnect codes, CSP) |
 | `push.test.mjs`, `push.dev-test.mjs` | `node relay/push.test.mjs` (signing), `node relay/push.dev-test.mjs` (end to end through `dev.mjs`) |
 
@@ -48,8 +49,12 @@ The `#k=` fragment is never sent to any server.
 
 ## Local development
 
-`dev.mjs` serves `web/` with the production headers and implements the
-same room semantics, so a real daemon can connect to it. With
+`dev.mjs` runs the Worker's own code: each room is `worker.js`'s
+`RelayRoom` over an in-memory stand-in for the Durable Object, and every
+HTTP request goes through the Worker's fetch handler (so `web/`, `/health`
+and `/push/key` answer exactly as in production, headers included). Only
+the WebSocket framing (masked frames required, 64 MB cap, closes echoed)
+and the mock provider are its own. A real daemon can connect to it. With
 `--mock-provider` it also serves a scripted OpenAI-compatible endpoint
 that streams reasoning, creates and calls a Tool (triggering the
 approval dialog), and answers in Markdown. Send `markdown demo` to get a
