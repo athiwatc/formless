@@ -67,3 +67,245 @@ fn the_image_and_packages_carry_what_they_need() {
     let release = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
     assert!(release.contains("needs: [build, linux, linux-install-test, docker]"));
 }
+
+fn sh() -> &'static str {
+    if Path::new("/bin/dash").exists() {
+        "/bin/dash"
+    } else {
+        "/bin/sh"
+    }
+}
+
+/// A release whose tag is not the Cargo.toml version is refused before
+/// any build; the real tag for this tree passes (#842).
+#[cfg(unix)]
+#[test]
+fn release_tags_must_match_the_cargo_version() {
+    let check = root().join("scripts/release-check.sh");
+    let run = |tag: &str, manifest: &Path| {
+        std::process::Command::new(sh())
+            .arg(&check)
+            .arg(tag)
+            .arg(manifest)
+            .output()
+            .unwrap()
+    };
+    let real = root().join("Cargo.toml");
+    let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+    assert!(run(&tag, &real).status.success(), "{tag} matches");
+    let wrong = run("v99.0.0", &real);
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not match"));
+    assert!(
+        !run(env!("CARGO_PKG_VERSION"), &real).status.success(),
+        "the v is required"
+    );
+
+    let release = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
+    assert!(release.contains("scripts/release-check.sh \"$GITHUB_REF_NAME\""));
+    for job in ["build:", "linux:", "docker:"] {
+        let at = release.find(&format!("\n  {job}")).unwrap();
+        assert!(
+            release[at..at + 200].contains("needs: version-check"),
+            "{job} waits for the check"
+        );
+    }
+    assert!(
+        release.contains("generate_release_notes: true")
+            && release.contains("body_path: release-notes.md")
+    );
+
+    let dir = std::env::temp_dir().join(format!("fl-notes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cl = dir.join("CHANGELOG.md");
+    std::fs::write(&cl, "## [Unreleased]\n- next\n\n## [0.2.0] - 2026-01-01\n\n### Fixed\n- a bug\n\n## [0.1.0]\n- first\n").unwrap();
+    let notes = std::process::Command::new(sh())
+        .arg(root().join("scripts/release-notes.sh"))
+        .args(["v0.2.0", cl.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&notes.stdout),
+        "### Fixed\n- a bug\n\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// install.sh under dash with only sha256sum (no shasum) on PATH: accepts
+/// a version without the v, replaces the binary atomically, leaves the old
+/// one intact when verification fails, and checks HOME/PREFIX first (#840).
+#[cfg(unix)]
+#[test]
+fn install_script_is_atomic_and_preflights() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let which = |tool: &str| {
+        [
+            "/bin",
+            "/usr/bin",
+            "/sbin",
+            "/usr/sbin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+        ]
+        .iter()
+        .map(|d| Path::new(d).join(tool))
+        .find(|p| p.exists())
+    };
+    let Some(sha256sum) = which("sha256sum") else {
+        eprintln!("skipped: no sha256sum on this machine");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("fl-install-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bin = dir.join("path");
+    std::fs::create_dir_all(&bin).unwrap();
+    // Everything the script uses, except shasum.
+    for tool in [
+        "sh", "curl", "tar", "gzip", "mkdir", "cp", "chmod", "mv", "rm", "sed", "head", "cat",
+        "dirname", "basename", "mktemp", "uname",
+    ] {
+        if let Some(p) = which(tool) {
+            symlink(p, bin.join(tool)).unwrap();
+        }
+    }
+    symlink(&sha256sum, bin.join("sha256sum")).unwrap();
+
+    // A fake release v0.9.0 for a made-up target.
+    let release = dir.join("releases/v0.9.0");
+    let pkg = dir.join("build/formless-v0.9.0-test-target");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::create_dir_all(&release).unwrap();
+    std::fs::write(pkg.join("formless"), "#!/bin/sh\necho new\n").unwrap();
+    std::fs::write(pkg.join("formless.1"), ".TH FORMLESS 1\n").unwrap();
+    let asset = "formless-v0.9.0-test-target.tar.gz";
+    assert!(std::process::Command::new("tar")
+        .args([
+            "-czf",
+            release.join(asset).to_str().unwrap(),
+            "formless-v0.9.0-test-target"
+        ])
+        .current_dir(dir.join("build"))
+        .status()
+        .unwrap()
+        .success());
+    let sum = std::process::Command::new(&sha256sum)
+        .arg(asset)
+        .current_dir(&release)
+        .output()
+        .unwrap();
+    std::fs::write(release.join(format!("{asset}.sha256")), &sum.stdout).unwrap();
+
+    let prefix = dir.join("prefix");
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    let target = prefix.join("bin/formless");
+    std::fs::write(&target, "#!/bin/sh\necho old\n").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let install = |envs: &[(&str, &str)], prefix: Option<&Path>| {
+        let mut c = std::process::Command::new(sh());
+        c.arg(root().join("scripts/install.sh"))
+            .env_clear()
+            .env("PATH", &bin)
+            .env("HOME", dir.join("home"))
+            .env("FORMLESS_TARGET", "test-target")
+            .env(
+                "FORMLESS_RELEASES_URL",
+                format!("file://{}", dir.join("releases").display()),
+            );
+        if let Some(p) = prefix {
+            c.env("PREFIX", p);
+        }
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+
+    // A broken checksum: refused, the old binary untouched, nothing left.
+    let good_sum = std::fs::read(release.join(format!("{asset}.sha256"))).unwrap();
+    std::fs::write(
+        release.join(format!("{asset}.sha256")),
+        format!("{}  {asset}\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let out = install(&[("FORMLESS_VERSION", "0.9.0")], Some(&prefix));
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("checksum mismatch"),
+        "{out:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "#!/bin/sh\necho old\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(prefix.join("bin")).unwrap().count(),
+        1,
+        "no temp files left"
+    );
+
+    // The real checksum, a version without its v: installed.
+    std::fs::write(release.join(format!("{asset}.sha256")), good_sum).unwrap();
+    let out = install(&[("FORMLESS_VERSION", "0.9.0")], Some(&prefix));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "#!/bin/sh\necho new\n"
+    );
+    assert!(prefix.join("share/man/man1/formless.1").exists());
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+    assert_eq!(mode & 0o111, 0o111, "executable");
+
+    // No HOME and no PREFIX: a clear error, not an unbound variable.
+    let out = std::process::Command::new(sh())
+        .arg(root().join("scripts/install.sh"))
+        .env_clear()
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("HOME is not set"),
+        "{out:?}"
+    );
+
+    // An unwritable PREFIX is found before downloading anything.
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(locked.join("bin")).unwrap();
+    std::fs::set_permissions(locked.join("bin"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = install(
+        &[
+            ("FORMLESS_VERSION", "v0.9.0"),
+            ("FORMLESS_RELEASES_URL", "file:///nonexistent"),
+        ],
+        Some(&locked),
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not writable"),
+        "{out:?}"
+    );
+    std::fs::set_permissions(locked.join("bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // A rate-limited release lookup says so.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut s in listener.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let latest = format!("http://{addr}/latest");
+    let out = install(&[("FORMLESS_LATEST_URL", latest.as_str())], Some(&prefix));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("HTTP 403"),
+        "{out:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

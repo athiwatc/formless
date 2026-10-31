@@ -6,10 +6,15 @@ platform app-dirs (SPEC §9.4).
 
 ## Cutting a release
 
-1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`).
-2. Run `cargo test --workspace --locked`.
+1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`), and
+   move the `CHANGELOG.md` entries under `## [X.Y.Z] - date`.
+2. Run `cargo test --workspace --locked`, and
+   `scripts/release-check.sh vX.Y.Z`.
 3. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. `.github/workflows/release.yml` then:
+   - first checks the tag names the Cargo.toml version
+     (`scripts/release-check.sh`) and stops before any build if not, so
+     asset names, `formless --version` and `formless update` agree;
    - builds macOS (arm64/x86_64) and Windows (x86_64) archives with
      SHA-256 files;
    - builds the Linux archive, `.deb` and `.rpm` (`cargo-deb`,
@@ -25,7 +30,10 @@ platform app-dirs (SPEC §9.4).
      fails;
    - renders the Homebrew formula and AUR `PKGBUILD` for the version
      (`scripts/render-packaging.sh`, which fails on a missing checksum or
-     an unfilled placeholder) and attaches them to the GitHub Release;
+     an unfilled placeholder) and attaches them to the GitHub Release,
+     whose notes (what `formless update` shows) are the version's
+     `CHANGELOG.md` section (`scripts/release-notes.sh`) followed by
+     GitHub's generated list of changes;
    - publishes to the tap, winget and the AUR **only when their secrets
      exist** (below), each on its own: one failing doesn't stop the
      others, the job summary lists each channel's result, and a re-run
