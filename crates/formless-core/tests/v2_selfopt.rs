@@ -3,6 +3,8 @@
 
 #[path = "support/env.rs"]
 mod credential_env;
+#[path = "support/historical.rs"]
+mod historical;
 
 use formless_core::optimiser::{
     proposal_beats_baseline, scenario_cases, significant_improvement, wilson_interval,
@@ -199,14 +201,12 @@ fn applied_memory_proposals_migrate_into_the_memory_store() {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let db = std::path::PathBuf::from(format!("/tmp/fl-memmig-{short}/f.db"));
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-    drop(Store::open(&db).unwrap());
     {
         // As an older build left it: an applied memory proposal, schema v17.
-        let c = rusqlite::Connection::open(&db).unwrap();
+        let c = historical::create(&db, 17);
         c.execute_batch(
             "INSERT INTO prompt_proposals(id,kind,content,rationale,status,est_tokens,created_at,applied_at)
-               VALUES('p1','memory','Prefers tabs.','x','applied',1,'2026-01-01','2026-01-02');
-             PRAGMA user_version=17;",
+               VALUES('p1','memory','Prefers tabs.','x','applied',1,'2026-01-01','2026-01-02');",
         )
         .unwrap();
     }
