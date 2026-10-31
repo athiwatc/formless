@@ -2,6 +2,9 @@
 //! fair smoke tests, process/fs/fetch primitives with binary data, async
 //! Tools, and lazy Tool loading via find_tools/read_tool/test_tool.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::daemon::Daemon;
 use formless_core::storage::Store;
 use formless_core::tools as toolreg;
@@ -15,6 +18,7 @@ use std::sync::Arc;
 
 fn exec(code: &str, input: Value, caps: &[&str], mode: HostMode) -> Result<Value, ExecError> {
     let req = ExecRequest {
+        output_schema: None,
         code: code.to_string(),
         input,
         caps: Capabilities::parse(&caps.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
@@ -43,6 +47,7 @@ fn temp_dir(tag: &str) -> String {
 
 #[test]
 fn returned_error_counts_as_failure() {
+    let _env = credential_env::EnvGuard::isolated();
     let e = live(
         "function run(){ return {error: 'disk on fire'}; }",
         json!({}),
@@ -62,6 +67,7 @@ fn returned_error_counts_as_failure() {
 
 #[test]
 fn async_run_resolves_and_rejects() {
+    let _env = credential_env::EnvGuard::isolated();
     let out = live(
         "async function run(i){ const x = await Promise.resolve(i.n); return {n: x + 1}; }",
         json!({"n": 1}),
@@ -88,6 +94,7 @@ fn async_run_resolves_and_rejects() {
 #[cfg(unix)]
 #[test]
 fn process_scope_matches_the_real_binary_only() {
+    let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("proc");
     let fake = format!("{dir}/ls");
     std::fs::copy("/bin/ls", &fake).unwrap();
@@ -106,6 +113,7 @@ fn process_scope_matches_the_real_binary_only() {
 #[cfg(unix)]
 #[test]
 fn process_run_takes_cwd_stdin_env_and_binary_output() {
+    let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("procopt");
     let out = live(
         &format!(
@@ -130,6 +138,7 @@ fn process_run_takes_cwd_stdin_env_and_binary_output() {
 
 #[test]
 fn fs_primitives_cover_binary_nested_and_metadata() {
+    let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("fsops");
     let w = format!("fs:write:{dir}");
     let r = format!("fs:read:{dir}");
@@ -186,6 +195,7 @@ fn fs_primitives_cover_binary_nested_and_metadata() {
 #[cfg(unix)]
 #[test]
 fn fs_refuses_dangling_symlink_escape() {
+    let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("dangle");
     let outside = temp_dir("dangle-out");
     std::os::unix::fs::symlink(format!("{outside}/target.txt"), format!("{dir}/link")).unwrap();
@@ -204,6 +214,7 @@ fn fs_refuses_dangling_symlink_escape() {
 
 #[test]
 fn read_chunks_never_split_utf8() {
+    let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("utf8");
     let text = "héllo wörld € 😀 ".repeat(50);
     std::fs::write(format!("{dir}/t.txt"), &text).unwrap();
@@ -222,6 +233,7 @@ fn read_chunks_never_split_utf8() {
 
 #[test]
 fn overlay_modes_keep_new_fs_ops_off_disk() {
+    let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("overlay");
     std::fs::write(format!("{dir}/keep.txt"), "real").unwrap();
     let out = exec(
@@ -248,6 +260,7 @@ fn overlay_modes_keep_new_fs_ops_off_disk() {
 
 #[test]
 fn smoke_failures_after_stubs_are_inconclusive() {
+    let _env = credential_env::EnvGuard::isolated();
     // Input-bound fs scope: smoke grants nothing it can't bind.
     let e = exec(
         "function run(i){ return fs.read(i.path); }",
@@ -308,6 +321,7 @@ async fn http_fixture() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_headers_binary_streaming_and_scoped_redirects() {
+    let _env = credential_env::EnvGuard::isolated();
     let base = http_fixture().await;
     let run = move |code: String| {
         tokio::task::spawn_blocking(move || live(&code, json!({}), &["net:127.0.0.1"]))
@@ -344,6 +358,7 @@ async fn fetch_headers_binary_streaming_and_scoped_redirects() {
 /// like a browser's, credentials stay on their host, loops are cut off.
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_redirect_hops_follow_browser_rules() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         http::{HeaderMap, Method},
         response::Redirect,
@@ -434,6 +449,7 @@ fn names(defs: &[Value]) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn large_registries_load_tools_lazily_through_find_tools() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("lazy");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -541,6 +557,7 @@ async fn large_registries_load_tools_lazily_through_find_tools() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn read_tool_and_test_tool() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("rt");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -616,6 +633,7 @@ async fn read_tool_and_test_tool() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_tool_accepts_generic_tools_and_rejects_real_bugs() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("ct");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -663,6 +681,7 @@ async fn create_tool_accepts_generic_tools_and_rejects_real_bugs() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_calls_still_need_approval_for_sensitive_tools() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("appr");
     let mut cfg = Config::default();
     cfg.security.secure = true;
@@ -711,7 +730,8 @@ async fn subagent_provider() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sub_agents_cannot_recurse_past_the_depth_limit() {
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("depth");
     let cfg = Config {
         provider: formless_core::config::ProviderCfg {
@@ -764,6 +784,7 @@ async fn sub_agents_cannot_recurse_past_the_depth_limit() {
 /// lands elsewhere (prompt-cache prefix), until its pin is refreshed.
 #[test]
 fn listed_tool_definitions_are_pinned_per_session() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = Store::open_in_memory().unwrap();
     let schema = |field: &str| {
         format!(r#"{{"type":"object","properties":{{"{field}":{{"type":"string"}}}}}}"#)
@@ -812,6 +833,7 @@ fn listed_tool_definitions_are_pinned_per_session() {
 /// already does the job (the keyword matcher misses most of these).
 #[test]
 fn bm25_search_finds_tools_by_meaning_not_exact_words() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = Store::open_in_memory().unwrap();
     let tools = [
         (
@@ -898,6 +920,7 @@ fn bm25_search_finds_tools_by_meaning_not_exact_words() {
 /// Tool; the per-Session cap drops the oldest loaded Tools first.
 #[test]
 fn session_tools_unload_at_compaction_and_respect_the_cap() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = Store::open_in_memory().unwrap();
     let mut ids = Vec::new();
     for name in ["alpha", "beta", "gamma", "delta"] {
@@ -948,6 +971,7 @@ fn session_tools_unload_at_compaction_and_respect_the_cap() {
 /// long-lived Session sees Tools that became popular later.
 #[test]
 fn filler_is_repicked_after_compaction() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = Store::open_in_memory().unwrap();
     let make = |name: &str| {
         store
@@ -994,6 +1018,7 @@ fn filler_is_repicked_after_compaction() {
 /// before versioning one, instead of rewriting it from memory.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_can_find_and_read_modules() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("readmod");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -1041,6 +1066,7 @@ async fn agent_can_find_and_read_modules() {
 /// other Sessions' artifacts stay out of reach.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_reads_its_own_artifacts_by_id() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("readart");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -1082,6 +1108,7 @@ async fn agent_reads_its_own_artifacts_by_id() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn read_tool_and_protocol_return_version_diffs() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("tooldiff");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -1116,6 +1143,7 @@ async fn read_tool_and_protocol_return_version_diffs() {
 /// With nobody to approve, an agent cannot add or remove MCP servers.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_mcp_server_changes_fail_closed_headless() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("mcpheadless");
     Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();

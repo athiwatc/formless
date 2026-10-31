@@ -14,7 +14,7 @@ use crate::Paths;
 /// bootstrap prompt and the optimiser so they never drift apart.
 macro_rules! host_api_doc {
     () => {
-        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure anyway, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding}) -> {code, signal, stdout, stderr} (no shell); tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role}) -> text; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding}) -> {code, signal, stdout, stderr} (no shell); tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role}) -> text; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
     };
 }
 pub(crate) use host_api_doc;
@@ -2784,6 +2784,7 @@ mod tests {
     /// ones, and Ollama gets the context Formless budgets for (#622).
     #[test]
     fn extra_body_merges_and_ollama_gets_num_ctx() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let mut cfg = ProviderCfg {
             base_url: "http://localhost:11434/v1".into(),
             context_tokens: 32000,
@@ -2818,6 +2819,7 @@ mod tests {
 
     #[test]
     fn usage_reads_reported_cost_and_cache_writes() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let u = Usage::parse(&json!({"prompt_tokens": 9213, "completion_tokens": 3,
             "cost": 0.0020006,
             "prompt_tokens_details": {"cached_tokens": 9203, "cache_write_tokens": 10}}))
@@ -2833,6 +2835,7 @@ mod tests {
 
     #[test]
     fn responses_input_keeps_the_preamble_before_tool_calls() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let items = responses_input(&[json!({"role": "assistant", "content": "Let me check.",
             "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]})]);
         assert_eq!(items.len(), 2);
@@ -2846,6 +2849,7 @@ mod tests {
 
     #[test]
     fn cache_breakpoints_mark_the_system_prompt_and_last_stable_text() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let msgs = [
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "q"}),
@@ -2867,6 +2871,7 @@ mod tests {
 
     #[test]
     fn model_windows_come_from_the_listing() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let w = parse_model_windows(&json!({"data": [
             {"id": "a", "context_length": 1_000_000},
             {"id": "b", "max_model_len": 32768},
@@ -2881,6 +2886,7 @@ mod tests {
 
     #[test]
     fn history_keeps_the_preamble_on_tool_call_turns() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let m = formless_protocol::MessageInfo {
             role: "assistant".into(),
             content: "Let me check the file first.".into(),
@@ -2906,6 +2912,7 @@ mod tests {
 
     #[test]
     fn gpt_family_gets_the_tool_use_addendum() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         for m in [
             "gpt-4.1",
             "openai/gpt-5-mini",
@@ -2929,6 +2936,7 @@ mod tests {
 
     #[test]
     fn detects_access_refusals() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         for t in [
             "I can't access files on your computer.",
             "I don\u{2019}t have access to the internet, but here is what I know.",
@@ -2948,6 +2956,7 @@ mod tests {
 
     #[test]
     fn retry_hints_are_parsed_from_headers() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         use reqwest::header::{HeaderMap, HeaderValue};
         let mut h = HeaderMap::new();
         assert_eq!(retry_after(&h), None);
@@ -2974,6 +2983,7 @@ mod tests {
 
     #[test]
     fn backoff_has_jitter_a_cap_and_honours_the_server() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let cfg = ProviderCfg {
             max_backoff_secs: 4,
             ..Default::default()
@@ -2998,6 +3008,7 @@ mod tests {
 
     #[test]
     fn unknown_param_needs_the_reasoning_param_named() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         // Rejections of the parameter itself.
         assert!(is_unknown_param(
             r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#
