@@ -222,6 +222,93 @@ pub struct RoleCfg {
     pub max_turns: Option<u32>,
 }
 
+/// A configuration with every option set and one entry in every map and
+/// list, so the §13 documentation test sees the keys nested inside them
+/// (#851). The test fails while any value here is still null or empty: a
+/// new field must be filled in here, and so gets checked.
+#[doc(hidden)]
+pub fn documented_shape() -> Config {
+    let s = |v: &str| v.to_string();
+    let mut cfg = Config::default();
+    let p = &mut cfg.provider;
+    p.reasoning_effort = Some(s("low"));
+    p.api_key_header = Some(s("api-key"));
+    p.vision = Some(true);
+    p.extra_headers.insert(s("*"), s("v"));
+    p.aliases.insert(s("*"), s("m"));
+    p.query_params.insert(s("*"), s("1"));
+    p.model_context_tokens.insert(s("*"), 8192);
+    p.fallback_models.push(s("m"));
+    p.routing_models.push(s("m"));
+    p.routing_fast_models.push(s("m"));
+    p.routing_strong_models.push(s("m"));
+    p.prices.insert(
+        s("*"),
+        ModelPrice {
+            input: 1.0,
+            output: 2.0,
+            cached_input: Some(0.5),
+            cache_write_input: Some(1.25),
+            retrieved_at: Some(s("2026-01-01T00:00:00Z")),
+        },
+    );
+    p.auth.extra_authorize_params.insert(s("*"), s("b"));
+    p.auth.extra_token_params.insert(s("*"), s("b"));
+    cfg.compaction.model = Some(s("m"));
+    cfg.compaction.trigger_fraction = Some(0.8);
+    cfg.limits.daily_usd = Some(1.0);
+    cfg.limits.run_usd = Some(1.0);
+    cfg.limits.run_steps = Some(10);
+    cfg.optimiser.model = Some(s("m"));
+    cfg.optimiser.reasoning_effort = Some(s("low"));
+    cfg.optimiser.token_budget = Some(1000);
+    cfg.skills.model = Some(s("m"));
+    cfg.security.trusted_hosts.push(s("api.example.com"));
+    cfg.security.trusted_paths.push(s("/srv"));
+    cfg.tui.colors.insert(s("*"), s("cyan"));
+    cfg.hooks.push(HookCfg {
+        event: s("pre_tool"),
+        tool: Some(s("t")),
+        capability: Some(s("net")),
+        run_tool: Some(s("t")),
+        command: vec![s("true")],
+        trusted: true,
+        timeout_secs: Some(5),
+    });
+    cfg.mcp.servers.insert(
+        s("*"),
+        McpServerCfg {
+            transport: s("stdio"),
+            command: s("srv"),
+            args: vec![s("--x")],
+            cwd: Some(s("/srv")),
+            env: [(s("*"), s("V"))].into(),
+            env_keys: vec![s("HOME")],
+            url: s("https://mcp.example.com"),
+            headers: [(s("*"), s("v"))].into(),
+            disabled: false,
+            oauth_client_id: Some(s("c")),
+            trusted: false,
+            disabled_tools: vec![s("x")],
+        },
+    );
+    cfg.roles.insert(
+        s("*"),
+        RoleCfg {
+            description: s("d"),
+            provider: Some(s("p")),
+            model: s("m"),
+            reasoning_effort: Some(s("low")),
+            system: Some(s("s")),
+            candidates: vec![s("m")],
+            max_turns: Some(3),
+        },
+    );
+    let provider = cfg.provider.clone();
+    cfg.providers.insert(s("*"), provider);
+    cfg
+}
+
 /// The role an old global `provider.model = "auto"` migrates to.
 pub const PRIMARY_ROLE: &str = "primary";
 
@@ -506,7 +593,7 @@ pub fn setting_docs() -> BTreeMap<String, (String, String)> {
 }
 
 /// Keys about credentials: never in client-facing settings data.
-const CREDENTIAL_KEYS: &[&str] = &["provider.extra_headers", "provider.api_key_ref"];
+const CREDENTIAL_KEYS: &[&str] = &["provider.extra_headers"];
 
 /// `{key: {description, default}}` for clients: the default is the real
 /// one from `Config::default()` when it has a value, else SPEC's text.

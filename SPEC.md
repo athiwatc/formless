@@ -3605,7 +3605,6 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
 | `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit. Attachments count too: a removed one shows as expired in its message (§5.6) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
-| `provider.api_key_ref` | keychain | Key storage pointer, never plaintext (§4.2) |
 | `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |
 | `relay.url` | `wss://formless.athiwat.xyz` | Relay websocket base URL |
 | `provider.extra_headers` | {} | Free-form headers per request (§4.1) |

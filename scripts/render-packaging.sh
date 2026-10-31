@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Fill the Homebrew formula and AUR PKGBUILD for a release:
+# Fill the Homebrew formula, AUR PKGBUILD and winget manifests for a
+# release:
 #   scripts/render-packaging.sh VERSION ASSET_DIR OUT_DIR
-# ASSET_DIR holds the release's *.sha256 files. The source tarball's
-# checksum is SRC_SHA, or fetched from GitHub. winget is not rendered
-# here: winget-releaser builds each version's manifests from the last
-# published one (packaging/winget/ is the template for the first, by hand).
+# ASSET_DIR holds the release's *.sha256 files (and the Windows .zip, when
+# present, whose listing must hold the path the manifest names). The
+# source tarball's checksum is SRC_SHA, or fetched from GitHub. VERSION
+# must be the Cargo.toml version (MANIFEST, default the workspace's).
+# winget-releaser builds later versions' manifests from the last published
+# one; the rendered ones are what the first submission uses (#841).
 # Fails on a missing input or any placeholder left unfilled.
 set -euo pipefail
 version="${1:?version, e.g. 0.2.0}"
@@ -13,7 +16,9 @@ out="${3:?output directory}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || {
   echo "error: '$version' is not a version like 0.2.0" >&2; exit 1; }
-mkdir -p "$out/homebrew" "$out/aur"
+# The packages must describe the version the binaries report.
+"$root/scripts/release-check.sh" "v$version" "${MANIFEST:-$root/Cargo.toml}" >/dev/null
+mkdir -p "$out/homebrew" "$out/aur" "$out/winget"
 sha_of() {
   local f="$assets/formless-v$version-$1.$2.sha256"
   [[ -s "$f" ]] || { echo "error: missing $f" >&2; exit 1; }
@@ -22,6 +27,15 @@ sha_of() {
   echo "$sum"
 }
 linux=$(sha_of x86_64-unknown-linux-gnu tar.gz)
+windows=$(sha_of x86_64-pc-windows-msvc zip)
+# The exe sits in a folder named after the archive (Compress-Archive -Path).
+nested="formless-v$version-x86_64-pc-windows-msvc/formless.exe"
+zip="$assets/formless-v$version-x86_64-pc-windows-msvc.zip"
+if [[ -f "$zip" ]]; then
+  listing=$(unzip -Z1 "$zip" | tr '\\' '/')
+  grep -qx "$nested" <<<"$listing" \
+    || { echo "error: $zip does not hold $nested (the manifest's RelativeFilePath)" >&2; exit 1; }
+fi
 src_url="https://github.com/athiwatc/formless/archive/refs/tags/v$version.tar.gz"
 src_sha="${SRC_SHA:-$(curl -fsSL "$src_url" | shasum -a 256 | cut -d' ' -f1)}"
 [[ "$src_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no checksum for $src_url" >&2; exit 1; }
@@ -33,9 +47,15 @@ awk -v url="$src_url" -v sha="$src_sha" '
 ' "$root/packaging/homebrew/formless.rb" > "$out/homebrew/formless.rb"
 sed -e "s|@VERSION@|$version|g" -e "s|@SHA256_LINUX@|$linux|g" \
     "$root/packaging/aur/PKGBUILD.in" > "$out/aur/PKGBUILD"
+for tpl in "$root"/packaging/winget/*.yaml.in; do
+  sed -e "s|@VERSION@|$version|g" -e "s|@SHA256_WINDOWS@|$windows|g" \
+    "$tpl" > "$out/winget/$(basename "${tpl%.in}")"
+done
+grep -q "RelativeFilePath: $nested" "$out/winget/athiwatc.formless.installer.yaml" \
+  || { echo "error: the winget manifest does not name $nested" >&2; exit 1; }
 # Nothing left unfilled, and each file names this version.
-if grep -n '@[A-Z0-9_]*@' "$out/aur/PKGBUILD"; then
-  echo "error: unfilled placeholder in PKGBUILD" >&2; exit 1
+if grep -n '@[A-Z0-9_]*@' "$out/aur/PKGBUILD" "$out"/winget/*.yaml; then
+  echo "error: unfilled placeholder" >&2; exit 1
 fi
 grep -q "v$version.tar.gz" "$out/homebrew/formless.rb" \
   || { echo "error: the formula does not name v$version" >&2; exit 1; }
