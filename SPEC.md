@@ -2208,6 +2208,15 @@ such as `read_file`, `read_text_file` and `file_read`.
    `invocations(tool_id) WHERE status='running'`, `artifacts(session_id)`
    and `audit(created_at)`.
 
+Schema upgrades snapshot the database before any step, then commit each step
+and its version bump together. A failure leaves the last completed version
+and preserves existing rows. A small atomic receipt binds the failed database's
+SHA-256 fingerprint to its original pre-upgrade snapshot and that snapshot's
+SHA-256. An unchanged retry reuses this verified recovery point; a changed
+source or missing/damaged snapshot gets a fresh copy. Names include fractional
+UTC seconds and a unique suffix. A failed checkpoint or receipt write disables
+reuse rather than sacrificing a backup or hiding the migration error.
+
 ### 9.5 Crash recovery
 
 - The daemon never idle-closes mid-Run (§9.1) but can crash/be killed. On
