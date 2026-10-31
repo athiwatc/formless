@@ -94,6 +94,52 @@ pub fn hello_frame(nonce: &[u8]) -> String {
     json!({"v": FRAME_VERSION, "hello": b64.encode(nonce)}).to_string()
 }
 
+/// The value proving one side of the handshake holds the pairing key:
+/// HKDF over the key, salted with both nonces (so it is bound to this
+/// transcript), with the sender's direction as info (#904).
+pub fn confirm_tag(
+    key: &[u8; 32],
+    browser_hello: &[u8],
+    daemon_hello: &[u8],
+    from: Side,
+) -> [u8; 32] {
+    let salt = [browser_hello, daemon_hello].concat();
+    let mut tag = [0u8; 32];
+    hkdf::Hkdf::<Sha256>::new(Some(&salt), key)
+        .expand(
+            format!("formless-relay/2 confirm {}", from.direction()).as_bytes(),
+            &mut tag,
+        )
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    tag
+}
+
+/// The daemon's handshake reply: its nonce and the proof it has the key.
+pub fn daemon_hello_frame(key: &[u8; 32], browser_hello: &[u8], daemon_hello: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let tag = confirm_tag(key, browser_hello, daemon_hello, Side::Daemon);
+    json!({"v": FRAME_VERSION, "hello": b64.encode(daemon_hello), "confirm": b64.encode(tag)})
+        .to_string()
+}
+
+/// The browser's answer once it has checked the daemon's proof: its own.
+pub fn confirm_frame(key: &[u8; 32], browser_hello: &[u8], daemon_hello: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let tag = confirm_tag(key, browser_hello, daemon_hello, Side::Browser);
+    json!({"v": FRAME_VERSION, "confirm": b64.encode(tag)}).to_string()
+}
+
+/// The tag in a confirmation frame (one without a `hello`).
+pub fn parse_confirm(frame: &str) -> Option<Vec<u8>> {
+    let v: serde_json::Value = serde_json::from_str(frame).ok()?;
+    if v["v"].as_u64() != Some(FRAME_VERSION) || v.get("hello").is_some() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(v["confirm"].as_str()?)
+        .ok()
+}
+
 /// The nonce of a handshake frame, or `None` if `frame` is not one.
 pub fn parse_hello(frame: &str) -> Option<Vec<u8>> {
     let v: serde_json::Value = serde_json::from_str(frame).ok()?;
@@ -223,6 +269,10 @@ pub fn browser_url(cfg: &RelayCfg, secret: &str) -> String {
 /// (approvals fail closed and the daemon can idle-close when none are).
 struct RelayClient {
     channel: Channel,
+    /// The handshake this channel came from, so a repeated hello for it
+    /// gets the same answer instead of a new key (#904).
+    browser_hello: Vec<u8>,
+    reply: String,
     /// Distinguishes this connection's output from an earlier one for
     /// the same `cid` that is still draining.
     generation: u64,
@@ -256,6 +306,8 @@ impl RelayClient {
         });
         Self {
             channel,
+            browser_hello: Vec::new(),
+            reply: String::new(),
             generation,
             write: Some(write),
         }
@@ -308,6 +360,17 @@ impl Drop for Forget {
 /// is dropped, in case the relay never said it closed (#910).
 const CLIENT_IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// How long an unconfirmed handshake is kept.
+const HANDSHAKE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A handshake waiting for the browser's key confirmation.
+struct Pending {
+    browser_hello: Vec<u8>,
+    daemon_hello: Vec<u8>,
+    reply: String,
+    at: std::time::Instant,
+}
+
 /// Close code the relay passes to a browser whose channel broke (#905):
 /// it reconnects and handshakes again, unlike 4001 (kicked).
 pub const INTEGRITY_CLOSE: u16 = 4002;
@@ -351,6 +414,11 @@ pub async fn connect_once(
     *daemon.relay_kick.locked() = Some(kick_tx);
     let _forget = Forget(daemon.clone());
     let mut seen: HashMap<String, std::time::Instant> = HashMap::new();
+    // Handshakes that haven't been confirmed yet, per browser: a browser
+    // becomes a subscriber (and appears in the device list) only once it
+    // has proved it holds the pairing key (#904).
+    let mut pending: HashMap<String, Pending> = HashMap::new();
+    let mut agents: HashMap<String, String> = HashMap::new();
     let mut reap = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
@@ -361,6 +429,7 @@ pub async fn connect_once(
                     .filter(|(_, t)| t.elapsed() > CLIENT_IDLE)
                     .map(|(cid, _)| cid.clone())
                     .collect();
+                pending.retain(|_, p| p.at.elapsed() < HANDSHAKE_TTL);
                 for cid in stale {
                     tracing::info!("relay: dropping browser {cid}: silent for {}s", CLIENT_IDLE.as_secs());
                     seen.remove(&cid);
@@ -408,38 +477,75 @@ pub async fn connect_once(
                 match relay.as_deref() {
                     Some("client_close") => {
                         seen.remove(&cid);
+                        pending.remove(&cid);
+                        agents.remove(&cid);
                         clients.remove(&cid);
                         daemon.relay_clients.locked().remove(&cid);
                         continue;
                     }
                     Some("client_open") => {
-                        let user_agent: String = ua.unwrap_or_default().chars().take(200).collect();
-                        daemon.relay_clients.locked().insert(
-                            cid.clone(),
-                            RelayClientInfo { cid: cid.clone(), user_agent, first_seen: now.clone(), last_seen: now },
-                        );
+                        // Listed once its handshake is confirmed.
+                        agents.insert(cid.clone(), ua.unwrap_or_default().chars().take(200).collect());
                         continue;
                     }
                     _ => {}
                 }
                 if let Some(c) = daemon.relay_clients.locked().get_mut(&cid) {
-                    c.last_seen = now;
+                    c.last_seen = now.clone();
                 }
                 seen.insert(cid.clone(), std::time::Instant::now());
                 let Some(f) = f else { continue };
                 if let Some(browser_hello) = parse_hello(&f) {
-                    // A (re)handshake starts a fresh connection and key.
-                    let daemon_hello = new_hello();
-                    let channel = Channel::new(&key, &browser_hello, &daemon_hello, Side::Daemon);
-                    generation += 1;
-                    clients.insert(
-                        cid.clone(),
-                        RelayClient::open(&daemon, cid.clone(), generation, channel, out_tx.clone()),
-                    );
-                    let reply = json!({"cid": cid, "f": hello_frame(&daemon_hello)}).to_string();
+                    // The same hello again (a resend, or the relay replaying
+                    // it) gets the same answer: no new key on one side only.
+                    let known = clients
+                        .get(&cid)
+                        .filter(|c| c.browser_hello == browser_hello)
+                        .map(|c| c.reply.clone())
+                        .or_else(|| {
+                            pending.get(&cid).filter(|p| p.browser_hello == browser_hello).map(|p| p.reply.clone())
+                        });
+                    let reply = match known {
+                        Some(reply) => reply,
+                        None => {
+                            // A new handshake waits for the browser's proof;
+                            // the established channel stays until then.
+                            let daemon_hello = new_hello();
+                            let reply = json!({"cid": cid, "f": daemon_hello_frame(&key, &browser_hello, &daemon_hello)}).to_string();
+                            pending.insert(
+                                cid.clone(),
+                                Pending { browser_hello, daemon_hello: daemon_hello.to_vec(), reply: reply.clone(), at: std::time::Instant::now() },
+                            );
+                            reply
+                        }
+                    };
                     if ws_write.send(Message::Text(reply)).await.is_err() {
                         return Ok(());
                     }
+                    continue;
+                }
+                if let Some(tag) = parse_confirm(&f) {
+                    let Some(p) = pending.get(&cid) else { continue };
+                    let want = confirm_tag(&key, &p.browser_hello, &p.daemon_hello, Side::Browser);
+                    if tag != want {
+                        tracing::warn!("relay: browser {cid} failed key confirmation; ignoring its handshake");
+                        pending.remove(&cid);
+                        continue;
+                    }
+                    let p = pending.remove(&cid).expect("checked above");
+                    let channel = Channel::new(&key, &p.browser_hello, &p.daemon_hello, Side::Daemon);
+                    generation += 1;
+                    let mut client = RelayClient::open(&daemon, cid.clone(), generation, channel, out_tx.clone());
+                    client.browser_hello = p.browser_hello;
+                    client.reply = p.reply;
+                    clients.insert(cid.clone(), client);
+                    let user_agent = agents.get(&cid).cloned().unwrap_or_default();
+                    daemon.relay_clients.locked().entry(cid.clone()).or_insert(RelayClientInfo {
+                        cid: cid.clone(),
+                        user_agent,
+                        first_seen: now.clone(),
+                        last_seen: now,
+                    });
                     continue;
                 }
                 // Frames before a handshake, or for a closed browser, are dropped.
