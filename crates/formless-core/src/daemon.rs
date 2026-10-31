@@ -2902,6 +2902,12 @@ impl Daemon {
                     );
                 }
                 let server = crate::mcp_catalog::server_config(entry, &params)?;
+                let needed_env: Vec<_> = server
+                    .env_keys
+                    .iter()
+                    .filter(|key| !server.env.contains_key(*key))
+                    .cloned()
+                    .collect();
                 let name = name
                     .map(|n| n.trim().to_string())
                     .filter(|n| !n.is_empty())
@@ -2922,7 +2928,7 @@ impl Daemon {
                     )
                 });
                 out["package_spec"] = json!(crate::mcp_catalog::target(entry));
-                out["env_keys"] = json!(entry.env_keys);
+                out["env_keys"] = json!(needed_env);
                 out["needs_login"] = json!(!entry.url.is_empty());
                 Ok(out)
             }

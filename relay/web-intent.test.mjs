@@ -76,6 +76,41 @@ test('secret prompts mask their field and ordinary prompts reset the input type'
   assert.equal(c.$('ask-input').type, 'text'); assert.equal(c.$('ask-input').value, '');
   c.closeAsk('name'); await plain;
 });
+test('passwordless PostgreSQL argv authenticates through the actual pg constructor fallback', () => {
+  const base = new URL('../crates/formless-core/tests/fixtures/postgres-env/', import.meta.url);
+  const cases = JSON.parse(readFileSync(new URL('cases.json', base), 'utf8'));
+  const parserModule = { exports: {} };
+  vm.runInNewContext(readFileSync(new URL('pg-connection-string.cjs', base), 'utf8'), {
+    module: parserModule, URL,
+    require: () => { throw new Error('fixture must not read files or connect'); },
+  });
+  for (const fixture of cases) {
+    const env = { PGPASSWORD: fixture.daemon_password };
+    if (fixture.literal_password !== null) env.PGPASSWORD = fixture.literal_password;
+    const module = { exports: {} };
+    vm.runInNewContext(readFileSync(new URL('pg-connection-parameters.cjs', base), 'utf8'), {
+      module, process: { env },
+      require: name => {
+        if (name === 'pg-connection-string') return parserModule.exports;
+        if (name === './defaults') return { user: 'default-user', database: null, host: 'localhost', port: 5432, password: null, ssl: false };
+        if (name === 'dns') return { lookup() { throw new Error('no network in constructor fixture'); } };
+        throw new Error('unexpected dependency ' + name);
+      },
+    });
+    // The pinned MCP package passes argv[0] to new pg.Pool({connectionString}).
+    // A fake Pool observes that exact constructor boundary without starting it.
+    class FakePool {
+      constructor(config) { this.parameters = new module.exports(config); }
+    }
+    const fakePackage = argv => new FakePool({ connectionString: argv[0] });
+    const pool = fakePackage([fixture.argument]);
+    assert.equal(new URL(fixture.argument).password, '');
+    assert.equal(pool.parameters.password, fixture.effective_password);
+    assert.equal(pool.parameters.user, 'u');
+    assert.equal(pool.parameters.database, 'db');
+    assert.equal(pool.parameters.host, 'h');
+  }
+});
 test('file upload remains in original Session after switching', async () => {
   const wait = deferred(), calls = [];
   const c = setup(['attachFiles'], { uploadFile: async (sid, file) => { calls.push(sid); await wait.promise; return { name: file.name }; } });

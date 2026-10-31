@@ -1,0 +1,37 @@
+[
+  {
+    "input": "postgresql://u:pw@h/db",
+    "argument": "postgresql://u@h/db",
+    "literal_password": "pw",
+    "daemon_password": "ignored-daemon-password",
+    "effective_password": "pw"
+  },
+  {
+    "input": "postgresql://u:p%40ss%2Bword@h:5433/db?sslmode=require",
+    "argument": "postgresql://u@h:5433/db?sslmode=require",
+    "literal_password": "p@ss+word",
+    "daemon_password": "ignored-daemon-password",
+    "effective_password": "p@ss+word"
+  },
+  {
+    "input": "postgresql://u:ignored@h/db?password=query%20pw&sslmode=require",
+    "argument": "postgresql://u@h/db?sslmode=require",
+    "literal_password": "query pw",
+    "daemon_password": "ignored-daemon-password",
+    "effective_password": "query pw"
+  },
+  {
+    "input": "postgresql://u:userinfo@h/db?password=first&password=&application_name=review",
+    "argument": "postgresql://u@h/db?application_name=review",
+    "literal_password": "userinfo",
+    "daemon_password": "ignored-daemon-password",
+    "effective_password": "userinfo"
+  },
+  {
+    "input": "postgresql://u@h/db",
+    "argument": "postgresql://u@h/db",
+    "literal_password": null,
+    "daemon_password": "from-daemon-environment",
+    "effective_password": "from-daemon-environment"
+  }
+]

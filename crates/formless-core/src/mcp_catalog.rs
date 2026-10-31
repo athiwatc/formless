@@ -1,7 +1,7 @@
 //! A small curated catalog of popular MCP servers, and importing servers
 //! already configured in other apps (SPEC §7.9).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ pub const CATALOG: &[Entry] = &[
             description: "A connection URL, e.g. postgresql://localhost/mydb",
             kind: ParamKind::Secret,
         }],
-        env_keys: &[],
+        env_keys: &["PGPASSWORD"],
     },
     Entry {
         id: "slack",
@@ -282,7 +282,7 @@ fn prepare(e: &Entry, params: &Map<String, Value>) -> Result<(McpServerCfg, Vec<
             .iter()
             .fold(s.to_string(), |s, (k, v)| s.replace(&format!("{{{k}}}"), v))
     };
-    let cfg = if e.url.is_empty() {
+    let mut cfg = if e.url.is_empty() {
         McpServerCfg {
             transport: "stdio".into(),
             command: e.command.into(),
@@ -297,7 +297,76 @@ fn prepare(e: &Entry, params: &Map<String, Value>) -> Result<(McpServerCfg, Vec<
             ..Default::default()
         }
     };
+    if e.id == "postgres" {
+        postgres_password_env(&mut cfg)?;
+    }
     Ok((cfg, warnings))
+}
+
+/// server-postgres 0.6.2 passes this URL to pg.Pool. pg's parsed password
+/// falls back to PGPASSWORD when the URL has none; keep credentials out of argv.
+fn postgres_password_env(cfg: &mut McpServerCfg) -> Result<()> {
+    let argument = cfg.args.last_mut().context("missing PostgreSQL URL")?;
+    let mut url = reqwest::Url::parse(argument).context("invalid PostgreSQL URL")?;
+    // pg-connection-string keeps the last query value and falls back to
+    // userinfo when that value is empty. Query pairs are already percent-decoded.
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let query_password = pairs
+        .iter()
+        .filter(|(k, _)| k == "password")
+        .next_back()
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty());
+    let password = match query_password {
+        Some(value) => Some(value),
+        None => url
+            .password()
+            .map(decode_password)
+            .transpose()?
+            .filter(|v| !v.is_empty()),
+    };
+    url.set_password(None)
+        .map_err(|_| anyhow!("invalid PostgreSQL URL credentials"))?;
+    let pairs: Vec<_> = pairs
+        .into_iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("password"))
+        .collect();
+    if pairs.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    *argument = url.to_string();
+    if let Some(password) = password {
+        if password.contains('\0') {
+            bail!("PostgreSQL password cannot contain NUL");
+        }
+        cfg.env.insert("PGPASSWORD".into(), password);
+    }
+    Ok(())
+}
+
+fn decode_password(raw: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut rest = raw.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let pair = rest
+                .get(1..3)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+                .context("invalid PostgreSQL password encoding")?;
+            bytes.push(pair);
+            rest = &rest[3..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).context("invalid PostgreSQL password encoding")
 }
 
 pub fn server_config(e: &Entry, params: &Map<String, Value>) -> Result<McpServerCfg> {
@@ -709,6 +778,40 @@ mod tests {
                     && version.chars().all(|c| c.is_ascii_digit() || c == '.'),
                 "{spec}"
             );
+        }
+    }
+
+    #[test]
+    fn postgres_passwords_use_private_env_and_never_process_arguments() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/postgres-env/cases.json"))
+                .unwrap();
+        for case in cases {
+            let params = Map::from_iter([("url".into(), case["input"].clone())]);
+            let cfg = server_config(find("postgres").unwrap(), &params).unwrap();
+            assert_eq!(cfg.args.last().unwrap(), case["argument"].as_str().unwrap());
+            assert_eq!(
+                cfg.env.get("PGPASSWORD").map(String::as_str),
+                case["literal_password"].as_str()
+            );
+            assert!(cfg.env_keys.iter().any(|key| key == "PGPASSWORD"));
+            let url = reqwest::Url::parse(cfg.args.last().unwrap()).unwrap();
+            assert!(url.password().is_none());
+            assert!(!url
+                .query_pairs()
+                .any(|(key, _)| key.eq_ignore_ascii_case("password")));
+        }
+        for value in [
+            "postgresql://u:%GG@h/db",
+            "postgresql://u:%ff@h/db",
+            "postgresql://u@h/db?password=%00",
+        ] {
+            assert!(server_config(
+                find("postgres").unwrap(),
+                &Map::from_iter([("url".into(), json!(value))])
+            )
+            .is_err());
         }
     }
 

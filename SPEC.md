@@ -1533,8 +1533,12 @@ None ship by default (principle 1).
   consent. The pinned spec is retained in config and the installation audit.
   Parameters distinguish paths, URLs and secrets. Secrets use masked inputs;
   URL passwords, configured env/header values and known secrets are redacted
-  from server targets, errors and stderr-log views. Servers that require a
-  credential URL argument retain it in config, but never in list output.
+  from server targets, errors and stderr-log views. The PostgreSQL catalog
+  entry removes userinfo/query passwords from its URL argument and passes the
+  decoded effective password in its private `env.PGPASSWORD` configuration.
+  Query-password precedence matches node-postgres; a passwordless URL may use
+  the daemon's explicitly passed `PGPASSWORD` instead. Literal env values remain
+  in the private plaintext config file, but never in process arguments or lists.
   Path parameters expand `~`, resolve symlinks and require an existing directory.
   Filesystem roots, home and credential folders/ancestors require a second
   confirmation that names the canonical folder and exposure.
