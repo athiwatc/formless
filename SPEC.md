@@ -2171,7 +2171,7 @@ such as `read_file`, `read_text_file` and `file_read`.
   only. If the previous Session was deleted, its text/files stay in that
   Session's draft and never move into a replacement Session. A newer
   RunPaused event retains its explanation and Resume banner over a stale
-  snapshot. An interrupted pre-send attachment upload restores the original
+  snapshot. An interrupted or timed-out pre-send attachment upload restores the original
   Session's text/files for review without automatically sending them; a
   newer draft remains untouched until its input is empty. It notes how long
   it was away. It clears the old daemon's

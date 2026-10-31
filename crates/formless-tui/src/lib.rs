@@ -1890,11 +1890,7 @@ impl App {
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
         self.restore_unsent_draft();
-        if let Some(send) = self.pending_send.take() {
-            self.interrupted_attachment_sends.push_back(send);
-            self.notes.push("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.".into());
-        }
-        self.restore_attachment_drafts();
+        self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
         self.sends.disconnected();
         self.clear_attention();
         self.client = None;
@@ -2252,6 +2248,9 @@ impl App {
             if matches!(kind, Pending::ReconnectSession) {
                 self.reconnect_read_failed(id);
             }
+            if matches!(kind, Pending::MentionAttach) {
+                self.interrupt_attachment_send("Attachment upload timed out before sending; its text/files are kept for review, never sent automatically.");
+            }
             if matches!(kind, Pending::SaveSetting) {
                 if let Some(key) = self.settings_saving.take() {
                     self.settings_error = Some((key, "no answer from the daemon".into()));
@@ -2287,6 +2286,24 @@ impl App {
         if !draft.input.is_empty() || !draft.attachments.is_empty() {
             self.drafts.insert(session_id.to_string(), draft);
         }
+    }
+
+    /// Cancel the attachment stage without sending, retaining its draft and
+    /// bytes for review and ignoring any late attachment acknowledgements.
+    fn interrupt_attachment_send(&mut self, note: &str) {
+        if let Some(send) = self.pending_send.take() {
+            self.interrupted_attachment_sends.push_back(send);
+            self.notes.push(note.into());
+        }
+        // Every outstanding attachment belongs to this interrupted stage.
+        // Forget all its request identities so a late reply cannot decrement
+        // the waiting count of a later message's attachment stage.
+        self.pending
+            .retain(|_, kind| *kind != Pending::MentionAttach);
+        let pending = &self.pending;
+        self.pending_since
+            .retain(|request, _| pending.contains_key(request));
+        self.restore_attachment_drafts();
     }
 
     /// Recovery only fills empty inputs. If newer text occupies a Session's
@@ -16538,6 +16555,80 @@ mod tests {
                 .try_iter()
                 .map(|line| serde_json::from_str::<RequestEnvelope>(&line).unwrap())
                 .all(|request| !matches!(request.request, Request::SendMessage { .. })));
+        }
+    }
+
+    #[test]
+    fn an_attachment_timeout_restores_the_draft_online_and_ignores_late_replies() {
+        for newer_input in [false, true] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            let files = vec![("one.bin".into(), vec![1]), ("two.bin".into(), vec![2])];
+            app.input.set("keep this attachment draft");
+            app.attachments = files.clone();
+            app.submit_chat(false);
+            let requests: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert_eq!(requests.len(), 2);
+            assert!(requests
+                .iter()
+                .all(|request| matches!(request.request, Request::AttachFile { .. })));
+            if newer_input {
+                app.input.set("newer text must survive");
+            }
+            // Only the first upload expires. The other is still in flight,
+            // and the socket remains open throughout recovery.
+            app.pending_since.insert(
+                requests[0].id,
+                Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+            );
+            app.drain_daemon();
+            assert!(app.offline.is_none() && app.client.is_some() && app.inbox.is_some());
+            assert!(app.pending_send.is_none());
+            assert!(requests.iter().all(|request| {
+                !app.pending.contains_key(&request.id)
+                    && !app.pending_since.contains_key(&request.id)
+            }));
+            if newer_input {
+                assert_eq!(app.input.expanded(), "newer text must survive");
+                assert_eq!(app.interrupted_attachment_sends.len(), 1);
+                app.input.clear();
+                app.drain_daemon();
+            }
+            assert_eq!(app.input.expanded(), "keep this attachment draft");
+            assert_eq!(app.attachments, files);
+            assert!(app.interrupted_attachment_sends.is_empty());
+            assert!(sent.try_recv().is_err(), "timeout does not send the draft");
+
+            // Start a fresh upload, then deliver both old replies. Neither
+            // acknowledgement may complete this new stage or send a message.
+            app.input.set("a fresh attachment draft");
+            app.attachments = vec![("fresh.bin".into(), vec![3])];
+            app.submit_chat(false);
+            let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(fresh.request, Request::AttachFile { .. }));
+            for request in requests {
+                tx.send(ServerMessage::Response {
+                    id: request.id,
+                    ok: true,
+                    result: Some(serde_json::json!({"attached":true})),
+                    error: None,
+                })
+                .unwrap();
+            }
+            app.drain_daemon();
+            assert!(app.offline.is_none());
+            assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+            assert!(app.pending.contains_key(&fresh.id));
+            assert!(
+                sent.try_recv().is_err(),
+                "late replies never send a message"
+            );
         }
     }
 
