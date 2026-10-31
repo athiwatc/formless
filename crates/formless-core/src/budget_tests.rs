@@ -496,6 +496,7 @@ async fn unpriced_aggregate_retains_existing_dollar_limit_semantics() {
     let (_root, _paths, mut cfg, daemon, server) =
         setup(&env, mock.clone(), Some(0.01), false).await;
     cfg.provider.prices.clear();
+    cfg.save(&daemon.paths).unwrap();
     let provider = daemon.provider(&cfg).await.unwrap();
     let messages = [json!({"role":"user","content":"work"})];
     for _ in 0..2 {
@@ -636,4 +637,109 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
         server.abort();
         let _ = server.await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_admission_reloads_live_limit_before_dispatch() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mock = Mock::new(true, false);
+    let (_root, _paths, cfg, daemon, server) = setup(&env, mock.clone(), Some(5.0), true).await;
+    let start = |daemon: Arc<Daemon>, cfg: Config| {
+        tokio::spawn(async move {
+            let provider = daemon.provider(&cfg).await.unwrap();
+            counted(
+                "llm",
+                "",
+                "live-limit",
+                provider.complete_result(
+                    &[json!({"role":"user","content":"work"})],
+                    "primary",
+                    None,
+                ),
+            )
+            .await
+        })
+    };
+    let first = start(daemon.clone(), cfg.clone());
+    arrived(&mock).await;
+    let queued = start(daemon.clone(), cfg);
+    entered(&daemon, 2).await;
+    let changed = daemon
+        .handle(Request::SetSetting {
+            key: "limits.daily_usd".into(),
+            value: json!(0.50),
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed["applies"], "now");
+    mock.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let failure = tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(failure.to_string().contains("daily_usd"), "{failure:#}");
+    assert_eq!(
+        mock.posts.load(Ordering::SeqCst),
+        1,
+        "queued request used pre-wait limit"
+    );
+    teardown(daemon, server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_admission_reprices_committed_usage_with_live_prices() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mock = Mock::new(true, false);
+    let (_root, _paths, cfg, daemon, server) = setup(&env, mock.clone(), Some(5.0), true).await;
+    let start = |daemon: Arc<Daemon>, cfg: Config| {
+        tokio::spawn(async move {
+            let provider = daemon.provider(&cfg).await.unwrap();
+            counted(
+                "llm",
+                "",
+                "live-price",
+                provider.complete_result(
+                    &[json!({"role":"user","content":"work"})],
+                    "primary",
+                    None,
+                ),
+            )
+            .await
+        })
+    };
+    let first = start(daemon.clone(), cfg.clone());
+    arrived(&mock).await;
+    let queued = start(daemon.clone(), cfg);
+    entered(&daemon, 2).await;
+    daemon
+        .handle(Request::SetSetting {
+            key: "provider.prices".into(),
+            value: json!({"primary":{"input":500_000.0,"output":50_000.0}}),
+        })
+        .await
+        .unwrap();
+    mock.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let failure = tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(failure.to_string().contains("daily_usd"), "{failure:#}");
+    assert_eq!(
+        mock.posts.load(Ordering::SeqCst),
+        1,
+        "queued request used pre-wait price table"
+    );
+    teardown(daemon, server).await;
 }

@@ -925,7 +925,7 @@ impl Daemon {
                 Ok(Provider::with_key(pcfg, key, self.http.clone())
                     .with_name(n)
                     .with_usage_hook(self.usage_hook())
-                    .with_request_hook(self.request_hook(cfg))
+                    .with_request_hook(self.request_hook())
                     .with_breaker_note_hook(self.provider_breaker_note_hook()))
             }
         }
@@ -1015,7 +1015,7 @@ impl Daemon {
                 .await?
                 .with_name(crate::config::DEFAULT_PROVIDER)
                 .with_usage_hook(self.usage_hook())
-                .with_request_hook(self.request_hook(cfg))
+                .with_request_hook(self.request_hook())
                 .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
     }
@@ -1035,11 +1035,11 @@ impl Daemon {
 
     /// Admission applies to every request through either provider factory.
     /// Attribution is resolved in the active task, not at Provider construction.
-    fn request_hook(&self, cfg: &Config) -> crate::provider::RequestHook {
+    fn request_hook(&self) -> crate::provider::RequestHook {
         let admission = self.budget_admission.clone();
         let store = self.store.clone();
         let waived = self.budget_waived.clone();
-        let cfg = cfg.clone();
+        let paths = self.paths.clone();
         Arc::new(move || {
             // Read task-local attribution when polled in the caller's scope,
             // never when the Provider is constructed or on a spawned task.
@@ -1050,16 +1050,16 @@ impl Daemon {
                     session_id: String::new(),
                     run_id: String::new(),
                 });
-            let (admission, store, cfg, waived) = (
+            let (admission, store, paths, waived) = (
                 admission.clone(),
                 store.clone(),
-                cfg.clone(),
+                paths.clone(),
                 waived.clone(),
             );
             Box::pin(async move {
                 let waived = waived.locked().contains(&owner.session_id);
                 let lease = admission
-                    .enter(&store, &cfg, &owner.run_id, waived)
+                    .enter(&store, &paths, &owner.run_id, waived)
                     .await
                     .map_err(|e| anyhow::Error::new(RequestFailure::budget(e.to_string())))?;
                 Ok(Box::new(lease) as crate::provider::RequestLease)

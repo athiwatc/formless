@@ -1,7 +1,7 @@
 //! Admission for a profile's model work. One bounded lane reserves the entire
 //! remaining headroom instead of pretending an uncapped response has a known
 //! price. Completed usage must be committed before its lease is dropped.
-use crate::{Config, Store};
+use crate::{Config, Paths, Store};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,18 +24,16 @@ impl Admission {
     pub async fn enter(
         &self,
         store: &Mutex<Store>,
-        cfg: &Config,
+        paths: &Paths,
         run: &str,
         waived: bool,
     ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         if self.accounting_failed.load(Ordering::SeqCst) {
             return Err(anyhow!("budget: usage accounting failed; repair storage and restart before sending more model requests"));
         }
-        #[cfg(test)]
-        {
-            self.entered.fetch_add(1, Ordering::SeqCst);
-            self.changed.notify_one();
-        }
+        // Read-only effective configuration: no daemon/config mutex is held
+        // while waiting, and no store lock is held while reading settings.
+        let cfg = Config::load(paths)?;
         let capped = [cfg.limits.run_usd, cfg.limits.daily_usd]
             .into_iter()
             .flatten()
@@ -43,10 +41,18 @@ impl Admission {
         if !capped || waived {
             return Ok(None);
         }
+        #[cfg(test)]
+        {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_one();
+        }
         let lease = self.lane.clone().lock_owned().await;
         if self.accounting_failed.load(Ordering::SeqCst) {
             return Err(anyhow!("budget: usage accounting failed; restart after repairing storage before sending more model requests"));
         }
+        // A queued request must not retain the pre-wait limit or price table.
+        // SetSetting reports applies=now, including while another call is held.
+        let cfg = Config::load(paths)?;
         let st = store
             .lock()
             .map_err(|_| anyhow!("budget: usage store is unavailable"))?;

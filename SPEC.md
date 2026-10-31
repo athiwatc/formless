@@ -390,7 +390,8 @@ an empty listing just asks for one.
 Model requests made by a daemon share budget admission, including Run turns,
 sub-agents, nested `llm.complete` and internal model work. With a positive dollar
 limit configured, one request at a time reserves the available budget headroom;
-queued requests recheck committed usage before dispatch. This conservative lane
+queued requests recheck committed usage and reload current effective limits and
+prices after acquiring admission, so live settings changes apply before dispatch. This conservative lane
 avoids guessing provider output costs: at most one in-flight request can cross a
 limit, even across concurrent Runs sharing the UTC daily limit. It is not a hard
 provider billing cap; an individual response, failed remote attempt or cancelled
