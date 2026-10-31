@@ -1533,7 +1533,8 @@ None ship by default (principle 1).
   consent. The pinned spec is retained in config and the installation audit.
   Parameters distinguish paths, URLs and secrets. Secrets use masked inputs;
   URL passwords, configured env/header values and known secrets are redacted
-  from server targets, errors and stderr-log views. The PostgreSQL catalog
+  from server targets, security overviews, approval details, errors and
+  stderr-log views. The PostgreSQL catalog
   entry removes userinfo/query passwords from its URL argument and passes the
   decoded effective password in its private `env.PGPASSWORD` configuration.
   Query-password precedence matches node-postgres; a passwordless URL may use

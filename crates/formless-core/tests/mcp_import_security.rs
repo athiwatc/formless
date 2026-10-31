@@ -125,6 +125,17 @@ async fn copying_values_is_explicit_and_list_and_stderr_json_mask_short_password
         .unwrap()
         .to_string();
     assert!(!list.contains("pw") && !list.contains("s3cr3t") && !list.contains("header-secret"));
+    let security = daemon
+        .handle(Request::SecurityStatus)
+        .await
+        .unwrap()
+        .to_string();
+    assert!(
+        !security.contains("pw")
+            && !security.contains("s3cr3t")
+            && !security.contains("header-secret"),
+        "security overview must use the same safe targets"
+    );
     std::fs::create_dir_all(paths.data_dir.join("mcp")).unwrap();
     std::fs::write(
         paths.data_dir.join("mcp/database.log"),

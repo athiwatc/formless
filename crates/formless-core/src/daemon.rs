@@ -1961,14 +1961,7 @@ impl Daemon {
                     .servers
                     .iter()
                     .map(|(name, s)| {
-                        let target = if s.transport == "http" {
-                            s.url.clone()
-                        } else {
-                            std::iter::once(s.command.clone())
-                                .chain(s.args.iter().cloned())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        };
+                        let target = crate::mcp_catalog::safe_target(s);
                         json!({"name": name, "transport": if s.transport.is_empty() { "stdio" } else { s.transport.as_str() },
                                "target": target, "trusted": s.trusted, "disabled": s.disabled})
                     })
@@ -9687,17 +9680,11 @@ impl Daemon {
             env_keys: strings("env_keys"),
             ..Default::default()
         };
-        let target = if http {
-            format!("url: {}", server.url)
-        } else {
-            format!(
-                "command: {}",
-                std::iter::once(server.command.clone())
-                    .chain(server.args.clone())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        };
+        let target = format!(
+            "{}: {}",
+            if http { "url" } else { "command" },
+            crate::mcp_catalog::safe_target(&server)
+        );
         let mut items = vec![target.clone()];
         if !server.env_keys.is_empty() {
             items.push(format!("env: {}", server.env_keys.join(", ")));
@@ -9707,8 +9694,11 @@ impl Daemon {
                 session_id,
                 "add_mcp_server",
                 items,
-                format!(
+                crate::mcp_catalog::redact_server_text(
+                    &server,
+                    &format!(
                     "The agent wants to add the MCP server '{name}'.\n{target}\nReason: {reason}"
+                ),
                 ),
                 cancel,
             )
@@ -14469,6 +14459,89 @@ async fn summarize_in_chunks(
         provider.summarize(&merged, model),
     )
     .await
+}
+
+#[cfg(test)]
+mod mcp_approval_redaction_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agent_mcp_approval_and_snapshot_redact_http_and_legacy_argv_passwords() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base =
+            std::env::temp_dir().join(format!("fl-mcp-approval-safe-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        let (tx, mut rx) = mpsc::channel(16);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx,
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gap: None,
+        });
+        for args in [
+            json!({"name":"safe-http", "transport":"http", "url":"https://u:pw@h/mcp", "reason":"connect https://u:pw@h/mcp"}),
+            json!({"name":"safe-stdio", "transport":"stdio", "command":"npx", "args":["postgresql://u:pw@h/db"], "reason":"connect postgresql://u:pw@h/db"}),
+        ] {
+            let cancel = CancellationToken::new();
+            let pending = daemon.agent_add_mcp_server(&sid, &args, &cancel);
+            let inspect_and_deny = async {
+                let (approval_id, detail) =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            let message = rx.recv().await.expect("approval subscriber closed");
+                            if let ServerMessage::Event(Event::ApprovalRequested {
+                                approval_id,
+                                detail,
+                                capabilities,
+                                ..
+                            }) = message
+                            {
+                                let detail = detail.unwrap();
+                                assert!(
+                                    !detail.contains("pw"),
+                                    "approval detail exposed a password"
+                                );
+                                assert!(
+                                    !capabilities.join(" ").contains("pw"),
+                                    "approval target exposed a password"
+                                );
+                                break (approval_id, detail);
+                            }
+                        }
+                    })
+                    .await
+                    .expect("approval was never broadcast");
+                assert!(detail.contains("REDACTED"));
+                let snapshot = daemon
+                    .handle(Request::GetSession { id: sid.clone() })
+                    .await
+                    .unwrap();
+                assert!(!snapshot["pending_events"].to_string().contains("pw"));
+                daemon
+                    .handle(Request::ApprovalDecision {
+                        approval_id,
+                        approved: false,
+                        scope: ApprovalScope::Once,
+                        paths: Default::default(),
+                        remember_denial: false,
+                    })
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(pending, inspect_and_deny);
+            assert!(result.contains("did not approve"));
+            assert!(
+                daemon.config().unwrap().mcp.servers.is_empty(),
+                "denied review must not install or start code"
+            );
+        }
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 #[cfg(test)]
