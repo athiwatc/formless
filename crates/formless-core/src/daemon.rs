@@ -836,7 +836,7 @@ impl Daemon {
                 Ok(Provider::with_key(pcfg, key, self.http.clone())
                     .with_name(n)
                     .with_usage_hook(self.usage_hook())
-                    .with_note_hook(self.provider_note_hook()))
+                    .with_breaker_note_hook(self.provider_breaker_note_hook()))
             }
         }
     }
@@ -925,11 +925,11 @@ impl Daemon {
                 .await?
                 .with_name(crate::config::DEFAULT_PROVIDER)
                 .with_usage_hook(self.usage_hook())
-                .with_note_hook(self.provider_note_hook()),
+                .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
     }
 
-    fn provider_note_hook(&self) -> crate::provider::NoteHook {
+    fn provider_breaker_note_hook(&self) -> crate::provider::NoteHook {
         let subs = self.subs.clone();
         Arc::new(move |text| {
             send_all(
@@ -4483,6 +4483,18 @@ impl Daemon {
                         },
                     );
                 }))
+                .with_note_hook({
+                    let (sid, subs) = (session_id.to_string(), self.subs.clone());
+                    Arc::new(move |text: String| {
+                        send_all(
+                            &subs,
+                            Event::Note {
+                                session_id: Some(sid.clone()),
+                                text,
+                            },
+                        );
+                    })
+                })
         };
         let requested_model = target.model.clone();
         let (context_chars, tool_count) = self.with_store(|st| {

@@ -393,6 +393,9 @@ credential digest, plus the model actually serving the request. Missing models
 open immediately; transport failures, rate limits, server errors and failed
 streams count toward the threshold. User-caused request rejections do not count.
 Only a completed response closes a breaker; receiving HTTP headers does not.
+Breaker notices use a dedicated global hook, independent of a Run's Session
+warning hook. Image-attachment warnings stay with the originating Session;
+overriding that warning hook cannot hide global breaker transitions.
 After cooldown exactly one request owns the half-open probe through response
 completion, while concurrent callers skip it. A failed probe immediately
 reopens with doubled cooldown; cancellation releases probe ownership without

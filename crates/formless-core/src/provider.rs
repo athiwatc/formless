@@ -197,8 +197,10 @@ pub struct Provider {
     /// Told before each retry wait, so clients can show "rate limited ·
     /// retrying in 8s (2/5)" instead of a plain wait (SPEC §4.4).
     on_retry: Option<RetryHook>,
-    /// Told when a model's circuit breaker opens or closes (#621).
+    /// Per-call warnings, such as an image that could not be attached.
     on_note: Option<NoteHook>,
+    /// Shared breaker transitions, independently of a Session warning hook.
+    on_breaker_note: Option<NoteHook>,
     /// Told of every request's reported usage (model, usage), so the
     /// daemon's own calls are counted too (#806).
     on_usage: Option<UsageHook>,
@@ -924,6 +926,7 @@ impl Provider {
             cache_key: None,
             on_retry: None,
             on_note: None,
+            on_breaker_note: None,
             on_usage: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
@@ -945,6 +948,7 @@ impl Provider {
             cache_key: None,
             on_retry: None,
             on_note: None,
+            on_breaker_note: None,
             on_usage: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
@@ -975,6 +979,7 @@ impl Provider {
             cache_key: None,
             on_retry: None,
             on_note: None,
+            on_breaker_note: None,
             on_usage: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
@@ -1003,9 +1008,16 @@ impl Provider {
         self
     }
 
-    /// Report breaker changes (a model skipped, back again) to `hook`.
+    /// Report per-call warnings to `hook`. Standalone callers without a
+    /// dedicated breaker hook also receive breaker transitions here.
     pub fn with_note_hook(mut self, hook: NoteHook) -> Self {
         self.on_note = Some(hook);
+        self
+    }
+
+    /// Report shared breaker transitions independently of Session warnings.
+    pub fn with_breaker_note_hook(mut self, hook: NoteHook) -> Self {
+        self.on_breaker_note = Some(hook);
         self
     }
 
@@ -1050,7 +1062,9 @@ impl Provider {
         BreakerPermit::acquire(
             self.breaker_key(model, credential),
             format!("provider '{}': {model}", self.name),
-            self.on_note.clone(),
+            self.on_breaker_note
+                .clone()
+                .or_else(|| self.on_note.clone()),
         )
     }
 
