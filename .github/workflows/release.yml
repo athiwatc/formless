@@ -7,6 +7,10 @@ permissions:
   contents: write
   packages: write
 jobs:
+  # No release workflow runs exist as of 2026-10-31, so build (60m) and
+  # smoke/install (30m) limits are provisional, not measured 2x baselines.
+  # Re-size each job from its first green cold build before treating the
+  # duration-sizing acceptance criterion as complete.
   # Before any build (#842): the tag must name the Cargo.toml version, or
   # the binaries would report another version than their release.
   version-check:
