@@ -215,12 +215,14 @@ Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Ser
 
 ### 3.2 Install
 
-**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` and puts `formless` in `$PREFIX/bin` (default `~/.local`):
+**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` (with `sha256sum` or `shasum`) and puts `formless` in `$PREFIX/bin` (default `~/.local`). It checks that `$PREFIX/bin` is writable before downloading, and replaces the binary atomically (a temp file renamed into place), so an interrupted or failed install leaves the previous version working:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh | sh
 
-# overrides: PREFIX=/usr/local, FORMLESS_VERSION=v0.1.0, FORMLESS_FROM_SOURCE=1
+# overrides: PREFIX=/usr/local, FORMLESS_VERSION=0.1.0 (or v0.1.0),
+# FORMLESS_FROM_SOURCE=1 (builds this checkout when run from one, else the
+# GitHub repository at FORMLESS_VERSION)
 ```
 
 **From source** (any platform with a toolchain):
@@ -464,7 +466,7 @@ Global flags: `--profile <name>`, `--secure` (turn approval prompts on for the d
 
 ### 3.12 Updating
 
-`formless update` lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it always fetches the latest release and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
+`formless update` lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it fetches the latest release, or `FORMLESS_VERSION`, and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
 
 ---
 
