@@ -11679,11 +11679,20 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                         ui::dim(app.color),
                     ));
                 }
-                if app.image_proto.is_some() {
+                if let Some(proto) = app.image_proto {
                     for (name, path) in image_attachments(m) {
-                        lines.push(Line::styled(format!("  🖼 {name}"), ui::dim(app.color)));
-                        image_lines.push((lines.len(), path));
-                        lines.extend((0..images::ROWS).map(|_| Line::raw("")));
+                        // Rows only for an image that will be drawn; else
+                        // the reference line says why (#881).
+                        if images::drawable(proto, &path) {
+                            lines.push(Line::styled(format!("  🖼 {name}"), ui::dim(app.color)));
+                            image_lines.push((lines.len(), path));
+                            lines.extend((0..images::ROWS).map(|_| Line::raw("")));
+                        } else {
+                            lines.push(Line::styled(
+                                format!("  🖼 {name} · can't be shown in this terminal"),
+                                ui::dim(app.color),
+                            ));
+                        }
                     }
                 }
                 if focused {

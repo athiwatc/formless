@@ -2446,10 +2446,22 @@ run_tool = "network_policy"     # a registry Tool, or…
   8-row thumbnail under their message. After each draw, thumbnails whose
   rows are all on screen are sent with the terminal's own protocol, which
   scales the image into the box: iTerm2's inline images (iTerm2,
-  WezTerm) or the kitty graphics protocol (kitty, Ghostty; PNG only).
+  WezTerm) or the kitty graphics protocol (kitty, Ghostty), which takes
+  PNG: JPEG, GIF and WebP are transcoded to a PNG thumbnail (at most
+  800 px) first. Rows are reserved only for an image that can be drawn;
+  one that can't keeps its reference line, marked "can't be shown in
+  this terminal".
   When thumbnails move, the screen is redrawn first so none linger. Other
   terminals, tmux, and `tui.inline_images = "off"` keep just the
   reference line.
+- **Mermaid diagrams (TUI).** Flowcharts, state, sequence and pie
+  diagrams are drawn in the chat; anything the renderer can't draw
+  faithfully shows its source instead of a wrong picture: other diagram
+  kinds, two-way edges (`<-->`) and cross/circle tips (`--x`, `--o`).
+  `;` splits statements except inside quotes, brackets, `|edge labels|`
+  and the text after a `:`; a subgraph's `direction` stays inside it;
+  note bodies are never states; participants may contain hyphens; a
+  labelled self-loop shows `↺ label`.
 - **Wide Mermaid diagrams (TUI).** A diagram wider than the chat shows a
   cut-down preview of its first 12 rows with the hint `/pager diagram N ·
   /open diagram N` (N is the block's `[N]` label). `/pager diagram [N]`
