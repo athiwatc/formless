@@ -2206,9 +2206,21 @@ such as `read_file`, `read_text_file` and `file_read`.
 - **Reconnecting.** When the daemon goes away (restart, crash), the TUI
   keeps the screen, Session, draft and scroll position, shows "⚠
   reconnecting to the daemon… (Ns)" in the status bar, and tries again
-  every 2 s, starting a daemon itself after 6 s. Enter keeps the typed
-  message instead of sending it into nothing. Once connected it reloads
-  the Session and notes how long it was away. It clears the old daemon's
+  every 2 s, starting a daemon itself after 6 s. Enter keeps all typed
+  input, including slash commands, with a not-sent/offline note; no
+  side-effecting command is queued or replayed. Old approvals, promotions,
+  questions and their decision state are discarded with a count. Once
+  connected it reloads the Session's authoritative running/queue/plan
+  state and global pending prompts before clearing the reconnecting banner.
+  Events arriving during that read are reconciled without replaying live
+  stream resets. Failed recovery reads keep the banner and retry reads
+  only. If the previous Session was deleted, its text/files stay in that
+  Session's draft and never move into a replacement Session. A newer
+  RunPaused event retains its explanation and Resume banner over a stale
+  snapshot. An interrupted or timed-out pre-send attachment upload restores the original
+  Session's text/files for review without automatically sending them; a
+  newer draft remains untouched until its input is empty. It notes how long
+  it was away. It clears the old daemon's
   approvals mode on disconnect and requests `Status` on every new
   connection, so Settings reports the attached daemon's mode. Until the
   reply arrives the mode is shown as unknown. The web already reconnects

@@ -193,6 +193,7 @@ enum Pending {
     UpdateModule,
     ListSessions,
     GetSession,
+    ReconnectSession,
     CreateSession,
     ForkSession,
     SearchSessions,
@@ -260,6 +261,43 @@ enum Pending {
     SaveSetting,
     SaveProviderOrRole,
     HarnessChanges,
+}
+
+fn attention_key(event: &Event) -> Option<(u8, &str)> {
+    match event {
+        Event::ApprovalRequested { approval_id, .. }
+        | Event::ApprovalAnswered { approval_id, .. }
+        | Event::ApprovalSummary { approval_id, .. } => Some((0, approval_id)),
+        Event::UserQuestion { question_id, .. } | Event::UserQuestionClosed { question_id } => {
+            Some((1, question_id))
+        }
+        Event::PromotionApprovalRequested { promotion_id, .. }
+        | Event::PromotionApprovalResolved { promotion_id } => Some((2, promotion_id)),
+        _ => None,
+    }
+}
+
+fn attention_request(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::ApprovalRequested { .. }
+            | Event::UserQuestion { .. }
+            | Event::PromotionApprovalRequested { .. }
+    )
+}
+
+fn reconnect_state_event(event: &Event) -> bool {
+    attention_key(event).is_some()
+        || matches!(
+            event,
+            Event::RunStarted { .. }
+                | Event::RunFinished { .. }
+                | Event::RunPaused { .. }
+                | Event::QueueChanged { .. }
+                | Event::PlanUpdated { .. }
+                | Event::MessageAppended { .. }
+                | Event::MessageComplete { .. }
+        )
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -391,6 +429,9 @@ struct PendingSend {
     content: String,
     mode: SendMode,
     waiting: usize,
+    /// Keep bytes until SendMessage is actually issued, so an interrupted
+    /// attachment stage can restore the user's original draft.
+    attachments: Vec<(String, Vec<u8>)>,
 }
 
 /// An open `ask_user` call (SPEC §5.5); `answers` fills as the user
@@ -1326,6 +1367,7 @@ struct App {
     mention: Option<MentionPopup>,
     /// A message waiting for its `@` attachments before it is sent.
     pending_send: Option<PendingSend>,
+    interrupted_attachment_sends: std::collections::VecDeque<PendingSend>,
     sends: client::SendTracker,
     restored_send: Option<(String, String)>,
     /// Files and pasted images for the next message, shown as chips in
@@ -1515,6 +1557,9 @@ struct App {
     tour: Option<u8>,
     /// The daemon connection was lost: (since, last reconnect attempt).
     offline: Option<(Instant, Instant)>,
+    /// The authoritative Session read required before leaving reconnect mode.
+    reconnect_request: Option<(u64, String)>,
+    reconnect_events: Vec<Event>,
     /// Step mode (`/step`) for the Session on screen, the call waiting
     /// for a decision, and whether the input holds its edited arguments.
     step_mode: bool,
@@ -1652,6 +1697,7 @@ impl App {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            interrupted_attachment_sends: Default::default(),
             sends: Default::default(),
             restored_send: None,
             attachments: Vec::new(),
@@ -1746,6 +1792,8 @@ impl App {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            reconnect_request: None,
+            reconnect_events: Vec::new(),
             seen: Seen::default(),
             tour: None,
             pull_status: None,
@@ -1784,12 +1832,20 @@ impl App {
 
     /// Initial connection and reconnect both refresh connection-specific state.
     fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
+        self.clear_attention();
+        self.pending.clear();
+        self.pending_since.clear();
+        self.reconnect_request = None;
+        self.reconnect_events.clear();
         self.daemon_secure = None;
         self.sends.disconnected();
         self.client = Some(client);
         self.inbox = Some(inbox);
-        self.request(Pending::DaemonMode, Request::Status);
-        self.request(Pending::ListSessions, Request::ListSessions);
+        self.send_request(Pending::DaemonMode, Request::Status);
+        self.send_request(Pending::ListSessions, Request::ListSessions);
+        if self.offline.is_some() {
+            self.begin_reconnect_snapshot();
+        }
     }
 
     /// `/restart-daemon`: replace the daemon and reconnect to the new one,
@@ -1801,21 +1857,13 @@ impl App {
             );
             return;
         }
-        self.client = None;
-        self.inbox = None;
-        self.daemon_secure = None;
-        // A new connection numbers its requests from 1 again: nothing from
-        // the old one may resolve against them (#884).
-        self.pending.clear();
-        self.pending_since.clear();
+        self.daemon_lost();
         let result =
             client::restart_daemon(&self.paths, false, |_| {}).and_then(|()| self.connect_daemon());
         match result {
             Ok(()) => {
-                self.notes.push("Daemon restarted.".into());
-                if let Some(id) = self.current.clone() {
-                    self.switch_session(id);
-                }
+                self.notes
+                    .push("Daemon restarted; refreshing Session state…".into());
             }
             Err(e) => self
                 .notes
@@ -1842,7 +1890,9 @@ impl App {
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
         self.restore_unsent_draft();
+        self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
         self.sends.disconnected();
+        self.clear_attention();
         self.client = None;
         self.inbox = None;
         self.daemon_secure = None;
@@ -1850,6 +1900,19 @@ impl App {
         self.pending_since.clear();
         self.activity = None;
         self.running_sessions.clear();
+        self.streaming.clear();
+        self.thinking.clear();
+        self.live_tools.clear();
+        self.queued.clear();
+        self.plan.clear();
+        self.step = None;
+        self.editing_step = false;
+        self.run_banner = None;
+        self.conn = None;
+        self.others.clear();
+        self.notifications.clear();
+        self.reconnect_request = None;
+        self.reconnect_events.clear();
         let now = Instant::now();
         self.offline = Some((now, now));
         self.notes.push("lost the daemon; reconnecting…".into());
@@ -1866,6 +1929,16 @@ impl App {
             return;
         }
         self.offline = Some((since, Instant::now()));
+        if self.client.is_some() {
+            if self.reconnect_request.is_none() {
+                if self.current.is_some() {
+                    self.begin_reconnect_snapshot();
+                } else {
+                    self.send_request(Pending::ListSessions, Request::ListSessions);
+                }
+            }
+            return;
+        }
         let start = since.elapsed() >= Duration::from_secs(6);
         let connected = if start {
             ensure_daemon(&self.paths).and_then(|()| DaemonClient::connect(&self.paths))
@@ -1874,10 +1947,98 @@ impl App {
         };
         if let Ok((client, inbox)) = connected {
             self.attach_daemon(client, inbox);
-            self.offline = None;
-            if let Some(id) = self.current.clone() {
-                self.switch_session(id);
+        }
+    }
+
+    fn clear_attention(&mut self) {
+        let count = self.approvals.len() + self.promotions.len();
+        if count > 0 {
+            self.notes
+                .push(format!("{count} approval(s) from the old daemon discarded"));
+        }
+        if !self.questions.is_empty() {
+            self.notes.push(format!(
+                "{} question(s) from the old daemon discarded",
+                self.questions.len()
+            ));
+        }
+        self.approvals.clear();
+        self.promotions.clear();
+        self.questions.clear();
+        self.approval_summaries.clear();
+        self.approval_batches.clear();
+        self.approval_scopes.clear();
+        self.scope_focus.clear();
+        self.batch_answers.clear();
+        self.broad_arm = None;
+        self.approval_code = None;
+        self.approval_explain = false;
+        self.input_focus = false;
+    }
+
+    fn begin_reconnect_snapshot(&mut self) {
+        let (Some(client), Some(session_id)) = (&self.client, self.current.clone()) else {
+            return;
+        };
+        self.reconnect_events.clear();
+        let subscribe = client.send(Request::Subscribe {
+            sessions: Some(vec![session_id.clone()]),
+            deltas: true,
+            client: Some("TUI".into()),
+        });
+        self.pending.insert(subscribe, Pending::Subscribed);
+        self.pending_since.insert(subscribe, Instant::now());
+        let id = client.send(Request::GetSession {
+            id: session_id.clone(),
+        });
+        self.pending.insert(id, Pending::ReconnectSession);
+        self.pending_since.insert(id, Instant::now());
+        self.reconnect_request = Some((id, session_id));
+    }
+
+    fn reconnect_read_failed(&mut self, id: u64) {
+        if self
+            .reconnect_request
+            .as_ref()
+            .is_some_and(|(request, _)| *request == id)
+        {
+            self.reconnect_request = None;
+            self.reconnect_events.clear();
+            if let Some((since, _)) = self.offline {
+                self.offline = Some((since, Instant::now()));
             }
+        }
+    }
+
+    fn reconnect_session_missing(&mut self, id: u64) {
+        let Some((request, session_id)) = self.reconnect_request.clone() else {
+            return;
+        };
+        if request != id {
+            return;
+        }
+        self.reconnect_read_failed(id);
+        if self.current.as_deref() == Some(session_id.as_str()) {
+            // Do not move an old Session's retained input into another Session.
+            self.stash_current_draft(&session_id);
+            self.current = None;
+            self.messages.clear();
+            self.notes.push("The previous Session is no longer available; its draft is kept. Choose a Session or use /new once reconnected.".into());
+        }
+        // A list requested before the missing-Session reply can still contain
+        // that Session. Only a fresh list may choose the replacement target.
+        self.pending
+            .retain(|_, kind| *kind != Pending::ListSessions);
+        let pending = &self.pending;
+        self.pending_since
+            .retain(|request, _| pending.contains_key(request));
+        self.send_request(Pending::ListSessions, Request::ListSessions);
+    }
+
+    fn finish_reconnect(&mut self) {
+        self.reconnect_request = None;
+        self.reconnect_events.clear();
+        if let Some((since, _)) = self.offline.take() {
             self.notes.push(format!(
                 "reconnected to the daemon after {}",
                 format_elapsed(since.elapsed())
@@ -1885,7 +2046,178 @@ impl App {
         }
     }
 
+    fn apply_reconnect_snapshot(&mut self, id: u64, result: serde_json::Value) {
+        let Some((request, session_id)) = self.reconnect_request.clone() else {
+            return;
+        };
+        if request != id {
+            return;
+        }
+        if self.current.as_deref() != Some(session_id.as_str()) {
+            self.reconnect_read_failed(id);
+            self.begin_reconnect_snapshot();
+            return;
+        }
+        // A socket alone is not recovery: all authoritative state must arrive.
+        let state = (|| -> Option<_> {
+            Some((
+                result["running"].as_bool()?,
+                serde_json::from_value::<Vec<Event>>(result["pending_events"].clone()).ok()?,
+                serde_json::from_value::<Vec<MessageInfo>>(result["messages"].clone()).ok()?,
+                serde_json::from_value::<Vec<QueuedMessage>>(result["queued_items"].clone())
+                    .ok()?,
+                serde_json::from_value::<Vec<PlanItem>>(result["plan"].clone()).ok()?,
+            ))
+        })();
+        let Some((mut running, pending, mut messages, mut queued, mut plan)) = state else {
+            self.notes
+                .push("still reconnecting: the daemon returned incomplete Session state".into());
+            self.reconnect_read_failed(id);
+            return;
+        };
+        let events = std::mem::take(&mut self.reconnect_events);
+        let mut run_banner = result["unfinished_run"].as_object().map(|run| {
+            (
+                run["status"].as_str().unwrap_or_default().to_string(),
+                run["error"].as_str().unwrap_or_default().to_string(),
+            )
+        });
+        let mut attention = Vec::<Event>::new();
+        for event in pending.into_iter().chain(events.iter().cloned()) {
+            if matches!(event, Event::ApprovalSummary { .. }) {
+                continue;
+            }
+            if let Some(key) = attention_key(&event) {
+                attention.retain(|old| attention_key(old) != Some(key));
+                if attention_request(&event) {
+                    attention.push(event);
+                }
+            }
+        }
+        // Reconcile state only. Replaying RunStarted would erase a delta that
+        // was already rendered while the snapshot request was outstanding.
+        for event in &events {
+            match event {
+                Event::RunStarted {
+                    session_id: sid, ..
+                } if sid == &session_id => {
+                    running = true;
+                    run_banner = None;
+                }
+                Event::RunFinished {
+                    session_id: sid,
+                    status,
+                    ..
+                } if sid == &session_id => {
+                    running = false;
+                    if status == "completed" {
+                        run_banner = None;
+                    } else if run_banner.is_none() {
+                        run_banner = Some((status.clone(), String::new()));
+                    }
+                }
+                Event::RunPaused {
+                    session_id: sid,
+                    error,
+                    explained,
+                    ..
+                } if sid == &session_id => {
+                    running = false;
+                    run_banner = Some((
+                        "paused".into(),
+                        explained
+                            .as_ref()
+                            .map_or_else(|| error.clone(), |why| why.message.clone()),
+                    ));
+                }
+                Event::QueueChanged {
+                    session_id: sid,
+                    queued: latest,
+                } if sid == &session_id => queued = latest.clone(),
+                Event::PlanUpdated {
+                    session_id: sid,
+                    items,
+                } if sid == &session_id => plan = items.clone(),
+                Event::MessageAppended {
+                    session_id: sid,
+                    message,
+                }
+                | Event::MessageComplete {
+                    session_id: sid,
+                    message,
+                    ..
+                } if sid == &session_id => {
+                    if let Some(old) = messages.iter_mut().find(|old| old.id == message.id) {
+                        *old = message.clone();
+                    } else {
+                        messages.push(message.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        messages.sort_by_key(|message| message.seq);
+        self.messages = messages;
+        self.md_cache.borrow_mut().clear();
+        self.queued = queued;
+        self.plan = plan;
+        self.step_mode = result["step_mode"] == true;
+        if running {
+            self.running_sessions.insert(session_id);
+        } else {
+            self.running_sessions.remove(&session_id);
+            self.activity = None;
+        }
+        self.run_banner = if running { None } else { run_banner };
+        self.clear_attention();
+        self.finish_reconnect();
+        if running && self.activity.is_none() {
+            self.set_activity("working");
+        }
+        // Attention events were held during recovery. Publish only the final
+        // pending set, once, so resolved prompts cannot reappear from a late read.
+        for event in attention {
+            self.on_event(event);
+        }
+        for event in events {
+            if let Event::ApprovalSummary {
+                ref approval_id, ..
+            } = event
+            {
+                if self
+                    .approvals
+                    .iter()
+                    .any(|pending| &pending.approval_id == approval_id)
+                {
+                    self.on_event(event);
+                }
+            }
+        }
+    }
+
     fn request(&mut self, kind: Pending, req: Request) {
+        if self.offline.is_some()
+            && !matches!(
+                &req,
+                Request::ListSessions
+                    | Request::Status
+                    | Request::ListTools
+                    | Request::ListModules
+                    | Request::ContextUsage { .. }
+                    | Request::RunMetrics { .. }
+                    | Request::SessionUsage { .. }
+                    | Request::ListInvocations
+                    | Request::Subscribe { .. }
+            )
+        {
+            self.notes
+                .push("not sent — offline; retry after reconnecting".into());
+            return;
+        }
+        self.send_request(kind, req);
+    }
+
+    fn send_request(&mut self, kind: Pending, req: Request) {
         if let Some(c) = &self.client {
             let id = c.send(req);
             self.pending.insert(id, kind);
@@ -1913,6 +2245,12 @@ impl App {
             if matches!(kind, Pending::SendMessage) {
                 self.restore_unsent_draft();
             }
+            if matches!(kind, Pending::ReconnectSession) {
+                self.reconnect_read_failed(id);
+            }
+            if matches!(kind, Pending::MentionAttach) {
+                self.interrupt_attachment_send("Attachment upload timed out before sending; its text/files are kept for review, never sent automatically.");
+            }
             if matches!(kind, Pending::SaveSetting) {
                 if let Some(key) = self.settings_saving.take() {
                     self.settings_error = Some((key, "no answer from the daemon".into()));
@@ -1937,7 +2275,73 @@ impl App {
         }
     }
 
+    fn stash_current_draft(&mut self, session_id: &str) {
+        if !self.is_current(session_id) {
+            return;
+        }
+        let draft = Draft {
+            input: std::mem::take(&mut self.input),
+            attachments: std::mem::take(&mut self.attachments),
+        };
+        if !draft.input.is_empty() || !draft.attachments.is_empty() {
+            self.drafts.insert(session_id.to_string(), draft);
+        }
+    }
+
+    /// Cancel the attachment stage without sending, retaining its draft and
+    /// bytes for review and ignoring any late attachment acknowledgements.
+    fn interrupt_attachment_send(&mut self, note: &str) {
+        if let Some(send) = self.pending_send.take() {
+            self.interrupted_attachment_sends.push_back(send);
+            self.notes.push(note.into());
+        }
+        // Every outstanding attachment belongs to this interrupted stage.
+        // Forget all its request identities so a late reply cannot decrement
+        // the waiting count of a later message's attachment stage.
+        self.pending
+            .retain(|_, kind| *kind != Pending::MentionAttach);
+        let pending = &self.pending;
+        self.pending_since
+            .retain(|request, _| pending.contains_key(request));
+        self.restore_attachment_drafts();
+    }
+
+    /// Recovery only fills empty inputs. If newer text occupies a Session's
+    /// composer, retain the interrupted action separately until it is empty.
+    fn restore_attachment_drafts(&mut self) {
+        let mut index = 0;
+        while index < self.interrupted_attachment_sends.len() {
+            let send = &self.interrupted_attachment_sends[index];
+            let current = self.is_current(&send.session_id);
+            let empty = if current {
+                self.input.is_empty()
+            } else {
+                self.drafts
+                    .get(&send.session_id)
+                    .is_none_or(|draft| draft.input.is_empty())
+            };
+            if !empty {
+                index += 1;
+                continue;
+            }
+            let send = self.interrupted_attachment_sends.remove(index).unwrap();
+            if current {
+                self.input.set(&send.content);
+                self.attachments.splice(0..0, send.attachments);
+            } else {
+                let draft = self.drafts.entry(send.session_id).or_default();
+                draft.input.set(&send.content);
+                draft.attachments.splice(0..0, send.attachments);
+            }
+        }
+    }
+
     fn fire(&mut self, req: Request) {
+        if self.offline.is_some() {
+            self.notes
+                .push("not sent — offline; retry after reconnecting".into());
+            return;
+        }
         if let Some(c) = &self.client {
             c.send(req);
         }
@@ -1945,6 +2349,7 @@ impl App {
 
     fn drain_daemon(&mut self) {
         self.expire_pending();
+        self.restore_attachment_drafts();
         let Some(inbox) = self.inbox.take() else {
             return;
         };
@@ -1997,6 +2402,15 @@ impl App {
                         continue;
                     };
                     if !ok {
+                        if matches!(kind, Pending::ReconnectSession) {
+                            if result.as_ref().and_then(|result| result["code"].as_str())
+                                == Some(codes::NOT_FOUND)
+                            {
+                                self.reconnect_session_missing(id);
+                            } else {
+                                self.reconnect_read_failed(id);
+                            }
+                        }
                         self.notes
                             .push(format!("daemon: {}", error.clone().unwrap_or_default()));
                         if matches!(kind, Pending::MentionAttach) {
@@ -2015,14 +2429,29 @@ impl App {
                         }
                         continue;
                     }
-                    let Some(result) = result else { continue };
+                    let Some(result) = result else {
+                        if matches!(kind, Pending::ReconnectSession) {
+                            self.reconnect_read_failed(id);
+                        }
+                        continue;
+                    };
                     match kind {
                         Pending::SendMessage => {}
                         Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
+                        Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
                                 self.sessions = v;
                                 if self.current.is_none() {
+                                    if self.offline.is_some() {
+                                        if let Some(first) = self.start_session() {
+                                            self.switch_session(first.id);
+                                            self.begin_reconnect_snapshot();
+                                        } else {
+                                            self.finish_reconnect();
+                                        }
+                                        continue;
+                                    }
                                     if self.on_start == "picker" {
                                         self.view = View::Sessions;
                                     }
@@ -3730,6 +4159,30 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Event) {
+        if self.offline.is_some() && self.client.is_some() && reconnect_state_event(&ev) {
+            self.reconnect_events.push(ev.clone());
+            if attention_key(&ev).is_some() {
+                return;
+            }
+        }
+        let duplicate = match &ev {
+            Event::ApprovalRequested { approval_id, .. } => self
+                .approvals
+                .iter()
+                .any(|pending| &pending.approval_id == approval_id),
+            Event::UserQuestion { question_id, .. } => self
+                .questions
+                .iter()
+                .any(|pending| &pending.id == question_id),
+            Event::PromotionApprovalRequested { promotion_id, .. } => self
+                .promotions
+                .iter()
+                .any(|pending| &pending.approval_id == promotion_id),
+            _ => false,
+        };
+        if duplicate {
+            return;
+        }
         self.maybe_notify(&ev);
         match ev {
             Event::MessageAppended {
@@ -4511,22 +4964,30 @@ impl App {
                 self.sessions.retain(|s| s.id != id);
                 self.running_sessions.remove(&id);
                 if self.is_current(&id) {
+                    self.stash_current_draft(&id);
                     self.current = None;
                     self.messages.clear();
                     self.streaming.clear();
                     self.thinking.clear();
                     self.live_tools.clear();
                     self.activity = None;
+                    self.notes
+                        .push("Session deleted; its draft is kept with that Session.".into());
+                    if self.offline.is_some() {
+                        if let Some((request, _)) = self.reconnect_request.clone() {
+                            self.reconnect_session_missing(request);
+                        }
+                    }
                 }
             }
         }
     }
 
     fn submit_chat(&mut self, queued: bool) {
-        if self.offline.is_some() && !self.input.expanded().trim_start().starts_with('/') {
+        if self.offline.is_some() {
             // Nothing can be sent: keep the draft until the daemon is back.
             self.notes
-                .push("not connected to the daemon yet; your message is kept".into());
+                .push("not sent — offline; your input is kept as a draft".into());
             return;
         }
         self.restored_send = None;
@@ -4678,6 +5139,7 @@ impl App {
             content: text,
             mode,
             waiting: found.len() + held.len(),
+            attachments: held,
         });
     }
 
@@ -15111,6 +15573,7 @@ mod tests {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            interrupted_attachment_sends: Default::default(),
             sends: Default::default(),
             restored_send: None,
             attachments: Vec::new(),
@@ -15206,6 +15669,8 @@ mod tests {
             plan: Vec::new(),
             mcp_import_pick: None,
             offline: None,
+            reconnect_request: None,
+            reconnect_events: Vec::new(),
             seen: Seen::default(),
             tour: None,
             pull_status: None,
@@ -15525,6 +15990,36 @@ mod tests {
     #[test]
     fn a_lost_daemon_keeps_the_draft_and_shows_reconnecting() {
         let mut app = test_app();
+        app.on_event(reconnect_approval("old-approval", "s1"));
+        app.on_event(Event::PromotionApprovalRequested {
+            promotion_id: "old-promotion".into(),
+            tool_name: "tool".into(),
+            reason: "review".into(),
+            capabilities: vec![],
+            memory_mb: 64,
+        });
+        app.on_event(Event::UserQuestion {
+            question_id: "old-question".into(),
+            session_id: "s1".into(),
+            question: "Old question?".into(),
+            options: vec![],
+            questions: vec![],
+        });
+        app.approval_summaries
+            .insert("old-approval".into(), "summary".into());
+        app.approval_batches.insert(
+            "old-approval".into(),
+            ApprovalBatch {
+                batch_id: "old-batch".into(),
+                index: 0,
+                calls: vec![],
+            },
+        );
+        app.approval_scopes.insert("old-approval".into(), vec![]);
+        app.scope_focus.insert("old-approval".into(), 0);
+        app.batch_answers
+            .insert("old-batch".into(), vec![(0, "once".into())]);
+        app.broad_arm = Some(("old-approval".into(), 'y'));
         let (tx, rx) = std::sync::mpsc::channel::<ServerMessage>();
         app.inbox = Some(rx);
         drop(tx);
@@ -15538,6 +16033,707 @@ mod tests {
             "kept while offline"
         );
         assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
+        assert!(app.approvals.is_empty() && app.promotions.is_empty() && app.questions.is_empty());
+        assert!(
+            app.approval_summaries.is_empty()
+                && app.approval_batches.is_empty()
+                && app.approval_scopes.is_empty()
+                && app.scope_focus.is_empty()
+                && app.batch_answers.is_empty()
+        );
+        assert!(app.broad_arm.is_none());
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note.contains("2 approval(s) from the old daemon discarded")));
+        for text in ["/stop", "/gc run", "/backup"] {
+            app.input.set(text);
+            app.submit_chat(false);
+            assert_eq!(
+                app.input.expanded(),
+                text,
+                "offline commands remain explicit drafts"
+            );
+            assert!(app.notes.last().unwrap().contains("not sent — offline"));
+        }
+    }
+
+    fn reconnect_approval(id: &str, session: &str) -> Event {
+        Event::ApprovalRequested {
+            session_id: session.into(),
+            approval_id: id.into(),
+            tool_name: "tool".into(),
+            version: 1,
+            capabilities: vec![],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+            batch: None,
+            path_options: vec![],
+        }
+    }
+
+    fn reconnect_snapshot(running: bool, attention: Vec<Event>) -> serde_json::Value {
+        serde_json::json!({
+            "messages": [], "running": running, "pending_events": attention,
+            "queued_items": [], "plan": [], "step_mode": false, "unfinished_run": null,
+        })
+    }
+
+    #[test]
+    fn reconnect_keeps_its_banner_until_authoritative_state_and_never_replays_commands() {
+        let mut app = test_app();
+        app.daemon_lost();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.attach_daemon(client, inbox);
+        let requests: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert!(requests
+            .iter()
+            .any(|request| matches!(request.request, Request::GetSession { .. })));
+        assert!(
+            app.offline.is_some(),
+            "a connected socket is not a recovered Session"
+        );
+        app.input.set("/backup");
+        app.submit_chat(false);
+        assert!(sent.try_recv().is_err());
+        let (id, _) = app.reconnect_request.clone().unwrap();
+        let mut snapshot = reconnect_snapshot(
+            true,
+            vec![
+                reconnect_approval("current-approval", "background-session"),
+                Event::UserQuestion {
+                    question_id: "current-question".into(),
+                    session_id: "s1".into(),
+                    question: "Current question?".into(),
+                    options: vec![],
+                    questions: vec![],
+                },
+                Event::PromotionApprovalRequested {
+                    promotion_id: "current-promotion".into(),
+                    tool_name: "tool".into(),
+                    reason: "review".into(),
+                    capabilities: vec![],
+                    memory_mb: 64,
+                },
+            ],
+        );
+        snapshot["queued_items"] = serde_json::json!([{"id":7,"content":"queued message"}]);
+        snapshot["plan"] = serde_json::json!([{"content":"Current plan", "status":"in_progress"}]);
+        tx.send(ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(snapshot),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.offline.is_none());
+        assert!(app.running());
+        assert_eq!(app.queued[0].content, "queued message");
+        assert_eq!(app.plan[0].content, "Current plan");
+        assert_eq!(app.approvals[0].approval_id, "current-approval");
+        assert_eq!(app.questions[0].id, "current-question");
+        assert_eq!(app.promotions[0].approval_id, "current-promotion");
+        assert_eq!(app.input.expanded(), "/backup");
+        assert!(
+            sent.try_recv().is_err(),
+            "recovery never executes the retained command"
+        );
+        // An already queued live delivery of a snapshot prompt is idempotent.
+        tx.send(ServerMessage::Event(reconnect_approval(
+            "current-approval",
+            "background-session",
+        )))
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.approvals.len(), 1);
+    }
+
+    #[test]
+    fn reconnect_reconciles_racing_prompts_queue_and_run_without_erasing_live_text() {
+        let mut app = test_app();
+        app.daemon_lost();
+        let (client, _sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.attach_daemon(client, inbox);
+        let (id, _) = app.reconnect_request.clone().unwrap();
+        let mut appended = msg("user", "message arrived during the read");
+        appended.seq = 2;
+        for event in [
+            Event::RunStarted {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+            },
+            Event::MessageAppended {
+                session_id: "s1".into(),
+                message: appended.clone(),
+            },
+            Event::MessageDelta {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                delta: "already streamed".into(),
+            },
+            Event::ApprovalAnswered {
+                approval_id: "answered-elsewhere".into(),
+                approved: false,
+                by: None,
+            },
+            Event::PromotionApprovalResolved {
+                promotion_id: "resolved-promotion".into(),
+            },
+            Event::UserQuestionClosed {
+                question_id: "closed-question".into(),
+            },
+            reconnect_approval("new-approval", "s1"),
+            Event::QueueChanged {
+                session_id: "s1".into(),
+                queued: vec![QueuedMessage {
+                    id: 8,
+                    content: "new queue".into(),
+                }],
+            },
+            Event::PlanUpdated {
+                session_id: "s1".into(),
+                items: vec![PlanItem {
+                    content: "new plan".into(),
+                    status: "pending".into(),
+                }],
+            },
+        ] {
+            tx.send(ServerMessage::Event(event)).unwrap();
+        }
+        let mut snapshot = reconnect_snapshot(
+            false,
+            vec![
+                reconnect_approval("answered-elsewhere", "s1"),
+                Event::PromotionApprovalRequested {
+                    promotion_id: "resolved-promotion".into(),
+                    tool_name: "tool".into(),
+                    reason: "review".into(),
+                    capabilities: vec![],
+                    memory_mb: 64,
+                },
+                Event::UserQuestion {
+                    question_id: "closed-question".into(),
+                    session_id: "s1".into(),
+                    question: "stale".into(),
+                    options: vec![],
+                    questions: vec![],
+                },
+            ],
+        );
+        snapshot["messages"] = serde_json::json!([msg("user", "history")]);
+        tx.send(ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(snapshot),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.offline.is_none() && app.running());
+        assert_eq!(
+            app.streaming, "already streamed",
+            "RunStarted is reconciled, never replayed"
+        );
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.messages.iter().any(|message| message.id == appended.id));
+        assert_eq!(app.queued[0].content, "new queue");
+        assert_eq!(app.plan[0].content, "new plan");
+        assert_eq!(app.approvals.len(), 1);
+        assert_eq!(app.approvals[0].approval_id, "new-approval");
+        assert!(app.promotions.is_empty() && app.questions.is_empty());
+    }
+
+    #[test]
+    fn a_missing_session_recovers_without_cross_posting_its_draft() {
+        let mut app = test_app();
+        app.input.set("/backup");
+        app.daemon_lost();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.attach_daemon(client, inbox);
+        let _: Vec<_> = sent.try_iter().collect();
+        let (id, _) = app.reconnect_request.clone().unwrap();
+        tx.send(ServerMessage::err_code(
+            id,
+            codes::NOT_FOUND,
+            "session not found".into(),
+        ))
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.offline.is_some() && app.current.is_none());
+        assert!(app.input.is_empty());
+        assert_eq!(app.drafts["s1"].input.expanded(), "/backup");
+        let list: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(list.request, Request::ListSessions));
+        tx.send(ServerMessage::Response {
+            id: list.id,
+            ok: true,
+            result: Some(serde_json::json!([])),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.offline.is_none() && app.current.is_none());
+        assert!(
+            sent.try_recv().is_err(),
+            "no old command or Session is recreated automatically"
+        );
+    }
+
+    #[test]
+    fn reconnect_gap_reads_preserve_newer_live_usage_in_either_reply_order() {
+        use formless_protocol::{DroppedEventKind as K, UsageInfo};
+        for session_reply_first in [false, true] {
+            let mut app = test_app();
+            app.daemon_lost();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let _: Vec<_> = sent.try_iter().collect();
+            let (snapshot, _) = app.reconnect_request.clone().unwrap();
+            app.on_event(Event::DeltasDropped {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                kinds: vec![K::RunUsage, K::InvocationActivity],
+                handle: None,
+                model: None,
+            });
+            let reads: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert_eq!(reads.len(), 2, "gap recovery remains available offline");
+            app.on_event(Event::RunUsage {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                usage: UsageInfo {
+                    steps: 9,
+                    context_used: 200,
+                    context_tokens: 2000,
+                    ..UsageInfo::default()
+                },
+            });
+            let session_reply = || ServerMessage::Response {
+                id: snapshot,
+                ok: true,
+                result: Some(reconnect_snapshot(false, vec![])),
+                error: None,
+            };
+            if session_reply_first {
+                tx.send(session_reply()).unwrap();
+            }
+            for read in reads {
+                let result = match read.request {
+                    Request::SessionUsage { session_id } => {
+                        assert_eq!(session_id, "s1");
+                        serde_json::json!({"last_run": UsageInfo {
+                            steps: 3,
+                            context_used: 100,
+                            context_tokens: 1000,
+                            ..UsageInfo::default()
+                        }})
+                    }
+                    Request::ListInvocations => serde_json::json!([]),
+                    other => panic!("unexpected recovery action: {other:?}"),
+                };
+                tx.send(ServerMessage::Response {
+                    id: read.id,
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                })
+                .unwrap();
+            }
+            if !session_reply_first {
+                tx.send(session_reply()).unwrap();
+            }
+            app.drain_daemon();
+            assert!(app.offline.is_none());
+            assert_eq!(app.run_usage["s1"].steps, 9);
+            assert_eq!(app.context_fill["s1"], (200, 2000));
+            assert!(sent.try_recv().is_err(), "recovery never replays commands");
+        }
+    }
+
+    #[test]
+    fn deletion_during_reconnect_stashes_the_old_draft_before_replacement_selection() {
+        for replacement_has_draft in [false, true] {
+            let mut app = test_app();
+            app.input.set("private text from Session one");
+            let old_files = vec![("private.bin".into(), vec![1, 2, 3])];
+            app.attachments = old_files.clone();
+            if replacement_has_draft {
+                app.drafts.insert(
+                    "s2".into(),
+                    Draft {
+                        input: "Session two's draft".into(),
+                        attachments: vec![("two.bin".into(), vec![9])],
+                    },
+                );
+            }
+            app.daemon_lost();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let initial: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            let old_list = initial
+                .iter()
+                .find(|request| matches!(request.request, Request::ListSessions))
+                .unwrap()
+                .id;
+            let (old_snapshot, _) = app.reconnect_request.clone().unwrap();
+            tx.send(ServerMessage::Event(Event::SessionDeleted {
+                id: "s1".into(),
+            }))
+            .unwrap();
+            // Both already queued replies are now stale, including a list
+            // taken before deletion that still contains the old Session.
+            tx.send(ServerMessage::Response {
+                id: old_snapshot,
+                ok: true,
+                result: Some(reconnect_snapshot(false, vec![])),
+                error: None,
+            })
+            .unwrap();
+            tx.send(ServerMessage::Response {
+                id: old_list,
+                ok: true,
+                result: Some(serde_json::json!([{
+                    "id":"s1", "name":"stale", "created_at":"", "updated_at":""
+                }])),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.current.is_none() && app.offline.is_some());
+            assert!(app.input.is_empty() && app.attachments.is_empty());
+            assert_eq!(
+                app.drafts["s1"].input.expanded(),
+                "private text from Session one"
+            );
+            assert_eq!(app.drafts["s1"].attachments, old_files);
+            let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(fresh.request, Request::ListSessions));
+            tx.send(ServerMessage::Response {
+                id: fresh.id,
+                ok: true,
+                result: Some(serde_json::json!([{
+                    "id":"s2", "name":"replacement", "created_at":"", "updated_at":""
+                }])),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(app.current.as_deref(), Some("s2"));
+            let (snapshot, session) = app.reconnect_request.clone().unwrap();
+            assert_eq!(session, "s2");
+            tx.send(ServerMessage::Response {
+                id: snapshot,
+                ok: true,
+                result: Some(reconnect_snapshot(false, vec![])),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.offline.is_none());
+            assert_eq!(
+                app.input.expanded(),
+                if replacement_has_draft {
+                    "Session two's draft"
+                } else {
+                    ""
+                }
+            );
+            assert_eq!(
+                app.attachments,
+                if replacement_has_draft {
+                    vec![("two.bin".into(), vec![9])]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(app.drafts["s1"].attachments, old_files);
+            assert!(sent
+                .try_iter()
+                .map(|line| serde_json::from_str::<RequestEnvelope>(&line).unwrap())
+                .all(|request| !matches!(request.request, Request::SendMessage { .. })));
+        }
+    }
+
+    #[test]
+    fn a_pause_during_reconnect_preserves_its_resume_banner_and_explanation() {
+        for explained in [
+            None,
+            Some(ErrorExplained {
+                category: "server".into(),
+                message: "A readable pause explanation".into(),
+                action: Some("Try again".into()),
+                details: "raw provider failure".into(),
+            }),
+        ] {
+            let mut app = test_app();
+            app.sessions = serde_json::from_value(serde_json::json!([{
+                "id": "s1",
+                "name": "Reconnect pause",
+                "created_at": "",
+                "updated_at": ""
+            }]))
+            .unwrap();
+            app.daemon_lost();
+            let (client, _sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let (id, _) = app.reconnect_request.clone().unwrap();
+            let expected = explained
+                .as_ref()
+                .map_or("raw provider failure", |why| why.message.as_str())
+                .to_string();
+            tx.send(ServerMessage::Event(Event::RunPaused {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                error: "raw provider failure".into(),
+                explained,
+            }))
+            .unwrap();
+            tx.send(ServerMessage::Event(Event::RunFinished {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+                status: "paused".into(),
+            }))
+            .unwrap();
+            // The read began while the Run was active, before its pause.
+            // SendMessage appends the user's message before starting a Run;
+            // include that durable history instead of a welcome-screen fixture.
+            let mut snapshot = reconnect_snapshot(true, vec![]);
+            snapshot["messages"] = serde_json::json!([msg("user", "Please continue my task")]);
+            tx.send(ServerMessage::Response {
+                id,
+                ok: true,
+                result: Some(snapshot),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.offline.is_none() && !app.running());
+            assert_eq!(app.run_banner, Some(("paused".into(), expected.clone())));
+            assert_eq!(app.last_error.as_deref(), Some("raw provider failure"));
+            let screen = render(&mut app, 120, 30);
+            assert!(
+                screen.contains("/resume") && screen.contains(&expected),
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_interrupted_attachment_stage_restores_files_and_text_without_sending() {
+        for (switch_session, newer_input) in [(false, false), (true, true), (false, true)] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            let original_files = vec![
+                ("one.bin".into(), vec![1, 2]),
+                ("two.bin".into(), vec![3, 4]),
+            ];
+            app.attachments = original_files.clone();
+            app.input.set("send these files");
+            app.submit_chat(false);
+            let requests: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert_eq!(requests.len(), 2);
+            assert!(requests
+                .iter()
+                .all(|request| matches!(request.request, Request::AttachFile { .. })));
+            assert!(app.input.is_empty() && app.attachments.is_empty());
+            assert!(
+                app.sends.unsent("s1").is_none(),
+                "SendMessage has not yet been issued"
+            );
+            if switch_session {
+                app.switch_session("s2".into());
+            }
+            if newer_input {
+                app.input.set("a newer draft");
+                app.attachments = vec![("new.bin".into(), vec![9])];
+            }
+            // Only one attachment was acknowledged before the socket ended.
+            tx.send(ServerMessage::Response {
+                id: requests[0].id,
+                ok: true,
+                result: Some(serde_json::json!({"attached":true})),
+                error: None,
+            })
+            .unwrap();
+            drop(tx);
+            app.drain_daemon();
+            assert!(app.offline.is_some() && app.pending_send.is_none());
+            if switch_session {
+                assert_eq!(app.input.expanded(), "a newer draft");
+                assert_eq!(app.attachments, vec![("new.bin".into(), vec![9])]);
+                assert_eq!(app.drafts["s1"].input.expanded(), "send these files");
+                assert_eq!(app.drafts["s1"].attachments, original_files);
+            } else if newer_input {
+                assert_eq!(app.input.expanded(), "a newer draft");
+                assert_eq!(app.interrupted_attachment_sends.len(), 1);
+                app.input.clear();
+                app.drain_daemon(); // Restore for review, not as a send action.
+                assert_eq!(app.input.expanded(), "send these files");
+                assert!(app.attachments.starts_with(&original_files));
+                assert_eq!(
+                    app.attachments.last().unwrap(),
+                    &("new.bin".into(), vec![9])
+                );
+                assert!(app.interrupted_attachment_sends.is_empty());
+            } else {
+                assert_eq!(app.input.expanded(), "send these files");
+                assert_eq!(app.attachments, original_files);
+            }
+            assert!(sent
+                .try_iter()
+                .map(|line| serde_json::from_str::<RequestEnvelope>(&line).unwrap())
+                .all(|request| !matches!(request.request, Request::SendMessage { .. })));
+        }
+    }
+
+    #[test]
+    fn an_attachment_timeout_restores_the_draft_online_and_ignores_late_replies() {
+        for newer_input in [false, true] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            let files = vec![("one.bin".into(), vec![1]), ("two.bin".into(), vec![2])];
+            app.input.set("keep this attachment draft");
+            app.attachments = files.clone();
+            app.submit_chat(false);
+            let requests: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert_eq!(requests.len(), 2);
+            assert!(requests
+                .iter()
+                .all(|request| matches!(request.request, Request::AttachFile { .. })));
+            if newer_input {
+                app.input.set("newer text must survive");
+            }
+            // Only the first upload expires. The other is still in flight,
+            // and the socket remains open throughout recovery.
+            app.pending_since.insert(
+                requests[0].id,
+                Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+            );
+            app.drain_daemon();
+            assert!(app.offline.is_none() && app.client.is_some() && app.inbox.is_some());
+            assert!(app.pending_send.is_none());
+            assert!(requests.iter().all(|request| {
+                !app.pending.contains_key(&request.id)
+                    && !app.pending_since.contains_key(&request.id)
+            }));
+            if newer_input {
+                assert_eq!(app.input.expanded(), "newer text must survive");
+                assert_eq!(app.interrupted_attachment_sends.len(), 1);
+                app.input.clear();
+                app.drain_daemon();
+            }
+            assert_eq!(app.input.expanded(), "keep this attachment draft");
+            assert_eq!(app.attachments, files);
+            assert!(app.interrupted_attachment_sends.is_empty());
+            assert!(sent.try_recv().is_err(), "timeout does not send the draft");
+
+            // Start a fresh upload, then deliver both old replies. Neither
+            // acknowledgement may complete this new stage or send a message.
+            app.input.set("a fresh attachment draft");
+            app.attachments = vec![("fresh.bin".into(), vec![3])];
+            app.submit_chat(false);
+            let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(fresh.request, Request::AttachFile { .. }));
+            for request in requests {
+                tx.send(ServerMessage::Response {
+                    id: request.id,
+                    ok: true,
+                    result: Some(serde_json::json!({"attached":true})),
+                    error: None,
+                })
+                .unwrap();
+            }
+            app.drain_daemon();
+            assert!(app.offline.is_none());
+            assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+            assert!(app.pending.contains_key(&fresh.id));
+            assert!(
+                sent.try_recv().is_err(),
+                "late replies never send a message"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_or_incomplete_reconnect_reads_keep_the_banner_and_retry_reads_only() {
+        let mut app = test_app();
+        app.daemon_lost();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.attach_daemon(client, inbox);
+        let _: Vec<_> = sent.try_iter().collect();
+        let (id, _) = app.reconnect_request.clone().unwrap();
+        tx.send(ServerMessage::Response {
+            id,
+            ok: false,
+            result: None,
+            error: Some("read failed".into()),
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.offline.is_some() && app.reconnect_request.is_none());
+        let (since, _) = app.offline.unwrap();
+        app.offline = Some((since, Instant::now() - Duration::from_secs(3)));
+        app.try_reconnect();
+        let retried: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(retried.len(), 2);
+        assert!(retried.iter().all(|request| matches!(
+            request.request,
+            Request::Subscribe { .. } | Request::GetSession { .. }
+        )));
+        let (next, _) = app.reconnect_request.clone().unwrap();
+        assert_ne!(next, id);
+        tx.send(ServerMessage::Response {
+            id: next,
+            ok: true,
+            result: Some(serde_json::json!({})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.offline.is_some() && app.reconnect_request.is_none());
+        app.begin_reconnect_snapshot();
+        let (next, _) = app.reconnect_request.clone().unwrap();
+        app.pending_since.insert(
+            next,
+            Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+        );
+        app.drain_daemon();
+        assert!(app.offline.is_some() && app.reconnect_request.is_none());
     }
 
     #[test]
@@ -19884,6 +21080,7 @@ mod tests {
             content: "explain @a @b".into(),
             mode: SendMode::Send,
             waiting: 2,
+            attachments: Vec::new(),
         });
         app.mention_attached();
         assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
