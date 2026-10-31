@@ -18,6 +18,7 @@ fn run_js(
     memory_mb: u32,
 ) -> Result<Value, formless_runtime::ExecError> {
     let req = ExecRequest {
+        output_schema: None,
         code: code.to_string(),
         input,
         caps: Capabilities::parse(&caps.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),

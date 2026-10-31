@@ -176,6 +176,8 @@ impl HostOps for NoHostOps {}
 pub struct ExecRequest {
     pub code: String,
     pub input: Value,
+    /// Declared Tool output schema; scripts and unschematized calls use None.
+    pub output_schema: Option<Value>,
     pub caps: Capabilities,
     pub memory_mb: u32,
     pub mode: HostMode,
@@ -271,7 +273,29 @@ function __call(op, args) {
   if (!r.ok) throw new Error(r.error);
   return r.value;
 }
-function __fmt(a) { return a.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" "); }
+function __formatValue(x) {
+  try {
+    if (typeof x === "string") return x;
+    const ancestors = [];
+    const text = JSON.stringify(x, function (_key, value) {
+      if (typeof value === "bigint") return String(value) + "n";
+      if (value === undefined) return "undefined";
+      if (typeof value === "function" || typeof value === "symbol") return String(value);
+      if (value instanceof Error) return value.name + ": " + value.message;
+      if (value && typeof value === "object") {
+        while (ancestors.length && ancestors[ancestors.length - 1] !== this) ancestors.pop();
+        if (ancestors.includes(value)) return "[Circular]";
+        ancestors.push(value);
+      }
+      return value;
+    });
+    // Match the ordinary console spelling for scalar special values.
+    if (x === undefined || typeof x === "bigint" || typeof x === "function" || typeof x === "symbol") return String(x) + (typeof x === "bigint" ? "n" : "");
+    if (x instanceof Error) return x.name + ": " + x.message;
+    return text;
+  } catch (_) { return "[Unformattable]"; }
+}
+function __fmt(a) { return a.map(__formatValue).join(" "); }
 globalThis.console = {
   log: (...a) => __call("log", { msg: __fmt(a) }),
   info: (...a) => __call("log", { msg: __fmt(a) }),
@@ -1835,7 +1859,7 @@ impl State {
             );
         }
         let enc = enc_of(&a["encoding"])?;
-        let args: Vec<String> = a["args"]
+        let mut args: Vec<String> = a["args"]
             .as_array()
             .map(|v| {
                 v.iter()
@@ -1850,7 +1874,7 @@ impl State {
         let mut command = std::process::Command::new(cmd);
         // Git under a sub-command grant (`process:git:status|log`) runs
         // without the repository settings that start programs: fsmonitor,
-        // pager, credential helpers, external diff (#1099).
+        // pager, credential helpers, external diff and textconv (#1099, #1130).
         let base = std::path::Path::new(cmd)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1868,10 +1892,15 @@ impl State {
                 "-c",
                 "credential.helper=",
                 "-c",
-                "diff.external=",
-                "-c",
                 "core.sshCommand=false",
             ]);
+            if matches!(first_arg, Some("diff" | "log" | "show")) {
+                // These are sub-command options, not global git options.
+                // Put them after caller options so --ext-diff/--textconv
+                // cannot turn drivers back on, but before a path separator.
+                let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+                args.splice(end..end, ["--no-ext-diff".into(), "--no-textconv".into()]);
+            }
         }
         command
             .args(&args)
@@ -2184,9 +2213,146 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
     }
 }
 
-/// A Tool that returns `{error: <truthy>}` instead of throwing has failed:
-/// counting it as a success would hide it from Self-Optimisation (§8.1).
-fn reported_error(output: &Value) -> Option<String> {
+/// Recognize declarations for the returned object, not declarations belonging to
+/// nested properties or unused definitions. Alternative/conditional branches only
+/// contribute when they validate this output. Local references retain root context.
+fn declares_output_error(schema: &Value, output: &Value) -> bool {
+    const MAX_DEPTH: usize = 64;
+    const MAX_NODES: usize = 4096;
+    fn bounded(value: &Value, depth: usize, left: &mut usize) -> bool {
+        if depth > MAX_DEPTH || *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        match value {
+            Value::Array(values) => values.iter().all(|v| bounded(v, depth + 1, left)),
+            Value::Object(values) => values.values().all(|v| bounded(v, depth + 1, left)),
+            _ => true,
+        }
+    }
+    let mut remaining = MAX_NODES;
+    if !bounded(schema, 0, &mut remaining) {
+        return false;
+    }
+    // Offline compilation cannot turn inspecting Tool output into a network read.
+    let validators = jsonschema::options().offline().build_map(schema).ok();
+    struct Declarations<'a> {
+        root: &'a Value,
+        output: &'a Value,
+        validators: Option<jsonschema::ValidatorMap>,
+        left: usize,
+    }
+    impl Declarations<'_> {
+        fn reference(&self, node: &Value) -> Option<String> {
+            let reference = node.get("$ref")?.as_str()?;
+            // JSON Pointer references only: external resources and dynamic
+            // anchors cannot be resolved by guessing against the root document.
+            let pointer = reference.strip_prefix('#')?;
+            (pointer.is_empty() || pointer.starts_with('/'))
+                .then(|| self.root.pointer(pointer).map(|_| reference.to_string()))?
+        }
+        fn visit(&mut self, path: &str, stack: &mut Vec<String>) -> bool {
+            if self.left == 0 || stack.len() >= MAX_DEPTH || stack.iter().any(|p| p == path) {
+                return false;
+            }
+            self.left -= 1;
+            let Some(node) = self.root.pointer(path.strip_prefix('#').unwrap_or(path)) else {
+                return false;
+            };
+            stack.push(path.to_string());
+            let declared = node["properties"]
+                .as_object()
+                .is_some_and(|p| p.contains_key("error"));
+            let mut result = declared;
+            if let Some(reference) = self.reference(node) {
+                result |= self.visit(&reference, stack);
+            }
+            for keyword in ["allOf", "anyOf", "oneOf"] {
+                if let Some(branches) = node[keyword].as_array() {
+                    for index in 0..branches.len() {
+                        let branch = format!("{path}/{keyword}/{index}");
+                        if keyword == "allOf" || self.matches(&branch) {
+                            result |= self.visit(&branch, stack);
+                        }
+                    }
+                }
+            }
+            if node.get("if").is_some() {
+                if let Some(matches) = self.match_result(&format!("{path}/if")) {
+                    let selected = if matches { "then" } else { "else" };
+                    result |= self.visit(&format!("{path}/{selected}"), stack);
+                }
+            }
+            if let Some(dependencies) = node["dependentSchemas"].as_object() {
+                for key in dependencies.keys() {
+                    if self.output.get(key).is_some() {
+                        let escaped = key.replace('~', "~0").replace('/', "~1");
+                        result |= self.visit(&format!("{path}/dependentSchemas/{escaped}"), stack);
+                    }
+                }
+            }
+            stack.pop();
+            result
+        }
+        // Validators handle recursive object schemas, but a reference cycle that
+        // reapplies to the same instance can recurse forever. Refuse that graph
+        // before asking whether an alternative/condition matches.
+        fn acyclic(&self, path: &str, stack: &mut Vec<String>, left: &mut usize) -> bool {
+            if *left == 0 || stack.len() >= MAX_DEPTH || stack.iter().any(|p| p == path) {
+                return false;
+            }
+            *left -= 1;
+            let Some(node) = self.root.pointer(path.strip_prefix('#').unwrap_or(path)) else {
+                return false;
+            };
+            stack.push(path.to_string());
+            let mut safe = self
+                .reference(node)
+                .is_none_or(|p| self.acyclic(&p, stack, left));
+            for keyword in ["allOf", "anyOf", "oneOf"] {
+                if let Some(branches) = node[keyword].as_array() {
+                    safe &= (0..branches.len())
+                        .all(|i| self.acyclic(&format!("{path}/{keyword}/{i}"), stack, left));
+                }
+            }
+            for keyword in ["if", "then", "else", "not"] {
+                if node.get(keyword).is_some() {
+                    safe &= self.acyclic(&format!("{path}/{keyword}"), stack, left);
+                }
+            }
+            if let Some(dependencies) = node["dependentSchemas"].as_object() {
+                for key in dependencies.keys() {
+                    let escaped = key.replace('~', "~0").replace('/', "~1");
+                    safe &=
+                        self.acyclic(&format!("{path}/dependentSchemas/{escaped}"), stack, left);
+                }
+            }
+            stack.pop();
+            safe
+        }
+        fn match_result(&self, path: &str) -> Option<bool> {
+            let mut remaining = MAX_NODES;
+            if !self.acyclic(path, &mut Vec::new(), &mut remaining) {
+                return None;
+            }
+            Some(self.validators.as_ref()?.get(path)?.is_valid(self.output))
+        }
+        fn matches(&self, path: &str) -> bool {
+            self.match_result(path) == Some(true)
+        }
+    }
+    Declarations {
+        root: schema,
+        output,
+        validators,
+        left: MAX_NODES,
+    }
+    .visit("#", &mut Vec::new())
+}
+
+/// Undeclared `{error: <truthy>}` results report failure (§8.1). An error
+/// property explicitly declared in the output schema is ordinary domain data.
+fn reported_error(output: &Value, output_schema: Option<&Value>) -> Option<String> {
     let e = output.as_object()?.get("error")?;
     let truthy = match e {
         Value::Null | Value::Bool(false) => false,
@@ -2194,7 +2360,10 @@ fn reported_error(output: &Value) -> Option<String> {
         Value::Number(n) => n.as_f64() != Some(0.0),
         _ => true,
     };
-    truthy.then(|| match e {
+    if !truthy || output_schema.is_some_and(|schema| declares_output_error(schema, output)) {
+        return None;
+    }
+    Some(match e {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     })
@@ -2265,10 +2434,13 @@ pub fn check_syntax(code: &str) -> Result<(), String> {
 
 const RUNNER: &str = r#"
   (function () {
-    const done = (v) => { globalThis.__result_json = JSON.stringify({ ok: true, value: v === undefined ? null : v }); };
     // QuickJS throws null when it cannot even allocate the out-of-memory
     // error, so a null exception is reported as out of memory.
     const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || "") }); };
+    const done = (v) => {
+      try { globalThis.__result_json = JSON.stringify({ ok: true, value: v === undefined ? null : v }); }
+      catch (e) { fail(new Error("return value is not JSON-serializable: " + String((e && e.message) || e))); }
+    };
     try {
       const out = run(JSON.parse(globalThis.__input_json));
       if (out && typeof out.then === "function") out.then(done, fail); else done(out);
@@ -2303,6 +2475,37 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         x
     };
     let runtime = Runtime::new().map_err(|e| err(&e))?;
+    // Keep promise identities alive until completion (a raw pointer/hash could
+    // be reused after GC). Clear persistent handles before Runtime is dropped,
+    // including on early error paths, as required by rquickjs::Persistent.
+    type Rejections = std::rc::Rc<
+        std::cell::RefCell<HashMap<rquickjs::Persistent<rquickjs::Value<'static>>, String>>,
+    >;
+    struct ClearRejections(Rejections);
+    impl Drop for ClearRejections {
+        fn drop(&mut self) {
+            self.0.borrow_mut().clear();
+        }
+    }
+    let unhandled: Rejections = Default::default();
+    let _clear_rejections = ClearRejections(unhandled.clone());
+    let rejected = unhandled.clone();
+    runtime.set_host_promise_rejection_tracker(Some(Box::new(
+        move |ctx, promise, reason, handled| {
+            let promise = rquickjs::Persistent::save(&ctx, promise);
+            if handled {
+                rejected.borrow_mut().remove(&promise);
+            } else {
+                let message = reason
+                    .as_exception()
+                    .and_then(|e| e.message())
+                    .or_else(|| reason.as_string().and_then(|s| s.to_string().ok()))
+                    .unwrap_or_else(|| format!("{reason:?}"));
+                rejected.borrow_mut().insert(promise, message);
+            }
+        },
+    )));
+
     runtime.set_memory_limit((req.memory_mb as usize).saturating_mul(1024 * 1024));
     runtime.set_max_stack_size(1024 * 1024);
     let cancel = req.cancel.clone();
@@ -2396,13 +2599,16 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
              tools.call returns a Promise, await every call"
         )));
     }
+    if let Some(message) = unhandled.borrow().values().next() {
+        return Err(err(&format!("unhandled Promise rejection: {message}")));
+    }
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
     let logs = state.logs.lock().map(|g| g.clone()).unwrap_or_default();
     if !parsed["ok"].as_bool().unwrap_or(false) {
         return Err(err(&parsed["error"].as_str().unwrap_or("tool error")));
     }
     let output = parsed["value"].clone();
-    if let Some(msg) = reported_error(&output) {
+    if let Some(msg) = reported_error(&output, req.output_schema.as_ref()) {
         return Err(err(&format!(
             "tool returned an error result (throw instead of returning {{error}}): {msg}"
         )));
@@ -2629,6 +2835,85 @@ mod tests {
         );
     }
 
+    /// Patch commands stay useful without executing repository diff drivers.
+    #[test]
+    #[cfg(unix)]
+    fn scoped_git_patch_commands_disable_diff_drivers() {
+        struct Repo(PathBuf);
+        impl Drop for Repo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let repo =
+            Repo(std::env::temp_dir().join(format!("formless-git-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir_all(&repo.0).unwrap();
+        let root = repo.0.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("file.txt"), "before\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "file.txt diff=probe\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "before"]);
+        std::fs::write(root.join("file.txt"), "after\n").unwrap();
+        git(&["commit", "-qam", "after"]);
+        std::fs::write(root.join("file.txt"), "working\n").unwrap();
+        std::fs::write(
+            root.join("driver.sh"),
+            "#!/bin/sh\nprintf ran > driver-ran\ncat \"$1\"\n",
+        )
+        .unwrap();
+        git(&["config", "diff.probe.textconv", "sh ./driver.sh"]);
+        // Prove the fixture would execute a configured textconv driver.
+        git(&["diff", "--textconv"]);
+        assert!(root.join("driver-ran").exists());
+        std::fs::remove_file(root.join("driver-ran")).unwrap();
+        // An external driver must also stay disabled; executing this would fail.
+        git(&["config", "diff.external", "false"]);
+        for args in [
+            json!(["diff", "--ext-diff", "--textconv"]),
+            json!(["diff", "--ext-diff", "--textconv", "--", "file.txt"]),
+            json!(["log", "-1", "-p", "--ext-diff", "--textconv"]),
+            json!(["show", "--ext-diff", "--textconv"]),
+        ] {
+            let mut req = live(&format!(
+                "function run() {{ return process.run('git', {}, {{cwd: {}}}); }}",
+                args,
+                json!(root.to_str().unwrap())
+            ));
+            req.caps = Capabilities::parse(&[
+                "process:git:diff|log|show".into(),
+                format!("fs:read:{}", root.display()),
+            ])
+            .unwrap();
+            let out = execute(&req, Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(out["code"], json!(0), "{args}: {out}");
+            assert!(
+                out["stdout"].as_str().unwrap().contains("diff --git"),
+                "{args}: {out}"
+            );
+            assert!(!root.join("driver-ran").exists(), "{args} ran textconv");
+        }
+    }
+
     /// A call's own env can't steer what runs without its env grant (#1098).
     #[test]
     fn execution_steering_env_needs_its_grant() {
@@ -2698,16 +2983,19 @@ mod tests {
     struct SlowOps;
     impl HostOps for SlowOps {
         fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // A failing call must settle before the successful slow call in
+            // the unawaited-rejection fixture, rather than racing two 300ms waits.
             if name == "bad" {
                 return Err("bad tool".into());
             }
+            std::thread::sleep(std::time::Duration::from_millis(300));
             Ok(json!({"name": name, "n": input["n"]}))
         }
     }
 
     fn live(code: &str) -> ExecRequest {
         ExecRequest {
+            output_schema: None,
             code: code.into(),
             input: json!({}),
             caps: Capabilities::default(),
@@ -2767,12 +3055,116 @@ mod tests {
     }
 
     #[test]
+    fn console_formats_circular_bigint_error_and_undefined_values() {
+        let req = live("function run() { const node = {}; node.parent = node; console.log(node); console.log('got', undefined, new Error('x'), 12n); return 7; }");
+        let out = execute(&req, Arc::new(NoHostOps)).unwrap();
+        assert_eq!(out.output, json!(7));
+        assert_eq!(
+            out.logs,
+            vec![r#"{"parent":"[Circular]"}"#, "got undefined Error: x 12n"]
+        );
+    }
+
+    #[test]
+    fn return_serialization_failures_name_the_actual_problem() {
+        for prefix in ["", "async "] {
+            for body in [
+                "return {id: 9007199254740993n};",
+                "const x = {}; x.self = x; return x;",
+            ] {
+                let req = live(&format!("{prefix}function run() {{ {body} }}"));
+                let e = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+                assert!(
+                    e.message.contains("return value is not JSON-serializable:"),
+                    "{}",
+                    e.message
+                );
+                assert!(!e.message.contains("never settled"), "{}", e.message);
+            }
+        }
+    }
+
+    #[test]
+    fn unhandled_rejections_fail_the_invocation() {
+        for (code, message) in [
+            ("function run() { Promise.reject(new Error('floating')); return 1; }", "floating"),
+            ("async function run() { tools.call('bad', {}); await tools.call('t', {}); return 1; }", "bad tool"),
+            ("async function run() { setTimeout(async () => { throw new Error('flush failed'); }, 0); await tools.call('t', {}); return 1; }", "flush failed"),
+        ] {
+            let e = execute(&live(code), Arc::new(SlowOps)).unwrap_err();
+            assert!(e.message.contains("unhandled Promise rejection:"), "{}", e.message);
+            assert!(e.message.contains(message), "{}", e.message);
+        }
+    }
+
+    #[test]
+    fn rejections_handled_before_completion_do_not_fail() {
+        let req = live("async function run() { const p = Promise.reject(new Error('later handled')); await tools.call('t', {}); p.catch(() => {}); return 7; }");
+        let out = execute(&req, Arc::new(SlowOps)).unwrap();
+        assert_eq!(out.output, json!(7));
+    }
+
+    #[test]
+    fn declared_error_fields_follow_only_applicable_output_schemas() {
+        let output = json!({"kind":"diagnostic", "error":"negative finding"});
+        let declaration = json!({"type":"object", "properties":{"error":{"type":"string"}}});
+        for schema in [
+            json!({"allOf":[declaration]}),
+            json!({"$defs":{"diagnostic":declaration}, "$ref":"#/$defs/diagnostic"}),
+            json!({"$defs":{"a/b~c":declaration}, "allOf":[{"$ref":"#/$defs/a~1b~0c"}]}),
+            json!({"anyOf":[{"type":"integer"}, declaration]}),
+            json!({"oneOf":[{"type":"integer"}, declaration]}),
+            json!({"if":{"properties":{"kind":{"const":"diagnostic"}}}, "then":declaration}),
+            json!({"if":{"properties":{"kind":{"const":"other"}}}, "else":declaration}),
+            json!({"dependentSchemas":{"kind":declaration}}),
+        ] {
+            assert!(reported_error(&output, Some(&schema)).is_none(), "{schema}");
+        }
+        for schema in [
+            json!({"properties":{"nested":declaration}}),
+            json!({"$defs":{"unused":declaration}}),
+            json!({"items":declaration}),
+            json!({"not":declaration}),
+            json!({"dependentSchemas":{"absent":declaration}}),
+            json!({"anyOf":[{"allOf":[{"properties":{"kind":{"const":"other"}}},declaration]}, {"type":"object"}]}),
+            json!({"oneOf":[{"allOf":[{"properties":{"kind":{"const":"other"}}},declaration]}, {"type":"object"}]}),
+            json!({"if":{"properties":{"kind":{"const":"other"}}}, "then":declaration}),
+            json!({"if":{"properties":{"kind":{"const":"diagnostic"}}}, "else":declaration}),
+            json!({"$ref":"#"}),
+            json!({"anyOf":[{"$ref":"#"}, {"type":"object"}]}),
+            json!({"$defs":{"a":{"$ref":"#/$defs/b"},"b":{"$ref":"#/$defs/a"}},"$ref":"#/$defs/a"}),
+            json!({"$ref":"https://schemas.example.invalid/output"}),
+            json!({"$ref":"file:///tmp/output-schema.json"}),
+        ] {
+            assert!(reported_error(&output, Some(&schema)).is_some(), "{schema}");
+        }
+        // An unusable condition must not select an else branch by guessing.
+        let cyclic = json!({"if":{"$ref":"#/if"}, "else":declaration});
+        assert!(reported_error(&output, Some(&cyclic)).is_some());
+        let mut deep = declaration;
+        for _ in 0..65 {
+            deep = json!({"allOf":[deep]});
+        }
+        assert!(reported_error(&output, Some(&deep)).is_some());
+        let wide = json!({"allOf": vec![json!({}); 4096]});
+        assert!(reported_error(&output, Some(&wide)).is_some());
+    }
+
+    #[test]
     fn reported_error_detects_truthy_error_fields() {
-        assert!(reported_error(&json!({"error": "boom"})).is_some());
-        assert!(reported_error(&json!({"error": {"code": 1}})).is_some());
-        assert!(reported_error(&json!({"error": null, "v": 1})).is_none());
-        assert!(reported_error(&json!({"error": ""})).is_none());
-        assert!(reported_error(&json!({"error": false})).is_none());
-        assert!(reported_error(&json!(["error"])).is_none());
+        assert!(reported_error(&json!({"error": "boom"}), None).is_some());
+        assert!(reported_error(&json!({"error": {"code": 1}}), None).is_some());
+        assert!(reported_error(&json!({"error": null, "v": 1}), None).is_none());
+        assert!(reported_error(&json!({"error": ""}), None).is_none());
+        assert!(reported_error(&json!({"error": false}), None).is_none());
+        assert!(reported_error(&json!(["error"]), None).is_none());
+        let schema = json!({"type":"object", "properties":{"error":{"type":"string"}}});
+        assert!(reported_error(&json!({"error":"invalid input"}), Some(&schema)).is_none());
+        let mut req = live("function run() { return {valid: false, error: 'invalid input'}; }");
+        req.output_schema = Some(schema);
+        assert_eq!(
+            execute(&req, Arc::new(NoHostOps)).unwrap().output,
+            json!({"valid":false,"error":"invalid input"})
+        );
     }
 }

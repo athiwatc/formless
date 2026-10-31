@@ -75,7 +75,15 @@ impl Capabilities {
             if s == "net" {
                 c.net = Some(Vec::new());
             } else if let Some(d) = s.strip_prefix("net:") {
-                c.net.get_or_insert_with(Vec::new).push(d.to_string());
+                if d.is_empty() {
+                    return Err("net needs a host name".into());
+                }
+                let host = if d.starts_with(INPUT_PREFIX) {
+                    d.to_string()
+                } else {
+                    canonical_host_scope(d)?
+                };
+                c.net.get_or_insert_with(Vec::new).push(host);
             } else if let Some(p) = s.strip_prefix("fs:read:") {
                 if p.is_empty() {
                     return Err("fs:read needs a path".into());
@@ -94,6 +102,9 @@ impl Capabilities {
             } else if s == "process" {
                 c.process = Some(Vec::new());
             } else if let Some(cmd) = s.strip_prefix("process:") {
+                if cmd.is_empty() {
+                    return Err("process needs a command name".into());
+                }
                 c.process.get_or_insert_with(Vec::new).push(cmd.to_string());
             } else if s == "clipboard" {
                 c.clipboard_read = true;
@@ -355,7 +366,9 @@ impl Capabilities {
     /// Does `self` (approved) fully cover `other` (requested)?
     pub fn covers(&self, other: &Capabilities) -> bool {
         scoped_covers(&self.net, &other.net, |a, b| {
-            a == b || b.ends_with(&format!(".{a}"))
+            let (ah, ap) = crate::split_grant(a);
+            let (bh, bp) = crate::split_grant(b);
+            (ah == bh || bh.ends_with(&format!(".{ah}"))) && ap.is_none_or(|p| Some(p) == bp)
         }) && path_covers(&self.fs_read, &other.fs_read)
             && path_covers(&self.fs_write, &other.fs_write)
             && other.env.iter().all(|k| self.env.contains(k))
@@ -456,6 +469,34 @@ pub fn canonical_path(raw: &str) -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// Static net scopes name hosts (optionally with a port), never URLs.
+/// Use the HTTP URL parser's host canonicalization so static and input-bound
+/// scopes agree on case, IDNA and IP literals without dropping an explicit port.
+fn canonical_host_scope(raw: &str) -> Result<String, String> {
+    let bad = || {
+        format!("bad net scope '{raw}': expected a bare host or host:port (for example net:api.example.com), without a scheme or path")
+    };
+    if raw.contains(['/', '\\', '?', '#', '@', '*']) || raw.contains(char::is_whitespace) {
+        return Err(bad());
+    }
+    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        return Ok(match ip {
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        });
+    }
+    if raw.ends_with(':') {
+        return Err(bad());
+    }
+    let url = reqwest::Url::parse(&format!("http://{raw}/")).map_err(|_| bad())?;
+    let host = url.host_str().ok_or_else(bad)?;
+    let (_, port) = crate::split_grant(raw);
+    Ok(match port {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    })
+}
+
 /// Host of a bound `net` value: a URL's host, or the value as a bare host.
 /// A non-default port is kept (`host:8443`), so the grant shown for
 /// approval is exactly that port, never every port (#603).
@@ -471,19 +512,7 @@ fn bound_host(raw: &str) -> Result<String, String> {
             None => host,
         });
     }
-    let first = raw.split('/').next().unwrap_or_default();
-    let (host, port) = match first.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') => (h, Some(p)),
-        _ => (first, None),
-    };
-    if host.is_empty() || host.contains(char::is_whitespace) {
-        return Err(format!("bad host for net binding: {raw}"));
-    }
-    match port {
-        Some(p) if p.parse::<u16>().is_ok() => Ok(format!("{}:{p}", host.to_lowercase())),
-        Some(_) => Err(format!("bad port for net binding: {raw}")),
-        None => Ok(host.to_lowercase()),
-    }
+    canonical_host_scope(raw).map_err(|e| format!("bad host for net binding: {e}"))
 }
 
 fn scoped_covers(
@@ -517,6 +546,50 @@ mod tests {
 
     fn caps(specs: &[&str]) -> Capabilities {
         Capabilities::parse(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn net_scopes_are_canonical_and_cover_mixed_case_bindings() {
+        let static_scope = caps(&["net:API.Example.COM"]);
+        assert_eq!(static_scope.to_specs(), ["net:api.example.com"]);
+        let template = caps(&["net:$input.url"]);
+        for raw in [
+            "https://aPI.ExAmPlE.com/path",
+            "Api.Example.Com",
+            "https://API.example.com:8443/path",
+        ] {
+            let bound = template.bind(&json!({"url":raw})).unwrap();
+            assert!(static_scope.covers(&bound), "{raw}");
+        }
+        let port_scope = caps(&["net:API.Example.COM:8443"]);
+        assert!(static_scope.covers(&port_scope));
+        assert!(!port_scope.covers(&static_scope));
+        assert!(port_scope.covers(
+            &template
+                .bind(&json!({"url":"https://API.EXAMPLE.COM:8443/x"}))
+                .unwrap()
+        ));
+        assert!(!port_scope.covers(&caps(&["net:api.example.com:443"])));
+        assert_eq!(caps(&["net:LOCALHOST:80"]).to_specs(), ["net:localhost:80"]);
+        assert!(caps(&["net:::1"]).covers(&caps(&["net:[::1]:8080"])));
+    }
+
+    #[test]
+    fn malformed_net_and_empty_process_scopes_are_rejected() {
+        for spec in ["net:", "process:"] {
+            let error = Capabilities::parse(&[spec.into()]).unwrap_err();
+            assert!(error.contains("needs a"), "{error}");
+        }
+        for spec in [
+            "net:https://api.example.com",
+            "net:api.example.com:443/v1",
+            "net:host:notaport",
+            "net:host:",
+            "net:bad host",
+        ] {
+            let error = Capabilities::parse(&[spec.into()]).unwrap_err();
+            assert!(error.contains("bare host"), "{error}");
+        }
     }
 
     #[test]
