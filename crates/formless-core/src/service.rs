@@ -315,9 +315,26 @@ fn uninstall_with(
     plan: &Plan,
     run: &mut impl FnMut(&[String]) -> Result<(bool, String)>,
 ) -> Result<()> {
-    // A manager can retain a registered job after its definition is removed.
+    disable_with(plan, run)?;
+    remove_definition(plan)
+}
+
+/// Stop registration without deleting its definition. Multi-profile uninstall
+/// uses this preparation phase before freezing and deleting any profile files.
+pub fn disable(plan: &Plan) -> Result<()> {
+    disable_with(plan, &mut run_command)
+}
+
+fn disable_with(
+    plan: &Plan,
+    run: &mut impl FnMut(&[String]) -> Result<(bool, String)>,
+) -> Result<()> {
     run_all_with(&plan.disable, run)
-        .context("could not disable the registered service; any definition is kept")?;
+        .context("could not disable the registered service; any definition is kept")
+}
+
+/// The manager must already have been disabled successfully (or proven absent).
+pub fn remove_definition(plan: &Plan) -> Result<()> {
     match std::fs::remove_file(&plan.file) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -494,6 +511,35 @@ mod tests {
             config_dir: config.into(),
             profile: profile.into(),
         }
+    }
+
+    #[test]
+    fn successful_preparation_keeps_definition_until_destructive_phase() {
+        let root = std::env::temp_dir().join(format!("fl-disable-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("service");
+        std::fs::write(&file, "definition sentinel").unwrap();
+        let plan = Plan {
+            manager: "fixture",
+            file: file.clone(),
+            contents: String::new(),
+            enable: Vec::new(),
+            disable: vec![vec!["private-fake-manager".into(), "disable".into()]],
+        };
+        let mut calls = 0;
+        disable_with(&plan, &mut |_| {
+            calls += 1;
+            Ok((true, String::new()))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "definition sentinel"
+        );
+        remove_definition(&plan).unwrap();
+        assert!(!file.exists());
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]

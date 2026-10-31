@@ -5,6 +5,7 @@
 use crate::Paths;
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -66,7 +67,11 @@ fn directory(create: bool) -> Result<PathBuf> {
 /// Lexical absolute identity survives unlinking or retargeting a configured
 /// symlink. Do not canonicalize even its parent: that namespace can change too.
 fn configured_identity(paths: &Paths) -> Result<PathBuf> {
-    let absolute = std::path::absolute(&paths.data_dir)?;
+    configured_path(&paths.data_dir)
+}
+
+fn configured_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -81,8 +86,11 @@ fn configured_identity(paths: &Paths) -> Result<PathBuf> {
 }
 
 fn canonical_identity(paths: &Paths) -> Result<PathBuf> {
-    let raw = paths
-        .data_dir
+    canonical_path(&paths.data_dir)
+}
+
+fn canonical_path(path: &Path) -> Result<PathBuf> {
+    let raw = path
         .to_str()
         .context("canonical profile ownership requires a UTF-8 data path")?;
     formless_runtime::caps::canonical_path(raw).map_err(anyhow::Error::msg)
@@ -168,24 +176,195 @@ fn open_lock(path: &Path, create: bool) -> Result<Option<File>> {
     Ok(Some(file))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+fn root_identities(paths: &Paths) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for path in [&paths.data_dir, &paths.config_dir] {
+        roots.push(configured_path(path)?);
+        roots.push(canonical_path(path)?);
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// Every ancestor participates, so an independently configured default profile
+/// inside another profile's subtree cannot bypass its parent's maintenance.
+#[cfg(test)]
+fn hierarchy_plan(paths: &Paths, exclusive: bool) -> Result<Vec<(PathBuf, LockMode)>> {
+    hierarchy_roots(&root_identities(paths)?, exclusive)
+}
+
+fn hierarchy_roots(roots: &[PathBuf], exclusive: bool) -> Result<Vec<(PathBuf, LockMode)>> {
+    let dir = directory(true)?;
+    let mut plan = BTreeMap::new();
+    for root in roots {
+        for ancestor in root.ancestors() {
+            let name = identity_lock_path(&dir, ancestor, false).with_extension("family");
+            let mode = if exclusive && ancestor == root.as_path() {
+                LockMode::Exclusive
+            } else {
+                LockMode::Shared
+            };
+            plan.entry(name)
+                .and_modify(|existing| {
+                    if mode > *existing {
+                        *existing = mode;
+                    }
+                })
+                .or_insert(mode);
+        }
+    }
+    Ok(plan.into_iter().collect())
+}
+
+fn try_plan(plan: Vec<(PathBuf, LockMode)>) -> Result<Option<ProfileLock>> {
+    let mut files = Vec::new();
+    for (path, mode) in plan {
+        let file = open_lock(&path, true)?.expect("create opens a lock file");
+        let locked = match mode {
+            LockMode::Shared => file.try_lock_shared(),
+            LockMode::Exclusive => file.try_lock(),
+        };
+        match locked {
+            Ok(()) => files.push(file),
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("claim profile kernel locks")
+            }
+        }
+    }
+    Ok(Some(ProfileLock { _files: files }))
+}
+
+/// Preparation is shared with ordinary operations. Freeze releases that shared
+/// lease before claiming the same namespace exclusively; its persistent launch
+/// lock stays held throughout, and failed upgrades never authorize deletion.
+pub struct MaintenanceGate {
+    paths: Paths,
+    shared: ProfileLock,
+    launch: ProfileLock,
+    roots: Vec<PathBuf>,
+}
+
+pub struct MaintenanceGuard {
+    _owner: ProfileLock,
+    _exclusive: ProfileLock,
+    _launch: ProfileLock,
+    roots: Vec<PathBuf>,
+}
+
+impl MaintenanceGate {
+    pub fn freeze(self) -> Result<MaintenanceGuard> {
+        let Self {
+            paths,
+            shared,
+            launch,
+            roots,
+        } = self;
+        drop(shared);
+        if root_identities(&paths)? != roots {
+            anyhow::bail!(
+                "profile namespace changed during preparation; destructive cleanup was refused"
+            );
+        }
+        let exclusive = try_plan(hierarchy_roots(&roots, true)?)?.ok_or_else(|| anyhow!("profile family is in use; close TUIs and stop named profiles before destructive cleanup"))?;
+        let owner = try_plan(
+            lock_paths(&paths, false)?
+                .into_iter()
+                .map(|p| (p, LockMode::Exclusive))
+                .collect(),
+        )?
+        .ok_or_else(|| anyhow!("profile is still owned; destructive cleanup was refused"))?;
+        if root_identities(&paths)? != roots {
+            anyhow::bail!(
+                "profile namespace changed while freezing; destructive cleanup was refused"
+            );
+        }
+        Ok(MaintenanceGuard {
+            _owner: owner,
+            _exclusive: exclusive,
+            _launch: launch,
+            roots,
+        })
+    }
+}
+
+impl MaintenanceGuard {
+    /// All raw and canonical paths must remain within the frozen namespace.
+    /// Retargeting a child symlink outside the protected tree is refused.
+    pub fn covers(&self, paths: &Paths) -> Result<bool> {
+        Ok(root_identities(paths)?
+            .iter()
+            .all(|path| self.roots.iter().any(|root| path.starts_with(root))))
+    }
+}
+
 impl ProfileLock {
     pub fn try_owner(paths: &Paths) -> Result<Option<Self>> {
         Self::try_kind(paths, false)
     }
 
     fn try_kind(paths: &Paths, launcher: bool) -> Result<Option<Self>> {
-        let mut files = Vec::new();
-        for path in lock_paths(paths, launcher)? {
-            let file = open_lock(&path, true)?.expect("create opens a lock file");
-            match file.try_lock() {
-                Ok(()) => files.push(file),
-                Err(TryLockError::WouldBlock) => return Ok(None),
-                Err(TryLockError::Error(error)) => {
-                    return Err(error).context("claim profile kernel locks")
-                }
-            }
+        let roots = root_identities(paths)?;
+        let mut plan = hierarchy_roots(&roots, false)?;
+        plan.extend(
+            lock_paths(paths, launcher)?
+                .into_iter()
+                .map(|p| (p, LockMode::Exclusive)),
+        );
+        plan.sort_by(|a, b| a.0.cmp(&b.0));
+        let claimed = try_plan(plan)?;
+        if root_identities(paths)? != roots {
+            anyhow::bail!("profile namespace changed while claiming ownership");
         }
-        Ok(Some(Self { _files: files }))
+        Ok(claimed)
+    }
+
+    /// Ordinary operations retain a shared lease through their last write.
+    pub fn hierarchy_shared(paths: &Paths) -> Result<Self> {
+        Self::shared_hierarchy(paths).map(|(guard, _)| guard)
+    }
+
+    fn shared_hierarchy(paths: &Paths) -> Result<(Self, Vec<PathBuf>)> {
+        let roots = root_identities(paths)?;
+        let shared = try_plan(hierarchy_roots(&roots, false)?)?.ok_or_else(|| {
+            anyhow!("profile family is under maintenance; wait for cleanup to finish and retry")
+        })?;
+        if root_identities(paths)? != roots {
+            anyhow::bail!("profile namespace changed while claiming operation lease");
+        }
+        Ok((shared, roots))
+    }
+
+    pub fn maintenance(paths: &Paths, timeout: Duration) -> Result<MaintenanceGate> {
+        let deadline = Instant::now() + timeout;
+        let launch = loop {
+            if let Some(lock) = try_plan(
+                lock_paths(paths, true)?
+                    .into_iter()
+                    .map(|p| (p, LockMode::Exclusive))
+                    .collect(),
+            )? {
+                break lock;
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!("profile launch/maintenance gate did not release"));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let (shared, roots) = Self::shared_hierarchy(paths)?;
+        Ok(MaintenanceGate {
+            paths: paths.clone(),
+            shared,
+            launch,
+            roots,
+        })
     }
 
     pub fn owner(paths: &Paths) -> Result<Self> {
@@ -266,6 +445,176 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn parent_cleanup_refuses_named_owner_and_named_profiles_without_touching_sentinels() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let (_fixture, base) = Fixture::new();
+        let named = base.named("child");
+        let child = Paths::from_dirs(named.data_dir.clone(), named.config_dir.clone()).unwrap();
+        std::fs::write(base.db_file(), "default sentinel").unwrap();
+        std::fs::write(child.db_file(), "child data sentinel").unwrap();
+        std::fs::write(child.config_file(), "child config sentinel").unwrap();
+        let owner = ProfileLock::owner(&named).unwrap();
+        let error = crate::config::reset_all(&base).unwrap_err();
+        assert!(error.to_string().contains("family is in use"));
+        assert_eq!(
+            std::fs::read_to_string(base.db_file()).unwrap(),
+            "default sentinel"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.db_file()).unwrap(),
+            "child data sentinel"
+        );
+        drop(owner);
+        let error = crate::config::reset_all(&base).unwrap_err();
+        assert!(error.to_string().contains("profiles rm NAME"));
+        assert_eq!(
+            std::fs::read_to_string(child.config_file()).unwrap(),
+            "child config sentinel"
+        );
+        assert!(
+            ProfileLock::owner(&named).is_ok(),
+            "failed parent cleanup rolls back all locks"
+        );
+    }
+
+    #[test]
+    fn parent_freeze_blocks_new_profile_creation_operation_and_constructor_until_release() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let (_fixture, base) = Fixture::new();
+        let frozen = ProfileLock::maintenance(&base, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .unwrap();
+        let named = base.named("new-child");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let child_paths = named.clone();
+        let child_barrier = barrier.clone();
+        let child = std::thread::spawn(move || {
+            child_barrier.wait();
+            assert!(
+                Paths::from_dirs(child_paths.data_dir.clone(), child_paths.config_dir.clone())
+                    .is_err()
+            );
+            assert!(ProfileLock::hierarchy_shared(&child_paths).is_err());
+            assert!(ProfileLock::try_owner(&child_paths).unwrap().is_none());
+            assert!(crate::daemon::Daemon::new(child_paths.clone()).is_err());
+            assert!(!child_paths.data_dir.exists() && !child_paths.config_dir.exists());
+        });
+        barrier.wait();
+        child.join().unwrap();
+        drop(frozen);
+        assert!(Paths::from_dirs(named.data_dir, named.config_dir).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeting_during_preparation_or_after_freeze_cannot_authorize_an_uncovered_tree() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let (fixture, base) = Fixture::new();
+        let alias_path = fixture.0.join("alias");
+        std::os::unix::fs::symlink(&base.data_dir, &alias_path).unwrap();
+        let alias = Paths {
+            data_dir: alias_path.clone(),
+            ..base.clone()
+        };
+        let gate = ProfileLock::maintenance(&alias, Duration::ZERO).unwrap();
+        let outside = fixture.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("formless.db"), "outside sentinel").unwrap();
+        std::fs::remove_file(&alias_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &alias_path).unwrap();
+        assert!(gate.freeze().is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("formless.db")).unwrap(),
+            "outside sentinel"
+        );
+        let frozen = ProfileLock::maintenance(&base, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .unwrap();
+        let child = base.named("child");
+        std::os::unix::fs::symlink(&outside, &child.data_dir).unwrap();
+        assert!(!frozen.covers(&child).unwrap());
+        assert!(crate::config::reset_all_guarded(&child, &frozen).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("formless.db")).unwrap(),
+            "outside sentinel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_parent_tree_cannot_freeze_a_descendant_owned_through_real_paths() {
+        let (fixture, base) = Fixture::new();
+        let child = base.named("child");
+        Paths::from_dirs(child.data_dir.clone(), child.config_dir.clone()).unwrap();
+        let owner = ProfileLock::owner(&child).unwrap();
+        let data_alias = fixture.0.join("data-alias");
+        let config_alias = fixture.0.join("config-alias");
+        std::os::unix::fs::symlink(&base.data_dir, &data_alias).unwrap();
+        std::os::unix::fs::symlink(&base.config_dir, &config_alias).unwrap();
+        let alias = Paths {
+            data_dir: data_alias,
+            config_dir: config_alias,
+            profile: "default".into(),
+        };
+        assert!(ProfileLock::maintenance(&alias, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .is_err());
+        drop(owner);
+        let frozen = ProfileLock::maintenance(&alias, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .unwrap();
+        assert!(ProfileLock::try_owner(&child).unwrap().is_none());
+        assert!(frozen.covers(&alias.named("child")).unwrap());
+    }
+
+    #[test]
+    fn failed_partial_freeze_releases_locks_and_overlapping_roots_do_not_self_deadlock() {
+        let (_fixture, base) = Fixture::new();
+        let plan = hierarchy_plan(&base, true).unwrap();
+        let blocked_path = &plan
+            .iter()
+            .rev()
+            .find(|(_, mode)| *mode == LockMode::Exclusive)
+            .unwrap()
+            .0;
+        let blocked = open_lock(blocked_path, true).unwrap().unwrap();
+        blocked.try_lock_shared().unwrap();
+        assert!(ProfileLock::maintenance(&base, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .is_err());
+        drop(blocked);
+        let frozen = ProfileLock::maintenance(&base, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .unwrap();
+        assert!(frozen.covers(&base).unwrap());
+        drop(frozen);
+        let nested = Paths {
+            config_dir: base.data_dir.join("config"),
+            ..base.clone()
+        };
+        let frozen = ProfileLock::maintenance(&nested, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .unwrap();
+        assert!(frozen.covers(&nested).unwrap());
+        let identical = Paths {
+            config_dir: base.data_dir.clone(),
+            ..base
+        };
+        drop(frozen);
+        assert!(ProfileLock::maintenance(&identical, Duration::ZERO)
+            .unwrap()
+            .freeze()
+            .is_ok());
     }
 
     #[cfg(unix)]

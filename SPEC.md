@@ -2276,10 +2276,21 @@ such as `read_file`, `read_text_file` and `file_read`.
   separate launcher gate; installation stops a running daemon and waits for its
   ownership to release before loading the service. A second daemon cannot alter
   the owner's PID marker, socket, uploads or recovery state.
-  Reset, profile removal and full uninstall keep the launcher gate through
-  shutdown and hold ownership through destructive changes. Full uninstall asks
+  Profile owners, launchers, directory creation and ordinary CLI lifetimes hold
+  shared hierarchy gates for data/config paths and their raw/canonical ancestors.
+  Destructive preparation retains its launch gate while releasing its own shared
+  lease before freezing affected roots exclusively (shared ancestors, sorted and
+  deduplicated); overlapping roots cannot self-deadlock. New descendant profiles
+  cannot be created, started or written by a current CLI during that freeze.
+  Reset, profile removal and full uninstall hold this freeze plus ownership
+  through destructive changes. Full uninstall asks
   the service manager to disable registration even if the definition is missing;
-  an unknown manager/ownership state preserves the profile and binary.
+  an unknown manager/ownership state preserves the profile and binary. Full
+  uninstall prepares every known profile before deleting any profile files,
+  freezes the base roots, rechecks the inventory, and erases named children before
+  the default parent. Failed child preparation preserves every profile; failed
+  child erasure prevents recursive parent erasure. An inventory change refuses
+  deletion and asks for a retry.
   `formless profiles list [--json]` shows
   each profile (default first), whether its daemon runs, when it was last
   used and its data dir, and marks the current one. `formless profiles rm
@@ -4122,7 +4133,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   keeps anonymised per-Tool tallies (payloads gone, counts stay). Tool purge
   removes everything incl. tallies. **Full reset** (Settings or
   `formless reset`) stops the daemon and deletes config, keychain entry, and
-  the entire data dir, with explicit confirmation.
+  the entire data dir, with explicit confirmation. Default reset refuses while
+  named profiles exist: remove them with `formless profiles rm NAME` first, or
+  use full uninstall to coordinate every profile. The refusal is checked under
+  the family freeze, so an in-use child or a newly created profile cannot be
+  erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
 
 ## 16. Error handling and edge cases (normative)
