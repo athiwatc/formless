@@ -1683,7 +1683,9 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
 - **No ambient authority, and no Capabilities.**
   - Inside the script, `tools` holds the Tools in `uses` as async
     functions (`await tools.search_repo({…})`) plus `tools.call(name,
-    input)`, which also returns a Promise.
+    input)`, which also returns a Promise. `tools.call` is always the
+    dispatcher, even when `uses` contains a Tool named `call`: invoke that
+    Tool as `tools.call("call", input)`.
   - Also available: `console`, timers, `sleep`, `JSON`, `cryptoRandom()`,
     `randomBytes()` and `requireModule` (§7.6).
   - Absent: `fetch`, `fetchChunks`, `fs`, `process`, `env`, `clipboard`,
