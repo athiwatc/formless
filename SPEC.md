@@ -410,7 +410,13 @@ an empty listing just asks for one.
   Neither is ever stored as an empty answer: the note says why, and an
   empty one becomes "(The provider's content filter stopped this
   answer.)". A Responses answer stopped by `max_output_tokens` keeps its
-  partial text with `truncated`, like Chat's `length`.
+  partial text with `truncated`, like Chat's `length`. Final output-limit
+  and context-window partials persist `meta.truncated: true`; output-limit
+  partials also persist `stop_reason: "max_tokens"`. When building later
+  provider context, append a `[harness note]` explaining the cut-off, or
+  substitute that note when the partial is empty. TUI and web history show
+  a muted stop note for stored `stop_reason`/`truncated` metadata, using
+  the same wording as live stop notes; ordinary completions show none.
 - **Rate limits.** The `x-ratelimit-*` (and `anthropic-ratelimit-*`)
   headers of each endpoint's latest response are kept: `RateLimits`,
   `Status.rate_limits`; `/usage` adds "41/50 requests left, resets …".
@@ -588,7 +594,8 @@ task, with quality as a gate**.
   the re-importable bundle; "markdown" and "html" return `{name, format,
   content}`, a readable transcript: user and assistant turns, notes, and
   each Tool call folded into `<details>` with its arguments and result
-  (results over 4000 characters are cut). The HTML page is
+  (arguments and results over 4000 characters are cut, with an `… (cut)`
+  marker). The HTML page is
   self-contained (inline styles, no scripts or external resources), and
   any HTML in messages is shown as text; Markdown images become their
   alt text and address as text (nothing is fetched when the page is
@@ -1607,7 +1614,9 @@ Tools fill capability gaps; skills say how to use them well.
 
 - **By hand.** `/skills NAME` previews a skill in the pager (SKILL.md,
   its files, and its scripts, which never run on the host) before it is
-  enabled; the web "Review" does the same. `/skill:NAME [args]`
+  enabled; `/skills enable NAME` and `/skills disable NAME` change its
+  enabled state instead of previewing a name beginning with the verb.
+  The web "Review" does the same preview. `/skill:NAME [args]`
   (`LoadSkill {session_id, name, args}`) loads an enabled skill into the
   Session: its instructions and arguments join the chat as a note, and
   the load counts like the agent's.
@@ -2102,7 +2111,10 @@ such as `read_file`, `read_text_file` and `file_read`.
   reconnecting to the daemon… (Ns)" in the status bar, and tries again
   every 2 s, starting a daemon itself after 6 s. Enter keeps the typed
   message instead of sending it into nothing. Once connected it reloads
-  the Session and notes how long it was away. The web already reconnects
+  the Session and notes how long it was away. It clears the old daemon's
+  approvals mode on disconnect and requests `Status` on every new
+  connection, so Settings reports the attached daemon's mode. Until the
+  reply arrives the mode is shown as unknown. The web already reconnects
   on its own.
 - **Resource use.** `Status.resources` has the daemon's memory (RSS),
   CPU % and CPU time (from `ps`; absent on Windows), the database and
@@ -2149,6 +2161,16 @@ such as `read_file`, `read_text_file` and `file_read`.
   After reconnecting, retrying an unacknowledged send can repeat an uncertain
   prior send: action ids deduplicate only within the original connection.
   Cached failures preserve the same machine-readable error code and message.
+  TUI, plain mode and headless sends carry a fresh UUID per user action.
+  Until a response arrives, retrying the same text in that Session reuses
+  the UUID and original send mode, including after a TUI timeout or
+  reconnect. A response clears the action, so a later intentional send
+  of the same text gets a new UUID. The TUI restores an unacknowledged
+  message to an empty draft on timeout/disconnect without overwriting
+  a newer draft. A late success retracts the untouched restored retry
+  draft, so Enter cannot accidentally send it again as a new action.
+  Buffered replies are consumed before disconnect cleanup: an accepted
+  send acknowledged immediately before EOF is never restored for retry.
 - A client that falls behind loses live deltas first; it is told with
   `DeltasDropped {session_id, run_id}` once there is room, and the
   answer's `MessageComplete` carries the whole text (plain mode notes the
