@@ -387,6 +387,26 @@ an empty listing just asks for one.
 
 ### 4.4 Provider failure handling
 
+Circuit breakers are scoped to the normalized endpoint (host case, default
+port and trailing slash), configured provider name and a non-reversible
+credential digest, plus the model actually serving the request. Missing models
+open immediately; transport failures, rate limits, server errors and failed
+streams count toward the threshold. User-caused request rejections do not count.
+Only a completed response closes a breaker; receiving HTTP headers does not.
+Breaker notices use a dedicated global hook, independent of a Run's Session
+warning hook. Image-attachment warnings stay with the originating Session;
+overriding that warning hook cannot hide global breaker transitions.
+After cooldown exactly one request owns the half-open probe through response
+completion, while concurrent callers skip it. A failed probe immediately
+reopens with doubled cooldown; cancellation releases probe ownership without
+counting a user failure. If every configured model is open, the request fails
+clearly until another probe is eligible. Breaker changes are global provider
+notes, including internal calls, and never attributed to an unrelated Session.
+The process-wide breaker cache holds at most 1024 identities, evicting the
+least recently used inactive entry; active requests cannot be evicted. If all
+1024 entries have active requests, a new identity is refused temporarily rather
+than growing the map or losing an in-flight probe.
+
 - 429 / 5xx / dropped stream: automatic retry with exponential backoff,
   bounded (default 5 attempts). Exhaustion ⇒ the Run **pauses** and the error
   is surfaced in the TUI; a Run never silently fails.

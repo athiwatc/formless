@@ -911,7 +911,8 @@ impl Daemon {
                 let key = crate::config::provider_key(&self.paths, n).unwrap_or_default();
                 Ok(Provider::with_key(pcfg, key, self.http.clone())
                     .with_name(n)
-                    .with_usage_hook(self.usage_hook()))
+                    .with_usage_hook(self.usage_hook())
+                    .with_breaker_note_hook(self.provider_breaker_note_hook()))
             }
         }
     }
@@ -999,8 +1000,22 @@ impl Daemon {
             Provider::for_profile_with(cfg.provider.clone(), self.paths.clone(), self.http.clone())
                 .await?
                 .with_name(crate::config::DEFAULT_PROVIDER)
-                .with_usage_hook(self.usage_hook()),
+                .with_usage_hook(self.usage_hook())
+                .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
+    }
+
+    fn provider_breaker_note_hook(&self) -> crate::provider::NoteHook {
+        let subs = self.subs.clone();
+        Arc::new(move |text| {
+            send_all(
+                &subs,
+                Event::Note {
+                    session_id: None,
+                    text,
+                },
+            )
+        })
     }
 
     /// Records the usage of the daemon's own model calls (compaction, the
@@ -14853,3 +14868,7 @@ mod live_snapshot_tests {
         let _ = std::fs::remove_dir_all(base);
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_provider_breaker_tests.rs"]
+mod provider_breaker_tests;
