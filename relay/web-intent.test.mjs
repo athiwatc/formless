@@ -54,7 +54,7 @@ test('init and hashchange recover malformed links through pairing guidance', () 
 });
 test('overlapping asks preserve typed text and both settle in FIFO order', async () => {
   const c = setup(['ask', 'showNextAsk', 'closeAsk']);
-  vm.runInContext('let askResolve = null; const askQueue = [];', c);
+  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
   const first = c.ask({ title: 'Rename', input: true });
   c.$('ask-input').value = 'typed name';
   const second = c.ask({ title: 'Agent question', input: true });
@@ -129,7 +129,7 @@ test('clearing search invalidates an in-flight reply', async () => {
 test('opening Session clears old messages and merges live appended messages into snapshot', async () => {
   const wait = deferred();
   const noop = () => {};
-  const c = setup(['openSession', 'onEvent'], { notifyFor: noop, renderComposer: noop, act: () => wait.promise, request: async () => ({}), prefs: { set() {} },
+  const c = setup(['openSession', 'onEvent'], { applySessionLiveState: noop, notifyFor: noop, renderComposer: noop, act: () => wait.promise, request: async () => ({}), prefs: { set() {} },
     rendered: new Map(), closeSidebar: noop, renderHistory: noop, renderRunTools: noop, renderStatus: noop,
     renderQueue: noop, renderPlan: noop, renderStep: noop, renderRunBanner: noop, renderAll: noop, isRunning: () => false });
   vm.runInContext('let sessionSeq = 0; const CLIENT_LABEL = "test"; const attachmentDrafts = {};', c);
@@ -222,4 +222,61 @@ test('live MessageComplete → RunRecap → RunFinished updates recap/rating out
   c.S.running.delete('A'); c.renderHistory();
   assert.equal(all(transcript).filter(n => n.attrs.class === 'rate').length, 1);
   assert.equal(all(originalBody).filter(n => n.attrs.class === 'rate').length, 0);
+});
+test('parallel questions queue across Sessions; closing queued question preserves active settings text', async () => {
+  const c = setup(['ask', 'showNextAsk', 'closeAsk', 'cancelAsk', 'queueQuestion', 'removeQuestion', 'showQuestion'], {
+    renderStatus() {}, questionForm: () => ({ querySelector: () => null }),
+    readQuestionForm: () => [{ selected: [], text: 'answer' }], act: async () => ({ answered: true }),
+  });
+  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
+  const settings = c.ask({ title: 'Setting', input: true }); c.$('ask-input').value = 'unsaved';
+  c.queueQuestion({ question_id: 'one', session_id: 'A', question: 'first' });
+  c.queueQuestion({ question_id: 'two', session_id: 'B', question: 'second' });
+  assert.equal(c.S.pendingQuestion.id, 'one'); assert.equal(c.S.questions.length, 2);
+  c.removeQuestion('one'); await Promise.resolve();
+  assert.equal(c.$('ask-title').textContent, 'Setting'); assert.equal(c.$('ask-input').value, 'unsaved');
+  c.closeAsk('saved'); assert.equal(await settings, 'saved');
+  assert.equal(c.$('ask-title').textContent, 'The agent asks'); assert.equal(c.S.pendingQuestion.id, 'two');
+  c.closeAsk(true); await new Promise(r => setImmediate(r));
+  assert.equal(c.S.questions.length, 0); assert.equal(c.S.pendingQuestion, null);
+});
+test('local and relay reconnect rebuild pending prompts/running and reject stale snapshot state', async () => {
+  for (const transport of ['local', 'relay']) {
+    let reply = deferred();
+    const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'queueQuestion', 'removeQuestion'], {
+      act: () => reply.promise, request: async () => ({}), prefs: { set() {} }, rendered: new Map(),
+      closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
+      renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
+      isRunning: () => c.S.running.has(c.S.current),
+    });
+    vm.runInContext('let sessionSeq = 0; const CLIENT_LABEL = "test"; const attachmentDrafts = {};', c);
+    c.S.local = transport === 'local'; c.S.running = new Set(['A']);
+    c.S.approvals = [{ kind: 'tool', id: 'answered-offline' }];
+    c.S.questions = [{ id: 'stale' }]; c.S.pendingQuestion = c.S.questions[0];
+    c.S.streaming = 'stale partial'; c.S.liveTools = [{}];
+    c.clearLiveState();
+    assert.equal(c.S.approvals.length, 0); assert.equal(c.S.questions.length, 0);
+    assert.equal(c.S.streaming, ''); assert.equal(c.S.liveTools.length, 0);
+    const loading = c.openSession('A');
+    reply.resolve({ messages: [], running: true, pending_events: [
+      { type: 'approval_requested', approval_id: 'raised-offline', session_id: 'A', capabilities: [] },
+      { type: 'user_question', question_id: 'new-question', session_id: 'A', question: 'which?' },
+    ] });
+    await loading;
+    assert.equal(c.S.running.has('A'), true);
+    assert.deepEqual(Array.from(c.S.approvals, a => a.id), ['raised-offline']);
+    assert.equal(c.S.pendingQuestion.id, 'new-question');
+    reply = deferred(); const refresh = c.openSession('A');
+    c.onEvent({ type: 'approval_answered', approval_id: 'raised-offline', approved: true });
+    c.onEvent({ type: 'approval_requested', approval_id: 'arrived-live', session_id: 'A', capabilities: [] });
+    c.onEvent({ type: 'user_question_closed', question_id: 'new-question' });
+    reply.resolve({ messages: [], running: false, pending_events: [
+      { type: 'approval_requested', approval_id: 'raised-offline', session_id: 'A', capabilities: [] },
+      { type: 'user_question', question_id: 'new-question', session_id: 'A', question: 'which?' },
+    ] });
+    await refresh;
+    assert.equal(c.S.running.has('A'), false);
+    assert.deepEqual(Array.from(c.S.approvals, a => a.id), ['arrived-live']);
+    assert.equal(c.S.pendingQuestion, null);
+  }
 });

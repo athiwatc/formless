@@ -3524,6 +3524,17 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### Relay and Web frontend (v2)
 
+`GetSession` includes `running` and `pending_events`: the current Session's
+outstanding approval/question events plus outstanding global promotion prompts.
+Resolving or cancelling a prompt removes it from subsequent snapshots. Local
+and Relay Web reconnects discard stale interactive/streaming state and seed the
+current Session from this snapshot; events received during the fetch are replayed
+idempotently so the snapshot cannot revive an answered prompt or erase a new one.
+Concurrent `ask_user` calls in the same Session, including nested sub-agents,
+wait behind a FIFO gate until the preceding question closes; cancellation also
+cancels queued waits. Web clients additionally queue question events across
+Sessions. Closing a queued question cannot dismiss an unrelated settings dialog.
+
 Web approval and promotion decisions remain pending locally until the daemon
 confirms resolution; failures report that the decision was not delivered and
 remain answerable. Recap and rating controls are rebuilt from current Run state

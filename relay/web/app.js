@@ -412,6 +412,7 @@
 
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
+  let askTag = null;
   const askQueue = [];
   /** Promise-based prompt/confirm: resolves the text (input) or true, or null. */
   function ask(opts) {
@@ -424,6 +425,7 @@
     if (!askQueue.length) return;
     const { opts, resolve } = askQueue.shift();
     askResolve = resolve;
+    askTag = opts.tag || null;
     rememberFocus("ask-backdrop");
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
@@ -444,8 +446,15 @@
     restoreFocus("ask-backdrop");
     const resolve = askResolve;
     askResolve = null;
+    askTag = null;
     if (resolve) resolve(value);
     showNextAsk();
+  }
+  function cancelAsk(tag) {
+    for (let i = askQueue.length - 1; i >= 0; i--) {
+      if (askQueue[i].opts.tag === tag) askQueue.splice(i, 1)[0].resolve(null);
+    }
+    if (askTag === tag) closeAsk(null);
   }
   $("ask-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -2189,22 +2198,40 @@
   }
   /** The agent's open question in a dialog; Cancel keeps it pending (the
    * status bar and `a` bring it back). */
+  function queueQuestion(ev) {
+    const questions = S.questions = S.questions || [];
+    if (questions.some((q) => q.id === ev.question_id)) return;
+    const qs = ev.questions && ev.questions.length ? ev.questions
+      : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
+    questions.push({ id: ev.question_id, session_id: ev.session_id, qs });
+    S.pendingQuestion = questions[0];
+    S.questionId = S.pendingQuestion.id;
+    showQuestion();
+  }
+  function removeQuestion(id) {
+    S.questions = (S.questions || []).filter((q) => q.id !== id);
+    cancelAsk("question:" + id);
+    S.pendingQuestion = S.questions[0] || null;
+    S.questionId = S.pendingQuestion && S.pendingQuestion.id;
+    renderStatus();
+    showQuestion();
+  }
   function showQuestion() {
     const q = S.pendingQuestion;
     if (!q || S.questionOpen) return;
     S.questionOpen = true;
     renderStatus();
     const body = questionForm(q.qs);
-    ask({ title: "The agent asks", body, ok: "Answer" }).then((done) => {
+    ask({ title: "The agent asks", body, ok: "Answer", tag: "question:" + q.id }).then(async (done) => {
       S.questionOpen = false;
-      if (!S.pendingQuestion || S.pendingQuestion.id !== q.id || !done) return renderStatus();
+      if (!S.pendingQuestion || S.pendingQuestion.id !== q.id) { renderStatus(); showQuestion(); return; }
+      if (!done) return renderStatus();
       const answers = readQuestionForm(body, q.qs);
       if (answers.every((a) => !a.selected.length && !a.text)) return renderStatus();
-      S.pendingQuestion = null;
-      S.questionId = null;
-      renderStatus();
       const answer = answers.map((a) => a.selected.concat(a.text ? [a.text] : []).join(", ")).join("; ");
-      act({ type: "answer_question", question_id: q.id, answer, answers });
+      const result = await act({ type: "answer_question", question_id: q.id, answer, answers });
+      if (result && result.answered) removeQuestion(q.id);
+      else renderStatus();
     });
   }
   /** `a` or the status bar: the oldest pending approval, else the open
@@ -3599,6 +3626,38 @@
     renderView();
   }
 
+  function clearQuestions() {
+    const questions = S.questions || [];
+    S.questions = [];
+    S.pendingQuestion = null;
+    S.questionId = null;
+    for (const q of questions) cancelAsk("question:" + q.id);
+  }
+  function clearLiveState() {
+    ++sessionSeq; // invalidate a snapshot requested on the old connection
+    S.sessionSnapshot = null;
+    S.approvals = [];
+    clearQuestions();
+    S.running.clear();
+    S.activity = null;
+    S.streaming = "";
+    S.thinking = "";
+    S.liveTools = [];
+    renderApproval();
+  }
+  function applySessionLiveState(id, result, liveEvents) {
+    if (typeof result.running !== "boolean" || !Array.isArray(result.pending_events)) return;
+    S.approvals = [];
+    clearQuestions();
+    if (result.running) S.running.add(id); else S.running.delete(id);
+    for (const ev of result.pending_events) onEvent(ev);
+    // Events delivered after dispatch may postdate the snapshot. Replaying
+    // them is idempotent and prevents a late snapshot resurrecting a prompt.
+    for (const ev of liveEvents) onEvent(ev);
+    renderApproval();
+    renderComposer();
+    renderStatus();
+  }
   /** Open a session; `stay` keeps the current view (initial load). */
   let sessionSeq = 0;
   async function openSession(id, stay) {
@@ -3606,6 +3665,7 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
     renderHistory();
     S.runTools = null;
@@ -3644,7 +3704,9 @@
     S.follow = true;
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
+    S.sessionSnapshot = null;
     if (r) {
+      applySessionLiveState(id, r, snapshot.events);
       const live = S.messages;
       const ids = new Set((r.messages || []).map((m) => m.id));
       S.messages = (r.messages || []).concat(live.filter((m) => !ids.has(m.id)));
@@ -4387,6 +4449,9 @@
   }
 
   function onEvent(ev) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "user_question", "user_question_closed"].includes(ev.type)) {
+      S.sessionSnapshot.events.push(ev);
+    }
     notifyFor(ev);
     const here = ev.session_id === S.current;
     switch (ev.type) {
@@ -4501,16 +4566,10 @@
           setActivity(isRunning() ? "waiting for model" : null);
         }
         break;
-      case "user_question": {
+      case "user_question":
         if (here) setActivity("awaiting your answer");
-        S.questionId = ev.question_id;
-        // An older daemon sends only the single-question form.
-        const qs = ev.questions && ev.questions.length ? ev.questions
-          : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
-        S.pendingQuestion = { id: ev.question_id, qs };
-        showQuestion();
+        queueQuestion(ev);
         break;
-      }
       case "run_usage":
         (S.usage = S.usage || {})[ev.session_id] = ev.usage;
         if (ev.usage.context_tokens > 0) (S.contextFill = S.contextFill || {})[ev.session_id] = { used: ev.usage.context_used, size: ev.usage.context_tokens };
@@ -4535,7 +4594,7 @@
       }
       case "user_question_closed":
         // Answered elsewhere (or the Run stopped): close our prompt.
-        if (S.questionId === ev.question_id) { S.questionId = null; S.pendingQuestion = null; if (S.questionOpen) closeAsk(null); renderStatus(); }
+        removeQuestion(ev.question_id);
         break;
       case "approval_summary": {
         const req = S.approvals.find((a) => a.id === ev.approval_id);
@@ -4543,6 +4602,7 @@
         break;
       }
       case "approval_requested":
+        if (S.approvals.some((a) => a.kind === "tool" && a.id === ev.approval_id)) break;
         S.approvals.push({ kind: "tool", id: ev.approval_id, tool_id: ev.tool_id || null, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
           already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
           pathOptions: ev.path_options || [], picks: {} });
@@ -4550,6 +4610,7 @@
         renderApproval();
         break;
       case "promotion_approval_requested":
+        if (S.approvals.some((a) => a.kind === "promotion" && a.id === ev.promotion_id)) break;
         S.approvals.push({ kind: "promotion", id: ev.promotion_id, tool_name: ev.tool_name, reason: ev.reason, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb });
         renderApproval();
         break;
@@ -4823,8 +4884,7 @@
       }
       S.daemonOnline = false;
       S.channel = null;
-      S.running.clear();
-      S.activity = null;
+      clearLiveState();
       for (const p of S.pending.values()) p.reject(new Error("relay connection closed"));
       S.pending.clear();
       if (!$("app").classList.contains("hidden")) renderAll();
@@ -4888,7 +4948,7 @@
       const wasOpen = S.channel != null;
       S.daemonOnline = false;
       S.channel = null;
-      S.running.clear();
+      clearLiveState();
       for (const p of S.pending.values()) p.reject(new Error("local daemon connection closed"));
       S.pending.clear();
       if (S.userClosed) return;

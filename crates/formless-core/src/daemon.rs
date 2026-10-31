@@ -390,6 +390,8 @@ pub struct Daemon {
     readers: Vec<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
+    /// Outstanding interactive prompts, replayable after a client reconnects.
+    pending_attention: StdMutex<Vec<Event>>,
     /// Ids for client connections.
     next_conn: AtomicU64,
     /// Fires when an approval or question starts waiting on the user (the
@@ -453,6 +455,8 @@ pub struct Daemon {
     grant_meta: StdMutex<HashMap<(ApprovalScope, String, String), (String, String)>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
+    /// FIFO question gate shared by main and nested calls in each Session.
+    question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
     startup_warnings: Vec<String>,
     /// The model each active Run resolved to (per-task routing, §4.6).
@@ -557,6 +561,7 @@ impl Daemon {
             readers,
             runs: Arc::new(StdMutex::new(HashMap::new())),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
+            pending_attention: StdMutex::new(Vec::new()),
             next_conn: AtomicU64::new(1),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
@@ -584,6 +589,7 @@ impl Daemon {
             denial_notes: StdMutex::new(Default::default()),
             grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
+            question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
             hook_approvals: StdMutex::new(Default::default()),
@@ -817,7 +823,26 @@ impl Daemon {
         )
     }
 
+    fn remove_attention(&self, id: &str) {
+        self.pending_attention.locked().retain(|ev| match ev {
+            Event::ApprovalRequested { approval_id, .. } => approval_id != id,
+            Event::UserQuestion { question_id, .. } => question_id != id,
+            Event::PromotionApprovalRequested { promotion_id, .. } => promotion_id != id,
+            _ => true,
+        });
+    }
+
     pub(crate) fn broadcast(&self, ev: Event) {
+        match &ev {
+            Event::ApprovalRequested { .. }
+            | Event::UserQuestion { .. }
+            | Event::PromotionApprovalRequested { .. } => {
+                self.pending_attention.locked().push(ev.clone())
+            }
+            Event::ApprovalAnswered { approval_id, .. } => self.remove_attention(approval_id),
+            Event::UserQuestionClosed { question_id } => self.remove_attention(question_id),
+            _ => {}
+        }
         if matches!(
             ev,
             Event::ApprovalRequested { .. }
@@ -1083,7 +1108,12 @@ impl Daemon {
                 let (queued, plan) = queued;
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run}),
+                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
+                        "pending_events": self.pending_attention.locked().iter().filter(|ev| match ev {
+                            Event::ApprovalRequested { session_id, .. } | Event::UserQuestion { session_id, .. } => session_id == &id,
+                            Event::PromotionApprovalRequested { .. } => true,
+                            _ => false,
+                        }).cloned().collect::<Vec<_>>() }),
                 )
             }
             Request::ForkSession {
@@ -2277,6 +2307,7 @@ impl Daemon {
             } => {
                 // First answer wins; the others find it gone.
                 let tx = self.questions.locked().remove(&question_id);
+                self.remove_attention(&question_id);
                 let answered = tx.is_some_and(|tx| tx.send((answer, answers)).is_ok());
                 Ok(json!({"answered": answered}))
             }
@@ -3026,6 +3057,7 @@ impl Daemon {
                 approved,
             } => {
                 let pending = self.promotions.locked().remove(&promotion_id);
+                self.remove_attention(&promotion_id);
                 match pending {
                     Some((attempt_id, kind)) => {
                         let this = self.clone();
@@ -3298,6 +3330,7 @@ impl Daemon {
                 // First answer wins (SPEC §10.4): removing the sender resolves
                 // it. A late or losing answer leaves nothing behind (#764).
                 let tx = self.approvals.locked().remove(&approval_id);
+                self.remove_attention(&approval_id);
                 if tx.is_some() {
                     if remember_denial && !approved {
                         self.deny_always.locked().insert(approval_id.clone());
@@ -8919,6 +8952,26 @@ impl Daemon {
         cancel: &CancellationToken,
     ) -> Result<String> {
         let questions = parse_questions(args)?;
+        let gate = {
+            let mut gates = self.question_gates.locked();
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(session_id).and_then(std::sync::Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(session_id.to_string(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        // Tokio's mutex queues in arrival order. Keep the guard until the
+        // question is answered/closed, including across nested sub-agents.
+        let _question = tokio::select! {
+            _ = cancel.cancelled() => bail!("interrupted before asking the user"),
+            guard = gate.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            bail!("interrupted before asking the user");
+        }
         // A single top-level question is the original form: its result
         // keeps the plain `answer` field.
         let legacy = args.get("questions").is_none();
@@ -9935,6 +9988,7 @@ impl Daemon {
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.locked().remove(&approval_id);
+        self.remove_attention(&approval_id);
         let by = self
             .approval_by
             .lock()
@@ -11272,6 +11326,7 @@ impl Daemon {
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
         self.approvals.locked().remove(&approval_id);
+        self.remove_attention(&approval_id);
         // These prompts have no Tool to remember a denial or a folder for:
         // drop what an answer may have left (clients don't offer them, #764).
         self.deny_always.locked().remove(&approval_id);
@@ -13903,4 +13958,84 @@ async fn summarize_in_chunks(
         provider.summarize(&merged, model),
     )
     .await
+}
+
+#[cfg(test)]
+mod live_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_snapshot_tracks_running_and_only_outstanding_approvals() {
+        let base = std::path::PathBuf::from(format!("/tmp/fl-live-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            data_dir: base.join("d"),
+            config_dir: base.join("c"),
+            profile: "live-test".into(),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let sid = daemon
+            .with_store(|st| Ok(st.create_session(None)?.id))
+            .unwrap();
+        let (steer_tx, _steer_rx) = mpsc::unbounded_channel();
+        daemon.runs.locked().insert(
+            sid.clone(),
+            RunCtl {
+                run_id: "in-flight".into(),
+                cancel: CancellationToken::new(),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                steer_tx,
+                retry: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        let (tx, rx) = oneshot::channel();
+        daemon.approvals.locked().insert("pending".into(), tx);
+        for session in [&sid, &"other-session".to_string()] {
+            daemon.broadcast(Event::ApprovalRequested {
+                approval_id: if session == &sid { "pending" } else { "other" }.into(),
+                session_id: session.clone(),
+                tool_name: "reader".into(),
+                version: 1,
+                capabilities: vec!["fs:read:/project".into()],
+                memory_mb: 64,
+                detail: None,
+                already_allowed: vec![],
+                code_preview: None,
+                tool_id: None,
+                batch: None,
+                path_options: Default::default(),
+            });
+        }
+        let snapshot = daemon
+            .handle(Request::GetSession { id: sid.clone() })
+            .await
+            .unwrap();
+        assert_eq!(snapshot["running"], true);
+        assert_eq!(snapshot["pending_events"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["pending_events"][0]["approval_id"], "pending");
+        // A second client answers while the browser is disconnected.
+        let decision = daemon
+            .handle(Request::ApprovalDecision {
+                approval_id: "pending".into(),
+                approved: true,
+                scope: ApprovalScope::Once,
+                paths: Default::default(),
+                remember_denial: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision["resolved"], true);
+        assert!(rx.await.unwrap().0);
+        daemon.runs.locked().remove(&sid);
+        let snapshot = daemon
+            .handle(Request::GetSession { id: sid })
+            .await
+            .unwrap();
+        assert_eq!(snapshot["running"], false);
+        assert_eq!(snapshot["pending_events"], json!([]));
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
