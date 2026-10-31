@@ -2213,6 +2213,15 @@ such as `read_file`, `read_text_file` and `file_read`.
    `invocations(tool_id) WHERE status='running'`, `artifacts(session_id)`
    and `audit(created_at)`.
 
+Schema upgrades snapshot the database before any step, then commit each step
+and its version bump together. A failure leaves the last completed version
+and preserves existing rows. A small atomic receipt binds the failed database's
+SHA-256 fingerprint to its original pre-upgrade snapshot and that snapshot's
+SHA-256. An unchanged retry reuses this verified recovery point; a changed
+source or missing/damaged snapshot gets a fresh copy. Names include fractional
+UTC seconds and a unique suffix. A failed checkpoint or receipt write disables
+reuse rather than sacrificing a backup or hiding the migration error.
+
 ### 9.5 Crash recovery
 
 - The daemon never idle-closes mid-Run (§9.1) but can crash/be killed. On
@@ -2252,7 +2261,8 @@ such as `read_file`, `read_text_file` and `file_read`.
   `/gc run`, web Clean up… which shows the dry run before "Free"):
   artifacts past their retention, `/rewind` snapshots older than 30
   days, MCP logs cut to their last 1 MB, all but the two newest
-  pre-migration copies, and the database's free pages (VACUUM). Each row
+  pre-migration copies by their recorded timestamp (not schema version),
+  and the database's free pages (VACUUM). Each row
   says how many items and bytes; a real run is audit-logged.
 - **Backups.** The daemon copies the database (`VACUUM INTO`, consistent
   under WAL) to `<data>/backups/formless-<UTC time>.db` when the newest is
@@ -2261,7 +2271,13 @@ such as `read_file`, `read_text_file` and `file_read`.
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
   the current database as `backups/before-restore-<time>.db`, copies it
-  in and migrates it. `formless doctor` shows the last backup's age.
+  in and migrates it. Backup and pre-restore filenames include fixed-width
+  fractional UTC seconds and a unique suffix, preserving distinct restore
+  points even within the same second; existing backup destinations are
+  never replaced. If post-restore migration fails, the error identifies the
+  safety copy; the copied database remains at its last completed schema
+  version, and the safety copy can be restored even from this state.
+  `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no
   filesystem path, because transcripts also reach remote web clients.
