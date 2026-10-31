@@ -2854,7 +2854,7 @@ run_tool = "network_policy"     # a registry Tool, or…
     real run, but nothing is recorded as an Invocation.
   - **Result:** `{ok, result?, error?, effects, logs}`, where `effects`
     are the would-be effects in order ("write 12 bytes to /tmp/x", "run
-    touch /tmp/y", "send POST https://…"). They are kept even when the
+    touch /tmp/y", "send POST https://example.com/endpoint"). They are kept even when the
     run fails.
   - **Where:** `formless tools run NAME --dry-run`, Ctrl+D in the TUI run
     editor, and the "Dry run" box in the web's Try it form.
