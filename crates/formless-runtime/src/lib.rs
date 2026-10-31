@@ -2790,10 +2790,12 @@ mod tests {
     struct SlowOps;
     impl HostOps for SlowOps {
         fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // A failing call must settle before the successful slow call in
+            // the unawaited-rejection fixture, rather than racing two 300ms waits.
             if name == "bad" {
                 return Err("bad tool".into());
             }
+            std::thread::sleep(std::time::Duration::from_millis(300));
             Ok(json!({"name": name, "n": input["n"]}))
         }
     }
