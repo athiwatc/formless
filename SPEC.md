@@ -364,6 +364,8 @@ start is refused with a clear explanation. Native tool-calling is required
 in v1; a prompt-based (text/JSON) fallback is explicitly out (§17).
 Thinking-mode endpoints that reject a forced `tool_choice` are re-probed
 with `tool_choice` omitted; a voluntary test tool-call still passes.
+The probe also makes one real streamed request and reports `streaming`
+from what came back; the wizard warns when the endpoint didn't stream.
 A failed model listing or probe is explained like `doctor` explains it
 (what happened, what to do, the raw error after it): a rejected key goes
 back to the key step, other failures let a model name be typed, and only
@@ -3683,6 +3685,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.tool_mode` | `native` | `native` or prompt-based fallback (§4.1) |
 | `provider.fallback_models` | [] | Failover models, in order (§4.1) |
 | `provider.aliases` | {} | Short names for model ids (`fast = "…"`), accepted wherever a model is (§4.2) |
+| `provider.extra_body` | {} | Vendor fields merged into every request body (Ollama `options`, vLLM `chat_template_kwargs`, OpenRouter `provider` routing); `model`, `messages`, `input`, `tools`, `stream` and `system` are never overridden, objects merge one level deep. The Ollama endpoint also gets `options.num_ctx` = the model's context size unless set here (§4.2) |
 | `provider.query_params` | {} | Query parameters added to every request, e.g. Azure's `api-version` (§4.2) |
 | `provider.api_key_header` | (Bearer) | Header that carries the API key instead of `Authorization: Bearer`, e.g. `api-key` (§4.2) |
 | `provider.proxy` | "" | HTTP(S) proxy for the daemon's requests, from start; empty uses `HTTPS_PROXY` / `NO_PROXY` (§4.2) |

@@ -529,6 +529,9 @@ struct Wizard {
     /// Previously saved model, pre-selected when the list arrives (§17).
     saved_model: String,
     prompt_fallback: bool,
+    /// What the probe saw: false when the endpoint answered without
+    /// streaming (#622).
+    streaming: bool,
     /// Ctrl+R: show the API key in full while typing it.
     reveal_key: bool,
     jobs: mpsc::Receiver<WizardJob>,
@@ -580,6 +583,7 @@ impl Wizard {
             status,
             saved_model: cfg.provider.model.clone(),
             prompt_fallback: false,
+            streaming: true,
             reveal_key: false,
             jobs,
             job_tx,
@@ -6027,6 +6031,7 @@ impl App {
                     }
                     WizardJob::Probe(Ok(r)) if r.tool_calling => {
                         w.prompt_fallback = r.prompt_fallback;
+                        w.streaming = r.streaming;
                         finish = true;
                     }
                     WizardJob::Probe(Ok(_)) => {
@@ -6082,6 +6087,12 @@ impl App {
             self.save_seen();
             self.notes.push(
                 "New here? /tour runs a 2-minute guided first task (/tour skip hides this for good)."
+                    .into(),
+            );
+        }
+        if !w.streaming {
+            self.notes.push(
+                "⚠ The endpoint didn't stream its test reply: answers may arrive all at once, and a long one can look stuck until it ends."
                     .into(),
             );
         }

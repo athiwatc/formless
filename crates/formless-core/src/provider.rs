@@ -516,6 +516,41 @@ fn apply_breakpoints(body: &mut Value, on: bool) {
     }
 }
 
+/// Body keys `provider.extra_body` may not replace.
+const CORE_BODY_KEYS: [&str; 6] = ["model", "messages", "input", "tools", "stream", "system"];
+
+/// Merge `provider.extra_body` into a request (objects one level deep, so
+/// `options` adds to what is there), and give Ollama a context window
+/// as large as the one Formless budgets for: its own default is small and
+/// it silently drops the start of the prompt past it (#622).
+fn apply_extra_body(body: &mut Value, cfg: &ProviderCfg, model: &str) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for (k, v) in &cfg.extra_body {
+        if CORE_BODY_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        match (obj.get_mut(k), v) {
+            (Some(Value::Object(have)), Value::Object(add)) => {
+                for (ik, iv) in add {
+                    have.insert(ik.clone(), iv.clone());
+                }
+            }
+            _ => {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let ollama = crate::presets::for_url(&cfg.base_url).is_some_and(|p| p.id == "ollama");
+    if ollama && !cfg.anthropic() && obj["options"].get("num_ctx").is_none() {
+        let options = obj.entry("options").or_insert_with(|| json!({}));
+        if let Some(o) = options.as_object_mut() {
+            o.insert("num_ctx".into(), json!(cfg.context_for(model)));
+        }
+    }
+}
+
 /// A message whose content is one marked text part, as a plain string.
 fn unmark(mut m: Value) -> Value {
     crate::anthropic::strip_cache_control(&mut m);
@@ -1186,6 +1221,7 @@ impl Provider {
                 if let Some(o) = b.as_object_mut() {
                     o.remove("__no_cache_control");
                 }
+                apply_extra_body(&mut b, &self.cfg, model);
                 if let (true, Some(effort)) = (with_effort, effort) {
                     if self.cfg.responses() {
                         b["reasoning"] = json!({"effort": effort});
@@ -2485,6 +2521,32 @@ async fn probe_prompt_tool_call(p: &Provider, model: &str, tool: &Value) -> Resu
 pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<ProbeResult> {
     let p = Provider::new(cfg.clone(), api_key.to_string())?;
     let models = p.list_models().await.unwrap_or_default();
+    // One real streamed reply, so `streaming` says what the endpoint did
+    // rather than what Formless hopes (#622).
+    let mut deltas = 0usize;
+    let streamed = p
+        .chat_stream(
+            &[json!({"role": "user", "content": "Reply with: ok"})],
+            &[],
+            model,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+            |_, _| deltas += 1,
+        )
+        .await
+        .is_ok()
+        && deltas > 0;
+    let mut result = probe_tools(&p, cfg, model, models).await?;
+    result.streaming = streamed;
+    Ok(result)
+}
+
+async fn probe_tools(
+    p: &Provider,
+    cfg: &ProviderCfg,
+    model: &str,
+    models: Vec<String>,
+) -> Result<ProbeResult> {
     let tool = json!({
         "type": "function",
         "function": {
@@ -2494,7 +2556,7 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
         }
     });
     if cfg.prompt_tools() {
-        let ok = probe_prompt_tool_call(&p, model, &tool).await?;
+        let ok = probe_prompt_tool_call(p, model, &tool).await?;
         return Ok(ProbeResult {
             models,
             streaming: true,
@@ -2502,10 +2564,10 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
             prompt_fallback: ok,
         });
     }
-    let native = match probe_tool_call(&p, model, &tool, true).await {
+    let native = match probe_tool_call(p, model, &tool, true).await {
         Ok(v) => Ok(v),
         Err(e) if is_tool_choice_rejection(&e.to_string()) => {
-            probe_tool_call(&p, model, &tool, false).await
+            probe_tool_call(p, model, &tool, false).await
         }
         Err(e) => Err(e),
     };
@@ -2517,7 +2579,7 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
             prompt_fallback: false,
         }),
         Ok(false) => {
-            let ok = probe_prompt_tool_call(&p, model, &tool)
+            let ok = probe_prompt_tool_call(p, model, &tool)
                 .await
                 .unwrap_or(false);
             Ok(ProbeResult {
@@ -2528,7 +2590,7 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
             })
         }
         Err(e) => {
-            if probe_prompt_tool_call(&p, model, &tool)
+            if probe_prompt_tool_call(p, model, &tool)
                 .await
                 .unwrap_or(false)
             {
@@ -2595,6 +2657,41 @@ pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<P
 
 #[cfg(test)]
 mod tests {
+
+    /// `provider.extra_body` adds vendor fields without touching the core
+    /// ones, and Ollama gets the context Formless budgets for (#622).
+    #[test]
+    fn extra_body_merges_and_ollama_gets_num_ctx() {
+        let mut cfg = ProviderCfg {
+            base_url: "http://localhost:11434/v1".into(),
+            context_tokens: 32000,
+            ..Default::default()
+        };
+        cfg.extra_body.insert("model".into(), json!("hijacked"));
+        cfg.extra_body
+            .insert("options".into(), json!({"temperature": 0.1}));
+        cfg.extra_body.insert("keep_alive".into(), json!("10m"));
+        let mut b = json!({"model": "llama", "messages": [], "stream": true});
+        apply_extra_body(&mut b, &cfg, "llama");
+        assert_eq!(b["model"], "llama", "core keys are protected");
+        assert_eq!(b["keep_alive"], "10m");
+        assert_eq!(b["options"]["temperature"], 0.1);
+        assert_eq!(b["options"]["num_ctx"], 32000);
+        // An explicit num_ctx wins; other endpoints get no options.
+        cfg.extra_body
+            .insert("options".into(), json!({"num_ctx": 8192}));
+        let mut b = json!({"model": "llama"});
+        apply_extra_body(&mut b, &cfg, "llama");
+        assert_eq!(b["options"]["num_ctx"], 8192);
+        let other = ProviderCfg {
+            base_url: "https://api.example.com/v1".into(),
+            ..Default::default()
+        };
+        let mut b = json!({"model": "m"});
+        apply_extra_body(&mut b, &other, "m");
+        assert!(b.get("options").is_none());
+    }
+
     use super::*;
 
     #[test]
