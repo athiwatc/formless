@@ -680,7 +680,11 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
                     .contains("cut off at the output token limit"),
                 "{text:#}"
             );
-            assert_eq!(*replies.locked(), vec![("fallback".into(), 10); 4]);
+            assert_eq!(
+                *replies.locked(),
+                vec![("fallback".into(), 10); 8],
+                "reported usage from rejected responses must count too"
+            );
         }
 
         drop(provider);
@@ -791,5 +795,372 @@ async fn queued_admission_reprices_committed_usage_with_live_prices() {
         1,
         "queued request used pre-wait price table"
     );
+    teardown(daemon, server).await;
+}
+
+#[derive(Clone, Copy)]
+enum ReportedFailure {
+    Cutoff,
+    Http,
+    Drop,
+    Event,
+}
+
+struct FailedMock {
+    posts: AtomicUsize,
+    arrived: Notify,
+    release: Arc<Notify>,
+}
+
+async fn reported_failure_fixture(
+    env: &crate::credential_env::EnvGuard,
+    style: &'static str,
+    failure: ReportedFailure,
+) -> (
+    Fixture,
+    Paths,
+    Config,
+    Arc<Daemon>,
+    Arc<FailedMock>,
+    tokio::task::JoinHandle<()>,
+) {
+    env.set("FORMLESS_API_KEY", "reported-failure-fixture");
+    env.remove("FORMLESS_BASE_URL");
+    env.remove("FORMLESS_MODEL");
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let mock = Arc::new(FailedMock {
+        posts: AtomicUsize::new(0),
+        arrived: Notify::new(),
+        release: Arc::new(Notify::new()),
+    });
+    let state = mock.clone();
+    let app=axum::Router::new().fallback(move || {
+        let mock=state.clone();
+        async move {
+            mock.posts.fetch_add(1,Ordering::SeqCst);
+            mock.arrived.notify_one();
+            match failure {
+                ReportedFailure::Cutoff|ReportedFailure::Http=>{
+                    mock.release.notified().await;
+                    if matches!(failure,ReportedFailure::Http) {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE,axum::Json(json!({"error":{"type":"api_error","message":"charged failure"},"usage":{"prompt_tokens":10,"completion_tokens":0}}))).into_response()
+                    } else {
+                        axum::Json(json!({"content":[{"type":"text","text":"cut off"}],"stop_reason":"max_tokens","usage":{"input_tokens":10,"output_tokens":0}})).into_response()
+                    }
+                },
+                ReportedFailure::Drop|ReportedFailure::Event=>{
+                    let usage=match style {
+                        "anthropic"=>json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+                        "responses"=>json!({"type":"response.created","response":{"usage":{"input_tokens":10}}}),
+                        _=>json!({"choices":[],"usage":{"prompt_tokens":10}}),
+                    };
+                    let content=match style {
+                        "anthropic"=>json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}),
+                        "responses"=>json!({"type":"response.output_text.delta","delta":"partial"}),
+                        _=>json!({"choices":[{"delta":{"content":"partial"}}]}),
+                    };
+                    // Error-event retries are eligible before text is shown;
+                    // transport drops are also retried after partial text.
+                    let first=if matches!(failure,ReportedFailure::Drop) {
+                        let block=if style=="anthropic" {format!("data: {}\n\n",json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))} else {String::new()};
+                        format!("data: {usage}\n\n{block}data: {content}\n\n")
+                    } else {format!("data: {usage}\n\n")};
+                    let release=mock.release.clone();
+                    let stream=futures_util::stream::unfold(0,move |phase| {
+                        let release=release.clone(); let first=first.clone();
+                        async move {
+                            match phase {
+                                0=>Some((Ok::<_,std::io::Error>(first),1)),
+                                1=>{
+                                    release.notified().await;
+                                    if matches!(failure,ReportedFailure::Drop) {
+                                        Some((Err(std::io::Error::other("controlled paid stream drop")),2))
+                                    } else {
+                                        let error=match style {
+                                            "anthropic"=>json!({"type":"error","error":{"type":"overloaded_error","message":"charged error"}}),
+                                            "responses"=>json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"charged error"},"usage":{"input_tokens":10}}}),
+                                            _=>json!({"error":{"code":"server_error","message":"charged error"},"usage":{"prompt_tokens":10}}),
+                                        };
+                                        Some((Ok(format!("data: {error}\n\n")),2))
+                                    }
+                                },
+                                _=>None,
+                            }
+                        }
+                    });
+                    axum::response::Response::builder().header("content-type","text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap()
+                }
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root =
+        Fixture(std::env::temp_dir().join(format!("fl-reported-charge-{}", uuid::Uuid::new_v4())));
+    let paths = Paths::from_dirs(root.0.join("data"), root.0.join("config")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = format!("http://{}", listener.local_addr().unwrap());
+    cfg.provider.api_style = style.into();
+    cfg.provider.model = "primary".into();
+    cfg.provider.max_retries = 1;
+    cfg.limits.daily_usd = Some(0.50);
+    cfg.provider.prices.insert(
+        "primary".into(),
+        crate::config::ModelPrice {
+            input: 100_000.0,
+            output: 100_000.0,
+            cached_input: None,
+            cache_write_input: None,
+            retrieved_at: None,
+        },
+    );
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (root, paths, cfg, daemon, mock, server)
+}
+
+async fn failed_arrived(mock: &FailedMock) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let notice = mock.arrived.notified();
+            if mock.posts.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            notice.await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_anthropic_cutoff_commits_reported_charge_before_queued_admission() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, _paths, cfg, daemon, mock, server) =
+        reported_failure_fixture(&env, "anthropic", ReportedFailure::Cutoff).await;
+    let start = |daemon: Arc<Daemon>, cfg: Config| {
+        tokio::spawn(async move {
+            let provider = daemon.provider(&cfg).await.unwrap();
+            counted(
+                "llm",
+                "",
+                "paid-cutoff",
+                provider.complete_result(
+                    &[json!({"role":"user","content":"work"})],
+                    "primary",
+                    None,
+                ),
+            )
+            .await
+        })
+    };
+    let first = start(daemon.clone(), cfg.clone());
+    failed_arrived(&mock).await;
+    let second = start(daemon.clone(), cfg.clone());
+    entered(&daemon, 2).await;
+    mock.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cut off at the output token limit"),
+        "{error:#}"
+    );
+    let refused = tokio::time::timeout(Duration::from_secs(10), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(refused.to_string().contains("daily_usd"), "{refused:#}");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        daemon
+            .usage_info(None, Some("paid-cutoff"), &cfg)
+            .unwrap()
+            .cost,
+        Some(1.0)
+    );
+    let rows = daemon
+        .with_store(|st| st.usage_grouped(None, "purpose"))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((&*rows[0].0, &*rows[0].2), ("llm", "primary"));
+    teardown(daemon, server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reported_http_error_charge_blocks_automatic_retry() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, _paths, cfg, daemon, mock, server) =
+        reported_failure_fixture(&env, "chat", ReportedFailure::Http).await;
+    let task = tokio::spawn({
+        let daemon = daemon.clone();
+        let cfg = cfg.clone();
+        async move {
+            let provider = daemon.provider(&cfg).await.unwrap();
+            counted(
+                "llm",
+                "",
+                "paid-http-error",
+                provider.complete_result(
+                    &[json!({"role":"user","content":"work"})],
+                    "primary",
+                    None,
+                ),
+            )
+            .await
+        }
+    });
+    failed_arrived(&mock).await;
+    mock.release.notify_one();
+    let refused = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(refused.to_string().contains("daily_usd"), "{refused:#}");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        daemon
+            .usage_info(None, Some("paid-http-error"), &cfg)
+            .unwrap()
+            .cost,
+        Some(1.0)
+    );
+    teardown(daemon, server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn known_stream_usage_survives_transport_drop_and_error_event_before_retry() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for style in ["chat", "responses", "anthropic"] {
+        for failure in [ReportedFailure::Drop, ReportedFailure::Event] {
+            let (_root, _paths, cfg, daemon, mock, server) =
+                reported_failure_fixture(&env, style, failure).await;
+            let parsed = Arc::new(Notify::new());
+            let visible = parsed.clone();
+            let task = tokio::spawn({
+                let daemon = daemon.clone();
+                let cfg = cfg.clone();
+                async move {
+                    let provider = daemon.provider(&cfg).await.unwrap();
+                    counted(
+                        "agent",
+                        "",
+                        "paid-stream",
+                        provider.chat_stream(
+                            &[json!({"role":"user","content":"work"})],
+                            &[],
+                            "primary",
+                            None,
+                            &CancellationToken::new(),
+                            move |kind, _| {
+                                if kind
+                                    == if matches!(failure, ReportedFailure::Drop) {
+                                        crate::provider::DeltaKind::Content
+                                    } else {
+                                        crate::provider::DeltaKind::Bytes
+                                    }
+                                {
+                                    visible.notify_one();
+                                }
+                            },
+                        ),
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(10), parsed.notified())
+                .await
+                .unwrap();
+            mock.release.notify_one();
+            let refused = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("daily_usd"),
+                "{style}: {refused:#}"
+            );
+            assert_eq!(
+                mock.posts.load(Ordering::SeqCst),
+                1,
+                "{style} retried a known paid attempt past its cap"
+            );
+            assert_eq!(
+                daemon
+                    .usage_info(None, Some("paid-stream"), &cfg)
+                    .unwrap()
+                    .cost,
+                Some(1.0),
+                "{style}"
+            );
+            teardown(daemon, server).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_native_stream_after_reported_input_commits_known_charge() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, _paths, cfg, daemon, mock, server) =
+        reported_failure_fixture(&env, "anthropic", ReportedFailure::Drop).await;
+    let parsed = Arc::new(Notify::new());
+    let visible = parsed.clone();
+    let task = tokio::spawn({
+        let daemon = daemon.clone();
+        let cfg = cfg.clone();
+        async move {
+            let provider = daemon.provider(&cfg).await.unwrap();
+            counted(
+                "agent",
+                "",
+                "cancel-paid-stream",
+                provider.chat_stream(
+                    &[json!({"role":"user","content":"work"})],
+                    &[],
+                    "primary",
+                    None,
+                    &CancellationToken::new(),
+                    move |kind, _| {
+                        if kind == crate::provider::DeltaKind::Content {
+                            visible.notify_one();
+                        }
+                    },
+                ),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), parsed.notified())
+        .await
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        daemon
+            .usage_info(None, Some("cancel-paid-stream"), &cfg)
+            .unwrap()
+            .cost,
+        Some(1.0)
+    );
+    let provider = daemon.provider(&cfg).await.unwrap();
+    let refused = provider
+        .complete_result(&[json!({"role":"user","content":"next"})], "primary", None)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("daily_usd"));
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    mock.release.notify_one();
+    drop(provider);
     teardown(daemon, server).await;
 }

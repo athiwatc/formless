@@ -429,6 +429,11 @@ lane is released; errors and cancellation release it too. If committing usage
 fails, subsequent model requests fail closed until storage is repaired and the
 daemon restarted. The lane never spans Tool execution. Unpriced aggregate usage retains the existing opt-in limit
 semantics, and an explicit budget-resume waiver remains effective.
+Known reported usage counts even when a response is rejected as unusable or a
+stream fails, is cancelled, or is retried. Each attempt commits its latest known
+cumulative usage once before its admission lease is released; a retry/fallback
+must acquire fresh admission. A rejected answer remains an error. Unknown remote
+charges cannot be inferred from a transport failure.
 Nested completion and sub-agent usage, prices and parent Tool model-use costs
 use the final serving model, including fallback, consistently with Run turns.
 
