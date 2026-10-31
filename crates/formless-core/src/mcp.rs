@@ -90,6 +90,32 @@ fn server_env(cfg: &McpServerCfg) -> Vec<(String, String)> {
     out
 }
 
+#[cfg(test)]
+mod postgres_env_tests {
+    use super::*;
+
+    #[test]
+    fn postgres_child_env_overrides_only_when_the_url_supplies_a_password() {
+        let env = crate::credential_env::EnvGuard::isolated();
+        env.set("PGPASSWORD", "daemon-password");
+        for (url, expected) in [
+            ("postgresql://u:url%2Bpassword@h/db", "url+password"),
+            ("postgresql://u@h/db", "daemon-password"),
+        ] {
+            let params = serde_json::Map::from_iter([("url".into(), serde_json::json!(url))]);
+            let cfg = crate::mcp_catalog::server_config(
+                crate::mcp_catalog::find("postgres").unwrap(),
+                &params,
+            )
+            .unwrap();
+            // Command::envs applies these pairs in order, including a literal
+            // override after an inherited variable with the same name.
+            let actual: std::collections::BTreeMap<_, _> = server_env(&cfg).into_iter().collect();
+            assert_eq!(actual["PGPASSWORD"], expected);
+        }
+    }
+}
+
 type Pending = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
 /// How messages reach the server.

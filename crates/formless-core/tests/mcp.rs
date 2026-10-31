@@ -20,6 +20,9 @@ fn fake_mcp_server() {
         "fixture requires FL_FAKE_MCP"
     );
     let log = std::env::var("FL_FAKE_LOG").unwrap_or_default();
+    if let Ok(marker) = std::env::var("FL_FAKE_START_MARKER") {
+        std::fs::write(marker, "started").unwrap();
+    }
     let out = std::sync::Arc::new(std::sync::Mutex::new(std::io::stdout()));
     let send = {
         let out = out.clone();
@@ -159,6 +162,101 @@ pub fn fake_server(paths: &Paths) -> (McpCfg, std::path::PathBuf) {
         ..Default::default()
     };
     (cfg, log)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imported_servers_cannot_start_until_explicitly_enabled() {
+    let _env = credential_env::EnvGuard::isolated();
+    use formless_core::{daemon::Daemon, Config};
+    use formless_protocol::Request;
+    use std::sync::Arc;
+    let paths = temp_paths("mcp-import-disabled");
+    let marker = paths.data_dir.join("process-started");
+    let mut initial = Config::default();
+    initial.naming.enabled = false;
+    initial.daemon.idle_grace_secs = 3600;
+    initial.save(&paths).unwrap();
+    let (mut imported, _) = fake_server(&paths);
+    let server_cfg = imported.servers.get_mut("fake").unwrap();
+    server_cfg.trusted = true;
+    server_cfg.disabled = false;
+    server_cfg.env.insert(
+        "FL_FAKE_START_MARKER".into(),
+        marker.to_string_lossy().into_owned(),
+    );
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let result = daemon
+        .handle(Request::ImportAll {
+            bundle: json!({"format":"formless.all/1", "config":{"mcp":imported}}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["mcp_review"][0]["disabled"], true);
+    assert_eq!(result["mcp_review"][0]["trusted"], false);
+    let cfg = Config::load_file_only(&paths).unwrap();
+    assert!(cfg.mcp.servers["fake"].disabled && !cfg.mcp.servers["fake"].trusted);
+    drop(daemon);
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let serving = tokio::spawn({
+        let daemon = daemon.clone();
+        async move { daemon.serve().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(client) = tokio::net::UnixStream::connect(paths.socket_path()).await {
+                drop(client);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon did not start");
+    let disabled = daemon
+        .handle(Request::RestartMcpServer {
+            name: "fake".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(disabled["tools"], 0);
+    assert!(
+        !marker.exists(),
+        "disabled imported code executed during startup/restart"
+    );
+    let mut cfg = Config::load_file_only(&paths).unwrap();
+    cfg.mcp.servers.get_mut("fake").unwrap().disabled = false;
+    cfg.save(&paths).unwrap();
+    let enabled = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        daemon.handle(Request::RestartMcpServer {
+            name: "fake".into(),
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(enabled["tools"], 4, "{enabled}");
+    assert!(
+        marker.exists(),
+        "fixture must prove code executes after enabling"
+    );
+    daemon.handle(Request::Shutdown).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let pending = Arc::downgrade(&daemon);
+    drop(daemon);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pending.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("MCP daemon tasks outlived isolation");
+    let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap());
 }
 
 #[test]

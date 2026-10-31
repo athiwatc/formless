@@ -1,0 +1,16 @@
+[
+  {
+    "name": "pg",
+    "version": "8.13.0",
+    "source": "package/lib/connection-parameters.js",
+    "registry": "https://registry.npmjs.org/pg/8.13.0",
+    "tarball_integrity": "sha512-34wkUTh3SxTClfoHB3pQ7bIMvw9dpFU1audQQeZG837fmHfHpr14n/AELVDoOYVDW2h5RDWU78tFjkD+erSBsw=="
+  },
+  {
+    "name": "pg-connection-string",
+    "version": "2.7.0",
+    "source": "package/index.js",
+    "registry": "https://registry.npmjs.org/pg-connection-string/2.7.0",
+    "tarball_integrity": "sha512-PI2W9mv53rXJQEOb8xNR8lH7Hr+EKa6oJa38zsK0S/ky2er16ios1wLKhZyxzD7jUReiWokc9WK5nxSnC7W1TA=="
+  }
+]
