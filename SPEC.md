@@ -588,7 +588,8 @@ task, with quality as a gate**.
   the re-importable bundle; "markdown" and "html" return `{name, format,
   content}`, a readable transcript: user and assistant turns, notes, and
   each Tool call folded into `<details>` with its arguments and result
-  (results over 4000 characters are cut). The HTML page is
+  (arguments and results over 4000 characters are cut, with an `… (cut)`
+  marker). The HTML page is
   self-contained (inline styles, no scripts or external resources), and
   any HTML in messages is shown as text; Markdown images become their
   alt text and address as text (nothing is fetched when the page is
