@@ -6619,7 +6619,8 @@ mod tests {
     #[test]
     fn oauth_diagnostics_report_all_providers_without_tokens_or_migration() {
         let _env = super::oauth_credential_env::EnvGuard::isolated();
-        let (_fixture, paths) = MaintenanceFixture::new();
+        let (_fixture, mut paths) = MaintenanceFixture::new();
+        paths.profile = format!("oauth-status-{}", std::process::id());
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         let mut cfg = super::Config::default();
         cfg.provider.auth.mode = "oauth".into();
