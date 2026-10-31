@@ -205,7 +205,7 @@ pub fn create_tool_definition() -> Value {
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "1-3 lowercase topic tags (git, web, files, finance) that help find_tools; a new version keeps the old tags when omitted"},
                     "input_schema": {"type": "object", "description": "JSON Schema (draft 2020-12) for run(input)"},
                     "output_schema": {"type": "object", "description": "JSON Schema for the return value"},
-                    "implementation_js": {"type": "string", "description": "Plain JS defining global function run(input) (may be async). Throw on failure; never return {error: ...}."},
+                    "implementation_js": {"type": "string", "description": "Plain JS defining global function run(input) (may be async). Throw on failure; {error: ...} is data only when output_schema declares an error property."},
                     "capabilities": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"net\", \"net:$input.url\", \"fs:read:/abs\", \"fs:read:$input.path\", \"fs:write:$input.out\", \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"notify\", \"llm\"]. $input.<field> scopes (fs:read, fs:write, net only) are granted per call for the path(s)/host in that input field."},
                     "memory_mb": {"type": "integer", "description": "Optional JS heap cap (default 256)"}
                 },
