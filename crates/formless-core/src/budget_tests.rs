@@ -569,16 +569,20 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
     for style in ["chat", "responses", "anthropic"] {
         let replies = Arc::new(StdMutex::new(Vec::new()));
         let recorded = replies.clone();
-        let app=axum::Router::new().fallback(move |axum::Json(body):axum::Json<Value>| async move {
+        let cutoff = Arc::new(AtomicBool::new(false));
+        let response_cutoff = cutoff.clone();
+        let app=axum::Router::new().fallback(move |axum::Json(body):axum::Json<Value>| {
+            let cutoff = response_cutoff.clone();
+            async move {
             if body["model"]=="primary" {
                 return (axum::http::StatusCode::SERVICE_UNAVAILABLE,"fixture primary unavailable").into_response();
             }
             axum::Json(match style {
                 "responses"=>json!({"status":"incomplete","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":10}}),
-                "anthropic"=>json!({"stop_reason":"max_tokens","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":10}}),
+                "anthropic"=>json!({"stop_reason":if cutoff.load(Ordering::SeqCst) {"max_tokens"} else {"end_turn"},"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":10}}),
                 _=>json!({"choices":[{"message":{"content":"ok"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":10}}),
             }).into_response()
-        });
+        }});
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = ProviderCfg {
             base_url: format!("http://{}", listener.local_addr().unwrap()),
@@ -602,13 +606,14 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
             axum::serve(listener, app).await.unwrap();
         });
         let messages = [json!({"role":"user","content":"work"})];
+        let expected_limited = style != "anthropic";
         let full = provider
             .complete_result(&messages, "preferred", None)
             .await
             .unwrap();
         assert_eq!(
             (&*full.text, &*full.model_used, full.output_limited),
-            ("ok", "fallback", true),
+            ("ok", "fallback", expected_limited),
             "{style}"
         );
         assert_eq!(full.usage.unwrap().prompt_tokens, 10);
@@ -618,7 +623,7 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
             .unwrap();
         assert_eq!(
             (text, usage.unwrap().prompt_tokens, cut),
-            ("ok".into(), 10, true)
+            ("ok".into(), 10, expected_limited)
         );
         let (text, usage) = provider
             .complete_with_usage(&messages, "preferred", None)
@@ -633,6 +638,51 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
             "ok"
         );
         assert_eq!(*replies.locked(), vec![("fallback".into(), 10); 4]);
+        if style == "anthropic" {
+            // Messages max_tokens is an error under the existing contract,
+            // unlike Chat/Responses' successful-but-limited completion result.
+            cutoff.store(true, Ordering::SeqCst);
+            let typed = provider
+                .complete_result(&messages, "preferred", None)
+                .await
+                .unwrap_err();
+            assert!(
+                typed
+                    .to_string()
+                    .contains("cut off at the output token limit"),
+                "{typed:#}"
+            );
+            let full = provider
+                .complete_full(&messages, "preferred", None)
+                .await
+                .unwrap_err();
+            assert!(
+                full.to_string()
+                    .contains("cut off at the output token limit"),
+                "{full:#}"
+            );
+            let usage = provider
+                .complete_with_usage(&messages, "preferred", None)
+                .await
+                .unwrap_err();
+            assert!(
+                usage
+                    .to_string()
+                    .contains("cut off at the output token limit"),
+                "{usage:#}"
+            );
+            let text = provider
+                .complete(&messages, "preferred", None)
+                .await
+                .unwrap_err();
+            assert!(
+                text.to_string()
+                    .contains("cut off at the output token limit"),
+                "{text:#}"
+            );
+            assert_eq!(*replies.locked(), vec![("fallback".into(), 10); 4]);
+        }
+
         drop(provider);
         server.abort();
         let _ = server.await;
