@@ -2124,6 +2124,14 @@ such as `read_file`, `read_text_file` and `file_read`.
   Session still queued behind a slow request (it fails with "interrupted
   before it started"). `SendMessage.client_msg_id` makes a retried send
   return the first outcome instead of sending twice (kept 10 minutes).
+  TUI, plain mode and headless sends carry a fresh UUID per user action.
+  Until a response arrives, retrying the same text in that Session reuses
+  the UUID and original send mode, including after a TUI timeout or
+  reconnect. A response clears the action, so a later intentional send
+  of the same text gets a new UUID. The TUI restores an unacknowledged
+  message to an empty draft on timeout/disconnect without overwriting
+  a newer draft. A late success retracts the untouched restored retry
+  draft, so Enter cannot accidentally send it again as a new action.
 - A client that falls behind loses live deltas first; it is told with
   `DeltasDropped {session_id, run_id}` once there is room, and the
   answer's `MessageComplete` carries the whole text (plain mode notes the

@@ -193,22 +193,25 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
         println!("Warning: {warning}");
     }
     let (client, rx) = DaemonClient::connect(&paths)?;
+    let sends = std::cell::RefCell::new(crate::client::SendTracker::default());
     let wait = |id: u64| -> Result<serde_json::Value> {
         loop {
-            match rx.recv()? {
-                ServerMessage::Response {
-                    id: rid,
-                    ok,
-                    result,
-                    error,
-                } if rid == id => {
-                    return if ok {
-                        Ok(result.unwrap_or_default())
-                    } else {
-                        Err(anyhow::anyhow!(error.unwrap_or_default()))
-                    };
+            if let ServerMessage::Response {
+                id: rid,
+                ok,
+                result,
+                error,
+            } = rx.recv()?
+            {
+                sends.borrow_mut().answered(rid);
+                if rid != id {
+                    continue;
                 }
-                _ => {}
+                return if ok {
+                    Ok(result.unwrap_or_default())
+                } else {
+                    Err(anyhow::anyhow!(error.unwrap_or_default()))
+                };
             }
         }
     };
@@ -263,6 +266,15 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let mut running = false;
     loop {
         while let Ok(msg) = rx.try_recv() {
+            if let ServerMessage::Response { id, ok, error, .. } = &msg {
+                sends.borrow_mut().answered(*id);
+                if !ok {
+                    say(&format!(
+                        "Daemon: {}",
+                        error.as_deref().unwrap_or("request failed")
+                    ));
+                }
+            }
             let ServerMessage::Event(ev) = msg else {
                 continue;
             };
@@ -448,12 +460,8 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             }
             msg => {
                 let msg = msg.strip_prefix('/').filter(|m| m.starts_with('/')).unwrap_or(msg);
-                client.send(Request::SendMessage {
-                    session_id: session.id.clone(),
-                    content: msg.to_string(),
-                    mode: if running { SendMode::Steer } else { SendMode::Send },
-                    client_msg_id: None,
-                });
+                sends.borrow_mut().send(&client, session.id.clone(), msg.to_string(),
+                    if running { SendMode::Steer } else { SendMode::Send });
             }
         }
     }

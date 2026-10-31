@@ -146,6 +146,7 @@ impl View {
 enum Pending {
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
+    SendMessage,
     /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
     Revoked,
     /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
@@ -1209,6 +1210,8 @@ struct App {
     mention: Option<MentionPopup>,
     /// A message waiting for its `@` attachments before it is sent.
     pending_send: Option<PendingSend>,
+    sends: client::SendTracker,
+    restored_send: Option<(String, String)>,
     /// Files and pasted images for the next message, shown as chips in
     /// the input and uploaded when it is sent (SPEC §5.6).
     attachments: Vec<(String, Vec<u8>)>,
@@ -1533,6 +1536,8 @@ impl App {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            sends: Default::default(),
+            restored_send: None,
             attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
@@ -1664,6 +1669,7 @@ impl App {
     /// Initial connection and reconnect both refresh connection-specific state.
     fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
         self.daemon_secure = None;
+        self.sends.disconnected();
         self.client = Some(client);
         self.inbox = Some(inbox);
         self.request(Pending::DaemonMode, Request::Status);
@@ -1719,6 +1725,8 @@ impl App {
     /// The daemon went away (restart, crash): keep everything on screen,
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
+        self.restore_unsent_draft();
+        self.sends.disconnected();
         self.client = None;
         self.inbox = None;
         self.daemon_secure = None;
@@ -1786,6 +1794,9 @@ impl App {
                 "the daemon did not answer within {}s; try again",
                 REQUEST_DEADLINE.as_secs()
             ));
+            if matches!(kind, Pending::SendMessage) {
+                self.restore_unsent_draft();
+            }
             if matches!(kind, Pending::SaveSetting) {
                 if let Some(key) = self.settings_saving.take() {
                     self.settings_error = Some((key, "no answer from the daemon".into()));
@@ -1793,6 +1804,23 @@ impl App {
             }
         }
     }
+    fn send_chat_message(&mut self, session_id: String, content: String, mode: SendMode) {
+        if let Some(client) = &self.client {
+            let id = self.sends.send(client, session_id, content, mode);
+            self.pending.insert(id, Pending::SendMessage);
+            self.pending_since.insert(id, Instant::now());
+        }
+    }
+
+    fn restore_unsent_draft(&mut self) {
+        if self.input.is_empty() {
+            if let Some(text) = self.current.as_deref().and_then(|id| self.sends.unsent(id)) {
+                self.input.set(text);
+                self.restored_send = self.current.clone().map(|id| (id, text.to_string()));
+            }
+        }
+    }
+
     fn fire(&mut self, req: Request) {
         if let Some(c) = &self.client {
             c.send(req);
@@ -1829,6 +1857,27 @@ impl App {
                     result,
                     error,
                 } => {
+                    if ok
+                        && self.sends.message(id).is_some_and(|(session, text)| {
+                            self.restored_send
+                                .as_ref()
+                                .is_some_and(|(s, t)| s == session && t == text)
+                        })
+                    {
+                        if let Some((session, text)) = self.restored_send.take() {
+                            if self.current.as_deref() == Some(&session)
+                                && self.input.expanded() == text
+                            {
+                                self.input.clear();
+                            }
+                        }
+                    }
+                    for answered in self.sends.answered(id) {
+                        if answered != id {
+                            self.pending.remove(&answered);
+                            self.pending_since.remove(&answered);
+                        }
+                    }
                     self.pending_since.remove(&id);
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
@@ -1854,6 +1903,7 @@ impl App {
                     }
                     let Some(result) = result else { continue };
                     match kind {
+                        Pending::SendMessage => {}
                         Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
@@ -4260,6 +4310,7 @@ impl App {
                 .push("not connected to the daemon yet; your message is kept".into());
             return;
         }
+        self.restored_send = None;
         let text = self.input.take();
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -4389,12 +4440,7 @@ impl App {
             );
         }
         if found.is_empty() && held.is_empty() {
-            self.fire(Request::SendMessage {
-                session_id,
-                content: text,
-                mode,
-                client_msg_id: None,
-            });
+            self.send_chat_message(session_id, text, mode);
             return;
         }
         let root = root.map(|r| r.to_string_lossy().into_owned());
@@ -4506,12 +4552,7 @@ impl App {
         p.waiting = p.waiting.saturating_sub(1);
         if p.waiting == 0 {
             let p = self.pending_send.take().unwrap();
-            self.fire(Request::SendMessage {
-                session_id: p.session_id,
-                content: p.content,
-                mode: p.mode,
-                client_msg_id: None,
-            });
+            self.send_chat_message(p.session_id, p.content, p.mode);
         }
     }
 
@@ -14708,6 +14749,8 @@ mod tests {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            sends: Default::default(),
+            restored_send: None,
             attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
@@ -15022,6 +15065,98 @@ mod tests {
             "kept while offline"
         );
         assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
+    }
+
+    #[test]
+    fn late_send_acknowledgement_retracts_only_the_restored_retry_draft() {
+        for newer_draft in [None, Some("new draft")] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("send once");
+            app.submit_chat(false);
+            let sent: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            app.pending_since.insert(
+                sent.id,
+                Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+            );
+            app.expire_pending();
+            if let Some(text) = newer_draft {
+                app.input.set(text);
+            }
+            tx.send(ServerMessage::Response {
+                id: sent.id,
+                ok: true,
+                result: Some(serde_json::json!({"started": true})),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(app.input.expanded(), newer_draft.unwrap_or(""));
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_tui_send_reuses_its_key_and_appends_one_user_message() {
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into();
+        cfg.provider.model = "test".into();
+        cfg.provider.max_retries = 0;
+        cfg.naming.enabled = false;
+        cfg.skills.auto_create = false;
+        cfg.save(&app.paths).unwrap();
+        let store = formless_core::Store::open(&app.paths.db_file()).unwrap();
+        let session = store.create_session(None).unwrap();
+        app.current = Some(session.id.clone());
+        let daemon =
+            std::sync::Arc::new(formless_core::daemon::Daemon::new(app.paths.clone()).unwrap());
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("send once");
+        app.submit_chat(false);
+        let first: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let original = serde_json::to_value(&first.request).unwrap();
+        daemon.handle(first.request).await.unwrap();
+        // The daemon executed it but its acknowledgement was lost.
+        app.pending_since.insert(
+            first.id,
+            Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+        );
+        app.expire_pending();
+        assert_eq!(app.input.expanded(), "send once");
+        app.submit_chat(false);
+        let retry: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&retry.request).unwrap(), original);
+        let outcome = daemon.handle(retry.request).await.unwrap();
+        assert_eq!(
+            store
+                .list_messages(&session.id)
+                .unwrap()
+                .iter()
+                .filter(|m| m.role == "user" && m.content == "send once")
+                .count(),
+            1
+        );
+        tx.send(ServerMessage::Response {
+            id: retry.id,
+            ok: true,
+            result: Some(outcome),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        app.input.set("send once");
+        app.submit_chat(false);
+        let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_ne!(
+            serde_json::to_value(fresh.request).unwrap()["client_msg_id"],
+            original["client_msg_id"]
+        );
     }
 
     #[test]
