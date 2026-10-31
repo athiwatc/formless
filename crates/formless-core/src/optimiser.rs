@@ -812,12 +812,38 @@ impl Daemon {
     fn promote_attempt_with(
         self: &Arc<Self>,
         info: &ToolInfo,
-        _attempt_id: &str,
+        attempt_id: &str,
         cand: &CandidateData,
         cfg: &Config,
     ) {
         let caps = Capabilities::parse(&cand.capabilities).unwrap_or_default();
         match self.with_store(|st| {
+            // Checked under the same store lock as the write: a Tool
+            // retired (or deleted) while the Candidate was measured stays
+            // retired, and the Candidate is discarded and logged (SPEC §16).
+            let live = st
+                .get_tool_current(&info.id)?
+                .is_some_and(|(t, _)| !t.retired);
+            if !live {
+                st.audit(
+                    "optimiser",
+                    "tool.promote_discarded",
+                    &format!(
+                        "{}: retired before its Candidate could be promoted",
+                        info.name
+                    ),
+                )?;
+                let _ = st.update_attempt(
+                    attempt_id,
+                    "discarded",
+                    "the Tool was retired",
+                    None,
+                    None,
+                    0,
+                    0,
+                );
+                return Err(anyhow::anyhow!("the Tool was retired; Candidate discarded"));
+            }
             st.create_tool_version(
                 &info.name,
                 &cand.description,
@@ -1484,4 +1510,63 @@ fn parse_proposal(raw: &str) -> Result<(String, String, String)> {
         .trim()
         .to_string();
     Ok((kind, content, rationale))
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+
+    /// Promotion racing a retirement: retirement wins, the Candidate is
+    /// discarded and logged (SPEC §16, #759).
+    #[test]
+    fn a_retired_tool_is_never_promoted() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        let base = std::path::PathBuf::from(format!("/tmp/fl-race-{short}"));
+        let paths = crate::Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let caps = Capabilities::parse(&[]).unwrap();
+        let (info, _) = daemon
+            .with_store(|st| {
+                st.create_tool_version(
+                    "t",
+                    "d",
+                    r#"{"type":"object"}"#,
+                    "{}",
+                    "function run(){}",
+                    &caps,
+                    64,
+                    "agent",
+                )
+            })
+            .unwrap();
+        daemon
+            .with_store(|st| st.set_tool_retired(&info.id, true))
+            .unwrap();
+        let cand = CandidateData {
+            code: "function run(){ return 2; }".into(),
+            description: "d".into(),
+            input_schema: r#"{"type":"object"}"#.into(),
+            output_schema: "{}".into(),
+            capabilities: Vec::new(),
+            memory_mb: 64,
+        };
+        daemon.promote_attempt_with(&info, "a1", &cand, &Config::default());
+        let (now, ver) = daemon
+            .with_store(|st| st.get_tool_current(&info.id))
+            .unwrap()
+            .unwrap();
+        assert!(now.retired, "still retired");
+        assert_eq!(ver.version, 1, "no new version");
+        let audit = daemon
+            .with_store(|st| st.recent_audit(Some("tool.promote"), 5))
+            .unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|(_, action, _, _)| action == "tool.promote_discarded"),
+            "{audit:?}"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
