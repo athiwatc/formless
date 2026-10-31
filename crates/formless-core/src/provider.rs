@@ -1054,6 +1054,13 @@ impl Provider {
         )
     }
 
+    fn note(&self, text: String) {
+        tracing::info!("{text}");
+        if let Some(hook) = &self.on_note {
+            hook(text);
+        }
+    }
+
     /// Tell the hook, then wait before retry `attempt` (0-based).
     async fn retry_wait(&self, attempt: usize, server_wait: Option<Duration>, reason: String) {
         let wait = self.backoff(attempt, server_wait);
