@@ -1,5 +1,8 @@
 //! Scheduled jobs (SPEC §9.7): cron, one-shot times, approval, running.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use chrono::{Local, TimeZone};
 use formless_core::jobs::{parse_at, Cron};
 use formless_core::{Paths, Store};
@@ -106,19 +109,10 @@ fn job_store_due_and_lifecycle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schedule_run_and_the_scheduler() {
-    let short = &uuid::Uuid::new_v4().to_string()[..8];
-    let base = std::path::PathBuf::from(format!("/tmp/fl-jobs-{short}"));
-    let paths = Paths {
-        data_dir: base.join("d"),
-        config_dir: base.join("c"),
-        profile: format!("test-jobs-{short}"),
-    };
-    std::fs::create_dir_all(&paths.data_dir).unwrap();
-    std::fs::create_dir_all(&paths.config_dir).unwrap();
-    formless_core::Config::default().save(&paths).unwrap();
-    let store = Store::open(&paths.db_file()).unwrap();
+    let env = credential_env::EnvGuard::isolated();
+    let (endpoint, requested, release, server) = held_provider(false).await;
+    let (paths, store, daemon) = job_daemon(&env, "jobs", &endpoint);
     let sid = store.create_session(None).unwrap().id;
-    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
 
     // Recurring with nobody to approve: saved, waiting for the user.
     let rec: serde_json::Value = serde_json::from_str(
@@ -162,6 +156,10 @@ async fn schedule_run_and_the_scheduler() {
         .create_job("say hi", None, None, &past, true, "user")
         .unwrap();
     daemon.run_due_jobs().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), requested)
+        .await
+        .expect("scheduled Run never requested its mock provider")
+        .unwrap();
     let ran = store.get_job(&job.id).unwrap().unwrap();
     assert!(
         ran.last_status.starts_with("started in session"),
@@ -174,18 +172,36 @@ async fn schedule_run_and_the_scheduler() {
         .unwrap()
         .iter()
         .any(|s| s.name == "Job: say hi"));
+    // The response stays held until the transient started/disabled/Session
+    // assertions have observed a genuinely in-flight Run.
+    release.notify_one();
+    let runs = completed_job(&store, &job.id, false).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "completed", "{runs:?}");
+    drain_daemon(daemon).await;
+    stop_provider(server).await;
+    drop(store);
+    std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).unwrap();
 }
 
-/// A daemon over a fresh profile whose provider is unreachable (Runs
-/// fail fast), and the store.
-fn job_daemon(tag: &str) -> (Paths, Store, Arc<formless_core::daemon::Daemon>) {
+/// The caller owns credential isolation through all awaited Run/delivery work.
+/// Each fixture uses an explicit local endpoint, never the default provider.
+fn job_daemon(
+    env: &credential_env::EnvGuard,
+    tag: &str,
+    endpoint: &str,
+) -> (Paths, Store, Arc<formless_core::daemon::Daemon>) {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-{tag}-{short}"));
     let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
     let mut cfg = formless_core::Config::default();
-    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    env.set("FORMLESS_API_KEY", "mock-jobs-key");
+    env.set("FORMLESS_BASE_URL", endpoint);
+    env.set("FORMLESS_MODEL", "m");
+    cfg.provider.base_url = endpoint.into();
     cfg.provider.model = "m".into();
     cfg.provider.max_retries = 0;
+    cfg.provider.fallback_models.clear();
     cfg.naming.enabled = false;
     cfg.save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
@@ -196,7 +212,9 @@ fn job_daemon(tag: &str) -> (Paths, Store, Arc<formless_core::daemon::Daemon>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn plain_english_schedules_run_now_history_and_the_keep_alive_warning() {
     use formless_protocol::Request;
-    let (_paths, store, daemon) = job_daemon("jobs2");
+    let env = credential_env::EnvGuard::isolated();
+    let (endpoint, requested, release, server) = held_provider(true).await;
+    let (paths, store, daemon) = job_daemon(&env, "jobs2", &endpoint);
     let preview = daemon
         .handle(Request::PreviewSchedule {
             schedule: "every weekday at 9am".into(),
@@ -234,6 +252,10 @@ async fn plain_english_schedules_run_now_history_and_the_keep_alive_warning() {
         .unwrap();
     assert!(r["status"].as_str().unwrap().starts_with("started"), "{r}");
     assert_eq!(store.get_job(&id).unwrap().unwrap().next_run, before);
+    tokio::time::timeout(std::time::Duration::from_secs(10), requested)
+        .await
+        .expect("manual Run never requested its mock provider")
+        .unwrap();
     // Firing again while it still runs is skipped (overlap = skip).
     let again = daemon
         .handle(Request::RunJobNow { id: id.clone() })
@@ -243,26 +265,101 @@ async fn plain_english_schedules_run_now_history_and_the_keep_alive_warning() {
         again["status"].as_str().unwrap().starts_with("skipped"),
         "{again}"
     );
-    // The Run fails (no provider): the history gets its outcome, and the
-    // answer-less result is still delivered to the file.
-    for _ in 0..600 {
-        let runs = store.job_runs(&id, 10).unwrap();
-        if runs.iter().any(|r| {
-            r.status != "running" && r.status != "skipped" && r.detail.contains("appended")
-        }) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let runs = store.job_runs(&id, 10).unwrap();
+    // Only now return an intentional local 503: failure/history/delivery
+    // assertions remain separate from the in-flight overlap assertion.
+    release.notify_one();
+    let runs = completed_job(&store, &id, true).await;
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert!(runs.iter().any(|r| r.status == "skipped"));
     let fired = runs.iter().find(|r| r.status != "skipped").unwrap();
     assert_eq!(fired.trigger, "manual");
     assert_ne!(fired.status, "running", "{fired:?}");
+    assert_eq!(fired.status, "paused", "the intentional 503 pauses the Run");
     assert!(fired.detail.contains("appended"), "{fired:?}");
     assert!(std::fs::read_to_string(&out).unwrap().contains("say hi"));
-    let _ = std::fs::remove_file(out);
+    std::fs::remove_file(out).unwrap();
+    drain_daemon(daemon).await;
+    stop_provider(server).await;
+    drop(store);
+    std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).unwrap();
+}
+
+/// A request-arrival handshake proves that the Run reached this local provider.
+/// The response is held until the test releases it after its in-flight checks.
+async fn held_provider(
+    fail: bool,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    Arc<tokio::sync::Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{response::IntoResponse, routing::post, Router};
+    let (requested, receiver) = tokio::sync::oneshot::channel();
+    let requested = Arc::new(std::sync::Mutex::new(Some(requested)));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = release.clone();
+    let app = Router::new().route("/chat/completions", post(move || {
+        let requested = requested.clone();
+        let gate = gate.clone();
+        async move {
+            requested.lock().unwrap().take().expect("unexpected provider retry").send(()).unwrap();
+            gate.notified().await;
+            if fail {
+                return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "intentional mock failure").into_response();
+            }
+            let event = serde_json::json!({"choices":[{"delta":{"content":"job completed"},"finish_reason":"stop"}]});
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")))
+                .unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, receiver, release, server)
+}
+
+async fn completed_job(
+    store: &Store,
+    id: &str,
+    delivered: bool,
+) -> Vec<formless_protocol::JobRunInfo> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let runs = store.job_runs(id, 10).unwrap();
+            if runs.iter().any(|r| {
+                r.status != "running"
+                    && r.status != "skipped"
+                    && (!delivered || r.detail.contains("appended"))
+            }) {
+                return runs;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("job did not reach its terminal history/delivery state")
+}
+
+async fn drain_daemon(daemon: Arc<formless_core::daemon::Daemon>) {
+    let pending = Arc::downgrade(&daemon);
+    drop(daemon);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pending.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("job tasks outlived credential isolation");
+}
+
+async fn stop_provider(server: tokio::task::JoinHandle<()>) {
+    server.abort();
+    if let Err(error) = server.await {
+        assert!(error.is_cancelled(), "mock provider failed: {error}");
+    }
 }
 
 #[test]
