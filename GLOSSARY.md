@@ -37,7 +37,7 @@ One user's continuous conversation and task history with the harness, resumable 
 _Avoid_: Thread, chat, connection
 
 **Run**:
-One unit of work inside a Session, started by a user message and continuing until the agent answers or the user interrupts it. A Run has no step, token, or time limit.
+One unit of work inside a Session, started by a user message and continuing until the agent answers or the user interrupts it. Budgets and configured step limits can pause a Run.
 _Avoid_: Task, job, turn
 
 **Invocation**:
@@ -73,5 +73,42 @@ Replacing older Session history and tool output with a persisted summary checkpo
 _Avoid_: Truncation, summarisation
 
 **Relay**:
-A future hosted intermediary that a Daemon Core connects out to with encryption, so a hosted frontend can reach a local daemon. Not in v1.
+A shipped WebSocket intermediary that a Daemon Core connects out to, so a browser frontend can reach the local daemon. Application payloads are encrypted end to end between the clients and daemon; the Relay routes ciphertext.
 _Avoid_: Proxy, tunnel
+
+
+**Role**:
+A named model assignment with a description, Provider, model, optional fallbacks, and optional system addendum for sub-agents.
+_Avoid_: Persona, agent type
+
+**Provider**:
+A named model endpoint and its connection settings and credential reference. Roles select models from Providers.
+_Avoid_: Model, vendor
+
+**Profile**:
+An isolated set of Formless configuration, data, and daemon state selected with `--profile`.
+_Avoid_: Account, workspace
+
+**Skill**:
+A named, reusable instruction document loaded into a Session, with optional supporting files. Skills guide the agent; they do not grant Capabilities.
+_Avoid_: Tool, plugin
+
+**MCP Server**:
+An external Model Context Protocol process or HTTP endpoint whose tools Formless can expose through its MCP integration.
+_Avoid_: Module, built-in Tool
+
+**Memory**:
+A persisted note the harness can recall across Runs, subject to the configured memory lifecycle and user controls.
+_Avoid_: Session transcript, context window
+
+**Proposal**:
+A recorded suggested harness or memory change awaiting the applicable review or application path.
+_Avoid_: Promotion, applied change
+
+**Job**:
+A persisted automation that starts Runs on a configured schedule and records its delivery and execution state.
+_Avoid_: Run, Pending Invocation
+
+**Artifact**:
+A file retained by the daemon for a Session, including emitted files and full output too large for the transcript, addressable through an artifact handle.
+_Avoid_: Attachment, Tool version

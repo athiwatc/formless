@@ -1,6 +1,9 @@
 //! Subscription/OAuth providers: authorization-code + PKCE login, secure
 //! token storage, refresh-on-expiry, and API-key backward compatibility.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -20,14 +23,7 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-fn clear_credential_env() {
-    std::env::remove_var("FORMLESS_API_KEY");
-    std::env::remove_var("FORMLESS_OAUTH_ACCESS_TOKEN");
-    std::env::remove_var("FORMLESS_OAUTH_CLIENT_SECRET");
-}
-
 fn test_paths(tag: &str) -> Paths {
-    clear_credential_env();
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-auth-{tag}-{short}"));
     let paths = Paths {
@@ -186,6 +182,7 @@ fn query_value(url: &str, key: &str) -> Option<String> {
 
 #[test]
 fn pkce_matches_rfc7636_vector_and_authorize_url_is_encoded() {
+    let _env = credential_env::EnvGuard::isolated();
     assert_eq!(
         pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
         "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
@@ -227,6 +224,7 @@ fn pkce_matches_rfc7636_vector_and_authorize_url_is_encoded() {
 
 #[test]
 fn oauth_config_toml_shape_and_token_storage() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("storage");
     std::fs::write(
         paths.config_file(),
@@ -297,6 +295,7 @@ prompt = "consent"
 
 #[tokio::test]
 async fn expired_tokens_refresh_once_and_rotated_tokens_persist() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("refresh");
     let (base, captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
@@ -330,6 +329,7 @@ async fn expired_tokens_refresh_once_and_rotated_tokens_persist() {
 
 #[tokio::test]
 async fn managed_provider_refreshes_again_when_token_expires_mid_run() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("managed-provider");
     let (base, captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
@@ -369,7 +369,7 @@ async fn managed_provider_refreshes_again_when_token_expires_mid_run() {
 
 #[tokio::test]
 async fn exchange_code_sends_pkce_verifier() {
-    clear_credential_env();
+    let _env = credential_env::EnvGuard::isolated();
     let (base, captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
     let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
@@ -407,6 +407,7 @@ fn send_callback(redirect_uri: &str, code: &str, state: &str) -> String {
 
 #[test]
 fn browser_login_callback_exchanges_code_and_saves_tokens() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("login");
     let (base, captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
@@ -442,6 +443,7 @@ fn browser_login_callback_exchanges_code_and_saves_tokens() {
 
 #[test]
 fn browser_login_rejects_state_mismatch() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("badstate");
     let (base, _captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
@@ -471,6 +473,7 @@ fn browser_login_rejects_state_mismatch() {
 
 #[tokio::test]
 async fn credential_resolution_errors_and_api_key_mode_are_actionable() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("errors");
     let oauth = oauth_cfg("http://127.0.0.1:9");
     assert!(!has_provider_credential(&paths, &oauth));
@@ -512,6 +515,7 @@ fn tokens(access: &str, refresh: &str, expires_at: i64) -> OAuthTokens {
 
 #[tokio::test]
 async fn two_oauth_providers_keep_separate_tokens() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("two");
     let a = oauth_cfg("http://a.example");
     let b = oauth_cfg("http://b.example");
@@ -546,6 +550,7 @@ async fn two_oauth_providers_keep_separate_tokens() {
 
 #[tokio::test]
 async fn legacy_tokens_move_to_the_default_provider_only() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("legacy");
     let mut cfg = formless_core::Config::default();
     cfg.provider = oauth_cfg("http://default.example");
@@ -571,6 +576,7 @@ async fn legacy_tokens_move_to_the_default_provider_only() {
 
 #[tokio::test]
 async fn a_401_forces_one_refresh_and_resends() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("401");
     let (base, captured) = spawn_token_server();
     let mut cfg = oauth_cfg(&base);
@@ -606,6 +612,7 @@ async fn a_401_forces_one_refresh_and_resends() {
 /// store, and logging out reports what it could not remove (#868).
 #[test]
 fn newer_copy_wins_and_delete_reports_leftovers() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("dual");
     let cfg = oauth_cfg("http://dual.example");
     save_oauth_tokens(&paths, &cfg.auth, &tokens("first", "r1", now_epoch() + 600)).unwrap();
@@ -655,6 +662,7 @@ fn newer_copy_wins_and_delete_reports_leftovers() {
 /// environment (#866).
 #[test]
 fn logout_says_what_stays_in_force() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("logout");
     let mut cfg = oauth_cfg("http://logout.example");
     cfg.auth.mode = "api_key".into();
@@ -674,6 +682,7 @@ const CHILD_ENV: &str = "FL_TEST_REFRESH_CHILD";
 /// Run only as a child of `two_processes_redeem_one_refresh_token_once`.
 #[tokio::test]
 async fn refresh_child() {
+    let _env = credential_env::EnvGuard::isolated();
     let Ok(spec) = std::env::var(CHILD_ENV) else {
         return;
     };
@@ -693,6 +702,7 @@ async fn refresh_child() {
 /// refresh token once between them (#865).
 #[test]
 fn two_processes_redeem_one_refresh_token_once() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("twoproc");
     let (base, captured) = spawn_token_server();
     let cfg = oauth_cfg(&base);
@@ -736,6 +746,7 @@ fn two_processes_redeem_one_refresh_token_once() {
 /// server added later under the same name (#866).
 #[tokio::test]
 async fn mcp_login_is_bound_to_its_server_address() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("mcpbind");
     let record = json!({
         "tokens": tokens("mcp-access", "mcp-refresh", now_epoch() + 600),
