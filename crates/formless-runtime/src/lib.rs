@@ -2330,6 +2330,37 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         x
     };
     let runtime = Runtime::new().map_err(|e| err(&e))?;
+    // Keep promise identities alive until completion (a raw pointer/hash could
+    // be reused after GC). Clear persistent handles before Runtime is dropped,
+    // including on early error paths, as required by rquickjs::Persistent.
+    type Rejections = std::rc::Rc<
+        std::cell::RefCell<HashMap<rquickjs::Persistent<rquickjs::Value<'static>>, String>>,
+    >;
+    struct ClearRejections(Rejections);
+    impl Drop for ClearRejections {
+        fn drop(&mut self) {
+            self.0.borrow_mut().clear();
+        }
+    }
+    let unhandled: Rejections = Default::default();
+    let _clear_rejections = ClearRejections(unhandled.clone());
+    let rejected = unhandled.clone();
+    runtime.set_host_promise_rejection_tracker(Some(Box::new(
+        move |ctx, promise, reason, handled| {
+            let promise = rquickjs::Persistent::save(&ctx, promise);
+            if handled {
+                rejected.borrow_mut().remove(&promise);
+            } else {
+                let message = reason
+                    .as_exception()
+                    .and_then(|e| e.message())
+                    .or_else(|| reason.as_string().and_then(|s| s.to_string().ok()))
+                    .unwrap_or_else(|| format!("{reason:?}"));
+                rejected.borrow_mut().insert(promise, message);
+            }
+        },
+    )));
+
     runtime.set_memory_limit((req.memory_mb as usize).saturating_mul(1024 * 1024));
     runtime.set_max_stack_size(1024 * 1024);
     let cancel = req.cancel.clone();
@@ -2422,6 +2453,9 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             "run() finished while {unsettled} tools.call result(s) were still pending: \
              tools.call returns a Promise, await every call"
         )));
+    }
+    if let Some(message) = unhandled.borrow().values().next() {
+        return Err(err(&format!("unhandled Promise rejection: {message}")));
     }
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
     let logs = state.logs.lock().map(|g| g.clone()).unwrap_or_default();
@@ -2843,6 +2877,26 @@ mod tests {
                 assert!(!e.message.contains("never settled"), "{}", e.message);
             }
         }
+    }
+
+    #[test]
+    fn unhandled_rejections_fail_the_invocation() {
+        for (code, message) in [
+            ("function run() { Promise.reject(new Error('floating')); return 1; }", "floating"),
+            ("async function run() { tools.call('bad', {}); await tools.call('t', {}); return 1; }", "bad tool"),
+            ("async function run() { setTimeout(async () => { throw new Error('flush failed'); }, 0); await tools.call('t', {}); return 1; }", "flush failed"),
+        ] {
+            let e = execute(&live(code), Arc::new(SlowOps)).unwrap_err();
+            assert!(e.message.contains("unhandled Promise rejection:"), "{}", e.message);
+            assert!(e.message.contains(message), "{}", e.message);
+        }
+    }
+
+    #[test]
+    fn rejections_handled_before_completion_do_not_fail() {
+        let req = live("async function run() { const p = Promise.reject(new Error('later handled')); await tools.call('t', {}); p.catch(() => {}); return 7; }");
+        let out = execute(&req, Arc::new(SlowOps)).unwrap();
+        assert_eq!(out.output, json!(7));
     }
 
     #[test]

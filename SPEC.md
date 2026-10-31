@@ -1275,6 +1275,10 @@ pattern (§4.4).
     - Values live in the `tool_kv` table (schema v23). They are never
       exported in bundles, and purging a Tool deletes its own namespace.
     - Smoke tests and replay use an in-memory store that is thrown away.
+  - Rejected Promises still unhandled when `run` completes fail the
+    Invocation with the rejection message, including floating nested calls
+    and async timer callbacks. A rejection handled before completion is
+    allowed.
   - Console formatting preserves `undefined`, BigInt (`n` suffix) and Error
     names/messages, and replaces circular references with `[Circular]`.
     A return value that cannot be JSON-serialized fails the Invocation with
