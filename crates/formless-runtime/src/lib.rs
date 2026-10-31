@@ -176,6 +176,8 @@ impl HostOps for NoHostOps {}
 pub struct ExecRequest {
     pub code: String,
     pub input: Value,
+    /// Declared Tool output schema; scripts and unschematized calls use None.
+    pub output_schema: Option<Value>,
     pub caps: Capabilities,
     pub memory_mb: u32,
     pub mode: HostMode,
@@ -2208,9 +2210,16 @@ fn classify(msg: &str, cancelled: bool) -> ExecError {
     }
 }
 
-/// A Tool that returns `{error: <truthy>}` instead of throwing has failed:
-/// counting it as a success would hide it from Self-Optimisation (§8.1).
-fn reported_error(output: &Value) -> Option<String> {
+/// Undeclared `{error: <truthy>}` results report failure (§8.1). An error
+/// property explicitly declared in the output schema is ordinary domain data.
+fn reported_error(output: &Value, output_schema: Option<&Value>) -> Option<String> {
+    if output_schema.is_some_and(|s| {
+        s["properties"]
+            .as_object()
+            .is_some_and(|p| p.contains_key("error"))
+    }) {
+        return None;
+    }
     let e = output.as_object()?.get("error")?;
     let truthy = match e {
         Value::Null | Value::Bool(false) => false,
@@ -2463,7 +2472,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         return Err(err(&parsed["error"].as_str().unwrap_or("tool error")));
     }
     let output = parsed["value"].clone();
-    if let Some(msg) = reported_error(&output) {
+    if let Some(msg) = reported_error(&output, req.output_schema.as_ref()) {
         return Err(err(&format!(
             "tool returned an error result (throw instead of returning {{error}}): {msg}"
         )));
@@ -2791,6 +2800,7 @@ mod tests {
 
     fn live(code: &str) -> ExecRequest {
         ExecRequest {
+            output_schema: None,
             code: code.into(),
             input: json!({}),
             caps: Capabilities::default(),
@@ -2901,11 +2911,19 @@ mod tests {
 
     #[test]
     fn reported_error_detects_truthy_error_fields() {
-        assert!(reported_error(&json!({"error": "boom"})).is_some());
-        assert!(reported_error(&json!({"error": {"code": 1}})).is_some());
-        assert!(reported_error(&json!({"error": null, "v": 1})).is_none());
-        assert!(reported_error(&json!({"error": ""})).is_none());
-        assert!(reported_error(&json!({"error": false})).is_none());
-        assert!(reported_error(&json!(["error"])).is_none());
+        assert!(reported_error(&json!({"error": "boom"}), None).is_some());
+        assert!(reported_error(&json!({"error": {"code": 1}}), None).is_some());
+        assert!(reported_error(&json!({"error": null, "v": 1}), None).is_none());
+        assert!(reported_error(&json!({"error": ""}), None).is_none());
+        assert!(reported_error(&json!({"error": false}), None).is_none());
+        assert!(reported_error(&json!(["error"]), None).is_none());
+        let schema = json!({"type":"object", "properties":{"error":{"type":"string"}}});
+        assert!(reported_error(&json!({"error":"invalid input"}), Some(&schema)).is_none());
+        let mut req = live("function run() { return {valid: false, error: 'invalid input'}; }");
+        req.output_schema = Some(schema);
+        assert_eq!(
+            execute(&req, Arc::new(NoHostOps)).unwrap().output,
+            json!({"valid":false,"error":"invalid input"})
+        );
     }
 }

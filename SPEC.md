@@ -1932,7 +1932,8 @@ it says.
   - `find_tools` before `create_tool`
   - least-privilege Capabilities (only scoped `fs:read:` for a read)
   - streaming (`*Chunks`) for large files
-  - throwing on failure, never `return {error}`
+  - throwing on failure; a returned `{error}` counts as failure unless
+    the output schema declares an `error` property for domain data
   - no hardcoded task paths, and a real input schema
   - reusing a loaded Tool
   - `env:` for API keys
@@ -4043,7 +4044,8 @@ yield the key (`relay`).
 ### v2.2 — Built-ins for self-expansion
 
 `find_tools` / `read_tool` / `test_tool` and lazy Tool listing (§7.1);
-honest outcomes (throw on failure, returned `{error}` counts as failure)
+honest outcomes (throw on failure; returned `{error}` counts as failure
+unless the output schema declares an `error` property for domain data)
 and inconclusive-after-stub smoke tests; async `run`; binary encodings,
 `fs` append/stat/mkdir/remove/rename, `process.run` options, response
 headers, truly streamed `fetchChunks`, scope-checked redirects (§7.5);

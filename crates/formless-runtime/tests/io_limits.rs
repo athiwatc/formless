@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 fn run(code: &str, caps: &[String]) -> Result<serde_json::Value, formless_runtime::ExecError> {
     let req = ExecRequest {
+        output_schema: None,
         code: code.into(),
         input: json!({}),
         caps: Capabilities::parse(caps).unwrap(),
@@ -60,6 +61,7 @@ fn reads_output_and_logs_stop_at_their_caps() {
     let staged = dir.join("staged.txt");
     let e = execute(
         &ExecRequest {
+            output_schema: None,
             code: format!(
                 "function run(){{ fs.write({p:?}, 'y'.repeat(1500)); return fs.read({p:?}); }}",
                 p = staged.display().to_string()
@@ -105,6 +107,7 @@ fn reads_output_and_logs_stop_at_their_caps() {
 
     let logged = execute(
         &ExecRequest {
+            output_schema: None,
             code: "function run(){ for (let i = 0; i < 100; i++) console.log('line ' + i); return 1; }".into(),
             input: json!({}),
             caps: Capabilities::default(),

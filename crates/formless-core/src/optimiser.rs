@@ -932,6 +932,7 @@ impl Daemon {
         self: &Arc<Self>,
         _tool_name: &str,
         code: &str,
+        output_schema: &str,
         caps: &Capabilities,
         memory_mb: u32,
         input: Value,
@@ -943,7 +944,11 @@ impl Daemon {
         Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send>,
     > {
         let this = self.clone();
-        let (code, cand_name) = (code.to_string(), cand_name.to_string());
+        let (code, cand_name, output_schema) = (
+            code.to_string(),
+            cand_name.to_string(),
+            serde_json::from_str(output_schema).ok(),
+        );
         let caps = caps.clone();
         let override_cand = override_cand.cloned();
         Box::pin(async move {
@@ -962,6 +967,7 @@ impl Daemon {
                 handle: tokio::runtime::Handle::current(),
             });
             let req = ExecRequest {
+                output_schema,
                 code,
                 input,
                 caps,
@@ -1019,6 +1025,7 @@ impl Daemon {
                 .replay_exec(
                     &tool_name,
                     &code,
+                    &output_schema,
                     &caps,
                     memory_mb,
                     input,
@@ -1064,10 +1071,11 @@ impl HostOps for ReplayOps {
                 _ => Err(format!("unrecorded MCP call in replay: {name}")),
             };
         }
-        let (code, caps, memory_mb, tool_name) = if name == self.cand_name {
+        let (code, output_schema, caps, memory_mb, tool_name) = if name == self.cand_name {
             match &self.override_cand {
                 Some(c) => (
                     c.code.clone(),
+                    c.output_schema.clone(),
                     Capabilities::parse(&c.capabilities).unwrap_or_default(),
                     c.memory_mb,
                     name.to_string(),
@@ -1075,6 +1083,7 @@ impl HostOps for ReplayOps {
                 None => match daemon.with_store(|st| st.get_tool_by_name(name)) {
                     Ok(Some((info, ver))) if !info.retired => (
                         ver.code.clone(),
+                        ver.output_schema.clone(),
                         Capabilities::parse(&ver.capabilities).unwrap_or_default(),
                         ver.memory_mb,
                         info.name.clone(),
@@ -1086,6 +1095,7 @@ impl HostOps for ReplayOps {
             match daemon.with_store(|st| st.get_tool_by_name(name)) {
                 Ok(Some((info, ver))) if !info.retired => (
                     ver.code.clone(),
+                    ver.output_schema.clone(),
                     Capabilities::parse(&ver.capabilities).unwrap_or_default(),
                     ver.memory_mb,
                     info.name.clone(),
@@ -1104,6 +1114,7 @@ impl HostOps for ReplayOps {
                 .replay_exec(
                     &tool_name,
                     &code,
+                    &output_schema,
                     &caps,
                     memory_mb,
                     input,

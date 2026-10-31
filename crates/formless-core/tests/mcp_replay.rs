@@ -70,6 +70,7 @@ async fn replay_serves_recorded_mcp_responses() {
         .replay_exec(
             "open_count",
             "async function run(i){ return await tools.call('mcp__issues__list_issues', {state: 'closed'}); }",
+            "{}",
             &caps,
             64,
             json!({}),
