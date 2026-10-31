@@ -9920,6 +9920,27 @@ fn is_placeholder(m: &MessageInfo) -> bool {
         .is_some_and(|meta| meta["placeholder"] == true)
 }
 
+/// Stop metadata survives reopening a Session, unlike the live Note event.
+fn stored_stop_note(m: &MessageInfo) -> Option<String> {
+    if m.role != "assistant" || is_placeholder(m) {
+        return None;
+    }
+    let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+    let reason = meta["stop_reason"]
+        .as_str()
+        .or_else(|| (meta["truncated"] == true).then_some("max_tokens"))?;
+    Some(match reason {
+        "max_tokens" => "The answer was cut off at the model's output token limit.".into(),
+        "model_context_window_exceeded" => {
+            "The answer stopped because the model's context window is full.".into()
+        }
+        "pause_turn" => "The model paused its turn; ask it to continue.".into(),
+        "refusal" => "The model refused this request.".into(),
+        "content_filter" => "The provider's content filter stopped this answer.".into(),
+        other => format!("The answer ended early ({other})."),
+    })
+}
+
 /// "via gpt-4.1-mini (fallback)" when another model than the Session's
 /// answered (SPEC §4.5).
 fn served_by(m: &MessageInfo) -> Option<String> {
@@ -11852,6 +11873,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     lines.push(Line::styled(format!("  {}", m.content), ui::dim(app.color)));
                 } else {
                     lines.extend(app.markdown_cached(m, width));
+                }
+                if let Some(note) = stored_stop_note(m) {
+                    lines.push(Line::styled(format!("  {note}"), ui::dim(app.color)));
                 }
                 if focused {
                     lines.push(focus_hint(app.color, false));
@@ -15528,6 +15552,32 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             meta: None,
         }
+    }
+
+    #[test]
+    fn stored_stops_remain_visible_when_history_is_opened() {
+        let mut app = test_app();
+        let mut partial = msg("assistant", "A partial answer");
+        partial.meta =
+            Some(r#"{"stop_reason":"model_context_window_exceeded","truncated":true}"#.into());
+        app.messages = vec![partial.clone()];
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("A partial answer"), "{screen}");
+        assert!(
+            screen.contains("The answer stopped because the model's context window is full."),
+            "{screen}"
+        );
+        partial.meta = Some(r#"{"truncated":true}"#.into());
+        app.messages = vec![partial.clone()];
+        assert!(render(&mut app, 120, 30)
+            .contains("The answer was cut off at the model's output token limit."));
+        partial.meta = None;
+        app.messages = vec![partial];
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            !screen.contains("The answer stopped") && !screen.contains("The answer was cut off"),
+            "{screen}"
+        );
     }
 
     #[test]

@@ -414,7 +414,9 @@ an empty listing just asks for one.
   and context-window partials persist `meta.truncated: true`; output-limit
   partials also persist `stop_reason: "max_tokens"`. When building later
   provider context, append a `[harness note]` explaining the cut-off, or
-  substitute that note when the partial is empty.
+  substitute that note when the partial is empty. TUI and web history show
+  a muted stop note for stored `stop_reason`/`truncated` metadata, using
+  the same wording as live stop notes; ordinary completions show none.
 - **Rate limits.** The `x-ratelimit-*` (and `anthropic-ratelimit-*`)
   headers of each endpoint's latest response are kept: `RateLimits`,
   `Status.rate_limits`; `/usage` adds "41/50 requests left, resets …".
