@@ -3952,6 +3952,11 @@ impl Store {
         duration_ms: i64,
         retention: usize,
     ) -> Result<()> {
+        // Stored text goes through the one secret scanner (#709).
+        let (output, error) = (
+            crate::secrets::redact(output).0,
+            crate::secrets::redact(error).0,
+        );
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE invocations SET status=?2, tag=?3, output=?4, error=?5, duration_ms=?6 WHERE id=?1",
@@ -4007,6 +4012,12 @@ impl Store {
             );
         }
         let id = uuid::Uuid::new_v4().to_string();
+        // Stored text goes through the one secret scanner (#709).
+        let (input, output, error) = (
+            crate::secrets::redact(input).0,
+            crate::secrets::redact(output).0,
+            crate::secrets::redact(error).0,
+        );
         tx.execute(
             "INSERT INTO invocations(id,tool_id,version,session_id,run_id,parent_id,status,tag,input,output,error,duration_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![id, tool_id, version, session_id, run_id, parent_id, status, tag, input, output, error, duration_ms, now()],

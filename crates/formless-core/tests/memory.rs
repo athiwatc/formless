@@ -266,3 +266,60 @@ async fn confirm_writes_discards_a_note_nobody_approved() {
         .unwrap();
     assert_eq!(used[0]["id"], m.id.as_str());
 }
+
+/// Recorded Invocation inputs, outputs and errors go through the secret
+/// scanner, whatever the key names (#709).
+#[test]
+fn recorded_invocations_are_redacted() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let db = std::path::PathBuf::from(format!("/tmp/fl-redact-{short}.db"));
+    let store = formless_core::Store::open(&db).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let (tool, _) = store
+        .create_tool_version(
+            "t",
+            "d",
+            r#"{"type":"object"}"#,
+            "{}",
+            "// x",
+            &caps,
+            64,
+            "agent",
+        )
+        .unwrap();
+    let key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123";
+    let id = store
+        .record_invocation(
+            &tool.id,
+            1,
+            None,
+            None,
+            None,
+            "failure",
+            "",
+            &format!(r#"{{"note": "use {key}"}}"#),
+            r#"{"body": "passwd: hunter22"}"#,
+            &format!("401 for Bearer {key}"),
+            1,
+            100,
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let row = conn.query_row(
+        "SELECT input, output, error FROM invocations WHERE id=?1",
+        [&id],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    );
+    let (input, output, error) = row.unwrap();
+    for text in [&input, &output, &error] {
+        assert!(!text.contains(key) && !text.contains("hunter22"), "{text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+    }
+    let _ = std::fs::remove_file(&db);
+}

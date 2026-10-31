@@ -57,6 +57,9 @@ pub struct SecurityCfg {
     /// a host already covers its subdomains, as everywhere. Bare `net`
     /// (any host) is never trusted.
     pub trusted_hosts: Vec<String>,
+    /// Extra secret shapes (regular expressions) blanked wherever Formless
+    /// stores or quotes text, beside the built-in ones (SPEC §15).
+    pub secret_patterns: Vec<String>,
 }
 
 impl Default for SecurityCfg {
@@ -66,6 +69,7 @@ impl Default for SecurityCfg {
             trusted_paths: Vec::new(),
             trust_writes: true,
             trusted_hosts: Vec::new(),
+            secret_patterns: Vec::new(),
         }
     }
 }
@@ -265,6 +269,7 @@ pub fn documented_shape() -> Config {
     cfg.skills.model = Some(s("m"));
     cfg.security.trusted_hosts.push(s("api.example.com"));
     cfg.security.trusted_paths.push(s("/srv"));
+    cfg.security.secret_patterns.push(s("ACME-[0-9]+"));
     cfg.tui.colors.insert(s("*"), s("cyan"));
     cfg.hooks.push(HookCfg {
         event: s("pre_tool"),
