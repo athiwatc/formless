@@ -2479,17 +2479,31 @@ run_tool = "network_policy"     # a registry Tool, or…
   first message (nothing pre-filled, no starter Tools).
 - **`/setup`** opens the wizard again at the saved provider's key step
   (re-enter the key, or Esc back to change provider); finishing saves and
-  reconnects as on first launch.
+  reconnects as on first launch. At the provider step, Esc cancels a
+  re-opened setup and returns to the Session without changing config,
+  credentials or the daemon connection. An empty key preserves a stored
+  credential only when the endpoint is unchanged; changing endpoints
+  without a new key requires confirmation before clearing the previous
+  stored credential.
 - **Moving around.** Esc goes back one step at every step (effort →
   model → key → URL → provider), keeping what was typed; the header shows
-  "step N of 5".
+  "step N of 5". Going back invalidates outstanding model-list/probe
+  results. Only the current operation at its expected step can advance
+  setup. Changing provider or custom endpoint clears the preceding
+  provider's key and model selection.
 - **The API key** shows as `••••abcd` (only the last 4 characters);
-  Ctrl+R shows it in full while typing, and pasting works (bracketed
-  paste). Ctrl-key presses never type letters into it.
-- **Resuming.** After every key the wizard keeps a draft in
+  Ctrl+R shows it in full for 10 seconds at the key step only; Enter and
+  step changes hide it. Short keys show at most half their characters
+  as a verifiable tail. Surrounding Unicode whitespace is trimmed before
+  requests and saving; internal whitespace produces a warning.
+  Pasting works (bracketed paste). Ctrl-key presses never type letters.
+- **Resuming.** After 300 ms without an edit the wizard atomically keeps
+  a private (`0600` on Unix) draft in
   `<config>/setup-draft.json`: the step, preset, base URL, model and
-  effort, never the key. The next launch resumes there (at the key step
-  for providers that need one); finishing deletes it.
+  effort, never the key. URLs with userinfo, queries or fragments are not
+  drafted. Drafts expire after 24 hours and are discarded when config is
+  newer. The next launch resumes there (at the key step for providers
+  that need one); successful config saves, including CLI setup, delete it.
 - **No key needed.** With no saved setup and no provider key in the
   environment, a running Ollama or LM Studio (a quick check of its port)
   is pre-selected and offered: "press Enter to use it (no account or API
