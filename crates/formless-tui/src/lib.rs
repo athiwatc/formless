@@ -572,7 +572,7 @@ impl Wizard {
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
-                "Saved setup found. Re-enter your API key to restore it (Esc to choose another provider).".into(),
+                "Saved setup found. Enter a replacement API key, or press Enter to reuse its stored key when available (Esc to choose another provider).".into(),
             )
         } else {
             (
@@ -6452,6 +6452,18 @@ impl App {
                     if w.api_key.is_empty() {
                         if let Some((_, k)) = w.preset.and_then(formless_core::presets::env_key) {
                             w.api_key = k;
+                        }
+                    }
+                    if w.api_key.is_empty() {
+                        // A saved credential belongs to the on-disk endpoint,
+                        // not whichever provider the wizard has since selected.
+                        if let Ok(saved) = Config::load_file_only(&self.paths) {
+                            if !saved.provider.base_url.trim().is_empty()
+                                && saved.provider.base_url.trim() == w.base_url.trim()
+                            {
+                                w.api_key = formless_core::config::load_api_key(&self.paths)
+                                    .unwrap_or_default();
+                            }
                         }
                     }
                     w.retry_fetch = false;
@@ -15998,6 +16010,85 @@ mod tests {
             w.key_update(&cfg.provider.base_url, true),
             WizardKeyUpdate::Save("replacement-key".into())
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_key_enter_reuses_a_saved_key_only_for_its_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _env = credential_env::EnvGuard::isolated();
+        for changed_endpoint in [false, true] {
+            let mut app = test_app();
+            let saved_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut cfg = Config::default();
+            cfg.provider.base_url = format!("http://{}/v1", saved_listener.local_addr().unwrap());
+            cfg.provider.model = "fixture-model".into();
+            cfg.save(&app.paths).unwrap();
+            formless_core::config::write_secret_file(
+                &app.paths.key_fallback_file(),
+                "synthetic-saved-key",
+            )
+            .unwrap();
+            let mut w = Wizard::new(&cfg);
+            assert!(w.api_key.is_empty());
+            let listener = if changed_endpoint {
+                w.base_url = format!("http://{}/v1", other_listener.local_addr().unwrap());
+                w.bind_custom_endpoint();
+                drop(saved_listener);
+                other_listener
+            } else {
+                drop(other_listener);
+                saved_listener
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("model request did not reach the fixture")
+                        .unwrap();
+                let mut headers = Vec::new();
+                let mut buffer = [0; 1024];
+                while !headers.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                        .await
+                        .expect("model request headers stalled")
+                        .unwrap();
+                    assert!(n > 0, "model request ended before its headers");
+                    headers.extend_from_slice(&buffer[..n]);
+                    assert!(headers.len() < 16 * 1024);
+                }
+                let body = r#"{"data":[{"id":"fixture-model"}]}"#;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8(headers).unwrap().to_ascii_lowercase()
+            });
+            app.wizard = Some(w);
+            app.wizard_key(key(KeyCode::Enter));
+            let headers = server.await.unwrap();
+            assert!(headers.starts_with("get /v1/models "));
+            assert_eq!(
+                headers.contains("authorization: bearer synthetic-saved-key"),
+                !changed_endpoint,
+            );
+            if changed_endpoint {
+                assert!(!headers.contains("authorization:"));
+                assert!(app.wizard.as_ref().unwrap().api_key.is_empty());
+            } else {
+                assert_eq!(app.wizard.as_ref().unwrap().api_key, "synthetic-saved-key");
+            }
+            // Receive the final worker result before releasing the credential
+            // guard; no fetch/probe task can outlive its fixture environment.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.wizard.as_ref().unwrap().step == WizardStep::FetchModels {
+                    app.wizard_poll();
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("model worker did not finish");
+            assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickModel);
+            assert_eq!(app.wizard.as_ref().unwrap().model(), "fixture-model");
+        }
     }
 
     #[test]

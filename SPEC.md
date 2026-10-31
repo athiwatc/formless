@@ -2484,7 +2484,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   credentials or the daemon connection. An empty key preserves a stored
   credential only when the endpoint is unchanged; changing endpoints
   without a new key requires confirmation before clearing the previous
-  stored credential.
+  stored credential. Enter at an empty key step can reuse the stored
+  credential for fetching/probing only when the endpoint matches the
+  on-disk provider; it is never reused for a changed endpoint.
 - **Moving around.** Esc goes back one step at every step (effort →
   model → key → URL → provider), keeping what was typed; the header shows
   "step N of 5". Going back invalidates outstanding model-list/probe
