@@ -2429,7 +2429,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   clickable in terminals that support OSC 8 hyperlinks. After each draw,
   the TUI repaints the visible URL cells wrapped in OSC 8, keeping their
   style, but only when the set of visible links changed
-  (`tui.hyperlinks`). `/open link [N]` opens the Nth link in the last
+  (`tui.hyperlinks`). A URL ends where its brackets balance
+  (`…/f_(x))` keeps one `)`), and a long URL hard-wrapped across rows is
+  one link on every fragment, never a link to its first piece. In the
+  Markdown, an image inside a link shows both addresses, and inline HTML
+  shows its text: `<b>`, `<i>`, `<s>`, `<code>`, `<kbd>` and `<a href>`
+  style it, other tags and comments are dropped. `/open link [N]` opens the Nth link in the last
   answer with the system opener (`open`, `xdg-open`, `start`).
   File paths in the chat (`src/main.rs`, `./a/b.txt:42`, `Cargo.toml`)
   that exist under the TUI's working directory are linked the same way,
@@ -2468,7 +2473,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   pane shrink: columns narrower than an equal share keep their width, and
   the rest share the room in proportion. Cell text wraps inside its
   column instead of being cut. When the pane can't give every column 4
-  characters, the table is shown as one `key: value` record per row.
+  characters, the table is shown as one `key: value` record per row,
+  each value wrapping under itself with a hanging indent.
   `/table [N]` opens the last answer's Nth table at full width in the
   pager, where ←/→ scroll sideways.
 - **Tool calls in the TUI chat.** Persisted calls start collapsed to one
@@ -3507,7 +3513,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   minutes (code 4002), so a vanished tab never stays an approval
   subscriber.
   **Pairing by QR code:** `formless relay enable` (and `formless relay
-  status --qr`) print the browser link as a terminal QR code, white on
+  status --qr`) print the browser link as a terminal QR code (error
+  correction level M, a 4-module quiet zone drawn light), white on
   black so phones read it on any theme, and only on a terminal, never into
   a pipe or log. The TUI's `/relay` shows the same in the pager when the
   relay is on. Each warns that the code holds the pairing secret and
