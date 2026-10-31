@@ -110,10 +110,17 @@ async fn nested_errors_preserve_inner_detail_and_redact_recorded_and_returned_in
         "{outer_detail}"
     );
     let own = outer_detail.strip_suffix(inner_detail).unwrap();
-    assert!(own.contains("outer_visible"));
-    assert!(!own.contains("inner_visible"));
-    assert!(inner_detail.contains("inner_visible"));
-    assert!(!inner_detail.contains("outer_visible"));
+    // The caller's source legitimately names the callee's input fields.
+    // Check each input excerpt independently from its source excerpt.
+    let shown_input = |detail: &str| -> Value {
+        serde_json::from_str(detail.rsplit("\ninput: ").next().unwrap().trim()).unwrap()
+    };
+    let own_input = shown_input(own);
+    let inner_input = shown_input(inner_detail);
+    assert_eq!(own_input["outer_visible"], "outer marker");
+    assert!(own_input.get("inner_visible").is_none());
+    assert_eq!(inner_input["inner_visible"], "inner marker");
+    assert!(inner_input.get("outer_visible").is_none());
     for text in std::iter::once(&returned).chain(failures.iter().flat_map(|row| [&row.1, &row.2])) {
         for secret in [secret, escaped, "fixture-secret-OPAQUE"] {
             assert!(
