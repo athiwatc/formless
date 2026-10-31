@@ -303,79 +303,261 @@ mod transient_tests {
     }
 }
 
-/// A Tool's JavaScript error made readable (SPEC §7.1): the message, the
-/// call path in the Tool's own code, the failing line with two lines of
-/// context, and the input that caused it. QuickJS reports Tool-code
-/// frames as `at NAME (eval_script:LINE:COL)`; the runner's own frames
-/// (`<anonymous>`, `<eval>`) are left out.
+/// Readable context for this Tool only. Eval filenames, rather than line
+/// numbers alone, distinguish Tool code from host/runner/module code.
 pub fn tool_error_detail(message: &str, code: &str, input: &serde_json::Value) -> String {
-    let mut lines = message.lines();
-    let head = lines.next().unwrap_or_default().trim().to_string();
-    let frames: Vec<(String, usize, usize)> = lines
-        .filter_map(|l| {
-            let l = l.trim().strip_prefix("at ")?;
-            let (name, loc) = l.split_once(" (")?;
+    let src: Vec<&str> = code.lines().collect();
+    let frames: Vec<(String, usize, usize)> = message
+        .lines()
+        .filter_map(|line| {
+            let frame = line.trim().strip_prefix("at ")?;
+            let (name, location) = frame.split_once(" (")?;
             if name.starts_with('<') {
                 return None;
             }
-            let loc = loc.strip_suffix(')')?.strip_prefix("eval_script:")?;
-            let mut parts = loc.split(':');
-            let line = parts.next()?.parse().ok()?;
-            let col = parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
-            Some((name.to_string(), line, col))
+            let location = location
+                .strip_suffix(')')?
+                .strip_prefix(formless_runtime::TOOL_SOURCE_NAME)?
+                .strip_prefix(':')?;
+            let mut parts = location.split(':');
+            let line: usize = parts.next()?.parse().ok()?;
+            let column = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+            (line > 0 && line <= src.len()).then(|| (name.to_string(), line, column))
         })
         .collect();
-    let src: Vec<&str> = code.lines().collect();
-    let mut out = vec![head];
-    let Some((_, line, col)) = frames
-        .first()
-        .filter(|(_, l, _)| *l >= 1 && *l <= src.len())
-    else {
-        // No position in the Tool's code: keep what QuickJS said.
-        return message.trim_end().to_string();
-    };
-    let path: Vec<String> = frames
-        .iter()
-        .map(|(name, l, _)| format!("{name} (line {l})"))
-        .collect();
-    out.push(format!("  at {}", path.join(" ← ")));
-    out.push(String::new());
-    let width = (line + 2).min(src.len()).to_string().len();
-    for n in line.saturating_sub(2).max(1)..=(line + 2).min(src.len()) {
-        let mark = if n == *line { ">" } else { " " };
-        out.push(format!("{mark} {n:>width$} | {}", src[n - 1]));
-        if n == *line && *col > 0 {
-            out.push(format!("  {:>width$} | {}^", "", " ".repeat(col - 1)));
+    let mut out = Vec::new();
+    if let Some((_, line, column)) = frames.first() {
+        out.push(
+            message
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        );
+        let path: Vec<String> = frames
+            .iter()
+            .map(|(name, line, _)| format!("{name} (line {line})"))
+            .collect();
+        out.push(format!("  at {}", path.join(" ← ")));
+        out.push(String::new());
+        let width = (line + 2).min(src.len()).to_string().len();
+        for number in line.saturating_sub(2).max(1)..=(line + 2).min(src.len()) {
+            let mark = if number == *line { ">" } else { " " };
+            let clean = crate::secrets::redact(src[number - 1]).0;
+            out.push(format!(
+                "{mark} {number:>width$} | {}",
+                expand_tabs(&clean).0
+            ));
+            if number == *line && *column > 0 {
+                // QuickJS-NG columns are one-based UTF-8 byte offsets. Round
+                // malformed offsets down before measuring graphemes for display.
+                let raw = src[number - 1];
+                let mut end = (column - 1).min(raw.len());
+                while !raw.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let prefix = crate::secrets::redact(&raw[..end]).0;
+                let display_column = expand_tabs(&prefix).1;
+                out.push(format!(
+                    "  {:>width$} | {}^",
+                    "",
+                    " ".repeat(display_column)
+                ));
+            }
         }
+    } else {
+        out.push(message.trim_end().to_string());
     }
-    let shown = input.to_string();
-    let shown: String = if shown.chars().count() > 500 {
+    // Redact the complete value before truncation: neither quoted key values
+    // nor a partially truncated credential can escape the shared scanner.
+    let shown = crate::tools::redact(input).to_string();
+    let shown = if shown.chars().count() > 500 {
         format!("{}…", shown.chars().take(500).collect::<String>())
     } else {
         shown
     };
     out.push(String::new());
     out.push(format!("input: {shown}"));
-    out.join("\n")
+    crate::secrets::redact(&out.join("\n")).0
+}
+
+fn expand_tabs(line: &str) -> (String, usize) {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut output = String::new();
+    let mut column = 0;
+    for grapheme in line.graphemes(true) {
+        if grapheme == "\t" {
+            let count = 4 - column % 4;
+            output.push_str(&" ".repeat(count));
+            column += count;
+        } else {
+            output.push_str(grapheme);
+            column += UnicodeWidthStr::width(grapheme);
+        }
+    }
+    (output, column)
+}
+
+/// Each level contributes only its own source/input. Already-formatted inner
+/// detail is appended unchanged, rather than interpreted as caller stack frames.
+pub fn tool_failure_detail(
+    tool: &str,
+    message: &str,
+    code: &str,
+    input: &serde_json::Value,
+    nested: Option<&formless_runtime::NestedToolError>,
+) -> String {
+    let inner = nested.filter(|nested| !nested.detail.is_empty());
+    let own_message = match inner {
+        Some(nested) => message.replace(
+            &nested.detail,
+            &format!("nested Tool {} failed", nested.tool),
+        ),
+        None => message.to_string(),
+    };
+    let own = tool_error_detail(&own_message, code, input);
+    let chain = match inner {
+        Some(nested) => format!(
+            "{tool} → {}",
+            nested
+                .detail
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("Tool call chain: "))
+                .unwrap_or(&nested.tool)
+        ),
+        None => tool.to_string(),
+    };
+    let mut result = format!("Tool call chain: {chain}\n\nTool {tool}:\n{own}");
+    if let Some(nested) = inner {
+        result.push_str("\n\n");
+        result.push_str(&nested.detail);
+    }
+    crate::secrets::redact(&result).0
 }
 
 #[cfg(test)]
 mod tool_error_tests {
-    use super::tool_error_detail;
+    use super::{tool_error_detail, tool_failure_detail};
 
     #[test]
     fn js_errors_show_the_line_the_path_and_the_input() {
         let code = "function helper(x) {\n  return x.missing.deep;\n}\nfunction run(input) {\n  const a = 1;\n  return helper(input);\n}";
-        let msg = "cannot read property 'deep' of undefined\n    at helper (eval_script:2:10)\n    at run (eval_script:6:17)\n    at <anonymous> (eval_script:8:34)\n    at <eval> (eval_script:11:3)\n";
+        let msg = "cannot read property 'deep' of undefined\n    at helper (formless-tool.js:2:10)\n    at run (formless-tool.js:6:17)\n    at <anonymous> (formless-host.js:8:34)\n    at <eval> (formless-runner.js:11:3)\n";
         let out = tool_error_detail(msg, code, &serde_json::json!({"a": 1}));
         assert_eq!(
             out,
             "cannot read property 'deep' of undefined\n  at helper (line 2) ← run (line 6)\n\n  1 | function helper(x) {\n> 2 |   return x.missing.deep;\n    |          ^\n  3 | }\n  4 | function run(input) {\n\ninput: {\"a\":1}"
         );
-        // No usable frame: unchanged.
+        // No usable frame: retain text and add the redacted input.
         assert_eq!(
             tool_error_detail("boom\n", code, &serde_json::json!({})),
-            "boom"
+            "boom\n\ninput: {}"
         );
+    }
+
+    #[test]
+    fn input_redaction_handles_nested_keys_escaping_and_truncation() {
+        let input = serde_json::json!({
+            "api_key":"short\"escaped\\credential",
+            "headers":[{"AUTHORIZATION":"pw", "nested":{"refreshToken":"private-token-value", "passphrase":"phrase", "pwd":"pw2"}}],
+            "note":"ordinary \"quoted\" text",
+            "body":"sk-abcdefghijklmnop1234567890"
+        });
+        let out = tool_error_detail("boom", "function run() {}", &input);
+        let shown: serde_json::Value =
+            serde_json::from_str(out.lines().last().unwrap().strip_prefix("input: ").unwrap())
+                .unwrap();
+        assert_eq!(shown["api_key"], "[redacted]");
+        assert_eq!(shown["headers"][0]["AUTHORIZATION"], "[redacted]");
+        assert_eq!(shown["headers"][0]["nested"]["refreshToken"], "[redacted]");
+        assert_eq!(shown["headers"][0]["nested"]["passphrase"], "[redacted]");
+        assert_eq!(shown["headers"][0]["nested"]["pwd"], "[redacted]");
+        assert_eq!(shown["note"], input["note"]);
+        for secret in [
+            "short\"escaped\\credential",
+            "pw2",
+            "private-token-value",
+            "sk-abcdefghijklmnop1234567890",
+        ] {
+            assert!(!out.contains(secret), "input credential leaked");
+        }
+        let out = tool_error_detail(
+            "boom",
+            "",
+            &serde_json::json!({
+                "note":format!("{} sk-abcdefghijklmnop1234567890", "a".repeat(480))
+            }),
+        );
+        assert!(!out.contains("sk-"), "redaction happened after truncation");
+    }
+
+    #[test]
+    fn utf8_byte_columns_use_grapheme_width_and_four_column_tabs() {
+        let line = "\tconst x = '😀界';\tthrow new Error('x');";
+        let column = line.find("throw").unwrap() + 1;
+        let out = tool_error_detail(
+            &format!("x\n at run (formless-tool.js:2:{column})"),
+            &format!("function run() {{\n{line}\n}}"),
+            &serde_json::json!({}),
+        );
+        assert!(
+            out.contains("> 2 |     const x = '😀界';   throw new Error('x');"),
+            "{out}"
+        );
+        assert!(out.contains(&format!("    | {}^", " ".repeat(24))), "{out}");
+    }
+
+    #[test]
+    fn unnamed_module_frames_are_never_mapped_to_tool_source() {
+        let code = "function run() {\n  const wrong = 'not module source';\n  return library.explode();\n}";
+        let out = tool_error_detail(
+            "module problem\n at explodeModule (eval_script:2:10)\n at run (formless-tool.js:3:10)",
+            code,
+            &serde_json::json!({}),
+        );
+        assert!(!out.contains("explodeModule (line 2)"), "{out}");
+        assert!(!out.contains("> 2 |"), "{out}");
+        assert!(out.contains("> 3 |   return library.explode();"), "{out}");
+    }
+
+    #[test]
+    fn nested_detail_stays_verbatim_with_separate_callsite_and_inputs() {
+        let inner = tool_failure_detail(
+            "inner",
+            "inner broke\n at run (formless-tool.js:2:3)",
+            "function run() {\n  throw new Error('INNER_SOURCE');\n}",
+            &serde_json::json!({"inner_visible":7,"token":"never-copy-this"}),
+            None,
+        );
+        let nested = formless_runtime::NestedToolError {
+            tool: "inner".into(),
+            detail: inner.clone(),
+        };
+        let outer = tool_failure_detail(
+            "outer",
+            &format!("{inner}\n at run (formless-tool.js:2:10)"),
+            "async function run() {\n  return await tools.call('inner', {});\n}",
+            &serde_json::json!({"outer_visible":9,"password":"pw"}),
+            Some(&nested),
+        );
+        assert!(
+            outer.starts_with("Tool call chain: outer → inner\n"),
+            "{outer}"
+        );
+        assert_eq!(
+            outer.matches(&inner).count(),
+            1,
+            "inner detail changed or duplicated"
+        );
+        let own = outer.strip_suffix(&inner).unwrap();
+        assert!(own.contains("outer_visible"));
+        assert!(!own.contains("inner_visible"));
+        assert!(!own.contains("INNER_SOURCE"));
+        assert!(inner.contains("inner_visible"));
+        assert!(!outer.contains("never-copy-this"));
+        assert!(!outer.contains("pw"));
     }
 }

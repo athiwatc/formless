@@ -1093,8 +1093,15 @@ pattern (§4.4).
   Invocation's stored error) is the message, the call path in the Tool's
   own code (`at helper (line 2) ← run (line 6)`), the failing line with
   two lines of context and a `^` at the column, and the input (first 500
-  characters). The runner's own frames are left out; without a position
-  in the Tool's code the QuickJS text is kept as is.
+  characters after recursive sensitive-key and shared-scanner redaction).
+  Persisted errors and returned tool results use the same redacted detail.
+  Nested failures retain the inner detail verbatim under an `outer → inner`
+  call chain; each Tool has its own source excerpt and redacted input.
+  Only frames explicitly named as that Tool's source are mapped: runner,
+  host and dynamically required-module frames are omitted from Tool excerpts.
+  Carets use UTF-8 byte positions converted to display columns, with tabs
+  expanded to four-column stops and Unicode grapheme widths respected.
+  Without a Tool-source position the redacted QuickJS text is retained.
 
 ### 7.2 Tool lifecycle
 
