@@ -463,6 +463,7 @@ fn error_line(e: &str) -> Option<u32> {
         })
     };
     after("eval_script:")
+        .or_else(|| after("formless-tool.js:"))
         .or_else(|| after(">:"))
         .or_else(|| after("line "))
 }
@@ -11211,8 +11212,14 @@ impl Daemon {
                         ExecErrorKind::Js => ("failure", ""),
                     };
                     // Where in the Tool's code, and on what input (§7.1).
-                    let message = if e.kind == ExecErrorKind::Js {
-                        crate::errors::tool_error_detail(&e.message, &ver.code, &input)
+                    let message = if e.kind == ExecErrorKind::Js || e.nested.is_some() {
+                        crate::errors::tool_failure_detail(
+                            &name,
+                            &e.message,
+                            &ver.code,
+                            &input,
+                            e.nested.as_ref(),
+                        )
                     } else {
                         e.message
                     };
