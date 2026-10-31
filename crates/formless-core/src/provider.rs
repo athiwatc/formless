@@ -3014,6 +3014,7 @@ mod tests {
     }
 
     async fn rejecting_provider(
+        _env: &crate::credential_env::EnvGuard,
         errors: Vec<&'static str>,
     ) -> (
         Provider,
@@ -3065,9 +3066,13 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_image_rejections_do_not_resend_an_unchanged_request() {
+        let env = crate::credential_env::EnvGuard::isolated();
         for image in [false, true] {
-            let (p, seen, server) =
-                rejecting_provider(vec!["unsupported image source: persistent-image-error"]).await;
+            let (p, seen, server) = rejecting_provider(
+                &env,
+                vec!["unsupported image source: persistent-image-error"],
+            )
+            .await;
             let content = if image {
                 json!([{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}])
             } else {
@@ -3096,17 +3101,21 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_kinds_apply_once_and_resend_cap_keeps_the_last_400() {
-        let (p, seen, server) = rejecting_provider(vec![
-            "stream_options unsupported",
-            "prompt_cache_key unsupported",
-            "Unrecognized request argument reasoning_effort",
-            "Invalid signature in thinking block",
-            "max_tokens must exceed thinking.budget_tokens",
-            "thinking unsupported",
-            "max_tokens: 10000 > 4096",
-            "cache_control unsupported",
-            "unsupported image: terminal-image-400",
-        ])
+        let env = crate::credential_env::EnvGuard::isolated();
+        let (p, seen, server) = rejecting_provider(
+            &env,
+            vec![
+                "stream_options unsupported",
+                "prompt_cache_key unsupported",
+                "Unrecognized request argument reasoning_effort",
+                "Invalid signature in thinking block",
+                "max_tokens must exceed thinking.budget_tokens",
+                "thinking unsupported",
+                "max_tokens: 10000 > 4096",
+                "cache_control unsupported",
+                "unsupported image: terminal-image-400",
+            ],
+        )
         .await;
         let mut body = json!({"model":"claude-x", "max_tokens":10000, "thinking":{"type":"enabled","budget_tokens":10000},
         "stream_options":{}, "prompt_cache_key":"x", "messages":[{"role":"user","content":[
@@ -3125,8 +3134,11 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), MAX_RESENDS + 1);
         server.abort();
 
-        let (p, seen, server) =
-            rejecting_provider(vec!["max_tokens: 10000 > 8192", "max_tokens: 8192 > 4096"]).await;
+        let (p, seen, server) = rejecting_provider(
+            &env,
+            vec!["max_tokens: 10000 > 8192", "max_tokens: 8192 > 4096"],
+        )
+        .await;
         let mut body = json!({"model":"claude-x", "max_tokens":10000,"messages":[]});
         let error = p
             .post_provider(&mut body, None, false)
