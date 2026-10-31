@@ -332,18 +332,27 @@ enum Cmd {
 enum AuthAction {
     /// Log in with the configured OAuth provider in a browser
     Login {
+        /// Provider name from [providers.NAME] (default: [provider])
+        #[arg(long)]
+        provider: Option<String>,
         /// Print the authorization URL without opening a browser
         #[arg(long)]
         no_browser: bool,
     },
     /// Show credential mode and stored-token status
     Status {
+        /// Provider name from [providers.NAME] (default: [provider])
+        #[arg(long)]
+        provider: Option<String>,
         /// One JSON object (never the token itself)
         #[arg(long)]
         json: bool,
     },
-    /// Delete stored OAuth tokens for this profile
-    Logout,
+    /// Revoke and delete the selected provider's stored OAuth tokens
+    Logout {
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 /// The pairing link as a terminal QR code, for a phone's camera; only on a
@@ -2163,20 +2172,45 @@ redirect_port = 8977\n\
 Register http://127.0.0.1:8977/callback as the redirect URI \
 (or use redirect_port = 0 only if the provider permits any loopback port).";
 
+/// Credential presence for every configured OAuth provider; diagnostics never
+/// redeem rotating refresh tokens or expose token values.
+fn oauth_provider_statuses(paths: &Paths, cfg: &Config) -> Vec<serde_json::Value> {
+    std::iter::once((formless_core::config::DEFAULT_PROVIDER, &cfg.provider))
+        .chain(cfg.providers.iter().filter(|(name, _)| name.as_str() != formless_core::config::DEFAULT_PROVIDER).map(|(n,p)| (n.as_str(),p)))
+        .filter(|(_, p)| p.oauth())
+        .map(|(name, p)| {
+            let status = formless_core::auth::auth_status(paths, p);
+            serde_json::json!({"name":name,"mode":status.mode,"credential_present":status.credential_present,
+                "expires_at":status.expires_at,"has_refresh_token":status.has_refresh_token,
+                "warning":status.warning,"login_command":formless_core::auth::login_command(name)})
+        }).collect()
+}
+
 fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
     let cfg = Config::load(&paths)?;
+    let selector = match &action {
+        AuthAction::Login { provider, .. }
+        | AuthAction::Status { provider, .. }
+        | AuthAction::Logout { provider } => provider.clone(),
+    };
+    let name = selector
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(formless_core::config::DEFAULT_PROVIDER);
+    let pcfg = cfg.provider_cfg(selector.as_deref())?;
+    let login = formless_core::auth::login_command(name);
     match action {
-        AuthAction::Login { no_browser } => {
-            if !cfg.provider.oauth() {
+        AuthAction::Login { no_browser, .. } => {
+            if !pcfg.oauth() {
                 return Err(anyhow::anyhow!(
                     "provider.auth.mode is {:?}, not \"oauth\".\n{OAUTH_CONFIG_EXAMPLE}",
-                    cfg.provider.auth.mode
+                    pcfg.auth.mode
                 ));
             }
-            if let Err(error) = formless_core::auth::validate_oauth_config(&cfg.provider) {
+            if let Err(error) = formless_core::auth::validate_oauth_config(&pcfg) {
                 return Err(error.context(OAUTH_CONFIG_EXAMPLE.to_string()));
             }
-            let tokens = formless_core::auth::login_with_callback(&paths, &cfg.provider, |url| {
+            let tokens = formless_core::auth::login_with_callback(&paths, &pcfg, |url| {
                 println!("Open this URL to authorize Formless:");
                 println!("{url}");
                 if no_browser {
@@ -2201,10 +2235,17 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
             }
             Ok(())
         }
-        AuthAction::Status { json } => {
-            let status = formless_core::auth::auth_status(&paths, &cfg.provider);
+        AuthAction::Status { json, .. } => {
+            let mut status = formless_core::auth::auth_status(&paths, &pcfg);
+            if !pcfg.oauth() && name != formless_core::config::DEFAULT_PROVIDER {
+                status.credential_present =
+                    formless_core::config::provider_key(&paths, name).is_some();
+            }
+            let providers = oauth_provider_statuses(&paths, &cfg);
             if json {
-                let source = if !cfg.provider.oauth() {
+                let source = if !pcfg.oauth() && name != formless_core::config::DEFAULT_PROVIDER {
+                    "named provider environment / keychain / 0600 file"
+                } else if !pcfg.oauth() {
                     formless_core::config::api_key_source(&paths).0
                 } else if std::env::var_os("FORMLESS_OAUTH_ACCESS_TOKEN").is_some() {
                     "env"
@@ -2214,17 +2255,39 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "provider": name,
                         "mode": status.mode,
                         "credential_present": status.credential_present,
                         "source": source,
                         "expires_at": status.expires_at,
                         "has_refresh_token": status.has_refresh_token,
                         "scope": status.scope,
+                        "warning": status.warning,
+                        "oauth_providers": providers,
                     }))?
                 );
                 return Ok(());
             }
+            println!("provider:       {name}");
             println!("mode:           {}", status.mode);
+            if let Some(warning) = &status.warning {
+                println!("WARNING: {warning}");
+            }
+            for p in &providers {
+                println!(
+                    "OAuth provider {}: {}{}",
+                    p["name"].as_str().unwrap_or_default(),
+                    if p["credential_present"] == true {
+                        "credential present"
+                    } else {
+                        "MISSING"
+                    },
+                    p["warning"]
+                        .as_str()
+                        .map(|w| format!("; {w}"))
+                        .unwrap_or_default()
+                );
+            }
             println!(
                 "credential:     {}",
                 if status.credential_present {
@@ -2233,7 +2296,7 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
                     "MISSING"
                 }
             );
-            if cfg.provider.oauth() {
+            if pcfg.oauth() {
                 println!(
                     "source:         {}",
                     if std::env::var_os("FORMLESS_OAUTH_ACCESS_TOKEN").is_some() {
@@ -2265,13 +2328,13 @@ fn auth_cmd(paths: Paths, action: AuthAction) -> Result<()> {
                     println!("scope:          {scope}");
                 }
                 if !status.credential_present {
-                    println!("Run `formless auth login` to sign in.");
+                    println!("Run `{login}` to sign in.");
                 }
             }
             Ok(())
         }
-        AuthAction::Logout => {
-            for line in formless_core::auth::logout_provider(&paths, &cfg.provider) {
+        AuthAction::Logout { .. } => {
+            for line in formless_core::auth::logout_provider(&paths, &pcfg) {
                 println!("{line}");
             }
             Ok(())
@@ -2568,6 +2631,7 @@ fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
             "auth_mode": auth.mode,
             "credential_present": auth.credential_present,
         },
+        "oauth_providers": oauth_provider_statuses(paths, &cfg),
         "relay": { "enabled": cfg.relay.enabled, "url": cfg.relay.url },
         "approvals": {
             // The running daemon's mode when there is one (#847).
@@ -2955,6 +3019,28 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
                     );
                 }
             }
+        }
+    }
+    for provider in oauth_provider_statuses(paths, &cfg) {
+        let name = provider["name"].as_str().unwrap_or_default();
+        say!(
+            "OAuth {name}: {}",
+            if provider["credential_present"] == true {
+                "credential present"
+            } else {
+                "MISSING"
+            }
+        );
+        if let Some(warning) = provider["warning"].as_str() {
+            say!("WARNING: {warning}");
+        }
+        if name != formless_core::config::DEFAULT_PROVIDER && provider["credential_present"] != true
+        {
+            problems.push(Problem {
+                what: format!("no OAuth credential for provider '{name}'"),
+                next: provider["login_command"].as_str().map(str::to_string),
+                fix: None,
+            });
         }
     }
     let auth_status = formless_core::auth::auth_status(&paths, &cfg.provider);
@@ -4223,15 +4309,13 @@ fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
     let name = provider.clone().unwrap_or_else(|| "default".into());
     let rt = tokio::runtime::Runtime::new()?;
     let listed = rt.block_on(async {
-        let p = match provider.as_deref() {
-            None => {
-                formless_core::provider::Provider::for_profile(pcfg.clone(), paths.clone()).await?
-            }
-            Some(n) => formless_core::provider::Provider::new(
-                pcfg.clone(),
-                formless_core::config::provider_key(&paths, n).unwrap_or_default(),
-            )?,
-        };
+        let p = formless_core::provider::Provider::for_named_profile_with(
+            pcfg.clone(),
+            paths.clone(),
+            formless_core::provider::http_client(&pcfg.proxy)?,
+            &name,
+        )
+        .await?;
         p.list_model_prices().await
     })?;
     if listed.is_empty() {
@@ -6493,7 +6577,79 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 }
 
 #[cfg(test)]
+#[path = "../../formless-core/tests/support/env.rs"]
+mod oauth_credential_env;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn auth_selectors_parse_for_every_action_and_resolve_named_config() {
+        use clap::Parser;
+        for verb in ["login", "logout", "status"] {
+            let parsed =
+                super::Cli::try_parse_from(["formless", "auth", verb, "--provider", "work"])
+                    .unwrap();
+            let Some(super::Cmd::Auth { action }) = parsed.cmd else {
+                panic!("wrong command")
+            };
+            let name = match action {
+                super::AuthAction::Login { provider, .. }
+                | super::AuthAction::Status { provider, .. }
+                | super::AuthAction::Logout { provider } => provider,
+            };
+            assert_eq!(name.as_deref(), Some("work"));
+        }
+        let mut cfg = super::Config::default();
+        cfg.providers.insert(
+            "work".into(),
+            formless_core::config::ProviderCfg {
+                model: "work-model".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.provider_cfg(Some("work")).unwrap().model, "work-model");
+        assert_eq!(cfg.provider_cfg(None).unwrap().model, cfg.provider.model);
+        assert!(cfg
+            .provider_cfg(Some("missing"))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown provider"));
+    }
+
+    #[test]
+    fn oauth_diagnostics_report_all_providers_without_tokens_or_migration() {
+        let _env = super::oauth_credential_env::EnvGuard::isolated();
+        let (_fixture, paths) = MaintenanceFixture::new();
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        let mut cfg = super::Config::default();
+        cfg.provider.auth.mode = "oauth".into();
+        cfg.provider.auth.token_url = "https://default.example/token".into();
+        cfg.provider.auth.client_id = "default-client".into();
+        let mut named = cfg.provider.clone();
+        named.auth.token_url = "https://work.example/token".into();
+        cfg.providers.insert("work".into(), named.clone());
+        let tokens = serde_json::json!({"access_token":"private-access","refresh_token":"private-refresh","token_type":"Bearer","token_url":named.auth.token_url});
+        formless_core::config::write_secret_file(
+            &formless_core::auth::oauth_tokens_file(&paths, &named.auth),
+            &tokens.to_string(),
+        )
+        .unwrap();
+        let statuses = super::oauth_provider_statuses(&paths, &cfg);
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0]["name"], "default");
+        assert_eq!(statuses[0]["credential_present"], false);
+        assert_eq!(statuses[1]["name"], "work");
+        assert_eq!(statuses[1]["credential_present"], true);
+        assert_eq!(
+            statuses[1]["login_command"],
+            "formless auth login --provider work"
+        );
+        let json = serde_json::to_string(&statuses).unwrap();
+        assert!(!json.contains("private-access"));
+        assert!(!json.contains("private-refresh"));
+        assert!(!paths.oauth_tokens_file().exists());
+    }
+
     struct MaintenanceFixture(std::path::PathBuf);
     impl MaintenanceFixture {
         fn new() -> (Self, super::Paths) {

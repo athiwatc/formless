@@ -517,8 +517,8 @@ fn tokens(access: &str, refresh: &str, expires_at: i64) -> OAuthTokens {
 async fn two_oauth_providers_keep_separate_tokens() {
     let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("two");
-    let a = oauth_cfg("http://a.example");
-    let b = oauth_cfg("http://b.example");
+    let a = oauth_cfg("https://a.example");
+    let b = oauth_cfg("https://b.example");
     save_oauth_tokens(
         &paths,
         &a.auth,
@@ -549,28 +549,24 @@ async fn two_oauth_providers_keep_separate_tokens() {
 }
 
 #[tokio::test]
-async fn legacy_tokens_move_to_the_default_provider_only() {
+async fn legacy_tokens_without_issuer_require_relogin() {
     let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("legacy");
     let mut cfg = formless_core::Config::default();
-    cfg.provider = oauth_cfg("http://default.example");
+    cfg.provider = oauth_cfg("https://default.example");
     cfg.save(&paths).unwrap();
-    let other = oauth_cfg("http://other.example");
+    let other = oauth_cfg("https://other.example");
     let legacy = serde_json::to_string(&tokens("old", "r", now_epoch() + 600)).unwrap();
     formless_core::config::write_secret_file(&paths.oauth_tokens_file(), &legacy).unwrap();
     // Another provider never picks up (or refreshes with) the default's tokens.
     assert!(load_oauth_tokens(&paths, &other.auth).is_none());
-    assert_eq!(
-        load_oauth_tokens(&paths, &cfg.provider.auth)
-            .unwrap()
-            .access_token,
-        "old"
-    );
+    assert!(load_oauth_tokens(&paths, &cfg.provider.auth).is_none());
+    assert!(auth_status(&paths, &cfg.provider).warning.is_some());
     assert!(
-        !paths.oauth_tokens_file().exists(),
-        "migrated out of the legacy file"
+        paths.oauth_tokens_file().exists(),
+        "unproven tokens are retained, never relabelled"
     );
-    assert!(formless_core::auth::oauth_tokens_file(&paths, &cfg.provider.auth).exists());
+    assert!(!formless_core::auth::oauth_tokens_file(&paths, &cfg.provider.auth).exists());
     delete_oauth_tokens(&paths, &cfg.provider.auth);
 }
 
@@ -614,7 +610,7 @@ async fn a_401_forces_one_refresh_and_resends() {
 fn newer_copy_wins_and_delete_reports_leftovers() {
     let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("dual");
-    let cfg = oauth_cfg("http://dual.example");
+    let cfg = oauth_cfg("https://dual.example");
     save_oauth_tokens(&paths, &cfg.auth, &tokens("first", "r1", now_epoch() + 600)).unwrap();
     save_oauth_tokens(
         &paths,
@@ -664,12 +660,12 @@ fn newer_copy_wins_and_delete_reports_leftovers() {
 fn logout_says_what_stays_in_force() {
     let _env = credential_env::EnvGuard::isolated();
     let paths = test_paths("logout");
-    let mut cfg = oauth_cfg("http://logout.example");
+    let mut cfg = oauth_cfg("https://logout.example");
     cfg.auth.mode = "api_key".into();
     let lines = formless_core::auth::logout_provider(&paths, &cfg).join("\n");
     assert!(lines.contains("no OAuth tokens"), "{lines}");
 
-    let cfg = oauth_cfg("http://logout.example");
+    let cfg = oauth_cfg("https://logout.example");
     save_oauth_tokens(&paths, &cfg.auth, &tokens("a", "r", now_epoch() + 600)).unwrap();
     let lines = formless_core::auth::logout_provider(&paths, &cfg).join("\n");
     assert!(lines.contains("no revocation endpoint"), "{lines}");

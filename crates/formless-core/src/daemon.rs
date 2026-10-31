@@ -916,17 +916,19 @@ impl Daemon {
             None => self.provider(cfg).await,
             Some(n) => {
                 let pcfg = cfg.provider_cfg(Some(n))?;
-                if pcfg.oauth() {
-                    return Err(anyhow!(
-                        "provider '{n}': OAuth is only supported for the default provider"
-                    ));
-                }
-                let key = crate::config::provider_key(&self.paths, n).unwrap_or_default();
-                Ok(Provider::with_key(pcfg, key, self.http.clone())
+                Ok(
+                    Provider::for_named_profile_with(
+                        pcfg,
+                        self.paths.clone(),
+                        self.http.clone(),
+                        n,
+                    )
+                    .await?
                     .with_name(n)
                     .with_usage_hook(self.usage_hook())
                     .with_request_hook(self.request_hook(cfg))
-                    .with_breaker_note_hook(self.provider_breaker_note_hook()))
+                    .with_breaker_note_hook(self.provider_breaker_note_hook()),
+                )
             }
         }
     }
@@ -2349,7 +2351,7 @@ impl Daemon {
                     "name": crate::config::DEFAULT_PROVIDER,
                     "base_url": cfg.provider.base_url,
                     "model": cfg.provider.model,
-                    "has_key": crate::config::load_api_key(&self.paths).is_some() || cfg.provider.oauth(),
+                    "has_key": crate::auth::has_provider_credential(&self.paths, &cfg.provider),
                 })];
                 for (name, p) in &cfg.providers {
                     providers.push(json!({
@@ -2357,7 +2359,7 @@ impl Daemon {
                         // Header values can be secrets: names only.
                         "header_names": p.extra_headers.keys().collect::<Vec<_>>(),
                         "query_params": p.query_params, "api_key_header": p.api_key_header,
-                        "has_key": crate::config::provider_key(&self.paths, name).is_some(),
+                        "has_key": if p.oauth() { crate::auth::has_provider_credential(&self.paths, p) } else { crate::config::provider_key(&self.paths, name).is_some() },
                     }));
                 }
                 Ok(json!({"providers": providers, "roles": cfg.roles}))

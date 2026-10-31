@@ -80,13 +80,34 @@ pub struct AuthStatus {
     pub expires_at: Option<i64>,
     pub has_refresh_token: bool,
     pub scope: Option<String>,
+    pub warning: Option<String>,
 }
 
 /// Which token set a provider's OAuth config owns: its token endpoint and
 /// client id, so two OAuth providers never share (or cross-refresh) tokens.
-fn token_slot(auth: &AuthCfg) -> String {
-    let digest = Sha256::digest(format!("{}\n{}", auth.token_url, auth.client_id));
+/// Stable issuer identity. Path case and query remain significant; endpoint
+/// spelling (including a trailing slash) does not create a new login.
+pub fn canonical_token_url(raw: &str) -> Result<String> {
+    validate_endpoint("token_url", raw)?;
+    let mut url = reqwest::Url::parse(raw.trim())?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("OAuth token_url must not contain userinfo or a fragment");
+    }
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(url.to_string())
+}
+
+fn raw_token_slot(endpoint: &str, client_id: &str) -> String {
+    let digest = Sha256::digest(format!("{endpoint}\n{client_id}"));
     digest[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn token_slot(auth: &AuthCfg) -> String {
+    raw_token_slot(
+        &canonical_token_url(&auth.token_url).unwrap_or_else(|_| auth.token_url.clone()),
+        auth.client_id.trim(),
+    )
 }
 
 /// The `0600` file holding the token set of the provider with `auth`.
@@ -108,7 +129,7 @@ fn legacy_keyring_user(paths: &Paths) -> String {
 /// Stored form: the token set plus the endpoint it was issued by.
 fn encode_tokens(auth: &AuthCfg, tokens: &OAuthTokens) -> Result<String> {
     let mut v = serde_json::to_value(tokens).context("encode OAuth tokens")?;
-    v["token_url"] = Value::String(auth.token_url.clone());
+    v["token_url"] = Value::String(canonical_token_url(&auth.token_url)?);
     Ok(v.to_string())
 }
 
@@ -184,15 +205,19 @@ impl DualStore {
         }
     }
 
-    /// The newer of the two copies.
-    fn load(&self) -> Option<String> {
+    /// The newer of the two copies, retaining its ordering for old-slot lookup.
+    fn load_versioned(&self) -> Option<(i128, String)> {
         let file = crate::config::read_secret_file(&self.file).and_then(|t| Self::unwrap(&t));
         let key = self.keyring_text().and_then(|t| Self::unwrap(&t));
         match (file, key) {
-            (Some(f), Some(k)) => Some(if k.0 > f.0 { k.1 } else { f.1 }),
-            (Some(one), None) | (None, Some(one)) => Some(one.1),
+            (Some(f), Some(k)) => Some(if k.0 > f.0 { k } else { f }),
+            (Some(one), None) | (None, Some(one)) => Some(one),
             (None, None) => None,
         }
+    }
+
+    fn load(&self) -> Option<String> {
+        self.load_versioned().map(|(_, value)| value)
     }
 
     /// Remove both copies; what could not be removed.
@@ -231,28 +256,137 @@ fn read_stored(file: &std::path::Path, user: &str) -> Option<(OAuthTokens, Optio
     decode_tokens(&store.load()?)
 }
 
-fn load_with_issuer(paths: &Paths, auth: &AuthCfg) -> Option<(OAuthTokens, Option<String>)> {
-    if let Some(found) = read_stored(
-        &oauth_tokens_file(paths, auth),
-        &oauth_keyring_user(paths, auth),
-    ) {
-        return Some(found);
+/// Compatibility lookup never assigns an issuer to an unlabelled token.
+/// Old file-backed slots can be discovered by their recorded endpoint and
+/// verified raw slot hash. Keyring-only old hashes cannot be enumerated.
+fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
+    let mut slots = std::collections::BTreeSet::from([
+        token_slot(auth),
+        raw_token_slot(&auth.token_url, &auth.client_id),
+    ]);
+    if let Ok(dir) = std::fs::read_dir(&paths.config_dir) {
+        for e in dir.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(slot) = name
+                .strip_prefix("oauth_tokens-")
+                .and_then(|s| s.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            if slot.len() != 12 || !slot.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let Some(text) = crate::config::read_secret_file(&e.path())
+                .and_then(|s| DualStore::unwrap(&s).map(|(_, v)| v))
+            else {
+                continue;
+            };
+            let Some((_, Some(issuer))) = decode_tokens(&text) else {
+                continue;
+            };
+            // The old slot proves the client id as well as the recorded issuer.
+            if slot == raw_token_slot(&issuer, &auth.client_id)
+                && canonical_token_url(&issuer).ok() == canonical_token_url(&auth.token_url).ok()
+                && canonical_token_url(&issuer).is_ok()
+            {
+                slots.insert(slot.to_string());
+            }
+        }
     }
-    // The old profile-wide set was always from `formless auth login`, i.e.
-    // the default provider: it moves into that provider's slot only.
-    let owner = crate::Config::load_file_only(paths).ok()?.provider.auth;
-    if token_slot(&owner) != token_slot(auth) {
-        return None;
-    }
-    let (tokens, _) = read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))?;
-    save_oauth_tokens(paths, auth, &tokens).ok()?;
-    delete_legacy_tokens(paths);
-    Some((tokens, Some(auth.token_url.clone())))
+    slots
+        .into_iter()
+        .map(|slot| DualStore {
+            file: paths.config_dir.join(format!("oauth_tokens-{slot}.json")),
+            user: format!("oauth-tokens-{}-{slot}", paths.profile),
+        })
+        .collect()
 }
 
-/// The token set of the provider with `auth`, if one is stored.
+fn issuer_matches(auth: &AuthCfg, issuer: Option<&str>) -> bool {
+    match (
+        canonical_token_url(&auth.token_url),
+        issuer.and_then(|i| canonical_token_url(i).ok()),
+    ) {
+        (Ok(expected), Some(actual)) => expected == actual,
+        _ => false,
+    }
+}
+
+fn load_with_issuer(paths: &Paths, auth: &AuthCfg) -> Option<(OAuthTokens, Option<String>)> {
+    // Prefer the current slot: a refreshed/rotated login supersedes old aliases.
+    if let Some(found) = token_store(paths, auth)
+        .load()
+        .and_then(|s| decode_tokens(&s))
+    {
+        return issuer_matches(auth, found.1.as_deref()).then_some(found);
+    }
+    let newest = compatible_token_stores(paths, auth)
+        .iter()
+        .filter_map(|store| store.load_versioned())
+        .filter_map(|(at, value)| {
+            let found = decode_tokens(&value)?;
+            issuer_matches(auth, found.1.as_deref()).then_some((at, found))
+        })
+        .max_by_key(|(at, _)| *at);
+    if let Some((_, found)) = newest {
+        return Some(found);
+    }
+    let found = read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))?;
+    issuer_matches(auth, found.1.as_deref()).then_some(found)
+}
+
+/// Unlabelled or mismatched legacy credentials are retained for explicit reset,
+/// never used or silently relabelled from today's default-provider settings.
+pub fn oauth_storage_warning(paths: &Paths, auth: &AuthCfg) -> Option<String> {
+    if load_with_issuer(paths, auth).is_some() {
+        return None;
+    }
+    let legacy = read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths)).is_some();
+    let invalid = compatible_token_stores(paths, auth)
+        .iter()
+        .any(|s| s.load().is_some());
+    (legacy || invalid).then(|| "Stored OAuth credentials have no proven matching issuer; sign in again. Older keyring-only logins with an unknown endpoint spelling cannot be discovered automatically.".into())
+}
+
+/// The token set of the provider with `auth`, only with proven issuer identity.
 pub fn load_oauth_tokens(paths: &Paths, auth: &AuthCfg) -> Option<OAuthTokens> {
     load_with_issuer(paths, auth).map(|(tokens, _)| tokens)
+}
+
+/// Login guidance includes the actual named provider (safe as a shell argument).
+pub fn login_command(name: &str) -> String {
+    let name = if name.is_empty() {
+        crate::config::DEFAULT_PROVIDER
+    } else {
+        name
+    };
+    let quoted = if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+    {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "'\"'\"'"))
+    };
+    format!("formless auth login --provider {quoted}")
+}
+
+pub fn provider_login_command(paths: &Paths, cfg: &ProviderCfg) -> String {
+    let name = crate::Config::load_file_only(paths)
+        .ok()
+        .and_then(|config| {
+            if token_slot(&config.provider.auth) == token_slot(&cfg.auth) {
+                Some(crate::config::DEFAULT_PROVIDER.to_string())
+            } else {
+                config
+                    .providers
+                    .iter()
+                    .find(|(_, p)| token_slot(&p.auth) == token_slot(&cfg.auth))
+                    .map(|(n, _)| n.clone())
+            }
+        })
+        .unwrap_or_else(|| crate::config::DEFAULT_PROVIDER.to_string());
+    login_command(&name)
 }
 
 /// A JSON credential stored like the provider tokens (keychain + `0600`
@@ -279,8 +413,22 @@ pub fn delete_named_secret(paths: &Paths, name: &str) -> Vec<String> {
 
 /// Delete a provider's stored tokens; what could not be removed (#868).
 pub fn delete_oauth_tokens(paths: &Paths, auth: &AuthCfg) -> Vec<String> {
-    let left = token_store(paths, auth).delete();
-    let _ = std::fs::remove_file(oauth_tokens_file(paths, auth).with_extension("json.tmp"));
+    let mut left = Vec::new();
+    for store in compatible_token_stores(paths, auth) {
+        left.extend(store.delete());
+        let _ = std::fs::remove_file(store.file.with_extension("json.tmp"));
+    }
+    if read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))
+        .is_some_and(|(_, issuer)| issuer_matches(auth, issuer.as_deref()))
+    {
+        left.extend(
+            DualStore {
+                file: paths.oauth_tokens_file(),
+                user: legacy_keyring_user(paths),
+            }
+            .delete(),
+        );
+    }
     left
 }
 
@@ -350,6 +498,7 @@ pub fn auth_status(paths: &Paths, cfg: &ProviderCfg) -> AuthStatus {
                 expires_at: None,
                 has_refresh_token: false,
                 scope: None,
+                warning: None,
             };
         }
         match load_oauth_tokens(paths, &cfg.auth) {
@@ -359,6 +508,7 @@ pub fn auth_status(paths: &Paths, cfg: &ProviderCfg) -> AuthStatus {
                 expires_at: tokens.expires_at,
                 has_refresh_token: tokens.has_refresh_token(),
                 scope: tokens.scope.clone(),
+                warning: None,
             },
             None => AuthStatus {
                 mode: cfg.auth.mode.clone(),
@@ -366,6 +516,7 @@ pub fn auth_status(paths: &Paths, cfg: &ProviderCfg) -> AuthStatus {
                 expires_at: None,
                 has_refresh_token: false,
                 scope: None,
+                warning: oauth_storage_warning(paths, &cfg.auth),
             },
         }
     } else {
@@ -376,6 +527,7 @@ pub fn auth_status(paths: &Paths, cfg: &ProviderCfg) -> AuthStatus {
             expires_at: None,
             has_refresh_token: false,
             scope: None,
+            warning: None,
         }
     }
 }
@@ -488,7 +640,7 @@ fn validate_endpoint(name: &str, raw: &str) -> Result<()> {
 }
 
 fn validate_token_config(cfg: &AuthCfg) -> Result<()> {
-    validate_endpoint("token_url", &cfg.token_url)?;
+    canonical_token_url(&cfg.token_url)?;
     if cfg.client_id.trim().is_empty() {
         bail!("provider.auth.client_id is required for OAuth mode");
     }
@@ -861,12 +1013,14 @@ pub fn peek_provider_token(paths: &Paths, cfg: &ProviderCfg) -> Result<String> {
     let (tokens, _) = stored_tokens(paths, cfg)?;
     if tokens.is_expired(now_epoch()) {
         bail!(
-            "the stored access token has expired{}",
+            "the stored access token has expired{}; login: `{}`",
             if tokens.has_refresh_token() {
                 "; the daemon refreshes it on the next request"
             } else {
-                " and no refresh token is stored: run `formless auth login`"
-            }
+                // Caller gets provider-specific guidance below.
+                " and no refresh token is stored"
+            },
+            provider_login_command(paths, cfg)
         );
     }
     Ok(tokens.access_token)
@@ -893,8 +1047,15 @@ pub async fn force_refresh_provider_token(
 }
 
 fn stored_tokens(paths: &Paths, cfg: &ProviderCfg) -> Result<(OAuthTokens, Option<String>)> {
-    load_with_issuer(paths, &cfg.auth)
-        .ok_or_else(|| anyhow!("OAuth login required: run `formless auth login` for this profile"))
+    load_with_issuer(paths, &cfg.auth).ok_or_else(|| {
+        anyhow!(
+            "OAuth login required for provider: run `{}`{}",
+            provider_login_command(paths, cfg),
+            oauth_storage_warning(paths, &cfg.auth)
+                .map(|w| format!("; {w}"))
+                .unwrap_or_default()
+        )
+    })
 }
 
 async fn refresh_stored(
@@ -905,19 +1066,23 @@ async fn refresh_stored(
 ) -> Result<String> {
     if !tokens.has_refresh_token() {
         bail!(
-            "OAuth access token expired and no refresh_token is stored: run `formless auth login`"
+            "OAuth access token expired and no refresh_token is stored: run `{}`",
+            provider_login_command(paths, cfg)
         );
     }
     // A refresh token only ever goes back to the endpoint that issued it.
-    if let Some(issuer) = issuer.filter(|i| *i != cfg.auth.token_url) {
+    if !issuer_matches(&cfg.auth, issuer) {
         bail!(
-            "stored OAuth tokens were issued by {issuer}, not {}; run `formless auth login`",
-            cfg.auth.token_url
+            "stored OAuth token issuer is unproven or different; run `{}`",
+            provider_login_command(paths, cfg)
         );
     }
-    let refreshed = refresh_tokens(&cfg.auth, tokens)
-        .await
-        .context("OAuth token refresh failed; run `formless auth login` if this persists")?;
+    let refreshed = refresh_tokens(&cfg.auth, tokens).await.with_context(|| {
+        format!(
+            "OAuth token refresh failed; run `{}` if this persists",
+            provider_login_command(paths, cfg)
+        )
+    })?;
     // Persist before use so a rotated refresh token cannot be lost after the
     // provider has already invalidated its predecessor.
     save_oauth_tokens(paths, &cfg.auth, &refreshed).context("persist refreshed OAuth tokens")?;
