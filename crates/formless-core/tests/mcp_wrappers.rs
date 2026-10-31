@@ -185,3 +185,158 @@ async fn repeated_raw_mcp_chains_are_suggested_until_a_tool_wraps_them() {
     );
     let _ = std::fs::remove_dir_all(base);
 }
+
+/// Wrappers brought into find_tools take places within the limit, and
+/// only what is returned is loaded into the Session (#771).
+#[tokio::test(flavor = "multi_thread")]
+async fn injected_wrappers_stay_within_the_limit() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-wrapcap-{short}"));
+    let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let caps = Capabilities::parse(&["mcp:issues".to_string()]).unwrap();
+    let tool = |name: &str, desc: &str| {
+        store
+            .create_tool_version(
+                name,
+                desc,
+                r#"{"type":"object"}"#,
+                "{}",
+                "// x",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+    };
+    let raw = tool(
+        "mcp__issues__list_issues",
+        "List issues in a tracker project",
+    );
+    // Five wrappers whose descriptions don't match the query.
+    for i in 0..5 {
+        let w = tool(&format!("wrapper_{i}"), "something else entirely");
+        let parent = store
+            .record_invocation(
+                &w.id,
+                1,
+                Some(&sid),
+                None,
+                None,
+                "success",
+                "",
+                "{}",
+                "[]",
+                "",
+                1,
+                100,
+            )
+            .unwrap();
+        store
+            .record_invocation(
+                &raw.id,
+                1,
+                Some(&sid),
+                None,
+                Some(&parent),
+                "success",
+                "",
+                "{}",
+                "[]",
+                "",
+                1,
+                100,
+            )
+            .unwrap();
+    }
+    let before = store.session_tool_ids(&sid).unwrap().len();
+    drop(store);
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let out = daemon
+        .call_tool_direct(
+            &sid,
+            "find_tools",
+            serde_json::json!({"query": "list issues tracker", "limit": 2}),
+        )
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["tools"].as_array().unwrap().len() <= 2, "{v}");
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert!(store.session_tool_ids(&sid).unwrap().len() <= before + 2);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// Failed calls make no chain, and a dismissed chain stays gone, across a
+/// daemon restart too (#771).
+#[tokio::test(flavor = "multi_thread")]
+async fn chains_count_successes_and_can_be_dismissed() {
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::path::PathBuf::from(format!("/tmp/fl-chaind-{short}"));
+    let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+    formless_core::Config::default().save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let caps = Capabilities::parse(&["mcp:a".to_string()]).unwrap();
+    let tool = |name: &str| {
+        store
+            .create_tool_version(
+                name,
+                "d",
+                r#"{"type":"object"}"#,
+                "{}",
+                "// x",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+    };
+    let (x, y, z) = (tool("mcp__a__x"), tool("mcp__a__y"), tool("mcp__a__z"));
+    let call = |id: &str, run: &str, status: &str| {
+        store
+            .record_invocation(
+                id,
+                1,
+                None,
+                Some(run),
+                None,
+                status,
+                "",
+                "{}",
+                "{}",
+                "",
+                1,
+                100,
+            )
+            .unwrap()
+    };
+    for run in ["r1", "r2", "r3"] {
+        call(&x.id, run, "success");
+        call(&y.id, run, "success");
+        call(&z.id, run, "failure");
+    }
+    drop(store);
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let found = daemon.mcp_chain_suggestions().unwrap();
+    assert_eq!(found.len(), 1, "failed calls make no chain: {found:?}");
+    let out = daemon
+        .call_tool_direct(
+            &sid,
+            "read_metrics",
+            serde_json::json!({"kind": "mcp_chains", "dismiss": ["mcp__a__x", "mcp__a__y"]}),
+        )
+        .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["mcp_chains"], serde_json::json!([]), "{out}");
+    drop(daemon);
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    assert!(
+        daemon.mcp_chain_suggestions().unwrap().is_empty(),
+        "still dismissed"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}

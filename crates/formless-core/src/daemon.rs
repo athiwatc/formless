@@ -495,7 +495,9 @@ pub struct Daemon {
     /// Context windows the endpoints' `/models` listings report, per base
     /// URL then model id; a base URL is listed once per daemon (or again
     /// when the model picker lists it).
-    model_windows: StdMutex<HashMap<String, HashMap<String, u32>>>,
+    /// Context windows per endpoint (`windows_key`), or when a failed
+    /// listing may be tried again (#770).
+    model_windows: StdMutex<HashMap<String, Result<HashMap<String, u32>, std::time::Instant>>>,
     pub(crate) shutdown: CancellationToken,
     /// Identity of the binary this daemon was started from (mtime, size,
     /// inode), captured once at start-up. A rebuild keeps `version`
@@ -1969,7 +1971,7 @@ impl Daemon {
                     self.model_windows
                         .lock()
                         .unwrap()
-                        .insert(provider.settings().base_url.clone(), windows);
+                        .insert(windows_key(&provider), Ok(windows));
                     Ok::<_, anyhow::Error>((models, meta))
                 };
                 let ((models, mut meta), error) = match listed.await {
@@ -4163,11 +4165,18 @@ impl Daemon {
             });
         }
         let effort = target.effort.clone();
-        let (context_tokens, _) = self.context_window(&provider, &model).await;
+        let (context_tokens, window_source) = self.context_window(&provider, &model).await;
         self.record_run_memories(session_id, run_id);
 
-        self.maybe_compact(&provider, &cfg, session_id, &model, context_tokens)
-            .await?;
+        self.maybe_compact(
+            &provider,
+            &cfg,
+            session_id,
+            &model,
+            context_tokens,
+            window_source,
+        )
+        .await?;
 
         // Agent loop: provider turn -> tool calls -> tool results -> repeat
         // until a final text answer (SPEC §5.2). Context is rebuilt from the
@@ -7243,6 +7252,10 @@ impl Daemon {
                 i += 1;
             }
         }
+        // Wrappers brought in above take places, they don't add them: the
+        // result, and what is loaded into the Session, stays within the
+        // limit (#771).
+        hits.truncate(limit);
         let ids: Vec<String> = hits.iter().map(|t| t.id.clone()).collect();
         self.with_store(|st| st.load_session_tools(session_id, &ids, "found"))?;
         let upgraded = self.refresh_pins(session_id, &ids)?;
@@ -7916,6 +7929,14 @@ impl Daemon {
         let filter = args["filter"].as_str().filter(|f| !f.trim().is_empty());
         let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
         if kind == "mcp_chains" {
+            // `dismiss: [first, second]` stops suggesting that pair (#771).
+            if let Some(pair) = args["dismiss"].as_array() {
+                let names: Vec<&str> = pair.iter().filter_map(Value::as_str).collect();
+                let [first, second] = names[..] else {
+                    bail!("dismiss takes the two call names of a chain, as listed in its `calls`");
+                };
+                self.with_store(|st| st.dismiss_mcp_chain(first, second))?;
+            }
             return Ok(json!({"mcp_chains": self.mcp_chain_suggestions()?}));
         }
         self.with_reader(|st| match kind {
@@ -9945,31 +9966,54 @@ impl Daemon {
         if let Some(n) = cfg.model_context_tokens.get(model) {
             return (*n, "configured");
         }
-        let listed = self
-            .model_windows
-            .lock()
-            .unwrap()
-            .contains_key(&cfg.base_url);
-        if !listed {
-            let windows = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+        let key = windows_key(provider);
+        // Fetch when never listed, or when a failed listing's back-off is
+        // over; a failure is not taken as "no windows" for good (#770).
+        let due = match self.model_windows.lock().unwrap().get(&key) {
+            None => true,
+            Some(Ok(_)) => false,
+            Some(Err(retry_at)) => std::time::Instant::now() >= *retry_at,
+        };
+        if due {
+            // A short cap: a slow endpoint costs a Run at most this, and
+            // the default size is used until a listing lands.
+            let listed = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
                 provider.list_models_with_windows(),
             )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .map(|(_, w)| w)
-            .unwrap_or_default();
+            .await;
+            let entry = match listed {
+                Ok(Ok((_, windows))) => Ok(windows),
+                failed => {
+                    // An error is tried again next time; an endpoint that
+                    // hangs is left alone for a minute, so Runs don't each
+                    // wait for it.
+                    let (why, back_off) = match failed {
+                        Ok(Err(e)) => (format!("{e:#}"), 0),
+                        _ => ("timed out after 3s".to_string(), 60),
+                    };
+                    let first =
+                        !matches!(self.model_windows.lock().unwrap().get(&key), Some(Err(_)));
+                    if first {
+                        tracing::warn!(
+                            "context windows from {}/models unavailable ({why}); using provider.context_tokens until it answers",
+                            cfg.base_url
+                        );
+                    }
+                    Err(std::time::Instant::now() + std::time::Duration::from_secs(back_off))
+                }
+            };
             self.model_windows
                 .lock()
                 .unwrap()
-                .insert(cfg.base_url.clone(), windows);
+                .insert(key.clone(), entry);
         }
         match self
             .model_windows
             .lock()
             .unwrap()
-            .get(&cfg.base_url)
+            .get(&key)
+            .and_then(|w| w.as_ref().ok())
             .and_then(|w| w.get(model))
         {
             Some(n) => (*n, "endpoint"),
@@ -9987,11 +10031,17 @@ impl Daemon {
         }
         let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(opt.mcp_chain_days)))
             .to_rfc3339();
-        let (pairs, wrappers) =
-            self.with_reader(|st| Ok((st.mcp_call_pairs(&since)?, st.mcp_wrappers()?)))?;
+        let (pairs, wrappers, dismissed) = self.with_reader(|st| {
+            Ok((
+                st.mcp_call_pairs(&since)?,
+                st.mcp_wrappers()?,
+                st.dismissed_mcp_chains()?,
+            ))
+        })?;
         Ok(pairs
             .into_iter()
             .filter(|(_, runs)| *runs >= opt.mcp_chain_min_runs as i64)
+            .filter(|(pair, _)| !dismissed.contains(pair))
             .filter(|((a, b), _)| {
                 let (wa, wb) = (wrappers.get(a), wrappers.get(b));
                 !wa.zip(wb).is_some_and(|(wa, wb)| wa.iter().any(|w| wb.contains(w)))
@@ -10006,7 +10056,7 @@ impl Daemon {
                     "calls": [a, b],
                     "runs": runs,
                     "suggestion": format!(
-                        "these MCP calls were made back to back in {runs} Runs: create a Tool that makes them together with tools.call and declares {}",
+                        "these MCP calls succeeded back to back in {runs} Runs: create a Tool that makes them together with tools.call and declares {}, or read_metrics {{kind: \"mcp_chains\", dismiss: [the two calls]}} to stop this suggestion",
                         caps.join(", ")
                     ),
                 })
@@ -10086,9 +10136,26 @@ impl Daemon {
             .map(|p| if p.is_empty() { "(input)" } else { p.as_str() })
             .collect::<Vec<_>>()
             .join(", ");
-        tracing::info!("{tool}: parsed JSON-string arguments at {at}");
-        let _ =
-            self.with_store(|st| st.audit("model", "tool.input_coerced", &format!("{tool}: {at}")));
+        // The first coercion per Tool is audited; later ones only logged,
+        // so a model that always does this doesn't fill the log (#773).
+        static AUDITED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let first = AUDITED
+            .get_or_init(Default::default)
+            .locked()
+            .insert(tool.to_string());
+        if first {
+            tracing::info!("{tool}: parsed JSON-string arguments at {at}");
+            let _ = self.with_store(|st| {
+                st.audit(
+                    "model",
+                    "tool.input_coerced",
+                    &format!("{tool}: {at} (later ones for this Tool are not audited)"),
+                )
+            });
+        } else {
+            tracing::debug!("{tool}: parsed JSON-string arguments at {at}");
+        }
     }
 
     fn record_inv(
@@ -10554,12 +10621,21 @@ impl Daemon {
         session_id: &str,
         model: &str,
         context_tokens: u32,
+        window_source: &str,
     ) -> Result<()> {
         let (_ctx, needs, compact_up_to) =
             self.session_context(session_id, context_tokens, cfg.compaction.fraction())?;
         if !needs {
             return Ok(());
         }
+        // Which window the budget was measured against (#770).
+        let _ = self.with_store(|st| {
+            st.audit(
+                "daemon",
+                "compaction.window",
+                &format!("{session_id}: {model} {context_tokens} tokens ({window_source})"),
+            )
+        });
         self.compact(
             provider,
             cfg,
@@ -13390,4 +13466,10 @@ mod run_start_tests {
         assert!(daemon.runs.locked().get(&sid).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Context windows are cached per provider and endpoint: two providers on
+/// one URL with different credentials may see different models (#770).
+fn windows_key(provider: &Provider) -> String {
+    format!("{}\n{}", provider.name(), provider.settings().base_url)
 }

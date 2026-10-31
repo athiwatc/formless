@@ -496,7 +496,8 @@ fn read_metrics_definition() -> Value {
                 "properties": {
                     "kind": {"type": "string", "enum": ["tools", "audit", "models", "runs", "builtins", "duplicates", "mcp_chains"]},
                     "filter": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Default 50, max 200"}
+                    "limit": {"type": "integer", "description": "Default 50, max 200"},
+                    "dismiss": {"type": "array", "items": {"type": "string"}, "description": "With kind mcp_chains: a chain's two `calls`, to stop suggesting it"}
                 },
                 "required": ["kind"]
             }
@@ -959,28 +960,118 @@ pub fn builtin_definitions() -> Vec<Value> {
 
 /// A built-in tool's input schema (its `parameters`).
 pub fn builtin_schema(name: &str) -> Option<Value> {
-    builtin_definitions()
-        .into_iter()
-        .find(|d| d["function"]["name"] == name)
-        .map(|d| d["function"]["parameters"].clone())
+    // Built once: the definitions don't change while the process runs (#773).
+    static SCHEMAS: std::sync::OnceLock<std::collections::HashMap<String, Value>> =
+        std::sync::OnceLock::new();
+    SCHEMAS
+        .get_or_init(|| {
+            builtin_definitions()
+                .into_iter()
+                .filter_map(|d| {
+                    let name = d["function"]["name"].as_str()?.to_string();
+                    Some((name, d["function"]["parameters"].clone()))
+                })
+                .collect()
+        })
+        .get(name)
+        .cloned()
 }
 
 /// Lenient input (some models, e.g. Qwen, send nested objects as JSON
 /// strings): where `schema` expects an object or array and `value` holds a
-/// string that parses as one, use the parsed value. Returns the paths it
-/// changed (`""` is the whole input).
+/// string that parses as one, use the parsed value. Follows local `$ref`s,
+/// `allOf`/`anyOf`/`oneOf` and `additionalProperties`, the shapes MCP
+/// servers' schemas use (#773). Returns the paths it changed (`""` is the
+/// whole input).
 pub fn coerce_json_strings(schema: &Value, value: &mut Value) -> Vec<String> {
     let mut changed = Vec::new();
-    coerce_at(schema, value, String::new(), &mut changed);
+    coerce_at(schema, schema, value, String::new(), &mut changed, 0);
     changed
 }
 
-fn coerce_at(schema: &Value, value: &mut Value, path: String, changed: &mut Vec<String>) {
-    let types: Vec<&str> = match &schema["type"] {
+/// `schema` with a local `$ref` (`#/$defs/X`, `#/definitions/X`) followed.
+fn resolve<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
+    let mut s = schema;
+    for _ in 0..8 {
+        match s["$ref"].as_str().and_then(|r| r.strip_prefix('#')) {
+            Some(pointer) => match root.pointer(pointer) {
+                Some(target) => s = target,
+                None => break,
+            },
+            None => break,
+        }
+    }
+    s
+}
+
+fn types_of(schema: &Value) -> Vec<&str> {
+    match &schema["type"] {
         Value::String(t) => vec![t.as_str()],
         Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
-    };
+    }
+}
+
+/// Whether `value`'s JSON type is one `schema` names (no type: any).
+fn type_fits(schema: &Value, value: &Value) -> bool {
+    let types = types_of(schema);
+    types.is_empty()
+        || types.iter().any(|t| match *t {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => false,
+        })
+}
+
+fn coerce_at(
+    root: &Value,
+    schema: &Value,
+    value: &mut Value,
+    path: String,
+    changed: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 32 {
+        return;
+    }
+    let schema = resolve(root, schema);
+    // allOf: every branch applies.
+    if let Some(all) = schema["allOf"].as_array() {
+        for branch in all {
+            coerce_at(root, branch, value, path.clone(), changed, depth + 1);
+        }
+    }
+    // anyOf / oneOf: the first branch the coerced value fits.
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema[key].as_array() {
+            for branch in branches {
+                let branch = resolve(root, branch);
+                let mut trial = value.clone();
+                let mut trial_changed = Vec::new();
+                coerce_at(
+                    root,
+                    branch,
+                    &mut trial,
+                    path.clone(),
+                    &mut trial_changed,
+                    depth + 1,
+                );
+                if type_fits(branch, &trial) && !types_of(branch).is_empty() {
+                    if !trial_changed.is_empty() {
+                        *value = trial;
+                        changed.extend(trial_changed);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let types = types_of(schema);
     let wants = |t: &str| types.contains(&t) && !types.contains(&"string");
     if let Value::String(s) = value {
         if wants("object") || wants("array") {
@@ -993,24 +1084,38 @@ fn coerce_at(schema: &Value, value: &mut Value, path: String, changed: &mut Vec<
             }
         }
     }
+    let join = |k: &str| {
+        if path.is_empty() {
+            k.to_string()
+        } else {
+            format!("{path}.{k}")
+        }
+    };
     match value {
         Value::Object(map) => {
-            if let Some(props) = schema["properties"].as_object() {
-                for (k, sub) in props {
-                    if let Some(v) = map.get_mut(k) {
-                        let p = if path.is_empty() {
-                            k.clone()
-                        } else {
-                            format!("{path}.{k}")
-                        };
-                        coerce_at(sub, v, p, changed);
+            let props = schema["properties"].as_object();
+            for (k, v) in map.iter_mut() {
+                let sub = match props.and_then(|p| p.get(k)) {
+                    Some(sub) => sub,
+                    // Map-like objects: every other key's value schema.
+                    None if schema["additionalProperties"].is_object() => {
+                        &schema["additionalProperties"]
                     }
-                }
+                    None => continue,
+                };
+                coerce_at(root, sub, v, join(k), changed, depth + 1);
             }
         }
         Value::Array(items) if schema["items"].is_object() => {
             for (i, v) in items.iter_mut().enumerate() {
-                coerce_at(&schema["items"], v, format!("{path}[{i}]"), changed);
+                coerce_at(
+                    root,
+                    &schema["items"],
+                    v,
+                    format!("{path}[{i}]"),
+                    changed,
+                    depth + 1,
+                );
             }
         }
         _ => {}
@@ -1229,5 +1334,40 @@ mod tests {
         assert!(!e.contains("string containing JSON"), "{e}");
         let e = validate_against(&v, &json!({"input": "{\"a\": 1}"})).unwrap_err();
         assert!(e.contains("pass the object or array itself"), "{e}");
+    }
+
+    /// MCP-shaped schemas: `$ref`, `anyOf` and map values are followed
+    /// (#773).
+    #[test]
+    fn coercion_follows_refs_branches_and_maps() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "$defs": {"Filter": {"type": "object", "properties": {"tags": {"type": "array"}}}},
+            "properties": {
+                "filter": {"$ref": "#/$defs/Filter"},
+                "target": {"anyOf": [{"type": "null"}, {"type": "object", "properties": {"id": {"type": "string"}}}]},
+                "labels": {"type": "object", "additionalProperties": {"type": "array"}},
+                "both": {"allOf": [{"type": "object"}]}
+            }
+        });
+        let mut v = serde_json::json!({
+            "filter": "{\"tags\": \"[1, 2]\"}",
+            "target": "{\"id\": \"x\"}",
+            "labels": {"a": "[\"p\"]"},
+            "both": "{\"k\": 1}"
+        });
+        let changed = coerce_json_strings(&schema, &mut v);
+        assert_eq!(v["filter"]["tags"], serde_json::json!([1, 2]));
+        assert_eq!(v["target"]["id"], "x");
+        assert_eq!(v["labels"]["a"], serde_json::json!(["p"]));
+        assert_eq!(v["both"]["k"], 1);
+        assert!(changed.contains(&"filter.tags".to_string()), "{changed:?}");
+        // A string that isn't JSON stays as it is, for validation to report.
+        let mut bad = serde_json::json!({"filter": "not json"});
+        assert!(coerce_json_strings(&schema, &mut bad).is_empty());
+        assert_eq!(bad["filter"], "not json");
+        // Built-in schemas come from the cache.
+        assert!(builtin_schema("find_tools").is_some());
+        assert!(builtin_schema("nope").is_none());
     }
 }
