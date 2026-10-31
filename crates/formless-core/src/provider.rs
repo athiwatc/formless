@@ -210,63 +210,174 @@ pub struct Provider {
 pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
 pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) + Send + Sync>;
 
-/// Per-model circuit breakers (#621), shared by every Session in the
-/// daemon: after `BREAKER_TRIP` consecutive retryable failures a model is
-/// skipped for a cooldown (doubling, with jitter, up to 10 minutes), then
-/// tried by one request (half-open).
-#[derive(Default)]
+/// Shared, bounded per-provider/model circuit breakers. An acquired permit
+/// remains live through body parsing, so one half-open probe includes streaming.
 struct Breaker {
     fails: u32,
     open_until: Option<std::time::Instant>,
     cooldown: Duration,
+    probing: bool,
+    generation: u64,
+    active: usize,
+    touched: std::time::Instant,
 }
-
+impl Default for Breaker {
+    fn default() -> Self {
+        Self {
+            fails: 0,
+            open_until: None,
+            cooldown: Duration::ZERO,
+            probing: false,
+            generation: 0,
+            active: 0,
+            touched: std::time::Instant::now(),
+        }
+    }
+}
 const BREAKER_TRIP: u32 = 3;
-
+const MAX_BREAKERS: usize = 1024;
 static BREAKERS: std::sync::Mutex<Option<HashMap<String, Breaker>>> = std::sync::Mutex::new(None);
 
-fn with_breaker<T>(key: &str, f: impl FnOnce(&mut Breaker) -> T) -> T {
-    let mut all = BREAKERS.lock().unwrap_or_else(|e| e.into_inner());
-    f(all
-        .get_or_insert_with(HashMap::new)
-        .entry(key.to_string())
-        .or_default())
+struct BreakerPermit {
+    key: String,
+    generation: u64,
+    probe: bool,
+    label: String,
+    note: Option<NoteHook>,
 }
-
-/// Skipped for now: open and still cooling down.
-fn breaker_open(key: &str) -> bool {
-    with_breaker(key, |b| {
-        b.open_until.is_some_and(|t| std::time::Instant::now() < t)
-    })
-}
-
-/// A success closes it; true when it had been open (worth saying).
-fn breaker_success(key: &str) -> bool {
-    with_breaker(key, |b| {
-        let was = b.open_until.is_some();
-        *b = Breaker::default();
-        was
-    })
-}
-
-/// A retryable failure; Some(cooldown) when this one opened the breaker.
-fn breaker_failure(key: &str) -> Option<Duration> {
-    with_breaker(key, |b| {
-        b.fails += 1;
-        if b.fails < BREAKER_TRIP {
+impl BreakerPermit {
+    fn acquire(key: String, label: String, note: Option<NoteHook>) -> Option<Self> {
+        let now = std::time::Instant::now();
+        let mut map = BREAKERS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if !map.contains_key(&key) && map.len() >= MAX_BREAKERS {
+            let oldest = map
+                .iter()
+                .filter(|(_, b)| b.active == 0)
+                .min_by_key(|(_, b)| b.touched)
+                .map(|(key, _)| key.clone())?;
+            map.remove(&oldest);
+        }
+        let breaker = map.entry(key.clone()).or_default();
+        breaker.touched = now;
+        if breaker.probing || breaker.open_until.is_some_and(|until| now < until) {
             return None;
         }
-        let base = if b.cooldown.is_zero() {
-            Duration::from_secs(60)
-        } else {
-            (b.cooldown * 2).min(Duration::from_secs(600))
+        let probe = breaker.open_until.is_some();
+        if probe {
+            breaker.probing = true;
+            breaker.generation += 1;
+        }
+        breaker.active += 1;
+        Some(Self {
+            key,
+            generation: breaker.generation,
+            probe,
+            label,
+            note,
+        })
+    }
+    fn say(&self, text: String) {
+        tracing::info!("{text}");
+        if let Some(note) = &self.note {
+            note(text);
+        }
+    }
+    fn success(&self) {
+        let changed = {
+            let mut map = BREAKERS.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(b) = map.as_mut().and_then(|m| m.get_mut(&self.key)) else {
+                return;
+            };
+            if b.generation != self.generation {
+                return;
+            }
+            let changed = b.open_until.is_some();
+            b.fails = 0;
+            b.open_until = None;
+            b.cooldown = Duration::ZERO;
+            b.probing = false;
+            b.touched = std::time::Instant::now();
+            if changed {
+                b.generation += 1;
+            }
+            changed
         };
-        b.cooldown = base;
-        b.fails = 0;
-        b.open_until =
-            Some(std::time::Instant::now() + base.mul_f64(1.0 + rand::random::<f64>() * 0.25));
-        Some(base)
-    })
+        if changed {
+            self.say(format!("{} is answering again.", self.label));
+        }
+    }
+    /// True means stop retrying this model, including stale in-flight failures.
+    fn failure(&self, reason: &str, missing_model: bool) -> bool {
+        let cooldown = {
+            let mut map = BREAKERS.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(b) = map.as_mut().and_then(|m| m.get_mut(&self.key)) else {
+                return true;
+            };
+            if b.generation != self.generation {
+                return true;
+            }
+            b.fails = b.fails.saturating_add(1);
+            b.touched = std::time::Instant::now();
+            if !self.probe && !missing_model && b.fails < BREAKER_TRIP {
+                return false;
+            }
+            let base = if b.cooldown.is_zero() {
+                Duration::from_secs(60)
+            } else {
+                (b.cooldown * 2).min(Duration::from_secs(600))
+            };
+            b.cooldown = base;
+            b.fails = 0;
+            b.probing = false;
+            b.generation += 1;
+            b.open_until =
+                Some(std::time::Instant::now() + base.mul_f64(1.0 + rand::random::<f64>() * 0.25));
+            base
+        };
+        let cause = if missing_model {
+            "model is unavailable".to_string()
+        } else if self.probe {
+            "probe failed".to_string()
+        } else {
+            format!("failed {BREAKER_TRIP} times in a row")
+        };
+        self.say(format!(
+            "{} {cause} ({reason}); skipping it for about {}s.",
+            self.label,
+            cooldown.as_secs()
+        ));
+        true
+    }
+}
+impl Drop for BreakerPermit {
+    fn drop(&mut self) {
+        let mut map = BREAKERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = map.as_mut().and_then(|m| m.get_mut(&self.key)) {
+            b.active = b.active.saturating_sub(1);
+            // Cancellation abandons a probe without recording a user failure.
+            if self.probe && b.generation == self.generation {
+                b.probing = false;
+            }
+        }
+    }
+}
+
+async fn completed_json(
+    resp: reqwest::Response,
+    permit: BreakerPermit,
+    context: &'static str,
+) -> Result<Value> {
+    match resp.json().await {
+        Ok(value) => {
+            permit.success();
+            Ok(value)
+        }
+        Err(error) => {
+            permit.failure("response body failed", false);
+            Err(error).context(context)
+        }
+    }
 }
 
 /// A provider request is about to be retried after `wait`.
@@ -395,6 +506,23 @@ pub enum DeltaKind {
     /// stall detection; also covers tool-call streaming, which has no
     /// visible deltas.
     Bytes,
+}
+
+// Availability failures count even when a stream error has no retryable code;
+// malformed user requests and authentication/permission failures do not.
+fn stream_failure_counts(code: &str, message: &str) -> (bool, bool) {
+    let missing = is_model_error_text(&message.to_lowercase());
+    let user_error = matches!(
+        code,
+        "invalid_request_error"
+            | "bad_request"
+            | "context_length_exceeded"
+            | "authentication_error"
+            | "permission_error"
+            | "authorization_error"
+            | "invalid_api_key"
+    );
+    (!user_error || missing, missing)
 }
 
 /// Convert Chat-Completions messages to Responses-API input items.
@@ -905,11 +1033,25 @@ impl Provider {
         }
     }
 
-    fn note(&self, text: String) {
-        tracing::info!("{text}");
-        if let Some(h) = &self.on_note {
-            h(text);
-        }
+    fn breaker_key(&self, model: &str, credential: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let endpoint = reqwest::Url::parse(&url(&self.cfg.base_url, ""))
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| self.cfg.base_url.clone());
+        format!(
+            "{}\0{}\0{:x}\0{model}",
+            endpoint.trim_end_matches('/'),
+            self.name,
+            Sha256::digest(credential.as_bytes())
+        )
+    }
+
+    fn breaker_permit(&self, model: &str, credential: &str) -> Option<BreakerPermit> {
+        BreakerPermit::acquire(
+            self.breaker_key(model, credential),
+            format!("provider '{}': {model}", self.name),
+            self.on_note.clone(),
+        )
     }
 
     /// Tell the hook, then wait before retry `attempt` (0-based).
@@ -1178,8 +1320,8 @@ impl Provider {
     ) -> Result<(String, Option<Usage>, bool)> {
         if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
-            let (resp, _, _) = self.post_provider(&mut body, None, true).await?;
-            let v: Value = resp.json().await.context("parse Messages response")?;
+            let (resp, _, _, permit) = self.post_provider(&mut body, None, true).await?;
+            let v = completed_json(resp, permit, "parse Messages response").await?;
             if let Some(why) = crate::anthropic::unusable_stop(&v) {
                 return Err(anyhow!("provider error: {why}"));
             }
@@ -1192,8 +1334,7 @@ impl Provider {
         } else {
             json!({"model": model, "messages": messages, "stream": false})
         };
-        let resp = self.post_chat(&mut body, effort).await?;
-        let v: Value = resp.json().await.context("parse chat completion")?;
+        let v = self.post_chat(&mut body, effort).await?;
         let usage = Usage::parse(&v["usage"]);
         if self.cfg.responses() {
             let cut = v["status"] == "incomplete";
@@ -1211,13 +1352,12 @@ impl Provider {
     }
 
     /// POST /chat/completions with bounded retries (SPEC §4.4). Returns the
-    /// raw response on success. If a 400 looks like an unknown-parameter
+    /// fully parsed JSON on success. If a 400 looks like an unknown-parameter
     /// rejection and reasoning_effort was set, retries once without it and
     /// flags `dropped` via the returned marker in ChatResult paths.
-    async fn post_chat(&self, body: &mut Value, effort: Option<&str>) -> Result<reqwest::Response> {
-        self.post_provider(body, effort, true)
-            .await
-            .map(|(r, _, _)| r)
+    async fn post_chat(&self, body: &mut Value, effort: Option<&str>) -> Result<Value> {
+        let (resp, _, _, permit) = self.post_provider(body, effort, true).await?;
+        completed_json(resp, permit, "parse chat completion").await
     }
 
     async fn post_provider(
@@ -1225,7 +1365,7 @@ impl Provider {
         body: &mut Value,
         effort: Option<&str>,
         allow_failover: bool,
-    ) -> Result<(reqwest::Response, Recovered, String)> {
+    ) -> Result<(reqwest::Response, Recovered, String, BreakerPermit)> {
         let endpoint = if self.cfg.anthropic() {
             "messages"
         } else if self.cfg.responses() {
@@ -1248,15 +1388,13 @@ impl Provider {
         let mut recovered = Recovered::default();
         let mut applied_fixes = Vec::new();
         let mut last_err = String::new();
-        let last = models.len().saturating_sub(1);
-        for (mi, model) in models.iter().enumerate() {
-            // A model whose breaker is open is skipped while another is
-            // left to try; the last one is always tried (#621).
-            let key = format!("{} {model}", self.cfg.base_url);
-            if mi < last && breaker_open(&key) {
-                tracing::info!("skipping {model}: its circuit breaker is open");
+        for model in &models {
+            let credential = self.credential().await?;
+            let Some(mut permit) = self.breaker_permit(model, &credential) else {
+                last_err =
+                    format!("model {model}: circuit breaker is open, probing, or at active-identity capacity");
                 continue;
-            }
+            };
             let mut with_effort = effort.is_some();
             let mut reauthed = false;
             // Retries count transient failures only; a resend after fixing a
@@ -1285,6 +1423,15 @@ impl Provider {
                     }
                 }
                 let credential = self.credential().await?;
+                // A live key/OAuth refresh must not charge failures to a
+                // different credential identity captured before the refresh.
+                if self.breaker_key(model, &credential) != permit.key {
+                    drop(permit);
+                    let Some(current) = self.breaker_permit(model, &credential) else {
+                        break 'attempts;
+                    };
+                    permit = current;
+                }
                 let req = apply_headers(
                     self.http.post(url(&self.cfg.base_url, endpoint)),
                     &self.cfg,
@@ -1298,10 +1445,7 @@ impl Provider {
                         let status = resp.status();
                         note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
-                            if breaker_success(&key) {
-                                self.note(format!("{model} is answering again."));
-                            }
-                            return Ok((resp, recovered, model.clone()));
+                            return Ok((resp, recovered, model.clone(), permit));
                         }
                         server_wait = retry_after(resp.headers());
                         let text = resp.text().await.unwrap_or_default();
@@ -1374,8 +1518,9 @@ impl Provider {
                                 continue;
                             }
                         }
-                        if is_model_error(status.as_u16(), &text) && models.len() > 1 {
-                            break; // fail over to the next model
+                        if is_model_error(status.as_u16(), &text) {
+                            permit.failure("model unavailable", true);
+                            break; // immediately open, then fail over if configured
                         }
                         if !(status.as_u16() == 429 || status.is_server_error()) {
                             return Err(anyhow!("provider error: {last_err}"));
@@ -1393,14 +1538,8 @@ impl Provider {
                 }
                 // Several failures in a row: stop paying retries on this
                 // model and fail over, for every Session, for a while.
-                if let Some(cool) = breaker_failure(&key) {
-                    if mi < last {
-                        self.note(format!(
-                            "{model} failed {BREAKER_TRIP} times in a row ({reason}); skipping it for about {}s.",
-                            cool.as_secs()
-                        ));
-                        break 'attempts;
-                    }
+                if permit.failure(&reason, false) {
+                    break 'attempts;
                 }
                 if attempt < self.cfg.max_retries {
                     self.retry_wait(attempt, server_wait, reason).await;
@@ -1565,7 +1704,7 @@ impl Provider {
             } = StreamAttempt::default();
             // Waiting for the response headers is cancellable too (a slow or
             // stuck endpoint must not outlive an interrupt).
-            let (resp, recovered, model_used) = tokio::select! {
+            let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 r = self.post_provider(&mut body, effort, true) => r?,
             };
@@ -1598,6 +1737,7 @@ impl Provider {
                             // (SPEC §4.4); partial output is discarded, and
                             // clients are told to clear what they showed.
                             Err(e) if attempt < self.cfg.max_retries => {
+                                permit.failure("stream dropped", false);
                                 tracing::warn!("provider stream dropped ({e}); re-sending the request");
                                 if !content.is_empty() || !reasoning.is_empty() {
                                     on_delta(DeltaKind::Restart, "");
@@ -1609,7 +1749,10 @@ impl Provider {
                                 attempt += 1;
                                 continue 'request;
                             }
-                            Err(e) => return Err(e).context("stream read"),
+                            Err(e) => {
+                                permit.failure("stream dropped", false);
+                                return Err(e).context("stream read");
+                            }
                         };
                         on_delta(DeltaKind::Bytes, "");
                         buf.extend_from_slice(&chunk);
@@ -1684,6 +1827,11 @@ impl Provider {
                                         let (retryable, message) = responses_failure(&v);
                                         let nothing_streamed =
                                             content.is_empty() && reasoning.is_empty() && tool_calls.is_empty();
+                                        let error = if v["response"]["error"].is_object() { &v["response"]["error"] }
+                                            else if v["error"].is_object() { &v["error"] } else { &v };
+                                        let code = error["code"].as_str().or_else(|| error["type"].as_str()).unwrap_or_default();
+                                        let (counts, missing) = stream_failure_counts(code, error["message"].as_str().unwrap_or_default());
+                                        if counts { permit.failure("provider stream error", missing); }
                                         if retryable && nothing_streamed && attempt < self.cfg.max_retries {
                                             tokio::select! {
                                                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
@@ -1845,6 +1993,7 @@ impl Provider {
                     }
                 }
             }
+            permit.success();
             break (
                 StreamAttempt {
                     content,
@@ -1933,7 +2082,7 @@ impl Provider {
         let mut attempt = 0;
         let mut shown = false;
         loop {
-            let (resp, recovered, model_used) = tokio::select! {
+            let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 r = self.post_provider(&mut body, None, true) => r?,
             };
@@ -2015,6 +2164,14 @@ impl Provider {
                 };
                 // A dropped stream is re-sent even after partial output (as
                 // on the other APIs); an error event only before any.
+                let (counts, missing) = f
+                    .error
+                    .as_ref()
+                    .map(|(kind, message)| stream_failure_counts(kind, message))
+                    .unwrap_or((dropped, false));
+                if counts {
+                    permit.failure("Messages stream failed", missing);
+                }
                 let retry = reason.filter(|_| dropped || f.nothing_streamed());
                 if let Some(reason) = retry.filter(|_| attempt < self.cfg.max_retries) {
                     if shown {
@@ -2031,6 +2188,7 @@ impl Provider {
                 }
                 return Err(anyhow!("provider error: {why}"));
             }
+            permit.success();
             let tool_calls = f
                 .tool_calls
                 .iter()
@@ -2075,21 +2233,35 @@ impl Provider {
     pub async fn compact_server(&self, text: &str, model: &str) -> Result<String> {
         let body = json!({"model": model, "input": text});
         let credential = self.credential().await?;
+        let permit = self.breaker_permit(model, &credential).ok_or_else(|| {
+            anyhow!(
+                "model {model}: circuit breaker is open, probing, or at active-identity capacity"
+            )
+        })?;
         let req = apply_headers(
             self.http.post(url(&self.cfg.base_url, "compact")),
             &self.cfg,
             &credential,
         )
         .json(&body);
-        let resp = req.send().await.context("POST /compact")?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                permit.failure("connection failed", false);
+                return Err(error).context("POST /compact");
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
+            if status.as_u16() == 429 || status.is_server_error() {
+                permit.failure("compaction provider failed", false);
+            }
             return Err(anyhow!(
                 "POST /compact failed: {status}: {}",
                 resp.text().await.unwrap_or_default()
             ));
         }
-        let v: Value = resp.json().await.context("parse /compact")?;
+        let v = completed_json(resp, permit, "parse /compact").await?;
         for key in ["summary", "output", "content"] {
             if let Some(s) = v[key].as_str() {
                 if !s.is_empty() {
@@ -2629,8 +2801,8 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         if forced {
             b["tool_choice"] = json!({"type": "any"});
         }
-        let (resp, _, _) = p.post_provider(&mut b, None, false).await?;
-        let v: Value = resp.json().await.context("parse probe response")?;
+        let (resp, _, _, permit) = p.post_provider(&mut b, None, false).await?;
+        let v = completed_json(resp, permit, "parse probe response").await?;
         return Ok(!crate::anthropic::response_parts(&v).1.is_empty());
     }
     let mut body = if p.cfg.responses() {
@@ -2656,8 +2828,8 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         }
         b
     };
-    let (resp, _, _) = p.post_provider(&mut body, None, false).await?;
-    let v: Value = resp.json().await.context("parse probe response")?;
+    let (resp, _, _, permit) = p.post_provider(&mut body, None, false).await?;
+    let v = completed_json(resp, permit, "parse probe response").await?;
     if p.cfg.responses() {
         return Ok(!responses_tool_calls(&v).is_empty());
     }
@@ -2824,6 +2996,10 @@ pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<P
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(probe(cfg, api_key, model))
 }
+
+#[cfg(test)]
+#[path = "provider_breaker_tests.rs"]
+mod breaker_tests;
 
 #[cfg(test)]
 mod tests {
