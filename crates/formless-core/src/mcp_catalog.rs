@@ -211,14 +211,26 @@ pub fn target(e: &Entry) -> String {
 
 /// Path checks happen in the daemon as well as in local review forms.
 pub fn normalize_directory(raw: &str) -> Result<PathBuf> {
-    let home = directories::BaseDirs::new().map(|d| {
-        d.home_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| d.home_dir().to_path_buf())
-    });
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    normalize_directory_with_home(raw, home.as_deref())
+}
+
+fn verified_home(home: Option<&Path>) -> Result<PathBuf> {
+    let home = home
+        .filter(|h| h.is_absolute())
+        .context("native home must be an absolute existing directory")?;
+    let home = home
+        .canonicalize()
+        .context("native home cannot be resolved canonically")?;
+    if !home.is_dir() {
+        bail!("native home must be a directory");
+    }
+    Ok(home)
+}
+
+fn normalize_directory_with_home(raw: &str, home: Option<&Path>) -> Result<PathBuf> {
     let expanded = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
-        home.context("no home directory")?
-            .join(raw.get(2..).unwrap_or(""))
+        verified_home(home)?.join(raw.get(2..).unwrap_or(""))
     } else {
         PathBuf::from(raw)
     };
@@ -226,30 +238,139 @@ pub fn normalize_directory(raw: &str) -> Result<PathBuf> {
         .canonicalize()
         .map_err(|_| anyhow!("path must name an existing accessible directory"))?;
     if !path.is_dir() {
-        return Err(anyhow!("path must be a directory"));
+        bail!("path must be a directory");
     }
     Ok(path)
 }
 
 pub fn path_exposure(path: &Path) -> Option<String> {
-    let home = directories::BaseDirs::new().map(|d| {
-        d.home_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| d.home_dir().to_path_buf())
-    });
-    let broad = path.parent().is_none() || home.as_ref().is_some_and(|h| h.starts_with(path));
-    let credential = [".ssh", ".aws", ".gnupg", ".kube", ".config"]
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    path_exposure_with_home(path, home.as_deref())
+}
+
+fn path_exposure_with_home(path: &Path, home: Option<&Path>) -> Option<String> {
+    let warning = |reason: &str| {
+        Some(format!(
+            "{} {reason}; confirm this exposure explicitly",
+            path.display()
+        ))
+    };
+    let home = match verified_home(home) {
+        Ok(home) => home,
+        Err(_) => return warning("exposure cannot be narrowed because native home is unverified"),
+    };
+    let path = match path.canonicalize() {
+        Ok(path) if path.is_absolute() && path.is_dir() => path,
+        _ => return warning("is not a verified canonical directory"),
+    };
+    if path.parent().is_none() || home.starts_with(&path) {
+        return warning("exposes a filesystem root or home folder");
+    }
+    if crate::daemon::credential_path(&path).is_some()
+        || path.components().any(|part| part.as_os_str() == ".config")
+    {
+        return warning("exposes a credential folder");
+    }
+    // Home-relative locations also recognize parents such as Library before
+    // reaching its nested Keychains child. Missing known locations remain
+    // lexical future credential roots; other resolution errors require review.
+    let mut roots: Vec<_> = crate::daemon::CREDENTIAL_DIRS
         .iter()
-        .any(|name| {
-            path.file_name().is_some_and(|n| n == *name)
-                || path.join(name).exists()
-                || home.as_ref().is_some_and(|h| {
-                    let known = h.join(name);
-                    let known = known.canonicalize().unwrap_or(known);
-                    path.starts_with(&known) || known.starts_with(path)
-                })
-        });
-    (broad || credential).then(|| format!("{} exposes a filesystem root, home, or credential folder; confirm this exposure explicitly", path.display()))
+        .map(|(name, _)| home.join(name))
+        .collect();
+    roots.extend(
+        [
+            ".config",
+            ".config/gcloud",
+            "Library/Keychains",
+            "AppData/Roaming/gcloud",
+            "AppData/Local/gcloud",
+        ]
+        .map(|name| home.join(name)),
+    );
+    let mut canonical_roots = Vec::new();
+    for known in roots {
+        let known = match known.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => known,
+            Err(_) => return warning("has an unverifiable relationship to credential folders"),
+        };
+        if path.starts_with(&known) || known.starts_with(&path) {
+            return warning("exposes a credential folder or its ancestor");
+        }
+        canonical_roots.push(known);
+    }
+    let mut pending = vec![(path.clone(), 0usize)];
+    let mut visited = std::collections::HashSet::from([path.clone()]);
+    let mut inspected = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => return warning("cannot be fully inspected for credential exposure"),
+        };
+        for entry in entries {
+            inspected += 1;
+            if inspected > 1024 {
+                return warning("has too many descendants to rule out credential exposure");
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    return warning(
+                        "has an unreadable descendant whose credential exposure is unknown",
+                    )
+                }
+            };
+            let entry_path = entry.path();
+            if crate::daemon::credential_path(&entry_path).is_some()
+                || entry.file_name() == ".config"
+            {
+                return warning("contains a credential path");
+            }
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    return warning(
+                        "has an unreadable descendant whose credential exposure is unknown",
+                    )
+                }
+            };
+            let nested = if kind.is_symlink() {
+                let target = match entry_path.canonicalize() {
+                    Ok(target) => target,
+                    Err(_) => {
+                        return warning(
+                            "contains an unresolved link whose credential exposure is unknown",
+                        )
+                    }
+                };
+                if crate::daemon::credential_path(&target).is_some()
+                    || canonical_roots
+                        .iter()
+                        .any(|root| target.starts_with(root) || root.starts_with(&target))
+                {
+                    return warning("contains a link to a credential path");
+                }
+                if !target.starts_with(&path) {
+                    return warning(
+                        "contains an external link whose credential exposure is unknown",
+                    );
+                }
+                target.is_dir().then_some(target)
+            } else {
+                kind.is_dir().then_some(entry_path)
+            };
+            if let Some(nested) = nested {
+                if visited.insert(nested.clone()) {
+                    if depth >= 16 {
+                        return warning("is too deep to rule out credential exposure");
+                    }
+                    pending.push((nested, depth + 1));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn prepare(e: &Entry, params: &Map<String, Value>) -> Result<(McpServerCfg, Vec<String>)> {
@@ -855,6 +976,112 @@ mod tests {
                 && !public.contains("pw")
         );
         assert!(public.contains("plaintext config.toml") && public.contains("Authorization"));
+    }
+
+    #[test]
+    fn credential_policy_covers_docker_nested_cloud_keychains_and_ancestors() {
+        let root =
+            std::env::temp_dir().join(format!("fl-mcp-exposure-policy-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let project = root.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let home = home.canonicalize().unwrap();
+        let project = project.canonicalize().unwrap();
+        assert!(path_exposure_with_home(&project, Some(&home)).is_none());
+        for relative in [
+            ".docker",
+            ".password-store",
+            ".config/gcloud",
+            "Library/Keychains",
+        ] {
+            let credential = home.join(relative);
+            let child = credential.join("nested");
+            std::fs::create_dir_all(&child).unwrap();
+            assert!(crate::daemon::credential_path(&child).is_some());
+            for target in [&credential, &child, credential.parent().unwrap()] {
+                let warning = path_exposure_with_home(target, Some(&home))
+                    .expect("credential exposure must require confirmation");
+                assert!(warning.contains(target.to_str().unwrap()));
+            }
+        }
+        // This folder is outside home; an immediate credential child still
+        // makes the folder an exposure, using the same attachment policy.
+        std::fs::create_dir_all(project.join(".docker/nested")).unwrap();
+        assert!(path_exposure_with_home(&project, Some(&home)).is_some());
+        assert!(path_exposure_with_home(&project.join(".docker/nested"), Some(&home)).is_some());
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("nested/cloud/gcloud/configurations")).unwrap();
+        assert!(
+            path_exposure_with_home(&elsewhere, Some(&home)).is_some(),
+            "an external ancestor also exposes its nested credential tree"
+        );
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join(".env"), "fixture only").unwrap();
+        assert!(path_exposure_with_home(&plain, Some(&home)).is_some());
+        #[cfg(unix)]
+        {
+            let alias_root = root.join("aliases");
+            std::fs::create_dir_all(&alias_root).unwrap();
+            std::os::unix::fs::symlink(home.join(".docker"), alias_root.join("neutral-name"))
+                .unwrap();
+            assert!(path_exposure_with_home(&alias_root, Some(&home)).is_some());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_tree_inspection_requires_review_instead_of_assuming_safe() {
+        let root =
+            std::env::temp_dir().join(format!("fl-mcp-exposure-budget-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let deep = root.join("deep");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut nested = deep.clone();
+        for _ in 0..17 {
+            nested.push("child");
+        }
+        std::fs::create_dir_all(nested).unwrap();
+        let warning = path_exposure_with_home(&deep, Some(&home)).unwrap();
+        assert!(warning.contains("too deep"));
+        #[cfg(unix)]
+        {
+            let links = root.join("links");
+            std::fs::create_dir_all(&links).unwrap();
+            std::os::unix::fs::symlink(root.join("missing"), links.join("unresolved")).unwrap();
+            let warning = path_exposure_with_home(&links, Some(&home)).unwrap();
+            assert!(warning.contains("unresolved link"));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unverifiable_home_never_weakens_folder_confirmation_or_tilde_expansion() {
+        let root =
+            std::env::temp_dir().join(format!("fl-mcp-unverified-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let folder = root.join("folder").canonicalize().unwrap();
+        let missing = root.join("missing/..");
+        let file = root.join("file");
+        std::fs::write(&file, "file").unwrap();
+        for home in [
+            None,
+            Some(Path::new("relative-home")),
+            Some(missing.as_path()),
+            Some(file.as_path()),
+        ] {
+            assert!(normalize_directory_with_home("~", home).is_err());
+            assert!(normalize_directory_with_home("~/folder", home).is_err());
+            let warning = path_exposure_with_home(&folder, home)
+                .expect("unknown native home requires explicit exposure review");
+            assert!(warning.contains("unverified") && warning.contains(folder.to_str().unwrap()));
+            assert_eq!(
+                normalize_directory_with_home(folder.to_str().unwrap(), home).unwrap(),
+                folder
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

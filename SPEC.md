@@ -1543,6 +1543,14 @@ None ship by default (principle 1).
   Path parameters expand `~`, resolve symlinks and require an existing directory.
   Filesystem roots, home and credential folders/ancestors require a second
   confirmation that names the canonical folder and exposure.
+  Credential recognition shares the attachment guard's policy (including
+  Docker, Google Cloud, keychains and password stores), covers nested native
+  credential locations and their ancestors, and inspects credential descendants
+  within 1,024 entries and 16 directory levels. Incomplete inspection, unreadable
+  descendants and unresolved/external links require explicit exposure review.
+  A relative or unresolvable native home never supplies a permissive fallback:
+  `~` expansion fails, and an absolute folder requires explicit exposure
+  confirmation when its relationship to home cannot be verified.
 - **Catalog.** A small curated list of popular servers ships in the binary
   (`mcp_catalog.rs`: filesystem, GitHub, git, fetch, Playwright,
   PostgreSQL, Slack, memory, time, Sentry, Linear, Notion): `McpCatalog`,
