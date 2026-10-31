@@ -16484,6 +16484,13 @@ mod tests {
             }),
         ] {
             let mut app = test_app();
+            app.sessions = serde_json::from_value(serde_json::json!([{
+                "id": "s1",
+                "name": "Reconnect pause",
+                "created_at": "",
+                "updated_at": ""
+            }]))
+            .unwrap();
             app.daemon_lost();
             let (client, _sent) = DaemonClient::recording();
             let (tx, inbox) = mpsc::channel();
@@ -16507,10 +16514,14 @@ mod tests {
             }))
             .unwrap();
             // The read began while the Run was active, before its pause.
+            // SendMessage appends the user's message before starting a Run;
+            // include that durable history instead of a welcome-screen fixture.
+            let mut snapshot = reconnect_snapshot(true, vec![]);
+            snapshot["messages"] = serde_json::json!([msg("user", "Please continue my task")]);
             tx.send(ServerMessage::Response {
                 id,
                 ok: true,
-                result: Some(reconnect_snapshot(true, vec![])),
+                result: Some(snapshot),
                 error: None,
             })
             .unwrap();
