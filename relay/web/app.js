@@ -125,10 +125,43 @@
   const FRAME_VERSION = 2;
   const enc = (s) => new TextEncoder().encode(s);
   const aad = (direction, seq) => enc("formless-relay/2 " + direction + " " + seq);
-  function startHandshake() {
+  // The handshake (#904): each side proves it holds the pairing key with a
+  // value bound to both nonces, before anything else is trusted. A lost
+  // reply is asked for again (the same hello gets the same answer); a
+  // handshake that never completes says so instead of looking connected.
+  const HANDSHAKE_MS = 8000;
+  const HANDSHAKE_TRIES = 3;
+  function startHandshake(again) {
     S.channel = null;
+    clearTimeout(S.handshakeTimer);
+    S.handshakeTries = again ? (S.handshakeTries || 0) + 1 : 1;
+    S.handshakeFailed = false;
     S.hello = crypto.getRandomValues(new Uint8Array(16));
-    S.ws.send(JSON.stringify({ v: FRAME_VERSION, hello: bytesToB64(S.hello) }));
+    sendHello();
+  }
+  function sendHello() {
+    const ws = S.ws;
+    if (!ws || ws.readyState !== 1 || !S.hello) return;
+    ws.send(JSON.stringify({ v: FRAME_VERSION, hello: bytesToB64(S.hello) }));
+    S.handshakeTimer = setTimeout(() => {
+      if (S.channel || S.ws !== ws || !S.daemonOnline) return;
+      if (S.handshakeTries < HANDSHAKE_TRIES) {
+        S.handshakeTries++;
+        sendHello();
+      } else {
+        S.handshakeFailed = true;
+        note("Couldn't secure the connection: the daemon didn't answer the handshake. Reload to try again, or check that the pairing secret is current.", true);
+        renderChrome();
+      }
+    }, HANDSHAKE_MS);
+  }
+  /** The proof `from` ("b2d" or "d2b") gives for this handshake. */
+  async function confirmTag(daemonHello, from) {
+    const salt = new Uint8Array(32);
+    salt.set(S.hello, 0);
+    salt.set(daemonHello, 16);
+    return new Uint8Array(await crypto.subtle.deriveBits(
+      { name: "HKDF", hash: "SHA-256", salt, info: enc("formless-relay/2 confirm " + from) }, S.key, 256));
   }
   async function finishHandshake(daemonHello) {
     const salt = new Uint8Array(32);
@@ -494,6 +527,10 @@
     } else if (!S.daemonOnline) {
       conn.className = "pill off";
       conn.textContent = "daemon offline";
+    } else if (!S.local && !S.channel) {
+      // Online, but not yet proven both ways: not "connected" (#904).
+      conn.className = "pill off";
+      conn.textContent = S.handshakeFailed ? "couldn't secure the connection" : "securing the connection…";
     } else {
       conn.className = "pill on";
       conn.textContent = "● connected";
@@ -4630,7 +4667,7 @@
     // Only a non-extractable key and the room stay; the raw bytes are
     // wiped and the secret string is kept only when the user chose to stay
     // paired across reloads (#908).
-    S.key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveKey"]);
+    S.key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveKey", "deriveBits"]);
     S.room = await roomFor(keyBytes);
     keyBytes.fill(0);
     try {
@@ -4665,18 +4702,31 @@
         const was = S.daemonOnline;
         S.daemonOnline = online;
         if (online && !was) startHandshake();
-        if (!online && was) { S.channel = null; note("daemon went offline", true); }
+        if (!online && was) { S.channel = null; clearTimeout(S.handshakeTimer); note("daemon went offline", true); }
         renderChrome();
         renderHistory();
         return;
       }
-      if (!S.channel) {
+      let hs = null;
+      try {
+        const v = JSON.parse(frame);
+        if (v.v === FRAME_VERSION && typeof v.hello === "string") hs = v;
+      } catch (_) {}
+      // With a channel up, a hello is a stray or replayed one: ignored, so
+      // it can neither rekey one side nor break the channel (#904).
+      if (S.channel) {
+        if (hs) return;
+      } else {
         let hello = null;
-        try {
-          const v = JSON.parse(frame);
-          if (v.v === FRAME_VERSION && typeof v.hello === "string") hello = b64ToBytes(v.hello);
-        } catch (_) {}
-        if (!hello || hello.length !== 16 || !S.hello) return;
+        try { hello = hs && b64ToBytes(hs.hello); } catch (_) {}
+        if (!hello || hello.length !== 16 || !S.hello || typeof hs.confirm !== "string") return;
+        // The daemon must prove it holds the key before anything is trusted.
+        const want = await confirmTag(hello, "d2b");
+        let got;
+        try { got = b64ToBytes(hs.confirm); } catch (_) { return; }
+        if (got.length !== want.length || got.some((b, i) => b !== want[i])) return;
+        S.ws.send(JSON.stringify({ v: FRAME_VERSION, confirm: bytesToB64(await confirmTag(hello, "b2d")) }));
+        clearTimeout(S.handshakeTimer);
         await finishHandshake(hello);
         markStable();
         note("daemon online");

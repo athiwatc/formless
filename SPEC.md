@@ -3525,7 +3525,18 @@ run_tool = "network_policy"     # a registry Tool, or…
   browser has its own daemon connection. Frames are version 2: each
   browser connection opens with a handshake (`{"v":2,"hello":<16 random
   bytes>}` from each side) and derives a session key with HKDF-SHA256
-  over the pairing key, salted with both nonces; every frame carries a
+  over the pairing key, salted with both nonces. Each side proves it holds
+  the key before anything is trusted: the daemon's hello carries
+  `confirm` = HKDF(key, salt = both nonces, info `formless-relay/2
+  confirm d2b`), which the browser checks before answering with its own
+  `{"v":2,"confirm":…}` (info `… b2d`). Only then does the browser count
+  as a subscriber or appear in the device list. The same hello again gets
+  the same answer (no one-sided rekey); a different hello starts a
+  pending handshake that replaces the live channel only once confirmed,
+  and is dropped after 30 s. The browser shows "securing the connection…"
+  until confirmed, asks again up to three times 8 s apart, then says it
+  couldn't secure the connection, and ignores any hello once its channel
+  is up. Every frame carries a
   per-direction `seq` bound into the AES-GCM associated data and must be
   exactly one more than the last, so the Relay cannot replay, reorder,
   withhold or reflect frames, nor reuse them in another connection. A

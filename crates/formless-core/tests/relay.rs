@@ -4,8 +4,8 @@
 
 use formless_core::config::{generate_relay_secret, RelayCfg};
 use formless_core::relay::{
-    browser_url, hello_frame, key_from_secret, new_hello, parse_hello, relay_ws_url, room_id,
-    Channel, Side,
+    browser_url, confirm_frame, confirm_tag, hello_frame, key_from_secret, new_hello, parse_hello,
+    relay_ws_url, room_id, Channel, Side,
 };
 
 fn pair(key: &[u8; 32]) -> (Channel, Channel) {
@@ -220,6 +220,9 @@ async fn relay_gives_each_browser_its_own_connection() {
         let reply = recv(&mut ws).await;
         assert_eq!(reply["cid"], cid);
         let daemon_hello = parse_hello(reply["f"].as_str().unwrap()).unwrap();
+        // Not a subscriber until it proves it has the key (#904).
+        let confirm = serde_json::json!({"cid": cid, "f": confirm_frame(&key, &browser_hello, &daemon_hello)});
+        ws.send(Message::Text(confirm.to_string())).await.unwrap();
         channels.insert(
             cid,
             Channel::new(&key, &browser_hello, &daemon_hello, Side::Browser),
@@ -411,6 +414,33 @@ async fn relay_browsers_are_listed_and_can_be_disconnected() {
     ))
     .await
     .unwrap();
+    // Listed only once its handshake is confirmed (#904).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(daemon
+        .handle(formless_protocol::Request::ListRelayClients)
+        .await
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let key = key_from_secret(&secret).unwrap();
+    let bh = new_hello();
+    ws.send(Message::Text(
+        serde_json::json!({"cid": "c1", "f": hello_frame(&bh)}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let reply: serde_json::Value = loop {
+        if let Some(Ok(Message::Text(t))) = ws.next().await {
+            break serde_json::from_str(&t).unwrap();
+        }
+    };
+    let dh = parse_hello(reply["f"].as_str().unwrap()).unwrap();
+    ws.send(Message::Text(
+        serde_json::json!({"cid": "c1", "f": confirm_frame(&key, &bh, &dh)}).to_string(),
+    ))
+    .await
+    .unwrap();
     let list = loop {
         let v = daemon
             .handle(formless_protocol::Request::ListRelayClients)
@@ -520,4 +550,117 @@ fn relay_key_material_is_zeroized() {
         formless_core::relay::key_from_secret(&formless_core::config::generate_relay_secret())
             .unwrap();
     let _: &zeroize::Zeroizing<[u8; 32]> = &key;
+}
+
+/// The handshake is confirmed both ways before a browser counts; a
+/// repeated hello gets the same answer; a wrong proof or a replayed old
+/// hello never replaces a live channel (#904).
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_handshake_is_confirmed_and_idempotent() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(temp_paths("relayconfirm")).unwrap());
+    let secret = generate_relay_secret();
+    let key = key_from_secret(&secret).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let link = tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    async fn recv(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> serde_json::Value {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Message::Text(t) = msg {
+                return serde_json::from_str(&t).unwrap();
+            }
+        }
+    }
+    let send =
+        |cid: &str, f: String| Message::Text(serde_json::json!({"cid": cid, "f": f}).to_string());
+
+    // Before any proof: no subscriber, however many hellos arrive.
+    let bh = new_hello();
+    ws.send(send("a", hello_frame(&bh))).await.unwrap();
+    let first = recv(&mut ws).await;
+    let f = first["f"].as_str().unwrap();
+    let dh = parse_hello(f).unwrap();
+    let v: serde_json::Value = serde_json::from_str(f).unwrap();
+    let proof = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        v["confirm"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        proof,
+        confirm_tag(&key, &bh, &dh, Side::Daemon).to_vec(),
+        "the daemon proves the key"
+    );
+    // A lost reply: the browser sends the same hello and gets the same one.
+    ws.send(send("a", hello_frame(&bh))).await.unwrap();
+    assert_eq!(recv(&mut ws).await, first, "idempotent");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        daemon.subscriber_count(),
+        0,
+        "no subscriber before the browser's proof"
+    );
+
+    // A wrong proof is ignored.
+    let wrong = confirm_frame(
+        &key_from_secret(&generate_relay_secret()).unwrap(),
+        &bh,
+        &dh,
+    );
+    ws.send(send("a", wrong)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(daemon.subscriber_count(), 0);
+
+    // The right one (after a fresh hello, since the wrong proof dropped it).
+    ws.send(send("a", hello_frame(&bh))).await.unwrap();
+    let dh = parse_hello(recv(&mut ws).await["f"].as_str().unwrap()).unwrap();
+    ws.send(send("a", confirm_frame(&key, &bh, &dh)))
+        .await
+        .unwrap();
+    let mut chan = Channel::new(&key, &bh, &dh, Side::Browser);
+    let mut tries = 0;
+    while daemon.subscriber_count() != 1 && tries < 50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tries += 1;
+    }
+    assert_eq!(daemon.subscriber_count(), 1);
+
+    // A replayed old hello (from another handshake) starts only a pending
+    // one: the live channel still answers.
+    let old = new_hello();
+    ws.send(send("a", hello_frame(&old))).await.unwrap();
+    let _pending = recv(&mut ws).await;
+    let req = serde_json::json!({"id": 1, "protocol": 1, "request": {"type": "ping"}});
+    ws.send(send("a", chan.seal(&req.to_string()).unwrap()))
+        .await
+        .unwrap();
+    let reply = loop {
+        let frame = recv(&mut ws).await;
+        if let Ok(line) = chan.open(frame["f"].as_str().unwrap()) {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["kind"] == "response" {
+                break v;
+            }
+        }
+    };
+    assert_eq!(reply["id"], 1);
+    shutdown.cancel();
+    link.await.unwrap().unwrap();
 }
