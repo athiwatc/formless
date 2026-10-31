@@ -568,7 +568,7 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
     for style in ["chat", "responses", "anthropic"] {
         let replies = Arc::new(StdMutex::new(Vec::new()));
         let recorded = replies.clone();
-        let app=axum::Router::new().fallback(axum::routing::post(move |axum::Json(body):axum::Json<Value>| async move {
+        let app=axum::Router::new().fallback(move |axum::Json(body):axum::Json<Value>| async move {
             if body["model"]=="primary" {
                 return (axum::http::StatusCode::SERVICE_UNAVAILABLE,"fixture primary unavailable").into_response();
             }
@@ -577,7 +577,7 @@ async fn typed_served_identity_and_compatibility_wrappers_cover_all_completion_a
                 "anthropic"=>json!({"stop_reason":"max_tokens","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":10}}),
                 _=>json!({"choices":[{"message":{"content":"ok"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":10}}),
             }).into_response()
-        }));
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = ProviderCfg {
             base_url: format!("http://{}", listener.local_addr().unwrap()),
