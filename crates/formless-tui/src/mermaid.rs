@@ -288,6 +288,10 @@ struct Graph {
     edges: Vec<Edge>,
     left_right: bool,
     index: HashMap<String, usize>,
+    /// Something this renderer can't draw faithfully (a two-way edge, a
+    /// cross or circle tip): show the source instead of a wrong picture
+    /// (#879).
+    unsupported: bool,
 }
 
 impl Graph {
@@ -347,9 +351,38 @@ fn statements(src: &str) -> impl Iterator<Item = &str> {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("%%"))
         .skip(1)
-        .flat_map(|l| l.split(';'))
+        .flat_map(split_statements)
         .map(str::trim)
         .filter(|l| !l.is_empty())
+}
+
+/// A line split at its `;` separators, but not inside a quoted label, a
+/// node shape's brackets, an `|edge label|`, or the text after a `:`
+/// (a message or label runs to the end of the line) (#878).
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut depth, mut quote, mut pipe) = (0, 0i32, None::<char>, false);
+    for (i, ch) in line.char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '`') => quote = Some(ch),
+            (None, '|') => pipe = !pipe,
+            (None, '[' | '(' | '{') => depth += 1,
+            (None, ']' | ')' | '}') => depth -= 1,
+            (None, ':') if depth <= 0 && !pipe => {
+                out.push(&line[start..]);
+                return out;
+            }
+            (None, ';') if depth <= 0 && !pipe => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&line[start..]);
+    out
 }
 
 fn parse_flowchart(src: &str) -> Option<Graph> {
@@ -361,10 +394,20 @@ fn parse_flowchart(src: &str) -> Option<Graph> {
         left_right: direction_is_lr(header.split_whitespace().nth(1)),
         ..Default::default()
     };
+    // Inside a subgraph, `direction` is that subgraph's: it never turns
+    // the whole chart (#879).
+    let mut depth = 0usize;
     for stmt in statements(src) {
         let first = stmt.split_whitespace().next().unwrap_or("");
+        match first {
+            "subgraph" => depth += 1,
+            "end" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
         if first == "direction" {
-            g.left_right = direction_is_lr(stmt.split_whitespace().nth(1));
+            if depth == 0 {
+                g.left_right = direction_is_lr(stmt.split_whitespace().nth(1));
+            }
             continue;
         }
         if matches!(
@@ -385,7 +428,7 @@ fn parse_flowchart(src: &str) -> Option<Graph> {
         }
         flow_statement(&mut g, stmt);
     }
-    (!g.nodes.is_empty()).then_some(g)
+    (!g.nodes.is_empty() && !g.unsupported).then_some(g)
 }
 
 struct Cursor<'a> {
@@ -428,9 +471,10 @@ fn flow_statement(g: &mut Graph, stmt: &str) {
         if c.eof() {
             return;
         }
-        let Some((label, dash, arrow, visible)) = flow_edge(&mut c) else {
+        let Some((label, dash, arrow, visible, exotic)) = flow_edge(&mut c) else {
             return;
         };
+        g.unsupported |= exotic;
         c.ws();
         let Some(next) = node_group(g, &mut c) else {
             return;
@@ -538,8 +582,13 @@ fn flow_node(g: &mut Graph, c: &mut Cursor) -> Option<usize> {
 
 /// One link operator plus its label: `-->`, `-.->`, `==>`, `---`, `-- x -->`,
 /// `-->|x|`, `<-->`, `--x`, `--o`, `~~~` (invisible).
-fn flow_edge(c: &mut Cursor) -> Option<(String, Dash, bool, bool)> {
-    let mut arrow = c.eat("<");
+fn flow_edge(c: &mut Cursor) -> Option<(String, Dash, bool, bool, bool)> {
+    // A tip at the start (`<-->`) or a cross/circle tip can't be drawn
+    // with this renderer's single arrowhead: reported, so the caller falls
+    // back to the source (#879).
+    let two_way = c.eat("<");
+    let mut exotic = two_way;
+    let mut arrow = two_way;
     let op_start = c.i;
     while c.peek().is_some_and(|ch| "-=.~".contains(ch)) {
         c.i += 1;
@@ -562,8 +611,10 @@ fn flow_edge(c: &mut Cursor) -> Option<(String, Dash, bool, bool)> {
         }
         false
     };
+    let crossed = |c: &Cursor| c.s[..c.i].ends_with(['x', 'o']);
     if tip(c) {
         arrow = true;
+        exotic |= crossed(c);
     } else if matches!(op.as_str(), "--" | "==" | "-.") && c.peek() == Some(' ') {
         // `-- label -->`: the label runs to the closing operator.
         let r = c.rest();
@@ -580,6 +631,7 @@ fn flow_edge(c: &mut Cursor) -> Option<(String, Dash, bool, bool)> {
         op.push_str(&c.s[s..c.i]);
         if tip(c) {
             arrow = true;
+            exotic |= crossed(c);
         }
     }
     c.ws();
@@ -596,16 +648,26 @@ fn flow_edge(c: &mut Cursor) -> Option<(String, Dash, bool, bool)> {
     } else {
         Dash::Solid
     };
-    Some((label, dash, arrow, !op.contains('~')))
+    Some((label, dash, arrow, !op.contains('~'), exotic))
 }
 
 fn parse_state(src: &str) -> Option<Graph> {
     let mut g = Graph::default();
     let mut start = None;
     let mut end = None;
+    // A multi-line `note … end note` body is text, never states (#879).
+    let mut in_note = false;
     for stmt in statements(src) {
         let stmt = stmt.trim_end_matches('{').trim();
         if stmt.is_empty() || stmt == "}" {
+            continue;
+        }
+        if in_note {
+            in_note = stmt != "end note";
+            continue;
+        }
+        if stmt.starts_with("note ") && !stmt.contains(':') {
+            in_note = true;
             continue;
         }
         let first = stmt.split_whitespace().next().unwrap_or("");
@@ -706,11 +768,11 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
         .filter(|(_, e)| e.from != e.to)
         .map(|(i, e)| (e.from, e.to, i))
         .collect();
-    let self_loops: Vec<usize> = g
+    let self_loops: Vec<(usize, &str)> = g
         .edges
         .iter()
         .filter(|e| e.from == e.to)
-        .map(|e| e.from)
+        .map(|e| (e.from, e.label.as_str()))
         .collect();
 
     // 1. Break cycles: DFS back edges are reversed for layering.
@@ -785,9 +847,14 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
     // 3. Layered graph with dummy nodes on long edges.
     let label_of = |v: usize| {
         let mut l = g.nodes[v].label.clone();
-        if self_loops.contains(&v) {
+        // A self-loop is a ↺ after the label, with its own label (#879).
+        for (_, label) in self_loops.iter().filter(|(n, _)| *n == v) {
             if let Some(last) = l.last_mut() {
                 last.push_str(" ↺");
+                if !label.is_empty() {
+                    last.push(' ');
+                    last.push_str(label);
+                }
             }
         }
         l
@@ -1139,11 +1206,6 @@ fn sequence(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> 
                 });
             }
             _ => {
-                let Some(dash_at) = stmt.find('-') else {
-                    continue;
-                };
-                let from = &stmt[..dash_at];
-                let r = &stmt[dash_at..];
                 let ops = [
                     ("-->>", '▶', Dash::Dotted),
                     ("->>", '▶', Dash::Solid),
@@ -1154,9 +1216,19 @@ fn sequence(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> 
                     ("--)", '▷', Dash::Dotted),
                     ("-)", '▷', Dash::Solid),
                 ];
-                let Some(&(op, head, dash)) = ops.iter().find(|(op, ..)| r.starts_with(op)) else {
+                // The first `-` that starts an arrow: participant names
+                // may hold hyphens themselves (`my-svc->>db`) (#879).
+                let Some((dash_at, &(op, head, dash))) =
+                    stmt.match_indices('-').find_map(|(i, _)| {
+                        ops.iter()
+                            .find(|(op, ..)| stmt[i..].starts_with(op))
+                            .map(|o| (i, o))
+                    })
+                else {
                     continue;
                 };
+                let from = &stmt[..dash_at];
+                let r = &stmt[dash_at..];
                 let r = r[op.len()..].trim_start_matches(['+', '-']);
                 let (to, text) = r.split_once(':').unwrap_or((r, ""));
                 if from.trim().is_empty() || to.trim().is_empty() {
@@ -1498,5 +1570,64 @@ mod tests {
             "{out:?}"
         );
         assert!(out[2].contains("25.0%"));
+    }
+
+    /// `;` inside a label or after a message's `:` is text (#878).
+    #[test]
+    fn semicolons_in_labels_and_messages_are_text() {
+        let all = text("flowchart LR\n  A[\"wait; retry\"] --> B", 80).join("\n");
+        assert!(all.contains("wait; retry"), "{all}");
+        assert!(
+            all.contains("│ B ") && all.contains('▶'),
+            "the edge stays:\n{all}"
+        );
+        assert!(!all.contains("│ retry"), "{all}");
+        let all = text("sequenceDiagram\n  A->>B: hello; world", 80).join("\n");
+        assert!(all.contains("hello; world"), "{all}");
+        // A plain `;` still separates statements.
+        let all = text("graph LR\n  A --> B; B --> C", 80).join("\n");
+        assert!(all.contains("│ A ") && all.contains("│ C │"), "{all}");
+    }
+
+    /// Constructs that used to draw a wrong picture now draw the right one
+    /// or fall back to the source (#879).
+    #[test]
+    fn no_wrong_pictures() {
+        // Hyphenated participants.
+        let all = text(
+            "sequenceDiagram\n  my-svc->>db: query\n  db-->>my-svc: rows",
+            80,
+        )
+        .join("\n");
+        assert!(
+            all.contains("my-svc") && all.contains("query") && all.contains("rows"),
+            "{all}"
+        );
+        // A note's body is not a state.
+        let all = text("stateDiagram-v2\n  [*] --> Idle\n  note right of Idle\n    Status: ok\n  end note\n  Idle --> Busy", 80).join("\n");
+        assert!(!all.contains("│ ok │"), "{all}");
+        assert!(all.contains("Idle") && all.contains("Busy"), "{all}");
+        // A subgraph's direction stays inside it.
+        let td = text(
+            "flowchart TD\n  A --> B\n  subgraph S\n    direction LR\n    C --> D\n  end",
+            80,
+        );
+        let row_of = |name: &str| {
+            td.iter()
+                .position(|l| l.contains(&format!("│ {name} ")))
+                .unwrap()
+        };
+        assert!(
+            row_of("A") < row_of("B"),
+            "top-down kept:\n{}",
+            td.join("\n")
+        );
+        // Two-way and cross/circle tips: the source, not a one-way arrow.
+        assert!(render("flowchart LR\n  A <--> B", false, 80).is_none());
+        assert!(render("flowchart LR\n  A --x B", false, 80).is_none());
+        assert!(render("flowchart LR\n  A --o B", false, 80).is_none());
+        // A labelled self-loop keeps its label.
+        let all = text("flowchart LR\n  A -->|retry| A\n  A --> B", 80).join("\n");
+        assert!(all.contains("↺ retry"), "{all}");
     }
 }
