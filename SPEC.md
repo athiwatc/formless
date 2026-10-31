@@ -173,7 +173,10 @@ without redesign.
   resend without it, with a note to the user: rejected replayed thinking
   (the Session's stored blocks are then dropped), thinking, an output
   limit (lowered to the one the error names), `cache_control` (also on
-  Chat Completions) or an image. Tools are native, or with
+  Chat Completions) or an image. Merely mentioning an image does not
+  resend a request with no image left to remove. Each recovery kind is
+  applied at most once per request, and exhausting the total resend cap
+  reports the final HTTP status and error body. Tools are native, or with
   `tool_mode = "prompt"` described in the `system` prompt and parsed from
   the text; the probe forces a call with `tool_choice: {type: "any"}`.
   The listing is read page by page (`has_more` / `after_id`), and its

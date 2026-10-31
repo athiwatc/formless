@@ -789,6 +789,22 @@ mod tests {
         );
         assert_eq!(recover(&mut b, "thinking: not supported"), None);
         assert_eq!(recover(&mut b, "something else"), None);
+        assert_eq!(
+            recover(&mut b, "unsupported image source"),
+            None,
+            "image mentions alone never resend"
+        );
+        b["messages"][0]["content"] =
+            json!([{"type":"image", "source":{"type":"url","url":"https://example.com/x.png"}}]);
+        assert_eq!(
+            recover(&mut b, "unsupported image source"),
+            Some(Recovery::Images)
+        );
+        assert_eq!(
+            recover(&mut b, "unsupported image source"),
+            None,
+            "already removed"
+        );
     }
 
     /// Anthropic's real wordings each take their own branch (#1089).

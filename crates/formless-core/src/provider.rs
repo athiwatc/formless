@@ -1246,6 +1246,7 @@ impl Provider {
             }
         }
         let mut recovered = Recovered::default();
+        let mut applied_fixes = Vec::new();
         let mut last_err = String::new();
         let last = models.len().saturating_sub(1);
         for (mi, model) in models.iter().enumerate() {
@@ -1304,6 +1305,12 @@ impl Provider {
                         }
                         server_wait = retry_after(resp.headers());
                         let text = resp.text().await.unwrap_or_default();
+                        // Save every rejected response before any recovery can
+                        // continue, including the final send at the resend cap.
+                        last_err = match server_wait {
+                            Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
+                            None => format!("{status}: {text}"),
+                        };
                         let lower = text.to_lowercase();
                         let rejected = OPTIONAL_PARAMS
                             .iter()
@@ -1326,19 +1333,22 @@ impl Provider {
                         // cap, cache breakpoints, images): each fixed once,
                         // so a rejected history never bricks the Session.
                         if status.as_u16() == 400 {
+                            let mut repaired = body.clone();
                             let fix = if self.cfg.anthropic() {
-                                crate::anthropic::recover(body, &text)
+                                crate::anthropic::recover(&mut repaired, &text)
                             } else if lower.contains("cache_control")
                                 && body.get("__no_cache_control").is_none()
                             {
                                 // Not marked again on later attempts.
-                                crate::anthropic::strip_cache_control(body);
-                                body["__no_cache_control"] = json!(true);
+                                crate::anthropic::strip_cache_control(&mut repaired);
+                                repaired["__no_cache_control"] = json!(true);
                                 Some(crate::anthropic::Recovery::CacheControl)
                             } else {
                                 None
                             };
-                            if let Some(fix) = fix {
+                            if let Some(fix) = fix.filter(|f| !applied_fixes.contains(f)) {
+                                *body = repaired;
+                                applied_fixes.push(fix);
                                 tracing::info!(
                                     "provider rejected the request ({fix:?}); resending"
                                 );
@@ -1348,10 +1358,7 @@ impl Provider {
                                 continue;
                             }
                         }
-                        last_err = match server_wait {
-                            Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
-                            None => format!("{status}: {text}"),
-                        };
+
                         // A rejected OAuth token (revoked, or clock skew past
                         // the expiry margin): refresh once and resend.
                         if status.as_u16() == 401 && self.cfg.oauth() && !reauthed {
@@ -2994,6 +3001,132 @@ mod tests {
             p.backoff(0, Some(Duration::from_secs(3600))),
             Duration::from_secs(300)
         );
+    }
+
+    async fn rejecting_provider(
+        errors: Vec<&'static str>,
+    ) -> (
+        Provider,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let app = axum::Router::new().route(
+            "/messages",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |axum::Json(body): axum::Json<Value>| {
+                    let seen = seen.clone();
+                    let errors = errors.clone();
+                    async move {
+                        let index = {
+                            let mut s = seen.lock().unwrap();
+                            let i = s.len();
+                            s.push(body);
+                            i
+                        };
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(
+                                json!({"error":{"message":errors[index.min(errors.len()-1)]}}),
+                            ),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = Provider::new(
+            ProviderCfg {
+                base_url: format!("http://{address}"),
+                api_style: "anthropic".into(),
+                max_retries: 0,
+                ..Default::default()
+            },
+            "test-key".into(),
+        )
+        .unwrap();
+        (provider, seen, server)
+    }
+
+    #[tokio::test]
+    async fn persistent_image_rejections_do_not_resend_an_unchanged_request() {
+        for image in [false, true] {
+            let (p, seen, server) =
+                rejecting_provider(vec!["unsupported image source: persistent-image-error"]).await;
+            let content = if image {
+                json!([{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}])
+            } else {
+                json!([{"type":"text","text":"hello"}])
+            };
+            let mut body =
+                json!({"model":"claude-x", "messages":[{"role":"user","content":content}]});
+            let error = p
+                .post_provider(&mut body, None, false)
+                .await
+                .err()
+                .expect("persistent400 must fail")
+                .to_string();
+            assert!(
+                error.contains("400") && error.contains("persistent-image-error"),
+                "{error}"
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), if image { 2 } else { 1 }, "{seen:?}");
+            if image {
+                assert!(!seen[1].to_string().contains("\"type\":\"image\""));
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_kinds_apply_once_and_resend_cap_keeps_the_last_400() {
+        let (p, seen, server) = rejecting_provider(vec![
+            "stream_options unsupported",
+            "prompt_cache_key unsupported",
+            "Unrecognized request argument reasoning_effort",
+            "Invalid signature in thinking block",
+            "max_tokens must exceed thinking.budget_tokens",
+            "thinking unsupported",
+            "max_tokens: 10000 > 4096",
+            "cache_control unsupported",
+            "unsupported image: terminal-image-400",
+        ])
+        .await;
+        let mut body = json!({"model":"claude-x", "max_tokens":10000, "thinking":{"type":"enabled","budget_tokens":10000},
+        "stream_options":{}, "prompt_cache_key":"x", "messages":[{"role":"user","content":[
+            {"type":"thinking","thinking":"x","signature":"bad"}, {"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}, {"type":"text","text":"x","cache_control":{"type":"ephemeral"}}
+        ]}]});
+        let error = p
+            .post_provider(&mut body, Some("high"), false)
+            .await
+            .err()
+            .expect("resend cap must fail")
+            .to_string();
+        assert!(
+            error.contains("400") && error.contains("terminal-image-400"),
+            "{error}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), MAX_RESENDS + 1);
+        server.abort();
+
+        let (p, seen, server) =
+            rejecting_provider(vec!["max_tokens: 10000 > 8192", "max_tokens: 8192 > 4096"]).await;
+        let mut body = json!({"model":"claude-x", "max_tokens":10000,"messages":[]});
+        let error = p
+            .post_provider(&mut body, None, false)
+            .await
+            .err()
+            .expect("same recovery kind must not repeat")
+            .to_string();
+        assert!(error.contains("8192 > 4096"), "{error}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        server.abort();
     }
 
     #[test]
