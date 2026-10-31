@@ -5110,6 +5110,22 @@ impl App {
             "mcp" => self.request(Pending::ListMcpServers, Request::ListMcpServers),
             "prompts" => self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts),
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
+            cmd if cmd.starts_with("skills enable ") || cmd.starts_with("skills disable ") => {
+                let enabled = cmd.starts_with("skills enable ");
+                let name = cmd
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or_default()
+                    .to_string();
+                self.fire(Request::SetSkillEnabled {
+                    name: name.clone(),
+                    enabled,
+                });
+                self.notes.push(format!(
+                    "{} skill {name}",
+                    if enabled { "enabling" } else { "disabling" }
+                ));
+            }
             // Preview a skill before enabling it: SKILL.md, files, scripts.
             cmd if cmd.starts_with("skills ") => {
                 let name = cmd["skills ".len()..].trim().to_string();
@@ -5510,22 +5526,6 @@ impl App {
                         .notes
                         .push("usage: /memory [rm|on|off ID | edit ID TEXT]".into()),
                 }
-            }
-            cmd if cmd.starts_with("skills enable ") || cmd.starts_with("skills disable ") => {
-                let enabled = cmd.starts_with("skills enable ");
-                let name = cmd
-                    .split_whitespace()
-                    .nth(2)
-                    .unwrap_or_default()
-                    .to_string();
-                self.fire(Request::SetSkillEnabled {
-                    name: name.clone(),
-                    enabled,
-                });
-                self.notes.push(format!(
-                    "{} skill {name}",
-                    if enabled { "enabling" } else { "disabling" }
-                ));
             }
             cmd if cmd.starts_with("prompt ") => {
                 let mut words = cmd["prompt ".len()..].split_whitespace();
@@ -15067,6 +15067,57 @@ mod tests {
                 .value,
             "daemon mode unknown"
         );
+    }
+
+    #[test]
+    fn skill_command_prefixes_dispatch_to_their_distinct_requests() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        for (command, expected) in [
+            ("skills", Request::ListSkills),
+            ("skills foo", Request::GetSkill { name: "foo".into() }),
+            (
+                "skills enable foo",
+                Request::SetSkillEnabled {
+                    name: "foo".into(),
+                    enabled: true,
+                },
+            ),
+            (
+                "skills disable foo",
+                Request::SetSkillEnabled {
+                    name: "foo".into(),
+                    enabled: false,
+                },
+            ),
+            (
+                "skill:foo",
+                Request::LoadSkill {
+                    session_id: "s1".into(),
+                    name: "foo".into(),
+                    args: None,
+                },
+            ),
+            (
+                "skill:foo do this",
+                Request::LoadSkill {
+                    session_id: "s1".into(),
+                    name: "foo".into(),
+                    args: Some("do this".into()),
+                },
+            ),
+        ] {
+            app.slash(command);
+            let envelope: RequestEnvelope =
+                serde_json::from_str(&sent.try_recv().expect(command)).unwrap();
+            assert_eq!(
+                serde_json::to_value(envelope.request).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{command}"
+            );
+            assert!(sent.try_recv().is_err(), "{command} must send one request");
+        }
     }
 
     #[test]

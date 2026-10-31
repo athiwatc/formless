@@ -1597,7 +1597,9 @@ Tools fill capability gaps; skills say how to use them well.
 
 - **By hand.** `/skills NAME` previews a skill in the pager (SKILL.md,
   its files, and its scripts, which never run on the host) before it is
-  enabled; the web "Review" does the same. `/skill:NAME [args]`
+  enabled; `/skills enable NAME` and `/skills disable NAME` change its
+  enabled state instead of previewing a name beginning with the verb.
+  The web "Review" does the same preview. `/skill:NAME [args]`
   (`LoadSkill {session_id, name, args}`) loads an enabled skill into the
   Session: its instructions and arguments join the chat as a note, and
   the load counts like the agent's.
