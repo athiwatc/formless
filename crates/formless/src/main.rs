@@ -1165,10 +1165,16 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
                     &name,
                 )?;
             }
-            if daemon_reachable(&target) {
-                let _ = formless_tui::client::request_once(&target, Request::Shutdown);
+            let _gate = formless_core::profile_lock::ProfileLock::launcher(
+                &target,
+                std::time::Duration::from_secs(30),
+            )?;
+            if formless_core::daemon::endpoint_occupied(&target)? {
+                formless_tui::client::request_once(&target, Request::Shutdown)?;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while daemon_reachable(&target) || target.lock_file().exists() {
+                while formless_core::daemon::endpoint_occupied(&target)?
+                    || formless_core::profile_lock::owner_held(&target)?
+                {
                     if std::time::Instant::now() > deadline {
                         anyhow::bail!(
                             "profile '{name}''s daemon did not stop; nothing was deleted"
@@ -1176,6 +1182,10 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+            }
+            let _owner = formless_core::profile_lock::ProfileLock::owner(&target)?;
+            if formless_core::daemon::endpoint_occupied(&target)? {
+                anyhow::bail!("profile daemon restarted; nothing was deleted");
             }
             formless_core::config::reset_all(&target)?;
             println!("removed profile '{name}'");
@@ -1479,6 +1489,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             if daemon_reachable(&paths) {
                 anyhow::bail!("stop the daemon first: formless daemon stop");
             }
+            eprintln!("restore: close TUIs and pause any login service that may restart the daemon; exclusive profile ownership is required");
             let saved = formless_core::housekeeping::restore(&paths, &file)?;
             println!("restored:  {}", file.display());
             println!("previous:  saved as {}", saved.display());
@@ -1958,7 +1969,19 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
                 println!("{}", formless_core::service::dry_run(&plan));
                 return Ok(());
             }
-            formless_core::service::install(&plan)?;
+            formless_core::service::handover(
+                &paths,
+                std::time::Duration::from_secs(60),
+                || {
+                    formless_tui::client::request_once_within(
+                        &paths,
+                        Request::Shutdown,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .map(|_| ())
+                },
+                || formless_core::service::install(&plan),
+            )?;
             println!("installed: {} ({})", plan.file.display(), plan.manager);
             println!("the daemon now starts at login and stays up, so jobs run on schedule");
             println!("remove it: formless daemon uninstall-service");
@@ -2234,20 +2257,8 @@ struct Problem {
 enum Fix {
     /// Leftovers of a daemon that is gone.
     RemoveStale(Vec<std::path::PathBuf>),
-    /// A daemon process that no longer answers: stop it, start a new one.
-    RestartStuck(u32),
     /// Secret files others can read.
     Chmod600(Vec<std::path::PathBuf>),
-}
-
-/// Whether `pid` is a live formless process (unix: `ps`).
-#[cfg(unix)]
-fn formless_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("formless"))
-        .unwrap_or(false)
 }
 
 /// The daemon and file checks `--fix` can act on.
@@ -2293,18 +2304,18 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     if !daemon_reachable(paths) {
         let sock = paths.socket_path();
         let lock = paths.lock_file();
-        let pid = std::fs::read_to_string(&lock)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        match pid {
-            Some(pid) if formless_pid_alive(pid) => out.push(Problem {
-                what: format!("the daemon (pid {pid}) is running but doesn't answer on its socket"),
-                next: Some(format!(
-                    "kill {pid}; then any formless command starts a new one"
-                )),
-                fix: Some(Fix::RestartStuck(pid)),
+        match formless_core::profile_lock::owner_held(paths) {
+            Ok(true) => out.push(Problem {
+                what: "the profile has a kernel owner but its daemon does not answer".into(),
+                next: Some("stop the daemon through its service manager or original binary; PID markers do not authenticate processes".into()),
+                fix: None,
             }),
-            _ => {
+            Err(e) => out.push(Problem {
+                what: format!("profile ownership is unknown: {e:#}"),
+                next: None,
+                fix: None,
+            }),
+            Ok(false) => {
                 let stale: Vec<std::path::PathBuf> =
                     [sock, lock].into_iter().filter(|p| p.exists()).collect();
                 if !stale.is_empty() {
@@ -2383,31 +2394,15 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
 fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
     match fix {
         Fix::RemoveStale(files) => {
+            let _owner = formless_core::profile_lock::ProfileLock::owner(paths)
+                .map_err(|e| format!("{e:#}"))?;
+            if formless_core::daemon::endpoint_occupied(paths).map_err(|e| format!("{e:#}"))? {
+                return Err("daemon became reachable; stale files were kept".into());
+            }
             for f in files {
                 std::fs::remove_file(f).map_err(|e| format!("{}: {e}", f.display()))?;
             }
             Ok("removed the stale files".into())
-        }
-        Fix::RestartStuck(pid) => {
-            let killed = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .map_err(|e| e.to_string())?;
-            if !killed.success() {
-                return Err(format!("could not stop pid {pid}"));
-            }
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                #[cfg(unix)]
-                if !formless_pid_alive(*pid) {
-                    break;
-                }
-            }
-            let _ = std::fs::remove_file(paths.lock_file());
-            #[cfg(unix)]
-            let _ = std::fs::remove_file(paths.socket_path());
-            formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
-            Ok(format!("stopped pid {pid} and started a new daemon"))
         }
         Fix::Chmod600(files) => {
             #[cfg(unix)]
@@ -2635,6 +2630,13 @@ fn storage_cmd(paths: &Paths, json: bool) -> Result<()> {
         ]);
     }
     tbl.print();
+    for copy in formless_core::housekeeping::list_restore_backups(paths) {
+        println!(
+            "recovery:  {} (before-restore; keeps {})",
+            copy.display(),
+            formless_core::housekeeping::RESTORE_BACKUPS_KEEP
+        );
+    }
     println!(
         "total:     {} in {}",
         human_bytes(u["total_bytes"].as_u64().unwrap_or(0)),
@@ -2741,15 +2743,36 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         Some(p) => say!("proxy:      {p} (provider.proxy or HTTPS_PROXY; NO_PROXY is honoured)"),
         None => say!("proxy:      none"),
     }
-    match formless_core::service::installed(&paths) {
-        Some((manager, file)) => say!(
-            "service:    starts at login ({manager}: {})",
-            file.display()
-        ),
-        None => {
-            say!("service:    not installed (formless daemon install-service starts it at login)")
+    match formless_core::service::status(&paths) {
+        Ok(service) => {
+            let registration = match service.registration {
+                formless_core::service::Registration::Registered => "registered".to_string(),
+                formless_core::service::Registration::NotRegistered => "not registered".to_string(),
+                formless_core::service::Registration::Unknown(why) => {
+                    format!("registration unknown ({why})")
+                }
+            };
+            say!(
+                "service:    {}; definition {} ({}: {})",
+                registration,
+                if service.file_present {
+                    "present"
+                } else {
+                    "missing"
+                },
+                service.manager,
+                service.file.display()
+            );
         }
+        Err(e) => say!("service:    status unknown ({e:#})"),
     }
+    let recovery = formless_core::housekeeping::list_restore_backups(&paths);
+    say!(
+        "recovery:   {} before-restore copies (keeps {}); {}",
+        recovery.len(),
+        formless_core::housekeeping::RESTORE_BACKUPS_KEEP,
+        formless_core::housekeeping::backup_dir(&paths).display()
+    );
     match formless_core::housekeeping::last_backup(&paths) {
         Some((file, at)) => {
             let age = at.elapsed().unwrap_or_default().as_secs();

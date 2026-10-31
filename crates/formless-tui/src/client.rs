@@ -407,15 +407,15 @@ pub fn restart_daemon(paths: &Paths, force: bool, mut say: impl FnMut(&str)) -> 
                 }
                 let _ = request_once(paths, Request::Shutdown);
             }
-            // A daemon on another protocol cannot be asked to stop: signal it.
+            // Another protocol cannot authenticate shutdown through this client.
             Err(e) if has_code(&e, codes::PROTOCOL_MISMATCH, "protocol mismatch") => {
                 terminate_daemon(paths)?
             }
             Err(e) => return Err(e),
         }
-        // Gone means not accepting and done flushing (it removes its lock last).
+        // Gone means not accepting and all ownership-bearing state has dropped.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while daemon_reachable(paths) || paths.lock_file().exists() {
+        while daemon_reachable(paths) || formless_core::profile_lock::owner_held(paths)? {
             if Instant::now() > deadline {
                 anyhow::bail!("the old daemon did not exit within 30s; see `formless doctor`");
             }
@@ -428,29 +428,10 @@ pub fn restart_daemon(paths: &Paths, force: bool, mut say: impl FnMut(&str)) -> 
     Ok(())
 }
 
-/// SIGTERM the daemon named in the lock file, then drop its lock and
-/// socket (it may not get to clean up after itself).
+/// PID markers can be stale or name a reused PID. Without an authenticated
+/// protocol shutdown, refusing is safer than signaling an unrelated process.
 fn terminate_daemon(paths: &Paths) -> Result<()> {
-    let pid = std::fs::read_to_string(paths.lock_file())
-        .ok()
-        .and_then(|p| p.trim().parse::<u32>().ok())
-        .ok_or_else(|| anyhow::anyhow!("no daemon pid in {}", paths.lock_file().display()))?;
-    #[cfg(unix)]
-    let status = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status()?;
-    #[cfg(windows)]
-    let status = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("could not stop the daemon (pid {pid})");
-    }
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = std::fs::remove_file(paths.lock_file());
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(paths.socket_path());
-    Ok(())
+    anyhow::bail!("cannot authenticate the older daemon for shutdown; stop it through its service manager or original binary before retrying (PID marker: {})", paths.lock_file().display())
 }
 
 #[cfg(test)]

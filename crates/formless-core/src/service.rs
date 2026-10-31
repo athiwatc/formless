@@ -151,13 +151,8 @@ fn plan_for(paths: &Paths, exe: &Path, home: &Path, os: ServiceOs) -> Result<Pla
             manager: "launchd",
             file,
             contents,
-            enable: vec![vec![
-                "launchctl".into(),
-                "load".into(),
-                "-w".into(),
-                f.clone(),
-            ]],
-            disable: vec![vec!["launchctl".into(), "unload".into(), "-w".into(), f]],
+            enable: vec![vec!["launchctl".into(), "load".into(), "-w".into(), f]],
+            disable: vec![vec!["launchctl".into(), "remove".into(), label]],
         })
     } else if os == ServiceOs::Windows {
         // Batch percent expansion happens even inside quotes. Disable delayed
@@ -274,7 +269,10 @@ fn run_all_with(
         let launchctl_failure = Path::new(prog)
             .file_name()
             .is_some_and(|n| n == "launchctl")
-            && matches!(c.get(1).map(String::as_str), Some("load" | "unload"))
+            && matches!(
+                c.get(1).map(String::as_str),
+                Some("load" | "unload" | "remove")
+            )
             && (stderr.to_ascii_lowercase().contains("failed")
                 || stderr.to_ascii_lowercase().contains("error"));
         if !success || launchctl_failure {
@@ -282,10 +280,6 @@ fn run_all_with(
         }
     }
     Ok(())
-}
-
-fn run_all(cmds: &[Vec<String>]) -> Result<()> {
-    run_all_with(cmds, &mut run_command)
 }
 
 /// Write the service file and load it. Reinstalling a launchd agent unloads
@@ -312,25 +306,167 @@ fn install_with(
 
 /// Unload the service, then remove its file. A failed unload keeps the
 /// file, so the service manager never respawns a deleted binary (#1079).
-/// A Windows task is deleted by name even when its script is gone.
+/// Every manager is addressed by stable registration identity even when its file is gone.
 pub fn uninstall(plan: &Plan) -> Result<()> {
-    let present = plan.file.exists();
-    if !present && plan.manager != "Task Scheduler" {
-        return Err(anyhow!(
-            "not installed ({} is missing)",
-            plan.file.display()
-        ));
+    uninstall_with(plan, &mut run_command)
+}
+
+fn uninstall_with(
+    plan: &Plan,
+    run: &mut impl FnMut(&[String]) -> Result<(bool, String)>,
+) -> Result<()> {
+    // A manager can retain a registered job after its definition is removed.
+    run_all_with(&plan.disable, run)
+        .context("could not disable the registered service; any definition is kept")?;
+    match std::fs::remove_file(&plan.file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
     }
-    if let Err(e) = run_all(&plan.disable) {
-        if present {
-            return Err(e.context("could not unload the service; its file is kept"));
+}
+
+/// Serialize automatic launchers during a deliberate stop, release, and load.
+pub fn handover(
+    paths: &Paths,
+    timeout: std::time::Duration,
+    stop: impl FnMut() -> Result<()>,
+    start: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    handover_with(paths, timeout, stop, start, || {
+        Ok((
+            crate::daemon::endpoint_occupied(paths)?,
+            crate::profile_lock::owner_held(paths)?,
+        ))
+    })
+}
+
+fn handover_with(
+    paths: &Paths,
+    timeout: std::time::Duration,
+    mut stop: impl FnMut() -> Result<()>,
+    start: impl FnOnce() -> Result<()>,
+    mut state: impl FnMut() -> Result<(bool, bool)>,
+) -> Result<()> {
+    let _gate = crate::profile_lock::ProfileLock::launcher(paths, timeout)?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut stopped = false;
+    loop {
+        let (reachable, owned) = state()?;
+        if !reachable && !owned {
+            break;
         }
-        return Err(anyhow!("not installed (no {} task)", plan.manager));
+        if reachable && !stopped {
+            stop()?;
+            stopped = true;
+            continue;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "existing daemon did not release ownership; service was not loaded"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    if present {
-        std::fs::remove_file(&plan.file)?;
+    start()?;
+    loop {
+        let (reachable, owned) = state()?;
+        if reachable || owned {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "service loaded but did not claim the profile; check the service manager"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Registration {
+    Registered,
+    NotRegistered,
+    Unknown(String),
+}
+
+pub struct ServiceStatus {
+    pub manager: &'static str,
+    pub file: PathBuf,
+    pub file_present: bool,
+    pub registration: Registration,
+}
+
+fn registration_with(
+    plan: &Plan,
+    mut query: impl FnMut(&[String]) -> Result<(bool, String)>,
+) -> Registration {
+    let command = match plan.manager {
+        "launchd" => vec![
+            "launchctl".into(),
+            "list".into(),
+            plan.file
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        "systemd" => vec![
+            "systemctl".into(),
+            "--user".into(),
+            "show".into(),
+            plan.file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            "--property=LoadState".into(),
+            "--property=ActiveState".into(),
+        ],
+        "Task Scheduler" => {
+            let name = plan
+                .disable
+                .iter()
+                .flat_map(|c| c.windows(2))
+                .find(|p| p[0] == "/TN")
+                .map(|p| p[1].clone());
+            let Some(name) = name else {
+                return Registration::Unknown("no task name".into());
+            };
+            vec!["schtasks".into(), "/Query".into(), "/TN".into(), name]
+        }
+        _ => return Registration::Unknown("unsupported manager".into()),
+    };
+    match query(&command) {
+        Ok((true, text)) if text.lines().any(|l| l == "LoadState=not-found") => {
+            Registration::NotRegistered
+        }
+        Ok((true, _)) => Registration::Registered,
+        Ok((false, text)) => Registration::Unknown(text.trim().into()),
+        Err(e) => Registration::Unknown(format!("{e:#}")),
+    }
+}
+
+/// Query registration independently of whether the definition still exists.
+pub fn status(paths: &Paths) -> Result<ServiceStatus> {
+    let plan = plan_here(paths)?;
+    let registration = registration_with(&plan, |c| {
+        let out = std::process::Command::new(&c[0]).args(&c[1..]).output()?;
+        let text = if out.status.success() {
+            &out.stdout
+        } else {
+            &out.stderr
+        };
+        Ok((
+            out.status.success(),
+            String::from_utf8_lossy(text).into_owned(),
+        ))
+    });
+    Ok(ServiceStatus {
+        manager: plan.manager,
+        file_present: plan.file.exists(),
+        file: plan.file,
+        registration,
+    })
 }
 
 /// The plan for this binary and this user.
@@ -358,6 +494,117 @@ mod tests {
             config_dir: config.into(),
             profile: profile.into(),
         }
+    }
+
+    #[test]
+    fn missing_definition_still_disables_registration_and_queries_remain_truthful() {
+        let base = std::env::temp_dir().join(format!("fl-svc-{}", uuid::Uuid::new_v4()));
+        let paths = fixture(
+            base.join("d").to_str().unwrap(),
+            base.join("c").to_str().unwrap(),
+            "default",
+        );
+        for os in [ServiceOs::MacOs, ServiceOs::Systemd, ServiceOs::Windows] {
+            let p = plan_for(&paths, &base.join("formless"), &base, os).unwrap();
+            assert!(!p.file.exists());
+            let mut called = Vec::new();
+            uninstall_with(&p, &mut |args| {
+                called.push(args.to_vec());
+                Ok((true, String::new()))
+            })
+            .unwrap();
+            assert_eq!(called, p.disable);
+            assert_eq!(
+                registration_with(&p, |_| Ok((true, String::new()))),
+                Registration::Registered
+            );
+            assert!(matches!(
+                registration_with(&p, |_| Ok((false, "manager unavailable".into()))),
+                Registration::Unknown(_)
+            ));
+            assert!(matches!(
+                registration_with(&p, |_| Err(anyhow!("permission denied"))),
+                Registration::Unknown(_)
+            ));
+            if os == ServiceOs::MacOs {
+                assert_eq!(p.disable[0][1], "remove");
+                assert!(!p.disable[0].contains(&p.file.display().to_string()));
+            }
+            if os == ServiceOs::Systemd {
+                assert_eq!(
+                    registration_with(&p, |_| Ok((
+                        true,
+                        "LoadState=not-found\nActiveState=inactive\n".into()
+                    ))),
+                    Registration::NotRegistered
+                );
+            }
+        }
+        assert!(
+            !base.exists(),
+            "queries and missing-file removal create no profile state"
+        );
+    }
+
+    #[test]
+    fn handover_serializes_stop_release_and_service_start_and_fails_closed() {
+        use std::cell::{Cell, RefCell};
+        let base = std::env::temp_dir().join(format!("fl-handover-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            data_dir: base.join("d"),
+            config_dir: base.join("c"),
+            profile: "default".into(),
+        };
+        let state = Cell::new((true, true));
+        let calls = RefCell::new(Vec::new());
+        handover_with(
+            &paths,
+            std::time::Duration::from_secs(1),
+            || {
+                calls.borrow_mut().push("stop");
+                state.set((false, false));
+                Ok(())
+            },
+            || {
+                assert!(
+                    crate::profile_lock::ProfileLock::launcher(&paths, std::time::Duration::ZERO)
+                        .is_err(),
+                    "automatic launchers remain serialized"
+                );
+                assert_eq!(state.get(), (false, false));
+                calls.borrow_mut().push("load");
+                state.set((false, true));
+                Ok(())
+            },
+            || Ok(state.get()),
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["stop", "load"]);
+        let started = Cell::new(false);
+        assert!(handover_with(
+            &paths,
+            std::time::Duration::ZERO,
+            || Err(anyhow!("shutdown rejected")),
+            || {
+                started.set(true);
+                Ok(())
+            },
+            || Ok((true, true))
+        )
+        .is_err());
+        assert!(!started.get());
+        assert!(handover_with(
+            &paths,
+            std::time::Duration::ZERO,
+            || Ok(()),
+            || {
+                started.set(true);
+                Ok(())
+            },
+            || Err(anyhow!("unknown owner"))
+        )
+        .is_err());
+        assert!(!started.get());
     }
 
     #[test]

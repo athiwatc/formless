@@ -23,6 +23,7 @@ pub mod optimiser;
 pub mod path_scope;
 pub mod paths;
 pub mod presets;
+pub mod profile_lock;
 pub mod provider;
 pub mod relay;
 pub mod routing;

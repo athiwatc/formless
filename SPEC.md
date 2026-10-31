@@ -2214,8 +2214,9 @@ such as `read_file`, `read_text_file` and `file_read`.
   `formless-protocol`).
 - A client whose protocol version is outside the daemon's range **refuses to
   attach** with a clear message (no silent incompatibility) that points to
-  `formless daemon restart`. Restart stops a daemon on another protocol by
-  signalling the pid in its lock file, since that daemon cannot be asked.
+  `formless daemon restart`. Restart uses protocol shutdown. If an incompatible
+  daemon cannot authenticate that request, it directs the user to its service
+  manager or original binary and refuses to signal a PID marker that may be stale.
 - On connect, the TUI and `formless run` compare their version with the
   daemon's (`Status.version`; a daemon that predates it counts as older).
   If they differ but the protocol matches, for example an old daemon left
@@ -2249,11 +2250,19 @@ such as `read_file`, `read_text_file` and `file_read`.
 
 ### 9.4 Instances, profiles, storage, data dirs
 
-- Single instance per data dir (lock file); starting a second daemon against
+- Single instance per data dir (kernel-held ownership lock); starting a second daemon against
   the same dir is refused and points at the running one. `--profile <name>`
   gives an isolated daemon + data/config dirs (intended for testing
   dangerous Tools). Named profiles live in sub-directories of the default
-  profile's data and config dirs. `formless profiles list [--json]` shows
+  profile's data and config dirs.
+  Ownership is acquired before opening/migrating the store or performing startup
+  recovery. Its private per-user lock file is keyed by the canonical data directory,
+  lives outside removable profile directories, and is never unlinked. `daemon.lock`
+  is an owner-written PID marker only. Auto-start and service installation share a
+  separate launcher gate; installation stops a running daemon and waits for its
+  ownership to release before loading the service. A second daemon cannot alter
+  the owner's PID marker, socket, uploads or recovery state.
+  `formless profiles list [--json]` shows
   each profile (default first), whether its daemon runs, when it was last
   used and its data dir, and marks the current one. `formless profiles rm
   NAME [--yes]` asks for the name to be typed, stops that profile's daemon
@@ -2349,13 +2358,18 @@ reuse rather than sacrificing a backup or hiding the migration error.
   `formless backup` / `Backup` / TUI `/backup` take one now. `formless
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
-  the current database as `backups/before-restore-<time>.db`, copies it
-  in and migrates it. Backup and pre-restore filenames include fixed-width
+  the current database as `backups/before-restore-<time>.db`, stages and migrates
+  the selected snapshot in the same directory, fsyncs it, and atomically replaces
+  the canonical database while holding exclusive daemon ownership. Current WAL
+  data is checkpointed before old sidecars are removed. Failed staging or migration
+  leaves the canonical database unchanged. Restore warns that open TUIs/login
+  services may restart the daemon after the operation. Pre-restore safety copies
+  have their own retention of seven and are listed by storage/doctor independently
+  of daily backups. Backup and pre-restore filenames include fixed-width
   fractional UTC seconds and a unique suffix, preserving distinct restore
   points even within the same second; existing backup destinations are
-  never replaced. If post-restore migration fails, the error identifies the
-  safety copy; the copied database remains at its last completed schema
-  version, and the safety copy can be restored even from this state.
+  never replaced. A failed staged migration identifies any safety copy and leaves
+  the old canonical database available; the safety copy remains independently usable.
   `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no
