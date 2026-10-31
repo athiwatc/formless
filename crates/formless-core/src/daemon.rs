@@ -1410,10 +1410,9 @@ impl Daemon {
                     if let Some(result) = outcome.borrow().clone() {
                         return result.map_err(CachedSendFailure::into_error);
                     }
-                    outcome
-                        .changed()
-                        .await
-                        .context("internal error: SendMessage outcome was lost")?;
+                    outcome.changed().await.context(RequestFailure::internal(
+                        "internal error: SendMessage outcome was lost",
+                    ))?;
                 }
             }
 
