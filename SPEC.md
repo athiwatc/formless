@@ -2261,8 +2261,9 @@ such as `read_file`, `read_text_file` and `file_read`.
   `formless-protocol`).
 - A client whose protocol version is outside the daemon's range **refuses to
   attach** with a clear message (no silent incompatibility) that points to
-  `formless daemon restart`. Restart stops a daemon on another protocol by
-  signalling the pid in its lock file, since that daemon cannot be asked.
+  `formless daemon restart`. Restart uses protocol shutdown. If an incompatible
+  daemon cannot authenticate that request, it directs the user to its service
+  manager or original binary and refuses to signal a PID marker that may be stale.
 - On connect, the TUI and `formless run` compare their version with the
   daemon's (`Status.version`; a daemon that predates it counts as older).
   If they differ but the protocol matches, for example an old daemon left
@@ -2296,11 +2297,37 @@ such as `read_file`, `read_text_file` and `file_read`.
 
 ### 9.4 Instances, profiles, storage, data dirs
 
-- Single instance per data dir (lock file); starting a second daemon against
+- Single instance per data dir (kernel-held ownership lock); starting a second daemon against
   the same dir is refused and points at the running one. `--profile <name>`
   gives an isolated daemon + data/config dirs (intended for testing
   dangerous Tools). Named profiles live in sub-directories of the default
-  profile's data and config dirs. `formless profiles list [--json]` shows
+  profile's data and config dirs.
+  Ownership is acquired before opening/migrating the store or performing startup
+  recovery. It holds private per-user locks for both the configured absolute
+  lexical path (without resolving symlinks) and the current canonical data
+  directory, acquired in sorted unique order. These locks live outside removable
+  profile directories and are never unlinked. Removing or retargeting a configured
+  symlink cannot split ownership while maintenance still changes its config. `daemon.lock`
+  is an owner-written PID marker only. Auto-start and service installation share a
+  separate launcher gate; installation stops a running daemon and waits for its
+  ownership to release before loading the service. A second daemon cannot alter
+  the owner's PID marker, socket, uploads or recovery state.
+  Profile owners, launchers, directory creation and ordinary CLI lifetimes hold
+  shared hierarchy gates for data/config paths and their raw/canonical ancestors.
+  Destructive preparation retains its launch gate while releasing its own shared
+  lease before freezing affected roots exclusively (shared ancestors, sorted and
+  deduplicated); overlapping roots cannot self-deadlock. New descendant profiles
+  cannot be created, started or written by a current CLI during that freeze.
+  Reset, profile removal and full uninstall hold this freeze plus ownership
+  through destructive changes. Full uninstall asks
+  the service manager to disable registration even if the definition is missing;
+  an unknown manager/ownership state preserves the profile and binary. Full
+  uninstall prepares every known profile before deleting any profile files,
+  freezes the base roots, rechecks the inventory, and erases named children before
+  the default parent. Failed child preparation preserves every profile; failed
+  child erasure prevents recursive parent erasure. An inventory change refuses
+  deletion and asks for a retry.
+  `formless profiles list [--json]` shows
   each profile (default first), whether its daemon runs, when it was last
   used and its data dir, and marks the current one. `formless profiles rm
   NAME [--yes]` asks for the name to be typed, stops that profile's daemon
@@ -2404,13 +2431,18 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   `formless backup` / `Backup` / TUI `/backup` take one now. `formless
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
-  the current database as `backups/before-restore-<time>.db`, copies it
-  in and migrates it. Backup and pre-restore filenames include fixed-width
+  the current database as `backups/before-restore-<time>.db`, stages and migrates
+  the selected snapshot in the same directory, fsyncs it, and atomically replaces
+  the canonical database while holding exclusive daemon ownership. Current WAL
+  data is checkpointed before old sidecars are removed. Failed staging or migration
+  leaves the canonical database unchanged. Restore warns that open TUIs/login
+  services may restart the daemon after the operation. Pre-restore safety copies
+  have their own retention of seven and are listed by storage/doctor independently
+  of daily backups. Backup and pre-restore filenames include fixed-width
   fractional UTC seconds and a unique suffix, preserving distinct restore
   points even within the same second; existing backup destinations are
-  never replaced. If post-restore migration fails, the error identifies the
-  safety copy; the copied database remains at its last completed schema
-  version, and the safety copy can be restored even from this state.
+  never replaced. A failed staged migration identifies any safety copy and leaves
+  the old canonical database available; the safety copy remains independently usable.
   `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no
@@ -4137,7 +4169,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   keeps anonymised per-Tool tallies (payloads gone, counts stay). Tool purge
   removes everything incl. tallies. **Full reset** (Settings or
   `formless reset`) stops the daemon and deletes config, keychain entry, and
-  the entire data dir, with explicit confirmation.
+  the entire data dir, with explicit confirmation. Default reset refuses while
+  named profiles exist: remove them with `formless profiles rm NAME` first, or
+  use full uninstall to coordinate every profile. The refusal is checked under
+  the family freeze, so an in-use child or a newly created profile cannot be
+  erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
 
 ## 16. Error handling and edge cases (normative)

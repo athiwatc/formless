@@ -21,6 +21,7 @@ impl Paths {
     /// FORMLESS_CONFIG_DIR. Profile appends a suffix dir (SPEC §9.4).
     pub fn resolve(profile: Option<&str>) -> Result<Self> {
         let paths = Self::resolve_read_only(profile)?;
+        let _lease = crate::profile_lock::ProfileLock::hierarchy_shared(&paths)?;
         std::fs::create_dir_all(&paths.data_dir)?;
         std::fs::create_dir_all(&paths.config_dir)?;
         Ok(paths)
@@ -104,13 +105,15 @@ impl Paths {
     }
 
     pub fn from_dirs(data_dir: PathBuf, config_dir: PathBuf) -> Result<Self> {
-        std::fs::create_dir_all(&data_dir)?;
-        std::fs::create_dir_all(&config_dir)?;
-        Ok(Self {
+        let paths = Self {
             data_dir,
             config_dir,
             profile: "default".into(),
-        })
+        };
+        let _lease = crate::profile_lock::ProfileLock::hierarchy_shared(&paths)?;
+        std::fs::create_dir_all(&paths.data_dir)?;
+        std::fs::create_dir_all(&paths.config_dir)?;
+        Ok(paths)
     }
 
     /// The Session the last `formless run` used (`run --continue`).

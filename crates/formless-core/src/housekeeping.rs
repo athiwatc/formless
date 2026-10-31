@@ -14,6 +14,8 @@ const SNAPSHOT_DAYS: i64 = 30;
 const MCP_LOG_KEEP: u64 = 1_000_000;
 /// Pre-migration database copies kept by `gc` (newest first).
 const MIGRATION_BACKUPS_KEEP: usize = 2;
+/// Recovery points have independent retention from daily snapshots.
+pub const RESTORE_BACKUPS_KEEP: usize = 7;
 
 /// Bytes in a file or (recursively) a folder; 0 when missing.
 pub fn path_bytes(p: &Path) -> u64 {
@@ -94,7 +96,7 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
         json!({"kind": "artifacts", "bytes": artifact_bytes, "detail": format!("{artifact_count} stored outputs")}),
         json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + mcp_logs, "detail": "daemon and MCP server logs"}),
         json!({"kind": "skills", "bytes": path_bytes(&paths.data_dir.join("skills")), "detail": "installed skill files"}),
-        json!({"kind": "backups", "bytes": backups, "detail": "rotated and pre-migration database copies"}),
+        json!({"kind": "backups", "bytes": backups, "detail": "daily, pre-migration and before-restore database copies", "before_restore": list_restore_backups(paths), "before_restore_keep": RESTORE_BACKUPS_KEEP}),
     ];
     let total = path_bytes(&paths.data_dir);
     Ok(
@@ -219,26 +221,34 @@ pub fn backup(paths: &Paths, store: &Store, keep: usize) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Rotated backups, oldest first.
+/// Daily snapshots, oldest first (independent from restore retention).
 pub fn list_backups(paths: &Paths) -> Vec<PathBuf> {
+    list_copies(paths, "formless-")
+}
+
+/// Before-restore recovery points, oldest first.
+pub fn list_restore_backups(paths: &Paths) -> Vec<PathBuf> {
+    list_copies(paths, "before-restore-")
+}
+
+fn list_copies(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(backup_dir(paths))
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("formless-") && n.ends_with(".db"))
+                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".db"))
         })
         .collect();
-    // Legacy names end in whole seconds: the literal Z otherwise sorts
-    // after the fractional dot of a newer snapshot from the same second.
     found.sort_by_cached_key(|p| {
         let at = p
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_prefix("formless-"))
+            .and_then(|n| n.strip_prefix(prefix))
             .and_then(|n| n.strip_suffix(".db"))
             .and_then(parse_backup_stamp);
         (at, p.clone())
@@ -257,6 +267,25 @@ pub fn last_backup(paths: &Paths) -> Option<(PathBuf, std::time::SystemTime)> {
 /// is checked first (a Formless database this build can open), and the
 /// current database is backed up next to it. Returns that backup.
 pub fn restore(paths: &Paths, file: &Path) -> Result<PathBuf> {
+    restore_with(paths, file, |stage, db| {
+        std::fs::rename(stage, db).context("atomically replace the profile database")
+    })
+}
+
+// The replace boundary permits deterministic failure testing without global
+// hooks. Both guards stay alive until migration, checkpoint and replacement end.
+fn restore_with(
+    paths: &Paths,
+    file: &Path,
+    replace: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<PathBuf> {
+    let _gate = crate::profile_lock::ProfileLock::launcher(paths, std::time::Duration::ZERO)?;
+    let _owner = crate::profile_lock::ProfileLock::owner(paths)?;
+    if crate::daemon::endpoint_occupied(paths)? {
+        return Err(anyhow!(
+            "a daemon is still reachable; stop it before restoring"
+        ));
+    }
     let probe =
         rusqlite::Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("cannot open {}", file.display()))?;
@@ -270,13 +299,11 @@ pub fn restore(paths: &Paths, file: &Path) -> Result<PathBuf> {
         ));
     }
     let version: i64 = probe.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let has_sessions: bool = probe
-        .query_row(
-            "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='sessions'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
+    let has_sessions: bool = probe.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='sessions'",
+        [],
+        |r| r.get(0),
+    )?;
     if !has_sessions {
         return Err(anyhow!("{} is not a Formless database", file.display()));
     }
@@ -287,34 +314,139 @@ pub fn restore(paths: &Paths, file: &Path) -> Result<PathBuf> {
             crate::storage::SCHEMA_VERSION
         ));
     }
-    drop(probe);
     let db = paths.db_file();
     let dir = backup_dir(paths);
     std::fs::create_dir_all(&dir)?;
-    let stamp = backup_stamp();
-    let saved = dir.join(format!("before-restore-{stamp}.db"));
+    let saved = dir.join(format!("before-restore-{}.db", backup_stamp()));
     if db.exists() {
-        // Snapshot the current file without migrating it. A previous restore
-        // may have left an older database whose migration fails; the safety
-        // copy must still be usable to recover from that state.
+        // Never migrate the current file: it may itself need recovery.
         let current =
             rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        current
-            .execute("VACUUM INTO ?1", [saved.to_string_lossy().as_ref()])
+        snapshot_into(&current, &saved)
             .with_context(|| format!("back up current database to {}", saved.display()))?;
+        #[cfg(unix)]
+        std::fs::File::open(&dir)?.sync_all()?;
     }
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    std::fs::copy(file, &db).with_context(|| format!("copy into {}", db.display()))?;
-    // Opening migrates an older backup to this build's schema.
-    Store::open(&db).with_context(|| {
+    let stage =
+        RestoreStage(db.with_file_name(format!(".formless-restore-{}.db", uuid::Uuid::new_v4())));
+    let result = (|| -> Result<()> {
+        // Capture the source WAL, including committed uncheckpointed rows.
+        snapshot_into(&probe, &stage.0)?;
+        drop(probe);
+        // Close the selected snapshot before pruning: Windows may refuse to
+        // delete an open old recovery point. Retention also applies on a failed
+        // migration, so repeated failures cannot grow recovery copies forever.
+        let all = list_restore_backups(paths);
+        for old in all.iter().rev().skip(RESTORE_BACKUPS_KEEP) {
+            std::fs::remove_file(old)?;
+        }
+        #[cfg(unix)]
+        std::fs::File::open(&dir)?.sync_all()?;
+        drop(Store::open(&stage.0)?);
+        let staged = rusqlite::Connection::open(&stage.0)?;
+        let ok: String = staged.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if ok != "ok" {
+            return Err(anyhow!("staged restore failed integrity check: {ok}"));
+        }
+        checkpoint(&staged)?;
+        staged.pragma_update(None, "journal_mode", "DELETE")?;
+        drop(staged);
+        sync_file(&stage.0)?;
+        // Fold any old WAL into the old canonical file before removing its
+        // sidecars. If replacement fails, that old file remains complete.
+        if db.exists() {
+            let current = rusqlite::Connection::open_with_flags(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+            checkpoint(&current)?;
+        }
+        for suffix in ["-wal", "-shm"] {
+            match std::fs::remove_file(format!("{}{suffix}", db.display())) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        replace(&stage.0, &db)?;
+        #[cfg(unix)]
+        std::fs::File::open(&paths.data_dir)?.sync_all()?;
+        Ok(())
+    })();
+    result.with_context(|| {
         format!(
-            "restored database migration failed; original database saved at {}",
+            "restore did not complete; recovery copy at {}",
             saved.display()
         )
     })?;
     Ok(saved)
+}
+
+fn snapshot_into(conn: &rusqlite::Connection, path: &Path) -> Result<()> {
+    // SQLite permits an existing empty destination; reserve it privately before
+    // the first database byte is written and never overwrite a prior snapshot.
+    reserve_private(path)?;
+    if let Err(error) = conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()]) {
+        let _ = std::fs::remove_file(path);
+        return Err(error.into());
+    }
+    sync_file(path)
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    // FlushFileBuffers on Windows requires a writable handle.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    Ok(())
+}
+
+fn reserve_private(path: &Path) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?;
+    Ok(())
+}
+
+fn checkpoint(conn: &rusqlite::Connection) -> Result<()> {
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    if busy != 0 {
+        return Err(anyhow!(
+            "database is busy; close other database clients before restoring"
+        ));
+    }
+    Ok(())
+}
+
+struct RestoreStage(PathBuf);
+impl Drop for RestoreStage {
+    fn drop(&mut self) {
+        // Only this random staging namespace; preserve all canonical recovery
+        // receipts and copies from ordinary failed migrations (#1208).
+        if let (Some(parent), Some(stem)) =
+            (self.0.parent(), self.0.file_name().and_then(|n| n.to_str()))
+        {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == stem
+                        || name.starts_with(&format!("{stem}-"))
+                        || name.starts_with(&format!("{stem}.v"))
+                        || entry.path() == self.0.with_extension("migration-backup.json")
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The daemon's own memory (RSS bytes), CPU % and CPU time, from `ps`
@@ -364,6 +496,127 @@ pub fn human_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> (Self, Paths) {
+            let base = std::env::temp_dir().join(format!("fl-restore-{}", uuid::Uuid::new_v4()));
+            let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+            (Self(base), paths)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restore_rejects_a_concurrent_owner_before_touching_database_or_backups() {
+        let (_fixture, paths) = Fixture::new();
+        std::fs::write(paths.db_file(), "unchanged").unwrap();
+        let owner = crate::profile_lock::ProfileLock::owner(&paths).unwrap();
+        let error = restore(&paths, &paths.data_dir.join("missing-source.db")).unwrap_err();
+        assert!(error.to_string().contains("owned"));
+        assert_eq!(
+            std::fs::read_to_string(paths.db_file()).unwrap(),
+            "unchanged"
+        );
+        assert!(!backup_dir(&paths).exists());
+        drop(owner);
+    }
+
+    #[test]
+    fn restore_stages_source_wal_and_keeps_original_on_injected_replace_failure() {
+        let (fixture, paths) = Fixture::new();
+        let original = Store::open(&paths.db_file()).unwrap();
+        original.create_session(Some("original".into())).unwrap();
+        drop(original);
+        let source = fixture.0.join("source.db");
+        let source_store = Store::open(&source).unwrap();
+        source_store
+            .create_session(Some("committed in source WAL".into()))
+            .unwrap();
+        assert!(path_bytes(&PathBuf::from(format!("{}-wal", source.display()))) > 0);
+        let error = restore_with(&paths, &source, |stage, db| {
+            assert_eq!(
+                stage.parent(),
+                db.parent(),
+                "replacement stays on the same filesystem"
+            );
+            assert!(
+                crate::profile_lock::ProfileLock::try_owner(&paths)?.is_none(),
+                "ownership spans replacement"
+            );
+            let conn = rusqlite::Connection::open(stage)?;
+            let name: String = conn.query_row("SELECT name FROM sessions", [], |r| r.get(0))?;
+            assert_eq!(name, "committed in source WAL");
+            Err(anyhow!("injected replacement failure"))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected replacement failure"));
+        let current = Store::open(&paths.db_file()).unwrap();
+        assert_eq!(current.list_sessions().unwrap()[0].name, "original");
+        drop(current);
+        assert_eq!(list_restore_backups(&paths).len(), 1);
+        assert!(
+            std::fs::read_dir(&paths.data_dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".formless-restore-")),
+            "staging database, sidecars and migration receipts are cleaned"
+        );
+        restore(&paths, &source).unwrap();
+        let current = Store::open(&paths.db_file()).unwrap();
+        assert_eq!(
+            current.list_sessions().unwrap()[0].name,
+            "committed in source WAL"
+        );
+        drop(current);
+        drop(source_store);
+    }
+
+    #[test]
+    fn restore_retention_is_seven_and_independent_of_daily_backups_and_gc() {
+        let (fixture, paths) = Fixture::new();
+        let current = Store::open(&paths.db_file()).unwrap();
+        current.create_session(Some("original".into())).unwrap();
+        let daily = backup(&paths, &current, 1).unwrap();
+        let source = fixture.0.join("source.db");
+        current.backup_into(&source).unwrap();
+        drop(current);
+        let mut copies = Vec::new();
+        for _ in 0..9 {
+            copies.push(restore(&paths, &source).unwrap());
+        }
+        assert_eq!(list_restore_backups(&paths), copies[2..]);
+        assert!(!copies[0].exists() && !copies[1].exists());
+        assert!(daily.is_file());
+        let current = Store::open(&paths.db_file()).unwrap();
+        backup(&paths, &current, 1).unwrap();
+        assert!(!daily.exists());
+        assert_eq!(list_backups(&paths).len(), 1);
+        assert_eq!(list_restore_backups(&paths).len(), RESTORE_BACKUPS_KEEP);
+        let report = usage(&paths, &current).unwrap();
+        let row = report["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["kind"] == "backups")
+            .unwrap();
+        assert_eq!(
+            row["before_restore"].as_array().unwrap().len(),
+            RESTORE_BACKUPS_KEEP
+        );
+        let mut cfg = Config::default();
+        cfg.daemon.backups_keep = 0;
+        gc(&paths, &current, &cfg, false).unwrap();
+        assert_eq!(list_restore_backups(&paths).len(), RESTORE_BACKUPS_KEEP);
+        drop(current);
+    }
 
     #[test]
     fn backups_rotate_and_restore_round_trips() {
@@ -530,16 +783,15 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            51
+            crate::storage::SCHEMA_VERSION
         );
         assert_eq!(
             conn.query_row("SELECT name FROM sessions", [], |r| r.get::<_, String>(0))
                 .unwrap(),
-            "from broken backup"
+            "original"
         );
         drop(conn);
-        // Recovery works through the public restore path even though the
-        // current database still cannot be migrated.
+        // The recovery point remains usable through the public restore path.
         let failed_copy = restore(&paths, &saved[0]).unwrap();
         assert!(failed_copy.exists());
         let store = Store::open(&paths.db_file()).unwrap();
