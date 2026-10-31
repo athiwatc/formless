@@ -3786,7 +3786,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
 | `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
 | `tools.fetch_connect_timeout_secs` | 10 | Tool `fetch`/`fetchChunks` connection deadline, clamped to 1–86400 seconds; applies to shared and DNS-pinned clients |
-| `tools.fetch_timeout_secs` | 60 | Total Tool HTTP request deadline across redirects and response-body reads, clamped to 1–86400 seconds; trickling data does not reset it. Cancellation returns promptly; abandoned network workers finish under this deadline. Timeout errors say `fetch timed out`, distinct from connection failures |
+| `tools.fetch_timeout_secs` | 60 | Tool HTTP transport deadline across redirects and response-body reads, clamped to 1–86400 seconds; trickling data does not reset it. Cancellation returns promptly and the native HTTP operation retains its deadline. Scoped-host security checks currently use the OS DNS resolver before transport, so resolver stalls can exceed this bound. Timeout errors say `fetch timed out`, distinct from connection failures |
 | `tools.max_read_bytes` | 67108864 | Largest `fs.read` or `fetch` body (64 MB): larger fails as a resource error pointing to `fs.readChunks` / `fetchChunks` (§7.5) |
 | `tools.max_process_output_bytes` | 16777216 | `process.run` keeps this much of stdout and of stderr (16 MB); the rest is read and dropped, and the result says `truncated: true` |
 | `tools.max_log_bytes` | 1048576 | All `log` lines of one Invocation (1 MB); later lines are dropped after one marker line |
