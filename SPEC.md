@@ -2247,7 +2247,8 @@ such as `read_file`, `read_text_file` and `file_read`.
   `/gc run`, web Clean up… which shows the dry run before "Free"):
   artifacts past their retention, `/rewind` snapshots older than 30
   days, MCP logs cut to their last 1 MB, all but the two newest
-  pre-migration copies, and the database's free pages (VACUUM). Each row
+  pre-migration copies by their recorded timestamp (not schema version),
+  and the database's free pages (VACUUM). Each row
   says how many items and bytes; a real run is audit-logged.
 - **Backups.** The daemon copies the database (`VACUUM INTO`, consistent
   under WAL) to `<data>/backups/formless-<UTC time>.db` when the newest is
@@ -2256,7 +2257,10 @@ such as `read_file`, `read_text_file` and `file_read`.
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
   the current database as `backups/before-restore-<time>.db`, copies it
-  in and migrates it. `formless doctor` shows the last backup's age.
+  in and migrates it. Backup and pre-restore filenames include fixed-width
+  fractional UTC seconds and a unique suffix, preserving distinct restore
+  points even within the same second; existing backup destinations are
+  never replaced. `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no
   filesystem path, because transcripts also reach remote web clients.

@@ -57,7 +57,21 @@ fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
                 .is_some_and(|n| n.starts_with(&format!("{name}.v")) && n.ends_with(".bak"))
         })
         .collect();
-    found.sort();
+    // Schema prefixes have different widths (v9 sorts after v52). Compare
+    // the timestamp after the version instead; malformed legacy names sort
+    // oldest.
+    found.sort_by_cached_key(|p| {
+        let stamp = p
+            .file_name()?
+            .to_str()?
+            .strip_prefix(&format!("{name}.v"))?
+            .split_once('-')?
+            .1
+            .strip_suffix(".bak")?
+            .split('-')
+            .next()?;
+        chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.fZ").ok()
+    });
     found.reverse();
     found
 }
@@ -177,12 +191,22 @@ fn keep_tail(p: &Path, keep: u64) -> Result<()> {
     Ok(())
 }
 
+/// Fixed-width fractional UTC time keeps filename order chronological;
+/// a random suffix also distinguishes calls made within one clock tick.
+fn backup_stamp() -> String {
+    format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+        uuid::Uuid::new_v4()
+    )
+}
+
 /// A consistent copy of the database into `backups/`, keeping the newest
 /// `keep` (SPEC §9.6). Returns the new file.
 pub fn backup(paths: &Paths, store: &Store, keep: usize) -> Result<PathBuf> {
     let dir = backup_dir(paths);
     std::fs::create_dir_all(&dir)?;
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let stamp = backup_stamp();
     let dest = dir.join(format!("formless-{stamp}.db"));
     store.backup_into(&dest)?;
     let mut all = list_backups(paths);
@@ -255,7 +279,7 @@ pub fn restore(paths: &Paths, file: &Path) -> Result<PathBuf> {
     let db = paths.db_file();
     let dir = backup_dir(paths);
     std::fs::create_dir_all(&dir)?;
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let stamp = backup_stamp();
     let saved = dir.join(format!("before-restore-{stamp}.db"));
     if db.exists() {
         Store::open(&db)?.backup_into(&saved)?;
@@ -325,10 +349,25 @@ mod tests {
         let store = Store::open(&paths.db_file()).unwrap();
         let s = store.create_session(Some("kept".into())).unwrap().id;
         let first = backup(&paths, &store, 2).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        backup(&paths, &store, 2).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        backup(&paths, &store, 2).unwrap();
+        let original = std::fs::read(&first).unwrap();
+        assert!(store
+            .backup_into(&first)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            original,
+            "existing snapshots are untouched"
+        );
+        let second = backup(&paths, &store, 2).unwrap();
+        assert_ne!(first, second);
+        assert!(
+            first.exists() && second.exists(),
+            "rapid backups both survive"
+        );
+        let third = backup(&paths, &store, 2).unwrap();
+        assert!(second < third, "filename order follows backup creation");
         let all = list_backups(&paths);
         assert_eq!(all.len(), 2, "rotated to backups_keep");
         assert!(!first.exists());
@@ -337,6 +376,12 @@ mod tests {
         drop(store);
         let saved = restore(&paths, all.last().unwrap()).unwrap();
         assert!(saved.exists());
+        let saved_again = restore(&paths, all.last().unwrap()).unwrap();
+        assert_ne!(saved, saved_again);
+        assert!(
+            saved.exists() && saved_again.exists(),
+            "restore safety copies survive"
+        );
         let store = Store::open(&paths.db_file()).unwrap();
         let names: Vec<String> = store
             .list_sessions()
@@ -351,6 +396,50 @@ mod tests {
         std::fs::write(&junk, "hello").unwrap();
         assert!(restore(&paths, &junk).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migration_gc_keeps_newest_timestamps_across_schema_widths() {
+        let base = std::env::temp_dir().join(format!("fl-hk-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let store = Store::open(&paths.db_file()).unwrap();
+        let mut copies = Vec::new();
+        for (version, day) in [(8, 1), (9, 2), (51, 3), (52, 4)] {
+            let copy = paths
+                .data_dir
+                .join(format!("formless.db.v{version}-202601{day:02}T120000Z.bak"));
+            std::fs::write(&copy, "backup").unwrap();
+            copies.push(copy);
+        }
+        assert_eq!(
+            migration_backups(&paths),
+            copies.iter().rev().cloned().collect::<Vec<_>>()
+        );
+        let cfg = Config::default();
+        let before = usage(&paths, &store).unwrap();
+        let backup_bytes = |u: &Value| {
+            u["kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["kind"] == "backups")
+                .unwrap()["bytes"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(backup_bytes(&before), 24);
+        gc(&paths, &store, &cfg, true).unwrap();
+        assert!(
+            copies.iter().all(|p| p.exists()),
+            "dry run preserves all copies"
+        );
+        gc(&paths, &store, &cfg, false).unwrap();
+        assert!(!copies[0].exists() && !copies[1].exists());
+        assert!(copies[2].exists() && copies[3].exists());
+        assert_eq!(backup_bytes(&usage(&paths, &store).unwrap()), 12);
+        drop(store);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

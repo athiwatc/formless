@@ -2353,9 +2353,13 @@ impl Store {
     }
 
     /// A consistent copy of the whole database (WAL included) at `dest`.
+    /// Existing snapshots are never removed or replaced.
     pub fn backup_into(&self, dest: &Path) -> Result<()> {
         if dest.exists() {
-            std::fs::remove_file(dest)?;
+            return Err(anyhow!(
+                "backup destination already exists: {}",
+                dest.display()
+            ));
         }
         self.conn
             .execute("VACUUM INTO ?1", params![dest.to_string_lossy()])
