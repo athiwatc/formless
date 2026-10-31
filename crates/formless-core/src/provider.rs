@@ -1548,22 +1548,21 @@ impl Provider {
             }
             b
         };
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        // Responses `output_index` → position in `tool_calls`.
-        let mut call_slots: HashMap<u64, usize> = HashMap::new();
-        // Chat tool-call slots seen streaming incrementally (#1106).
-        let mut incremental: Vec<bool> = Vec::new();
-        let mut truncated = false;
-        // Why it stopped (#615), and refusal text the model sent instead
-        // of an answer.
-        let mut finish: Option<String> = None;
-        // A `data:` field whose JSON spans several lines (#614).
-        let mut pending = String::new();
-        let mut usage = None;
         let mut attempt = 0;
-        let (recovered, model_used) = 'request: loop {
+        let (state, recovered, model_used) = 'request: loop {
+            // All stream assembly belongs to this attempt. Every retry path
+            // drops it, including flags/finish reasons from a discarded stream.
+            let StreamAttempt {
+                mut content,
+                mut reasoning,
+                mut tool_calls,
+                mut call_slots,
+                mut incremental,
+                mut truncated,
+                mut finish,
+                mut pending,
+                mut usage,
+            } = StreamAttempt::default();
             // Waiting for the response headers is cancellable too (a slow or
             // stuck endpoint must not outlive an interrupt).
             let (resp, recovered, model_used) = tokio::select! {
@@ -1574,7 +1573,6 @@ impl Provider {
             // Raw bytes: a chunk boundary can split a multibyte character, so
             // only complete lines are decoded.
             let mut buf: Vec<u8> = Vec::new();
-            pending.clear();
             let mut eof = false;
             loop {
                 if eof {
@@ -1604,12 +1602,6 @@ impl Provider {
                                 if !content.is_empty() || !reasoning.is_empty() {
                                     on_delta(DeltaKind::Restart, "");
                                 }
-                                content.clear();
-                                reasoning.clear();
-                                tool_calls.clear();
-                                call_slots.clear();
-                                truncated = false;
-                                usage = None;
                                 tokio::select! {
                                     _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                                     _ = self.retry_wait(attempt, None, "stream dropped".into()) => {}
@@ -1853,8 +1845,31 @@ impl Provider {
                     }
                 }
             }
-            break (recovered, model_used);
+            break (
+                StreamAttempt {
+                    content,
+                    reasoning,
+                    tool_calls,
+                    call_slots,
+                    incremental,
+                    truncated,
+                    finish,
+                    pending,
+                    usage,
+                },
+                recovered,
+                model_used,
+            );
         };
+        let StreamAttempt {
+            mut content,
+            reasoning,
+            mut tool_calls,
+            truncated,
+            finish,
+            usage,
+            ..
+        } = state;
         if prompt_mode {
             let (clean, calls) = parse_prompt_tool_calls(&content);
             if !clean.is_empty() {
@@ -2318,14 +2333,37 @@ const MAX_RESENDS: usize = 8;
 /// provider protocol error, never an allocation (#1107).
 const MAX_TOOL_CALLS: usize = 128;
 
+/// Assembly state that must never survive a stream retry. Raw byte buffers
+/// and EOF are also created inside the request loop, alongside this value.
+#[derive(Default)]
+struct StreamAttempt {
+    content: String,
+    reasoning: String,
+    tool_calls: Vec<ToolCall>,
+    /// Responses output_index -> tool_calls position.
+    call_slots: HashMap<u64, usize>,
+    incremental: Vec<ToolFragmentMode>,
+    truncated: bool,
+    finish: Option<String>,
+    /// An SSE JSON field split over several data lines.
+    pending: String,
+    usage: Option<Usage>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ToolFragmentMode {
+    name_appending: bool,
+    arguments_appending: bool,
+}
+
 /// Fold one streamed Chat tool-call fragment into the calls so far
 /// (#614): by `index`, else by `id`, else onto the last call. A server
 /// that resends the whole name or arguments so far (cumulative style)
-/// replaces rather than doubles them; `incremental[i]` records that slot
-/// `i` has been seen appending, after which nothing is replaced (#1106).
+/// replaces rather than doubles them. Each field independently records whether
+/// it has appended, after which that field never replaces text (#1106, #1122).
 fn merge_tool_fragment(
     calls: &mut Vec<ToolCall>,
-    incremental: &mut Vec<bool>,
+    incremental: &mut Vec<ToolFragmentMode>,
     tc: &Value,
 ) -> Result<()> {
     let id = tc["id"].as_str().filter(|i| !i.is_empty());
@@ -2349,14 +2387,17 @@ fn merge_tool_fragment(
     while calls.len() <= idx {
         calls.push(ToolCall::default());
     }
-    incremental.resize(calls.len(), false);
+    incremental.resize(calls.len(), ToolFragmentMode::default());
     let slot = &mut calls[idx];
     if let Some(id) = id {
         slot.id = id.to_string();
     }
-    let appending = &mut incremental[idx];
-    let mut grow = |have: &mut String, frag: &str| {
-        // Cumulative only when strictly longer and the slot never appended:
+    let mode = &mut incremental[idx];
+    let grow = |have: &mut String, frag: &str, appending: &mut bool| {
+        if frag.is_empty() {
+            return;
+        }
+        // Cumulative only when strictly longer and this field never appended:
         // an incremental "aaa" + "aaa" is "aaaaaa", not "aaa".
         if !*appending
             && frag.len() > have.len()
@@ -2372,10 +2413,10 @@ fn merge_tool_fragment(
         }
     };
     if let Some(n) = tc["function"]["name"].as_str() {
-        grow(&mut slot.name, n);
+        grow(&mut slot.name, n, &mut mode.name_appending);
     }
     if let Some(a) = tc["function"]["arguments"].as_str() {
-        grow(&mut slot.arguments, a);
+        grow(&mut slot.arguments, a, &mut mode.arguments_appending);
     }
     Ok(())
 }
@@ -2786,6 +2827,45 @@ pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<P
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tool_name_and_arguments_choose_fragment_modes_independently() {
+        for (fragments, name) in [
+            (
+                vec![
+                    json!({"index":0,"function":{"name":"read_","arguments":"{\"x\":"}}),
+                    json!({"index":0,"function":{"name":"file","arguments":"{\"x\":1"}}),
+                    json!({"index":0,"function":{"name":"","arguments":"{\"x\":1}"}}),
+                ],
+                "read_file",
+            ),
+            (
+                vec![
+                    json!({"index":0,"function":{"name":"read_","arguments":"{"}}),
+                    json!({"index":0,"function":{"name":"read_file","arguments":"\"x\":1"}}),
+                    json!({"index":0,"function":{"name":"read_file_v2","arguments":"}"}}),
+                ],
+                "read_file_v2",
+            ),
+            (
+                vec![
+                    json!({"index":0,"function":{"name":"read","arguments":"{\"x\":"}}),
+                    json!({"index":0,"function":{"name":"","arguments":""}}),
+                    json!({"index":0,"function":{"name":"reader","arguments":"{\"x\":1}"}}),
+                ],
+                "reader",
+            ),
+        ] {
+            let mut calls = Vec::new();
+            let mut modes = Vec::new();
+            for fragment in fragments {
+                merge_tool_fragment(&mut calls, &mut modes, &fragment).unwrap();
+            }
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, name);
+            assert_eq!(calls[0].arguments, r#"{"x":1}"#);
+        }
+    }
 
     /// `provider.extra_body` adds vendor fields without touching the core
     /// ones, and Ollama gets the context Formless budgets for (#622).
