@@ -67,10 +67,8 @@ fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
             .strip_prefix(&format!("{name}.v"))?
             .split_once('-')?
             .1
-            .strip_suffix(".bak")?
-            .split('-')
-            .next()?;
-        chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.fZ").ok()
+            .strip_suffix(".bak")?;
+        parse_backup_stamp(stamp)
     });
     found.reverse();
     found
@@ -191,6 +189,10 @@ fn keep_tail(p: &Path, keep: u64) -> Result<()> {
     Ok(())
 }
 
+fn parse_backup_stamp(stamp: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(stamp.split('-').next()?, "%Y%m%dT%H%M%S%.fZ").ok()
+}
+
 /// Fixed-width fractional UTC time keeps filename order chronological;
 /// a random suffix also distinguishes calls made within one clock tick.
 fn backup_stamp() -> String {
@@ -230,7 +232,17 @@ pub fn list_backups(paths: &Paths) -> Vec<PathBuf> {
                 .is_some_and(|n| n.starts_with("formless-") && n.ends_with(".db"))
         })
         .collect();
-    found.sort();
+    // Legacy names end in whole seconds: the literal Z otherwise sorts
+    // after the fractional dot of a newer snapshot from the same second.
+    found.sort_by_cached_key(|p| {
+        let at = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("formless-"))
+            .and_then(|n| n.strip_suffix(".db"))
+            .and_then(parse_backup_stamp);
+        (at, p.clone())
+    });
     found
 }
 
@@ -396,6 +408,29 @@ mod tests {
         std::fs::write(&junk, "hello").unwrap();
         assert!(restore(&paths, &junk).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rotated_backups_order_legacy_and_fractional_timestamps() {
+        let base = std::env::temp_dir().join(format!("fl-hk-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::create_dir_all(backup_dir(&paths)).unwrap();
+        let names = [
+            "formless-20260101T120000Z.db",
+            "formless-20260101T120000.123000000Z-unique.db",
+            "formless-20260101T120001Z.db",
+        ];
+        let expected: Vec<_> = names.iter().map(|n| backup_dir(&paths).join(n)).collect();
+        for path in expected.iter().rev() {
+            std::fs::write(path, "backup").unwrap();
+        }
+        assert_eq!(list_backups(&paths), expected);
+        assert_eq!(last_backup(&paths).unwrap().0, expected[2]);
+        // Rotation must keep the fractional snapshot ahead of its legacy
+        // whole-second predecessor, even when both share a UTC second.
+        std::fs::remove_file(&expected[2]).unwrap();
+        assert_eq!(last_backup(&paths).unwrap().0, expected[1]);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
