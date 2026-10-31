@@ -5827,6 +5827,23 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         let why = meta["stop_reason"].as_str().unwrap_or("stopped");
         return json!({"role": "assistant", "content": format!("[harness note] No answer was given ({why}).")});
     }
+    if m.role == "assistant"
+        && (meta["truncated"] == true
+            || meta["stop_reason"] == "model_context_window_exceeded"
+            || meta["stop_reason"] == "max_tokens")
+    {
+        let why = meta["stop_reason"].as_str().unwrap_or("max_tokens");
+        let note =
+            format!("[harness note] The preceding answer was cut off ({why}); it is incomplete.");
+        let content = if m.content.trim().is_empty() {
+            format!(
+                "[harness note] No answer text was produced before generation was cut off ({why})."
+            )
+        } else {
+            format!("{}\n\n{note}", m.content)
+        };
+        return json!({"role": "assistant", "content": content});
+    }
     if m.role == "tool" {
         let mut msg = json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
         // A failed call: Anthropic's `tool_result.is_error` (a marker the
