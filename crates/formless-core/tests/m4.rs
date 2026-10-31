@@ -1,6 +1,9 @@
 //! M4 acceptance tests (SPEC §18 M4): pending invocations (await + push),
 //! crash recovery, export/import across profiles, reset, server compaction.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::config::reset_all;
 use formless_core::storage::Store;
 use formless_core::Paths;
@@ -26,6 +29,7 @@ fn temp_paths(tag: &str) -> Paths {
 
 #[test]
 fn crash_recovery_marks_run_and_invocation_interrupted_without_reexecution() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("m4crash");
     let (run_id, inv_id, tool_id) = {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -65,6 +69,7 @@ fn crash_recovery_marks_run_and_invocation_interrupted_without_reexecution() {
 
 #[test]
 fn reset_wipes_data_config_and_key_file() {
+    let _env = credential_env::EnvGuard::isolated();
     let paths = temp_paths("m4reset");
     std::fs::write(paths.db_file(), "db").unwrap();
     std::fs::write(paths.config_file(), "cfg").unwrap();
@@ -74,8 +79,8 @@ fn reset_wipes_data_config_and_key_file() {
     reset_all(&paths).unwrap();
     assert!(!data.exists(), "data dir must be gone");
     assert!(!cfg.exists(), "config dir must be gone");
-    // Key material gone (checked via the file, not load_api_key: sibling
-    // tests set FORMLESS_API_KEY process-wide, which load honours first).
+    // The shared guard excludes both sibling and inherited credential overrides.
+    assert!(formless_core::config::load_api_key(&paths).is_none());
     assert!(
         !paths.key_fallback_file().exists(),
         "key fallback file must be gone"
@@ -306,13 +311,14 @@ fn sse_text(text: &str) -> String {
 #[cfg(unix)]
 #[tokio::test]
 async fn pending_await_path_with_remind_once() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4await");
     seed_sleeper(&paths);
     let app = Router::new()
@@ -385,6 +391,7 @@ async fn pending_await_path_with_remind_once() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pending_push_delivery_reaches_agent() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         response::IntoResponse,
         routing::{get, post},
@@ -392,7 +399,7 @@ async fn pending_push_delivery_reaches_agent() {
     };
     use formless_protocol::{Request, SendMode};
     use std::sync::atomic::{AtomicBool, Ordering};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4push");
     seed_sleeper(&paths);
     let saw_push = Arc::new(AtomicBool::new(false));
@@ -465,8 +472,9 @@ async fn pending_push_delivery_reaches_agent() {
 #[cfg(unix)]
 #[tokio::test]
 async fn tool_and_session_export_import_across_profiles() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_protocol::Request;
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths_a = temp_paths("m4pa");
     let paths_b = temp_paths("m4pb");
     // Seed A: tool with metrics + approval, session with messages.
@@ -586,13 +594,14 @@ async fn tool_and_session_export_import_across_profiles() {
 #[cfg(unix)]
 #[tokio::test]
 async fn server_side_compaction_uses_compact_endpoint() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4compact");
     let session_id = {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -674,13 +683,14 @@ async fn next_session_update(client: &mut Client) -> formless_protocol::SessionI
 #[cfg(unix)]
 #[tokio::test]
 async fn untitled_session_is_auto_named_after_first_run_but_user_names_stick() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode, SessionInfo};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4naming");
     let app = Router::new()
         .route(
@@ -753,12 +763,13 @@ async fn untitled_session_is_auto_named_after_first_run_but_user_names_stick() {
 #[cfg(unix)]
 #[tokio::test]
 async fn deleting_a_session_interrupts_its_run_first() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4del");
     let app = Router::new()
         .route(
@@ -825,12 +836,13 @@ async fn deleting_a_session_interrupts_its_run_first() {
 #[cfg(unix)]
 #[tokio::test]
 async fn length_truncated_tool_call_is_explained_not_run() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4len");
     seed_sleeper(&paths);
     let app = Router::new()
@@ -905,12 +917,13 @@ async fn length_truncated_tool_call_is_explained_not_run() {
 #[cfg(unix)]
 #[tokio::test]
 async fn interrupt_releases_a_tool_waiting_on_llm_complete() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4llm");
     {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -1011,12 +1024,13 @@ async fn interrupt_releases_a_tool_waiting_on_llm_complete() {
 #[cfg(unix)]
 #[tokio::test]
 async fn resume_continues_an_interrupted_run_and_abandon_drops_it() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::Request;
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4resume");
     let session_id = {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -1105,12 +1119,13 @@ async fn resume_continues_an_interrupted_run_and_abandon_drops_it() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stalled_stream_is_flagged_and_can_be_resent() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4stall");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let app = Router::new()
@@ -1206,12 +1221,13 @@ async fn stalled_stream_is_flagged_and_can_be_resent() {
 #[cfg(unix)]
 #[tokio::test]
 async fn queued_message_is_persisted_and_runs_next() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4queue");
     let app = Router::new()
         .route(
@@ -1287,12 +1303,13 @@ async fn queued_message_is_persisted_and_runs_next() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pending_handle_survives_restart_as_interrupted() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4handle");
     let sid = {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -1351,12 +1368,13 @@ async fn pending_handle_survives_restart_as_interrupted() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stalled_invocation_is_flagged_and_can_be_cancelled_alone() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4invstall");
     seed_sleeper(&paths);
     let app = Router::new()
@@ -1433,12 +1451,13 @@ async fn stalled_invocation_is_flagged_and_can_be_cancelled_alone() {
 #[cfg(unix)]
 #[tokio::test]
 async fn subagents_emit_events_and_keep_a_transcript() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4sub");
     {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -1552,8 +1571,9 @@ async fn subagents_emit_events_and_keep_a_transcript() {
 #[cfg(unix)]
 #[tokio::test]
 async fn config_edits_are_picked_up_and_announced() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_protocol::{Event, Request, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4cfg");
     write_cfg(&paths, "http://127.0.0.1:9/v1", 30, false, 128_000);
     let server = start_daemon(&paths).await;
@@ -1588,13 +1608,14 @@ async fn config_edits_are_picked_up_and_announced() {
 #[cfg(unix)]
 #[tokio::test]
 async fn provider_connections_are_reused_across_runs() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         extract::ConnectInfo,
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4pool");
     let peers = Arc::new(std::sync::Mutex::new(Vec::<u16>::new()));
     let app = Router::new()
@@ -1651,12 +1672,13 @@ async fn provider_connections_are_reused_across_runs() {
 #[cfg(unix)]
 #[tokio::test]
 async fn subscriptions_scope_live_events_per_client() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4subs");
     let app = Router::new()
         .route(
@@ -1733,12 +1755,13 @@ async fn subscriptions_scope_live_events_per_client() {
 #[cfg(unix)]
 #[tokio::test]
 async fn clients_on_a_session_see_each_other() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4clients");
     let app = Router::new()
         .route(
@@ -1823,12 +1846,13 @@ async fn clients_on_a_session_see_each_other() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sessions_keep_their_system_prompt_when_guidance_changes() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4prompt");
     let systems = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let app = Router::new()
@@ -1902,12 +1926,13 @@ async fn sessions_keep_their_system_prompt_when_guidance_changes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn model_stats_include_token_and_cache_totals() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4cachestats");
     let app = Router::new()
         .route(
@@ -1964,13 +1989,14 @@ async fn model_stats_include_token_and_cache_totals() {
 #[cfg(unix)]
 #[tokio::test]
 async fn compaction_appends_to_the_previous_summary() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4append");
     let sid = {
         let store = Store::open(&paths.db_file()).unwrap();
@@ -2032,12 +2058,13 @@ async fn compaction_appends_to_the_previous_summary() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pending_results_are_delivered_in_one_ordered_note() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4batch");
     seed_sleeper(&paths);
     let notes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -2115,13 +2142,14 @@ async fn pending_results_are_delivered_in_one_ordered_note() {
 #[cfg(unix)]
 #[tokio::test]
 async fn agent_adds_an_mcp_server_after_approval() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4addmcp");
     // A minimal Streamable HTTP MCP server with one tool.
     let mcp_app = Router::new().route(
@@ -2236,12 +2264,13 @@ async fn agent_adds_an_mcp_server_after_approval() {
 #[cfg(unix)]
 #[tokio::test]
 async fn enabled_skills_are_indexed_in_the_system_prompt() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4skills");
     let src = paths.data_dir.join("src/tidy");
     std::fs::create_dir_all(&src).unwrap();
@@ -2308,13 +2337,14 @@ async fn enabled_skills_are_indexed_in_the_system_prompt() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_step_limit_warns_then_pauses_and_resume_goes_past_it() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4budget");
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
@@ -2401,13 +2431,14 @@ async fn a_step_limit_warns_then_pauses_and_resume_goes_past_it() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_per_run_step_limit_pauses_and_is_cleared_after() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4limit");
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
@@ -2496,13 +2527,14 @@ async fn a_per_run_step_limit_pauses_and_is_cleared_after() {
 #[cfg(unix)]
 #[tokio::test]
 async fn retry_reruns_the_last_message_on_another_model() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Request, SendMode};
     use std::sync::Mutex;
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4retry");
     let models = Arc::new(Mutex::new(Vec::<String>::new()));
     let app = Router::new()
@@ -2588,13 +2620,14 @@ async fn retry_reruns_the_last_message_on_another_model() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_file_changes_are_listed_and_rewound() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4files");
     let work = paths.data_dir.parent().unwrap().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -2754,13 +2787,14 @@ async fn run_file_changes_are_listed_and_rewound() {
 #[cfg(unix)]
 #[tokio::test]
 async fn update_plan_is_stored_and_broadcast() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4plan");
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
@@ -2854,13 +2888,14 @@ async fn update_plan_is_stored_and_broadcast() {
 #[cfg(unix)]
 #[tokio::test]
 async fn step_mode_pauses_edits_and_skips_calls() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4step");
     seed_sleeper(&paths);
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2970,12 +3005,13 @@ async fn step_mode_pauses_edits_and_skips_calls() {
 #[cfg(unix)]
 #[tokio::test]
 async fn compare_runs_each_model_in_a_fork_and_reports_both() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4cmp");
     let app = Router::new()
         .route(
@@ -3049,13 +3085,14 @@ async fn compare_runs_each_model_in_a_fork_and_reports_both() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_panicking_run_frees_its_session() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::{
         routing::{get, post},
         Json, Router,
     };
     use formless_protocol::{Event, Request, SendMode, ServerMessage};
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
-    std::env::set_var("FORMLESS_TEST_PANIC_MARKER", "panic-now-7c1");
+    _env.set("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_TEST_PANIC_MARKER", "panic-now-7c1");
     let paths = temp_paths("m4panic");
     let app = Router::new()
         .route(
