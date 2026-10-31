@@ -144,6 +144,9 @@ impl View {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
+    /// Refresh the approvals mode of this connection without opening a pager.
+    DaemonMode,
+    SendMessage,
     /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
     Revoked,
     /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
@@ -1207,6 +1210,8 @@ struct App {
     mention: Option<MentionPopup>,
     /// A message waiting for its `@` attachments before it is sent.
     pending_send: Option<PendingSend>,
+    sends: client::SendTracker,
+    restored_send: Option<(String, String)>,
     /// Files and pasted images for the next message, shown as chips in
     /// the input and uploaded when it is sent (SPEC §5.6).
     attachments: Vec<(String, Vec<u8>)>,
@@ -1531,6 +1536,8 @@ impl App {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            sends: Default::default(),
+            restored_send: None,
             attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
@@ -1654,16 +1661,19 @@ impl App {
             self.notes
                 .push(format!("Warning: {warning} Or type /restart-daemon."));
         }
-        // The approvals the running daemon enforces, for Settings (#847).
-        self.daemon_secure =
-            client::request_once_within(&self.paths, Request::Status, Duration::from_secs(5))
-                .ok()
-                .and_then(|v| v["secure"].as_bool());
         let (client, inbox) = DaemonClient::connect(&self.paths)?;
+        self.attach_daemon(client, inbox);
+        Ok(())
+    }
+
+    /// Initial connection and reconnect both refresh connection-specific state.
+    fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
+        self.daemon_secure = None;
+        self.sends.disconnected();
         self.client = Some(client);
         self.inbox = Some(inbox);
+        self.request(Pending::DaemonMode, Request::Status);
         self.request(Pending::ListSessions, Request::ListSessions);
-        Ok(())
     }
 
     /// `/restart-daemon`: replace the daemon and reconnect to the new one,
@@ -1677,6 +1687,7 @@ impl App {
         }
         self.client = None;
         self.inbox = None;
+        self.daemon_secure = None;
         // A new connection numbers its requests from 1 again: nothing from
         // the old one may resolve against them (#884).
         self.pending.clear();
@@ -1714,8 +1725,11 @@ impl App {
     /// The daemon went away (restart, crash): keep everything on screen,
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
+        self.restore_unsent_draft();
+        self.sends.disconnected();
         self.client = None;
         self.inbox = None;
+        self.daemon_secure = None;
         self.pending.clear();
         self.pending_since.clear();
         self.activity = None;
@@ -1743,10 +1757,8 @@ impl App {
             DaemonClient::connect(&self.paths)
         };
         if let Ok((client, inbox)) = connected {
-            self.client = Some(client);
-            self.inbox = Some(inbox);
+            self.attach_daemon(client, inbox);
             self.offline = None;
-            self.request(Pending::ListSessions, Request::ListSessions);
             if let Some(id) = self.current.clone() {
                 self.switch_session(id);
             }
@@ -1782,6 +1794,9 @@ impl App {
                 "the daemon did not answer within {}s; try again",
                 REQUEST_DEADLINE.as_secs()
             ));
+            if matches!(kind, Pending::SendMessage) {
+                self.restore_unsent_draft();
+            }
             if matches!(kind, Pending::SaveSetting) {
                 if let Some(key) = self.settings_saving.take() {
                     self.settings_error = Some((key, "no answer from the daemon".into()));
@@ -1789,6 +1804,23 @@ impl App {
             }
         }
     }
+    fn send_chat_message(&mut self, session_id: String, content: String, mode: SendMode) {
+        if let Some(client) = &self.client {
+            let id = self.sends.send(client, session_id, content, mode);
+            self.pending.insert(id, Pending::SendMessage);
+            self.pending_since.insert(id, Instant::now());
+        }
+    }
+
+    fn restore_unsent_draft(&mut self) {
+        if self.input.is_empty() {
+            if let Some(text) = self.current.as_deref().and_then(|id| self.sends.unsent(id)) {
+                self.input.set(text);
+                self.restored_send = self.current.clone().map(|id| (id, text.to_string()));
+            }
+        }
+    }
+
     fn fire(&mut self, req: Request) {
         if let Some(c) = &self.client {
             c.send(req);
@@ -1812,9 +1844,7 @@ impl App {
                 }
             }
         }
-        if lost {
-            self.daemon_lost();
-        } else {
+        if !lost {
             self.inbox = Some(inbox);
         }
         for msg in msgs {
@@ -1825,6 +1855,27 @@ impl App {
                     result,
                     error,
                 } => {
+                    if ok
+                        && self.sends.message(id).is_some_and(|(session, text)| {
+                            self.restored_send
+                                .as_ref()
+                                .is_some_and(|(s, t)| s == session && t == text)
+                        })
+                    {
+                        if let Some((session, text)) = self.restored_send.take() {
+                            if self.current.as_deref() == Some(&session)
+                                && self.input.expanded() == text
+                            {
+                                self.input.clear();
+                            }
+                        }
+                    }
+                    for answered in self.sends.answered(id) {
+                        if answered != id {
+                            self.pending.remove(&answered);
+                            self.pending_since.remove(&answered);
+                        }
+                    }
                     self.pending_since.remove(&id);
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
@@ -1850,6 +1901,8 @@ impl App {
                     }
                     let Some(result) = result else { continue };
                     match kind {
+                        Pending::SendMessage => {}
+                        Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
                                 self.sessions = v;
@@ -3239,6 +3292,12 @@ impl App {
                 ServerMessage::Event(ev) => self.on_event(ev),
             }
         }
+        // EOF can follow an acknowledgement already queued by the reader.
+        // Consume those replies before clearing request identities or restoring
+        // an unacknowledged draft, otherwise an accepted send becomes retryable.
+        if lost {
+            self.daemon_lost();
+        }
     }
 
     /// `/queue [edit|rm|up|down N]`: the messages waiting for this Run.
@@ -4258,6 +4317,7 @@ impl App {
                 .push("not connected to the daemon yet; your message is kept".into());
             return;
         }
+        self.restored_send = None;
         let text = self.input.take();
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -4387,12 +4447,7 @@ impl App {
             );
         }
         if found.is_empty() && held.is_empty() {
-            self.fire(Request::SendMessage {
-                session_id,
-                content: text,
-                mode,
-                client_msg_id: None,
-            });
+            self.send_chat_message(session_id, text, mode);
             return;
         }
         let root = root.map(|r| r.to_string_lossy().into_owned());
@@ -4504,12 +4559,7 @@ impl App {
         p.waiting = p.waiting.saturating_sub(1);
         if p.waiting == 0 {
             let p = self.pending_send.take().unwrap();
-            self.fire(Request::SendMessage {
-                session_id: p.session_id,
-                content: p.content,
-                mode: p.mode,
-                client_msg_id: None,
-            });
+            self.send_chat_message(p.session_id, p.content, p.mode);
         }
     }
 
@@ -5108,6 +5158,22 @@ impl App {
             "mcp" => self.request(Pending::ListMcpServers, Request::ListMcpServers),
             "prompts" => self.request(Pending::ListMcpPrompts, Request::ListMcpPrompts),
             "skills" => self.request(Pending::ListSkills, Request::ListSkills),
+            cmd if cmd.starts_with("skills enable ") || cmd.starts_with("skills disable ") => {
+                let enabled = cmd.starts_with("skills enable ");
+                let name = cmd
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or_default()
+                    .to_string();
+                self.fire(Request::SetSkillEnabled {
+                    name: name.clone(),
+                    enabled,
+                });
+                self.notes.push(format!(
+                    "{} skill {name}",
+                    if enabled { "enabling" } else { "disabling" }
+                ));
+            }
             // Preview a skill before enabling it: SKILL.md, files, scripts.
             cmd if cmd.starts_with("skills ") => {
                 let name = cmd["skills ".len()..].trim().to_string();
@@ -5508,22 +5574,6 @@ impl App {
                         .notes
                         .push("usage: /memory [rm|on|off ID | edit ID TEXT]".into()),
                 }
-            }
-            cmd if cmd.starts_with("skills enable ") || cmd.starts_with("skills disable ") => {
-                let enabled = cmd.starts_with("skills enable ");
-                let name = cmd
-                    .split_whitespace()
-                    .nth(2)
-                    .unwrap_or_default()
-                    .to_string();
-                self.fire(Request::SetSkillEnabled {
-                    name: name.clone(),
-                    enabled,
-                });
-                self.notes.push(format!(
-                    "{} skill {name}",
-                    if enabled { "enabling" } else { "disabling" }
-                ));
             }
             cmd if cmd.starts_with("prompt ") => {
                 let mut words = cmd["prompt ".len()..].split_whitespace();
@@ -7478,10 +7528,11 @@ impl App {
                     settings::rows(&cfg, &self.providers_info, self.show_thinking, &self.paths);
                 // Show what the running daemon enforces, not what this
                 // process would (#847).
-                if let Some(running) = self.daemon_secure {
-                    if let Some(r) = rows.iter_mut().find(|r| r.key == "security.secure") {
-                        r.value = settings::approvals_text(running, cfg.security.secure);
-                    }
+                if let Some(r) = rows.iter_mut().find(|r| r.key == "security.secure") {
+                    r.value = match self.daemon_secure {
+                        Some(running) => settings::approvals_text(running, cfg.security.secure),
+                        None => "daemon mode unknown".into(),
+                    };
                 }
                 rows
             }
@@ -9923,6 +9974,27 @@ fn is_placeholder(m: &MessageInfo) -> bool {
         .is_some_and(|meta| meta["placeholder"] == true)
 }
 
+/// Stop metadata survives reopening a Session, unlike the live Note event.
+fn stored_stop_note(m: &MessageInfo) -> Option<String> {
+    if m.role != "assistant" || is_placeholder(m) {
+        return None;
+    }
+    let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
+    let reason = meta["stop_reason"]
+        .as_str()
+        .or_else(|| (meta["truncated"] == true).then_some("max_tokens"))?;
+    Some(match reason {
+        "max_tokens" => "The answer was cut off at the model's output token limit.".into(),
+        "model_context_window_exceeded" => {
+            "The answer stopped because the model's context window is full.".into()
+        }
+        "pause_turn" => "The model paused its turn; ask it to continue.".into(),
+        "refusal" => "The model refused this request.".into(),
+        "content_filter" => "The provider's content filter stopped this answer.".into(),
+        other => format!("The answer ended early ({other})."),
+    })
+}
+
 /// "via gpt-4.1-mini (fallback)" when another model than the Session's
 /// answered (SPEC §4.5).
 fn served_by(m: &MessageInfo) -> Option<String> {
@@ -11855,6 +11927,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     lines.push(Line::styled(format!("  {}", m.content), ui::dim(app.color)));
                 } else {
                     lines.extend(app.markdown_cached(m, width));
+                }
+                if let Some(note) = stored_stop_note(m) {
+                    lines.push(Line::styled(format!("  {note}"), ui::dim(app.color)));
                 }
                 if focused {
                     lines.push(focus_hint(app.color, false));
@@ -14617,6 +14692,10 @@ fn skill_success(s: &formless_protocol::SkillInfo) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../formless-core/tests/support/env.rs"]
+mod credential_env;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -14681,6 +14760,8 @@ mod tests {
             model_overlay: None,
             mention: None,
             pending_send: None,
+            sends: Default::default(),
+            restored_send: None,
             attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
@@ -14995,6 +15076,271 @@ mod tests {
             "kept while offline"
         );
         assert!(app.notes.iter().any(|n| n.contains("reconnecting")));
+    }
+
+    #[test]
+    fn buffered_send_acknowledgement_before_eof_does_not_restore_an_accepted_send() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("accepted once");
+        app.submit_chat(false);
+        let first: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let first_key = serde_json::to_value(&first.request).unwrap()["client_msg_id"].clone();
+        tx.send(ServerMessage::Response {
+            id: first.id,
+            ok: true,
+            result: Some(serde_json::json!({"started": true})),
+            error: None,
+        })
+        .unwrap();
+        drop(tx); // The reader delivered the acknowledgement, then saw EOF.
+        app.drain_daemon();
+        assert!(app.offline.is_some() && app.inbox.is_none());
+        assert_eq!(app.input.expanded(), "");
+        assert_eq!(app.sends.unsent(app.current.as_deref().unwrap()), None);
+        assert!(app.pending.is_empty());
+
+        // A later deliberate send of identical text is a new action.
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.offline = None;
+        app.input.set("accepted once");
+        app.submit_chat(false);
+        let next: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_ne!(
+            serde_json::to_value(&next.request).unwrap()["client_msg_id"],
+            first_key
+        );
+    }
+
+    #[test]
+    fn eof_without_a_send_acknowledgement_restores_only_an_empty_draft() {
+        for newer_draft in [None, Some("new draft")] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel::<ServerMessage>();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("unacknowledged send");
+            app.submit_chat(false);
+            let _: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            if let Some(text) = newer_draft {
+                app.input.set(text);
+            }
+            drop(tx);
+            app.drain_daemon();
+            assert!(app.offline.is_some() && app.inbox.is_none());
+            assert_eq!(
+                app.input.expanded(),
+                newer_draft.unwrap_or("unacknowledged send")
+            );
+            assert_eq!(
+                app.sends.unsent(app.current.as_deref().unwrap()),
+                Some("unacknowledged send")
+            );
+        }
+    }
+
+    #[test]
+    fn late_send_acknowledgement_retracts_only_the_restored_retry_draft() {
+        for newer_draft in [None, Some("new draft")] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("send once");
+            app.submit_chat(false);
+            let sent: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            app.pending_since.insert(
+                sent.id,
+                Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+            );
+            app.expire_pending();
+            if let Some(text) = newer_draft {
+                app.input.set(text);
+            }
+            tx.send(ServerMessage::Response {
+                id: sent.id,
+                ok: true,
+                result: Some(serde_json::json!({"started": true})),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(app.input.expanded(), newer_draft.unwrap_or(""));
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_tui_send_reuses_its_key_and_appends_one_user_message() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into();
+        cfg.provider.model = "test".into();
+        cfg.provider.max_retries = 0;
+        cfg.naming.enabled = false;
+        cfg.skills.auto_create = false;
+        cfg.save(&app.paths).unwrap();
+        let store = formless_core::Store::open(&app.paths.db_file()).unwrap();
+        let session = store.create_session(None).unwrap();
+        app.current = Some(session.id.clone());
+        let daemon =
+            std::sync::Arc::new(formless_core::daemon::Daemon::new(app.paths.clone()).unwrap());
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("send once");
+        app.submit_chat(false);
+        let first: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let original = serde_json::to_value(&first.request).unwrap();
+        daemon.handle(first.request).await.unwrap();
+        // The daemon executed it but its acknowledgement was lost.
+        app.pending_since.insert(
+            first.id,
+            Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+        );
+        app.expire_pending();
+        assert_eq!(app.input.expanded(), "send once");
+        app.submit_chat(false);
+        let retry: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&retry.request).unwrap(), original);
+        let outcome = daemon.handle(retry.request).await.unwrap();
+        assert_eq!(
+            store
+                .list_messages(&session.id)
+                .unwrap()
+                .iter()
+                .filter(|m| m.role == "user" && m.content == "send once")
+                .count(),
+            1
+        );
+        tx.send(ServerMessage::Response {
+            id: retry.id,
+            ok: true,
+            result: Some(outcome),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        app.input.set("send once");
+        app.submit_chat(false);
+        let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_ne!(
+            serde_json::to_value(fresh.request).unwrap()["client_msg_id"],
+            original["client_msg_id"]
+        );
+        // The send response can precede the detached Run's cleanup. Do not
+        // restore inherited credentials while that task still reads config.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::sync::Arc::strong_count(&daemon) != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("send retry Run did not finish within 10 seconds");
+        drop(daemon);
+    }
+
+    #[test]
+    fn attaching_each_replacement_daemon_refreshes_its_approvals_mode() {
+        let mut app = test_app();
+        let cfg = Config::default();
+        cfg.save(&app.paths).unwrap();
+        for secure in [true, false] {
+            app.daemon_lost();
+            assert_eq!(app.daemon_secure, None);
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.attach_daemon(client, inbox);
+            let status: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(status.request, Request::Status));
+            assert_eq!(app.daemon_secure, None, "unknown until this daemon replies");
+            tx.send(ServerMessage::Response {
+                id: status.id,
+                ok: true,
+                result: Some(serde_json::json!({"secure": secure})),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(app.daemon_secure, Some(secure));
+            let row = app
+                .settings_rows()
+                .into_iter()
+                .find(|r| r.key == "security.secure")
+                .unwrap();
+            assert_eq!(
+                row.value,
+                settings::approvals_text(secure, cfg.security.secure)
+            );
+        }
+        app.daemon_lost();
+        assert_eq!(app.daemon_secure, None);
+        assert_eq!(
+            app.settings_rows()
+                .into_iter()
+                .find(|r| r.key == "security.secure")
+                .unwrap()
+                .value,
+            "daemon mode unknown"
+        );
+    }
+
+    #[test]
+    fn skill_command_prefixes_dispatch_to_their_distinct_requests() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        for (command, expected) in [
+            ("skills", Request::ListSkills),
+            ("skills foo", Request::GetSkill { name: "foo".into() }),
+            (
+                "skills enable foo",
+                Request::SetSkillEnabled {
+                    name: "foo".into(),
+                    enabled: true,
+                },
+            ),
+            (
+                "skills disable foo",
+                Request::SetSkillEnabled {
+                    name: "foo".into(),
+                    enabled: false,
+                },
+            ),
+            (
+                "skill:foo",
+                Request::LoadSkill {
+                    session_id: "s1".into(),
+                    name: "foo".into(),
+                    args: None,
+                },
+            ),
+            (
+                "skill:foo do this",
+                Request::LoadSkill {
+                    session_id: "s1".into(),
+                    name: "foo".into(),
+                    args: Some("do this".into()),
+                },
+            ),
+        ] {
+            app.slash(command);
+            let envelope: RequestEnvelope =
+                serde_json::from_str(&sent.try_recv().expect(command)).unwrap();
+            assert_eq!(
+                serde_json::to_value(envelope.request).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{command}"
+            );
+            assert!(sent.try_recv().is_err(), "{command} must send one request");
+        }
     }
 
     #[test]
@@ -15531,6 +15877,32 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             meta: None,
         }
+    }
+
+    #[test]
+    fn stored_stops_remain_visible_when_history_is_opened() {
+        let mut app = test_app();
+        let mut partial = msg("assistant", "A partial answer");
+        partial.meta =
+            Some(r#"{"stop_reason":"model_context_window_exceeded","truncated":true}"#.into());
+        app.messages = vec![partial.clone()];
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("A partial answer"), "{screen}");
+        assert!(
+            screen.contains("The answer stopped because the model's context window is full."),
+            "{screen}"
+        );
+        partial.meta = Some(r#"{"truncated":true}"#.into());
+        app.messages = vec![partial.clone()];
+        assert!(render(&mut app, 120, 30)
+            .contains("The answer was cut off at the model's output token limit."));
+        partial.meta = None;
+        app.messages = vec![partial];
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            !screen.contains("The answer stopped") && !screen.contains("The answer was cut off"),
+            "{screen}"
+        );
     }
 
     #[test]

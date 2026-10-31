@@ -7,8 +7,8 @@ use pulldown_cmark::{html, Event, Options, Parser};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/// Tool output longer than this is cut in exports.
-const MAX_RESULT_CHARS: usize = 4000;
+/// Each Tool argument/result longer than this is cut in exports.
+const MAX_CALL_CHARS: usize = 4000;
 
 /// One turn of the transcript, ready to render.
 enum Part {
@@ -46,7 +46,7 @@ fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
                         calls.insert(id.to_string(), out.len());
                     }
                     let name = c["function"]["name"].as_str().unwrap_or("tool");
-                    out.push(Part::Call(name.to_string(), args, None));
+                    out.push(Part::Call(name.to_string(), clip(&args), None));
                 }
             }
             "tool" => {
@@ -68,10 +68,10 @@ fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
 }
 
 fn clip(s: &str) -> String {
-    if s.chars().count() <= MAX_RESULT_CHARS {
+    if s.chars().count() <= MAX_CALL_CHARS {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(MAX_RESULT_CHARS).collect();
+    let mut out: String = s.chars().take(MAX_CALL_CHARS).collect();
     out.push_str("\n… (cut)");
     out
 }
@@ -263,6 +263,26 @@ mod tests {
         assert!(md.contains("````\na.rs: 3"), "{md}");
         assert!(md.contains("> *The working directory is now /x.*"));
         assert!(md.trim_end().ends_with("There are **3**."));
+    }
+
+    #[test]
+    fn multi_megabyte_tool_arguments_are_bounded_in_both_exports() {
+        let arguments = serde_json::json!({"content": "<&é".repeat(1_000_000)}).to_string();
+        let meta = serde_json::json!({"tool_calls": [{"id": "large", "function": {
+            "name": "write", "arguments": arguments
+        }}]})
+        .to_string();
+        let messages = [msg("assistant", "", Some(&meta))];
+        for export in [markdown("large", &messages), html("large", &messages)] {
+            assert!(export.contains("… (cut)"));
+            // HTML escaping expands each bounded character by at most six
+            // bytes; the remainder is the fixed transcript wrapper.
+            assert!(
+                export.len() < MAX_CALL_CHARS * 6 + 4000,
+                "{} bytes",
+                export.len()
+            );
+        }
     }
 
     #[test]
