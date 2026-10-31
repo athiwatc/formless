@@ -74,6 +74,11 @@ struct Renderer {
     code: Option<(String, String)>,
     table: Option<Table>,
     link: Option<(String, usize)>,
+    /// An image's source, kept apart from `link` so an image inside a link
+    /// leaves the link's destination intact (#875).
+    image: Option<String>,
+    /// Styles opened by inline HTML tags (`<kbd>`, `<b>`…), innermost last.
+    html: Vec<(String, Style)>,
     need_gap: bool,
     /// Code blocks so far, so each is labelled `[n]` like `/copy code n`.
     code_index: usize,
@@ -83,7 +88,105 @@ impl Renderer {
     fn style(&self) -> Style {
         self.styles
             .iter()
+            .chain(self.html.iter().map(|(_, s)| s))
             .fold(Style::default(), |a, s| a.patch(*s))
+    }
+
+    /// Where the next pushed span lands (for a link's text).
+    fn mark(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(self.spans.len(), |t| t.cell.len())
+    }
+
+    /// Close a link: its URL follows its text unless the text is the URL.
+    fn finish_link(&mut self) {
+        if let Some((url, at)) = self.link.take() {
+            let spans = self.table.as_ref().map_or(&self.spans, |t| &t.cell);
+            let text: String = spans[at.min(spans.len())..]
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            let bare = url.trim_start_matches("mailto:");
+            if !url.is_empty() && text != url && text != bare && !url.starts_with('#') {
+                self.push_text(format!(" ({url})"), dim(self.color));
+            }
+        }
+    }
+
+    /// Inline HTML as its text content (#875): common formatting tags
+    /// style what they wrap, `<a href>` is a link, `<br>` breaks the line,
+    /// and any other tag (and every comment) is dropped, not shown.
+    fn html(&mut self, raw: &str) {
+        let color = self.color;
+        let mut rest = raw;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("<!--") {
+                rest = after.split_once("-->").map_or("", |(_, r)| r);
+                continue;
+            }
+            let Some(lt) = rest.find('<') else {
+                self.push_text(rest.trim_end_matches('\n').to_string(), Style::default());
+                break;
+            };
+            if lt > 0 {
+                self.push_text(rest[..lt].to_string(), Style::default());
+            }
+            let Some(gt) = rest[lt..].find('>') else {
+                self.push_text(rest[lt..].to_string(), Style::default());
+                break;
+            };
+            let tag = &rest[lt + 1..lt + gt];
+            rest = &rest[lt + gt + 1..];
+            let closing = tag.starts_with('/');
+            let body = tag.trim_start_matches('/').trim_end_matches('/').trim();
+            let name: String = body
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if name == "br" {
+                self.push_text("\n", Style::default());
+                continue;
+            }
+            if closing {
+                if let Some(i) = self.html.iter().rposition(|(n, _)| *n == name) {
+                    self.html.truncate(i);
+                    if name == "a" {
+                        self.finish_link();
+                    }
+                }
+                continue;
+            }
+            let style = match name.as_str() {
+                "b" | "strong" => Style::default().add_modifier(Modifier::BOLD),
+                "i" | "em" => Style::default().add_modifier(Modifier::ITALIC),
+                "s" | "del" | "strike" => Style::default().add_modifier(Modifier::CROSSED_OUT),
+                "u" | "ins" => Style::default().add_modifier(Modifier::UNDERLINED),
+                "code" | "kbd" | "samp" => fg(color, Color::Yellow),
+                "sub" | "sup" | "span" | "small" | "mark" => Style::default(),
+                "a" => {
+                    let href = body
+                        .split("href=")
+                        .nth(1)
+                        .map(|v| {
+                            let q = v.chars().next().filter(|c| *c == '"' || *c == '\'');
+                            match q {
+                                Some(q) => v[1..].split(q).next().unwrap_or_default(),
+                                None => v.split_whitespace().next().unwrap_or_default(),
+                            }
+                        })
+                        .unwrap_or_default()
+                        .to_string();
+                    if self.link.is_none() && !href.is_empty() {
+                        self.link = Some((href, self.mark()));
+                    }
+                    fg(color, Color::Blue).add_modifier(Modifier::UNDERLINED)
+                }
+                _ => continue,
+            };
+            self.html.push((name, style));
+        }
     }
 
     fn push_text(&mut self, text: impl Into<String>, extra: Style) {
@@ -175,14 +278,7 @@ impl Renderer {
                 t.to_string(),
                 fg(color, Color::LightMagenta).add_modifier(Modifier::ITALIC),
             ),
-            Event::Html(t) | Event::InlineHtml(t) => {
-                let tag = t.trim().to_ascii_lowercase();
-                if matches!(tag.as_str(), "<br>" | "<br/>" | "<br />") {
-                    self.push_text("\n", Style::default());
-                } else if !tag.starts_with("<!--") {
-                    self.push_text(t.trim_end_matches('\n').to_string(), dim(color));
-                }
-            }
+            Event::Html(t) | Event::InlineHtml(t) => self.html(&t),
             Event::SoftBreak => self.push_text(" ", Style::default()),
             Event::HardBreak => self.push_text("\n", Style::default()),
             Event::Rule => {
@@ -314,17 +410,14 @@ impl Renderer {
                 .styles
                 .push(Style::default().add_modifier(Modifier::CROSSED_OUT)),
             Tag::Link { dest_url, .. } => {
-                let at = self
-                    .table
-                    .as_ref()
-                    .map_or(self.spans.len(), |t| t.cell.len());
+                let at = self.mark();
                 self.link = Some((dest_url.to_string(), at));
                 self.styles
                     .push(fg(color, Color::Blue).add_modifier(Modifier::UNDERLINED));
             }
             Tag::Image { dest_url, .. } => {
                 self.push_text("[image: ", dim(color));
-                self.link = Some((dest_url.to_string(), usize::MAX));
+                self.image = Some(dest_url.to_string());
                 self.styles.push(dim(color));
             }
             Tag::FootnoteDefinition(name) => {
@@ -403,21 +496,11 @@ impl Renderer {
             }
             TagEnd::Link => {
                 self.styles.pop();
-                if let Some((url, at)) = self.link.take() {
-                    let spans = self.table.as_ref().map_or(&self.spans, |t| &t.cell);
-                    let text: String = spans[at.min(spans.len())..]
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect();
-                    let bare = url.trim_start_matches("mailto:");
-                    if !url.is_empty() && text != url && text != bare && !url.starts_with('#') {
-                        self.push_text(format!(" ({url})"), dim(color));
-                    }
-                }
+                self.finish_link();
             }
             TagEnd::Image => {
                 self.styles.pop();
-                if let Some((url, _)) = self.link.take() {
+                if let Some(url) = self.image.take() {
                     self.push_text(format!("]({url})"), dim(color));
                 }
             }
@@ -598,8 +681,26 @@ impl Renderer {
                     )),
                 }
                 line.push(Span::raw(": "));
-                line.extend(cell.iter().cloned());
-                self.emit(line);
+                // The value wraps under itself with a hanging indent, so no
+                // row is wider than the pane (#874); a key too wide to leave
+                // room puts the value on the rows below it.
+                let avail = self.width.saturating_sub(self.prefix_width()).max(1);
+                let key_w: usize = line.iter().map(|s| s.content.width()).sum();
+                let (first, hang) = if avail >= key_w + 8 {
+                    (line, key_w)
+                } else {
+                    self.emit(truncate_spans(line, avail));
+                    (vec![Span::raw("    ")], 4.min(avail.saturating_sub(1)))
+                };
+                let mut rows = wrap(cell.clone(), avail - hang).into_iter();
+                let mut head = first;
+                head.extend(rows.next().unwrap_or_default());
+                self.emit(head);
+                for r in rows {
+                    let mut l = vec![Span::raw(" ".repeat(hang))];
+                    l.extend(r);
+                    self.emit(l);
+                }
             }
         }
     }
@@ -873,6 +974,51 @@ mod tests {
         let out = lines(wide, 20);
         assert!(out.iter().any(|l| l.trim() == "▸ row 1"), "{out:#?}");
         assert!(out.iter().any(|l| l.trim() == "c: 3"), "{out:#?}");
+        // A long value in records mode wraps under its key (#874).
+        let long = "| a | b | c | d | e |\n|---|---|---|---|---|\n| 1 | a very long cell value that keeps going and going | 3 | 4 | 5 |";
+        let out = lines(long, 20);
+        assert!(out.iter().all(|l| l.width() <= 20), "{out:#?}");
+        let text = out.join(" ");
+        for word in ["very", "long", "cell", "value", "keeps", "going"] {
+            assert!(text.contains(word), "{word} lost: {out:#?}");
+        }
+        let b = out
+            .iter()
+            .position(|l| l.trim_start().starts_with("b: "))
+            .unwrap();
+        assert!(out[b + 1].starts_with("     "), "hanging indent: {out:#?}");
+    }
+
+    /// An image inside a link keeps both addresses, and inline HTML shows
+    /// its text, not its tags (#875).
+    #[test]
+    fn image_links_and_inline_html() {
+        let out = lines(
+            "[![alt](https://i.example/x.png)](https://dest.example/)",
+            80,
+        )
+        .join("\n");
+        assert!(out.contains("https://i.example/x.png"), "{out}");
+        assert!(out.contains("(https://dest.example/)"), "{out}");
+        let out = lines(
+            "Press <kbd>Esc</kbd>, H<sub>2</sub>O, a<sup>2</sup> <!-- hidden --> <foo>x</foo>",
+            80,
+        )
+        .join("\n");
+        assert_eq!(out.trim(), "Press Esc, H2O, a2 x");
+        let out = lines(
+            "see <a href=\"https://x.dev\">the docs</a> and <b>bold</b>",
+            80,
+        )
+        .join("\n");
+        assert_eq!(out.trim(), "see the docs (https://x.dev) and bold");
+        let styled = render("<b>bold</b>", false, "", 40);
+        let span = styled[0]
+            .spans
+            .iter()
+            .find(|s| s.content == "bold")
+            .unwrap();
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

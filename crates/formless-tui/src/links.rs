@@ -30,18 +30,7 @@ pub fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
         .min()
     {
         let start = from + s[byte_of(&chars, from)..][..rel].chars().count();
-        let mut end = start;
-        while end < chars.len() && !chars[end].is_whitespace() && !"<>\"`│".contains(chars[end]) {
-            end += 1;
-        }
-        // Trailing punctuation belongs to the sentence, not the URL.
-        while end > start && ".,;:!?'\")]}".contains(chars[end - 1]) {
-            // Keep a `)` that closes a `(` inside the URL.
-            if chars[end - 1] == ')' && chars[start..end].contains(&'(') {
-                break;
-            }
-            end -= 1;
-        }
+        let end = url_end(&chars, start, run_end(&chars, start));
         let url: String = chars[start..end].iter().collect();
         if url.len() > "https://".len() {
             out.push((start, end, url));
@@ -94,6 +83,43 @@ pub fn find_paths(text: &str) -> Vec<(usize, usize, String, Option<u32>)> {
     out
 }
 
+/// Where a URL starting at `start` runs to: up to whitespace or a
+/// character that can't be in one.
+fn run_end(chars: &[char], start: usize) -> usize {
+    let mut end = start;
+    while end < chars.len() && !chars[end].is_whitespace() && !"<>\"`│".contains(chars[end]) {
+        end += 1;
+    }
+    end
+}
+
+/// The end of the URL in `chars[start..end]` once trailing punctuation
+/// that belongs to the sentence is dropped. A closing bracket stays only
+/// while it closes one opened inside the URL (#880): `f_(x))` keeps one.
+fn url_end(chars: &[char], start: usize, mut end: usize) -> usize {
+    while end > start {
+        let c = chars[end - 1];
+        let opener = match c {
+            ')' => Some('('),
+            ']' => Some('['),
+            '}' => Some('{'),
+            _ => None,
+        };
+        if let Some(open) = opener {
+            let url = &chars[start..end];
+            let opened = url.iter().filter(|&&x| x == open).count();
+            let closed = url.iter().filter(|&&x| x == c).count();
+            if closed <= opened {
+                break;
+            }
+        } else if !".,;:!?'\"".contains(c) {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
 fn byte_of(chars: &[char], idx: usize) -> usize {
     chars[..idx.min(chars.len())]
         .iter()
@@ -108,34 +134,82 @@ pub fn scan(
     area: Rect,
     resolve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Vec<Painted> {
+    // One char per cell; wide chars leave an empty continuation cell.
+    let rows: Vec<(u16, Vec<u16>, Vec<char>)> = (area.top()..area.bottom())
+        .map(|y| {
+            let mut xs = Vec::new();
+            let mut text = Vec::new();
+            for x in area.left()..area.right() {
+                for c in buf[(x, y)].symbol().chars().take(1) {
+                    xs.push(x);
+                    text.push(c);
+                }
+            }
+            (y, xs, text)
+        })
+        .collect();
+    let first_ink = |t: &[char]| t.iter().position(|c| !c.is_whitespace());
+    let last_ink = |t: &[char]| t.iter().rposition(|c| !c.is_whitespace());
+    // Char ranges per row already covered by a URL (a fragment of one
+    // wrapped from the row above included).
+    let mut covered: Vec<Vec<(usize, usize)>> = vec![Vec::new(); rows.len()];
     let mut out = Vec::new();
-    for y in area.top()..area.bottom() {
-        // One char per cell; wide chars leave an empty continuation cell.
-        let mut xs = Vec::new();
-        let mut text = String::new();
-        for x in area.left()..area.right() {
-            let sym = buf[(x, y)].symbol();
-            for c in sym.chars().take(1) {
-                xs.push(x);
-                text.push(c);
+    for (i, (y, xs, chars)) in rows.iter().enumerate() {
+        let text: String = chars.iter().collect();
+        for (a, b, url) in find_urls(&text) {
+            if covered[i].iter().any(|&(ca, cb)| a < cb && b > ca) {
+                continue;
+            }
+            // A long URL hard-split across rows (#880): it is alone on its
+            // row, fills it, and the next row carries on at the same
+            // column. Join the pieces into one target for every fragment.
+            let mut pieces = vec![(i, a, run_end(chars, a))];
+            loop {
+                let &(r, pa, pb) = pieces.last().expect("one piece");
+                let (_, _, rc) = &rows[r];
+                let alone = first_ink(rc) == Some(pa) && last_ink(rc).map(|l| l + 1) == Some(pb);
+                let Some((_, _, next)) = rows.get(r + 1) else {
+                    break;
+                };
+                if !alone || pb - pa < 16 || first_ink(next) != Some(a) {
+                    break;
+                }
+                pieces.push((r + 1, a, run_end(next, a)));
+            }
+            let target = if pieces.len() == 1 {
+                url
+            } else {
+                let joined: Vec<char> = pieces
+                    .iter()
+                    .flat_map(|&(r, pa, pb)| rows[r].2[pa..pb].iter().copied())
+                    .collect();
+                let end = url_end(&joined, 0, joined.len());
+                joined[..end].iter().collect()
+            };
+            let mut left = target.chars().count();
+            for &(r, pa, pb) in &pieces {
+                let n = (pb - pa).min(left);
+                if n == 0 {
+                    break;
+                }
+                left -= n;
+                let (ry, rxs, _) = &rows[r];
+                out.push(Painted {
+                    y: *ry,
+                    x0: rxs[pa],
+                    x1: rxs[pa + n - 1],
+                    url: target.clone(),
+                });
+                covered[r].push((pa, pa + n));
             }
         }
-        let urls = find_urls(&text);
-        for (a, b, url) in &urls {
-            out.push(Painted {
-                y,
-                x0: xs[*a],
-                x1: xs[*b - 1],
-                url: url.clone(),
-            });
-        }
         for (a, b, path, _) in find_paths(&text) {
-            if urls.iter().any(|(ua, ub, _)| a < *ub && b > *ua) {
+            if covered[i].iter().any(|&(ua, ub)| a < ub && b > ua) {
                 continue;
             }
             if let Some(url) = resolve(&path) {
                 out.push(Painted {
-                    y,
+                    y: *y,
                     x0: xs[a],
                     x1: xs[b - 1],
                     url,
@@ -261,6 +335,11 @@ mod tests {
         let wiki = find_urls("https://en.wikipedia.org/wiki/Rust_(language) ok");
         assert_eq!(wiki[0].2, "https://en.wikipedia.org/wiki/Rust_(language)");
         assert!(find_urls("no links here, just https:// alone").is_empty());
+        // Brackets are balanced, not just looked for (#880).
+        let paren = find_urls("(see https://example.com/f_(x))");
+        assert_eq!(paren[0].2, "https://example.com/f_(x)");
+        let square = find_urls("(https://x.dev/a[1])");
+        assert_eq!(square[0].2, "https://x.dev/a[1]");
         let wide = find_urls("日本 https://a.jp");
         assert_eq!((wide[0].0, wide[0].2.as_str()), (3, "https://a.jp"));
     }
@@ -285,6 +364,39 @@ mod tests {
             "the :line is part of the link"
         );
         assert!(find_paths("https://x.dev/a.html and @user").is_empty());
+    }
+
+    /// A URL hard-wrapped across rows links every fragment to the whole
+    /// URL; a URL that merely ends a row is left alone (#880).
+    #[test]
+    fn a_url_wrapped_across_rows_is_one_link() {
+        let url = "https://example.com/very/long/path/to/a/page";
+        let lines = crate::markdown::render(&format!("see {url} now"), false, "", 24);
+        let area = Rect::new(0, 0, 24, lines.len() as u16);
+        let mut buf = Buffer::empty(area);
+        for (y, l) in lines.iter().enumerate() {
+            buf.set_line(0, y as u16, l, 24);
+        }
+        let links = scan(&buf, area, &mut |_| None);
+        assert!(links.len() >= 2, "{links:?}");
+        assert!(links.iter().all(|l| l.url == url), "{links:?}");
+        let painted: usize = links.iter().map(|l| (l.x1 - l.x0 + 1) as usize).sum();
+        assert_eq!(painted, url.len());
+
+        // A short URL that ends a soft-wrapped row is not joined to the
+        // words below it.
+        let lines =
+            crate::markdown::render("read https://x.dev/a then continue reading", false, "", 20);
+        let area = Rect::new(0, 0, 20, lines.len() as u16);
+        let mut buf = Buffer::empty(area);
+        for (y, l) in lines.iter().enumerate() {
+            buf.set_line(0, y as u16, l, 20);
+        }
+        let links = scan(&buf, area, &mut |_| None);
+        assert_eq!(
+            links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            ["https://x.dev/a"]
+        );
     }
 
     #[test]

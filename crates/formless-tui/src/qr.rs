@@ -7,11 +7,15 @@ use qrcode::{Color, EcLevel, QrCode};
 /// The code for `text` as lines of `█`, `▀`, `▄` and spaces (light
 /// modules print as blocks, so it reads the same on any background).
 pub fn lines(text: &str) -> Option<Vec<String>> {
-    let code = QrCode::with_error_correction_level(text, EcLevel::L).ok()?;
+    // Level M (~15% damage tolerance) costs the pairing link about one
+    // version over L: still terminal-sized, and it scans off a glossy or
+    // scaled screen (#882).
+    let code = QrCode::with_error_correction_level(text, EcLevel::M).ok()?;
     let width = code.width();
     let colors = code.to_colors();
-    // A 2-module quiet zone; outside the code counts as light.
-    let quiet = 2i64;
+    // The 4-module quiet zone ISO/IEC 18004 asks for, drawn light, since
+    // what lies beyond the code on a dark terminal is not (#882).
+    let quiet = 4i64;
     let size = width as i64 + 2 * quiet;
     let light = |x: i64, y: i64| {
         let (cx, cy) = (x - quiet, y - quiet);
@@ -66,5 +70,26 @@ mod tests {
         // The quiet zone is light: the top line is all full blocks.
         assert!(l[0].chars().all(|c| c == '█'));
         assert!(l.iter().any(|r| r.contains(' ')), "dark modules show");
+    }
+
+    #[test]
+    fn the_pairing_link_has_a_full_quiet_zone_and_fits_a_terminal() {
+        // The default relay URL with a 43-character secret.
+        let url = format!("https://formless.athiwat.xyz/#k={}", "A".repeat(43));
+        let l = lines(&url).unwrap();
+        let w = l[0].chars().count();
+        // Four light modules on every side: two text lines on top, four
+        // full blocks at both ends of every line.
+        assert!(l[..2].iter().all(|r| r.chars().all(|c| c == '█')));
+        for row in &l {
+            let chars: Vec<char> = row.chars().collect();
+            assert!(
+                chars[..4].iter().chain(&chars[w - 4..]).all(|c| *c == '█'),
+                "{row}"
+            );
+        }
+        // Level M: version 5 (37 modules) plus the quiet zone.
+        assert_eq!(w, 37 + 8);
+        assert!(l.len() <= 23, "{} lines", l.len());
     }
 }
