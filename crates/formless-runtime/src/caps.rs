@@ -439,6 +439,17 @@ fn bound_path(raw: &str) -> Result<String, String> {
 /// through it would land wherever it points; so is `..` in the missing
 /// tail, which could otherwise climb out after canonicalisation.
 pub fn canonical_path(raw: &str) -> Result<std::path::PathBuf, String> {
+    canonical_path_with(raw, |p| p.canonicalize(), |p| p.symlink_metadata())
+}
+
+// Separate filesystem operations let tests place a creation exactly between
+// canonicalize's NotFound and symlink_metadata, without timing or global hooks.
+fn canonical_path_with(
+    raw: &str,
+    mut canonicalize: impl FnMut(&std::path::Path) -> std::io::Result<std::path::PathBuf>,
+    mut metadata: impl FnMut(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::ErrorKind;
     use std::path::{Component, Path};
     if raw.is_empty() {
         return Err("empty path".into());
@@ -452,11 +463,25 @@ pub fn canonical_path(raw: &str) -> Result<std::path::PathBuf, String> {
     let mut base = abs.as_path();
     let mut tail = Vec::new();
     loop {
-        if let Ok(c) = base.canonicalize() {
-            return Ok(tail.iter().rev().fold(c, |acc, t| acc.join(t)));
+        let unresolved = |e| format!("cannot resolve path {}: {e}", base.display());
+        match canonicalize(base) {
+            Ok(c) => return Ok(tail.iter().rev().fold(c, |acc, t| acc.join(t))),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(unresolved(e)),
         }
-        if base.symlink_metadata().is_ok() {
-            return Err(format!("dangling symlink: {}", base.display()));
+        match metadata(base) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!("dangling symlink: {}", base.display()));
+            }
+            Ok(_) => {
+                // Another writer created this entry after canonicalize saw it
+                // missing. Resolve it rather than mistaking a regular file or
+                // directory for a dangling symlink. A failed retry stays closed.
+                let c = canonicalize(base).map_err(unresolved)?;
+                return Ok(tail.iter().rev().fold(c, |acc, t| acc.join(t)));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(unresolved(e)),
         }
         match base.components().next_back() {
             Some(Component::Normal(name)) => tail.push(name.to_os_string()),
@@ -546,6 +571,166 @@ mod tests {
 
     fn caps(specs: &[&str]) -> Capabilities {
         Capabilities::parse(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    struct PathFixture(std::path::PathBuf);
+    impl PathFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("fl-canonical-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root.canonicalize().unwrap())
+        }
+    }
+    impl Drop for PathFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn canonical_path_resolves_entries_created_after_the_missing_probe() {
+        let root = PathFixture::new();
+        for directory in [false, true] {
+            let created = root.0.join(if directory { "parent" } else { "out.txt" });
+            let target = if directory {
+                created.join("out.txt")
+            } else {
+                created.clone()
+            };
+            let mut resolutions = Vec::new();
+            let mut created_between_probes = false;
+            let result = canonical_path_with(
+                target.to_str().unwrap(),
+                |p| {
+                    resolutions.push(p.to_path_buf());
+                    p.canonicalize()
+                },
+                |p| {
+                    if p == created && !created_between_probes {
+                        // The preceding real canonicalize returned NotFound.
+                        if directory {
+                            std::fs::create_dir(p).unwrap();
+                        } else {
+                            std::fs::write(p, "created by another writer").unwrap();
+                        }
+                        created_between_probes = true;
+                    }
+                    p.symlink_metadata()
+                },
+            )
+            .unwrap();
+            assert!(created_between_probes);
+            assert_eq!(result, target);
+            let expected = if directory {
+                vec![target, created.clone(), created]
+            } else {
+                vec![created.clone(), created]
+            };
+            assert_eq!(
+                resolutions, expected,
+                "retry the same entry, not its parent"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_path_never_ascends_after_resolution_or_metadata_errors() {
+        use std::io::{Error, ErrorKind};
+        let root = PathFixture::new();
+        let target = root.0.join("out.txt");
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotADirectory,
+            ErrorKind::Other,
+        ] {
+            let mut resolutions = 0;
+            let error = canonical_path_with(
+                target.to_str().unwrap(),
+                |_| {
+                    resolutions += 1;
+                    Err(Error::from(kind))
+                },
+                |_| panic!("non-missing resolution errors must stop immediately"),
+            )
+            .unwrap_err();
+            assert!(error.starts_with("cannot resolve path"), "{error}");
+            assert_eq!(resolutions, 1);
+            let mut metadata_calls = 0;
+            let error = canonical_path_with(
+                target.to_str().unwrap(),
+                |_| Err(Error::from(ErrorKind::NotFound)),
+                |_| {
+                    metadata_calls += 1;
+                    Err(Error::from(kind))
+                },
+            )
+            .unwrap_err();
+            assert!(error.starts_with("cannot resolve path"), "{error}");
+            assert_eq!(metadata_calls, 1);
+        }
+    }
+
+    #[test]
+    fn canonical_path_does_not_fall_back_when_the_creation_retry_fails() {
+        use std::io::{Error, ErrorKind};
+        let root = PathFixture::new();
+        let target = root.0.join("out.txt");
+        std::fs::write(&target, "exists by the metadata probe").unwrap();
+        for kind in [ErrorKind::NotFound, ErrorKind::PermissionDenied] {
+            let mut resolutions = 0;
+            let error = canonical_path_with(
+                target.to_str().unwrap(),
+                |_| {
+                    resolutions += 1;
+                    Err(Error::from(if resolutions == 1 {
+                        ErrorKind::NotFound
+                    } else {
+                        kind
+                    }))
+                },
+                |p| p.symlink_metadata(),
+            )
+            .unwrap_err();
+            assert!(error.starts_with("cannot resolve path"), "{error}");
+            assert_eq!(resolutions, 2, "only one retry, no ancestor fallback");
+        }
+    }
+
+    #[test]
+    fn canonical_path_preserves_missing_tail_and_refuses_parent_traversal() {
+        let root = PathFixture::new();
+        let target = root.0.join("missing").join("out.txt");
+        assert_eq!(canonical_path(target.to_str().unwrap()).unwrap(), target);
+        let escape = root.0.join("missing").join("..").join("escape.txt");
+        assert!(canonical_path(escape.to_str().unwrap()).is_err());
+        assert!(canonical_path("").is_err());
+        let file = root.0.join("file");
+        std::fs::write(&file, "regular file").unwrap();
+        assert!(canonical_path(file.join("child").to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_path_refuses_real_dangling_and_looping_symlinks() {
+        let root = PathFixture::new();
+        let dangling = root.0.join("dangling");
+        std::os::unix::fs::symlink(root.0.join("absent"), &dangling).unwrap();
+        for target in [dangling.clone(), dangling.join("child")] {
+            let error = canonical_path(target.to_str().unwrap()).unwrap_err();
+            assert!(error.starts_with("dangling symlink:"), "{error}");
+        }
+        let looping = root.0.join("loop");
+        std::os::unix::fs::symlink(&looping, &looping).unwrap();
+        let error = canonical_path(looping.to_str().unwrap()).unwrap_err();
+        assert!(error.starts_with("cannot resolve path"), "{error}");
+        let actual = root.0.join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        let link = root.0.join("link");
+        std::os::unix::fs::symlink(&actual, &link).unwrap();
+        assert_eq!(
+            canonical_path(link.join("new").to_str().unwrap()).unwrap(),
+            actual.join("new")
+        );
     }
 
     #[test]
