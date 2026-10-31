@@ -1,6 +1,9 @@
 //! v2 prompt/memory self-optimisation (SPEC §7.7/§17): versioned,
 //! measured proposals and their lifecycle gates.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::optimiser::{
     proposal_beats_baseline, scenario_cases, significant_improvement, wilson_interval,
 };
@@ -21,6 +24,7 @@ fn temp_store(tag: &str) -> Store {
 
 #[test]
 fn proposal_lifecycle_is_measured_and_versioned() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = temp_store("selfopt");
     let p = store
         .create_proposal(
@@ -105,6 +109,7 @@ fn create(js: &str, caps: &[&str]) -> ToolCall {
 
 #[test]
 fn scenarios_judge_actions_not_words() {
+    let _env = credential_env::EnvGuard::isolated();
     let cases = scenario_cases();
     let case = |n: &str| cases.iter().find(|c| c.name == n).unwrap().check;
     let find = call("find_tools", serde_json::json!({"query": "csv"}));
@@ -155,6 +160,7 @@ fn scenarios_judge_actions_not_words() {
 
 #[test]
 fn eval_statistics() {
+    let _env = credential_env::EnvGuard::isolated();
     let (lo, hi) = wilson_interval(15, 21);
     assert!(
         lo > 0.49 && lo < 0.52 && hi > 0.85 && hi < 0.88,
@@ -173,6 +179,7 @@ fn eval_statistics() {
 
 #[test]
 fn proposal_apply_requires_margin_win() {
+    let _env = credential_env::EnvGuard::isolated();
     // Exactly the margin passes despite float rounding (0.6 - 0.5 < 0.1).
     assert!(proposal_beats_baseline(0.5, 0.6, 10));
     assert!(proposal_beats_baseline(0.5, 0.83, 10));
@@ -188,6 +195,7 @@ fn proposal_apply_requires_margin_win() {
 
 #[test]
 fn applied_memory_proposals_migrate_into_the_memory_store() {
+    let _env = credential_env::EnvGuard::isolated();
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let db = std::path::PathBuf::from(format!("/tmp/fl-memmig-{short}/f.db"));
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
@@ -216,6 +224,7 @@ fn applied_memory_proposals_migrate_into_the_memory_store() {
 
 #[test]
 fn optimiser_fix_plan_follows_failure_tags() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::optimiser::{fix_plan, tag_breakdown, FixPlan};
     use formless_core::storage::ReplayItem;
     let item = |tag: &str, ok: bool| ReplayItem {
@@ -258,6 +267,7 @@ fn optimiser_fix_plan_follows_failure_tags() {
 
 #[test]
 fn optimiser_queue_persists_and_waits_only_for_busy_tools() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = temp_store("optq");
     let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
     let mk = |n: &str| {
@@ -321,6 +331,7 @@ fn optimiser_queue_persists_and_waits_only_for_busy_tools() {
 
 #[test]
 fn near_duplicate_proposals() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::optimiser::near_duplicate;
     assert!(near_duplicate(
         "Always stream large files in chunks.",
@@ -334,9 +345,10 @@ fn near_duplicate_proposals() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generate_does_not_repeat_or_run_twice() {
+    let _env = credential_env::EnvGuard::isolated();
     use axum::routing::post;
     use formless_protocol::Request;
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let app = axum::Router::new().route(
         "/chat/completions",

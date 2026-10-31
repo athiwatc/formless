@@ -4093,5 +4093,11 @@ without an approver fails closed.
 - No test may require a real provider key; all provider behaviour is mocked
   or pointed at a local compatible endpoint.
 
-
-
+Credential-sensitive tests share a per-binary environment guard. It holds a
+lock for the full test body (including awaited work), saves and clears inherited
+`FORMLESS_API_KEY*` and OAuth credential overrides, and restores them on exit or
+panic. Helpers borrow the caller's guard rather than reacquiring it; key-absence
+and fallback tests use the same lock as setters. Tests pin hostile inherited
+credentials, named-provider/file overrides, unwind restoration and contrasting
+parallel mock keys. A source check rejects bare environment mutation outside the
+shared helper.

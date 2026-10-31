@@ -41,3 +41,7 @@ pub mod win_pipe;
 pub use config::Config;
 pub use paths::Paths;
 pub use storage::Store;
+
+#[cfg(test)]
+#[path = "../tests/support/env.rs"]
+mod credential_env;
