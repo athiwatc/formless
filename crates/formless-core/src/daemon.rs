@@ -14789,7 +14789,7 @@ mod mcp_approval_redaction_tests {
             tx,
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
-            gap: None,
+            gaps: Default::default(),
         });
         for args in [
             json!({"name":"safe-http", "transport":"http", "url":"https://u:pw@h/mcp", "reason":"connect https://u:pw@h/mcp"}),
