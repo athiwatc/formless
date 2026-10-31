@@ -1522,9 +1522,17 @@ fn run_cli(cli: Cli) -> Result<()> {
                 anyhow::bail!("stop the daemon first: formless daemon stop");
             }
             eprintln!("restore: close TUIs and pause any login service that may restart the daemon; exclusive profile ownership is required");
-            let saved = formless_core::housekeeping::restore(&paths, &file)?;
+            let outcome = formless_core::housekeeping::restore_report(&paths, &file)?;
             println!("restored:  {}", file.display());
-            println!("previous:  saved as {}", saved.display());
+            if outcome.saved.is_file() {
+                println!("previous:  saved as {}", outcome.saved.display());
+            } else {
+                println!("previous:  none (the destination had no database)");
+            }
+            for warning in outcome.warnings() {
+                eprintln!("warning: {warning}");
+            }
+            println!("scope:     database only; external artifact/skill files and recorded paths were not restored or rewritten");
             Ok(())
         }
         Some(Cmd::Run {
@@ -2721,6 +2729,9 @@ fn backup_cmd(paths: &Paths) -> Result<()> {
         r["file"].as_str().unwrap_or_default(),
         formless_core::housekeeping::human_bytes(r["bytes"].as_u64().unwrap_or(0))
     );
+    println!("scope:     database only; copy artifacts/ and skills/ separately");
+    println!("excluded:  config.toml, credential files and OS keyring entries");
+    println!("paths:     recorded file paths are not rewritten for another profile or machine");
     println!("restore:   formless daemon stop && formless restore FILE");
     Ok(())
 }

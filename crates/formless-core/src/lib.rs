@@ -26,6 +26,7 @@ pub mod presets;
 pub mod profile_lock;
 pub mod provider;
 pub mod relay;
+pub mod restore_references;
 pub mod routing;
 pub mod runs;
 pub mod scripts;
