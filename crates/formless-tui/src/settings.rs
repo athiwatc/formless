@@ -649,7 +649,7 @@ impl Form {
                     base_url,
                     model: Some(self.value(2)).filter(|m| !m.is_empty()),
                     api_key: Some(self.fields[3].input.to_string()).filter(|k| !k.is_empty()),
-                    headers: pairs(&self.fields[4].input.to_string())?,
+                    headers: pairs(&self.fields[4].input)?,
                     query_params: pairs(&self.value(5))?.or_else(|| Some(Default::default())),
                     api_key_header: Some(self.value(6)),
                 })
