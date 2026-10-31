@@ -776,7 +776,11 @@
     if (!SAFE_URL.test(url)) return kids;
     return h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, kids);
   }
-  function inline(text) {
+  // Keep persisted or streaming model text from creating unbounded recursive
+  // work. Excess text remains readable verbatim instead of being discarded.
+  const MD_DEPTH = 32, MD_INLINE_CHARS = 4096, MD_FORMAT_CHARS = 128 * 1024;
+  function inline(text, depth = 0) {
+    if (depth >= MD_DEPTH || text.length > MD_INLINE_CHARS) return [text];
     const out = [];
     const re = new RegExp(INLINE.source, "g");
     let last = 0;
@@ -784,13 +788,13 @@
     while ((m = re.exec(text))) {
       if (m.index > last) out.push(text.slice(last, m.index));
       if (m[2] != null) out.push(h("code", null, m[1].length > 1 ? m[2].trim() : m[2]));
-      else if (m[3] != null || m[4] != null) out.push(h("strong", null, inline(m[3] != null ? m[3] : m[4])));
-      else if (m[5] != null) out.push(h("del", null, inline(m[5])));
-      else if (m[6] != null || m[7] != null) out.push(h("em", null, inline(m[6] != null ? m[6] : m[7])));
+      else if (m[3] != null || m[4] != null) out.push(h("strong", null, inline(m[3] != null ? m[3] : m[4], depth + 1)));
+      else if (m[5] != null) out.push(h("del", null, inline(m[5], depth + 1)));
+      else if (m[6] != null || m[7] != null) out.push(h("em", null, inline(m[6] != null ? m[6] : m[7], depth + 1)));
       // Remote images are blocked by the CSP (img-src 'self' data:), so an
       // image is shown as a labelled link instead.
       else if (m[9] != null) out.push(link(m[9], h("span", { class: "img-link" }, "🖼 " + (m[8] || "image"))));
-      else if (m[11] != null) out.push(link(m[11], inline(m[10])));
+      else if (m[11] != null) out.push(link(m[11], inline(m[10], depth + 1)));
       else if (m[12] != null) out.push(link(m[12], m[12].replace(/^mailto:/i, "")));
       else if (m[13] != null) out.push(link(m[13], m[13]));
       else if (m[14] != null) out.push(h("span", { class: "math" }, m[14]));
@@ -1061,7 +1065,8 @@
   }
 
   /** Append the block structure of `lines` to `root`. */
-  function blocks(lines, root) {
+  function blocks(lines, root, depth = 0) {
+    if (depth >= MD_DEPTH) { root.append(h("pre", { class: "md-plain" }, lines.join("\n"))); return root; }
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
@@ -1113,11 +1118,11 @@
         const alert = buf[0] && buf[0].trim().match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$/i);
         const q = h("blockquote", { class: alert ? "callout " + alert[1].toLowerCase() : null });
         if (alert) { buf.shift(); q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()])); }
-        blocks(buf, q);
+        blocks(buf, q, depth + 1);
         root.append(q);
         continue;
       }
-      if (ITEM.test(line)) { i = list(lines, i, root); continue; }
+      if (ITEM.test(line)) { i = list(lines, i, root, depth); continue; }
       const p = h("p");
       p.append(...inline(line.trim()));
       i++;
@@ -1128,7 +1133,7 @@
   }
 
   /** A (possibly nested) list starting at lines[i]; returns the next index. */
-  function list(lines, i, root) {
+  function list(lines, i, root, depth = 0) {
     const first = lines[i].match(ITEM);
     const base = indentOf(first[1]);
     const ordered = /\d/.test(first[2]);
@@ -1162,7 +1167,7 @@
         li.className = "task";
         li.append(h("input", { type: "checkbox", disabled: true, checked: task[1] !== " ", "aria-label": task[1] !== " " ? "done" : "not done" }));
       }
-      blocks(body, li);
+      blocks(body, li, depth + 1);
       el.append(li);
       // Blank line before a sibling item makes the list loose.
       if (i > 0 && !lines[i - 1].trim() && i < lines.length && ITEM.test(lines[i])) loose = true;
@@ -1173,7 +1178,10 @@
   }
 
   function markdown(text) {
-    return blocks(String(text || "").replace(/\r\n?/g, "\n").split("\n"), h("div", { class: "md bubble" }));
+    text = String(text || "");
+    const root = h("div", { class: "md bubble" });
+    if (text.length > MD_FORMAT_CHARS) { root.append(h("pre", { class: "md-plain" }, text)); return root; }
+    return blocks(text.replace(/\r\n?/g, "\n").split("\n"), root);
   }
 
   // ------------------------------------------------------------- chat
@@ -1722,11 +1730,14 @@
           let calls = [];
           try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
           calls.forEach((c) => n.append(toolCallChip(c)));
-          if (m === lastAnswer && !isRunning()) {
-            if (S.recap) n.append(recapBlock(S.recap));
-            n.append(rateButtons());
-          }
         }));
+        // Run state changes after MessageComplete. Keep its controls outside
+        // the cached body so recap/rating and the last-answer target stay live.
+        if (m === lastAnswer && !isRunning()) {
+          const body = turn.body;
+          if (S.recap) body.append(recapBlock(S.recap));
+          body.append(rateButtons());
+        }
       }
     }
     box.append(h("div", { id: "live", class: "turn" }));
@@ -2121,6 +2132,10 @@
     $("modal-backdrop").classList.toggle("hidden", !req || S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
+    for (const id of ["modal-approve", "modal-once", "modal-session", "modal-hour", "modal-deny", "modal-deny-always"]) {
+      const button = $(id);
+      if (button) button.disabled = !!req.deciding;
+    }
     $("modal-title").textContent = promo ? "Promotion approval" : "Approval required";
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
@@ -2227,9 +2242,10 @@
     else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
     else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   });
-  function decide(approved, scope, rememberDenial) {
+  async function decide(approved, scope, rememberDenial) {
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
+    if (!head || head.deciding) return;
     if (approved && head && head.kind !== "promotion" && scope !== "once") {
       const broad = (head.capabilities || []).filter((c) => !(head.already || []).includes(c) && isBroad(c));
       if (broad.length && head.broadConfirm !== (scope || "always")) {
@@ -2239,16 +2255,35 @@
         return;
       }
     }
-    const req = S.approvals.shift();
-    if (!req) return;
+    const req = head;
+    req.deciding = true;
+    renderApproval();
+    let result;
+    try {
+      result = await request(req.kind === "promotion"
+        ? { type: "promotion_decision", promotion_id: req.id, approved }
+        : { type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: scope === "once" ? {} : pickedPaths(req), remember_denial: !!rememberDenial });
+    } catch (e) {
+      toast("Decision was not delivered: " + e.message + ". Try again.", true);
+      note("Decision was not delivered: " + e.message, true);
+      return;
+    } finally {
+      req.deciding = false;
+      renderApproval();
+      renderStatus();
+    }
+    S.approvals = S.approvals.filter((a) => a !== req);
+    if (!result || !result.resolved) {
+      note("That approval is no longer pending; no decision was applied.");
+      renderApproval();
+      renderStatus();
+      return;
+    }
     // A batch's later prompts show how each earlier call was answered.
     if (req.batch) {
       const answers = (S.batchAnswers = S.batchAnswers || {})[req.batch.batch_id] = S.batchAnswers[req.batch.batch_id] || {};
       answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
     }
-    if (req.kind === "promotion") act({ type: "promotion_decision", promotion_id: req.id, approved });
-    // A wider folder is a lasting grant's; "once" allows only this call (#765).
-    else act({ type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: scope === "once" ? {} : pickedPaths(req), remember_denial: !!rememberDenial });
     prefs.set("seen.approvalHelp", true);
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");

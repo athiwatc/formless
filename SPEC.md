@@ -3524,6 +3524,15 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### Relay and Web frontend (v2)
 
+Web approval and promotion decisions remain pending locally until the daemon
+confirms resolution; failures report that the decision was not delivered and
+remain answerable. Recap and rating controls are rebuilt from current Run state
+outside the cached message body, so live completion and rating changes appear
+immediately and only the current last answer has controls. Markdown formatting
+is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
+per formatted message. Content beyond these limits is displayed verbatim as
+plain text, preserving access to persisted messages without recursive parsing.
+
 The Web client treats each user action as belonging to the Session selected
 when it starts: attachment uploads, mentioned paths, send mode and completion
 cleanup keep that Session id across asynchronous work. Newly mentioned files

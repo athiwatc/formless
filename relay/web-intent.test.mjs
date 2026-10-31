@@ -11,7 +11,7 @@ const fn = (name) => {
   const end = source.indexOf('\n  }', start);
   return source.slice(start, end + 4);
 };
-const deferred = () => { let resolve; const promise = new Promise(r => resolve = r); return { promise, resolve }; };
+const deferred = () => { let resolve, reject; const promise = new Promise((r, e) => { resolve = r; reject = e; }); return { promise, resolve, reject }; };
 function setup(names, extras = {}) {
   const elements = new Map();
   const $ = id => {
@@ -139,4 +139,87 @@ test('opening Session clears old messages and merges live appended messages into
   c.onEvent({ type: 'message_appended', session_id: 'B', message: { id: 'live', role: 'user' } });
   wait.resolve({ messages: [{ id: 'snapshot' }, { id: 'duplicate' }] }); await a;
   assert.deepEqual(Array.from(c.S.messages, m => m.id), ['snapshot', 'duplicate', 'live']);
+});
+test('approval decisions stay pending until confirmed; failures remain retryable', async () => {
+  const waits = [deferred(), deferred()]; let calls = 0; const notes = [], errors = [];
+  const c = setup(['decide'], { request: () => waits[calls++].promise, renderApproval() {}, renderStatus() {},
+    toast: x => errors.push(x), note: x => notes.push(x), isBroad: () => false, pickedPaths: () => ({}),
+    prefs: { set() {} }, isRunning: () => false });
+  c.S.approvals = [{ kind: 'tool', id: 'one', tool_name: 'reader', capabilities: [], batch: { batch_id: 'b', index: 1 } }];
+  const first = c.decide(true, 'once');
+  await c.decide(false); // a repeated key cannot send a second request
+  assert.equal(calls, 1); assert.equal(c.S.approvals.length, 1); assert.equal(notes.length, 0);
+  waits[0].reject(new Error('offline')); await first;
+  assert.equal(c.S.approvals.length, 1); assert.equal(c.S.approvals[0].deciding, false);
+  assert.match(errors[0], /not delivered/); assert.equal(c.S.batchAnswers, undefined);
+  const retry = c.decide(true, 'once'); waits[1].resolve({ resolved: true }); await retry;
+  assert.equal(c.S.approvals.length, 0); assert.equal(c.S.batchAnswers.b[1], 'once');
+  assert.equal(notes.filter(x => x.startsWith('approved ')).length, 1);
+});
+test('a stale approval response cannot be reported as an accepted denial', async () => {
+  const notes = [];
+  const c = setup(['decide'], { request: async () => ({ resolved: false }), renderApproval() {}, renderStatus() {},
+    note: x => notes.push(x), isBroad: () => false, pickedPaths: () => ({}) });
+  c.S.approvals = [{ kind: 'tool', id: 'gone', tool_name: 'reader' }];
+  await c.decide(false);
+  assert.equal(c.S.approvals.length, 0); assert.equal(notes.some(x => x.startsWith('denied ')), false);
+});
+function node(tag, attrs, ...children) {
+  return { tag, attrs: attrs || {}, children: children.flat(Infinity), classList: { add() {} },
+    append(...kids) { this.children.push(...kids.flat(Infinity)); }, replaceChildren(...kids) { this.children = kids.flat(Infinity); },
+    setAttribute(k, v) { this.attrs[k] = v; } };
+}
+const all = (n) => typeof n === 'object' && n ? [n, ...n.children.flatMap(all)] : [];
+const plainText = n => typeof n === 'string' ? n : (n?.children || []).map(plainText).join('');
+test('hostile persisted Markdown has bounded nesting and preserves readable text', () => {
+  const c = setup(['link', 'inline', 'splitRow', 'blocks', 'list', 'markdown'], { h: node });
+  vm.runInContext(source.slice(source.indexOf('  const SAFE_URL'), source.indexOf('  function link')), c);
+  vm.runInContext(source.slice(source.indexOf('  const FENCE'), source.indexOf('  function splitRow')), c);
+  vm.runInContext('const MD_DEPTH = 32, MD_INLINE_CHARS = 4096, MD_FORMAT_CHARS = 128 * 1024;', c);
+  const corpus = [
+    '> '.repeat(5000) + 'quote end',
+    Array.from({ length: 1500 }, (_, i) => ' '.repeat(i * 2) + '- item').join('\n'),
+    '**a '.repeat(20000) + ' **'.repeat(20000),
+    '['.repeat(20000) + 'brackets' + ']'.repeat(20000),
+    Array.from({ length: 250 }, (_, i) => ' '.repeat(i * 2) + '- item').join('\n'),
+  ];
+  for (const text of corpus) {
+    const at = performance.now(), rendered = c.markdown(text);
+    assert.ok(performance.now() - at < 1000, 'render exceeded 1 second');
+    assert.ok(all(rendered).length < 1000, 'excessive DOM expansion');
+    assert.ok(plainText(rendered).length > 0);
+  }
+  const normal = c.markdown('## Heading\n\n**bold** and [link](https://example.com)\n\n- item');
+  assert.ok(all(normal).some(n => n.tag === 'strong'));
+  assert.ok(all(normal).some(n => n.tag === 'a'));
+  assert.ok(all(normal).some(n => n.tag === 'ul'));
+});
+test('live MessageComplete → RunRecap → RunFinished updates recap/rating outside cached body', async () => {
+  const transcript = node('div'), cached = new Map();
+  const c = setup(['renderHistory', 'messageBody', 'rateButtons', 'onEvent'], {
+    h: node, notifyFor() {}, renderPlan() {}, refreshSessions() {}, renderStatus() {}, renderComposer() {}, renderLive() {}, scrollToBottom() {}, renderRunBanner() {}, setActivity() {},
+    markdown: text => node('p', null, text), speaker: () => 'assistant', clock: () => '',
+    recapBlock: r => node('recap', null, r.label), tr: x => x,
+    act: async () => ({ rating: 'good' }), note() {}, isRunning: () => c.S.running.has(c.S.current),
+  });
+  c.$ = id => id === 'transcript' ? transcript : null;
+  c.S.daemonOnline = true; c.S.running = new Set(['A']);
+  c.rendered = cached;
+  vm.runInContext('const rendered = globalThis.rendered; const WHO = { assistant: "Formless" };', c);
+  c.onEvent({ type: 'message_complete', session_id: 'A', message: { id: 'answer', role: 'assistant', content: 'answer' } });
+  const originalBody = cached.get('answer');
+  assert.equal(all(transcript).filter(n => n.attrs.class === 'rate').length, 0);
+  c.onEvent({ type: 'run_recap', session_id: 'A', recap: { label: 'summary' } });
+  c.onEvent({ type: 'run_finished', session_id: 'A', status: 'completed' });
+  assert.equal(cached.get('answer'), originalBody);
+  assert.equal(all(transcript).filter(n => n.tag === 'recap').length, 1);
+  const rate = all(transcript).find(n => n.attrs.class === 'rate');
+  assert.ok(rate);
+  await rate.children[0].attrs.onclick();
+  assert.ok(all(transcript).some(n => n.attrs['aria-pressed'] === 'true'));
+  c.S.running.add('A'); c.S.messages.push({ id: 'next', role: 'assistant', content: 'next' });
+  c.renderHistory(); assert.equal(all(transcript).filter(n => n.attrs.class === 'rate').length, 0);
+  c.S.running.delete('A'); c.renderHistory();
+  assert.equal(all(transcript).filter(n => n.attrs.class === 'rate').length, 1);
+  assert.equal(all(originalBody).filter(n => n.attrs.class === 'rate').length, 0);
 });
