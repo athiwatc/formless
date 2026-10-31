@@ -1275,6 +1275,10 @@ pattern (§4.4).
     - Values live in the `tool_kv` table (schema v23). They are never
       exported in bundles, and purging a Tool deletes its own namespace.
     - Smoke tests and replay use an in-memory store that is thrown away.
+  - Console formatting preserves `undefined`, BigInt (`n` suffix) and Error
+    names/messages, and replaces circular references with `[Circular]`.
+    A return value that cannot be JSON-serialized fails the Invocation with
+    `return value is not JSON-serializable`, for both sync and async `run`.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.

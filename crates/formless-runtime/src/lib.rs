@@ -271,7 +271,29 @@ function __call(op, args) {
   if (!r.ok) throw new Error(r.error);
   return r.value;
 }
-function __fmt(a) { return a.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" "); }
+function __formatValue(x) {
+  try {
+    if (typeof x === "string") return x;
+    const ancestors = [];
+    const text = JSON.stringify(x, function (_key, value) {
+      if (typeof value === "bigint") return String(value) + "n";
+      if (value === undefined) return "undefined";
+      if (typeof value === "function" || typeof value === "symbol") return String(value);
+      if (value instanceof Error) return value.name + ": " + value.message;
+      if (value && typeof value === "object") {
+        while (ancestors.length && ancestors[ancestors.length - 1] !== this) ancestors.pop();
+        if (ancestors.includes(value)) return "[Circular]";
+        ancestors.push(value);
+      }
+      return value;
+    });
+    // Match the ordinary console spelling for scalar special values.
+    if (x === undefined || typeof x === "bigint" || typeof x === "function" || typeof x === "symbol") return String(x) + (typeof x === "bigint" ? "n" : "");
+    if (x instanceof Error) return x.name + ": " + x.message;
+    return text;
+  } catch (_) { return "[Unformattable]"; }
+}
+function __fmt(a) { return a.map(__formatValue).join(" "); }
 globalThis.console = {
   log: (...a) => __call("log", { msg: __fmt(a) }),
   info: (...a) => __call("log", { msg: __fmt(a) }),
@@ -2267,10 +2289,13 @@ pub fn check_syntax(code: &str) -> Result<(), String> {
 
 const RUNNER: &str = r#"
   (function () {
-    const done = (v) => { globalThis.__result_json = JSON.stringify({ ok: true, value: v === undefined ? null : v }); };
     // QuickJS throws null when it cannot even allocate the out-of-memory
     // error, so a null exception is reported as out of memory.
     const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || "") }); };
+    const done = (v) => {
+      try { globalThis.__result_json = JSON.stringify({ ok: true, value: v === undefined ? null : v }); }
+      catch (e) { fail(new Error("return value is not JSON-serializable: " + String((e && e.message) || e))); }
+    };
     try {
       const out = run(JSON.parse(globalThis.__input_json));
       if (out && typeof out.then === "function") out.then(done, fail); else done(out);
@@ -2788,6 +2813,36 @@ mod tests {
         let req = live("function run() { return tools.call('t', {n: 1}); }");
         let out = execute(&req, Arc::new(SlowOps)).unwrap();
         assert_eq!(out.output["n"], 1);
+    }
+
+    #[test]
+    fn console_formats_circular_bigint_error_and_undefined_values() {
+        let req = live("function run() { const node = {}; node.parent = node; console.log(node); console.log('got', undefined, new Error('x'), 12n); return 7; }");
+        let out = execute(&req, Arc::new(NoHostOps)).unwrap();
+        assert_eq!(out.output, json!(7));
+        assert_eq!(
+            out.logs,
+            vec![r#"{"parent":"[Circular]"}"#, "got undefined Error: x 12n"]
+        );
+    }
+
+    #[test]
+    fn return_serialization_failures_name_the_actual_problem() {
+        for prefix in ["", "async "] {
+            for body in [
+                "return {id: 9007199254740993n};",
+                "const x = {}; x.self = x; return x;",
+            ] {
+                let req = live(&format!("{prefix}function run() {{ {body} }}"));
+                let e = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+                assert!(
+                    e.message.contains("return value is not JSON-serializable:"),
+                    "{}",
+                    e.message
+                );
+                assert!(!e.message.contains("never settled"), "{}", e.message);
+            }
+        }
     }
 
     #[test]
