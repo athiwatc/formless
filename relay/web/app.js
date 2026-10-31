@@ -3644,6 +3644,17 @@
     renderView();
   }
 
+  function addApproval(ev) {
+    const kind = ev.type === "promotion_approval_requested" ? "promotion" : "tool";
+    const id = kind === "promotion" ? ev.promotion_id : ev.approval_id;
+    const existing = S.approvals.find((a) => a.kind === kind && a.id === id);
+    if (existing) { if (ev.summary) existing.summary = ev.summary; return; }
+    S.approvals.push({ kind, id, tool_id: ev.tool_id || null, tool_name: ev.tool_name,
+      version: ev.version, reason: ev.reason, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb,
+      detail: ev.detail || null, summary: ev.summary, already: ev.already_allowed || [],
+      code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
+      pathOptions: ev.path_options || [], picks: {} });
+  }
   function clearQuestions() {
     const questions = S.questions || [];
     S.questions = [];
@@ -3665,13 +3676,38 @@
   }
   function applySessionLiveState(id, result, liveEvents) {
     if (typeof result.running !== "boolean" || !Array.isArray(result.pending_events)) return;
-    S.approvals = [];
-    clearQuestions();
     if (result.running) S.running.add(id); else S.running.delete(id);
-    for (const ev of result.pending_events) onEvent(ev);
-    // Events delivered after dispatch may postdate the snapshot. Replaying
-    // them is idempotent and prevents a late snapshot resurrecting a prompt.
-    for (const ev of liveEvents) onEvent(ev);
+    // Reduce authoritative global attention plus racing events as data. Replaying
+    // onEvent would notify twice and erase already-received streaming text.
+    const pending = new Map();
+    for (const ev of result.pending_events.concat(liveEvents)) {
+      switch (ev.type) {
+        case "approval_requested": pending.set("tool:" + ev.approval_id, ev); break;
+        case "user_question": pending.set("question:" + ev.question_id, ev); break;
+        case "promotion_approval_requested": pending.set("promotion:" + ev.promotion_id, ev); break;
+        case "approval_answered": pending.delete("tool:" + ev.approval_id); break;
+        case "user_question_closed": pending.delete("question:" + ev.question_id); break;
+        case "promotion_approval_resolved": pending.delete("promotion:" + ev.promotion_id); break;
+        case "approval_summary": {
+          const req = pending.get("tool:" + ev.approval_id);
+          if (req) pending.set("tool:" + ev.approval_id, { ...req, summary: ev.summary });
+          break;
+        }
+        case "run_started": S.running.add(ev.session_id); break;
+        case "run_finished": case "run_paused": S.running.delete(ev.session_id); break;
+      }
+    }
+    S.approvals = S.approvals.filter((a) => pending.has(a.kind + ":" + a.id));
+    const questions = S.questions || [];
+    S.questions = questions.filter((q) => pending.has("question:" + q.id));
+    S.pendingQuestion = S.questions[0] || null;
+    S.questionId = S.pendingQuestion && S.pendingQuestion.id;
+    for (const q of questions) if (!pending.has("question:" + q.id)) cancelAsk("question:" + q.id);
+    for (const ev of pending.values()) {
+      if (ev.type === "user_question") queueQuestion(ev);
+      else addApproval(ev);
+    }
+    showQuestion();
     renderApproval();
     renderComposer();
     renderStatus();
@@ -3728,7 +3764,9 @@
       const live = S.messages;
       const ids = new Set((r.messages || []).map((m) => m.id));
       S.messages = (r.messages || []).concat(live.filter((m) => !ids.has(m.id)));
-      S.unfinished = r.unfinished_run || null;
+      if (!snapshot.events.some((ev) => ev.session_id === id && ["run_started", "run_finished", "run_paused"].includes(ev.type))) {
+        S.unfinished = r.unfinished_run || null;
+      }
       renderRunBanner();
       S.queued = r.queued_items || [];
       renderQueue();
@@ -4467,7 +4505,7 @@
   }
 
   function onEvent(ev) {
-    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "user_question", "user_question_closed"].includes(ev.type)) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }
     notifyFor(ev);
@@ -4620,17 +4658,18 @@
         break;
       }
       case "approval_requested":
-        if (S.approvals.some((a) => a.kind === "tool" && a.id === ev.approval_id)) break;
-        S.approvals.push({ kind: "tool", id: ev.approval_id, tool_id: ev.tool_id || null, tool_name: ev.tool_name, version: ev.version, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb, detail: ev.detail || null,
-          already: ev.already_allowed || [], code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
-          pathOptions: ev.path_options || [], picks: {} });
+        addApproval(ev);
         if (here) setActivity("awaiting your approval");
         renderApproval();
         break;
       case "promotion_approval_requested":
-        if (S.approvals.some((a) => a.kind === "promotion" && a.id === ev.promotion_id)) break;
-        S.approvals.push({ kind: "promotion", id: ev.promotion_id, tool_name: ev.tool_name, reason: ev.reason, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb });
+        addApproval(ev);
         renderApproval();
+        break;
+      case "promotion_approval_resolved":
+        S.approvals = S.approvals.filter((a) => a.kind !== "promotion" || a.id !== ev.promotion_id);
+        renderApproval();
+        renderStatus();
         break;
       case "session_updated": {
         const i = S.sessions.findIndex((s) => s.id === ev.session.id);
@@ -4849,7 +4888,14 @@
         const was = S.daemonOnline;
         S.daemonOnline = online;
         if (online && !was) startHandshake();
-        if (!online && was) { S.channel = null; clearTimeout(S.handshakeTimer); note("daemon went offline", true); }
+        if (!online && was) {
+          S.channel = null;
+          clearTimeout(S.handshakeTimer);
+          clearLiveState();
+          for (const p of S.pending.values()) p.reject(new Error("daemon went offline"));
+          S.pending.clear();
+          note("daemon went offline", true);
+        }
         renderChrome();
         renderHistory();
         return;

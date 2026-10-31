@@ -457,7 +457,26 @@ type QuestionReply = (String, Vec<QuestionAnswer>);
 mod send_dedupe_tests;
 
 type SendKey = (Option<u64>, String, String);
-type SendOutcome = std::result::Result<Value, String>;
+type SendOutcome = std::result::Result<Value, CachedSendFailure>;
+#[derive(Clone, Debug)]
+struct CachedSendFailure {
+    code: Option<&'static str>,
+    message: String,
+}
+impl CachedSendFailure {
+    fn capture(error: anyhow::Error) -> Self {
+        Self {
+            code: error.downcast_ref::<RequestFailure>().map(|e| e.code),
+            message: error.to_string(),
+        }
+    }
+    fn into_error(self) -> anyhow::Error {
+        match self.code {
+            Some(code) => RequestFailure::new(code, self.message).into(),
+            None => anyhow::Error::msg(self.message),
+        }
+    }
+}
 struct SentEntry {
     at: std::time::Instant,
     outcome: tokio::sync::watch::Receiver<Option<SendOutcome>>,
@@ -926,6 +945,9 @@ impl Daemon {
             }
             Event::ApprovalAnswered { approval_id, .. } => self.remove_attention(approval_id),
             Event::UserQuestionClosed { question_id } => self.remove_attention(question_id),
+            Event::PromotionApprovalResolved { promotion_id } => {
+                self.remove_attention(promotion_id)
+            }
             _ => {}
         }
         if matches!(
@@ -1200,11 +1222,7 @@ impl Daemon {
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
                     json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
-                        "pending_events": self.pending_attention.locked().iter().filter(|ev| match ev {
-                            Event::ApprovalRequested { session_id, .. } | Event::UserQuestion { session_id, .. } => session_id == &id,
-                            Event::PromotionApprovalRequested { .. } => true,
-                            _ => false,
-                        }).cloned().collect::<Vec<_>>() }),
+                        "pending_events": self.pending_attention.locked().clone() }),
                 )
             }
             Request::ForkSession {
@@ -1365,11 +1383,16 @@ impl Daemon {
                             .catch_unwind()
                             .await
                             {
-                                Ok(result) => result.map_err(|e| e.to_string()),
+                                Ok(result) => result.map_err(CachedSendFailure::capture),
                                 Err(panic) => {
                                     let why = panic_text(&panic);
                                     tracing::error!("panic while handling SendMessage: {why}");
-                                    Err(format!("internal error while handling SendMessage: {why}"))
+                                    Err(CachedSendFailure::capture(
+                                        RequestFailure::internal(format!(
+                                            "internal error while handling SendMessage: {why}"
+                                        ))
+                                        .into(),
+                                    ))
                                 }
                             }
                         };
@@ -1385,7 +1408,7 @@ impl Daemon {
                 }
                 loop {
                     if let Some(result) = outcome.borrow().clone() {
-                        return result.map_err(anyhow::Error::msg);
+                        return result.map_err(CachedSendFailure::into_error);
                     }
                     outcome
                         .changed()
@@ -3249,6 +3272,9 @@ impl Daemon {
                 self.remove_attention(&promotion_id);
                 match pending {
                     Some((attempt_id, kind)) => {
+                        self.broadcast(Event::PromotionApprovalResolved {
+                            promotion_id: promotion_id.clone(),
+                        });
                         let this = self.clone();
                         tokio::spawn(async move {
                             this.resume_promotion(attempt_id, kind, approved).await;
@@ -14346,7 +14372,7 @@ mod live_snapshot_tests {
             .await
             .unwrap();
         assert_eq!(snapshot["running"], true);
-        assert_eq!(snapshot["pending_events"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["pending_events"].as_array().unwrap().len(), 2);
         assert_eq!(snapshot["pending_events"][0]["approval_id"], "pending");
         // A second client answers while the browser is disconnected.
         let decision = daemon
@@ -14363,11 +14389,66 @@ mod live_snapshot_tests {
         assert!(rx.await.unwrap().0);
         daemon.runs.locked().remove(&sid);
         let snapshot = daemon
-            .handle(Request::GetSession { id: sid })
+            .handle(Request::GetSession { id: sid.clone() })
             .await
             .unwrap();
         assert_eq!(snapshot["running"], false);
-        assert_eq!(snapshot["pending_events"], json!([]));
+        assert_eq!(snapshot["pending_events"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["pending_events"][0]["approval_id"], "other");
+        // A decision in another client broadcasts resolution before a delayed
+        // snapshot can revive the promotion prompt in this client.
+        let (events, mut received) = mpsc::channel(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: events,
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gap: None,
+        });
+        daemon.promotions.locked().insert(
+            "promo".into(),
+            ("missing-attempt".into(), "widening".into()),
+        );
+        daemon.broadcast(Event::PromotionApprovalRequested {
+            promotion_id: "promo".into(),
+            tool_name: "reader".into(),
+            reason: "widening".into(),
+            capabilities: vec![],
+            memory_mb: 64,
+        });
+        let before = daemon
+            .handle(Request::GetSession { id: sid.clone() })
+            .await
+            .unwrap();
+        assert!(before["pending_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["promotion_id"] == "promo"));
+        let decision = daemon
+            .handle(Request::PromotionDecision {
+                promotion_id: "promo".into(),
+                approved: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(decision["resolved"], true);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            ServerMessage::Event(Event::PromotionApprovalRequested { .. })
+        ));
+        assert!(
+            matches!(received.try_recv().unwrap(), ServerMessage::Event(Event::PromotionApprovalResolved { promotion_id }) if promotion_id == "promo")
+        );
+        let after = daemon
+            .handle(Request::GetSession { id: sid })
+            .await
+            .unwrap();
+        assert!(!after["pending_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["promotion_id"] == "promo"));
         drop(daemon);
         let _ = std::fs::remove_dir_all(base);
     }

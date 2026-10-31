@@ -2476,6 +2476,10 @@ pub enum Event {
         capabilities: Vec<String>,
         memory_mb: u32,
     },
+    /// A promotion prompt was resolved by any client.
+    PromotionApprovalResolved {
+        promotion_id: String,
+    },
 }
 
 impl Event {
@@ -2536,6 +2540,7 @@ impl Event {
             | Event::ApprovalSummary { .. }
             | Event::OptimiserActivity { .. }
             | Event::PromotionApprovalRequested { .. }
+            | Event::PromotionApprovalResolved { .. }
             | Event::ApprovalAnswered { .. } => None,
         }
     }

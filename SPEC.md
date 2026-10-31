@@ -2121,6 +2121,9 @@ such as `read_file`, `read_text_file` and `file_read`.
   connection using the same key performs its own send. A key is claimed before
   execution; concurrent retries wait for the in-flight outcome, including errors.
   Losing a response/waiter does not cancel the claimed send or lose its outcome.
+  After reconnecting, retrying an unacknowledged send can repeat an uncertain
+  prior send: action ids deduplicate only within the original connection.
+  Cached failures preserve the same machine-readable error code and message.
 - A client that falls behind loses live deltas first; it is told with
   `DeltasDropped {session_id, run_id}` once there is room, and the
   answer's `MessageComplete` carries the whole text (plain mode notes the
@@ -3538,12 +3541,15 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ### Relay and Web frontend (v2)
 
-`GetSession` includes `running` and `pending_events`: the current Session's
-outstanding approval/question events plus outstanding global promotion prompts.
+`GetSession` includes the selected Session's `running` and global `pending_events`:
+all outstanding approval/question events across Sessions and promotion prompts.
 Resolving or cancelling a prompt removes it from subsequent snapshots. Local
 and Relay Web reconnects discard stale interactive/streaming state and seed the
 current Session from this snapshot; events received during the fetch are replayed
-idempotently so the snapshot cannot revive an answered prompt or erase a new one.
+as state only, without re-running notifications or resetting live streaming text,
+so the snapshot cannot revive an answered prompt or erase a new one.
+`PromotionApprovalResolved` closes the matching prompt in every client when any
+client resolves it, including while a browser's snapshot request is in flight.
 Concurrent `ask_user` calls in the same Session, including nested sub-agents,
 wait behind a FIFO gate until the preceding question closes; cancellation also
 cancels queued waits. Web clients additionally queue question events across

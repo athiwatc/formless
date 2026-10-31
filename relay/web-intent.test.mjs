@@ -243,7 +243,7 @@ test('parallel questions queue across Sessions; closing queued question preserve
 test('local and relay reconnect rebuild pending prompts/running and reject stale snapshot state', async () => {
   for (const transport of ['local', 'relay']) {
     let reply = deferred();
-    const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'queueQuestion', 'removeQuestion'], {
+    const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
       act: () => reply.promise, request: async () => ({}), prefs: { set() {} }, rendered: new Map(),
       closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
       renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
@@ -279,6 +279,71 @@ test('local and relay reconnect rebuild pending prompts/running and reject stale
     assert.deepEqual(Array.from(c.S.approvals, a => a.id), ['arrived-live']);
     assert.equal(c.S.pendingQuestion, null);
   }
+});
+
+function liveSetup(extras = {}) {
+  const wait = deferred();
+  const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
+    act: () => wait.promise, request: async () => ({}), prefs: { set() {} }, rendered: new Map(),
+    closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
+    renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
+    isRunning: () => c.S.running.has(c.S.current), ...extras,
+  });
+  vm.runInContext('let sessionSeq = 0; const CLIENT_LABEL = "test"; const attachmentDrafts = {};', c);
+  c.S.running = new Set(); c.S.approvals = []; c.S.questions = []; c.S.liveTools = [];
+  return { c, wait };
+}
+test('global attention snapshot preserves another Session question and entered dialog', async () => {
+  const cancelled = [], { c, wait } = liveSetup({ cancelAsk: tag => cancelled.push(tag) });
+  c.onEvent({ type: 'user_question', question_id: 'qa', session_id: 'A', question: 'A?' });
+  const question = c.S.questions[0];
+  c.$('ask-input').value = 'typed answer';
+  const load = c.openSession('B');
+  wait.resolve({ messages: [], running: false, pending_events: [
+    { type: 'user_question', question_id: 'qa', session_id: 'A', question: 'A?' },
+    { type: 'user_question', question_id: 'qb', session_id: 'B', question: 'B?' },
+  ] });
+  await load;
+  assert.deepEqual(Array.from(c.S.questions, q => q.id), ['qa', 'qb']);
+  assert.equal(c.S.questions[0], question);
+  assert.equal(c.$('ask-input').value, 'typed answer');
+  assert.deepEqual(cancelled, []);
+});
+test('snapshot reduction retains racing stream state and does not notify twice', async () => {
+  let notifications = 0;
+  const { c, wait } = liveSetup({ notifyFor: () => notifications++ });
+  const load = c.openSession('A');
+  c.onEvent({ type: 'run_started', session_id: 'A' });
+  c.onEvent({ type: 'message_delta', session_id: 'A', delta: 'partial answer' });
+  c.onEvent({ type: 'reasoning_delta', session_id: 'A', delta: 'thinking' });
+  c.onEvent({ type: 'tool_call_started', session_id: 'A', tool_name: 'reader', arguments: '{}' });
+  const liveTools = c.S.liveTools;
+  const before = notifications;
+  wait.resolve({ messages: [], running: false, pending_events: [] }); await load;
+  assert.equal(c.S.streaming, 'partial answer'); assert.equal(c.S.thinking, 'thinking');
+  assert.equal(c.S.liveTools, liveTools); assert.equal(c.S.liveTools.length, 1);
+  assert.equal(c.S.running.has('A'), true); assert.equal(notifications, before);
+});
+test('promotion resolved by another client cannot reappear from a delayed snapshot', async () => {
+  const { c, wait } = liveSetup();
+  const load = c.openSession('A');
+  c.onEvent({ type: 'promotion_approval_resolved', promotion_id: 'p' });
+  wait.resolve({ messages: [], running: false, pending_events: [
+    { type: 'promotion_approval_requested', promotion_id: 'p', tool_name: 'reader', capabilities: [] },
+  ] }); await load;
+  assert.equal(c.S.approvals.length, 0);
+});
+test('relay daemon_offline clears live state and rejects pending requests without socket close', async () => {
+  const { c } = liveSetup({ clearTimeout() {}, note() {}, renderChrome() {} });
+  const socket = {}; c.S.ws = socket; c.S.daemonOnline = true; c.S.channel = {};
+  c.S.running.add('A'); c.S.approvals = [{ id: 'old' }]; c.S.streaming = 'old partial';
+  let rejected = 0; c.S.pending = new Map([[1, { reject: e => { assert.match(e.message, /offline/); rejected++; } }]]);
+  const start = source.indexOf('    async function onFrame(ws, frame) {');
+  vm.runInContext(source.slice(start, source.indexOf('\n    ws.onclose =', start)), c);
+  await c.onFrame(socket, '{"relay":"daemon_offline"}');
+  assert.equal(c.S.channel, null); assert.equal(c.S.approvals.length, 0);
+  assert.equal(c.S.running.size, 0); assert.equal(c.S.streaming, '');
+  assert.equal(rejected, 1); assert.equal(c.S.pending.size, 0);
 });
 
 test('persisted assistant stop reasons render explanatory notes when Session is reopened', () => {
