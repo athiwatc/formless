@@ -580,9 +580,12 @@ pub fn non_public(ip: std::net::IpAddr) -> bool {
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // unique local
                 || (seg[0] & 0xffc0) == 0xfe80 // link-local
+                || (seg[0] & 0xffc0) == 0xfec0 // deprecated site-local
                 || (seg[0] == 0x64 && seg[1] == 0xff9b) // local-use NAT64
                 || (seg[0] == 0x2001 && seg[1] == 0) // Teredo
                 || (seg[0] == 0x2001 && seg[1] == 0xdb8) // documentation
+                || (seg[0] == 0x2001 && seg[1] == 2 && seg[2] == 0) // benchmarking
+                || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0) // documentation
                 || (seg[0] == 0x100 && seg[1..4] == [0, 0, 0]) // discard-only
         }
     }
@@ -2473,33 +2476,90 @@ mod tests {
         assert!(checked_address(&url("http://localhost/"), &["localhost".into()]).is_ok());
     }
 
-    /// Reserved and transition address families are not public (#1092).
+    /// IANA special-purpose families plus deprecated site-local addresses.
+    /// https://www.iana.org/assignments/iana-ipv6-special-registry/
+    /// https://www.iana.org/assignments/iana-ipv4-special-registry/
     #[test]
-    fn transition_and_reserved_addresses_are_not_public() {
+    fn special_purpose_registry_addresses_are_not_public() {
         use std::net::IpAddr;
-        for ip in [
-            "::a9fe:a9fe",         // IPv4-compatible 169.254.169.254
-            "64:ff9b::a9fe:a9fe",  // NAT64 of it
-            "64:ff9b::7f00:1",     // NAT64 of 127.0.0.1
-            "64:ff9b:1::1",        // local-use NAT64
-            "2002:a9fe:a9fe::1",   // 6to4 of it
-            "2001:0:4136:e378::1", // Teredo
-            "2001:db8::1",         // documentation
-            "100::1",              // discard-only
-            "240.0.0.1",           // reserved
-            "255.255.255.254",
-            "198.18.0.1", // benchmarking
-            "192.0.0.8",
+        for (name, prefix, ip) in [
+            ("This network", "0.0.0.0/8", "0.1.2.3"),
+            ("Private-use", "10.0.0.0/8", "10.1.2.3"),
+            ("Shared address space", "100.64.0.0/10", "100.64.0.1"),
+            ("Loopback", "127.0.0.0/8", "127.0.0.1"),
+            ("Link-local", "169.254.0.0/16", "169.254.169.254"),
+            ("Private-use", "172.16.0.0/12", "172.16.0.1"),
+            ("Private-use", "192.168.0.0/16", "192.168.0.1"),
+            ("Documentation TEST-NET-1", "192.0.2.0/24", "192.0.2.1"),
+            (
+                "Documentation TEST-NET-2",
+                "198.51.100.0/24",
+                "198.51.100.1",
+            ),
+            ("Documentation TEST-NET-3", "203.0.113.0/24", "203.0.113.1"),
+            ("Multicast", "224.0.0.0/4", "224.0.0.1"),
+            ("Limited broadcast", "255.255.255.255/32", "255.255.255.255"),
+            ("Loopback", "::1/128", "::1"),
+            ("Unspecified", "::/128", "::"),
+            ("Unique-local", "fc00::/7", "fd00::1"),
+            ("Link-local unicast", "fe80::/10", "fe80::1"),
+            ("Multicast", "ff00::/8", "ff00::1"),
+            ("IPv4-compatible private", "::/96", "::a9fe:a9fe"),
+            ("IPv4-mapped private", "::ffff:0:0/96", "::ffff:10.0.0.1"),
+            ("NAT64 private", "64:ff9b::/96", "64:ff9b::a9fe:a9fe"),
+            ("NAT64 loopback", "64:ff9b::/96", "64:ff9b::7f00:1"),
+            ("Local-use NAT64", "64:ff9b:1::/48", "64:ff9b:1::1"),
+            ("6to4 private", "2002::/16", "2002:a9fe:a9fe::1"),
+            ("Teredo", "2001::/32", "2001:0:4136:e378::1"),
+            ("Documentation", "2001:db8::/32", "2001:db8::1"),
+            ("Discard-only", "100::/64", "100::1"),
+            ("Reserved", "240.0.0.0/4", "240.0.0.1"),
+            ("Reserved upper end", "240.0.0.0/4", "255.255.255.254"),
+            ("Benchmarking", "198.18.0.0/15", "198.18.0.1"),
+            ("IETF protocol assignments", "192.0.0.0/24", "192.0.0.8"),
+            ("Deprecated site-local", "fec0::/10", "fec0::1"),
+            (
+                "Deprecated site-local upper end",
+                "fec0::/10",
+                "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            ),
+            ("Benchmarking", "2001:2::/48", "2001:2::1"),
+            (
+                "Benchmarking upper end",
+                "2001:2::/48",
+                "2001:2:0:ffff:ffff:ffff:ffff:ffff",
+            ),
+            ("Documentation", "3fff::/20", "3fff::1"),
+            (
+                "Documentation upper end",
+                "3fff::/20",
+                "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
+            ),
         ] {
-            assert!(non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
+            assert!(
+                non_public(ip.parse::<IpAddr>().unwrap()),
+                "{name} ({prefix}): {ip}"
+            );
         }
-        for ip in ["64:ff9b::808:808", "2002:808:808::1", "198.20.0.1"] {
+        for ip in [
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            "198.20.0.1",
+            "2001:2:1::1",
+            "3fff:1000::1",
+            "3ffe:ffff::1",
+        ] {
             assert!(!non_public(ip.parse::<IpAddr>().unwrap()), "{ip}");
         }
         let url = |u: &str| reqwest::Url::parse(u).unwrap();
         for u in ["http://[64:ff9b::a9fe:a9fe]/", "http://[::a9fe:a9fe]/"] {
             let err = checked_address(&url(u), &["example.com".into()]).unwrap_err();
             assert!(err.starts_with("denied:"), "{err}");
+        }
+        for ip in ["fec0::1", "2001:2::1", "3fff::1"] {
+            let u = url(&format!("http://[{ip}]/"));
+            assert!(checked_address(&u, &[]).unwrap_err().starts_with("denied:"));
+            assert!(checked_address(&u, &[ip.to_string()]).is_ok());
         }
         assert!(checked_address(&url("http://[::a9fe:a9fe]/"), &["::a9fe:a9fe".into()]).is_ok());
     }
