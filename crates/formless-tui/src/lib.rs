@@ -5996,6 +5996,7 @@ impl App {
                     .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
                     .collect();
                 if let Some(entry) = formless_core::mcp_catalog::find(&id) {
+                    self.open_view(View::Settings);
                     self.settings_form = Some(settings::Form::mcp(entry, &params));
                 } else { self.notes.push("Unknown catalog entry; see /mcp catalog".into()); }
             }
@@ -17159,11 +17160,10 @@ mod tests {
     #[test]
     fn mcp_catalog_review_shows_pinned_code_and_masks_connection_secrets() {
         let mut app = test_app();
-        app.view = View::Settings;
-        let entry = formless_core::mcp_catalog::find("postgres").unwrap();
-        let mut form = settings::Form::mcp(entry, &Default::default());
-        form.fields[1].input = input::InputLine::from("postgresql://u:SecretForMcpOnly@h/db");
-        app.settings_form = Some(form);
+        app.slash("mcp add postgres");
+        assert_eq!(app.view, View::Settings);
+        app.settings_form.as_mut().unwrap().fields[1].input =
+            input::InputLine::from("postgresql://u:SecretForMcpOnly@h/db");
         let screen = render(&mut app, 160, 60);
         assert!(screen.contains("server-postgres@0.6.2"), "{screen}");
         assert!(screen.contains("Downloads and runs code"), "{screen}");
