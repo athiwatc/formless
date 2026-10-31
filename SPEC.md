@@ -1516,7 +1516,13 @@ Tools fill capability gaps; skills say how to use them well.
   install as-is.
 - **Install:** from a folder, a git URL (`--ref`, `--subdir`) or a
   `.zip`; validated, then stored versioned under
-  `<data>/skills/<name>/v<N>/` (10 MB max). Every install, including a new
+  `<data>/skills/<name>/v<N>/` (10 MB max). A `.zip` is extracted
+  in-process (no `unzip`; works on Windows) with the caps applied while
+  writing: at most 2,000 entries and 10 MB decompressed, and entries that
+  are links, absolute or contain `..` are refused by name; a refused
+  install leaves no staging files. A folder's links are followed only
+  when they stay inside it, and `git clone` is stopped after 120 s.
+  Every install, including a new
   version, starts **disabled**: the user reviews the body and files
   (`GetSkill`, `formless skills show`) and enables it. Skills that bundle
   scripts are flagged.

@@ -11,6 +11,8 @@ use crate::{Paths, Store};
 
 /// Bundled files beyond this total are refused.
 const MAX_BYTES: u64 = 10_000_000;
+/// At most this many entries in a skill archive (#856).
+const MAX_ZIP_ENTRIES: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillMeta {
@@ -142,8 +144,16 @@ with a process: capability the user approves.";
 fn copy_dir(from: &Path, to: &Path) -> Result<u64> {
     let mut total = 0;
     std::fs::create_dir_all(to)?;
+    let root = from.canonicalize()?;
     for rel in files(from)? {
         let (src, dst) = (from.join(&rel), to.join(&rel));
+        // A link may point anywhere on this machine: only ones that stay
+        // inside the skill are followed (#856).
+        if std::fs::symlink_metadata(&src)?.file_type().is_symlink()
+            && !src.canonicalize().is_ok_and(|t| t.starts_with(&root))
+        {
+            bail!("skill file '{rel}' is a link to outside the skill folder");
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -155,19 +165,98 @@ fn copy_dir(from: &Path, to: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// How long fetching a skill (`git clone`) may take.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run `cmd`, killing it after [`FETCH_TIMEOUT`] (#856).
 fn run(cmd: &mut std::process::Command, what: &str) -> Result<()> {
-    let out = cmd.output().with_context(|| format!("run {what}"))?;
-    if !out.status.success() {
-        bail!(
-            "{what} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {what}"))?;
+    let mut stderr = child.stderr.take().expect("piped");
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > FETCH_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{what} took longer than {}s", FETCH_TIMEOUT.as_secs());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let err = reader.join().unwrap_or_default();
+    if !status.success() {
+        bail!("{what} failed: {}", err.trim());
     }
     Ok(())
 }
 
+/// Extract a skill archive in-process (no `unzip`, so Windows works too),
+/// enforcing the caps while writing: entry count, each file's size and
+/// the total, counted on the bytes actually decompressed. Entries that
+/// would land outside `dest` (absolute, `..`) and links are refused by
+/// name (#856).
+pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64> {
+    use std::io::Read;
+    let file =
+        std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(file).context("not a readable .zip archive")?;
+    if zip.len() > MAX_ZIP_ENTRIES {
+        bail!(
+            "the archive has {} entries; skills may have at most {MAX_ZIP_ENTRIES}",
+            zip.len()
+        );
+    }
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let name = entry.name().to_string();
+        if entry.is_symlink() {
+            bail!("zip entry '{name}' is a symbolic link; skills may not contain links");
+        }
+        // `enclosed_name` would quietly make "/etc/x" relative: refuse it.
+        let absolute = name.starts_with(['/', '\\']) || name.as_bytes().get(1) == Some(&b':');
+        let Some(rel) = entry.enclosed_name().filter(|_| !absolute) else {
+            bail!("zip entry '{name}' would be written outside the skill folder");
+        };
+        let out = dest.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out)?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let left = MAX_BYTES.saturating_sub(total);
+        let mut writer = std::fs::File::create(&out)?;
+        // Read one byte past what is left: more means over the cap, however
+        // small the archive claimed the entry was.
+        let n = std::io::copy(&mut (&mut entry).take(left + 1), &mut writer)?;
+        total += n;
+        if total > MAX_BYTES {
+            bail!(
+                "the archive expands to more than {} MB (at '{name}')",
+                MAX_BYTES / 1_000_000
+            );
+        }
+    }
+    Ok(total)
+}
+
 /// Fetch a source into a temporary directory: a local folder, a git URL
-/// (optionally at `git_ref`), or a `.zip`. Returns the staging dir.
+/// (optionally at `git_ref`), or a `.zip`. Returns the staging dir; on
+/// failure nothing is left behind.
 fn stage(paths: &Paths, source: &str, git_ref: Option<&str>) -> Result<PathBuf> {
     let staging = paths
         .data_dir
@@ -175,6 +264,16 @@ fn stage(paths: &Paths, source: &str, git_ref: Option<&str>) -> Result<PathBuf> 
         .join(".staging")
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&staging)?;
+    match fetch_into(&staging, source, git_ref) {
+        Ok(()) => Ok(staging),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+fn fetch_into(staging: &Path, source: &str, git_ref: Option<&str>) -> Result<()> {
     let local = Path::new(source);
     let is_git = source.starts_with("https://")
         || source.starts_with("git@")
@@ -185,23 +284,16 @@ fn stage(paths: &Paths, source: &str, git_ref: Option<&str>) -> Result<PathBuf> 
         if let Some(r) = git_ref {
             git.args(["--branch", r]);
         }
-        git.arg(source).arg(&staging);
+        git.arg(source).arg(staging);
         run(&mut git, "git clone")?;
     } else if local.is_dir() {
-        copy_dir(local, &staging)?;
+        copy_dir(local, staging)?;
     } else if source.to_lowercase().ends_with(".zip") && local.is_file() {
-        run(
-            std::process::Command::new("unzip")
-                .arg("-q")
-                .arg(local)
-                .arg("-d")
-                .arg(&staging),
-            "unzip",
-        )?;
+        extract_zip(local, staging)?;
     } else {
         bail!("skill source must be a folder, a .zip or a git URL: {source}");
     }
-    Ok(staging)
+    Ok(())
 }
 
 /// A fetched, validated skill not yet installed (no database access, so
