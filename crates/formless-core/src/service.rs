@@ -589,7 +589,12 @@ mod tests {
         let base = std::env::temp_dir().join(format!("fl-svc-preview-{}", uuid::Uuid::new_v4()));
         let paths = fixture("/a space \" & %PATH% <node>/data", "/config & <c>", "work");
         for os in [ServiceOs::MacOs, ServiceOs::Systemd] {
-            let p = plan_for(&paths, Path::new("/bin/a \" & <b>"), &base, os).unwrap();
+            let exe = if os == ServiceOs::Systemd {
+                "/bin/a $TOKEN %n & <b>"
+            } else {
+                "/bin/a \" & <b>"
+            };
+            let p = plan_for(&paths, Path::new(exe), &base, os).unwrap();
             let shown = dry_run(&p);
             assert!(shown.starts_with(&format!("# {} ({})\n", p.file.display(), p.manager)));
             assert!(shown.contains(&p.contents));
