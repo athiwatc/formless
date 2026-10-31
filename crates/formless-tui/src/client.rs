@@ -11,6 +11,97 @@ pub struct DaemonClient {
     next_id: AtomicU64,
 }
 
+/// User sends whose daemon acknowledgement has not arrived. Transport request
+/// ids can change on retry/reconnect; the action UUID and original mode cannot.
+#[derive(Clone)]
+struct SendAction {
+    session_id: String,
+    content: String,
+    mode: SendMode,
+    key: String,
+}
+
+#[derive(Default)]
+pub struct SendTracker {
+    actions: Vec<SendAction>,
+    requests: std::collections::HashMap<u64, String>,
+}
+
+impl SendTracker {
+    pub fn send(
+        &mut self,
+        client: &DaemonClient,
+        session_id: String,
+        content: String,
+        mode: SendMode,
+    ) -> u64 {
+        let action = match self
+            .actions
+            .iter()
+            .find(|a| a.session_id == session_id && a.content == content)
+        {
+            Some(action) => action.clone(),
+            None => {
+                let action = SendAction {
+                    session_id,
+                    content,
+                    mode,
+                    key: uuid::Uuid::new_v4().to_string(),
+                };
+                self.actions.push(action.clone());
+                action
+            }
+        };
+        let id = client.send(Request::SendMessage {
+            session_id: action.session_id,
+            content: action.content,
+            mode: action.mode,
+            client_msg_id: Some(action.key.clone()),
+        });
+        self.requests.insert(id, action.key);
+        id
+    }
+
+    /// Any answer (including a definite rejection) ends this send action.
+    pub fn answered(&mut self, id: u64) -> Vec<u64> {
+        if let Some(key) = self.requests.remove(&id) {
+            let mut answered = vec![id];
+            self.actions.retain(|a| a.key != key);
+            self.requests.retain(|request, action| {
+                if action == &key {
+                    answered.push(*request);
+                    false
+                } else {
+                    true
+                }
+            });
+            answered
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn unsent(&self, session_id: &str) -> Option<&str> {
+        self.actions
+            .iter()
+            .rev()
+            .find(|a| a.session_id == session_id)
+            .map(|a| a.content.as_str())
+    }
+
+    pub fn message(&self, request: u64) -> Option<(&str, &str)> {
+        let key = self.requests.get(&request)?;
+        self.actions
+            .iter()
+            .find(|a| &a.key == key)
+            .map(|a| (a.session_id.as_str(), a.content.as_str()))
+    }
+
+    pub fn disconnected(&mut self) {
+        self.requests.clear();
+    }
+}
+
 fn connect_stream(paths: &Paths) -> Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     #[cfg(unix)]
     {
@@ -35,6 +126,18 @@ fn connect_stream(paths: &Paths) -> Result<(Box<dyn Read + Send>, Box<dyn Write 
 }
 
 impl DaemonClient {
+    #[cfg(test)]
+    pub(crate) fn recording() -> (Self, mpsc::Receiver<String>) {
+        let (write_tx, rx) = mpsc::channel();
+        (
+            Self {
+                write_tx,
+                next_id: AtomicU64::new(1),
+            },
+            rx,
+        )
+    }
+
     pub fn connect(paths: &Paths) -> Result<(Self, mpsc::Receiver<ServerMessage>)> {
         let (reader, mut writer) = connect_stream(paths)?;
         let (msg_tx, msg_rx) = mpsc::channel::<ServerMessage>();
@@ -352,7 +455,50 @@ fn terminate_daemon(paths: &Paths) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::version_warning;
+    use super::*;
+
+    #[test]
+    fn send_actions_keep_keys_until_answered_and_scope_them_to_the_session() {
+        let (client, sent) = DaemonClient::recording();
+        let mut sends = SendTracker::default();
+        let mut send = |session: &str, mode| {
+            let id = sends.send(&client, session.into(), "same text".into(), mode);
+            let envelope: RequestEnvelope =
+                serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            (id, envelope.request)
+        };
+        let (first, original) = send("s1", SendMode::Send);
+        let (retry_id, retry) = send("s1", SendMode::Steer);
+        assert_eq!(
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(&retry).unwrap()
+        );
+        let (_, other_session) = send("s2", SendMode::Send);
+        let key = |request: &Request| match request {
+            Request::SendMessage { client_msg_id, .. } => client_msg_id.clone().unwrap(),
+            _ => panic!("not a send"),
+        };
+        assert_ne!(key(&original), key(&other_session));
+        let cleared = sends.answered(first);
+        assert!(cleared.contains(&first) && cleared.contains(&retry_id));
+        sends.send(&client, "s1".into(), "same text".into(), SendMode::Send);
+        let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_ne!(key(&original), key(&fresh.request));
+        // Reconnecting resets transport ids, but preserves the user action.
+        sends.disconnected();
+        let (replacement, sent) = DaemonClient::recording();
+        let id = sends.send(
+            &replacement,
+            "s1".into(),
+            "same text".into(),
+            SendMode::Steer,
+        );
+        let resent: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert_eq!(key(&fresh.request), key(&resent.request));
+        sends.answered(id);
+        assert_eq!(sends.unsent("s1"), None);
+        assert_eq!(sends.unsent("s2"), Some("same text"));
+    }
 
     #[test]
     fn version_warning_only_on_a_mismatch() {

@@ -259,6 +259,16 @@ async fn run_turns(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
+    // A terminal storage status precedes the Run tail. Keep the caller's
+    // credential guard alive until that detached task has released the daemon.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while Arc::strong_count(&daemon) != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Anthropic Run tasks did not finish within 10 seconds");
+    drop(daemon);
     (store, sid)
 }
 
@@ -294,28 +304,74 @@ async fn a_paused_turn_resumes_with_its_thinking() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_context_compaction_keeps_the_partial_answer() {
     let _env = credential_env::EnvGuard::isolated();
-    let fail = (
-        400,
-        json!({"type": "error", "error": {"type": "invalid_request_error", "message": "nope"}})
-            .to_string(),
-    );
-    let (base, seen) = scripted(vec![
-        answer(false, "first answer", "end_turn"),
-        answer(false, "second answer", "end_turn"),
-        answer(false, "third answer", "end_turn"),
-        answer(false, "partial", "model_context_window_exceeded"),
-        fail,
-    ])
-    .await;
-    let (store, sid) = run_turns(&_env, base, "anth-ctx", &["one", "two", "three", "four"]).await;
-    assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
-    let msgs = store.list_messages(&sid).unwrap();
-    let last = msgs.iter().rev().find(|m| m.role == "assistant").unwrap();
-    assert_eq!(last.content, "partial");
-    assert!(seen.lock().unwrap().len() >= 5, "compaction was tried");
-    assert!(last
-        .meta
-        .as_deref()
-        .unwrap_or_default()
-        .contains("model_context_window_exceeded"));
+    for partial in ["partial", ""] {
+        let fail = (
+            400,
+            json!({"type": "error", "error": {"type": "invalid_request_error", "message": "nope"}})
+                .to_string(),
+        );
+        let (base, seen) = scripted(vec![
+            answer(false, "first answer", "end_turn"),
+            answer(false, "second answer", "end_turn"),
+            answer(false, "third answer", "end_turn"),
+            answer(false, partial, "model_context_window_exceeded"),
+            fail,
+        ])
+        .await;
+        let (store, sid) =
+            run_turns(&_env, base, "anth-ctx", &["one", "two", "three", "four"]).await;
+        assert_eq!(store.last_run(&sid).unwrap().unwrap().1, "completed");
+        let msgs = store.list_messages(&sid).unwrap();
+        let last = msgs.iter().rev().find(|m| m.role == "assistant").unwrap();
+        assert_eq!(last.content, partial);
+        assert!(seen.lock().unwrap().len() >= 5, "compaction was tried");
+        assert!(last
+            .meta
+            .as_deref()
+            .unwrap_or_default()
+            .contains("model_context_window_exceeded"));
+        let meta: Value = serde_json::from_str(last.meta.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["truncated"], true);
+        let context = formless_core::storage::build_context(&store, &sid, "system", 200_000, 1.0)
+            .unwrap()
+            .0;
+        let answer = context
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert!(answer["content"]
+            .as_str()
+            .unwrap()
+            .contains("[harness note]"));
+        assert!(answer["content"].as_str().unwrap().contains("cut off"));
+        assert!(!answer["content"].as_str().unwrap().trim().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_limit_partials_persist_and_resend_as_incomplete() {
+    let _env = credential_env::EnvGuard::isolated();
+    let (base, _) = scripted(vec![answer(false, "unfinished", "max_tokens")]).await;
+    let (store, sid) = run_turns(&_env, base, "anth-output-limit", &["go"]).await;
+    let messages = store.list_messages(&sid).unwrap();
+    let answer = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .unwrap();
+    let meta: Value = serde_json::from_str(answer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["truncated"], true);
+    assert_eq!(meta["stop_reason"], "max_tokens");
+    let context = formless_core::storage::build_context(&store, &sid, "system", 200_000, 1.0)
+        .unwrap()
+        .0;
+    let answer = context
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .unwrap();
+    let text = answer["content"].as_str().unwrap();
+    assert!(text.starts_with("unfinished\n\n[harness note]"), "{text}");
+    assert!(text.contains("cut off (max_tokens)"), "{text}");
 }

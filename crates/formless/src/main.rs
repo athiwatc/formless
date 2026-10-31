@@ -3294,12 +3294,8 @@ fn run_headless(
             max_steps,
         });
     }
-    critical.insert(client.send(Request::SendMessage {
-        session_id: session_id.clone(),
-        content: task,
-        mode: SendMode::Send,
-        client_msg_id: None,
-    }));
+    let mut sends = formless_tui::client::SendTracker::default();
+    critical.insert(sends.send(&client, session_id.clone(), task, SendMode::Send));
     let sigints = count_sigints();
     let mut interrupting = false;
     let mut code = 1;
@@ -3342,6 +3338,9 @@ fn run_headless(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(e) => Err(e),
         };
+        if let Ok(ServerMessage::Response { id, .. }) = &msg {
+            sends.answered(*id);
+        }
         match msg {
             Ok(ServerMessage::Event(ev)) => {
                 // The daemon broadcasts every Session's events; only act on ours.
