@@ -640,6 +640,9 @@ pub fn non_public(ip: std::net::IpAddr) -> bool {
     }
 }
 
+type DnsResolver<'a> =
+    dyn Fn(&str, u16, std::time::Instant) -> Result<Vec<std::net::SocketAddr>, String> + 'a;
+
 /// Resolve the URL's host once and check every address (SPEC §7.4): a
 /// private one is refused unless a grant names this host exactly. The
 /// address returned is the one the request is then pinned to, so DNS
@@ -648,7 +651,7 @@ fn checked_address(
     url: &reqwest::Url,
     scope: &[String],
     deadline: std::time::Instant,
-    resolve: &dyn Fn(&str, u16, std::time::Instant) -> Result<Vec<std::net::SocketAddr>, String>,
+    resolve: &DnsResolver<'_>,
 ) -> Result<Vec<std::net::SocketAddr>, String> {
     let host = url
         .host_str()
@@ -815,7 +818,7 @@ fn send_request(req: FetchRequest) -> Result<reqwest::blocking::Response, String
 
 fn send_request_with_resolver(
     mut req: FetchRequest,
-    resolve: &dyn Fn(&str, u16, std::time::Instant) -> Result<Vec<std::net::SocketAddr>, String>,
+    resolve: &DnsResolver<'_>,
 ) -> Result<reqwest::blocking::Response, String> {
     use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION};
     let deadline =
