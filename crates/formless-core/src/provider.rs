@@ -939,6 +939,7 @@ pub fn proxy_in_use(cfg: &ProviderCfg) -> Option<String> {
 struct AuthRecovery {
     attempted: bool,
     failure: Option<String>,
+    original_401: Option<String>,
 }
 
 impl AuthRecovery {
@@ -947,6 +948,29 @@ impl AuthRecovery {
             .as_ref()
             .map(|e| format!("; OAuth refresh failed: {e}"))
             .unwrap_or_default()
+    }
+
+    fn error(&self, message: impl std::fmt::Display) -> anyhow::Error {
+        let context = self
+            .original_401
+            .as_ref()
+            .map(|original| {
+                format!(
+                    "; initial authentication failure: {original}{}",
+                    self.detail()
+                )
+            })
+            .unwrap_or_default();
+        anyhow!("{message}{context}")
+    }
+
+    fn annotate(&self, error: anyhow::Error) -> anyhow::Error {
+        if self.original_401.is_some() {
+            let message = self.error(format!("{error:#}")).to_string();
+            error.context(message)
+        } else {
+            error
+        }
     }
 }
 
@@ -1540,6 +1564,17 @@ impl Provider {
         effort: Option<&str>,
         allow_failover: bool,
     ) -> Result<(reqwest::Response, Recovered, String, BreakerPermit)> {
+        self.post_provider_with_auth(body, effort, allow_failover, &mut AuthRecovery::default())
+            .await
+    }
+
+    async fn post_provider_with_auth(
+        &self,
+        body: &mut Value,
+        effort: Option<&str>,
+        allow_failover: bool,
+        auth: &mut AuthRecovery,
+    ) -> Result<(reqwest::Response, Recovered, String, BreakerPermit)> {
         let endpoint = if self.cfg.anthropic() {
             "messages"
         } else if self.cfg.responses() {
@@ -1562,10 +1597,11 @@ impl Provider {
         let mut recovered = Recovered::default();
         let mut applied_fixes = Vec::new();
         let mut last_err = String::new();
-        let mut auth = AuthRecovery::default();
-        let mut rejected_auth = None;
         for model in &models {
-            let credential = self.credential().await?;
+            let credential = self
+                .credential()
+                .await
+                .map_err(|error| auth.annotate(error))?;
             let Some(mut permit) = self.breaker_permit(model, &credential) else {
                 last_err =
                     format!("model {model}: circuit breaker is open, probing, or at active-identity capacity");
@@ -1597,7 +1633,10 @@ impl Provider {
                         b["reasoning_effort"] = json!(effort);
                     }
                 }
-                let credential = self.credential().await?;
+                let credential = self
+                    .credential()
+                    .await
+                    .map_err(|error| auth.annotate(error))?;
                 // A live key/OAuth refresh must not charge failures to a
                 // different credential identity captured before the refresh.
                 if self.breaker_key(model, &credential) != permit.key {
@@ -1681,11 +1720,11 @@ impl Provider {
                         // A rejected OAuth token (revoked, or clock skew past
                         // the expiry margin): refresh once and resend.
                         if status.as_u16() == 401 && self.cfg.oauth() {
-                            if self.recover_unauthorized(&credential, &mut auth).await {
-                                continue;
+                            if auth.original_401.is_none() {
+                                auth.original_401 = Some(last_err.clone());
                             }
-                            if rejected_auth.is_none() {
-                                rejected_auth = Some(format!("{last_err}{}", auth.detail()));
+                            if self.recover_unauthorized(&credential, auth).await {
+                                continue;
                             }
                             // Authentication cannot be repaired again for this
                             // logical call; let a configured fallback still run.
@@ -1696,7 +1735,7 @@ impl Provider {
                             break; // immediately open, then fail over if configured
                         }
                         if !(status.as_u16() == 429 || status.is_server_error()) {
-                            return Err(anyhow!("provider error: {last_err}"));
+                            return Err(auth.error(format!("provider error: {last_err}")));
                         }
                         reason = if status.as_u16() == 429 {
                             "rate limited".to_string()
@@ -1724,12 +1763,7 @@ impl Provider {
                 tracing::warn!("provider model {model} failed ({last_err}); failing over");
             }
         }
-        let auth_context = rejected_auth
-            .map(|e| format!("; initial authentication failure: {e}"))
-            .unwrap_or_default();
-        Err(anyhow!(
-            "provider request failed after retries: {last_err}{auth_context}"
-        ))
+        Err(auth.error(format!("provider request failed after retries: {last_err}")))
     }
 
     /// Wait before retry `attempt` (0-based): the server's own hint when it
@@ -1870,6 +1904,7 @@ impl Provider {
             b
         };
         let mut attempt = 0;
+        let mut auth = AuthRecovery::default();
         let (state, recovered, model_used) = 'request: loop {
             // All stream assembly belongs to this attempt. Every retry path
             // drops it, including flags/finish reasons from a discarded stream.
@@ -1888,7 +1923,7 @@ impl Provider {
             // stuck endpoint must not outlive an interrupt).
             let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                r = self.post_provider(&mut body, effort, true) => r?,
+                r = self.post_provider_with_auth(&mut body, effort, true, &mut auth) => r?,
             };
             let mut stream = resp.bytes_stream();
             // Raw bytes: a chunk boundary can split a multibyte character, so
@@ -2262,11 +2297,12 @@ impl Provider {
         let mut notes = crate::anthropic::skipped_images(messages);
         let mut dropped_replayed_thinking = false;
         let mut attempt = 0;
+        let mut auth = AuthRecovery::default();
         let mut shown = false;
         loop {
             let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                r = self.post_provider(&mut body, None, true) => r?,
+                r = self.post_provider_with_auth(&mut body, None, true, &mut auth) => r?,
             };
             for n in recovered.notes {
                 if !notes.contains(&n) {

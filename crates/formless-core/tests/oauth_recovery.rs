@@ -178,6 +178,10 @@ struct Seen {
     fallback_ok: bool,
     reject_new: bool,
     pages: bool,
+    fallback_status: Option<u16>,
+    drop_stream_once: bool,
+    stream_delivered: bool,
+    stream_drop_gate: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 struct Server {
     base: String,
@@ -207,7 +211,11 @@ async fn endpoint(
     ));
     if path.trim_end_matches('/') == "/token" {
         seen.refreshes += 1;
-        assert!(String::from_utf8_lossy(&body).contains("refresh_token=private-refresh"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("refresh_token=private-refresh")
+                || (seen.drop_stream_once && body.contains("refresh_token=rotated-refresh"))
+        );
         return if seen.fail_refresh {
             (
                 StatusCode::BAD_REQUEST,
@@ -218,10 +226,56 @@ async fn endpoint(
             Json(json!({"access_token":"new-access","refresh_token":"rotated-refresh","expires_in":3600})).into_response()
         };
     }
+    if payload["model"] == "fallback" {
+        if let Some(status) = seen.fallback_status {
+            return (
+                StatusCode::from_u16(status).unwrap(),
+                "fallback policy rejection",
+            )
+                .into_response();
+        }
+    }
+    if seen.drop_stream_once && seen.stream_delivered && payload["stream"] == true {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "second revoked credential after stream drop",
+        )
+            .into_response();
+    }
     let good = (credential.ends_with("new-access") && !seen.reject_new)
         || (seen.fallback_ok && payload["model"] == "fallback");
     if !good {
         return (StatusCode::UNAUTHORIZED, "original revoked credential").into_response();
+    }
+    if seen.drop_stream_once && payload["stream"] == true {
+        seen.stream_delivered = true;
+        let gate = seen.stream_drop_gate.take().expect("private drop gate");
+        // Deliver response headers and an SSE comment first. The test's Bytes
+        // callback acknowledges consuming that body chunk before releasing the
+        // transport error, proving this retry occurs after post_provider returns.
+        let stream =
+            futures_util::stream::unfold((false, Some(gate)), |(emitted, gate)| async move {
+                if !emitted {
+                    Some((
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                            b": headers ready\n\n",
+                        )),
+                        (true, gate),
+                    ))
+                } else {
+                    let gate = gate?;
+                    let _ = gate.await;
+                    Some((
+                        Err(std::io::Error::other("intentional withheld stream drop")),
+                        (true, None),
+                    ))
+                }
+            });
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
     }
     if path.ends_with("/models") {
         let more = seen.pages && uri.query().is_none_or(|q| !q.contains("after_id"));
@@ -240,6 +294,8 @@ impl Server {
             .route("/token/", post(endpoint))
             .route("/v1/models", get(endpoint))
             .route("/v1/chat/completions", post(endpoint))
+            .route("/v1/responses", post(endpoint))
+            .route("/v1/messages", post(endpoint))
             .route("/v1/compact", post(endpoint))
             .with_state(seen.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -596,4 +652,116 @@ async fn changing_default_does_not_send_unknown_legacy_refresh_token_to_new_issu
         legacy
     );
     server.close().await;
+}
+
+#[tokio::test]
+async fn forced_refresh_is_shared_across_withheld_stream_drop_retries_for_all_apis() {
+    let env = credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    for style in ["chat", "responses", "anthropic"] {
+        let (drop_now, gate) = tokio::sync::oneshot::channel();
+        let server = Server::new(Seen {
+            drop_stream_once: true,
+            stream_drop_gate: Some(gate),
+            ..Default::default()
+        })
+        .await;
+        let mut cfg = config(&server.base);
+        cfg.api_style = style.into();
+        cfg.max_retries = 1;
+        cfg.max_backoff_secs = 1;
+        let p = managed(&f, cfg, "work").await;
+        let mut drop_now = Some(drop_now);
+        let mut bytes_seen = 0;
+        let mut shown = String::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            p.chat_stream(
+                &[json!({"role":"user","content":"hi"})],
+                &[],
+                "primary",
+                None,
+                &cancel,
+                |kind, text| {
+                    if kind == provider::DeltaKind::Bytes {
+                        bytes_seen += 1;
+                        if let Some(sender) = drop_now.take() {
+                            sender.send(()).expect("mock stream still waiting");
+                        }
+                    }
+                    if kind == provider::DeltaKind::Content {
+                        shown.push_str(text);
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("withheld stream retry timed out");
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("second revoked credential"),
+            "{style}: {error}"
+        );
+        assert!(
+            bytes_seen > 0,
+            "{style}: error was released only after receiving body bytes"
+        );
+        assert!(
+            shown.is_empty(),
+            "{style}: fixture never emits a visible delta"
+        );
+        let seen = server.seen.lock().unwrap();
+        assert!(
+            seen.stream_delivered,
+            "{style}: successful200 stream preceded retry"
+        );
+        assert_eq!(
+            seen.refreshes, 1,
+            "{style}: one forced refresh for the whole logical stream"
+        );
+        assert_eq!(
+            seen.calls
+                .iter()
+                .filter(|(path, _, _)| path != "/token")
+                .count(),
+            3,
+            "{style}: initial401, refreshed200, retry401"
+        );
+        drop(seen);
+        server.close().await;
+    }
+}
+
+#[tokio::test]
+async fn failed_refresh_context_survives_fallback_hard_error() {
+    let env = credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    for status in [400, 403] {
+        let server = Server::new(Seen {
+            fail_refresh: true,
+            fallback_status: Some(status),
+            ..Default::default()
+        })
+        .await;
+        let mut cfg = config(&server.base);
+        cfg.fallback_models = vec!["fallback".into()];
+        let p = managed(&f, cfg, "work").await;
+        let error = complete(&p).await.unwrap_err().to_string();
+        let status_text = status.to_string();
+        for detail in [
+            "401",
+            "original revoked credential",
+            "invalid_grant",
+            "fallback policy rejection",
+            status_text.as_str(),
+        ] {
+            assert!(error.contains(detail), "missing{detail} in {error}");
+        }
+        let seen = server.seen.lock().unwrap();
+        assert_eq!(seen.refreshes, 1);
+        assert!(seen.calls.iter().any(|(_, _, model)| model == "fallback"));
+        drop(seen);
+        server.close().await;
+    }
 }

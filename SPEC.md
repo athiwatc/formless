@@ -328,10 +328,12 @@ without redesign.
   A refresh token is only sent to the token endpoint that issued it. A
   401 for a token that has not expired by the clock (revoked, or clock
   skew) forces at most one refresh for a logical authenticated request:
-  chat/completion across model fallbacks, all pages of a model listing,
+  chat/completion across model fallbacks and outer stream-drop resends
+  (including native Messages streams), all pages of a model listing,
   compaction, and calls made by a managed operational probe. A failed forced
-  refresh retains the original 401 context and attempts configured fallback
-  models; it does not replace the error or reset the refresh allowance per
+  refresh retains the original 401 and refresh-error context even when a
+  later fallback returns a hard 400/403 or credential resolution fails, and
+  attempts configured fallback models; it does not replace the error or reset the refresh allowance per
   model. API-key/fixed-token and explicit environment overrides do not redeem
   a stored refresh token. `doctor` remains read-only, including its fixed-token
   diagnostic probes; operational probes can use a managed Provider.
