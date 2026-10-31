@@ -247,9 +247,13 @@ without redesign.
 - Each model's context window drives Compaction. It is
   `model_context_tokens[model]` when configured, else what the endpoint's
   `GET /models` listing reports for it (`context_length`, vLLM's
-  `max_model_len`, …; fetched once per base URL and refreshed whenever
-  the model picker lists models), else `context_tokens`. `ContextUsage`
-  reports which (`context_source`: `configured`, `endpoint`, `default`).
+  `max_model_len`, …; fetched once per provider and base URL, waiting at
+  most 3 s, and refreshed whenever the model picker lists models), else
+  `context_tokens`. A listing that fails is not kept: an error is tried
+  again on the next Run, a timeout after a minute, and it is logged once.
+  `ContextUsage` reports which (`context_source`: `configured`,
+  `endpoint`, `default`); `/context` in the TUI and web shows it, and each
+  automatic compaction is audited with it (`compaction.window`).
 - An assistant turn's text before its tool calls (a preamble such as
   "Let me check the file first") is kept in the history sent back to the
   model, on both API styles.
@@ -1816,10 +1820,14 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 
 - **MCP chains.** Two raw MCP calls the agent made back to back (top
   level, nothing between) in at least `optimiser.mcp_chain_min_runs` (3)
-  Runs within `optimiser.mcp_chain_days` (14) are suggested as a Tool,
-  unless a live Tool already wraps both. The suggestion appears in
-  `find_tools` results that list either call (`suggested_tools`) and in
-  `read_metrics {kind: "mcp_chains"}`. Nothing is created automatically.
+  Runs within `optimiser.mcp_chain_days` (14), both succeeding, are
+  suggested as a Tool, unless a live Tool already wraps both. The
+  suggestion appears in `find_tools` results that list either call
+  (`suggested_tools`) and in `read_metrics {kind: "mcp_chains"}`.
+  `read_metrics {kind: "mcp_chains", dismiss: [first, second]}` stops
+  suggesting that pair for good (stored, schema v57). Nothing is created
+  automatically. Wrappers `find_tools` brings in beside a raw MCP tool
+  count toward its limit, and only the Tools it returns are loaded.
 
 - **Trigger:** success rate **< 90%** over the last **≥20** Invocations
   (rolling window: last 100). Only the primary metric triggers.

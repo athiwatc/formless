@@ -4117,7 +4117,9 @@
     renderStatus();
     const b = r.breakdown || {};
     const pct = r.context_tokens ? Math.floor(r.used_tokens * 100 / r.context_tokens) : 0;
-    note("context: " + r.used_tokens + " of " + r.context_tokens + " tokens (" + pct + "%" + (r.measured ? "" : ", estimated") + ") on " + r.model);
+    // Where the window size came from (#770).
+    const source = { configured: "from provider.model_context_tokens", endpoint: "reported by the endpoint" }[r.context_source] || "provider.context_tokens (not reported by the endpoint)";
+    note("context: " + r.used_tokens + " of " + r.context_tokens + " tokens (" + pct + "%" + (r.measured ? "" : ", estimated") + ") on " + r.model + " · window " + source);
     note("≈ system prompt " + b.system_prompt + " · Tool schemas " + b.tool_schemas + " · history " + b.history + " tokens · " + b.attachments + " attachment(s)");
   }
   async function slash(cmd) {

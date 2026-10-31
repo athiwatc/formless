@@ -1090,6 +1090,15 @@ fn stable_prefix_len(text: &str) -> usize {
     stable
 }
 
+/// What `ContextUsage.context_source` means, for `/context`.
+fn window_source_text(source: &str) -> &'static str {
+    match source {
+        "configured" => "from provider.model_context_tokens",
+        "endpoint" => "reported by the endpoint's /models",
+        _ => "provider.context_tokens (the endpoint didn't report this model's)",
+    }
+}
+
 /// `s` on one line in at most `max` screen columns (the `…` included),
 /// cut between clusters (#785).
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -2454,6 +2463,11 @@ impl App {
                                     "  ≈ system prompt {} · Tool schemas {} · history {} tokens · {} attachment(s)",
                                     b["system_prompt"], b["tool_schemas"], b["history"], b["attachments"]
                                 ));
+                                // Where the window size came from (#770).
+                                if let Some(source) = result["context_source"].as_str() {
+                                    self.notes
+                                        .push(format!("  window: {}", window_source_text(source)));
+                                }
                             }
                         }
                         Pending::SaveSetting => {

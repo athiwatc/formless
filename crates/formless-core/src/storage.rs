@@ -351,7 +351,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 56;
+pub const SCHEMA_VERSION: i64 = 57;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -436,7 +436,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 56] = [
+const MIGRATIONS: [(i64, MigrationStep); 57] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -696,6 +696,14 @@ const MIGRATIONS: [(i64, MigrationStep); 56] = [
     // provisional and the naming model replaces them; NULL is the default
     // name, a user's name, or an earlier version's.
     (56, |c| add_column(c, "sessions", "name_source TEXT")),
+    // MCP chain suggestions the agent or user dismissed (#771).
+    (57, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS dismissed_mcp_chains (
+               first TEXT NOT NULL, second TEXT NOT NULL, dismissed_at TEXT NOT NULL,
+               PRIMARY KEY (first, second));",
+        )?)
+    }),
 ];
 
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
@@ -4634,6 +4642,7 @@ impl Store {
         let mut stmt = self.ps(
             "SELECT i.run_id, t.name FROM invocations i JOIN tools t ON t.id = i.tool_id
              WHERE i.parent_id IS NULL AND i.run_id IS NOT NULL AND i.created_at >= ?1
+               AND i.status = 'success'
              ORDER BY i.run_id, i.created_at, i.rowid",
         )?;
         let rows = stmt
@@ -4661,6 +4670,23 @@ impl Store {
             .collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(out)
+    }
+
+    /// Stop suggesting the chain `first` → `second` (#771).
+    pub fn dismiss_mcp_chain(&self, first: &str, second: &str) -> Result<()> {
+        self.ex(
+            "INSERT OR REPLACE INTO dismissed_mcp_chains (first, second, dismissed_at) VALUES (?1, ?2, ?3)",
+            params![first, second, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn dismissed_mcp_chains(&self) -> Result<std::collections::HashSet<(String, String)>> {
+        let mut stmt = self.ps("SELECT first, second FROM dismissed_mcp_chains")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// The output of the latest successful Invocation of the Tool called
