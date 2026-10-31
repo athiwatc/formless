@@ -20,6 +20,15 @@ impl Paths {
     /// Resolve OS dirs. Env overrides (for tests): FORMLESS_DATA_DIR,
     /// FORMLESS_CONFIG_DIR. Profile appends a suffix dir (SPEC §9.4).
     pub fn resolve(profile: Option<&str>) -> Result<Self> {
+        let paths = Self::resolve_read_only(profile)?;
+        std::fs::create_dir_all(&paths.data_dir)?;
+        std::fs::create_dir_all(&paths.config_dir)?;
+        Ok(paths)
+    }
+
+    /// Resolve the same profile paths without creating directories or
+    /// opening profile state, for previews that must not change anything.
+    pub fn resolve_read_only(profile: Option<&str>) -> Result<Self> {
         let profile = profile.unwrap_or("default").to_string();
         let (mut data, mut config) = match (
             std::env::var("FORMLESS_DATA_DIR"),
@@ -41,8 +50,6 @@ impl Paths {
             data = data.join(&profile);
             config = config.join(&profile);
         }
-        std::fs::create_dir_all(&data)?;
-        std::fs::create_dir_all(&config)?;
         Ok(Self {
             data_dir: data,
             config_dir: config,
