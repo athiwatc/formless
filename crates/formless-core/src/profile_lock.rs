@@ -6,11 +6,11 @@ use crate::Paths;
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions, TryLockError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub struct ProfileLock {
-    _file: File,
+    _files: Vec<File>,
 }
 
 fn directory(create: bool) -> Result<PathBuf> {
@@ -63,23 +63,64 @@ fn directory(create: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn lock_path(paths: &Paths, launcher: bool, create: bool) -> Result<PathBuf> {
+/// Lexical absolute identity survives unlinking or retargeting a configured
+/// symlink. Do not canonicalize even its parent: that namespace can change too.
+fn configured_identity(paths: &Paths) -> Result<PathBuf> {
+    let absolute = std::path::absolute(&paths.data_dir)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => (),
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn canonical_identity(paths: &Paths) -> Result<PathBuf> {
     let raw = paths
         .data_dir
         .to_str()
-        .context("profile data path must be UTF-8")?;
-    let canonical = formless_runtime::caps::canonical_path(raw).map_err(anyhow::Error::msg)?;
-    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-    let key: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(directory(create)?.join(format!(
-        "{key}.{}",
-        if launcher { "launch" } else { "owner" }
-    )))
+        .context("canonical profile ownership requires a UTF-8 data path")?;
+    formless_runtime::caps::canonical_path(raw).map_err(anyhow::Error::msg)
 }
 
-fn open_lock(paths: &Paths, launcher: bool, create: bool) -> Result<Option<File>> {
-    let path = lock_path(paths, launcher, create)?;
-    match std::fs::symlink_metadata(&path) {
+fn identity_lock_path(dir: &Path, identity: &Path, launcher: bool) -> PathBuf {
+    let digest = Sha256::digest(identity.as_os_str().as_encoded_bytes());
+    let key: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    dir.join(format!(
+        "{key}.{}",
+        if launcher { "launch" } else { "owner" }
+    ))
+}
+
+#[cfg(test)]
+fn lock_path(paths: &Paths, launcher: bool, create: bool) -> Result<PathBuf> {
+    Ok(identity_lock_path(
+        &directory(create)?,
+        &configured_identity(paths)?,
+        launcher,
+    ))
+}
+
+fn lock_paths(paths: &Paths, launcher: bool) -> Result<Vec<PathBuf>> {
+    let dir = directory(true)?;
+    let mut names = vec![
+        identity_lock_path(&dir, &configured_identity(paths)?, launcher),
+        identity_lock_path(&dir, &canonical_identity(paths)?, launcher),
+    ];
+    // Partial acquisition is released on any failure. A global ordering keeps
+    // aliases from acquiring their shared locks in opposite orders.
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn open_lock(path: &Path, create: bool) -> Result<Option<File>> {
+    match std::fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
             return Err(anyhow!(
                 "ownership lock is not a regular file: {}",
@@ -102,11 +143,11 @@ fn open_lock(paths: &Paths, launcher: bool, create: bool) -> Result<Option<File>
         options.mode(0o600);
     }
     let file = options
-        .open(&path)
+        .open(path)
         .with_context(|| format!("open profile lock {}", path.display()))?;
     // Recheck after opening as well. The parent is private; a same-user rename
     // must not make us knowingly accept a symlink or special file.
-    let named = std::fs::symlink_metadata(&path)?;
+    let named = std::fs::symlink_metadata(path)?;
     if !named.is_file() || named.file_type().is_symlink() || !file.metadata()?.is_file() {
         return Err(anyhow!(
             "profile lock changed while opening {}",
@@ -133,12 +174,18 @@ impl ProfileLock {
     }
 
     fn try_kind(paths: &Paths, launcher: bool) -> Result<Option<Self>> {
-        let file = open_lock(paths, launcher, true)?.expect("create opens a lock file");
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(error)) => Err(error).context("claim profile kernel lock"),
+        let mut files = Vec::new();
+        for path in lock_paths(paths, launcher)? {
+            let file = open_lock(&path, true)?.expect("create opens a lock file");
+            match file.try_lock() {
+                Ok(()) => files.push(file),
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Error(error)) => {
+                    return Err(error).context("claim profile kernel locks")
+                }
+            }
         }
+        Ok(Some(Self { _files: files }))
     }
 
     pub fn owner(paths: &Paths) -> Result<Self> {
@@ -166,13 +213,31 @@ impl ProfileLock {
 
 /// Errors remain errors: unknown ownership must never be treated as idle.
 pub fn owner_held(paths: &Paths) -> Result<bool> {
-    let Some(file) = open_lock(paths, false, false)? else {
-        return Ok(false);
-    };
-    match file.try_lock() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(error).context("inspect profile kernel ownership"),
+    let dir = directory(false)?;
+    let mut unknown = None;
+    for identity in [configured_identity(paths), canonical_identity(paths)] {
+        let probe = identity.and_then(|identity| {
+            let path = identity_lock_path(&dir, &identity, false);
+            let Some(file) = open_lock(&path, false)? else {
+                return Ok(false);
+            };
+            match file.try_lock() {
+                Ok(()) => Ok(false),
+                Err(TryLockError::WouldBlock) => Ok(true),
+                Err(TryLockError::Error(error)) => {
+                    Err(error).context("inspect profile kernel ownership")
+                }
+            }
+        });
+        match probe {
+            Ok(true) => return Ok(true),
+            Ok(false) => (),
+            Err(error) => unknown = Some(error),
+        }
+    }
+    match unknown {
+        Some(error) => Err(error),
+        None => Ok(false),
     }
 }
 
@@ -201,6 +266,92 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_alias_stays_owned_after_unlink_and_retarget_without_constructor_effects() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let (fixture, mut paths) = Fixture::new();
+        let real = paths.data_dir.clone();
+        let alias = fixture.0.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        paths.data_dir = alias.clone();
+        let owner = ProfileLock::owner(&paths).unwrap();
+        std::fs::remove_dir_all(&alias).unwrap();
+        assert!(
+            owner_held(&paths).unwrap(),
+            "stable configured key is held after unlink"
+        );
+        assert!(ProfileLock::try_owner(&paths).unwrap().is_none());
+        let replacement = fixture.0.join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(
+            replacement.join("formless.db"),
+            "untouched replacement database",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        assert!(owner_held(&paths).unwrap());
+        assert!(
+            ProfileLock::try_owner(&paths).unwrap().is_none(),
+            "retargeting cannot evade the configured identity"
+        );
+        let error = crate::daemon::Daemon::new(paths.clone()).err().unwrap();
+        assert!(error.to_string().contains("owned"));
+        assert_eq!(
+            std::fs::read_to_string(replacement.join("formless.db")).unwrap(),
+            "untouched replacement database"
+        );
+        assert!(!paths.config_file().exists());
+        drop(owner);
+        assert!(ProfileLock::try_owner(&paths).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_existing_aliases_share_canonical_ownership_and_launch_gate() {
+        let (fixture, paths) = Fixture::new();
+        let mut first = paths.clone();
+        first.data_dir = fixture.0.join("first");
+        let mut second = paths.clone();
+        second.data_dir = fixture.0.join("second");
+        std::os::unix::fs::symlink(&paths.data_dir, &first.data_dir).unwrap();
+        std::os::unix::fs::symlink(&paths.data_dir, &second.data_dir).unwrap();
+        let owner = ProfileLock::owner(&first).unwrap();
+        assert!(owner_held(&second).unwrap());
+        assert!(ProfileLock::try_owner(&second).unwrap().is_none());
+        assert!(ProfileLock::try_owner(&paths).unwrap().is_none());
+        let launch = ProfileLock::launcher(&first, Duration::ZERO).unwrap();
+        assert!(ProfileLock::launcher(&second, Duration::ZERO).is_err());
+        drop(launch);
+        drop(owner);
+        assert!(ProfileLock::try_owner(&second).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_configured_owner_wins_over_unknown_canonical_resolution() {
+        let (fixture, paths) = Fixture::new();
+        let mut alias = paths.clone();
+        alias.data_dir = fixture.0.join("alias");
+        std::os::unix::fs::symlink(&paths.data_dir, &alias.data_dir).unwrap();
+        let owner = ProfileLock::owner(&alias).unwrap();
+        std::fs::remove_file(&alias.data_dir).unwrap();
+        std::os::unix::fs::symlink(fixture.0.join("missing-target"), &alias.data_dir).unwrap();
+        assert!(
+            owner_held(&alias).unwrap(),
+            "known raw ownership remains authoritative even when canonical resolution fails"
+        );
+        assert!(
+            ProfileLock::try_owner(&alias).is_err(),
+            "canonical uncertainty cannot authorize a partial claim"
+        );
+        drop(owner);
+        assert!(
+            owner_held(&alias).is_err(),
+            "unknown canonical state must not become idle"
+        );
     }
 
     #[test]

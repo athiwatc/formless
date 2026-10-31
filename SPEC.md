@@ -2263,8 +2263,11 @@ such as `read_file`, `read_text_file` and `file_read`.
   dangerous Tools). Named profiles live in sub-directories of the default
   profile's data and config dirs.
   Ownership is acquired before opening/migrating the store or performing startup
-  recovery. Its private per-user lock file is keyed by the canonical data directory,
-  lives outside removable profile directories, and is never unlinked. `daemon.lock`
+  recovery. It holds private per-user locks for both the configured absolute
+  lexical path (without resolving symlinks) and the current canonical data
+  directory, acquired in sorted unique order. These locks live outside removable
+  profile directories and are never unlinked. Removing or retargeting a configured
+  symlink cannot split ownership while maintenance still changes its config. `daemon.lock`
   is an owner-written PID marker only. Auto-start and service installation share a
   separate launcher gate; installation stops a running daemon and waits for its
   ownership to release before loading the service. A second daemon cannot alter
