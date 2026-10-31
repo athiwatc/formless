@@ -6271,8 +6271,16 @@ mod tests {
     struct MaintenanceFixture(std::path::PathBuf);
     impl MaintenanceFixture {
         fn new() -> (Self, super::Paths) {
-            let base =
-                std::env::temp_dir().join(format!("fl-maintenance-{}", uuid::Uuid::new_v4()));
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let base = std::env::temp_dir().join(format!(
+                "fl-maintenance-{}-{stamp}-{next}",
+                std::process::id()
+            ));
             let paths = super::Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
             (Self(base), paths)
         }
