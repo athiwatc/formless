@@ -205,6 +205,8 @@ async fn nested_errors_preserve_inner_detail_and_redact_recorded_and_returned_in
     })
     .await
     .expect("mock-provider diagnostic Run did not complete");
+    let conn =
+        Connection::open_with_flags(paths.db_file(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let persisted_for_run: String = conn.query_row(
         "SELECT i.error FROM invocations i JOIN tools t ON t.id=i.tool_id WHERE t.name='outer_diagnostic' AND i.run_id IS NOT NULL AND i.status='failure' ORDER BY i.created_at DESC LIMIT 1",
         [], |row| row.get(0),
