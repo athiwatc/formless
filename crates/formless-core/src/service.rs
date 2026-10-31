@@ -101,6 +101,13 @@ fn plan_for(paths: &Paths, exe: &Path, home: &Path, os: ServiceOs) -> Result<Pla
     let log = service_path(&paths.log_file(), os)?;
     let exe_s = service_path(exe, os)?;
     service_path(home, os)?;
+    // systemd rejects these in the executable name after unquoting it, even
+    // when they are escaped correctly. Environment/output paths permit them.
+    if os == ServiceOs::Systemd && exe_s.contains(['\'', '"', '\\']) {
+        return Err(anyhow!(
+            "systemd cannot represent an executable path containing quotes or backslashes: {exe_s:?}"
+        ));
+    }
     if os == ServiceOs::MacOs {
         let label = format!("xyz.athiwat.{name}");
         let file = home
@@ -198,8 +205,10 @@ fn plan_for(paths: &Paths, exe: &Path, home: &Path, os: ServiceOs) -> Result<Pla
         // word: quotes/backslashes/spaces remain literal. Only specifiers
         // are expanded (systemd load-fragment.c config_parse_exec_output).
         let output = log.replace('%', "%%");
+        // Quotes do not suppress systemd's $NAME/${NAME} substitution.
+        // The ':' executable prefix disables it for the whole command.
         let contents = format!(
-            "[Unit]\nDescription=Formless daemon\n\n[Service]\nExecStart={} daemon serve --stay\nEnvironment={}\nEnvironment={}\nEnvironment={}=1\nStandardOutput=append:{output}\nStandardError=append:{output}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Formless daemon\n\n[Service]\nExecStart=:{} daemon serve --stay\nEnvironment={}\nEnvironment={}\nEnvironment={}=1\nStandardOutput=append:{output}\nStandardError=append:{output}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
             systemd_quote(&exe_s),
             systemd_quote(&format!("FORMLESS_DATA_DIR={data}")),
             systemd_quote(&format!("FORMLESS_CONFIG_DIR={config}")),
@@ -389,7 +398,7 @@ mod tests {
             "/home/a space \"quotes\" %n & <node> $TOKEN/config",
             "work",
         );
-        let exe = Path::new("/opt/a space \"quotes\" %n & <node>/formless");
+        let exe = Path::new("/opt/a space \"quotes\" %n & <node> $TOKEN/${TOKEN}/formless");
         let mac = plan_for(&paths, exe, Path::new("/home"), ServiceOs::MacOs).unwrap();
         assert!(mac
             .contents
@@ -397,12 +406,18 @@ mod tests {
         assert!(mac
             .contents
             .contains("/home/a space &quot;quotes&quot; %n &amp; &lt;node&gt; $TOKEN/data"));
-        assert!(mac
-            .contents
-            .contains("/opt/a space &quot;quotes&quot; %n &amp; &lt;node&gt;/formless"));
-        let linux = plan_for(&paths, exe, Path::new("/home"), ServiceOs::Systemd).unwrap();
+        assert!(mac.contents.contains(
+            "/opt/a space &quot;quotes&quot; %n &amp; &lt;node&gt; $TOKEN/${TOKEN}/formless"
+        ));
+        let linux = plan_for(
+            &paths,
+            Path::new("/opt/a space %n & <node> $TOKEN/${TOKEN}/formless"),
+            Path::new("/home"),
+            ServiceOs::Systemd,
+        )
+        .unwrap();
         assert!(linux.contents.contains(
-            r#"ExecStart="/opt/a space \"quotes\" %%n & <node>/formless" daemon serve --stay"#
+            r#"ExecStart=:"/opt/a space %%n & <node> $TOKEN/${TOKEN}/formless" daemon serve --stay"#
         ));
         assert!(linux.contents.contains(
             r#"Environment="FORMLESS_DATA_DIR=/home/a space \"quotes\" %%n & <node> $TOKEN/data""#
@@ -413,6 +428,35 @@ mod tests {
         assert!(linux.contents.contains(
             "StandardError=append:/home/a space \"quotes\" %%n & <node> $TOKEN/data/daemon.log\n"
         ));
+        let preview = dry_run(&linux);
+        assert!(preview.contains(&linux.contents));
+        assert!(preview.contains(
+            r#"ExecStart=:"/opt/a space %%n & <node> $TOKEN/${TOKEN}/formless" daemon serve --stay"#
+        ));
+    }
+
+    #[test]
+    fn systemd_refuses_unrepresentable_executable_paths_before_writing() {
+        let paths = fixture("/data \"quotes\"", "/config\\backslash", "work");
+        for exe in [
+            "/opt/a\"quote/formless",
+            "/opt/a'quote/formless",
+            "/opt/a\\slash/formless",
+        ] {
+            let error = plan_for(
+                &paths,
+                Path::new(exe),
+                Path::new("/home"),
+                ServiceOs::Systemd,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("systemd cannot represent an executable path"),
+                "{error}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
