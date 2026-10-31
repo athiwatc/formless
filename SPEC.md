@@ -1179,9 +1179,14 @@ pattern (§4.4).
   exactly the paths/hosts it was called with, never a project directory
   baked in at creation.
 - **Private addresses (#603).** Every `fetch` hop resolves the host once
-  and refuses loopback, private, link-local, CGNAT, unique-local,
+  and refuses loopback, private, link-local, deprecated site-local, CGNAT,
+  unique-local,
   multicast, unspecified, reserved (`240/4`), benchmarking, documentation,
-  Teredo and discard addresses; IPv6 forms that carry an IPv4 address
+  Teredo and discard addresses. The registry-entry test table
+  [`special_purpose_registry_addresses_are_not_public`](crates/formless-runtime/src/lib.rs)
+  covers the blocked special-purpose families,
+  including IPv6 `fec0::/10`, `2001:2::/48` and `3fff::/20`.
+  IPv6 forms that carry an IPv4 address
   (mapped, compatible, NAT64 `64:ff9b::/96`, 6to4) are judged by that
   address. The exception is a grant that names that host or IP exactly
   (and its port, if the grant has one): `net:localhost` /
