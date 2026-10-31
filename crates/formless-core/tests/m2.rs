@@ -1,6 +1,9 @@
 //! M2 acceptance tests (SPEC §18 M2): sandbox capability escapes, registry
 //! lifecycle + metrics exactness, daemon builds & uses a Tool end-to-end.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::storage::Store;
 use formless_core::Paths;
 use formless_runtime::{execute, Capabilities, ExecErrorKind, ExecRequest, HostMode, NoHostOps};
@@ -15,6 +18,7 @@ fn run_js(
     memory_mb: u32,
 ) -> Result<Value, formless_runtime::ExecError> {
     let req = ExecRequest {
+        output_schema: None,
         code: code.to_string(),
         input,
         caps: Capabilities::parse(&caps.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap(),
@@ -30,6 +34,7 @@ fn run_js(
 
 #[test]
 fn sandbox_executes_and_enforces_capabilities() {
+    let _env = credential_env::EnvGuard::isolated();
     // Happy path.
     let out = run_js(
         "function run(i){ return {echo: i.x}; }",
@@ -169,6 +174,7 @@ fn sandbox_executes_and_enforces_capabilities() {
 
 #[test]
 fn registry_lifecycle_and_metrics_exact() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = Store::open_in_memory().unwrap();
     let caps = Capabilities::parse(&["fs:read:/tmp".to_string()]).unwrap();
     let (_info, v) = store
@@ -352,6 +358,7 @@ fn temp_paths(tag: &str) -> Paths {
 /// answers approvals with `approve`. Returns (final assistant text, paths).
 #[cfg(unix)]
 async fn scripted_flow(
+    _env: &credential_env::EnvGuard,
     tag: &str,
     approve: bool,
     scope: formless_protocol::ApprovalScope,
@@ -370,7 +377,7 @@ async fn scripted_flow(
     use formless_protocol::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    std::env::set_var("FORMLESS_API_KEY", "test-key");
+    _env.set("FORMLESS_API_KEY", "test-key");
     let workdir = format!("/tmp/fl-{tag}w-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     std::fs::create_dir_all(&workdir).unwrap();
     let base = mock_m2_server(workdir.clone()).await;
@@ -540,8 +547,9 @@ async fn scripted_flow(
 #[cfg(unix)]
 #[tokio::test]
 async fn daemon_builds_and_uses_tool_with_approval() {
+    let _env = credential_env::EnvGuard::isolated();
     let (final_text, paths, workdir, changes, summary, prompts, _, grants) =
-        scripted_flow("m2a", true, formless_protocol::ApprovalScope::Always).await;
+        scripted_flow(&_env, "m2a", true, formless_protocol::ApprovalScope::Always).await;
     assert_eq!(prompts, 1, "a stored approval covers the second call");
     assert!(
         grants
@@ -594,8 +602,9 @@ async fn daemon_builds_and_uses_tool_with_approval() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_once_runs_the_tool_without_storing_a_grant() {
+    let _env = credential_env::EnvGuard::isolated();
     let (final_text, paths, workdir, _, _, prompts, _, _) =
-        scripted_flow("m2o", true, formless_protocol::ApprovalScope::Once).await;
+        scripted_flow(&_env, "m2o", true, formless_protocol::ApprovalScope::Once).await;
     assert_eq!(prompts, 2, "once means asking again on the next call");
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert!(std::path::Path::new(&format!("{workdir}/out.txt")).exists());
@@ -610,8 +619,14 @@ async fn approve_once_runs_the_tool_without_storing_a_grant() {
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant() {
-    let (final_text, paths, _, _, _, prompts, _, grants) =
-        scripted_flow("m2s", true, formless_protocol::ApprovalScope::Session).await;
+    let _env = credential_env::EnvGuard::isolated();
+    let (final_text, paths, _, _, _, prompts, _, grants) = scripted_flow(
+        &_env,
+        "m2s",
+        true,
+        formless_protocol::ApprovalScope::Session,
+    )
+    .await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(
         prompts, 1,
@@ -632,8 +647,9 @@ async fn approve_for_the_session_covers_its_later_calls_without_storing_a_grant(
 #[cfg(unix)]
 #[tokio::test]
 async fn approve_for_an_hour_covers_later_calls_without_storing_a_grant() {
+    let _env = credential_env::EnvGuard::isolated();
     let (final_text, paths, _, _, _, prompts, _, grants) =
-        scripted_flow("m2h", true, formless_protocol::ApprovalScope::Hour).await;
+        scripted_flow(&_env, "m2h", true, formless_protocol::ApprovalScope::Hour).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(prompts, 1, "the hour covers the second call (SPEC §10.3)");
     // The approvals list shows the hour grant and when it ends.
@@ -655,9 +671,10 @@ async fn approve_for_an_hour_covers_later_calls_without_storing_a_grant() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_batch_lists_each_held_call_and_asks_for_each() {
+    let _env = credential_env::EnvGuard::isolated();
     // Two calls of the new Tool in one turn, each answered "once".
     let (final_text, _, _, _, _, prompts, batches, _) =
-        scripted_flow("m2b", true, formless_protocol::ApprovalScope::Once).await;
+        scripted_flow(&_env, "m2b", true, formless_protocol::ApprovalScope::Once).await;
     assert!(final_text.contains("hello-m2"), "final text: {final_text}");
     assert_eq!(prompts, 2, "each held call is asked on its own");
     let indexes: Vec<usize> = batches.iter().map(|b| b.as_ref().unwrap().index).collect();
@@ -674,8 +691,14 @@ async fn a_batch_lists_each_held_call_and_asks_for_each() {
 #[cfg(unix)]
 #[tokio::test]
 async fn denied_approval_blocks_execution_and_counts_denied() {
-    let (final_text, paths, workdir, _, _, _, _, _) =
-        scripted_flow("m2d", false, formless_protocol::ApprovalScope::Always).await;
+    let _env = credential_env::EnvGuard::isolated();
+    let (final_text, paths, workdir, _, _, _, _, _) = scripted_flow(
+        &_env,
+        "m2d",
+        false,
+        formless_protocol::ApprovalScope::Always,
+    )
+    .await;
     assert!(
         final_text.to_lowercase().contains("denied"),
         "final text: {final_text}"

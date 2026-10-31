@@ -14689,6 +14689,10 @@ fn skill_success(s: &formless_protocol::SkillInfo) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../formless-core/tests/support/env.rs"]
+mod credential_env;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -15170,6 +15174,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_tui_send_reuses_its_key_and_appends_one_user_message() {
+        let _env = credential_env::EnvGuard::isolated();
         let mut app = test_app();
         let mut cfg = Config::default();
         cfg.provider.base_url = "http://127.0.0.1:9".into();
@@ -15227,6 +15232,16 @@ mod tests {
             serde_json::to_value(fresh.request).unwrap()["client_msg_id"],
             original["client_msg_id"]
         );
+        // The send response can precede the detached Run's cleanup. Do not
+        // restore inherited credentials while that task still reads config.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::sync::Arc::strong_count(&daemon) != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("send retry Run did not finish within 10 seconds");
+        drop(daemon);
     }
 
     #[test]

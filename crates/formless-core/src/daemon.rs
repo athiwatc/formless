@@ -5843,6 +5843,7 @@ impl Daemon {
                 .join(format!("formless-dry-run-{}", uuid::Uuid::new_v4())),
         });
         let req = ExecRequest {
+            output_schema: serde_json::from_str(&ver.output_schema).ok(),
             code: ver.code.clone(),
             input,
             caps,
@@ -6868,6 +6869,7 @@ impl Daemon {
             serde_json::to_string(name)?
         );
         let req = ExecRequest {
+            output_schema: None,
             code: probe,
             input: json!({}),
             caps: Capabilities::default(),
@@ -7181,6 +7183,7 @@ impl Daemon {
         // Smoke test in the stubbed sandbox with a schema-minimal input.
         // Input-bound scopes stay as templates: the runtime stubs them.
         let req = ExecRequest {
+            output_schema: Some(d.output_schema.clone()),
             code: d.code.clone(),
             input: toolreg::minimal_input(&d.input_schema),
             caps: d.caps.clone(),
@@ -9488,6 +9491,7 @@ impl Daemon {
             });
         }
         let req = ExecRequest {
+            output_schema: None,
             code: code.clone(),
             input: input.clone(),
             caps: Capabilities::default(),
@@ -9677,6 +9681,7 @@ impl Daemon {
             artifact_dir: self.paths.data_dir.join("artifacts"),
         });
         let req = ExecRequest {
+            output_schema: Some(d.output_schema.clone()),
             code: d.code.clone(),
             input,
             caps,
@@ -10672,6 +10677,7 @@ impl Daemon {
                 artifact_dir: self.paths.data_dir.join("artifacts"),
             });
             let req = ExecRequest {
+                output_schema: serde_json::from_str(&ver.output_schema).ok(),
                 code: ver.code.clone(),
                 input: input.clone(),
                 caps,
@@ -13011,6 +13017,7 @@ mod path_scope_tests {
 
     #[test]
     fn approvals_offer_and_apply_wider_path_grants() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "fl-widen-{}",
             &uuid::Uuid::new_v4().to_string()[..8]
@@ -13062,6 +13069,7 @@ mod trust_precedence_tests {
     /// the basis the audit names (SPEC §10.3).
     #[tokio::test(flavor = "multi_thread")]
     async fn trusted_calls_are_not_held_and_grants_come_first() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir()
             .canonicalize()
@@ -13164,6 +13172,7 @@ mod backpressure_tests {
 
     #[tokio::test]
     async fn frames_are_capped_while_reading() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let data = b"short\nxxxxxxxxxxxxxxxxxxxx\n".to_vec();
         let mut r = BufReader::new(&data[..]);
         assert_eq!(
@@ -13181,6 +13190,7 @@ mod backpressure_tests {
 
     #[test]
     fn a_stuck_client_loses_deltas_then_is_disconnected() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let (tx, _rx) = mpsc::channel::<ServerMessage>(1);
         let kick = CancellationToken::new();
         let subs: Subs = Arc::new(StdMutex::new(vec![Subscriber {
@@ -13213,6 +13223,7 @@ mod backpressure_tests {
     /// A dropped delta is told once there is room, before what follows (#1096).
     #[test]
     fn a_dropped_delta_is_announced() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let (tx, mut rx) = mpsc::channel::<ServerMessage>(3);
         let subs: Subs = Arc::new(StdMutex::new(vec![Subscriber {
             conn: 1,
@@ -13250,6 +13261,7 @@ mod backpressure_tests {
     /// connection's tasks all end (#1095).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_kicked_connection_ends_all_its_tasks() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir().join(format!("fl-kick-{short}"));
         let paths = crate::Paths {
@@ -13334,6 +13346,7 @@ mod internal_usage_tests {
     /// with their purpose and serving provider, so usage views and the
     /// daily limit see them; calls outside `counted` are not (#806).
     async fn compaction_daemon(
+        _env: &crate::credential_env::EnvGuard,
         reply: Value,
     ) -> (Arc<Daemon>, Arc<std::sync::atomic::AtomicUsize>, String) {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -13349,7 +13362,6 @@ mod internal_usage_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        std::env::set_var("FORMLESS_API_KEY", "k");
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir().join(format!("fl-cmp-{short}"));
         let paths = crate::Paths {
@@ -13364,6 +13376,7 @@ mod internal_usage_tests {
         cfg.provider.model = "m".into();
         cfg.provider.max_retries = 0;
         cfg.save(&paths).unwrap();
+        _env.set("FORMLESS_API_KEY", "k");
         let daemon = Arc::new(Daemon::new(paths).unwrap());
         let sid = daemon
             .with_store(|st| Ok(st.create_session(None)?.id))
@@ -13375,11 +13388,12 @@ mod internal_usage_tests {
     /// checkpoint: the turns stay (#619).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_truncated_summary_is_not_checkpointed() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         for reply in [
             json!({"choices": [{"message": {"content": "half a summ"}, "finish_reason": "length"}]}),
             json!({"choices": [{"message": {"content": "  "}, "finish_reason": "stop"}]}),
         ] {
-            let (daemon, _, sid) = compaction_daemon(reply).await;
+            let (daemon, _, sid) = compaction_daemon(&_env, reply).await;
             let last = daemon
                 .with_store(|st| {
                     st.append_message(&sid, "user", "hello")?;
@@ -13407,9 +13421,10 @@ mod internal_usage_tests {
     /// then merged; tool calls and results are part of what is summarised.
     #[tokio::test(flavor = "multi_thread")]
     async fn long_histories_are_summarised_in_parts() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let ok =
             json!({"choices": [{"message": {"content": "## Goal\nx"}, "finish_reason": "stop"}]});
-        let (daemon, calls, sid) = compaction_daemon(ok).await;
+        let (daemon, calls, sid) = compaction_daemon(&_env, ok).await;
         let last = daemon
             .with_store(|st| {
                 let mut last = 0;
@@ -13456,6 +13471,7 @@ mod internal_usage_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn counted_calls_are_recorded_by_purpose() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let app = axum::Router::new().route(
             "/chat/completions",
             axum::routing::post(|| async {
@@ -13468,7 +13484,7 @@ mod internal_usage_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        std::env::set_var("FORMLESS_API_KEY", "k");
+        _env.set("FORMLESS_API_KEY", "k");
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir().join(format!("fl-iu-{short}"));
         let paths = crate::Paths {
@@ -13518,6 +13534,7 @@ mod grant_code_tests {
     /// the same Capabilities (#704); with nobody to ask, it fails closed.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_new_version_with_other_code_asks_again() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir().join(format!("fl-gc-{short}"));
         let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
@@ -13598,6 +13615,7 @@ mod widen_scope_tests {
     /// says so (#765).
     #[tokio::test(flavor = "multi_thread")]
     async fn only_lasting_answers_widen() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir()
             .canonicalize()
@@ -13715,6 +13733,7 @@ mod poison_tests {
     /// request down with it (#717).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_poisoned_lock_leaves_the_daemon_answering() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir().join(format!("fl-poison-{short}"));
         let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
@@ -13742,6 +13761,7 @@ mod run_start_tests {
     /// and a finishing Run never removes a newer Run's controls (#726).
     #[tokio::test(flavor = "multi_thread")]
     async fn run_start_is_atomic_and_cleanup_is_by_run() {
+        let _env = crate::credential_env::EnvGuard::isolated();
         let short = &uuid::Uuid::new_v4().to_string()[..8];
         let dir = std::env::temp_dir().join(format!("fl-rs-{short}"));
         let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();

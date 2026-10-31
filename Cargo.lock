@@ -1391,6 +1391,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "jsonschema",
  "libc",
  "rand 0.8.8",
  "reqwest 0.12.28",

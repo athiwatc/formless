@@ -4,6 +4,9 @@
 //! credential-store feature enabled, `keyring` uses an in-process mock, the
 //! save "succeeds", and the daemon then sends requests with no key (401).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::config::{delete_api_key, load_api_key, save_api_key};
 use formless_core::Paths;
 
@@ -22,7 +25,8 @@ fn test_paths(tag: &str) -> Paths {
 
 #[test]
 fn api_key_saved_in_one_process_is_loadable_in_another() {
-    std::env::remove_var("FORMLESS_API_KEY");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.remove("FORMLESS_API_KEY");
     let paths = test_paths("keyxproc");
 
     if std::env::var("FORMLESS_KEY_XPROC_CHILD").is_ok() {
@@ -74,6 +78,7 @@ fn paths_for_child() -> Paths {
 #[cfg(unix)]
 #[test]
 fn secret_files_are_private_from_the_start_and_loose_ones_are_tightened() {
+    let _env = credential_env::EnvGuard::isolated();
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!(
         "fl-secret-{}",
