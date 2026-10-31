@@ -1,6 +1,9 @@
 //! v2 provider tranche: Responses API, prompt-based tool-calling
 //! fallback (with probe auto-detect), and model failover routing.
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -1715,4 +1718,208 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
     let text = body["messages"][0]["content"][1]["text"].as_str().unwrap();
     assert!(text.contains("big.png could not be attached"), "{text}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// #1122: opposite streaming styles can coexist, even within one response.
+#[tokio::test]
+async fn tool_call_name_and_argument_styles_are_independent_over_http() {
+    let _env = credential_env::EnvGuard::isolated();
+    let event = |fragment: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[fragment]}}]})
+        )
+    };
+    let script = [
+        event(json!({"index":0,"id":"a","function":{"name":"read_","arguments":"{\"x\":"}})),
+        event(json!({"index":0,"function":{"name":"file","arguments":"{\"x\":1"}})),
+        event(json!({"index":0,"function":{"name":"","arguments":"{\"x\":1}"}})),
+        event(json!({"index":1,"id":"b","function":{"name":"read_","arguments":"{"}})),
+        event(json!({"index":1,"function":{"name":"read_file","arguments":"\"x\":1"}})),
+        event(json!({"index":1,"function":{"name":"read_file_v2","arguments":"}"}})),
+        "data: [DONE]\n\n".into(),
+    ]
+    .concat();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let script = script.clone();
+            async move {
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(script))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        try_stream_full(base, false),
+    )
+    .await
+    .expect("mixed fragment response did not complete")
+    .unwrap();
+    assert_eq!(result.tool_calls.len(), 2);
+    for (call, (id, name)) in result
+        .tool_calls
+        .iter()
+        .zip([("a", "read_file"), ("b", "read_file_v2")])
+    {
+        assert_eq!(call.id, id);
+        assert_eq!(call.name, name);
+        assert_eq!(call.arguments, r#"{"x":1}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments).unwrap(),
+            json!({"x":1})
+        );
+    }
+    stop_stream_fixture(server).await;
+}
+
+/// #1121: the old attempt must be parsed before the transport fails, so
+/// the fixture handshakes through the last visible delta instead of sleeping.
+#[tokio::test]
+async fn dropped_attempt_cannot_leak_fragment_modes_finish_or_other_stream_state() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let _env = credential_env::EnvGuard::isolated();
+    let event = |value: Value| format!("data: {value}\n\n");
+    let call = |fragment: Value| event(json!({"choices":[{"delta":{"tool_calls":[fragment]}}]}));
+    for stop in ["refusal", "content_filter"] {
+        let first = [
+            call(json!({"index":0,"id":"old","function":{"name":"old_","arguments":"{\"old\":"}})),
+            call(json!({"index":0,"function":{"name":"tool","arguments":"1}"}})),
+            call(json!({"index":1,"id":"discarded","function":{"name":"extra","arguments":"{}"}})),
+            event(json!({"choices":[{"delta":{"reasoning_content":"lost reasoning"},"finish_reason":"length"}],"usage":{"prompt_tokens":99,"completion_tokens":99}})),
+            event(json!({"choices":[{"delta":{},"finish_reason":stop}]})),
+            event(json!({"choices":[{"delta":{"content":"discarded"}}]})),
+            // Leave a partial raw SSE line behind as well.
+            "data: {\"unfinished\":".into(),
+        ].concat();
+        let final_finish = (stop == "refusal").then_some("stop");
+        let second = [
+            call(json!({"index":0,"id":"fresh","function":{"name":"write","arguments":"{\"value\":"}})),
+            call(json!({"index":0,"function":{"name":"writer","arguments":"{\"value\":2}"}})),
+            event(json!({"choices":[{"delta":{"content":"kept","reasoning_content":"kept reasoning"},"finish_reason":final_finish}],"usage":{"prompt_tokens":7,"completion_tokens":3}})),
+            "data: [DONE]\n\n".into(),
+        ].concat();
+        let parsed = Arc::new(tokio::sync::Notify::new());
+        let observed = parsed.clone();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let requests = hits.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let request = requests.fetch_add(1, Ordering::SeqCst);
+                let first = first.clone();
+                let second = second.clone();
+                let observed = observed.clone();
+                async move {
+                    assert!(
+                        request < 2,
+                        "unexpected retry after the successful response"
+                    );
+                    let body = if request == 0 {
+                        let chunks = futures_util::stream::unfold(0, move |phase| {
+                            let first = first.clone();
+                            let observed = observed.clone();
+                            async move {
+                                match phase {
+                                    0 => Some((Ok::<_, std::io::Error>(first), 1)),
+                                    1 => {
+                                        observed.notified().await;
+                                        Some((
+                                            Err(std::io::Error::other("controlled stream reset")),
+                                            2,
+                                        ))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        });
+                        axum::body::Body::from_stream(chunks)
+                    } else {
+                        axum::body::Body::from(second)
+                    };
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = cfg(&base);
+        config.fallback_models.clear();
+        config.max_retries = 1;
+        config.max_backoff_secs = 1;
+        let provider = Provider::new(config, "mock-stream-key".into()).unwrap();
+        let mut visible = String::new();
+        let mut thinking = String::new();
+        let mut restarts = 0;
+        let cancel = CancellationToken::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.chat_stream(
+                &[json!({"role":"user","content":"go"})],
+                &[],
+                "good",
+                None,
+                &cancel,
+                |kind, text| match kind {
+                    DeltaKind::Content => {
+                        visible.push_str(text);
+                        if text == "discarded" {
+                            parsed.notify_one();
+                        }
+                    }
+                    DeltaKind::Reasoning => thinking.push_str(text),
+                    DeltaKind::Restart => {
+                        restarts += 1;
+                        visible.clear();
+                        thinking.clear();
+                    }
+                    DeltaKind::Bytes => {}
+                },
+            ),
+        )
+        .await
+        .expect("stream reset/retry handshake did not complete")
+        .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(restarts, 1);
+        assert_eq!(visible, "kept");
+        assert_eq!(thinking, "kept reasoning");
+        assert_eq!(result.content, visible);
+        assert_eq!(result.reasoning, thinking);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "fresh");
+        assert_eq!(result.tool_calls[0].name, "writer");
+        assert_eq!(result.tool_calls[0].arguments, r#"{"value":2}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.tool_calls[0].arguments).unwrap(),
+            json!({"value":2})
+        );
+        assert!(!result.truncated);
+        assert_eq!(result.stop_reason, None);
+        assert_eq!(result.model_used, "good");
+        let usage = result.usage.unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (7, 3));
+        drop(provider);
+        stop_stream_fixture(server).await;
+    }
+}
+
+async fn stop_stream_fixture(server: tokio::task::JoinHandle<()>) {
+    server.abort();
+    if let Err(error) = server.await {
+        assert!(error.is_cancelled(), "stream mock failed: {error}");
+    }
 }
