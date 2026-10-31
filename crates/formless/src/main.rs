@@ -1,6 +1,6 @@
 mod table;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use formless_core::daemon::{daemon_reachable, Daemon};
 use formless_core::provider::probe_blocking;
