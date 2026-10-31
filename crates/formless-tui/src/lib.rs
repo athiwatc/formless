@@ -17159,6 +17159,7 @@ mod tests {
     #[test]
     fn mcp_catalog_review_shows_pinned_code_and_masks_connection_secrets() {
         let mut app = test_app();
+        app.view = View::Settings;
         let entry = formless_core::mcp_catalog::find("postgres").unwrap();
         let mut form = settings::Form::mcp(entry, &Default::default());
         form.fields[1].input = input::InputLine::from("postgresql://u:SecretForMcpOnly@h/db");
