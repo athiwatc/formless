@@ -717,20 +717,35 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
             "database schema v{version} is newer than this build (v{SCHEMA_VERSION}); upgrade formless"
         ));
     }
-    if version > 0 && version < SCHEMA_VERSION {
-        if let Some(f) = file {
-            backup_before_migration(conn, f, version)?;
+    let backup = if version > 0 && version < SCHEMA_VERSION {
+        file.map(|f| backup_before_migration(conn, f, version))
+            .transpose()?
+    } else {
+        None
+    };
+    let result = (|| {
+        for (target, step) in MIGRATIONS {
+            if version < target {
+                let tx = conn.unchecked_transaction()?;
+                step(&tx).with_context(|| format!("migrate database to v{target}"))?;
+                tx.execute_batch(&format!("PRAGMA user_version={target};"))?;
+                tx.commit()?;
+            }
+        }
+        Ok(())
+    })();
+    if let (Some(file), Some(backup)) = (file, backup.as_ref()) {
+        if result.is_err() {
+            // Earlier steps may have committed. Remember this exact failed
+            // state so the next attempt reuses the original recovery point.
+            if let Err(error) = remember_migration_backup(conn, file, backup) {
+                tracing::warn!(%error, "could not remember migration backup; it remains preserved");
+            }
+        } else {
+            let _ = std::fs::remove_file(migration_receipt_path(file));
         }
     }
-    for (target, step) in MIGRATIONS {
-        if version < target {
-            let tx = conn.unchecked_transaction()?;
-            step(&tx).with_context(|| format!("migrate database to v{target}"))?;
-            tx.execute_batch(&format!("PRAGMA user_version={target};"))?;
-            tx.commit()?;
-        }
-    }
-    Ok(())
+    result
 }
 
 /// Whether `e` says the database file itself is damaged (corrupt, or not a
@@ -788,10 +803,122 @@ fn damaged(file: &Path, detail: &str) -> anyhow::Error {
     )
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MigrationBackupReceipt {
+    state_sha256: String,
+    backup_name: String,
+    backup_sha256: String,
+}
+
+fn migration_receipt_path(file: &Path) -> PathBuf {
+    file.with_extension("migration-backup.json")
+}
+
+fn file_sha256(file: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut input = std::fs::File::open(file)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// A checkpoint makes the source fingerprint independent of WAL teardown
+/// when this connection closes. Busy readers disable reuse rather than
+/// allowing a receipt to describe only part of the database.
+fn migration_state_sha256(conn: &Connection, file: &Path) -> Result<Option<String>> {
+    let before: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    if busy != 0 {
+        return Ok(None);
+    }
+    let hash = file_sha256(file)?;
+    let after: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+    // Another connection committing during the checkpoint/hash must not
+    // make a receipt bless a fingerprint of only the main file.
+    let wal = PathBuf::from(format!("{}-wal", file.display()));
+    if before != after || std::fs::metadata(wal).is_ok_and(|m| m.len() != 0) {
+        return Ok(None);
+    }
+    Ok(Some(hash))
+}
+
+fn remember_migration_backup(conn: &Connection, file: &Path, backup: &Path) -> Result<()> {
+    let Some(state_sha256) = migration_state_sha256(conn, file)? else {
+        return Ok(());
+    };
+    let receipt = MigrationBackupReceipt {
+        state_sha256,
+        backup_name: backup
+            .file_name()
+            .context("backup has no filename")?
+            .to_str()
+            .context("backup filename is not UTF-8")?
+            .to_string(),
+        backup_sha256: file_sha256(backup)?,
+    };
+    let destination = migration_receipt_path(file);
+    let temporary = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    use std::io::Write;
+    let written = (|| -> Result<()> {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        output.write_all(&serde_json::to_vec(&receipt)?)?;
+        output.sync_all()?;
+        std::fs::rename(&temporary, &destination)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
+fn reusable_migration_backup(conn: &Connection, file: &Path) -> Option<PathBuf> {
+    let receipt: MigrationBackupReceipt =
+        serde_json::from_slice(&std::fs::read(migration_receipt_path(file)).ok()?).ok()?;
+    let name = file.file_name()?.to_str()?;
+    // A receipt can only name one of this database's adjacent snapshots.
+    let filename = Path::new(&receipt.backup_name);
+    if filename.file_name()?.to_str()? != receipt.backup_name
+        || !receipt.backup_name.starts_with(&format!("{name}.v"))
+        || !receipt.backup_name.ends_with(".bak")
+    {
+        return None;
+    }
+    let backup = file.with_file_name(&receipt.backup_name);
+    if !std::fs::symlink_metadata(&backup)
+        .ok()?
+        .file_type()
+        .is_file()
+        || migration_state_sha256(conn, file).ok()?? != receipt.state_sha256
+        || file_sha256(&backup).ok()? != receipt.backup_sha256
+    {
+        return None;
+    }
+    Some(backup)
+}
+
 /// Consistent copy (WAL included) next to the database, named after the
 /// version it holds and the time it was taken.
 fn backup_before_migration(conn: &Connection, file: &Path, version: i64) -> Result<PathBuf> {
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    if let Some(backup) = reusable_migration_backup(conn, file) {
+        return Ok(backup);
+    }
+    let stamp = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
+        uuid::Uuid::new_v4()
+    );
     let name = format!(
         "{}.v{version}-{stamp}.bak",
         file.file_name()
@@ -801,6 +928,11 @@ fn backup_before_migration(conn: &Connection, file: &Path, version: i64) -> Resu
     let dest = file.with_file_name(name);
     conn.execute("VACUUM INTO ?1", params![dest.to_string_lossy()])
         .with_context(|| format!("back up database to {}", dest.display()))?;
+    // Record the initial state too, so an interrupted attempt before its
+    // first committed step can reuse the snapshot on restart.
+    if let Err(error) = remember_migration_backup(conn, file, &dest) {
+        tracing::warn!(%error, "could not remember migration backup; it remains preserved");
+    }
     Ok(dest)
 }
 
@@ -2353,9 +2485,13 @@ impl Store {
     }
 
     /// A consistent copy of the whole database (WAL included) at `dest`.
+    /// Existing snapshots are never removed or replaced.
     pub fn backup_into(&self, dest: &Path) -> Result<()> {
         if dest.exists() {
-            std::fs::remove_file(dest)?;
+            return Err(anyhow!(
+                "backup destination already exists: {}",
+                dest.display()
+            ));
         }
         self.conn
             .execute("VACUUM INTO ?1", params![dest.to_string_lossy()])
@@ -5797,6 +5933,219 @@ pub fn fts_query(text: &str) -> Option<String> {
         .map(|w| format!("\"{w}\"*"))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+#[cfg(test)]
+mod migration_failure_tests {
+    use super::*;
+
+    fn failing_fixture() -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("fl-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("formless.db");
+        let store = Store::open(&file).unwrap();
+        store.create_session(Some("preserved".into())).unwrap();
+        drop(store);
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch("DROP TABLE run_usage; PRAGMA user_version=50;")
+            .unwrap();
+        drop(conn);
+        (base, file)
+    }
+
+    fn backups(base: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(base)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "bak"))
+            .collect()
+    }
+
+    fn fails_at_52(file: &Path) {
+        let error = Store::open(file).err().expect("step 52 must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("migrate database to v52"), "{message}");
+        assert!(!message.contains("output file already exists"), "{message}");
+        let conn = Connection::open(file).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            51
+        );
+        assert_eq!(
+            conn.query_row("SELECT name FROM sessions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+    }
+
+    #[test]
+    fn migration_failure_retries_reuse_the_original_recovery_point() {
+        let (base, file) = failing_fixture();
+        fails_at_52(&file);
+        let initial = backups(&base);
+        assert_eq!(initial.len(), 1);
+        let snapshot = std::fs::read(&initial[0]).unwrap();
+        let backup = Connection::open(&initial[0]).unwrap();
+        assert_eq!(
+            backup
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            50
+        );
+        drop(backup);
+        // Immediate retries previously collided with the second-resolution
+        // filename; a later retry previously made another full snapshot.
+        fails_at_52(&file);
+        fails_at_52(&file);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fails_at_52(&file);
+        assert_eq!(backups(&base), initial);
+        assert_eq!(std::fs::read(&initial[0]).unwrap(), snapshot);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn interrupted_attempt_reuses_its_verified_initial_snapshot() {
+        let (base, file) = failing_fixture();
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(PRAGMAS).unwrap();
+        let initial = backup_before_migration(&conn, &file, 50).unwrap();
+        // Simulate losing the process after backup, before the first step.
+        drop(conn);
+        fails_at_52(&file);
+        assert_eq!(backups(&base), [initial]);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn interrupted_after_a_committed_step_preserves_the_original_backup() {
+        let (base, file) = failing_fixture();
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(PRAGMAS).unwrap();
+        let initial = backup_before_migration(&conn, &file, 50).unwrap();
+        let (_, step) = MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == 51)
+            .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        step(&tx).unwrap();
+        tx.execute_batch("PRAGMA user_version=51;").unwrap();
+        tx.commit().unwrap();
+        // A crash before the receipt is updated means the changed state
+        // receives a fresh recovery point; the original is never replaced.
+        drop(conn);
+        fails_at_52(&file);
+        assert!(initial.exists());
+        assert_eq!(backups(&base).len(), 2);
+        fails_at_52(&file);
+        assert_eq!(
+            backups(&base).len(),
+            2,
+            "subsequent unchanged retry reuses the recovery point"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn changed_source_and_damaged_snapshot_disable_reuse() {
+        let (base, file) = failing_fixture();
+        fails_at_52(&file);
+        let first = backups(&base).pop().unwrap();
+        // A receipt is only a hint: changed backup bytes cannot authorize
+        // skipping a fresh safety copy.
+        std::fs::write(&first, "damaged").unwrap();
+        fails_at_52(&file);
+        assert_eq!(backups(&base).len(), 2);
+        assert_eq!(std::fs::read(&first).unwrap(), b"damaged");
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE external_change(value TEXT); INSERT INTO external_change VALUES('new');",
+        )
+        .unwrap();
+        drop(conn);
+        fails_at_52(&file);
+        assert_eq!(
+            backups(&base).len(),
+            3,
+            "changed database needs its own recovery point"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn busy_checkpoint_creates_a_fresh_backup_without_replacing_the_original() {
+        let (base, file) = failing_fixture();
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(PRAGMAS).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let initial = backup_before_migration(&conn, &file, 50).unwrap();
+        let original = std::fs::read(&initial).unwrap();
+        let reader = Connection::open(&file).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        conn.execute_batch("CREATE TABLE concurrent_change(value TEXT);")
+            .unwrap();
+        assert!(migration_state_sha256(&conn, &file).unwrap().is_none());
+        let fresh = backup_before_migration(&conn, &file, 50).unwrap();
+        assert_ne!(initial, fresh);
+        assert!(fresh.exists());
+        assert_eq!(std::fs::read(&initial).unwrap(), original);
+        drop(reader);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn receipt_write_failure_preserves_the_backup_and_original_migration_error() {
+        let (base, file) = failing_fixture();
+        std::fs::create_dir(migration_receipt_path(&file)).unwrap();
+        fails_at_52(&file);
+        assert_eq!(backups(&base).len(), 1);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_failure_in_a_read_only_directory_prevents_all_migration_steps() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, file) = failing_fixture();
+        // Keep already-created WAL/SHM handles available: only creating the
+        // adjacent backup should fail when the directory becomes read-only.
+        let conn = Connection::open(&file).unwrap();
+        conn.execute_batch(PRAGMAS).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
+        struct RestorePermissions(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        let permissions = std::fs::metadata(&base).unwrap().permissions();
+        let restore_permissions = RestorePermissions(base.clone(), permissions);
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let error = Store::open(&file).err().expect("backup creation must fail");
+        assert!(
+            format!("{error:#}").contains("back up database to"),
+            "{error:#}"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            50
+        );
+        assert_eq!(
+            conn.query_row("SELECT name FROM sessions", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+        assert!(backups(&base).is_empty());
+        drop(restore_permissions);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 #[cfg(test)]
