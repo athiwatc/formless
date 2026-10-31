@@ -41,25 +41,49 @@ const CLIENT_QUEUE: usize = 4096;
 /// reading.
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
 
-/// A failed request's reply, with a code clients can branch on when the
-/// error is one of the kinds they handle (#885).
+/// A request's machine-readable classification is chosen at its failure
+/// site and survives anyhow context wrappers; wording never chooses a code.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RequestFailure {
+    code: &'static str,
+    message: String,
+}
+
+impl RequestFailure {
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(codes::NOT_FOUND, message)
+    }
+
+    fn busy(message: impl Into<String>) -> Self {
+        Self::new(codes::BUSY, message)
+    }
+
+    fn budget(message: impl Into<String>) -> Self {
+        Self::new(codes::BUDGET, message)
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::new(codes::INVALID, message)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(codes::INTERNAL, message)
+    }
+
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// Unknown errors remain uncoded rather than guessing from their prose.
 fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
-    let msg = e.to_string();
-    let lower = msg.to_ascii_lowercase();
-    let code = if msg.starts_with("budget:") {
-        Some(codes::BUDGET)
-    } else if lower.contains("not found") || lower.starts_with("no session") {
-        Some(codes::NOT_FOUND)
-    } else if lower.contains("already running") || lower.contains("is busy") {
-        Some(codes::BUSY)
-    } else if lower.starts_with("internal error") || lower.contains("panicked") {
-        Some(codes::INTERNAL)
-    } else {
-        None
-    };
-    match code {
-        Some(c) => ServerMessage::err_code(id, c, msg),
-        None => ServerMessage::err(id, msg),
+    match e.downcast_ref::<RequestFailure>() {
+        Some(failure) => ServerMessage::err_code(id, failure.code, e.to_string()),
+        None => ServerMessage::err(id, e.to_string()),
     }
 }
 
@@ -129,7 +153,9 @@ async fn handle_safely(this: &Arc<Daemon>, req: Request) -> Result<Value> {
         Err(p) => {
             let why = panic_text(&p);
             tracing::error!("panic while handling {kind}: {why}");
-            Err(anyhow!("internal error while handling {kind}: {why}"))
+            Err(anyhow::Error::new(RequestFailure::internal(format!(
+                "internal error while handling {kind}: {why}"
+            ))))
         }
     }
 }
@@ -139,6 +165,48 @@ fn panic_text(p: &Box<dyn std::any::Any + Send>) -> String {
         .map(|s| s.to_string())
         .or_else(|| p.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "panic".into())
+}
+
+#[cfg(test)]
+mod request_failure_tests {
+    use super::*;
+
+    #[test]
+    fn codes_survive_context_and_do_not_depend_on_wording() {
+        for code in [
+            codes::NOT_FOUND,
+            codes::BUSY,
+            codes::BUDGET,
+            codes::INVALID,
+            codes::INTERNAL,
+        ] {
+            let e = anyhow::Error::new(RequestFailure::new(code, "arbitrarily reworded detail"))
+                .context("outer operation context")
+                .context("another context");
+            let reply = error_reply(17, &e);
+            assert_eq!(reply.error_code(), Some(code));
+            let ServerMessage::Response { id, error, .. } = reply else {
+                unreachable!()
+            };
+            assert_eq!(id, 17);
+            assert_eq!(error.as_deref(), Some("another context"));
+        }
+        for prose in [
+            "not found",
+            "no session",
+            "already running",
+            "is busy",
+            "budget: quota",
+            "internal error",
+            "a tool panicked",
+        ] {
+            assert_eq!(
+                error_reply(18, &anyhow!(prose)).error_code(),
+                None,
+                "{prose}"
+            );
+        }
+    }
 }
 
 struct EventFilter {
@@ -407,6 +475,8 @@ pub struct Daemon {
     pending_attention: StdMutex<Vec<Event>>,
     /// Ids for client connections.
     next_conn: AtomicU64,
+    #[cfg(test)]
+    panic_in_finish_tail: AtomicBool,
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
@@ -576,6 +646,8 @@ impl Daemon {
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             pending_attention: StdMutex::new(Vec::new()),
             next_conn: AtomicU64::new(1),
+            #[cfg(test)]
+            panic_in_finish_tail: AtomicBool::new(false),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
@@ -986,11 +1058,13 @@ impl Daemon {
             } => {
                 let name = name.trim().to_string();
                 if name.is_empty() {
-                    return Err(anyhow!("a template needs a name"));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "a template needs a name",
+                    )));
                 }
                 let s = self
                     .with_reader(|st| st.get_session(&id))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 let t = formless_protocol::TemplateInfo {
                     name,
                     model: s.model,
@@ -1007,7 +1081,9 @@ impl Daemon {
             )?),
             Request::DeleteSessionTemplate { name } => {
                 if !self.with_store(|st| st.delete_template(&name))? {
-                    return Err(anyhow!("no template '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no template '{name}'"
+                    ))));
                 }
                 Ok(json!({ "deleted": name }))
             }
@@ -1016,7 +1092,9 @@ impl Daemon {
                     .with_reader(|st| st.list_templates())?
                     .into_iter()
                     .find(|t| t.name.eq_ignore_ascii_case(template.trim()))
-                    .with_context(|| format!("no template '{}'", template.trim()))?;
+                    .with_context(|| {
+                        RequestFailure::not_found(format!("no template '{}'", template.trim()))
+                    })?;
                 let s = self.with_store(|st| {
                     let s = st.create_session(Some(name.unwrap_or_else(|| t.name.clone())))?;
                     if t.model.is_some() || t.reasoning_effort.is_some() {
@@ -1040,28 +1118,28 @@ impl Daemon {
             Request::SetSessionTags { id, tags } => {
                 let s = self
                     .with_store(|st| st.set_session_tags(&id, &tags))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
             Request::SetSessionArchived { id, archived } => {
                 let s = self
                     .with_store(|st| st.set_session_archived(&id, archived))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
             Request::SetSessionPinned { id, pinned } => {
                 let s = self
                     .with_store(|st| st.set_session_pinned(&id, pinned))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
             Request::RenameSession { id, name } => {
                 let s = self
                     .with_store(|st| st.rename_session(&id, &name))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
@@ -1104,7 +1182,7 @@ impl Daemon {
                     let s = st
                         .get_session(&id)?
                         .filter(|_| !st.session_deleted(&id).unwrap_or(false))
-                        .context("session not found")?;
+                        .context(RequestFailure::not_found("session not found"))?;
                     let m = st.list_messages(&id)?;
                     let q = (st.queued_items(&id)?, st.session_plan(&id)?);
                     let l = st.unfinished_last_run(&id)?;
@@ -1136,7 +1214,7 @@ impl Daemon {
             } => {
                 let s = self
                     .with_store(|st| st.fork_session(&id, name, up_to_seq))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
@@ -1151,15 +1229,15 @@ impl Daemon {
                 content,
             } => {
                 if self.runs.locked().contains_key(&session_id) {
-                    return Err(anyhow!(
-                        "session has an active run; interrupt it before editing"
-                    ));
+                    return Err(anyhow::Error::new(RequestFailure::busy(
+                        "session has an active run; interrupt it before editing",
+                    )));
                 }
                 // Editing and re-running says the last Run missed (§8.7).
                 let _ = self.with_store(|st| st.mark_last_run_followup(&session_id, "edited"));
                 let msg = self
                     .with_store(|st| st.edit_message(&session_id, &message_id, &content))?
-                    .context("user message not found")?;
+                    .context(RequestFailure::not_found("user message not found"))?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
                 });
@@ -1186,7 +1264,7 @@ impl Daemon {
                 };
                 let s = self
                     .with_store(|st| st.set_session_cwd(&id, cwd.as_deref()))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 // The agent learns it at the next step: a fresh prompt
                 // snapshot, and a note in the transcript.
                 let prompt = self.fresh_session_prompt(&id);
@@ -1229,7 +1307,7 @@ impl Daemon {
                 }
                 let s = self
                     .with_store(|st| st.set_session_model(&id, model, reasoning_effort))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 // Every client on the Session sees it; a Run going now keeps
                 // the model it started with (#726).
                 if self.runs.locked().contains_key(&id) {
@@ -1436,7 +1514,7 @@ impl Daemon {
                                 None,
                             )
                         })?
-                        .context("session not found")?;
+                        .context(RequestFailure::not_found("session not found"))?;
                     self.broadcast(Event::SessionUpdated {
                         session: fork.clone(),
                     });
@@ -1452,7 +1530,7 @@ impl Daemon {
                         .insert(session_id.clone(), m.clone());
                 }
                 self.with_store(|st| st.edit_message(&session_id, &user.id, &user.content))?
-                    .context("user message not found")?;
+                    .context(RequestFailure::not_found("user message not found"))?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
                 });
@@ -1469,13 +1547,17 @@ impl Daemon {
                 comment,
             } => {
                 if !matches!(rating.as_str(), "good" | "bad" | "") {
-                    return Err(anyhow!("rating must be \"good\", \"bad\" or \"\""));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "rating must be \"good\", \"bad\" or \"\"",
+                    )));
                 }
                 let rated = self
                     .with_store(|st| {
                         st.rate_run(&session_id, run_id.as_deref(), &rating, comment.as_deref())
                     })?
-                    .context("no finished Run to rate in this session")?;
+                    .context(RequestFailure::not_found(
+                        "no finished Run to rate in this session",
+                    ))?;
                 Ok(json!({"run_id": rated, "rating": rating}))
             }
             Request::SetStepLimit {
@@ -1483,7 +1565,7 @@ impl Daemon {
                 max_steps,
             } => {
                 self.with_store(|st| st.get_session(&session_id))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 let mut limits = self.step_limits.locked();
                 match max_steps.filter(|n| *n > 0) {
                     Some(n) => limits.insert(session_id.clone(), n),
@@ -1494,7 +1576,9 @@ impl Daemon {
             }
             Request::ResumeRun { session_id } => {
                 if self.runs.locked().contains_key(&session_id) {
-                    return Err(anyhow!("a run is already active in this session"));
+                    return Err(anyhow::Error::new(RequestFailure::busy(
+                        "a run is already active in this session",
+                    )));
                 }
                 let (run_id, status) = self
                     .with_store(|st| st.last_run(&session_id))?
@@ -1544,11 +1628,13 @@ impl Daemon {
             Request::DiffToolVersions { id, from, to } => {
                 let d = self
                     .with_reader(|st| st.tool_detail(&id))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let find = |v: i64| d.versions.iter().find(|x| x.version == v);
                 let (a, b) = (
-                    find(from).with_context(|| format!("no version {from}"))?,
-                    find(to).with_context(|| format!("no version {to}"))?,
+                    find(from)
+                        .with_context(|| RequestFailure::not_found(format!("no version {from}")))?,
+                    find(to)
+                        .with_context(|| RequestFailure::not_found(format!("no version {to}")))?,
                 );
                 Ok(json!({"diff": crate::diff::version_diff(a, b)}))
             }
@@ -1577,7 +1663,9 @@ impl Daemon {
             Request::RemoveSkill { name } => {
                 let dirs = self.with_store(|st| st.remove_skill(&name))?;
                 if dirs.is_empty() {
-                    return Err(anyhow!("no skill named '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no skill named '{name}'"
+                    ))));
                 }
                 let _ = std::fs::remove_dir_all(self.paths.data_dir.join("skills").join(&name));
                 let _ = self.with_store(|st| st.audit("user", "skill.remove", &name));
@@ -1586,7 +1674,9 @@ impl Daemon {
             }
             Request::SetSkillEnabled { name, enabled } => {
                 if !self.with_store(|st| st.set_skill_enabled(&name, enabled))? {
-                    return Err(anyhow!("no skill named '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no skill named '{name}'"
+                    ))));
                 }
                 let action = if enabled {
                     "skill.enable"
@@ -1600,7 +1690,9 @@ impl Daemon {
             Request::GetSkill { name } => {
                 let info = self
                     .with_reader(|st| st.get_skill(&name))?
-                    .with_context(|| format!("no skill named '{name}'"))?;
+                    .with_context(|| {
+                        RequestFailure::not_found(format!("no skill named '{name}'"))
+                    })?;
                 let dir = self.with_reader(|st| crate::skills::current_dir(st, &name))?;
                 let text = std::fs::read_to_string(dir.join("SKILL.md"))?;
                 let body = crate::skills::parse_skill_md(&text)?.body;
@@ -1963,7 +2055,7 @@ impl Daemon {
             Request::SetSessionInstructions { id, instructions } => {
                 let s = self
                     .with_store(|st| st.set_session_instructions(&id, instructions.as_deref()))?
-                    .context("session not found")?;
+                    .context(RequestFailure::not_found("session not found"))?;
                 // A fresh prompt snapshot: the agent follows them from its
                 // next step.
                 let prompt = self.fresh_session_prompt(&id);
@@ -2053,7 +2145,7 @@ impl Daemon {
             Request::GetArtifact { id, offset, length } => {
                 let (session, path, bytes) = self
                     .with_reader(|st| st.get_artifact(&id))?
-                    .with_context(|| format!("no artifact '{id}'"))?;
+                    .with_context(|| RequestFailure::not_found(format!("no artifact '{id}'")))?;
                 let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
                 let total = text.chars().count();
                 let offset = offset.unwrap_or(0);
@@ -2161,7 +2253,7 @@ impl Daemon {
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 {
-                    return Err(anyhow!("provider names use letters, digits, '-' and '_' (and 'default' is [provider])"));
+                    return Err(anyhow::Error::new(RequestFailure::invalid( "provider names use letters, digits, '-' and '_' (and 'default' is [provider])")));
                 }
                 // One config edit at a time: load, change and save together (#1101).
                 let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
@@ -2218,7 +2310,9 @@ impl Daemon {
                     ));
                 }
                 if cfg.providers.remove(&name).is_none() {
-                    return Err(anyhow!("no provider '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no provider '{name}'"
+                    ))));
                 }
                 cfg.save(&self.paths)?;
                 drop(edit);
@@ -2239,7 +2333,9 @@ impl Daemon {
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 {
-                    return Err(anyhow!("role names use letters, digits, '-' and '_'"));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "role names use letters, digits, '-' and '_'",
+                    )));
                 }
                 let role: crate::config::RoleCfg =
                     serde_json::from_value(role).context("invalid role")?;
@@ -2259,7 +2355,9 @@ impl Daemon {
                 let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = Config::load_file_only(&self.paths)?;
                 if cfg.roles.remove(&name).is_none() {
-                    return Err(anyhow!("no role '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no role '{name}'"
+                    ))));
                 }
                 cfg.save(&self.paths)?;
                 drop(edit);
@@ -2318,7 +2416,7 @@ impl Daemon {
             Request::RunJobNow { id } => {
                 let job = self
                     .with_store(|st| st.get_job(&id))?
-                    .with_context(|| format!("no job '{id}'"))?;
+                    .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
                 let status = self.fire_job(&job, "manual", 0).await;
                 let _ = self.with_store(|st| st.audit("user", "job.run_now", &id));
                 self.broadcast(Event::JobsChanged);
@@ -2336,7 +2434,7 @@ impl Daemon {
             } => {
                 check_overlap(overlap.as_deref())?;
                 self.with_store(|st| st.get_job(&id))?
-                    .with_context(|| format!("no job '{id}'"))?;
+                    .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
                 self.with_store(|st| {
                     st.set_job_options(&id, overlap.as_deref(), deliver.as_ref())
                 })?;
@@ -2348,7 +2446,9 @@ impl Daemon {
             }
             Request::SetJobEnabled { id, enabled } => {
                 if !self.with_store(|st| st.set_job_enabled(&id, enabled))? {
-                    return Err(anyhow!("no job '{id}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no job '{id}'"
+                    ))));
                 }
                 let action = if enabled { "job.enable" } else { "job.disable" };
                 let _ = self.with_store(|st| st.audit("user", action, &id));
@@ -2358,7 +2458,9 @@ impl Daemon {
             }
             Request::DeleteJob { id } => {
                 if !self.with_store(|st| st.delete_job(&id))? {
-                    return Err(anyhow!("no job '{id}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no job '{id}'"
+                    ))));
                 }
                 let _ = self.with_store(|st| st.audit("user", "job.delete", &id));
                 self.broadcast(Event::JobsChanged);
@@ -2445,7 +2547,7 @@ impl Daemon {
                         .with_store(|st| {
                             st.update_memory(&id, text.as_deref(), scope.as_deref(), enabled)
                         })?
-                        .with_context(|| format!("no memory '{id}'"))?,
+                        .with_context(|| RequestFailure::not_found(format!("no memory '{id}'")))?,
                     None => {
                         let text = text.context("text required")?;
                         let scope = scope.as_deref().unwrap_or("global");
@@ -2465,7 +2567,9 @@ impl Daemon {
             }
             Request::DeleteMemory { id } => {
                 if !self.with_store(|st| st.delete_memory(&id))? {
-                    return Err(anyhow!("no memory '{id}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no memory '{id}'"
+                    ))));
                 }
                 let _ = self.with_store(|st| st.audit("user", "memory.delete", &id));
                 self.broadcast(Event::MemoryUpdated);
@@ -2564,7 +2668,9 @@ impl Daemon {
                     let prompt = prompts
                         .iter()
                         .find(|p| p["name"] == name.as_str())
-                        .with_context(|| format!("{server} has no prompt '{name}'"))?;
+                        .with_context(|| {
+                            RequestFailure::not_found(format!("{server} has no prompt '{name}'"))
+                        })?;
                     let declared: Vec<String> = prompt["arguments"]
                         .as_array()
                         .into_iter()
@@ -2611,7 +2717,9 @@ impl Daemon {
             Request::McpServerLog { name, lines } => {
                 let cfg = self.config()?;
                 if !cfg.mcp.servers.contains_key(&name) {
-                    return Err(anyhow!("no MCP server '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no MCP server '{name}'"
+                    ))));
                 }
                 let file = self.paths.data_dir.join("mcp").join(format!("{name}.log"));
                 let text = std::fs::read(&file)
@@ -2624,11 +2732,9 @@ impl Daemon {
             }
             Request::ListMcpTools { name } => {
                 let cfg = self.config()?;
-                let server = cfg
-                    .mcp
-                    .servers
-                    .get(&name)
-                    .with_context(|| format!("no MCP server '{name}'"))?;
+                let server = cfg.mcp.servers.get(&name).with_context(|| {
+                    RequestFailure::not_found(format!("no MCP server '{name}'"))
+                })?;
                 if server.disabled {
                     return Err(anyhow!("MCP server '{name}' is disabled"));
                 }
@@ -2662,11 +2768,9 @@ impl Daemon {
                 // One config edit at a time: load, change and save together (#1101).
                 let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cfg = self.config()?;
-                let server = cfg
-                    .mcp
-                    .servers
-                    .get_mut(&name)
-                    .with_context(|| format!("no MCP server '{name}'"))?;
+                let server = cfg.mcp.servers.get_mut(&name).with_context(|| {
+                    RequestFailure::not_found(format!("no MCP server '{name}'"))
+                })?;
                 server.disabled_tools.retain(|t| t != &tool);
                 if !enabled {
                     server.disabled_tools.push(tool.clone());
@@ -2697,7 +2801,9 @@ impl Daemon {
             }
             Request::AddMcpFromCatalog { id, name, params } => {
                 let entry = crate::mcp_catalog::find(&id).with_context(|| {
-                    format!("no catalog server '{id}' (see `formless mcp catalog`)")
+                    RequestFailure::not_found(format!(
+                        "no catalog server '{id}' (see `formless mcp catalog`)"
+                    ))
                 })?;
                 let server = crate::mcp_catalog::server_config(entry, &params)?;
                 let name = name
@@ -2734,7 +2840,9 @@ impl Daemon {
             )?),
             Request::GetSubagent { id } => {
                 let (info, messages) = self.with_reader(|st| {
-                    let info = st.get_subagent(&id)?.context("sub-agent not found")?;
+                    let info = st
+                        .get_subagent(&id)?
+                        .context(RequestFailure::not_found("sub-agent not found"))?;
                     Ok((info, st.subagent_messages(&id)?))
                 })?;
                 Ok(json!({"subagent": info, "messages": messages}))
@@ -2775,7 +2883,7 @@ impl Daemon {
             Request::AbandonInvocation { handle } => {
                 let entry = self
                     .pending_get(&handle)
-                    .context("no invocation with that handle")?;
+                    .context(RequestFailure::not_found("no invocation with that handle"))?;
                 // The agent stops waiting for it; it may still finish.
                 entry.abandoned.store(true, Ordering::SeqCst);
                 let _ =
@@ -2786,7 +2894,9 @@ impl Daemon {
                 let entry = self
                     .pending_get(&handle)
                     .filter(|e| e.result.locked().is_none())
-                    .context("no running invocation with that handle")?;
+                    .context(RequestFailure::not_found(
+                        "no running invocation with that handle",
+                    ))?;
                 entry.cancel.cancel();
                 Ok(json!({"cancelled": true}))
             }
@@ -2794,7 +2904,7 @@ impl Daemon {
                 let runs = self.runs.locked();
                 let ctl = runs
                     .get(&session_id)
-                    .context("no active run in this session")?;
+                    .context(RequestFailure::not_found("no active run in this session"))?;
                 ctl.retry.notify_one();
                 Ok(json!({"retrying": true}))
             }
@@ -2837,12 +2947,14 @@ impl Daemon {
                         used_by,
                     }))
                 })?;
-                Ok(serde_json::to_value(detail.context("module not found")?)?)
+                Ok(serde_json::to_value(
+                    detail.context(RequestFailure::not_found("module not found"))?,
+                )?)
             }
             Request::UpdateModuleCode { id, code } => {
                 let m = self
                     .with_reader(|st| st.find_module(&id))?
-                    .context("module not found")?;
+                    .context(RequestFailure::not_found("module not found"))?;
                 let args = json!({"name": m.name, "description": m.description, "implementation_js": code});
                 let cfg = self.config()?;
                 let out = self
@@ -2852,13 +2964,20 @@ impl Daemon {
             }
             Request::RollbackModule { id, version } => {
                 let (m, code) = self.with_reader(|st| {
-                    let m = st.find_module(&id)?.context("module not found")?;
+                    let m = st
+                        .find_module(&id)?
+                        .context(RequestFailure::not_found("module not found"))?;
                     let code = st
                         .module_versions(&m.id)?
                         .into_iter()
                         .find(|v| v.0 == version)
                         .map(|v| v.1)
-                        .with_context(|| format!("{} has no version {version}", m.name))?;
+                        .with_context(|| {
+                            RequestFailure::not_found(format!(
+                                "{} has no version {version}",
+                                m.name
+                            ))
+                        })?;
                     Ok((m, code))
                 })?;
                 let args = json!({"name": m.name, "description": m.description, "implementation_js": code});
@@ -2871,7 +2990,7 @@ impl Daemon {
             Request::DeleteModule { id } => {
                 let m = self
                     .with_reader(|st| st.find_module(&id))?
-                    .context("module not found")?;
+                    .context(RequestFailure::not_found("module not found"))?;
                 self.with_store(|st| st.delete_module(&m.id))?;
                 let _ = self.with_store(|st| st.audit("user", "module.delete", &m.name));
                 self.broadcast(Event::ModuleDeleted { id: m.id.clone() });
@@ -2884,13 +3003,15 @@ impl Daemon {
             } => {
                 let tool = self
                     .with_reader(|st| st.tool_detail(&id))?
-                    .context("tool not found")?
+                    .context(RequestFailure::not_found("tool not found"))?
                     .tool;
                 if tool.retired {
                     return Err(anyhow!("'{}' is retired", tool.name));
                 }
                 if !input.is_object() {
-                    return Err(anyhow!("the input must be a JSON object"));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "the input must be a JSON object",
+                    )));
                 }
                 let _ = self.with_store(|st| st.audit("user", "tool.run", &tool.name));
                 let (result, ok) = self
@@ -2925,15 +3046,19 @@ impl Daemon {
             } => {
                 let (info, ver) = self
                     .with_store(|st| st.get_tool_current(&id))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 for s in [&input_schema, &output_schema].into_iter().flatten() {
                     if !s.is_object() {
-                        return Err(anyhow!("a schema must be a JSON object"));
+                        return Err(anyhow::Error::new(RequestFailure::invalid(
+                            "a schema must be a JSON object",
+                        )));
                     }
                 }
                 let description = description.map(|d| d.trim().to_string());
                 if description.as_deref() == Some("") {
-                    return Err(anyhow!("the description can't be empty"));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "the description can't be empty",
+                    )));
                 }
                 let cfg = self.config()?;
                 let current = |s: &str| {
@@ -2957,7 +3082,7 @@ impl Daemon {
                 // through the same syntax + smoke gate as agent edits.
                 let (info, ver) = self
                     .with_store(|st| st.get_tool_current(&id))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let cfg = self.config()?;
                 let args = edit_args(&info, &ver, &code);
                 let (info, version, _) = self.create_tool_as(&args, &cfg, "user", None).await?;
@@ -2966,7 +3091,7 @@ impl Daemon {
             Request::PreviewToolCode { id, code } => {
                 let (info, ver) = self
                     .with_reader(|st| st.get_tool_current(&id))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let cfg = self.config()?;
                 let mut draft = ver.clone();
                 draft.code = code.clone();
@@ -2995,7 +3120,7 @@ impl Daemon {
             Request::GetTool { id } => {
                 let mut d = self
                     .with_reader(|st| st.tool_detail(&id))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 // What listing it costs per request (the price of pinning).
                 if let Some(v) = d
                     .versions
@@ -3022,7 +3147,7 @@ impl Daemon {
             Request::RetireTool { id } => {
                 let t = self
                     .with_store(|st| st.set_tool_retired(&id, true))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let _ = self.with_store(|st| st.audit("user", "tool.retire", &t.name));
                 self.note_registry_change(&t, "retired", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
@@ -3031,7 +3156,7 @@ impl Daemon {
             Request::SetToolDisabled { id, disabled } => {
                 let t = self
                     .with_store(|st| st.set_tool_disabled(&id, disabled))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let action = if disabled {
                     "tool.disable"
                 } else {
@@ -3044,7 +3169,7 @@ impl Daemon {
             Request::SetToolPinned { id, pinned } => {
                 let t = self
                     .with_store(|st| st.set_tool_pinned(&id, pinned))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let action = if pinned { "tool.pin" } else { "tool.unpin" };
                 let _ = self.with_store(|st| st.audit("user", action, &t.name));
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
@@ -3054,7 +3179,7 @@ impl Daemon {
                 let tags = toolreg::normalize_tags(tags.iter().map(String::as_str));
                 let t = self
                     .with_store(|st| st.set_tool_tags(&id, &tags))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let _ = self.with_store(|st| {
                     st.audit(
                         "user",
@@ -3068,7 +3193,7 @@ impl Daemon {
             Request::RestoreTool { id } => {
                 let t = self
                     .with_store(|st| st.set_tool_retired(&id, false))?
-                    .context("tool not found")?;
+                    .context(RequestFailure::not_found("tool not found"))?;
                 let _ = self.with_store(|st| st.audit("user", "tool.restore", &t.name));
                 self.note_registry_change(&t, "restored", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
@@ -3095,7 +3220,7 @@ impl Daemon {
                     "retired" => self.with_store(|st| st.set_tool_retired(id, false))?,
                     _ => self.with_store(|st| st.rollback_tool(id, change.from_version))?,
                 }
-                .context("that Tool no longer exists")?;
+                .context(RequestFailure::not_found("that Tool no longer exists"))?;
                 self.with_store(|st| st.kv_set(REGISTRY_NS, LAST_CHANGE, &Value::Null))?;
                 let undone = change.summary();
                 let _ = self.with_store(|st| st.audit("user", "tool.undo", &undone));
@@ -3108,7 +3233,7 @@ impl Daemon {
                     .map_or(0, |(i, _)| i.current_version);
                 let t = self
                     .with_store(|st| st.rollback_tool(&id, version))?
-                    .context("tool/version not found")?;
+                    .context(RequestFailure::not_found("tool/version not found"))?;
                 let _ = self.with_store(|st| {
                     st.audit("user", "tool.rollback", &format!("{} v{version}", t.name))
                 });
@@ -3134,7 +3259,9 @@ impl Daemon {
                 }
             }
             Request::ExportTool { id } => {
-                let bundle = self.export_tool_bundle(&id)?.context("tool not found")?;
+                let bundle = self
+                    .export_tool_bundle(&id)?
+                    .context(RequestFailure::not_found("tool not found"))?;
                 Ok(bundle)
             }
             Request::ExportTools => {
@@ -3165,7 +3292,9 @@ impl Daemon {
                 let format = format.as_deref().unwrap_or("json").to_ascii_lowercase();
                 if format != "json" {
                     let (s, msgs) = self.with_reader(|st| {
-                        let s = st.get_session(&id)?.context("session not found")?;
+                        let s = st
+                            .get_session(&id)?
+                            .context(RequestFailure::not_found("session not found"))?;
                         Ok((s, st.list_messages(&id)?))
                     })?;
                     let content = match format.as_str() {
@@ -3238,14 +3367,18 @@ impl Daemon {
                 arguments,
             } => {
                 if !matches!(action.as_str(), "continue" | "skip" | "edit" | "all") {
-                    return Err(anyhow!("action must be continue, skip, edit or all"));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "action must be continue, skip, edit or all",
+                    )));
                 }
                 if action == "edit" {
                     let a = arguments.as_deref().unwrap_or_default();
                     let v: Value = serde_json::from_str(a)
                         .context("edited arguments must be a JSON object")?;
                     if !v.is_object() {
-                        return Err(anyhow!("edited arguments must be a JSON object"));
+                        return Err(anyhow::Error::new(RequestFailure::invalid(
+                            "edited arguments must be a JSON object",
+                        )));
                     }
                 }
                 let tx = self
@@ -3253,7 +3386,7 @@ impl Daemon {
                     .lock()
                     .unwrap()
                     .remove(&step_id)
-                    .context("that step is no longer waiting")?;
+                    .context(RequestFailure::not_found("that step is no longer waiting"))?;
                 let _ = tx.send((action.clone(), arguments));
                 Ok(json!({"step_id": step_id, "action": action}))
             }
@@ -3311,7 +3444,8 @@ impl Daemon {
             Request::ProposalDiff { id } => {
                 let (p, applied, memories) = self.with_reader(|st| {
                     Ok((
-                        st.get_proposal(&id)?.context("proposal not found")?,
+                        st.get_proposal(&id)?
+                            .context(RequestFailure::not_found("proposal not found"))?,
                         st.applied_proposals()?,
                         st.list_memories()?,
                     ))
@@ -3360,7 +3494,9 @@ impl Daemon {
                 } else {
                     self.with_store(|st| st.set_proposal_status(&id, status))?
                 }
-                .context("proposal not found or not in an actionable state")?;
+                .context(RequestFailure::not_found(
+                    "proposal not found or not in an actionable state",
+                ))?;
                 let _ = self
                     .with_store(|st| st.audit("user", &format!("proposal.{status}"), &p.content));
                 if p.kind == "memory" {
@@ -3374,7 +3510,9 @@ impl Daemon {
             Request::RollbackProposal { id } => {
                 let p = self
                     .with_store(|st| st.set_proposal_status(&id, "rolled_back"))?
-                    .context("proposal not found or not applied")?;
+                    .context(RequestFailure::not_found(
+                        "proposal not found or not applied",
+                    ))?;
                 let _ = self.with_store(|st| st.audit("user", "proposal.rolled_back", &p.content));
                 if p.kind == "memory" {
                     self.broadcast(Event::MemoryUpdated);
@@ -3622,7 +3760,7 @@ impl Daemon {
         mode: SendMode,
     ) -> Result<serde_json::Value> {
         self.with_store(|st| st.get_session(&session_id))?
-            .context("session not found")?;
+            .context(RequestFailure::not_found("session not found"))?;
         let busy = self.runs.locked().contains_key(&session_id);
         match (busy, mode) {
             (true, SendMode::Queue) => {
@@ -3672,7 +3810,10 @@ impl Daemon {
                     Ok(()) => Ok(json!({"started": true})),
                     // Another client's Run started first: the message (already
                     // in the transcript) joins it at its next step (#726).
-                    Err(e) if e.to_string().starts_with("already running") => {
+                    Err(e)
+                        if e.downcast_ref::<RequestFailure>()
+                            .is_some_and(|f| f.code == codes::BUSY) =>
+                    {
                         if let Some(ctl) = self.runs.locked().get(&session_id) {
                             let _ = ctl.steer_tx.send(());
                         }
@@ -3689,7 +3830,10 @@ impl Daemon {
     /// error naming the Run that won, and that Run's controls stay.
     fn start_run(self: &Arc<Self>, session_id: String) -> Result<()> {
         if let Some(ctl) = self.runs.locked().get(&session_id) {
-            return Err(anyhow!("already running: run {}", ctl.run_id));
+            return Err(anyhow::Error::new(RequestFailure::busy(format!(
+                "already running: run {}",
+                ctl.run_id
+            ))));
         }
         self.close_dangling_tool_calls(&session_id)?;
         let run_id = self.with_store(|st| st.create_run(&session_id))?;
@@ -3706,7 +3850,9 @@ impl Daemon {
                     st.set_run_status(&run_id, "interrupted")?;
                     st.set_run_error(&run_id, "another Run of this Session started first")
                 });
-                return Err(anyhow!("already running: run {winner}"));
+                return Err(anyhow::Error::new(RequestFailure::busy(format!(
+                    "already running: run {winner}"
+                ))));
             }
             runs.insert(
                 session_id.clone(),
@@ -3830,6 +3976,37 @@ impl Daemon {
     /// free the Session, report what changed, resolve comparisons and jobs,
     /// run `run_end` hooks, and start the next queued message.
     async fn finish_run(self: &Arc<Self>, session_id: String, run_id: String, final_status: &str) {
+        use futures_util::FutureExt;
+        // run_panicked reaches this outside run_loop's unwind boundary too.
+        // Whatever a tail step does, the queue drain remains reachable.
+        if let Err(p) =
+            std::panic::AssertUnwindSafe(self.finish_run_tail(&session_id, &run_id, final_status))
+                .catch_unwind()
+                .await
+        {
+            self.finish_tail_failed(&session_id, "Run finish", &p);
+        }
+        self.start_next_queued_message(session_id);
+    }
+
+    fn finish_tail_failed(&self, session_id: &str, step: &str, p: &Box<dyn std::any::Any + Send>) {
+        let why = panic_text(p);
+        tracing::error!("{step} for session {session_id} panicked: {why}");
+        self.broadcast(Event::Note {
+            session_id: Some(session_id.to_string()),
+            text: format!("Internal error in {step}: {why}; continuing Run cleanup"),
+        });
+    }
+
+    fn finish_tail_step(&self, session_id: &str, step: &str, f: impl FnOnce()) {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            self.finish_tail_failed(session_id, step, &p);
+        }
+    }
+
+    async fn finish_run_tail(self: &Arc<Self>, session_id: &str, run_id: &str, final_status: &str) {
+        let session_id = session_id.to_string();
+        let run_id = run_id.to_string();
         if final_status != "paused" {
             self.record_run_status(&session_id, &run_id, final_status);
         }
@@ -3855,6 +4032,14 @@ impl Daemon {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&run_id);
+        // Resolve these independently before optional effects, so a naming or
+        // hook panic cannot leave comparisons/jobs waiting on a finished Run.
+        self.finish_tail_step(&session_id, "comparison completion", || {
+            self.comparison_run_ended(&session_id);
+        });
+        self.finish_tail_step(&session_id, "job completion", || {
+            self.job_run_ended(&session_id, &run_id, final_status);
+        });
         let files = self.run_file_infos(&run_id, false).unwrap_or_default();
         if let Some(recap) = self.run_recap(&session_id, &run_id, changes.as_deref(), &files) {
             self.broadcast(Event::RunRecap {
@@ -3883,8 +4068,6 @@ impl Daemon {
             status: final_status.to_string(),
         });
         self.maybe_name_session(&session_id);
-        self.comparison_run_ended(&session_id);
-        self.job_run_ended(&session_id, &run_id, final_status);
         self.maybe_auto_skill(&session_id, &run_id, final_status);
         self.record_primary_task(&session_id, &run_id, final_status);
         // run_end hooks (SPEC §9.8): automation, results only logged.
@@ -3907,6 +4090,13 @@ impl Daemon {
                     }
                 }
             }
+        }
+    }
+
+    fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
+        // A stale finisher must not take a newer Run's queued message.
+        if self.runs.locked().contains_key(&session_id) {
+            return;
         }
         // Queued messages start fresh Runs, in order (SPEC §5.3).
         let next = self
@@ -3931,6 +4121,10 @@ impl Daemon {
     /// timeout, and nothing awaits it, so Runs and requests never wait on
     /// the model. The result lands as a SessionUpdated event.
     fn maybe_name_session(self: &Arc<Self>, session_id: &str) {
+        #[cfg(test)]
+        if self.panic_in_finish_tail.swap(false, Ordering::SeqCst) {
+            panic!("injected session naming panic");
+        }
         let Ok(cfg) = self.config() else {
             return;
         };
@@ -4204,7 +4398,7 @@ impl Daemon {
             ));
         }
         self.with_store(|st| st.get_session(session_id))?
-            .context("session not found")?;
+            .context(RequestFailure::not_found("session not found"))?;
         // Tests inject a panic here (debug builds only) to prove a Run that
         // panics frees its Session (#607).
         #[cfg(debug_assertions)]
@@ -4880,7 +5074,7 @@ impl Daemon {
         }
         let session = self
             .with_reader(|st| st.get_session(session_id))?
-            .context("session not found")?;
+            .context(RequestFailure::not_found("session not found"))?;
         // Re-ask the last message (forked before it), or ask `prompt`.
         let (up_to, text) = match prompt
             .map(|p| p.trim().to_string())
@@ -4908,7 +5102,7 @@ impl Daemon {
                         up_to,
                     )
                 })?
-                .context("session not found")?;
+                .context(RequestFailure::not_found("session not found"))?;
             if let Some(info) =
                 self.with_store(|st| st.set_session_model(&fork.id, Some(model.clone()), None))?
             {
@@ -5879,7 +6073,7 @@ impl Daemon {
     ) -> Result<Value> {
         let (info, ver) = self
             .with_reader(|st| st.get_tool_current(id))?
-            .context("tool not found")?;
+            .context(RequestFailure::not_found("tool not found"))?;
         if info.retired || info.disabled {
             bail!(
                 "'{}' is {}",
@@ -6333,7 +6527,7 @@ impl Daemon {
     /// A Session as a `formless.session/1` bundle.
     fn session_bundle(&self, id: &str) -> Result<Value> {
         self.with_reader(|st| {
-            let s = st.get_session(id)?.context("session not found")?;
+            let s = st.get_session(id)?.context(RequestFailure::not_found( "session not found"))?;
             let msgs = st.list_messages(id)?;
             let cps = st.list_checkpoints(id)?;
             Ok(json!({
@@ -6981,7 +7175,7 @@ impl Daemon {
                 ))
             }
             Bounded::Cancelled => return Err(anyhow!("interrupted")),
-            Bounded::Panicked(e) => return Err(anyhow!("module smoke test panicked: {e}")),
+            Bounded::Panicked(e) => return Err(anyhow::Error::new(RequestFailure::internal( format!("module smoke test panicked: {e}")))),
         }
         let (info, version) =
             self.with_store(|st| st.create_module_version(name, &description, &code, author))?;
@@ -7296,7 +7490,7 @@ impl Daemon {
                 limit.as_secs()
             )),
             Bounded::Cancelled => return Err(anyhow!("interrupted")),
-            Bounded::Panicked(e) => return Err(anyhow!("smoke test panicked: {e}")),
+            Bounded::Panicked(e) => return Err(anyhow::Error::new(RequestFailure::internal( format!("smoke test panicked: {e}")))),
         };
         Ok(note)
     }
@@ -7526,7 +7720,7 @@ impl Daemon {
     fn enabled_skill(&self, name: &str) -> Result<SkillInfo> {
         self.with_store(|st| st.get_skill(name))?
             .filter(|s| s.enabled && !s.retired)
-            .with_context(|| format!("no enabled skill named '{name}'"))
+            .with_context(|| RequestFailure::not_found(format!("no enabled skill named '{name}'")))
     }
 
     /// Delete a Session for good, with its stored outputs (SPEC §15).
@@ -7760,7 +7954,9 @@ impl Daemon {
             }
             "skills.remove" => {
                 if self.with_store(|st| st.remove_skill(&name))?.is_empty() {
-                    return Err(anyhow!("no skill named '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no skill named '{name}'"
+                    ))));
                 }
                 let _ = std::fs::remove_dir_all(self.paths.data_dir.join("skills").join(&name));
                 self.broadcast(Event::SkillsChanged);
@@ -7769,7 +7965,9 @@ impl Daemon {
             "skills.enable" => {
                 let enabled = args["enabled"].as_bool().context("enabled required")?;
                 if !self.with_store(|st| st.set_skill_enabled(&name, enabled))? {
-                    return Err(anyhow!("no skill named '{name}'"));
+                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                        "no skill named '{name}'"
+                    ))));
                 }
                 self.broadcast(Event::SkillsChanged);
                 Ok(json!({"name": name, "enabled": enabled}))
@@ -7803,9 +8001,9 @@ impl Daemon {
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 {
-                    return Err(anyhow!(
-                        "provider names use letters, digits, '-' and '_' (and not 'default')"
-                    ));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "provider names use letters, digits, '-' and '_' (and not 'default')",
+                    )));
                 }
                 // A URL, or a preset id (SPEC §4.2) in `preset` or `base_url`.
                 let base_url = args["preset"]
@@ -7857,7 +8055,7 @@ impl Daemon {
                     cfg.providers
                         .remove(&name)
                         .map(|_| ())
-                        .with_context(|| format!("no provider '{name}'"))
+                        .with_context(|| RequestFailure::not_found(format!("no provider '{name}'")))
                 })?;
                 // The key stays, so undo restores the provider whole.
                 Ok(json!({"removed": name}))
@@ -7868,7 +8066,9 @@ impl Daemon {
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 {
-                    return Err(anyhow!("role names use letters, digits, '-' and '_'"));
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "role names use letters, digits, '-' and '_'",
+                    )));
                 }
                 let role: crate::config::RoleCfg =
                     serde_json::from_value(args["role"].clone()).context("invalid role")?;
@@ -7884,7 +8084,7 @@ impl Daemon {
                     cfg.roles
                         .remove(&name)
                         .map(|_| ())
-                        .with_context(|| format!("no role '{name}'"))
+                        .with_context(|| RequestFailure::not_found(format!("no role '{name}'")))
                 })?;
                 Ok(json!({"deleted": name}))
             }
@@ -8014,9 +8214,9 @@ impl Daemon {
                 format!(" (limits.{name})")
             };
             if max > 0.0 && used >= max {
-                return Err(anyhow!(
+                return Err(anyhow::Error::new(RequestFailure::budget(format!(
                     "budget: {what}{source}. The Run is paused: /resume continues, /abandon stops."
-                ));
+                ))));
             }
             let key = if name == "daily_usd" {
                 format!("day:{today}")
@@ -8154,7 +8354,7 @@ impl Daemon {
         mime: Option<String>,
     ) -> Result<Value> {
         self.with_store(|st| st.get_session(session_id))?
-            .context("session not found")?;
+            .context(RequestFailure::not_found("session not found"))?;
         if bytes as usize > MAX_ATTACHMENT_BYTES {
             bail!(
                 "attachment is larger than {} MB",
@@ -8197,7 +8397,9 @@ impl Daemon {
         let mut uploads = self.uploads.locked();
         let u = uploads
             .get_mut(upload_id)
-            .context("no such upload (finished, aborted or expired)")?;
+            .context(RequestFailure::not_found(
+                "no such upload (finished, aborted or expired)",
+            ))?;
         if index != u.next {
             bail!("piece {index} arrived when piece {} was expected", u.next);
         }
@@ -8222,7 +8424,9 @@ impl Daemon {
             .uploads
             .locked()
             .remove(upload_id)
-            .context("no such upload (finished, aborted or expired)")?;
+            .context(RequestFailure::not_found(
+                "no such upload (finished, aborted or expired)",
+            ))?;
         if u.received != u.expected {
             let _ = std::fs::remove_file(&u.part);
             bail!(
@@ -8270,7 +8474,7 @@ impl Daemon {
     ) -> Result<Value> {
         use base64::Engine;
         self.with_store(|st| st.get_session(session_id))?
-            .context("session not found")?;
+            .context(RequestFailure::not_found("session not found"))?;
         // Judged on the encoded size first, before decoding a copy (#888).
         if data_b64.trim().len() / 4 * 3 > MAX_ATTACHMENT_BYTES + 3 {
             return Err(anyhow!(
@@ -8436,7 +8640,7 @@ impl Daemon {
             return Ok(r);
         }
         self.with_store(|st| st.get_session(session_id))?
-            .context("session not found")?;
+            .context(RequestFailure::not_found("session not found"))?;
         let att = json!({"reference": true, "name": attachment_name(&name), "path": full,
                          "dir": meta.is_dir(), "bytes": if meta.is_dir() { 0 } else { meta.len() }});
         self.with_store(|st| st.add_pending_attachment(session_id, &att))?;
@@ -9187,7 +9391,7 @@ impl Daemon {
         let id = args["id"].as_str().context("id required")?;
         let m = self
             .with_store(|st| st.get_memory(id))?
-            .with_context(|| format!("no memory '{id}'"))?;
+            .with_context(|| RequestFailure::not_found(format!("no memory '{id}'")))?;
         self.with_store(|st| st.delete_memory(id))?;
         let _ = self.with_store(|st| st.audit("agent", "memory.forget", id));
         self.broadcast(Event::MemoryUpdated);
@@ -9379,7 +9583,9 @@ impl Daemon {
         let (_, path, _) = self
             .with_store(|st| st.get_artifact(id))?
             .filter(|(owner, ..)| owner.as_deref() == Some(session_id))
-            .with_context(|| format!("no artifact '{id}' in this session"))?;
+            .with_context(|| {
+                RequestFailure::not_found(format!("no artifact '{id}' in this session"))
+            })?;
         let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
         if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
             let needle = needle.to_lowercase();
@@ -9407,7 +9613,7 @@ impl Daemon {
         let name = args["name"].as_str().context("name required")?;
         let (info, _) = self
             .with_store(|st| st.get_module_by_name(name))?
-            .with_context(|| format!("no module named '{name}'"))?;
+            .with_context(|| RequestFailure::not_found(format!("no module named '{name}'")))?;
         let (versions, dependents) = self.with_store(|st| {
             Ok((
                 st.module_versions(&info.id)?,
@@ -9415,10 +9621,9 @@ impl Daemon {
             ))
         })?;
         let want = args["version"].as_i64().unwrap_or(info.current_version);
-        let (version, code, ..) = versions
-            .iter()
-            .find(|v| v.0 == want)
-            .with_context(|| format!("module '{name}' has no version {want}"))?;
+        let (version, code, ..) = versions.iter().find(|v| v.0 == want).with_context(|| {
+            RequestFailure::not_found(format!("module '{name}' has no version {want}"))
+        })?;
         Ok(json!({
             "name": info.name,
             "description": info.description,
@@ -9436,7 +9641,7 @@ impl Daemon {
         let name = args["name"].as_str().context("name required")?;
         let (info, _) = self
             .with_store(|st| st.get_tool_by_name(name))?
-            .with_context(|| format!("no tool named '{name}'"))?;
+            .with_context(|| RequestFailure::not_found(format!("no tool named '{name}'")))?;
         let upgraded = self.refresh_pins(session_id, std::slice::from_ref(&info.id))?;
         let detail = self
             .with_store(|st| st.tool_detail(&info.id))?
@@ -9446,7 +9651,9 @@ impl Daemon {
             .versions
             .iter()
             .find(|v| v.version == want)
-            .with_context(|| format!("'{name}' has no version {want}"))?;
+            .with_context(|| {
+                RequestFailure::not_found(format!("'{name}' has no version {want}"))
+            })?;
         let failures = self.with_store(|st| st.recent_failures(&info.id, 5))?;
         let example = self.with_reader(|st| st.tool_example(&info.id))?;
         let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or(json!(s));
@@ -9532,7 +9739,9 @@ impl Daemon {
             }
             let (info, ver) = self
                 .with_store(|st| st.get_tool_by_name(name))?
-                .with_context(|| format!("no tool named '{name}' (find_tools first)"))?;
+                .with_context(|| {
+                    RequestFailure::not_found(format!("no tool named '{name}' (find_tools first)"))
+                })?;
             if info.retired {
                 bail!("tool '{name}' is retired");
             }
@@ -9612,7 +9821,9 @@ impl Daemon {
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn))
             .await
-            .map_err(|e| anyhow!("script panicked: {e}"));
+            .map_err(|e| {
+                anyhow::Error::new(RequestFailure::internal(format!("script panicked: {e}")))
+            });
         done.cancel();
         let elapsed_ms = started.elapsed().as_millis() as i64;
         let hash = crate::scripts::recurrence_key(source, &uses);
@@ -9801,7 +10012,9 @@ impl Daemon {
         let started = std::time::Instant::now();
         let outcome = tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn))
             .await
-            .map_err(|e| anyhow!("test run panicked: {e}"))?;
+            .map_err(|e| {
+                anyhow::Error::new(RequestFailure::internal(format!("test run panicked: {e}")))
+            })?;
         let elapsed_ms = started.elapsed().as_millis() as i64;
         let emitted = ops
             .emitted
@@ -11340,7 +11553,9 @@ impl Daemon {
         let edit = self.config_edit.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = self.config()?;
         if cfg.mcp.servers.remove(name).is_none() {
-            return Err(anyhow!("no MCP server '{name}'"));
+            return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                "no MCP server '{name}'"
+            ))));
         }
         cfg.save(&self.paths)?;
         drop(edit);
@@ -13852,6 +14067,57 @@ mod poison_tests {
 #[cfg(test)]
 mod run_start_tests {
     use super::*;
+
+    /// A second panic during cleanup cannot strand the queue (#1133).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poisoned_tail_lock_and_tail_panic_still_start_the_queue() {
+        let dir = std::env::temp_dir().join(format!("fl-tail-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        let run = daemon.with_store(|st| st.create_run(&sid)).unwrap();
+        daemon
+            .with_store(|st| st.enqueue_message(&sid, "queued after tail panic"))
+            .unwrap();
+        let d = daemon.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = d.comparisons.lock().unwrap();
+            panic!("poisoned comparison bookkeeping");
+        })
+        .join();
+        assert!(daemon.comparisons.is_poisoned());
+        daemon.panic_in_finish_tail.store(true, Ordering::SeqCst);
+        // Exercise the same path used after a run_loop panic, with a second
+        // panic injected into its finish tail.
+        daemon.run_panicked(&sid, &run, "first panic").await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let runs = daemon
+                    .with_reader(|st| st.run_metrics_for(Some(&sid), 10, None))
+                    .unwrap();
+                if runs.len() == 2 && !daemon.runs.locked().contains_key(&sid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued Run never started and finished");
+        assert_eq!(daemon.with_reader(|st| st.queued_count(&sid)).unwrap(), 0);
+        let msgs = daemon.with_reader(|st| st.list_messages(&sid)).unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m.role == "user" && m.content == "queued after tail panic"));
+        assert_eq!(
+            daemon
+                .with_reader(|st| st.run_status(&run))
+                .unwrap()
+                .as_deref(),
+            Some("paused")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// One Run per Session: a second start is refused naming the winner,
     /// and a finishing Run never removes a newer Run's controls (#726).

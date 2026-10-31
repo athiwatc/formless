@@ -2101,7 +2101,12 @@ such as `read_file`, `read_text_file` and `file_read`.
 - **Errors and limits.** A failed response may carry `result: {"code":
   …}` (`protocol_mismatch`, `unsupported`, `bad_request`, `not_found`,
   `busy`, `budget`, `invalid`, `internal`); clients branch on the code,
-  the `error` text is for people. A request that did what was asked with
+  the `error` text is for people. Codes originate at the failure site and
+  survive diagnostic context wrappers; changing or quoting error prose
+  never changes its classification. Missing resource lookups use
+  `not_found`; validation sites such as malformed ratings and empty
+  template names use `invalid`. Errors without an explicit classification
+  remain uncoded. A request that did what was asked with
   a degraded part (a model listing that failed) succeeds and names it in
   its result's `error`. Every reader (daemon, TUI, relay pump, web
   bridge) refuses a line over `MAX_FRAME_BYTES` (32 MB) while reading;
@@ -2213,6 +2218,11 @@ such as `read_file`, `read_text_file` and `file_read`.
    and `audit(created_at)`.
 
 ### 9.5 Crash recovery
+
+- Finishing a Run isolates comparison and job bookkeeping from unrelated
+  finish-tail failures. A panic in naming, recap, or `run_end` hooks is
+  logged and surfaced as a note, and still drains the next queued message.
+  This applies after a Run panic as well as normal completion.
 
 - The daemon never idle-closes mid-Run (§9.1) but can crash/be killed. On
   restart, affected Runs are marked **Interrupted**; the in-flight Invocation
