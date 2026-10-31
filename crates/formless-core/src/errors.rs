@@ -312,9 +312,6 @@ pub fn tool_error_detail(message: &str, code: &str, input: &serde_json::Value) -
         .filter_map(|line| {
             let frame = line.trim().strip_prefix("at ")?;
             let (name, location) = frame.split_once(" (")?;
-            if name.starts_with('<') {
-                return None;
-            }
             let location = location
                 .strip_suffix(')')?
                 .strip_prefix(formless_runtime::TOOL_SOURCE_NAME)?
@@ -441,6 +438,19 @@ pub fn tool_failure_detail(
 #[cfg(test)]
 mod tool_error_tests {
     use super::{tool_error_detail, tool_failure_detail};
+
+    #[test]
+    fn anonymous_tool_callbacks_keep_their_own_source_location() {
+        let code = "async function run() {\n  return Promise.all([1].map(async () => {\n    await tools.call('inner', {});\n  }));\n}";
+        let message = "inner failed\n    at <anonymous> (formless-tool.js:3:11)\n    at run (formless-tool.js:2:30)\n    at <anonymous> (formless-host.js:9:4)";
+        let detail = tool_error_detail(message, code, &serde_json::json!({}));
+        assert!(detail.contains("at <anonymous> (line 3)"), "{detail}");
+        assert!(
+            detail.contains("> 3 |     await tools.call('inner', {});"),
+            "{detail}"
+        );
+        assert!(!detail.contains("line 9"), "{detail}");
+    }
 
     #[test]
     fn js_errors_show_the_line_the_path_and_the_input() {
