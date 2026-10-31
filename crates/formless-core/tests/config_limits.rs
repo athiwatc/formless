@@ -1,10 +1,14 @@
 //! Former hidden constants are settings (SPEC §13).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::{Config, Paths, Store};
 use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nesting_and_sleep_limits_come_from_config() {
+    let _env = credential_env::EnvGuard::isolated();
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let base = std::path::PathBuf::from(format!("/tmp/fl-lim-{short}"));
     let paths = Paths {
@@ -63,26 +67,28 @@ async fn nesting_and_sleep_limits_come_from_config() {
 
 #[test]
 fn yes_no_env_vars_accept_the_usual_spellings_and_reject_others() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::config::env_flag;
     let var = "FORMLESS_TEST_FLAG_7531";
     for (v, want) in [("1", true), ("TRUE", true), ("yes", true), ("on", true)] {
-        std::env::set_var(var, v);
+        _env.set(var, v);
         assert_eq!(env_flag(var).unwrap(), Some(want), "{v}");
     }
     for v in ["0", "false", "No", "off"] {
-        std::env::set_var(var, v);
+        _env.set(var, v);
         assert_eq!(env_flag(var).unwrap(), Some(false), "{v}");
     }
-    std::env::set_var(var, "");
+    _env.set(var, "");
     assert_eq!(env_flag(var).unwrap(), None);
-    std::env::set_var(var, "maybe");
+    _env.set(var, "maybe");
     assert!(env_flag(var).is_err());
-    std::env::remove_var(var);
+    _env.remove(var);
     assert_eq!(env_flag(var).unwrap(), None);
 }
 
 #[test]
 fn trusted_folders_match_by_components_on_every_os_shape() {
+    let _env = credential_env::EnvGuard::isolated();
     let sec = formless_core::config::SecurityCfg {
         trusted_paths: vec![
             "/home/me/code/app/".into(),

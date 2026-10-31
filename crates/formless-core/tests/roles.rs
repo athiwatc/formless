@@ -1,5 +1,8 @@
 //! Multiple providers and Roles (SPEC §4.5).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use axum::routing::post;
 use formless_core::config::{ProviderCfg, RoleCfg};
 use formless_core::{Config, Paths, Store};
@@ -47,6 +50,7 @@ async fn mock(answer: &'static str) -> (String, Seen) {
 
 #[test]
 fn providers_and_roles_resolve_with_clear_errors() {
+    let _env = credential_env::EnvGuard::isolated();
     let mut cfg = Config::default();
     cfg.provider.model = "big".into();
     assert_eq!(cfg.provider_cfg(None).unwrap().model, "big");
@@ -77,8 +81,9 @@ fn providers_and_roles_resolve_with_clear_errors() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_role_on_a_second_provider_serves_llm_calls_and_the_session() {
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
-    std::env::set_var("FORMLESS_API_KEY_LOCAL", "key-b");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "key-a");
+    _env.set("FORMLESS_API_KEY_LOCAL", "key-b");
     let (a, seen_a) = mock("from A").await;
     let (b, seen_b) = mock("from B").await;
     let short = &uuid::Uuid::new_v4().to_string()[..8];
@@ -216,6 +221,7 @@ async fn a_role_on_a_second_provider_serves_llm_calls_and_the_session() {
 
 #[test]
 fn per_task_routing_gates_on_quality_then_cost() {
+    let _env = credential_env::EnvGuard::isolated();
     use formless_core::routing::{select_task_model, TaskStat};
     let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let stat = |m: &str, samples, good, ms, tok| TaskStat {
@@ -264,6 +270,7 @@ fn per_task_routing_gates_on_quality_then_cost() {
 
 #[test]
 fn task_stats_count_respawns_and_limits_as_bad() {
+    let _env = credential_env::EnvGuard::isolated();
     let store = Store::open_in_memory().unwrap();
     store
         .record_task("scout", "m1", "s", "r1", "h1", 1000, 50, 3, "completed")
@@ -285,7 +292,8 @@ fn task_stats_count_respawns_and_limits_as_bad() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_auto_role_uses_the_measured_winner() {
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "key-a");
     let (a, seen) = mock("ok").await;
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let dir = std::path::PathBuf::from(format!("/tmp/fl-auto-{short}"));
@@ -366,6 +374,7 @@ async fn an_auto_role_uses_the_measured_winner() {
 
 #[test]
 fn global_auto_migrates_to_a_primary_role() {
+    let _env = credential_env::EnvGuard::isolated();
     let mut cfg = Config::default();
     assert_eq!(cfg.migrate_global_auto(), None);
     cfg.provider.model = "auto".into();
@@ -386,7 +395,8 @@ fn global_auto_migrates_to_a_primary_role() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn old_auto_configs_migrate_on_start_and_primary_runs_feed_routing() {
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "key-a");
     let (a, seen) = mock("done").await;
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let dir = std::path::PathBuf::from(format!("/tmp/fl-mig-{short}"));
@@ -448,7 +458,8 @@ async fn old_auto_configs_migrate_on_start_and_primary_runs_feed_routing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nested_llm_spend_counts_toward_the_run_budget() {
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "key-a");
     let seen: Seen = Arc::default();
     let app = axum::Router::new().route(
         "/chat/completions",
@@ -517,7 +528,8 @@ async fn nested_llm_spend_counts_toward_the_run_budget() {
 /// why, and the next request never hands it back as the model's words (#1104).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_placeholder_is_never_sent_back_as_the_models_words() {
-    std::env::set_var("FORMLESS_API_KEY", "key-a");
+    let _env = credential_env::EnvGuard::isolated();
+    _env.set("FORMLESS_API_KEY", "key-a");
     let seen: Seen = Arc::default();
     let app = axum::Router::new().route(
         "/chat/completions",
@@ -604,6 +616,7 @@ async fn a_refusal_placeholder_is_never_sent_back_as_the_models_words() {
 /// text: a result reading "errors: 0" is a success (#901).
 #[tokio::test(flavor = "multi_thread")]
 async fn run_tool_reports_ok_from_the_outcome() {
+    let _env = credential_env::EnvGuard::isolated();
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let dir = std::path::PathBuf::from(format!("/tmp/fl-runok-{short}"));
     let paths = Paths {
