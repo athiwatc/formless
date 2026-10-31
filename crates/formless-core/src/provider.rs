@@ -496,6 +496,40 @@ pub fn with_cache_breakpoints(messages: &[Value]) -> Vec<Value> {
     out
 }
 
+/// Mark or unmark a Chat Completions or Responses body's breakpoints for
+/// the model it goes to. Unmarked text parts go back to plain strings.
+fn apply_breakpoints(body: &mut Value, on: bool) {
+    if let Some(messages) = body["messages"].as_array().cloned() {
+        let plain: Vec<Value> = messages.into_iter().map(unmark).collect();
+        body["messages"] = json!(if on {
+            with_cache_breakpoints(&plain)
+        } else {
+            plain
+        });
+    } else if body["input"].is_array() {
+        let mut input = body["input"].take();
+        crate::anthropic::strip_cache_control(&mut input);
+        if let (true, Some(parts)) = (on, input.as_array_mut()) {
+            mark_responses_system(parts);
+        }
+        body["input"] = input;
+    }
+}
+
+/// A message whose content is one marked text part, as a plain string.
+fn unmark(mut m: Value) -> Value {
+    crate::anthropic::strip_cache_control(&mut m);
+    let single = m["content"]
+        .as_array()
+        .filter(|parts| parts.len() == 1 && parts[0]["type"] == "text")
+        .and_then(|parts| parts[0]["text"].as_str())
+        .map(str::to_string);
+    if let Some(text) = single {
+        m["content"] = json!(text);
+    }
+    m
+}
+
 /// The Responses-API form of [`with_cache_breakpoints`]: the system
 /// prompt's text part carries the breakpoint.
 fn mark_responses_system(input: &mut [Value]) {
@@ -1143,6 +1177,15 @@ impl Provider {
                 sends += 1;
                 let mut b = body.clone();
                 b["model"] = json!(model);
+                // Breakpoints follow the model actually tried: a fallback
+                // that isn't Claude gets plain content, one that is gets
+                // them, whoever built the body (#769).
+                if !self.cfg.anthropic() && body.get("__no_cache_control").is_none() {
+                    apply_breakpoints(&mut b, self.cfg.cache_breakpoints(model));
+                }
+                if let Some(o) = b.as_object_mut() {
+                    o.remove("__no_cache_control");
+                }
                 if let (true, Some(effort)) = (with_effort, effort) {
                     if self.cfg.responses() {
                         b["reasoning"] = json!({"effort": effort});
@@ -1196,8 +1239,11 @@ impl Provider {
                             let fix = if self.cfg.anthropic() {
                                 crate::anthropic::recover(body, &text)
                             } else if lower.contains("cache_control")
-                                && crate::anthropic::strip_cache_control(body)
+                                && body.get("__no_cache_control").is_none()
                             {
+                                // Not marked again on later attempts.
+                                crate::anthropic::strip_cache_control(body);
+                                body["__no_cache_control"] = json!(true);
                                 Some(crate::anthropic::Recovery::CacheControl)
                             } else {
                                 None

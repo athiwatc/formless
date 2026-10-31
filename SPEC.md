@@ -364,6 +364,10 @@ start is refused with a clear explanation. Native tool-calling is required
 in v1; a prompt-based (text/JSON) fallback is explicitly out (§17).
 Thinking-mode endpoints that reject a forced `tool_choice` are re-probed
 with `tool_choice` omitted; a voluntary test tool-call still passes.
+A failed model listing or probe is explained like `doctor` explains it
+(what happened, what to do, the raw error after it): a rejected key goes
+back to the key step, other failures let a model name be typed, and only
+an empty listing just asks for one.
 
 - **Testing any model.** `TestModel {model, provider?}` (TUI `/test
   [MODEL]` and Ctrl+T in the picker, the web picker's Test, `formless
@@ -3669,7 +3673,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.model_context_tokens` | {} | Context size per model id, overriding the endpoint-reported size and `context_tokens` for that model (§4.2, §11) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
-| `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off` (§4.2) |
+| `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off`. Decided per model tried, so a fallback that isn't Claude gets plain content; applied to one-shot completions (compaction, `llm.complete`) too; a 400 naming `cache_control` resends once without them (§4.2) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
 | `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
 | `provider.tool_use_nudge` | true | Push models to build Tools: a GPT-family system-prompt addendum, and one nudge per step when an answer refuses for lack of access before using any Tool (§5.2) |

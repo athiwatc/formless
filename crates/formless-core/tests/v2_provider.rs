@@ -1516,3 +1516,83 @@ async fn tool_call_fragments_are_merged_exactly_and_bounded() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("tool call index"), "{err:#}");
 }
+
+/// Cache breakpoints follow the model each attempt goes to: a Claude
+/// primary that fails over to another model sends that one plain text,
+/// and `complete` marks a Claude request like a streamed one (#769).
+#[tokio::test]
+async fn cache_breakpoints_follow_the_attempted_model() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route(
+        "/chat/completions",
+        post({
+            let seen = seen.clone();
+            move |Json(body): Json<Value>| {
+                seen.lock().unwrap().push(body.clone());
+                async move {
+                    if body["model"] == "anthropic/claude-x" && body["stream"] == true {
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "down")
+                            .into_response();
+                    }
+                    if body["stream"] == false {
+                        return Json(json!({"choices": [{"message": {"content": "sum"}}]}))
+                            .into_response();
+                    }
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices": [{"delta": {"content": "ok"}}]})
+                    )
+                    .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut c = cfg(&base);
+    c.fallback_models = vec!["gpt-other".into()];
+    c.max_retries = 0;
+    let p = Provider::new(c, "k".into()).unwrap();
+    let msgs = [
+        json!({"role": "system", "content": "be brief"}),
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "hello"}),
+        json!({"role": "user", "content": "again"}),
+    ];
+    let out = p
+        .chat_stream(
+            &msgs,
+            &[],
+            "anthropic/claude-x",
+            None,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.content, "ok");
+    let bodies = seen.lock().unwrap().clone();
+    let claude = bodies
+        .iter()
+        .find(|b| b["model"] == "anthropic/claude-x")
+        .unwrap();
+    assert!(
+        claude.to_string().contains("cache_control"),
+        "the Claude attempt is marked"
+    );
+    let other = bodies.iter().find(|b| b["model"] == "gpt-other").unwrap();
+    assert!(!other.to_string().contains("cache_control"), "{other}");
+    assert_eq!(
+        other["messages"][0]["content"], "be brief",
+        "plain strings again"
+    );
+
+    seen.lock().unwrap().clear();
+    p.complete(&msgs, "anthropic/claude-x", None).await.unwrap();
+    let body = seen.lock().unwrap()[0].clone();
+    assert!(
+        body.to_string().contains("cache_control"),
+        "complete() marks Claude too: {body}"
+    );
+}

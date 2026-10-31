@@ -1090,6 +1090,16 @@ fn stable_prefix_len(text: &str) -> usize {
     stable
 }
 
+/// A setup failure explained the way `doctor` explains it (#744).
+fn wizard_explain(raw: &str, base_url: &str, model: &str) -> formless_protocol::ErrorExplained {
+    let ctx = formless_core::errors::ErrorContext {
+        base_url: base_url.trim(),
+        model,
+        alternatives: Vec::new(),
+    };
+    formless_core::errors::explain(raw, &ctx)
+}
+
 /// What `ContextUsage.context_source` means, for `/context`.
 fn window_source_text(source: &str) -> &'static str {
     match source {
@@ -5988,11 +5998,32 @@ impl App {
                             w.base_url.trim()
                         );
                     }
+                    // Why the listing failed decides what comes next (#744):
+                    // a rejected key goes back to the key, anything else says
+                    // what happened and lets a model name be typed.
+                    WizardJob::Models(Err(e)) => {
+                        let why = wizard_explain(&e, &w.base_url, "");
+                        if why.category == "auth" {
+                            w.enter_api_key_step();
+                            w.status = format!("{} Enter it again. ({})", why.message, why.details);
+                        } else {
+                            w.picker = picker::ModelPicker::new(Vec::new());
+                            w.picker.query = w.saved_model.clone();
+                            w.step = WizardStep::PickModel;
+                            w.status = format!(
+                                "Could not list models: {}{} Type a model name, then Enter. ({})",
+                                why.message,
+                                why.action.map(|a| format!(" {a}.")).unwrap_or_default(),
+                                why.details
+                            );
+                        }
+                    }
                     WizardJob::Models(_) => {
                         w.picker = picker::ModelPicker::new(Vec::new());
                         w.picker.query = w.saved_model.clone();
                         w.step = WizardStep::PickModel;
-                        w.status = "Could not list models; type a model name, then Enter.".into();
+                        w.status =
+                            "The endpoint listed no models; type a model name, then Enter.".into();
                     }
                     WizardJob::Probe(Ok(r)) if r.tool_calling => {
                         w.prompt_fallback = r.prompt_fallback;
@@ -6003,8 +6034,19 @@ impl App {
                         w.status = "This endpoint/model supports neither native nor prompt-based tool-calling. Press Enter to pick another model.".into();
                     }
                     WizardJob::Probe(Err(e)) => {
-                        w.step = WizardStep::Failed;
-                        w.status = format!("Probe failed: {e}. Press Enter to retry model pick.");
+                        let why = wizard_explain(&e, &w.base_url, &w.model());
+                        if why.category == "auth" {
+                            w.enter_api_key_step();
+                            w.status = format!("{} Enter it again. ({})", why.message, why.details);
+                        } else {
+                            w.step = WizardStep::Failed;
+                            w.status = format!(
+                                "Probe failed: {}{} Press Enter to pick a model again. ({})",
+                                why.message,
+                                why.action.map(|a| format!(" {a}.")).unwrap_or_default(),
+                                why.details
+                            );
+                        }
                     }
                 }
             }
@@ -15201,6 +15243,47 @@ mod tests {
         app.key(key(KeyCode::Char('h')));
         assert!(app.call_focus.is_none());
         assert_eq!(app.input, "h");
+    }
+
+    /// A rejected key goes back to the key step with the reason; an
+    /// unreachable endpoint says so; only an empty list just asks for a
+    /// model name (#744).
+    #[test]
+    fn wizard_failures_say_why() {
+        let mut app = test_app();
+        let mut w = Wizard::new(&Config::default());
+        w.base_url = "https://api.example.com/v1".into();
+        w.step = WizardStep::FetchModels;
+        let tx = w.job_tx.clone();
+        app.wizard = Some(w);
+        tx.send(WizardJob::Models(Err(
+            "401 Unauthorized: invalid api key".into()
+        )))
+        .unwrap();
+        app.wizard_poll();
+        let w = app.wizard.as_ref().unwrap();
+        assert_eq!(w.step, WizardStep::ApiKey);
+        assert!(w.status.contains("API key was rejected"), "{}", w.status);
+
+        tx.send(WizardJob::Models(Err("404 Not Found: no route".into())))
+            .unwrap();
+        app.wizard_poll();
+        let w = app.wizard.as_ref().unwrap();
+        assert_eq!(w.step, WizardStep::PickModel);
+        assert!(
+            w.status.contains("404") && w.status.contains("Type a model name"),
+            "{}",
+            w.status
+        );
+
+        tx.send(WizardJob::Models(Ok(Vec::new()))).unwrap();
+        app.wizard_poll();
+        assert!(app
+            .wizard
+            .as_ref()
+            .unwrap()
+            .status
+            .contains("listed no models"));
     }
 
     #[test]
