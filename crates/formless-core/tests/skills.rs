@@ -74,12 +74,15 @@ fn skills_install_from_folder_zip_and_git_and_version() {
     // A zip that wraps the skill in a folder: a new version, disabled again.
     write_skill(&src, "report-writer", "Step 1: read the sheet carefully.");
     let zip = paths.data_dir.join("report.zip");
-    assert!(std::process::Command::new("zip")
-        .args(["-qr", zip.to_str().unwrap(), "report"])
-        .current_dir(paths.data_dir.join("src"))
-        .status()
-        .unwrap()
-        .success());
+    let report = paths.data_dir.join("src/report");
+    let mut entries = Vec::new();
+    for rel in formless_core::skills::files(&report).unwrap() {
+        entries.push((
+            format!("report/{rel}"),
+            std::fs::read(report.join(&rel)).unwrap(),
+        ));
+    }
+    write_zip(&zip, &entries);
     let v2 = install(&paths, &store, zip.to_str().unwrap(), None, None, "user").unwrap();
     assert_eq!((v2.version, v2.enabled), (2, false));
 
@@ -434,4 +437,90 @@ fn run_tool_sequences_are_compared_across_sessions() {
     assert!(!store.tool_sequence_seen_elsewhere(&b, &seq).unwrap());
     run_in(&a);
     assert!(store.tool_sequence_seen_elsewhere(&b, &seq).unwrap());
+}
+
+/// A zip of `(name, bytes)` entries, deflated, written in-process.
+fn write_zip(path: &std::path::Path, entries: &[(String, Vec<u8>)]) {
+    use std::io::Write;
+    let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in entries {
+        w.start_file(name.as_str(), opts).unwrap();
+        w.write_all(bytes).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// Archives are extracted in-process with caps enforced while writing:
+/// a zip bomb, too many entries, escaping paths and links are refused by
+/// name and leave nothing behind (#856).
+#[test]
+fn hostile_skill_zips_are_refused_and_leave_nothing() {
+    use std::io::Write;
+    let paths = temp_paths("zipbomb");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let skill_md = b"---\nname: bomb\ndescription: d\n---\nbody".to_vec();
+    let staging = paths.data_dir.join("skills/.staging");
+    let refused = |zip: &std::path::Path, want: &str| {
+        let err = install(&paths, &store, zip.to_str().unwrap(), None, None, "user")
+            .err()
+            .unwrap_or_else(|| panic!("{} installed", zip.display()));
+        assert!(format!("{err:#}").contains(want), "{err:#}");
+        let left = std::fs::read_dir(&staging).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "staging removed");
+        assert!(store
+            .list_skills()
+            .unwrap()
+            .iter()
+            .all(|s| s.name != "bomb"));
+    };
+
+    // 11 MB of zeros compresses to a few KB.
+    let bomb = paths.data_dir.join("bomb.zip");
+    write_zip(
+        &bomb,
+        &[
+            ("SKILL.md".into(), skill_md.clone()),
+            ("zeros.bin".into(), vec![0u8; 11_000_000]),
+        ],
+    );
+    assert!(std::fs::metadata(&bomb).unwrap().len() < 100_000);
+    refused(&bomb, "more than 10 MB");
+
+    let many = paths.data_dir.join("many.zip");
+    let mut entries = vec![("SKILL.md".to_string(), skill_md.clone())];
+    entries.extend((0..2001).map(|i| (format!("f{i}.txt"), Vec::new())));
+    write_zip(&many, &entries);
+    refused(&many, "at most 2000");
+
+    let dots = paths.data_dir.join("dots.zip");
+    write_zip(
+        &dots,
+        &[
+            ("SKILL.md".into(), skill_md.clone()),
+            ("../escape.txt".into(), b"x".to_vec()),
+        ],
+    );
+    refused(&dots, "'../escape.txt' would be written outside");
+    assert!(!paths.data_dir.join("skills/escape.txt").exists());
+
+    let abs = paths.data_dir.join("abs.zip");
+    write_zip(
+        &abs,
+        &[
+            ("SKILL.md".into(), skill_md.clone()),
+            ("/tmp/fl-abs-escape.txt".into(), b"x".to_vec()),
+        ],
+    );
+    refused(&abs, "would be written outside");
+
+    let link = paths.data_dir.join("link.zip");
+    let mut w = zip::ZipWriter::new(std::fs::File::create(&link).unwrap());
+    let opts = zip::write::SimpleFileOptions::default();
+    w.start_file("SKILL.md", opts).unwrap();
+    w.write_all(&skill_md).unwrap();
+    w.add_symlink("hosts", "/etc/hosts", opts).unwrap();
+    w.finish().unwrap();
+    refused(&link, "'hosts' is a symbolic link");
 }

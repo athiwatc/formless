@@ -20,6 +20,7 @@ base64.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 unicode-segmentation.workspace = true
+zip.workspace = true
 sha2.workspace = true
 hkdf.workspace = true
 ignore.workspace = true
