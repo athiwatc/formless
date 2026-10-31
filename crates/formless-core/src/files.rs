@@ -30,13 +30,43 @@ pub struct FileEntry {
 /// Every file and directory under `root`, and whether the walk stopped at
 /// `MAX_WALK`.
 pub fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return (Vec::new(), false);
+    };
     let walker = ignore::WalkBuilder::new(root)
+        .follow_links(true)
         .hidden(true)
         .git_ignore(true)
         .require_git(false)
-        .filter_entry(|e| {
-            !(e.file_type().is_some_and(|t| t.is_dir())
-                && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+        .filter_entry(move |e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            if e.file_type().is_some_and(|t| t.is_dir())
+                && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
+            {
+                return false;
+            }
+            // Check each entry too: an alias may have been replaced since
+            // its parent was admitted, so descendants must remain contained.
+            let Ok(target) = e.path().canonicalize() else {
+                return false;
+            };
+            let Ok(relative) = target.strip_prefix(&canonical_root) else {
+                return false;
+            };
+            // A visible alias must not bypass the hidden/build exclusions.
+            let directories = if e.file_type().is_some_and(|t| t.is_dir()) {
+                relative
+            } else {
+                relative.parent().unwrap_or_else(|| Path::new(""))
+            };
+            !relative
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+                && !directories
+                    .components()
+                    .any(|part| SKIP_DIRS.contains(&part.as_os_str().to_string_lossy().as_ref()))
         })
         .build();
     let mut out = Vec::new();
@@ -157,6 +187,77 @@ mod tests {
             || p.starts_with("ignored")));
         let main = entries.iter().find(|e| e.path == "src/main.rs").unwrap();
         assert_eq!((main.dir, main.bytes), (false, 1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn in_root_directory_links_are_searchable_without_escaping_or_looping() {
+        use std::os::unix::fs::symlink;
+        let root = tree();
+        let outside =
+            std::env::temp_dir().join(format!("fl-files-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("outside-secret.txt"), "outside").unwrap();
+        symlink(root.join("src"), root.join("linked-src")).unwrap();
+        symlink(root.join("src/main.rs"), root.join("linked-file.rs")).unwrap();
+        symlink(&root, root.join("src/loop")).unwrap();
+        symlink(&outside, root.join("outside-dir")).unwrap();
+        symlink(
+            outside.join("outside-secret.txt"),
+            root.join("outside-file"),
+        )
+        .unwrap();
+        symlink(root.join(".hidden"), root.join("visible-hidden-alias")).unwrap();
+        symlink(root.join("target"), root.join("visible-build-alias")).unwrap();
+        symlink(root.join("missing"), root.join("dangling")).unwrap();
+
+        let (entries, truncated) = walk(&root);
+        assert!(!truncated);
+        assert!(
+            entries.len() < 40,
+            "looping aliases cannot duplicate indefinitely"
+        );
+        let directory = entries
+            .iter()
+            .find(|entry| entry.path == "linked-src")
+            .unwrap();
+        assert_eq!((directory.dir, directory.bytes), (true, 0));
+        let file = entries
+            .iter()
+            .find(|entry| entry.path == "linked-file.rs")
+            .unwrap();
+        assert_eq!(
+            (file.dir, file.bytes),
+            (false, 1),
+            "size comes from the target file"
+        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == "linked-src/ui/view.rs"));
+        let children: Vec<&str> = search(&entries, "linked-src/", 10)
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert!(children.contains(&"linked-src/main.rs") && children.contains(&"linked-src/ui"));
+        assert_eq!(
+            search(&entries, "linked-src/view", 1)[0].path,
+            "linked-src/ui/view.rs"
+        );
+        for excluded in [
+            "outside-dir",
+            "outside-file",
+            "visible-hidden-alias",
+            "visible-build-alias",
+            "dangling",
+        ] {
+            assert!(
+                !entries.iter().any(|entry| entry.path == excluded
+                    || entry.path.starts_with(&format!("{excluded}/"))),
+                "{excluded}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
