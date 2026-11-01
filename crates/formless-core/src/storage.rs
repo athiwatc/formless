@@ -6998,6 +6998,22 @@ mod native_cost_basis_tests {
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("formless.db");
         let old = schema_at(61).unwrap();
+        // schema_at constructs historical DDL without promising a final
+        // user_version; the on-disk upgrade fixture must identify itself.
+        old.pragma_update(None, "user_version", 61).unwrap();
+        assert_eq!(
+            old.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            61
+        );
+        let native_cost_columns: i64 = old
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('run_usage') WHERE name='cost_unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_cost_columns, 0, "fixture must predate schema 62");
         // Schema 61 requires the physical token counters even for a legacy
         // text-only row; it has no native-cost-basis column yet.
         old.execute("INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,created_at) VALUES('s','legacy','model',10,5,0,0,0,'2026-11-01')",[]).unwrap();
