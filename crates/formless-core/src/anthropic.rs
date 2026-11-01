@@ -148,6 +148,9 @@ fn content_blocks(content: &Value) -> Vec<Value> {
                             |why| json!({"type": "text", "text": format!("[{why}]")}),
                         ))
                     }
+                    Some("file")=>p["file"]["file_data"].as_str()
+                        .and_then(|s|s.strip_prefix("data:application/pdf;base64,"))
+                        .map(|data|json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":data}})),
                     _ => None,
                 })
                 .collect()
@@ -383,6 +386,35 @@ pub fn strip_cache_control(v: &mut Value) -> bool {
     }
 }
 
+/// Remove only cache annotations in actual request slots. In particular,
+/// JSON schemas may legitimately have cache_control keys in constants/defaults.
+pub(crate) fn strip_request_cache_control(body: &mut Value) -> bool {
+    fn remove(value: &mut Value) -> bool {
+        value
+            .as_object_mut()
+            .is_some_and(|o| o.remove("cache_control").is_some())
+    }
+    let mut found = remove(body);
+    if let Some(messages) = body.as_array_mut() {
+        for message in messages {
+            found |= remove(message);
+        }
+    }
+    for key in ["tools", "system"] {
+        if let Some(values) = body.get_mut(key).and_then(Value::as_array_mut) {
+            for value in values {
+                found |= remove(value);
+            }
+        }
+    }
+    crate::tokens::content_parts_mut(body, |parts| {
+        for part in parts {
+            found |= remove(part);
+        }
+    });
+    found
+}
+
 /// The limit a `max_tokens` rejection names (`max_tokens: 40192 >
 /// 8192, which is the maximum …`).
 fn named_limit(text: &str) -> Option<u64> {
@@ -443,7 +475,7 @@ pub fn recover(body: &mut Value, error: &str) -> Option<Recovery> {
             return Some(Recovery::MaxTokens);
         }
     }
-    if lower.contains("cache_control") && strip_cache_control(body) {
+    if lower.contains("cache_control") && strip_request_cache_control(body) {
         return Some(Recovery::CacheControl);
     }
     if lower.contains("image") && any_block(body, |b| b["type"] == "image") {

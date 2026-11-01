@@ -416,7 +416,12 @@ pub(crate) fn estimate_store_with_window(
     let preview_images: Vec<_> = input
         .attachments
         .iter()
-        .filter(|a| a.reference.is_none() && crate::daemon::is_raster_image(&a.mime))
+        .filter(|a| {
+            a.reference.is_none()
+                && (crate::daemon::is_raster_image(&a.mime)
+                    || a.mime == "application/pdf"
+                    || a.mime.starts_with("audio/"))
+        })
         .cloned()
         .collect();
     let mut preview_range = None;
@@ -459,7 +464,18 @@ pub(crate) fn estimate_store_with_window(
     .with_attachment_snapshot(st, &ctx)?;
     let key = crate::tokens::provider_key(name, &pcfg);
     let ratio = st.token_ratio(&key, &model)?;
+    let fallback_native_possible = ctx
+        .iter()
+        .flat_map(|m| m["_attachments"].as_array().into_iter().flatten())
+        .any(|a| {
+            let mime = a["mime"].as_str().unwrap_or_default();
+            (mime == "application/pdf" || mime.starts_with("audio/"))
+                && pcfg.fallback_models.iter().any(|fallback| {
+                    provider.accepts_attachment(mime, &pcfg.resolve_alias(fallback))
+                })
+        });
     let ctx = provider.prepare_forecast_attachments(&ctx, &model, preview_range);
+    let unknown_media_tokens = crate::tokens::has_native_media(&json!(&ctx));
     let prompt_tokens =
         crate::tokens::calibrated(provider.prompt_tokens(&ctx, &defs, &model), ratio);
     let basis = ForecastBasis {
@@ -578,6 +594,12 @@ pub(crate) fn estimate_store_with_window(
     warnings.push("Crossing the compaction trigger also requires a complete older turn; the flag is not a guarantee".into());
     if !logical.is_empty() {
         warnings.push("Attachment token counts use local dimensions/detail and reference metadata; unsupported media are uncertain".into());
+    }
+    if fallback_native_possible {
+        warnings.push("A configured fallback can use native audio/PDF; its media token expansion/cost is unknown and may differ from the initial-model estimate".into());
+    }
+    if unknown_media_tokens {
+        warnings.push("Native audio/PDF input tokens and media pricing are unknown locally; prompt tokens cover text/known images only, excluding the encoded payload and provider-side document/audio expansion".into());
     }
     if unknown_held {
         warnings.push("Some held attachment hashes/dimensions remain unknown: ownership, size, or the bounded descriptor-read budget could not be verified".into());

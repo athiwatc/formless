@@ -226,7 +226,7 @@ impl Store {
         };
         let (mut lower, mut upper) = (0.0, 0.0);
         let mut prices_complete = true;
-        let mut query = self.ps("SELECT run_id,provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,usage_complete FROM run_usage WHERE session_id=?1")?;
+        let mut query = self.ps("SELECT run_id,provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,usage_complete,cost_unknown FROM run_usage WHERE session_id=?1")?;
         let records = query.query_map(params![session.id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -238,10 +238,12 @@ impl Store {
                 r.get::<_, i64>(6)?,
                 r.get::<_, Option<f64>>(7)?,
                 r.get::<_, i64>(8)?,
+                r.get::<_, bool>(9)?,
             ))
         })?;
         for record in records {
-            let (run, provider, model, p, c, cache, write, reported, covered) = record?;
+            let (run, provider, model, p, c, cache, write, reported, covered, cost_unknown) =
+                record?;
             let assignment = if all_owned {
                 Some(true)
             } else {
@@ -255,9 +257,8 @@ impl Store {
             }
             let price = reported
                 .or_else(|| {
-                    cfg.provider_cfg(Some(&provider))
-                        .ok()?
-                        .cost_of(&model, p, c, cache, write, None)
+                    cfg.provider_cfg(Some(&provider)).ok()?;
+                    cfg.cost_of_known(&provider, &model, p, c, cache, write, None, cost_unknown)
                 })
                 .filter(|value| value.is_finite());
             if reported.is_none() && price.is_some() {

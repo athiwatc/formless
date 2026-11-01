@@ -147,7 +147,7 @@ impl Store {
             unpriced: Vec::new(),
         };
         let mut prices_complete = true;
-        let mut query=self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,usage_complete FROM run_usage WHERE session_id=?1 AND run_id=?2")?;
+        let mut query=self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,usage_complete,cost_unknown FROM run_usage WHERE session_id=?1 AND run_id=?2")?;
         let rows = query.query_map(params![target, operation], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -158,10 +158,11 @@ impl Store {
                 r.get::<_, u64>(5)?,
                 r.get::<_, Option<f64>>(6)?,
                 r.get::<_, bool>(7)?,
+                r.get::<_, bool>(8)?,
             ))
         })?;
         for row in rows {
-            let (provider, model, p, c, cache, write, reported, complete) = row?;
+            let (provider, model, p, c, cache, write, reported, complete, cost_unknown) = row?;
             usage.reported_requests += 1;
             usage.reported_prompt_tokens = usage
                 .reported_prompt_tokens
@@ -182,13 +183,16 @@ impl Store {
             usage.usage_complete &= complete;
             let price = reported
                 .or_else(|| {
-                    cfg.provider_cfg(Some(&provider)).ok()?.cost_of(
+                    cfg.provider_cfg(Some(&provider)).ok()?;
+                    cfg.cost_of_known(
+                        &provider,
                         &model,
                         p as i64,
                         c as i64,
                         cache as i64,
                         write as i64,
                         None,
+                        cost_unknown,
                     )
                 })
                 .filter(|p| p.is_finite());
@@ -364,6 +368,88 @@ fn summary_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_usage_preserves_native_unknown_and_reported_cost_after_restart() {
+        let root = std::env::temp_dir().join(format!("fl-summary-cost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("formless.db");
+        let st = Store::open(&file).unwrap();
+        let session = st.create_session(None).unwrap().id;
+        let unknown = crate::provider::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            reported: 3,
+            cost_unknown: true,
+            ..Default::default()
+        };
+        let reported = crate::provider::Usage {
+            cost: Some(0.4),
+            ..unknown.clone()
+        };
+        let text = crate::provider::Usage {
+            cost_unknown: false,
+            ..unknown.clone()
+        };
+        for (operation, rows) in [
+            ("unknown", vec![unknown.clone()]),
+            ("reported", vec![reported.clone()]),
+            ("mixed", vec![unknown, reported, text]),
+        ] {
+            for usage in rows {
+                st.record_usage_full(
+                    &session,
+                    operation,
+                    "default",
+                    "model",
+                    &usage,
+                    "branch-summary",
+                )
+                .unwrap();
+            }
+        }
+        drop(st);
+        for price in [1_000_000.0, 0.0] {
+            let st = Store::open(&file).unwrap();
+            let mut cfg = crate::Config::default();
+            cfg.provider.prices.insert(
+                "model".into(),
+                crate::config::ModelPrice {
+                    input: price,
+                    output: price,
+                    ..Default::default()
+                },
+            );
+            let unknown = st
+                .branch_summary_usage(&session, "unknown", &cfg, 1)
+                .unwrap();
+            assert!(unknown.usage_complete);
+            assert_eq!(
+                unknown.cost, None,
+                "native unknown never becomes text-priced"
+            );
+            assert_eq!(unknown.estimated_requests, 0);
+            assert_eq!(unknown.priced_cost_subtotal, 0.0);
+            assert_eq!(unknown.unpriced, vec!["default/model"]);
+            let reported = st
+                .branch_summary_usage(&session, "reported", &cfg, 1)
+                .unwrap();
+            assert_eq!(
+                reported.cost,
+                Some(0.4),
+                "reported USD wins regardless of current price"
+            );
+            assert_eq!(reported.estimated_requests, 0);
+            assert!(reported.unpriced.is_empty());
+            let mixed = st.branch_summary_usage(&session, "mixed", &cfg, 3).unwrap();
+            assert_eq!(mixed.cost, None);
+            assert_eq!(mixed.estimated_requests, 1);
+            assert_eq!(mixed.priced_cost_subtotal, 0.4 + 12.0 * price / 1_000_000.0);
+            assert_eq!(mixed.reported_requests, 3);
+            assert!(mixed.usage_complete);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn fixture_config() -> crate::Config {
         let mut cfg = crate::Config::default();

@@ -952,6 +952,35 @@ pasting paths.
   attempted read. Snapshot registry/lineage resolution considers only the same
   bounded positional prefix and caches missing IDs; omitted/unverified held
   hashes and dimensions remain explicitly unknown.
+- **Native audio and PDFs.** Owned WAV/MP3 sources can become Chat
+  `input_audio`; PDFs become Chat `file`, Responses `input_file`, or native
+  Messages `document` parts. These are inline bytes, without Files API uploads,
+  transcription calls, or capability probes. Native audio/PDF parts have an
+  8 MiB decoded source limit and share the attachment count/source/encoded
+  request budgets. Unsupported API/model/format combinations retain artifact
+  reference text and a bounded omission note. Provider and resolved-model
+  capability overrides are explicit; unset defaults match only documented exact
+  models on known first-party transports. Gemini compatibility defaults to WAV
+  only; its native API's PDF/MP3 capabilities are not inferred for this adapter.
+  Audio/PDF payloads never count as ordinary base64 text tokens. Their local
+  media-token/cost contribution is unknown, and they do not train text-only
+  token calibration. Source preparation uses a private frozen-byte map rather
+  than introducing file authority into provider JSON.
+  Canonical messages and verified frozen bytes survive the first-model gate;
+  each physical attempt projects for its actual model/API. Content repairs are
+  typed and persist across stream retries, touching only real API content parts,
+  never Tool schemas, defaults/examples, structured arguments or vendor data.
+  Final wire bodies reach input/accounting hooks after optional-body repairs.
+  Provider diagnostics that echo submitted attachment bytes or recognizable
+  encoded prefixes/data URLs are suppressed before display or truncation,
+  including later errors after a content repair. Only actual attempted content
+  parts supply these bounded patterns; schemas and untransmitted sources do not.
+  Raw protocol responses still drive usage parsing and recovery classification.
+  Strict dollar limits refuse unknown native input costs before HTTP; existing
+  explicit budget waivers retain their meaning. Schema 62 records unknown native
+  cost durably: generic text prices cannot replace an unreported media cost,
+  including after restart or pricing changes. Provider-reported USD wins;
+  reported and estimated rows remain separate cost bases before aggregation.
 - **Retention.** Attachments are artifacts, so `artifacts.*` retention
   removes them too. A removed one is marked expired where it was sent:
   clients show "name · expired" and the model's history says it is no
@@ -986,7 +1015,7 @@ pasting paths.
   step by step. Tab or Enter inserts `@path`. On send, each `@path`
   mention that names an existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
-  - text files up to 256 KB and images up to 8 MB are attached as below;
+  - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
     `[referenced: PATH (SIZE | directory); not attached, read it with
     your Tools]`, so the agent reads only what it needs.
@@ -4376,6 +4405,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Character-equivalent threshold (÷4 tokens) for calibrated prompt complexity |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
+| `provider.audio_input` / `provider.pdf_input` | known endpoint/model only | Permit native audio/PDF attachments (§5.6); unknown adapters/models retain references. API-style gates still apply. |
+| `provider.model_audio_input` / `provider.model_pdf_input` | {} | Boolean overrides by resolved model ID, before provider defaults. An explicit audio override asserts Chat WAV/MP3 support; Gemini's inferred default is WAV only. |
 | `provider.image_max_px` | 1568 | Longest side, in pixels, of an attached image sent to a vision model; bigger ones are scaled down once per Session and the encoded image kept for later steps (0: never scale). An image that can't be sent (gone, unreadable, over 8 MB) leaves a marker for the model and a note for the user (§4.2) |
 | `provider.image_detail` | auto | The `detail` asked of vision models for attached images: `auto`, `low` or `high`; images go to Chat Completions as `image_url` parts and to the Responses API as `input_image` parts (§4.2) |
 | `provider.prices` | {} | USD per million tokens per model (`input`, `output`, `cached_input`, `cache_write_input`; `retrieved_at` when imported with `formless prices import`) for cost estimates and dollar limits (§10.6) |
