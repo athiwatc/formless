@@ -1618,6 +1618,15 @@ pattern (§4.4).
     Windows assigns a suspended child to a private kill-on-close Job before
     resuming it, failing closed if Job setup fails. This is process
     ownership/cleanup, not an OS sandbox for arbitrary granted programs.
+    Before either process API executes, its program is resolved from the exact
+    filtered child environment and working directory. The effective executable
+    receives credential/profile checks, and that same canonical absolute path
+    is passed to the OS; a later PATH change cannot redirect execution after
+    consent. Relative PATH entries are based on the child cwd. Unix PATH removal
+    uses the native default search path; Windows retains Rust's documented
+    application/system/Windows/parent-PATH fallback and implicit `.exe` lookup.
+    PATHEXT spelling for explicit batch-file grants and native Windows argument
+    quoting are preserved; the runtime introduces no shell command parsing.
   - `progress(fraction, label)` — no Capability needed: `fraction` 0..1
     (or null when unknown) and a short label. The daemon broadcasts
     `ToolProgress {tool_name, depth, fraction, label}` (at most 5 a second
@@ -2859,6 +2868,13 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   filesystem path, because transcripts also reach remote web clients.
   `GetArtifact {id, offset?, length?}` returns a text slice (200 000
   characters by default) with `total_chars` and `end`, never the path.
+  Both client and agent readers open only regular files beneath this profile's
+  artifact directory using rooted no-follow handles, reject changed recorded
+  sizes, and read at most 32 MiB plus one growth-detection byte before slicing
+  or grep. Larger artifacts return an explicit text-reader limit error.
+  Client ID access remains profile-wide; agent `read_artifact` still requires
+  exact ownership by its current Session. A restored registry path alone cannot
+  authorize a host-file read.
   - TUI: a tool result that references an artifact shows `/open <id>`,
     and `/open` (the newest) or `/open <id-prefix>` shows a full-screen
     pager (↑↓, PgUp/PgDn, g/G, Esc).
@@ -4239,11 +4255,27 @@ during its snapshot fetch, deduplicated by message id.
   ports. The Relay (a Cloudflare Worker + Durable Object room in
   `relay/`) forwards only opaque AES-256-GCM ciphertext: the pairing
   secret (32 random bytes, keychain + `0600` file, never in config) is
-  the key, and the room id is a truncated SHA-256 of it, so the Relay
-  can neither read traffic nor derive the key. The daemon connects with
+  the E2E key. Room identity v3 is the first 16 bytes of SHA-256 of a
+  separate 32-byte HKDF-SHA256 claim (empty salt, info
+  `formless-relay/3 daemon-claim`). The daemon sends this claim as canonical
+  lowercase hex in an `Authorization: Bearer` Upgrade header, never the URL.
+  The room checks its hash commitment before upgrading/admitting a daemon;
+  there is no first-writer verifier registration or unauthenticated fallback.
+  The relay sees this separate daemon-slot capability, not the pairing key or
+  plaintext; the capability cannot decrypt E2E traffic. A valid restart
+  preempts the old slot (close 4003) without rotating the pairing secret.
+  Superseded socket attachments lose control/routing authority before close,
+  including delayed frames and hibernation; browsers receive offline/online
+  in order to start fresh channels. Unauthenticated requests return 401 and
+  cannot claim a slot, push, or disconnect clients. The daemon connects with
   `?mux=1`: the Relay gives every browser a client id, announces
   `client_open`/`client_close`, and routes `{cid, f}` frames, so each
-  browser has its own daemon connection. Frames are version 2: each
+  browser has its own daemon connection. Room v3 requires matching Worker,
+  browser and daemon code: existing pairing fragments/secrets remain valid,
+  but derive a new room. Reload the browser after updating; existing opt-in
+  push subscriptions re-register only after a current authenticated handshake,
+  never by copying old-room state or requesting new notification permission.
+  Hosted deployment is a separate operation. Frames remain version 2: each
   browser connection opens with a handshake (`{"v":2,"hello":<16 random
   bytes>}` from each side) and derives a session key with HKDF-SHA256
   over the pairing key, salted with both nonces. Each side proves it holds

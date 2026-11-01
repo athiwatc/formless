@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { b64u } from "./push.mjs";
+import { daemonClaim, claimRoom, claimAuthorization } from "./daemon-claim.mjs";
+import { wireOpen } from "./test-wire.mjs";
 
 const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
 const env = {
@@ -27,8 +29,9 @@ try {
   await new Promise((r) => setTimeout(r, 500));
   const key = await (await fetch(`http://127.0.0.1:${relayPort}/push/key`)).json();
   assert.equal(key.key, env.VAPID_PUBLIC_KEY);
-  const room = "a".repeat(32);
-  const open = (role) => new Promise((resolve) => {
+  const claim = await daemonClaim(crypto.getRandomValues(new Uint8Array(32)));
+  const room = await claimRoom(claim);
+  const open = (role) => role === "daemon" ? wireOpen(`ws://127.0.0.1:${relayPort}/relay/${room}?role=daemon&mux=1`, claimAuthorization(claim)) : new Promise((resolve) => {
     const ws = new WebSocket(`ws://127.0.0.1:${relayPort}/relay/${room}?role=${role}&mux=1`);
     ws.onopen = () => resolve(ws);
   });

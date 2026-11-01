@@ -2965,7 +2965,9 @@ impl Daemon {
                 let (session, path, bytes) = self
                     .with_reader(|st| st.get_artifact(&id))?
                     .with_context(|| RequestFailure::not_found(format!("no artifact '{id}'")))?;
-                let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
+                let source =
+                    crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
+                let text = String::from_utf8_lossy(&source).into_owned();
                 let total = text.chars().count();
                 let offset = offset.unwrap_or(0);
                 let length = length.unwrap_or(200_000).min(1_000_000);
@@ -11173,13 +11175,14 @@ impl Daemon {
     /// A slice (or grep) of one of this Session's artifacts (SPEC §9.6).
     fn read_artifact_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let id = args["id"].as_str().context("id required")?;
-        let (_, path, _) = self
+        let (_, path, bytes) = self
             .with_store(|st| st.get_artifact(id))?
             .filter(|(owner, ..)| owner.as_deref() == Some(session_id))
             .with_context(|| {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
-        let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
+        let source = crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
+        let text = String::from_utf8_lossy(&source).into_owned();
         if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
             let needle = needle.to_lowercase();
             let hits: Vec<Value> = text
@@ -17056,3 +17059,7 @@ mod sensitive_read_daemon_tests;
 #[cfg(test)]
 #[path = "model_test_daemon_tests.rs"]
 mod model_test_daemon_tests;
+
+#[cfg(test)]
+#[path = "artifact_read_tests.rs"]
+mod artifact_read_tests;

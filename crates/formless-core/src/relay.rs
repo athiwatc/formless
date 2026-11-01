@@ -2,8 +2,8 @@
 //! (`wss://formless.athiwat.xyz` by default) and browsers meet it there.
 //! The relay only forwards opaque AES-256-GCM ciphertext — the pairing
 //! secret (32 random bytes, base64url) *is* the key, and the room id is
-//! a truncated SHA-256 of the key, so the relay cannot read traffic or
-//! derive the key from the room it routes.
+//! a truncated SHA-256 of a domain-separated daemon claim, so the relay
+//! cannot derive the pairing key or read traffic from its routing proof.
 //!
 //! Frames are protocol v2 (SPEC §12). Each browser connection starts with
 //! a handshake: both sides send `{"v":2,"hello":<16 random bytes>}` and
@@ -50,9 +50,35 @@ pub fn key_from_secret(secret: &str) -> Result<Zeroizing<[u8; 32]>> {
     Ok(Zeroizing::new(key))
 }
 
+/// Distinct daemon-slot capability. It never serves as an E2E traffic key.
+/// The room commits to this derived value, avoiding attacker-controlled TOFU.
+pub fn daemon_claim(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut claim = Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<Sha256>::new(None, key)
+        .expand(b"formless-relay/3 daemon-claim", claim.as_mut_slice())
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    claim
+}
+
 pub fn room_id(key: &[u8; 32]) -> String {
-    let digest = Sha256::digest(key);
+    let claim = daemon_claim(key);
+    let digest = Sha256::digest(claim.as_slice());
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Header-only proof, marked sensitive so request Debug output omits it.
+/// Never put the derived capability or pairing secret in a relay URL.
+pub fn daemon_authorization(key: &[u8; 32]) -> tokio_tungstenite::tungstenite::http::HeaderValue {
+    let claim = daemon_claim(key);
+    let mut value = Zeroizing::new(String::from("Bearer "));
+    use std::fmt::Write as _;
+    for byte in claim.iter() {
+        write!(&mut *value, "{byte:02x}").expect("write to String");
+    }
+    let mut header = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&value)
+        .expect("canonical ASCII daemon claim");
+    header.set_sensitive(true);
+    header
 }
 
 pub const FRAME_VERSION: u64 = 2;
@@ -401,7 +427,13 @@ pub async fn connect_once(
     // become ready while connect_async is waiting. Retain those notifications
     // in the existing bounded broadcast queue until the link can send them.
     let mut attention = daemon.attention.subscribe();
-    let (ws, _resp) = tokio_tungstenite::connect_async(&url)
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let mut request = url.as_str().into_client_request()?;
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+        daemon_authorization(&key),
+    );
+    let (ws, _resp) = tokio_tungstenite::connect_async(request)
         .await
         .with_context(|| format!("connect relay {base_url}"))?;
     let (mut ws_write, mut ws_read) = ws.split();
