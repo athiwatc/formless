@@ -4103,6 +4103,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
 | `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
 | `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
+| `daemon.backup_restore_drill` | false | After a daily backup, rehearse restoration in a private throwaway profile and read its Sessions with an offline daemon; never start providers, MCP, hooks or jobs (§9.6) |
 | `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit. Attachments count too: a removed one shows as expired in its message (§5.6) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |
