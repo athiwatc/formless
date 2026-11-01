@@ -82,6 +82,9 @@ fn corruption_missing_inventory_and_foreign_keys_fail_and_changed_bytes_invalida
         .contains("missing table messages"));
     std::fs::write(&file, &healthy).unwrap();
     let conn = Connection::open(&file).unwrap();
+    // Deliberately construct a damaged backup; normal connections enforce
+    // foreign keys, so disable enforcement only on this fixture writer.
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
     conn.execute("INSERT INTO messages(id,session_id,seq,role,content,created_at) VALUES('orphan','absent',1,'user','x','')",[]).unwrap();
     drop(conn);
     assert!(
