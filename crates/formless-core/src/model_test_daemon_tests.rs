@@ -13,6 +13,8 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(env: &crate::credential_env::EnvGuard, auto: bool) -> Self {
+        env.remove("FORMLESS_BASE_URL");
+        env.remove("FORMLESS_MODEL");
         env.set("FORMLESS_API_KEY", "private-loopback-key");
         env.set("NO_PROXY", "127.0.0.1,localhost");
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -44,6 +46,11 @@ impl Fixture {
         cfg.skills.auto_create = false;
         cfg.save(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(paths).unwrap());
+        assert_eq!(
+            daemon.config().unwrap().provider.base_url,
+            base,
+            "fixture must never send to an inherited endpoint"
+        );
         let session = daemon.with_store(|st| st.create_session(None)).unwrap().id;
         Self {
             daemon: Some(daemon),
