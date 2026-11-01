@@ -125,9 +125,9 @@ without redesign.
   selected model fails with a model/retryable error (failover routing).
   With `provider.model = "auto"`, the daemon instead **auto-selects**
   per Run from `provider.routing_models` (or the fallback list) using
-  only measured local outcomes — recorded provider successes/failures
-  and latency per model, smoothed toward a neutral prior with a small
-  exploration bonus for under-sampled models; optional
+  recent correlated local outcomes (§4.6): a quality gate followed by
+  complete USD per success, or tokens plus latency when unpriced. The
+  smoothed success/latency score retains cold-start exploration; optional
   `routing_fast_models` / `routing_strong_models` subsets constrain
   simple vs complex tasks (`routing_complex_chars`, converted to a token
   threshold at four characters per token). Context size uses the shared,
@@ -485,8 +485,11 @@ an empty listing just asks for one.
   Probe transport uses the configured proxy and normal factory TLS trust.
   `TestModel.probe_usage` reports physical sends and only provider-reported
   counters/costs; missing counters remain unknown, with explicit partial-usage
-  and partial-cost flags. A deadline marks even interim reported counters/costs
-  as partial, retaining their known values and exposing `deadline_exceeded`.
+  and partial-cost flags. A deadline or a stream without its protocol terminal
+  marks even interim reported counters/costs as partial, retaining known values
+  and exposing `deadline_exceeded` / `incomplete_transport`. HTTP EOF alone is
+  not final cost evidence. Chat needs a finish reason or `[DONE]`, Responses a
+  terminal response event, and Messages a complete `message_stop` sequence.
   Its observer does not commit a second usage charge.
   Timeout/cancellation drops the current logical request future rather than
   detaching retries. An already-issued server request may continue or be billed;
@@ -651,6 +654,67 @@ The user talks to one **primary** model; work can go to others.
 
 ### 4.6 Per-task routing for roles
 
+Financial completeness is independent of response success. A typed Responses
+`response.failed` envelope with `status: failed` and final usage can retain
+complete spend for a later successful decision; it never proves model quality.
+Quality evidence belongs to the exact returned physical response, not another
+same-model attempt. Chat finish-only evidence requires the final wire body to
+request one choice and all observed chunks to retain that shape; unknown or
+multiple choices need `[DONE]`. Missing protocol termination keeps reported
+figures but marks routing and probe cost incomplete.
+
+Cost-aware routing uses recent, correlated observations, not the historical
+all-time Metrics totals. `provider.routing_window_days` defaults to 30 and
+applies to actual dispatch, forecasts, context information and explanations.
+The main auto-model quality gate requires `provider.routing_min_samples` (5)
+and `provider.routing_quality_bar` (0.8); roles retain their separate
+`tools.task_min_samples` and `tools.task_quality_bar` thresholds. Existing
+fast/strong subsets and configured-order ties remain effective.
+Model aliases resolve once at raw selection. A forecast/consent's resolved
+provider/role/model is immutable through admission, media projection and HTTP
+serialization; it is never treated as another alias. Scoped resolved dispatch
+clones retain all request/usage hooks and resolve configured fallback aliases
+independently once. Raw public Provider alias inputs keep their existing API.
+
+Among qualified models with a complete cost basis, choose the lowest observed
+USD per success. Provider-reported USD takes precedence; otherwise both token
+counters and configured prices must be known (including cache pricing).
+Unknown or partial usage is not zero cost. When no qualified model has a
+complete USD basis, use relative tokens plus latency; if any qualifier lacks
+complete token counters, use a shared latency-only comparison until they are
+known, rather than discounting missing tokens as zero. An unpriced candidate
+is not silently treated as free in a mixed priced/unpriced pool. Cold-start
+and exploration fallbacks remain explicit. Legacy observations without
+provider/endpoint or correlated cost evidence remain historical metrics;
+no endpoint identity or cost is invented by joining timestamps. Schema 64 stores
+immutable correlated call receipts, exact call-to-task links, and separately
+closed/final task receipts. A task enters the routing sample only when its
+final receipt and all expected call receipts exist. Persistence retries are
+idempotent; a delayed closed receipt cannot overwrite final evidence. User
+ratings and respawns join the exact task identifier, not a model/time guess.
+A role receipt without its exact durable task metadata stays unscored.
+Primary role completion loads its exact Run identity, independently of the
+newest-Runs page; concurrent newer Sessions cannot displace that task metadata. The
+Run's durable rating also applies when feedback races ahead of task insertion.
+Logical producer clocks stop at completion/cancellation, while pending sandbox
+and handle owners retain the receipt until late accounting finishes. Only the
+responsible agent steps choose the task identity; incidental Tool-LLM and child
+resources contribute cost without relabeling it. Multiple responsible serving
+identities make a whole task unscored. A final neutral/incomplete step cannot
+borrow an earlier successful step; cancellation and producer unwind remain
+neutral. Generic transport, auth, rate, context, configuration and resource
+failures make a neutral whole-call sample whose cost is excluded from the
+main selector's quality-ranking numerator; billing remains independent. An
+eligible call includes all its physical failed attempts before a successful
+fallback. A role task includes all its responsible and incidental resources,
+including context compaction and continuations. The main sample is one logical
+Provider dispatch (transport/auth/body/schema/fallback retries included), not
+total Run USD; a changed prompt after context compaction or pause continuation
+starts a new dispatch. Only a compiled-schema
+InvalidJson/SchemaViolation from an actual complete HTTP200 returned response
+is an eligible model-contract failure.
+
+
 Per-call success and latency (§4.1 routing) cannot tell whether a
 sub-agent's answer was good, and per-call latency is the wrong unit. A
 role with `model = "auto"` and `candidates` is therefore routed **per
@@ -666,12 +730,13 @@ task, with quality as a gate**.
   - `respawned`: the primary agent started the same task again in the
     same Run, so the first result wasn't good enough.
   Interrupted tasks are not recorded.
-- **Selection** (`routing::select_task_model`):
+- **Selection** (`routing_policy::select_task` over windowed schema 64 receipts):
   - A candidate qualifies once it has `tools.task_min_samples` (5) tasks
     and at least `tools.task_quality_bar` (0.8) of them completed and not
     re-run.
-  - Among qualifiers the cheapest per task wins: time plus tokens, each
-    relative to the best qualifier.
+  - Among qualifiers with complete cost evidence, lowest USD per success
+    wins. If no qualifier has a complete cost basis, time plus tokens are
+    compared relative to the best qualifier.
   - With no qualifier, the role's first candidate. With probability
     `tools.task_explore_rate` (0.1), the least-sampled under-sampled
     candidate instead, so the others earn samples.
@@ -680,8 +745,8 @@ task, with quality as a gate**.
   to. When the user edits and re-runs it, or corrects it ("that's
   wrong", §8.7), the task becomes bad, so per-role `auto` has a quality
   signal for the primary role as well.
-- Per-call outcomes stay as they were, for failover and the Models
-  metrics view.
+- Historical per-call Metrics remain available independently of the
+  recent, provider-scoped routing evidence. Transport failover is unchanged.
 - Pinned roles (a concrete `model`) are unaffected.
 - **Explained.** Every routing decision (per-role candidates, and
   `provider.model = "auto"`) is kept (the last 50, in memory) with each
@@ -4687,6 +4752,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.routing_models` | [] | Candidates for `model="auto"` measured routing |
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Character-equivalent threshold (÷4 tokens) for calibrated prompt complexity |
+| `provider.routing_window_days` | 30 | Recent event window used by call and role auto-routing; positive days (§4.6) |
+| `provider.routing_min_samples` / `provider.routing_quality_bar` | 5 / 0.8 | Main auto-model quality gate before USD-per-success ranking; role thresholds remain separate (§4.6) |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
 | `provider.audio_input` / `provider.pdf_input` | known endpoint/model only | Permit native audio/PDF attachments (§5.6); unknown adapters/models retain references. API-style gates still apply. |
 | `provider.model_audio_input` / `provider.model_pdf_input` | {} | Boolean overrides by resolved model ID, before provider defaults. An explicit audio override asserts Chat WAV/MP3 support; Gemini's inferred default is WAV only. |

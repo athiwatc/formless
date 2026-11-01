@@ -127,14 +127,7 @@ impl Daemon {
         let model = if ProviderCfg::is_auto_model(&requested) {
             let complex =
                 self.routing_complex(&target_model.provider, &requested, &messages, &[], &cfg)?;
-            crate::routing::select_model(
-                target_model.provider.settings(),
-                &self.with_reader(|st| st.list_model_stats())?,
-                complex,
-            )
-            .context(BranchSummaryFailure::Invalid(
-                "No configured model candidates for the target summary provider".into(),
-            ))?
+            self.resolve_model_named(&requested, &cfg, target_model.provider.name(), complex)?
         } else {
             requested
         };
