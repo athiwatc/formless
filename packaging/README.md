@@ -56,7 +56,13 @@ permissions, and selecting a version tag can reach its publishing jobs.
 The baseline token has only `contents: read`; checkout does not persist its
 credentials. It never creates a tag/release, logs into or pushes a container or
 package registry, updates a tap, submits winget/AUR changes, or uses publishing
-secrets. Only Linux package/checksum fixtures transfer between jobs as private,
+secrets. The bullseye SHA read uses a temporary, command-scoped Git context:
+Git 2.30.2 needs its exact checkout exception in a private XDG global-scope file,
+not `-c safe.directory`. The same private file serves newer Git through
+`GIT_CONFIG_GLOBAL`; ambient broader trust is refused, system config is disabled
+for these commands, `HOME` is unchanged, and the private context is removed on
+step exit. No actual user/system Git configuration is written.
+Only Linux package/checksum fixtures transfer between jobs as private,
 same-run workflow artifacts (one-day retention), not GitHub Release assets or
 GitHub Packages. Package installation is confined to disposable Debian/Ubuntu/
 Rocky job containers. The built package must have no maintainer/trigger scripts
