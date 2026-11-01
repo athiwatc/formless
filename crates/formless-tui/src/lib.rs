@@ -5108,10 +5108,7 @@ impl App {
         let paths: Vec<_> = formless_core::files::mentions(&text)
             .iter()
             .map(|p| {
-                let path = p
-                    .strip_prefix("~/")
-                    .and_then(|rest| directories::BaseDirs::new().map(|b| b.home_dir().join(rest)))
-                    .unwrap_or_else(|| root.join(p));
+                let path = mention_path_in(&root, p).unwrap_or_else(|| root.join(p));
                 let stamp = path.metadata().ok().map(|m| (m.len(), m.modified().ok()));
                 (path, stamp)
             })
@@ -5129,10 +5126,9 @@ impl App {
             .collect();
         let root = self.work_dir();
         for mention in formless_core::files::mentions(&self.input.expanded()) {
-            let candidate = mention
-                .strip_prefix("~/")
-                .and_then(|rest| directories::BaseDirs::new().map(|b| b.home_dir().join(rest)))
-                .unwrap_or_else(|| root.join(&mention));
+            let Some(candidate) = mention_path_in(&root, &mention) else {
+                continue;
+            };
             let Ok(path) = candidate.canonicalize() else {
                 continue;
             };
@@ -5435,7 +5431,10 @@ impl App {
         let root = Some(self.work_dir());
         let found: Vec<String> = formless_core::files::mentions(&text)
             .into_iter()
-            .filter(|p| root.as_ref().is_some_and(|r| r.join(p).exists()))
+            .filter(|p| {
+                root.as_ref()
+                    .is_some_and(|r| mention_path_in(r, p).is_some_and(|p| p.exists()))
+            })
             .collect();
         let held = std::mem::take(&mut self.attachments);
         for (name, bytes) in &held {
@@ -11353,6 +11352,15 @@ fn short_dir(dir: &str) -> String {
     } else {
         d
     }
+}
+
+/// Resolve the same native-home spelling used by daemon AttachPath. Merely
+/// constructing this path grants no access; the daemon still validates intake.
+fn mention_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    Some(match path.strip_prefix("~/") {
+        Some(rest) => directories::BaseDirs::new()?.home_dir().join(rest),
+        None => base.join(path),
+    })
 }
 
 /// A file a chat mentions, resolved against `base` (the Session's working

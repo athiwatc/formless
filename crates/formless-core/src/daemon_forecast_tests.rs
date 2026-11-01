@@ -523,7 +523,7 @@ async fn racing_attachment_waits_for_admission_and_cannot_enter_the_confirmed_re
                 session_id: sid.clone(),
                 content: "task".into(),
                 mode: SendMode::Send,
-                client_msg_id: Some("approved-race".into()),
+                client_msg_id: None,
             }),
         )
         .await
@@ -617,7 +617,7 @@ async fn preview_makes_zero_requests_and_completed_run_records_exact_wire_usage_
                 session_id: sid.clone(),
                 content: "task".into(),
                 mode: SendMode::Send,
-                client_msg_id: Some("actual-wire".into()),
+                client_msg_id: None,
             }),
         )
         .await

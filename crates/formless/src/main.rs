@@ -1454,6 +1454,8 @@ fn run_cli(cli: Cli) -> Result<()> {
         } else {
             formless_core::forecast::estimate(&paths, &input)?
         };
+        // Only an owned DTO reaches output: private readers and maintenance
+        // freezes have dropped, even if stdout is a backpressured pipe.
         if *json {
             println!("{}", serde_json::to_string_pretty(&forecast)?);
         } else {

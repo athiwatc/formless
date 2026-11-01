@@ -136,7 +136,10 @@ fn dimension_image(dims: Option<(u32, u32)>) -> String {
 }
 
 pub fn estimate(paths: &Paths, input: &ForecastInput) -> Result<RunForecast> {
-    let st = Store::open_forecast_snapshot(paths)?.unwrap_or(Store::open_in_memory()?);
+    let st = match Store::open_forecast_snapshot(paths)? {
+        Some(snapshot) => snapshot,
+        None => Store::open_in_memory()?,
+    };
     // The private snapshot retains its configuration namespace freeze while quoting.
     let cfg = Config::load(paths)?; // Configuration only, never provider_key/auth.
     estimate_store(&st, &cfg, input)
@@ -349,7 +352,7 @@ pub(crate) fn estimate_store_with_window(
         if let Some(path) = &a.reference {
             normalized.push(json!({"reference":true,"name":a.name,"path":path,"dir":a.directory,"bytes":a.bytes}));
         } else {
-            normalized.push(json!({"id":"00000000-0000-0000-0000-000000000000","name":a.name,"mime":a.mime,"bytes":a.bytes}));
+            normalized.push(json!({"id":"00000000-0000-0000-0000-000000000000","name":crate::daemon::cap_name(&a.name,120),"mime":a.mime,"bytes":a.bytes}));
         }
     }
     if !input.draft.is_empty() {
