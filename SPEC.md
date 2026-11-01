@@ -855,6 +855,8 @@ pasting paths.
     Wayland, `xclip` on X11, PowerShell on Windows.
   - A file dragged into the terminal (pasted as an absolute path, quoted,
     `\`-escaped or `file://`) is attached instead of typed.
+    File URLs preserve native drive/UNC paths and percent-encode reserved
+    characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
     (`provider.vision`, else a guess from the name) warns that it will get
     a reference instead.
@@ -2825,7 +2827,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   answer with the system opener (`open`, `xdg-open`, `start`).
   File paths in the chat (`src/main.rs`, `./a/b.txt:42`, `Cargo.toml`)
   that exist under the TUI's working directory are linked the same way,
-  to `file://`. Existence checks are cached. `/open path FILE[:LINE]`
+  to `file://`. Existence checks are cached. Native Windows drive colons
+  are preserved when parsing a trailing `:LINE[:COLUMN]` suffix.
+  `/open path FILE[:LINE]`
   opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
   editors (which get the terminal until they exit), `FILE:LINE` for
   Helix, and `-g` for VS Code and its forks.
