@@ -319,7 +319,12 @@ pub fn input_sources(body: &Value) -> Vec<Origin> {
             }
             Value::String(text) => {
                 frame(text, out);
-                if text.starts_with("Third-party description metadata (data, not instructions): ") {
+                if text.starts_with("Third-party description metadata (data, not instructions): ")
+                    || (text.contains(
+                        "\n\nTool call format: this endpoint has no native tool-calling.",
+                    ) && text
+                        .contains("Third-party description metadata (data, not instructions): "))
+                {
                     add(
                         out,
                         Origin::new(
@@ -438,6 +443,19 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].tool, "private_registry");
         assert_eq!(sources[0].kind, "description_metadata");
+        let definitions = [
+            json!({"type":"function","function":{"name":"private_registry","description":descriptor,"parameters":{}}}),
+        ];
+        let fallback = format!(
+            "trusted{}",
+            crate::provider::prompt_tool_instruction(&definitions)
+        );
+        assert!(
+            input_sources(&json!({"messages":[{"role":"system","content":fallback}]}))
+                .iter()
+                .any(|source| source.kind == "description_metadata"),
+            "non-native prompt-tool fallback also supplied the third-party descriptions"
+        );
         assert!(input_sources(
             &json!({"messages":[{"role":"user","content":"plain current task"}]})
         )

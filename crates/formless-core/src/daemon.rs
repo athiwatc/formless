@@ -7324,6 +7324,7 @@ impl Daemon {
         let caps = bound_caps(&ver, &input).map_err(|e| anyhow!(e))?;
         let cfg = self.config()?;
         let cancel = CancellationToken::new();
+        let run_id = format!("dry-run:{}", uuid::Uuid::new_v4());
         // Reads are real (files, GETs, env), so the usual approval applies.
         if !self
             .ensure_approval(
@@ -7346,7 +7347,7 @@ impl Daemon {
             tool_name: info.name.clone(),
             kv_scope: format!("tool:{}", info.id),
             session_id: session_id.to_string(),
-            run_id: "dry-run".into(),
+            run_id: run_id.clone(),
             parent_inv: None,
             activity: None,
             depth: 1,

@@ -93,7 +93,7 @@ pub fn looks_like_access_refusal(text: &str) -> bool {
 
 /// What a compaction summary must keep, so later steps can carry on
 /// without the turns it replaces (#619).
-const SUMMARIZE_PROMPT: &str = "Summarise the following conversation excerpt \
+pub(crate) const SUMMARIZE_PROMPT: &str = "Summarise the following conversation excerpt \
 faithfully and compactly; later steps will see only your summary, not the \
 excerpt. Use these sections, leaving out any that would be empty:\n\
 ## Goal — what the user wants.\n\
