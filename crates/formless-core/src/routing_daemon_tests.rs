@@ -260,13 +260,14 @@ async fn real_pending_tool_pins_role_cost_until_last_handle_owner_without_relabe
         .await
         .expect("real nested model POST missing");
     f.idle().await;
-    let (handle, task_weak) = {
+    let (handle, task_weak, task_id) = {
         let pending = f.daemon().pending.locked();
         assert_eq!(pending.len(), 1);
         let (handle, entry) = pending.iter().next().unwrap();
         (
             handle.clone(),
             Arc::downgrade(entry.routing_task.as_ref().expect("pending task owner")),
+            entry.routing_task.as_ref().unwrap().id().to_string(),
         )
     };
     f.daemon().flush_routing().unwrap();
@@ -293,15 +294,28 @@ async fn real_pending_tool_pins_role_cost_until_last_handle_owner_without_relabe
         "real Runloop auto-abandons after its pending reminder"
     );
     f.release.add_permits(1);
+    // Arc reaches strong_count=0 before Task::drop publishes Final. A
+    // nonblocking flush also intentionally skips another in-progress batch.
+    // Synchronize on the actual durable receipt, not either intermediate
+    // lifecycle observation. Eligibility/cost assertions remain below.
     tokio::time::timeout(Duration::from_secs(10), async {
-        while task_weak.strong_count() != 0 {
+        loop {
+            if task_weak.strong_count() == 0 {
+                f.daemon().flush_routing().unwrap();
+                if f.daemon()
+                    .with_reader(|st| st.routing_task_final_persisted(&task_id))
+                    .unwrap()
+                {
+                    break;
+                }
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("running abandoned executor retained task after completion");
+    .expect("abandoned executor did not release its last owner and persist Final");
     assert!(!f.daemon().pending.locked().contains_key(&handle));
-    f.daemon().flush_routing().unwrap();
+    assert_eq!(task_weak.strong_count(), 0);
     let stats = f
         .daemon()
         .with_reader(|st| st.routing_task_stats(&f.cfg, "worker", "default", chrono::Utc::now()))

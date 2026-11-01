@@ -79,8 +79,9 @@ impl RequestFailure {
     }
 }
 
-/// Admission refusals and local accounting errors provide no model-quality
-/// observation. Preserve real provider faults, even if their prose says budget.
+/// Legacy request-health counters exclude admission and local accounting
+/// errors. Correlated routing-quality eligibility is classified separately.
+/// Preserve real provider faults, even if their prose says budget.
 fn is_model_failure(error: &anyhow::Error) -> bool {
     !error
         .downcast_ref::<RequestFailure>()
@@ -6157,14 +6158,18 @@ impl Daemon {
                 &outcome,
                 cancel.is_cancelled(),
             );
-            match routing_call.resolved_outcome() {
-                crate::routing_observation::Outcome::Success(identity) => {
-                    self.record_model_outcome(&identity.model, true, started)
+            // Keep the legacy request-health counters independently of the
+            // correlated routing-quality receipt. HTTP availability faults are
+            // neutral for routing, but remain real failures in Metrics. Local
+            // admission/accounting failures still do not blame a model.
+            match &outcome {
+                Ok(result) => self.record_model_outcome(&result.model_used, true, started),
+                Err(error) if !cancel.is_cancelled() && is_model_failure(error) => {
+                    if let Some(identity) = routing_call.last_sent_identity() {
+                        self.record_model_outcome(&identity.model, false, started);
+                    }
                 }
-                crate::routing_observation::Outcome::ContractFailure(identity) => {
-                    self.record_model_outcome(&identity.model, false, started)
-                }
-                crate::routing_observation::Outcome::Neutral(_) => {}
+                _ => {}
             }
             drop(routing_call);
             self.flush_routing()?;

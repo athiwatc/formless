@@ -196,6 +196,21 @@ impl Call {
     pub fn contract_identity(&self) -> Option<Identity> {
         self.state.locked().contract.clone()
     }
+    /// Legacy request-health counters can record a real failed send without
+    /// treating availability as model quality. This is attempted identity only;
+    /// it never attests a served response or changes the correlated outcome.
+    pub fn last_sent_identity(&self) -> Option<Identity> {
+        let state = self.state.locked();
+        if state.truncated {
+            return None;
+        }
+        state
+            .attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.sent)
+            .map(|attempt| attempt.identity.clone())
+    }
     fn stop_clock(&self) {
         self.stop_clock_at(
             std::time::Instant::now(),

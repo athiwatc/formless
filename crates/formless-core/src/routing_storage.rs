@@ -143,6 +143,15 @@ impl Store {
         }
         Ok(choice)
     }
+    #[cfg(test)]
+    pub(crate) fn routing_task_final_persisted(&self, task_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM routing_tasks WHERE id=?1 AND final=1)",
+            params![task_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Called with a detached serialized batch. Callbacks never hold this Store
     /// or execute SQL; an error leaves the caller's exact receipts retryable.
     pub(crate) fn record_routing(&self, receipts: &[Receipt]) -> Result<()> {

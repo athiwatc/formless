@@ -321,34 +321,79 @@ async fn an_auto_role_uses_the_measured_winner() {
     );
     cfg.save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
+    // Legacy task_stats alone intentionally has no provable provider/endpoint,
+    // window or paid-call correlation. Seed the finalized, exactly linked
+    // receipts the current selector consumes; retain the original quality
+    // contrast (fast-bad 2/6, good 6/6), not a cold-start candidate-order test.
+    let db = rusqlite::Connection::open(paths.db_file()).unwrap();
+    let endpoint = formless_core::tokens::provider_key("default", &cfg.provider);
+    let finished = chrono::Utc::now().timestamp_millis();
     for i in 0..6 {
-        store
-            .record_task(
-                "scout",
-                "fast-bad",
-                "s",
-                "r",
-                &format!("a{i}"),
-                500,
-                10,
-                2,
-                if i < 2 { "completed" } else { "failed" },
+        for (model, hash, ms, tokens, turns, good) in [
+            ("fast-bad", format!("a{i}"), 500, 10, 2, i < 2),
+            ("good", format!("b{i}"), 4000, 90, 3, true),
+        ] {
+            store
+                .record_task(
+                    "scout",
+                    model,
+                    "s",
+                    "r",
+                    &hash,
+                    ms,
+                    tokens,
+                    turns,
+                    if good { "completed" } else { "failed" },
+                )
+                .unwrap();
+            let task_id: String = db
+                .query_row(
+                    "SELECT id FROM task_stats WHERE role='scout' AND task_hash=?1",
+                    [&hash],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let call_id = format!("call-{hash}");
+            let identity =
+                serde_json::json!({"provider":"default","endpoint":endpoint,"model":model});
+            let outcome = if good {
+                serde_json::json!({"Success": identity})
+            } else {
+                serde_json::json!({"ContractFailure": identity})
+            };
+            let call = serde_json::json!({
+                "id":call_id,"outcome":outcome,
+                "attempts":[{"id":format!("attempt-{hash}"),"identity":identity,"sent":true,
+                    "status":200,"neutral":null,"response_complete":true,"usage":{
+                        "prompt_tokens":tokens,"completion_tokens":0,"reasoning_tokens":0,
+                        "cached_tokens":0,"cache_write_tokens":0,"cost":null,"cost_unknown":false,"reported":3
+                    }}],
+                "task_ids":[task_id],"resource_only":false,"truncated":false,
+                "started_at_ms":finished-ms,"finished_at_ms":finished,"elapsed_ms":ms
+            });
+            let task = serde_json::json!({
+                "id":task_id,"role":"scout","parent_ids":[],
+                "outcome":if good { "Completed" } else { "ContractFailure" },
+                "responsible":identity,"mixed":false,"expected_calls":1,"capture_complete":true,
+                "started_at_ms":finished-ms,"finished_at_ms":finished,"elapsed_ms":ms
+            });
+            db.execute(
+                "INSERT INTO routing_calls(id,finished_at_ms,provider,endpoint,model,payload) VALUES(?1,?2,'default',?3,?4,?5)",
+                rusqlite::params![call_id,finished,endpoint,model,call.to_string()],
+            ).unwrap();
+            db.execute(
+                "INSERT INTO routing_tasks(id,finished_at_ms,role,provider,endpoint,model,final,payload) VALUES(?1,?2,'scout','default',?3,?4,1,?5)",
+                rusqlite::params![task_id,finished,endpoint,model,task.to_string()],
+            ).unwrap();
+            db.execute(
+                "INSERT INTO routing_call_tasks(call_id,task_id) VALUES(?1,?2)",
+                rusqlite::params![call_id, task_id],
             )
             .unwrap();
-        store
-            .record_task(
-                "scout",
-                "good",
-                "s",
-                "r",
-                &format!("b{i}"),
-                4000,
-                90,
-                3,
-                "completed",
-            )
-            .unwrap();
+        }
     }
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM routing_tasks t JOIN routing_call_tasks l ON l.task_id=t.id JOIN routing_calls c ON c.id=l.call_id WHERE t.final=1 AND t.endpoint=?1 AND c.endpoint=?1",[&endpoint],|r|r.get::<_,i64>(0)).unwrap(),12);
+    drop(db);
     let sid = store.create_session(None).unwrap().id;
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
     daemon
