@@ -14,6 +14,9 @@ pub struct Capabilities {
     pub net: Option<Vec<String>>,
     pub fs_read: Vec<String>,
     pub fs_write: Vec<String>,
+    /// Exact-path consent for a credential read; grants no filesystem scope.
+    #[serde(default)]
+    pub sensitive_read: Vec<String>,
     pub env: Vec<String>,
     /// None = no process. Some(empty) = unscoped. Some(list) = those commands.
     pub process: Option<Vec<String>>,
@@ -84,6 +87,11 @@ impl Capabilities {
                     canonical_host_scope(d)?
                 };
                 c.net.get_or_insert_with(Vec::new).push(host);
+            } else if let Some(p) = s.strip_prefix("fs:read-sensitive:") {
+                if p.is_empty() || !std::path::Path::new(p).is_absolute() {
+                    return Err("fs:read-sensitive needs an absolute concrete path".into());
+                }
+                c.sensitive_read.push(p.to_string());
             } else if let Some(p) = s.strip_prefix("fs:read:") {
                 if p.is_empty() {
                     return Err("fs:read needs a path".into());
@@ -172,6 +180,11 @@ impl Capabilities {
             None => {}
         }
         out.extend(self.fs_read.iter().map(|p| format!("fs:read:{p}")));
+        out.extend(
+            self.sensitive_read
+                .iter()
+                .map(|p| format!("fs:read-sensitive:{p}")),
+        );
         out.extend(self.fs_write.iter().map(|p| format!("fs:write:{p}")));
         out.extend(self.env.iter().map(|k| format!("env:{k}")));
         match &self.process {
@@ -340,6 +353,7 @@ impl Capabilities {
             net: merge_scoped(&self.net, &other.net),
             fs_read: merge(&self.fs_read, &other.fs_read),
             fs_write: merge(&self.fs_write, &other.fs_write),
+            sensitive_read: merge(&self.sensitive_read, &other.sensitive_read),
             env: merge(&self.env, &other.env),
             process: merge_scoped(&self.process, &other.process),
             clipboard_read: self.clipboard_read || other.clipboard_read,
@@ -359,6 +373,7 @@ impl Capabilities {
         self.net.is_some()
             || self.process.is_some()
             || !self.fs_write.is_empty()
+            || !self.sensitive_read.is_empty()
             || !self.env.is_empty()
             || self.clipboard_read
             || self.clipboard_write
@@ -377,6 +392,11 @@ impl Capabilities {
             formless_protocol::net_scope::host_covers(ah, bh) && ap.is_none_or(|p| Some(p) == bp)
         }) && path_covers(&self.fs_read, &other.fs_read)
             && path_covers(&self.fs_write, &other.fs_write)
+            // These are captured canonical identities, not grants to a
+            // namespace which may later be retargeted through a symlink.
+            && other.sensitive_read.iter().all(|want| self.sensitive_read.iter().any(|have| {
+                std::path::Path::new(have) == std::path::Path::new(want)
+            }))
             && other.env.iter().all(|k| self.env.contains(k))
             // `process:git` covers `process:git:status`; a scoped grant
             // covers only the sub-commands it lists.
@@ -452,7 +472,7 @@ pub fn canonical_path(raw: &str) -> Result<std::path::PathBuf, String> {
 /// Relative separators are reconstructed natively, so ordinary JS `sub/file`
 /// also works under a canonical Windows Session cwd. OS names stay OsString;
 /// only the JSON-facing caller requires UTF-8.
-fn lexical_absolute(
+pub fn lexical_absolute(
     base: &std::path::Path,
     path: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
@@ -752,6 +772,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn credential_consent_is_exact_and_never_filesystem_authority() {
+        let root = PathFixture::new();
+        let child = root.0.join("secret.key");
+        let wanted = caps(&[&format!("fs:read-sensitive:{}", child.display())]);
+        let broad = caps(&[&format!("fs:read:{}", root.0.display())]);
+        assert!(!broad.covers(&wanted));
+        let parent = caps(&[&format!("fs:read-sensitive:{}", root.0.display())]);
+        assert!(!parent.covers(&wanted));
+        assert!(wanted.is_sensitive());
+        assert!(wanted.covers(&wanted));
+        assert!(wanted.fs_read.is_empty() && wanted.fs_write.is_empty());
+        assert_eq!(Capabilities::parse(&wanted.to_specs()).unwrap(), wanted);
+        assert!(Capabilities::parse(&["fs:read-sensitive:relative".into()]).is_err());
     }
 
     #[test]

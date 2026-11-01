@@ -591,6 +591,7 @@ struct ForecastConsent {
 }
 
 pub struct Daemon {
+    pub(crate) sensitive_anchors: Vec<std::path::PathBuf>,
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
     /// Read-only connections for client queries (lists, search, exports),
@@ -625,6 +626,8 @@ pub struct Daemon {
     input_taint: crate::approval_preview::TaintIndex,
     #[cfg(test)]
     forecast_admission_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    approval_transition_test: StdMutex<Option<Arc<dyn Fn(&str, &str) + Send + Sync>>>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
     /// or next Run (cleared when it ends).
     step_limits: StdMutex<HashMap<String, u32>>,
@@ -750,6 +753,27 @@ impl Daemon {
             bail!("a daemon is already running for this data dir");
         }
         let store = Store::open(&paths.db_file())?;
+        let cwd = std::env::current_dir()?;
+        let mut sensitive_anchors = [&paths.data_dir, &paths.config_dir]
+            .into_iter()
+            .map(|root| {
+                formless_runtime::caps::lexical_absolute(&cwd, root).map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sensitive_anchors
+            .extend(crate::sensitive_reads::credential_file_paths().map_err(|e| anyhow!(e))?);
+        // Keep configured namespaces as well as physical startup identities.
+        // A later env change or symlink retarget cannot unprotect an old key.
+        let canonical_anchors = sensitive_anchors
+            .iter()
+            .map(|root| {
+                formless_runtime::caps::canonical_path(
+                    root.to_str().context("protected path is not UTF-8")?,
+                )
+                .map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sensitive_anchors.extend(canonical_anchors);
         // A damaged database stops the daemon with the backup to restore,
         // instead of failing wherever it first bites (SPEC §16).
         store.check_integrity(&paths.db_file())?;
@@ -815,6 +839,8 @@ impl Daemon {
             input_taint: Arc::new(StdMutex::new(Default::default())),
             #[cfg(test)]
             forecast_admission_test: StdMutex::new(None),
+            #[cfg(test)]
+            approval_transition_test: StdMutex::new(None),
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
@@ -861,6 +887,7 @@ impl Daemon {
             shutdown: CancellationToken::new(),
             build: build_id(),
             started: std::time::Instant::now(),
+            sensitive_anchors,
             _ownership: ownership,
         })
     }
@@ -1316,6 +1343,14 @@ impl Daemon {
             tools.len(),
             cfg.provider.routing_complex_chars,
         ))
+    }
+
+    #[cfg(test)]
+    fn test_approval_transition(&self, phase: &str, id: &str) {
+        let hook = self.approval_transition_test.locked().clone();
+        if let Some(hook) = hook {
+            hook(phase, id);
+        }
     }
 
     fn remove_attention(&self, id: &str) {
@@ -4318,31 +4353,44 @@ impl Daemon {
                 paths,
                 remember_denial,
             } => {
-                // First answer wins (SPEC §10.4): removing the sender resolves
-                // it. A late or losing answer leaves nothing behind (#764).
-                let tx = self.approvals.locked().remove(&approval_id);
-                self.remove_attention(&approval_id);
-                if tx.is_some() {
-                    if remember_denial && !approved {
-                        self.deny_always.locked().insert(approval_id.clone());
+                // Serialize claiming the waiter and publishing answer metadata
+                // against cancellation cleanup. Lock order is approvals then
+                // one metadata map; no path holds metadata then approvals.
+                // No mutex is held across an await, attention or broadcast.
+                let resolved = {
+                    let mut waiters = self.approvals.locked();
+                    if waiters.contains_key(&approval_id) {
+                        #[cfg(test)]
+                        self.test_approval_transition("answer-claimed", &approval_id);
+                        if remember_denial && !approved {
+                            self.deny_always.locked().insert(approval_id.clone());
+                        }
+                        if !paths.is_empty() {
+                            self.approval_paths
+                                .locked()
+                                .insert(approval_id.clone(), paths);
+                        }
+                        if let Some((_, label)) = current_client() {
+                            self.approval_by.locked().insert(approval_id.clone(), label);
+                        }
+                        let sent = match waiters.remove(&approval_id) {
+                            Some(tx) => tx.send((approved, scope)).is_ok(),
+                            None => false,
+                        };
+                        if !sent {
+                            // Cancellation already dropped the receiver. Its
+                            // cleanup cannot run until this lock is released;
+                            // a losing answer must leave no metadata to apply.
+                            self.deny_always.locked().remove(&approval_id);
+                            self.approval_paths.locked().remove(&approval_id);
+                            self.approval_by.locked().remove(&approval_id);
+                        }
+                        sent
+                    } else {
+                        false
                     }
-                    if !paths.is_empty() {
-                        self.approval_paths
-                            .lock()
-                            .unwrap()
-                            .insert(approval_id.clone(), paths);
-                    }
-                    if let Some((_, label)) = current_client() {
-                        self.approval_by
-                            .lock()
-                            .unwrap()
-                            .insert(approval_id.clone(), label);
-                    }
-                }
-                let resolved = match tx {
-                    Some(tx) => tx.send((approved, scope)).is_ok(),
-                    None => false,
                 };
+                self.remove_attention(&approval_id);
                 if resolved {
                     self.broadcast(Event::ApprovalAnswered {
                         approval_id,
@@ -7386,6 +7434,8 @@ impl Daemon {
         }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let ops = Arc::new(NestedOps {
+            read_identity: Some((info.clone(), ver.clone())),
+            read_input: input.clone(),
             _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: info.name.clone(),
@@ -8503,7 +8553,7 @@ impl Daemon {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let limit = std::time::Duration::from_secs(cfg.tools.smoke_timeout_secs.max(1));
-        match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), Some(cancel.clone()), limit).await {
+        match execute_bounded(req, Arc::new(formless_runtime::GuardedNoHostOps(crate::sensitive_reads::policy(&self.paths, &cfg.security, &self.sensitive_anchors).map_err(|e| anyhow!(e))?)), Some(cancel.clone()), limit).await {
             Bounded::Done(Ok(_)) => {}
             Bounded::Done(Err(e)) if e.after_stub => {}
             Bounded::Done(Err(e)) => return Err(anyhow!("module smoke test failed: {}", e.message)),
@@ -8818,7 +8868,7 @@ impl Daemon {
         // Bounded and cancellable (SPEC §7.1): it is a validation gate on
         // synthetic input, not user work.
         let limit = std::time::Duration::from_secs(cfg.tools.smoke_timeout_secs.max(1));
-        let note = match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), cancel, limit).await {
+        let note = match execute_bounded(req, Arc::new(formless_runtime::GuardedNoHostOps(crate::sensitive_reads::policy(&self.paths, &cfg.security, &self.sensitive_anchors).map_err(|e| anyhow!(e))?)), cancel, limit).await {
             Bounded::Done(Ok(_)) => None,
             Bounded::Done(Err(e)) if e.after_stub && e.kind != ExecErrorKind::Resource => Some(format!(
                 "inconclusive (failed after a stubbed effect: {}); call the Tool or test_tool it with real input",
@@ -11158,6 +11208,8 @@ impl Daemon {
         }
         let script_id = uuid::Uuid::new_v4().to_string();
         let ops = Arc::new(NestedOps {
+            read_identity: None,
+            read_input: Value::Null,
             _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: "run_script".into(),
@@ -11395,6 +11447,8 @@ impl Daemon {
             );
         }
         let ops = Arc::new(NestedOps {
+            read_identity: Some((info.clone(), ver.clone())),
+            read_input: input.clone(),
             _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: d.name.clone(),
@@ -11485,6 +11539,58 @@ impl Daemon {
         input: Option<&Value>,
         cancel: &CancellationToken,
     ) -> bool {
+        // Concrete protected targets are never offered for consent. Broad
+        // scopes remain usable for ordinary files; the runtime excludes the
+        // protected subtree at each actual operation regardless of that grant.
+        let policy = match crate::sensitive_reads::policy(
+            &self.paths,
+            &cfg.security,
+            &self.sensitive_anchors,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!("invalid credential-read policy: {error}");
+                return false;
+            }
+        };
+        for path in caps
+            .fs_read
+            .iter()
+            .chain(&caps.fs_write)
+            .chain(&caps.sensitive_read)
+        {
+            if path.starts_with("$input.") {
+                continue;
+            }
+            let canonical = match formless_runtime::caps::canonical_path(path) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let raw = match formless_runtime::caps::lexical_absolute(
+                &std::env::current_dir().unwrap_or_default(),
+                std::path::Path::new(path),
+            ) {
+                Ok(path) => path,
+                Err(_) => return false,
+            };
+            match policy.classify(&raw, &canonical) {
+                Ok(formless_runtime::sensitive_paths::PathDecision::Forbidden) | Err(_) => {
+                    let _ = self.with_store(|st| {
+                        st.audit(
+                            "daemon",
+                            "tool.deny_profile",
+                            &format!(
+                                "{}: protected profile path {}",
+                                info.name,
+                                canonical.display()
+                            ),
+                        )
+                    });
+                    return false;
+                }
+                _ => {}
+            }
+        }
         let needs = caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb;
         if !needs {
             return true;
@@ -11511,7 +11617,7 @@ impl Daemon {
         }
         // Approvals are opt-in (`security.secure`); denials apply anyway.
         // Record the allow decision, not an execution or successful outcome.
-        if !cfg.security.secure {
+        if !cfg.security.secure && caps.sensitive_read.is_empty() {
             let _ = self.with_store(|st| {
                 st.audit(
                     "approvals-off",
@@ -11715,6 +11821,8 @@ impl Daemon {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
+        #[cfg(test)]
+        self.test_approval_transition("waiter-cleanup", &approval_id);
         self.approvals.locked().remove(&approval_id);
         self.remove_attention(&approval_id);
         let by = self
@@ -12561,6 +12669,8 @@ impl Daemon {
                 return outcome.map(|v| (v, inv_id));
             }
             let ops = Arc::new(NestedOps {
+                read_identity: Some((info.clone(), ver.clone())),
+                read_input: input.clone(),
                 _taint_scope: self.taint_scope(&session_id, &run_id),
                 daemon: self.clone(),
                 tool_name: info.name.clone(),
@@ -13238,6 +13348,8 @@ impl Daemon {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
+        #[cfg(test)]
+        self.test_approval_transition("waiter-cleanup", &approval_id);
         self.approvals.locked().remove(&approval_id);
         self.remove_attention(&approval_id);
         // These prompts have no Tool to remember a denial or a folder for:
@@ -14308,6 +14420,8 @@ fn mcp_state(s: &McpServerInfo) -> &'static str {
 /// block_on the daemon executor.
 struct NestedOps {
     _taint_scope: Arc<crate::approval_preview::RunTaint>,
+    read_identity: Option<(ToolInfo, ToolVersionInfo)>,
+    read_input: Value,
     daemon: Arc<Daemon>,
     tool_name: String,
     /// The Tool's own store namespace ("tool:<id>"; "test:<name>" drafts).
@@ -14351,6 +14465,57 @@ impl NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn path_policy(
+        &self,
+    ) -> std::result::Result<formless_runtime::sensitive_paths::PathPolicy, String> {
+        let cfg = self.daemon.config().map_err(|e| e.to_string())?;
+        crate::sensitive_reads::policy(
+            &self.daemon.paths,
+            &cfg.security,
+            &self.daemon.sensitive_anchors,
+        )
+    }
+
+    fn approve_sensitive_read(
+        &self,
+        path: &std::path::Path,
+        operation: &str,
+        reason: &str,
+    ) -> std::result::Result<(), String> {
+        let (info, ver) = self
+            .read_identity
+            .as_ref()
+            .ok_or("no invocation identity for credential consent")?;
+        let path = path
+            .to_str()
+            .ok_or("credential path cannot be represented as UTF-8 JSON")?;
+        let caps = Capabilities {
+            sensitive_read: vec![path.to_string()],
+            ..Default::default()
+        };
+        let input = json!({"invocation":self.read_input, "runtime_access":{"path":path, "operation":operation, "credential_rule":reason}});
+        let cfg = self.daemon.config().map_err(|e| e.to_string())?;
+        // ensure_approval owns cancellation and removes its waiter, retained
+        // attention and decision metadata before returning. Wrapping it in
+        // block_cancellable's outer select could drop that future at its
+        // await point and let the Invocation finish before cleanup ran.
+        let allowed = self.handle.block_on(self.daemon.ensure_approval(
+            &cfg,
+            &self.session_id,
+            &self.run_id,
+            info,
+            ver,
+            &caps,
+            Some(&input),
+            &self.cancel,
+        ));
+        if allowed {
+            Ok(())
+        } else {
+            Err("credential read approval denied".into())
+        }
+    }
+
     fn data_observed(&self, kind: &str, origin: &str) -> std::result::Result<(), String> {
         self.daemon
             .record_data_origin(
@@ -16676,3 +16841,7 @@ mod session_comparison_rpc_tests;
 #[cfg(test)]
 #[path = "approval_daemon_tests.rs"]
 mod approval_daemon_tests;
+
+#[cfg(test)]
+#[path = "sensitive_read_daemon_tests.rs"]
+mod sensitive_read_daemon_tests;

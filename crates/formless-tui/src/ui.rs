@@ -166,6 +166,12 @@ pub(crate) fn explain_capability(spec: &str) -> String {
         },
         ("fs", s) => {
             let (mode, path) = s.split_once(':').unwrap_or((s, ""));
+            if mode == "read-sensitive" {
+                return format!(
+                    "can read credential data at exactly {path}. {}",
+                    formless_protocol::sensitive_read_warning(spec).unwrap_or_default()
+                );
+            }
             let what = if mode == "write" {
                 "can create, overwrite or delete files"
             } else {
@@ -221,5 +227,14 @@ mod capability_tests {
         assert_eq!(e("process:git"), "can run the program `git`");
         assert!(e("harness:mcp").contains("each one asks you"));
         assert!(e("weird:thing").contains("doesn't know"));
+    }
+
+    #[test]
+    fn credential_reads_are_exact_instead_of_directory_grants() {
+        let explanation = e("fs:read-sensitive:/private/project/token.json");
+        assert!(explanation.contains("at exactly /private/project/token.json"));
+        assert!(explanation.contains("not descendants"));
+        assert!(explanation.contains("may flow to the model provider"));
+        assert!(!explanation.contains("under "));
     }
 }

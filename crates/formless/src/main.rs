@@ -3847,10 +3847,18 @@ fn run_headless(
                     Event::ApprovalRequested {
                         approval_id,
                         tool_name,
+                        capabilities,
                         context,
                         ..
                     } => {
                         if progress {
+                            for capability in &capabilities {
+                                if let Some(warning) =
+                                    formless_protocol::sensitive_read_warning(capability)
+                                {
+                                    eprintln!("⚠ {capability}: {warning}");
+                                }
+                            }
                             if let Some(context) = &context {
                                 for line in formless_protocol::approval_context_lines(context) {
                                     eprintln!("{line}");
@@ -6685,6 +6693,11 @@ fn tool_run(
                 context,
                 ..
             }) => {
+                for capability in &capabilities {
+                    if let Some(warning) = formless_protocol::sensitive_read_warning(capability) {
+                        eprintln!("⚠ {capability}: {warning}");
+                    }
+                }
                 if let Some(context) = &context {
                     for line in formless_protocol::approval_context_lines(context) {
                         eprintln!("{line}");
