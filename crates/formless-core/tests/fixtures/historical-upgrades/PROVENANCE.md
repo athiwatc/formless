@@ -21,7 +21,7 @@ Checkpoints 1, 3 and 46 are actual migration prefixes, even though no
 separate `SCHEMA_VERSION` declaration advertised each one. Tests replay
 only steps 1 through the checkpoint and stamp each successfully applied
 step, seed old columns directly, then invoke the production upgrade.
-The upgrade destination is `storage::SCHEMA_VERSION`, currently 57, rather
+The upgrade destination is the current `storage::SCHEMA_VERSION`, rather
 than the issue's historical target of 47.
 
 `config-v1.toml` uses fields accepted by `Config` at the original commit

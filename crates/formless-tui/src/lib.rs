@@ -18957,6 +18957,8 @@ mod tests {
         let mut app = test_app();
         app.view = View::Sessions;
         app.sessions = vec![SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: "s1".into(),
             name: "notes".into(),
             model: None,
@@ -19844,6 +19846,8 @@ mod tests {
     fn approvals_place_paths_against_the_working_folder() {
         let mut app = test_app();
         app.sessions = vec![SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: "s".into(),
             name: "notes".into(),
             model: None,
@@ -20434,6 +20438,8 @@ mod tests {
         app.sessions = ["refactor-auth", "docs"]
             .iter()
             .map(|n| SessionInfo {
+                forked_from: None,
+                fork_point_seq: None,
                 id: n.to_string(),
                 name: n.to_string(),
                 model: None,
@@ -21044,6 +21050,8 @@ mod tests {
         let mut app = test_app();
         let here = std::env::current_dir().unwrap();
         app.sessions = vec![SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: "s".into(),
             name: "work".into(),
             model: None,
@@ -21076,6 +21084,8 @@ mod tests {
     fn sessions_list_shows_state_count_and_preview() {
         let mut app = test_app();
         let session = |id: &str, status: Option<&str>| SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: id.into(),
             name: format!("{id} work"),
             model: Some("gpt-x".into()),
@@ -21114,6 +21124,8 @@ mod tests {
     fn pinned_sessions_sort_first() {
         let mut app = test_app();
         let session = |id: &str, at: &str, pinned: bool| SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: id.into(),
             name: id.into(),
             model: None,
@@ -21152,6 +21164,8 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         let session = |id: &str, archived: bool| SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: id.into(),
             name: id.into(),
             model: None,
@@ -21187,6 +21201,8 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         let session = |id: &str, tags: &[&str]| SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: id.into(),
             name: id.into(),
             model: None,
@@ -21232,6 +21248,8 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         app.sessions = vec![SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: "s".into(),
             name: "doomed".into(),
             model: None,
@@ -21266,6 +21284,8 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         let session = |id: &str| SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: id.into(),
             name: id.into(),
             model: None,
@@ -21314,6 +21334,8 @@ mod tests {
     fn launch_opens_the_most_recent_or_a_fresh_session() {
         let mut app = test_app();
         let session = |id: &str, at: &str, pinned: bool, archived: bool| SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: id.into(),
             name: id.into(),
             model: None,
@@ -21344,6 +21366,8 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         app.sessions = vec![SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: "a".into(),
             name: "Refactor auth".into(),
             model: None,
@@ -21862,6 +21886,8 @@ mod tests {
         };
         app.tools = vec![tool.clone()];
         app.sessions = vec![SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: "s1".into(),
             name: "Research".into(),
             model: None,
@@ -21948,6 +21974,8 @@ mod tests {
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         let mut app = test_app();
         let session = |id: &str, name: &str, at: &str, preview: &str| SessionInfo {
+            forked_from: None,
+            fork_point_seq: None,
             id: id.into(),
             name: name.into(),
             model: None,
