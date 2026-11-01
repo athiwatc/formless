@@ -11364,7 +11364,7 @@ impl Daemon {
         let review = self
             .with_reader(|st| {
                 Ok(st
-                    .description_reviews(None, Some(&info.name), 20)?
+                    .description_reviews(Some("tool"), Some(&info.name), 20)?
                     .into_iter()
                     .find(|review| {
                         review.version == ver.version

@@ -213,7 +213,9 @@ enum Pending {
     ListModelStats,
     ListProposals,
     UpdateTool,
-    GetTool,
+    GetTool {
+        description_revision: u64,
+    },
     ExportTool,
     ExportSession,
     /// Resume/abandon: the answer is a note (errors already are).
@@ -1431,6 +1433,7 @@ struct App {
     description_history_revision: [u64; 2],
     description_save_preview: Option<(String, String, i64)>,
     description_editor_observed: Option<(String, i64)>,
+    description_editor_revision: u64,
     import_description_preview: Option<(String, String)>,
     import_description_requested: Option<(String, String)>,
     /// Files and pasted images for the next message, shown as chips in
@@ -1768,6 +1771,7 @@ impl App {
             description_history_revision: Default::default(),
             description_save_preview: None,
             description_editor_observed: None,
+            description_editor_revision: 0,
             import_description_preview: None,
             import_description_requested: None,
             attachments: Vec::new(),
@@ -1905,6 +1909,7 @@ impl App {
         self.clear_attention();
         self.description_save_preview = None;
         self.description_editor_observed = None;
+        self.description_editor_revision = self.description_editor_revision.wrapping_add(1);
         self.pending.clear();
         self.pending_since.clear();
         self.reconnect_request = None;
@@ -2270,24 +2275,34 @@ impl App {
     }
 
     fn description_editor_version(&self, id: &str) -> i64 {
-        self.tool_detail
-            .iter()
-            .filter(|detail| detail.tool.id == id)
-            .map(|detail| detail.tool.current_version)
-            .chain(
+        // Versions can decrease on rollback. An observed current version is
+        // authoritative; request generations, not numeric MAX, order replies.
+        self.description_editor_observed
+            .as_ref()
+            .filter(|(tool, _)| tool == id)
+            .map(|(_, version)| *version)
+            .or_else(|| {
+                self.tool_detail
+                    .as_ref()
+                    .filter(|d| d.tool.id == id)
+                    .map(|d| d.tool.current_version)
+            })
+            .or_else(|| {
                 self.tools
                     .iter()
-                    .filter(|tool| tool.id == id)
-                    .map(|tool| tool.current_version),
-            )
-            .chain(
-                self.description_editor_observed
-                    .iter()
-                    .filter(|(tool, _)| tool == id)
-                    .map(|(_, version)| *version),
-            )
-            .max()
+                    .find(|tool| tool.id == id)
+                    .map(|tool| tool.current_version)
+            })
             .unwrap_or(0)
+    }
+
+    fn request_tool(&mut self, id: String) {
+        self.request(
+            Pending::GetTool {
+                description_revision: self.description_editor_revision,
+            },
+            Request::GetTool { id },
+        );
     }
 
     fn refresh_description_reviews(&mut self, show: bool) {
@@ -2809,7 +2824,7 @@ impl App {
                             self.editor = None;
                             self.request(Pending::ListTools, Request::ListTools);
                             if let Some(t) = self.selected_tool().cloned() {
-                                self.request(Pending::GetTool, Request::GetTool { id: t.id });
+                                self.request_tool(t.id);
                             }
                         }
                         Pending::ListTools => {
@@ -2921,8 +2936,20 @@ impl App {
                                 styled: Vec::new(),
                             });
                         }
-                        Pending::GetTool => {
+                        Pending::GetTool {
+                            description_revision,
+                        } => {
                             if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
+                                if self.editor.as_ref().is_some_and(|editor| {
+                                    editor.tool_id == d.tool.id
+                                        && editor.mode == EditMode::Description
+                                }) {
+                                    if description_revision != self.description_editor_revision {
+                                        continue;
+                                    }
+                                    self.description_editor_observed =
+                                        Some((d.tool.id.clone(), d.tool.current_version));
+                                }
                                 if self.tool_detail.as_ref().map(|o| &o.tool.id) != Some(&d.tool.id)
                                 {
                                     self.call_idx = None;
@@ -5072,19 +5099,14 @@ impl App {
                     editor.tool_id == tool.id && editor.mode == EditMode::Description
                 });
                 if editing {
-                    let observed = self
-                        .description_editor_version(&tool.id)
-                        .max(tool.current_version);
-                    self.description_editor_observed = Some((tool.id.clone(), observed));
+                    self.description_editor_revision =
+                        self.description_editor_revision.wrapping_add(1);
+                    self.description_editor_observed =
+                        Some((tool.id.clone(), tool.current_version));
                     self.description_save_preview = None;
                     self.notes
                         .push("Tool changed; review its current description before saving.".into());
-                    self.request(
-                        Pending::GetTool,
-                        Request::GetTool {
-                            id: tool.id.clone(),
-                        },
-                    );
+                    self.request_tool(tool.id.clone());
                 }
                 if let Some(existing) = self.tools.iter_mut().find(|x| x.id == tool.id) {
                     *existing = tool;
@@ -8362,7 +8384,7 @@ impl App {
                     if let Some(call) = self.selected_call() {
                         self.open_call(&call);
                     } else if let Some(tool) = self.selected_tool().cloned() {
-                        self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                        self.request_tool(tool.id);
                     }
                 }
                 KeyCode::Char('c') => {
@@ -8461,7 +8483,7 @@ impl App {
                                 });
                             }
                             _ => {
-                                self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                                self.request_tool(tool.id);
                                 self.notes
                                     .push("loading Tool detail; press E again to edit".into());
                             }
@@ -8521,7 +8543,7 @@ impl App {
                                 .notes
                                 .push(format!("{} has only one version", tool.name)),
                             _ => {
-                                self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                                self.request_tool(tool.id);
                                 self.notes
                                     .push("loading versions… press b again to pick one".into());
                             }
@@ -8840,7 +8862,7 @@ impl App {
         {
             self.tool_idx = pos;
         }
-        self.request(Pending::GetTool, Request::GetTool { id });
+        self.request_tool(id);
     }
 
     fn selected_tool(&self) -> Option<&ToolInfo> {
@@ -12218,11 +12240,13 @@ impl App {
     /// Edit Tool `d`'s description (`D`) or schemas (`S`) in the editor.
     fn start_spec_editor(&mut self, d: &ToolDetail, mode: EditMode) {
         self.description_save_preview = None;
-        self.description_editor_observed = Some((
-            d.tool.id.clone(),
-            self.description_editor_version(&d.tool.id)
-                .max(d.tool.current_version),
-        ));
+        self.description_editor_revision = self.description_editor_revision.wrapping_add(1);
+        let version = self
+            .description_editor_observed
+            .as_ref()
+            .filter(|(id, _)| *id == d.tool.id)
+            .map_or(d.tool.current_version, |(_, version)| *version);
+        self.description_editor_observed = Some((d.tool.id.clone(), version));
         let current = d
             .versions
             .iter()
@@ -16299,6 +16323,7 @@ mod tests {
             description_history_revision: Default::default(),
             description_save_preview: None,
             description_editor_observed: None,
+            description_editor_revision: 0,
             import_description_preview: None,
             import_description_requested: None,
             attachments: Vec::new(),
@@ -22660,6 +22685,72 @@ mod tests {
             app.notes.len(),
             count,
             "a stale response cannot make a retained review appear new again"
+        );
+    }
+    #[test]
+    fn description_editor_accepts_rollback_but_ignores_pre_rollback_detail_reply() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let mut detail = description_fixture_detail();
+        detail.tool.current_version = 2;
+        app.tool_detail = Some(detail.clone());
+        app.tools = vec![detail.tool.clone()];
+        app.start_spec_editor(&detail, EditMode::Description);
+        app.editor.as_mut().unwrap().chars = "always reviewed after rollback".chars().collect();
+        app.request_tool(detail.tool.id.clone());
+        let old: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let mut rollback = detail.clone();
+        rollback.tool.current_version = 1;
+        app.on_event(Event::ToolUpdated {
+            tool: rollback.tool.clone(),
+        });
+        let reads: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        let current = reads
+            .iter()
+            .find(|request| matches!(request.request, Request::GetTool { .. }))
+            .unwrap();
+        let reply = |id, result| ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        };
+        tx.send(reply(current.id, serde_json::to_value(&rollback).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        tx.send(reply(old.id, serde_json::to_value(&detail).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        assert_eq!(
+            app.tool_detail.as_ref().unwrap().tool.current_version,
+            1,
+            "late v2 details cannot undo an observed rollback"
+        );
+        assert_eq!(app.description_editor_version(&detail.tool.id), 1);
+        // Closing and reopening must not preserve a numeric high-water mark.
+        app.start_spec_editor(&rollback, EditMode::Description);
+        app.editor.as_mut().unwrap().chars = "always reviewed after rollback".chars().collect();
+        app.save_tool_spec();
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            preview.request,
+            Request::PreviewDescription { .. }
+        ));
+        tx.send(reply(preview.id, serde_json::json!({"version":1,"before":"Plain inventory reader","after":formless_core::descriptions::screen("always reviewed after rollback")}))).unwrap();
+        app.drain_daemon();
+        assert_eq!(app.description_save_preview.as_ref().unwrap().2, 1);
+        app.pager = None;
+        app.save_tool_spec();
+        let save: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(save.request, Request::UpdateToolSpec { expected_current_version:Some(1), description:Some(ref text), .. } if text == "always reviewed after rollback")
         );
     }
 }
