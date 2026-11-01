@@ -359,7 +359,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 60;
+pub const SCHEMA_VERSION: i64 = 61;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -444,7 +444,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 60] = [
+const MIGRATIONS: [(i64, MigrationStep); 61] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -733,6 +733,22 @@ const MIGRATIONS: [(i64, MigrationStep); 60] = [
             "CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from);",
         )?;
         Ok(())
+    }),
+    (61, |c| {
+        // No backfill from timestamps or message sequence guesses. Deleted
+        // messages must not cascade-delete the billing history of old Runs.
+        add_column(c, "runs", "start_message_id TEXT")?;
+        add_column(
+            c,
+            "runs",
+            "start_message_seq INTEGER CHECK(start_message_seq IS NULL OR start_message_seq>=0)",
+        )?;
+        add_column(c, "runs", "end_message_id TEXT")?;
+        add_column(
+            c,
+            "runs",
+            "end_message_seq INTEGER CHECK(end_message_seq IS NULL OR end_message_seq>=0)",
+        )
     }),
 ];
 
@@ -1834,7 +1850,7 @@ impl Store {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
         self.ex(
-            "INSERT INTO runs(id,session_id,status,created_at,updated_at) VALUES(?1,?2,'running',?3,?3)",
+            "INSERT INTO runs(id,session_id,status,created_at,updated_at,start_message_id,start_message_seq) VALUES(?1,?2,'running',?3,?3,(SELECT id FROM messages WHERE session_id=?2 ORDER BY seq DESC,rowid DESC LIMIT 1),(SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?2))",
             params![id, session_id, t],
         )?;
         Ok(id)
@@ -2884,7 +2900,9 @@ impl Store {
 
     pub fn set_run_status(&self, run_id: &str, status: &str) -> Result<()> {
         self.ex(
-            "UPDATE runs SET status=?2, updated_at=?3 WHERE id=?1",
+            "UPDATE runs SET status=?2, updated_at=?3,
+             end_message_id=CASE WHEN end_message_seq IS NULL AND status='running' AND ?2 IN ('completed','paused','interrupted','failed','abandoned') THEN (SELECT id FROM messages WHERE session_id=runs.session_id ORDER BY seq DESC,rowid DESC LIMIT 1) ELSE end_message_id END,
+             end_message_seq=CASE WHEN end_message_seq IS NULL AND status='running' AND ?2 IN ('completed','paused','interrupted','failed','abandoned') THEN (SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=runs.session_id) ELSE end_message_seq END WHERE id=?1",
             params![run_id, status, now()],
         )?;
         Ok(())
@@ -6932,3 +6950,11 @@ mod description_store_tests;
 #[cfg(test)]
 #[path = "session_lineage_tests.rs"]
 mod session_lineage_tests;
+
+#[path = "session_comparison.rs"]
+mod session_comparison;
+pub(crate) use session_comparison::SessionComparisonFailure;
+
+#[cfg(test)]
+#[path = "session_comparison_tests.rs"]
+mod session_comparison_tests;

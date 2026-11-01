@@ -14,6 +14,7 @@ mod notify;
 mod picker;
 pub mod plain;
 pub mod qr;
+mod session_ui;
 mod settings;
 mod text;
 mod theme;
@@ -166,8 +167,13 @@ enum Pending {
     Routing,
     /// `/usage` adds the endpoint's rate limits.
     RateLimits,
-    /// `/compare A B [prompt]`: the forks were started.
+    /// `/compare-models A B [prompt]`: the forks were started.
     Compare,
+    CompareSessions {
+        revision: u64,
+        left: String,
+        right: String,
+    },
     /// A step-mode decision (errors keep the step waiting).
     StepDecision,
     /// `/status`, `/storage`, `/gc [run]`, `/backup` (SPEC §9.6).
@@ -1403,6 +1409,7 @@ struct App {
     sessions: Vec<SessionInfo>,
     session_idx: usize,
     session_filter: lists::ListFilter,
+    session_comparison_revision: u64,
     current: Option<String>,
     messages: Vec<MessageInfo>,
     streaming: String,
@@ -1766,6 +1773,7 @@ impl App {
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
+            session_comparison_revision: 0,
             current: None,
             messages: Vec::new(),
             streaming: String::new(),
@@ -2665,7 +2673,9 @@ impl App {
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
+                                let selected = self.selected_session().map(|s| s.id.clone());
                                 self.sessions = v;
+                                self.restore_session_selection(selected.as_deref());
                                 if self.current.is_none() {
                                     if self.offline.is_some() {
                                         if let Some(first) = self.start_session() {
@@ -4129,6 +4139,30 @@ impl App {
                                 }
                             }
                         }
+                        Pending::CompareSessions {
+                            revision,
+                            left,
+                            right,
+                        } => {
+                            if revision != self.session_comparison_revision {
+                                continue;
+                            }
+                            match serde_json::from_value::<SessionComparison>(result) {
+                                Ok(comparison) if comparison.left.session.id == left && comparison.right.session.id == right => {
+                                    self.pager = Some(Pager {
+                                        title: "Stored Session comparison".into(),
+                                        lines: session_ui::comparison_lines(&comparison),
+                                        top: 0,
+                                        left: 0,
+                                        styled: Vec::new(),
+                                    })
+                                }
+                                Ok(_) => self.notes.push("Session comparison reply does not match the requested ordered pair; retry /compare.".into()),
+                                Err(error) => self
+                                    .notes
+                                    .push(format!("Invalid Session comparison: {error}")),
+                            }
+                        }
                         Pending::Compare => {
                             let models: Vec<&str> = result["forks"]
                                 .as_array()
@@ -5386,11 +5420,13 @@ impl App {
                 ));
             }
             Event::SessionUpdated { session } => {
+                let selected = self.selected_session().map(|s| s.id.clone());
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session.id) {
                     *s = session;
                 } else {
                     self.sessions.insert(0, session);
                 }
+                self.restore_session_selection(selected.as_deref());
             }
             Event::MessagesEdited { session_id } => {
                 if self.current.as_deref() == Some(&session_id) {
@@ -5398,8 +5434,10 @@ impl App {
                 }
             }
             Event::SessionDeleted { id } => {
+                let selected = self.selected_session().map(|s| s.id.clone());
                 self.sessions.retain(|s| s.id != id);
                 self.running_sessions.remove(&id);
+                self.restore_session_selection(selected.as_deref());
                 if self.is_current(&id) {
                     self.stash_current_draft(&id);
                     self.current = None;
@@ -7087,14 +7125,25 @@ impl App {
                 }
             }
             cmd if cmd == "compare" || cmd.starts_with("compare ") => {
+                self.session_comparison_revision = self.session_comparison_revision.wrapping_add(1);
+                let words: Vec<_> = cmd["compare".len()..].split_whitespace().collect();
+                if words.len() != 2 { self.notes.push("usage: /compare SESSION_A SESSION_B (stored history only); /compare-models starts paid model comparisons".into()); return; }
+                let pair = session_ui::resolve(&self.sessions, words[0]).and_then(|left| session_ui::resolve(&self.sessions, words[1]).map(|right| (left,right)));
+                match pair {
+                    Ok((left,right)) => self.request(Pending::CompareSessions { revision: self.session_comparison_revision, left: left.clone(), right: right.clone() }, Request::CompareSessions {left,right}),
+                    Err(error) => self.notes.push(error),
+                }
+            }
+            cmd if cmd == "compare-models" || cmd.starts_with("compare-models ") => {
+                self.session_comparison_revision = self.session_comparison_revision.wrapping_add(1);
                 let Some(session_id) = self.current.clone() else {
                     return;
                 };
-                let mut words = cmd["compare".len()..].split_whitespace();
+                let mut words = cmd["compare-models".len()..].split_whitespace();
                 let (a, b) = (words.next(), words.next());
                 let (Some(a), Some(b)) = (a, b) else {
                     self.notes.push(
-                        "usage: /compare MODEL_A MODEL_B [prompt] (no prompt: your last message again)".into(),
+                        "usage: /compare-models MODEL_A MODEL_B [prompt] (no prompt: your last message again)".into(),
                     );
                     return;
                 };
@@ -8359,6 +8408,15 @@ impl App {
                 self.notes.push("delete cancelled".into());
             }
             View::Sessions => match key.code {
+                KeyCode::Char('T') => {
+                    let selected = self.selected_session().map(|s| s.id.clone());
+                    self.session_filter.tree = !self.session_filter.tree;
+                    self.session_idx = self
+                        .visible_sessions()
+                        .iter()
+                        .position(|&i| Some(&self.sessions[i].id) == selected.as_ref())
+                        .unwrap_or(0);
+                }
                 KeyCode::Up => self.session_idx = self.session_idx.saturating_sub(1),
                 KeyCode::Down => {
                     self.session_idx =
@@ -8678,8 +8736,23 @@ impl App {
         lists::tools(&self.tools, &self.tool_filter)
     }
 
+    fn session_rows(&self) -> Vec<session_ui::SessionRow> {
+        let visible = lists::sessions(&self.sessions, &self.running_sessions, &self.session_filter);
+        session_ui::rows(&self.sessions, &visible, self.session_filter.tree)
+    }
+
     fn visible_sessions(&self) -> Vec<usize> {
-        lists::sessions(&self.sessions, &self.running_sessions, &self.session_filter)
+        self.session_rows()
+            .into_iter()
+            .map(|row| row.index)
+            .collect()
+    }
+
+    fn restore_session_selection(&mut self, selected: Option<&str>) {
+        let visible = self.visible_sessions();
+        self.session_idx = selected
+            .and_then(|id| visible.iter().position(|&i| self.sessions[i].id == id))
+            .unwrap_or_else(|| self.session_idx.min(visible.len().saturating_sub(1)));
     }
 
     fn visible_proposals(&self) -> Vec<usize> {
@@ -11422,7 +11495,7 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// The `/compare` pager: each model's figures, then the answers in
+/// The `/compare-models` pager: each model's figures, then the answers in
 /// columns side by side (stacked when the screen is narrow).
 fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthStr;
@@ -13941,7 +14014,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let now = chrono::Utc::now();
     let name_w = (area.width as usize / 3).clamp(10, 40);
-    let visible = app.visible_sessions();
+    let rows = app.session_rows();
+    let visible: Vec<_> = rows.iter().map(|row| row.index).collect();
     let items: Vec<ListItem> = if app.sessions.is_empty() {
         vec![ListItem::new(Line::styled(
             "No sessions yet — press n to start one.",
@@ -13953,10 +14027,9 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
             ui::dim(app.color),
         ))]
     } else {
-        visible
-            .iter()
-            .map(|&i| &app.sessions[i])
-            .map(|s| {
+        rows.iter()
+            .map(|row| {
+                let s = &app.sessions[row.index];
                 let current = Some(&s.id) == app.current.as_ref();
                 let (icon, style) = session_state(app, s);
                 let mut meta = format!(
@@ -13974,6 +14047,15 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                 if !s.tags.is_empty() {
                     meta.push_str(&format!(" · #{}", s.tags.join(" #")));
                 }
+                if !row.note.is_empty() {
+                    meta.push_str(&format!(" · {}", row.note));
+                }
+                let name = format!(
+                    "{}{}{}",
+                    "  ".repeat(row.depth),
+                    if row.depth > 0 { "↳ " } else { "" },
+                    s.name
+                );
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         if app.marked.contains(&s.id) {
@@ -13990,7 +14072,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                         if s.pinned { "★ " } else { "  " },
                         fg(app.color, Color::Yellow),
                     ),
-                    Span::raw(ui::pad(&s.name, name_w)),
+                    Span::raw(ui::pad(&name, name_w.max(text::width(&name)))),
                     Span::styled(format!(" {meta}"), ui::dim(app.color)),
                     Span::styled(
                         s.preview
@@ -14019,6 +14101,11 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                         lists::SESSION_SORTS,
                         lists::SESSION_QUICK,
                     );
+                    t.push_str(if app.session_filter.tree {
+                        " · T tree on "
+                    } else {
+                        " · T tree off "
+                    });
                     if !app.marked.is_empty() {
                         t.push_str(&format!(
                             "· {} selected: a archive · e export · t tag · d delete · Esc clear ",
@@ -16489,6 +16576,7 @@ mod tests {
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
+            session_comparison_revision: 0,
             current: Some("s1".into()),
             messages: Vec::new(),
             streaming: String::new(),
@@ -21091,6 +21179,202 @@ mod tests {
         assert_eq!(short_dir("/a/b"), "/a/b");
         #[cfg(unix)]
         assert_eq!(short_dir("/a/folder\\name/leaf"), "/a/folder\\name/leaf");
+    }
+
+    #[test]
+    fn lineage_tree_uses_the_same_rows_for_render_selection_and_marks() {
+        let mut app = test_app();
+        let session = |id: &str, parent: Option<&str>| {
+            serde_json::from_value::<SessionInfo>(serde_json::json!({"id":id,"name":id,"created_at":"","updated_at":"","forked_from":parent,"fork_point_seq":parent.map(|_|3)})).unwrap()
+        };
+        app.sessions = vec![
+            session("child", Some("parent")),
+            session("parent", None),
+            session("orphan", Some("deleted")),
+        ];
+        app.view = View::Sessions;
+        assert_eq!(app.selected_session().unwrap().id, "child");
+        app.key(key(KeyCode::Char('T')));
+        assert_eq!(app.visible_sessions(), [1, 0, 2]);
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "child",
+            "toggle must retain selected identity"
+        );
+        let screen = render(&mut app, 180, 24);
+        assert!(screen.contains("↳ child"), "{screen}");
+        assert!(screen.contains("fork at seq 3"), "{screen}");
+        assert!(screen.contains("parent unavailable: deleted"), "{screen}");
+        app.key(key(KeyCode::Char(' ')));
+        assert!(app.marked.contains("child") && !app.marked.contains("parent"));
+        app.click(Click::Session(0));
+        assert_eq!(app.selected_session().unwrap().id, "parent");
+        app.key(key(KeyCode::Char('T')));
+        assert_eq!(app.selected_session().unwrap().id, "parent");
+    }
+
+    #[test]
+    fn lineage_selection_survives_parent_deletion_archive_and_list_refresh() {
+        let mut app = test_app();
+        let session = |id: &str, parent: Option<&str>| {
+            serde_json::from_value::<SessionInfo>(serde_json::json!({"id":id,"name":id,"created_at":"","updated_at":"","forked_from":parent,"fork_point_seq":parent.map(|_|3)})).unwrap()
+        };
+        let parent = session("parent", None);
+        let child = session("child", Some("parent"));
+        let sibling = session("sibling", Some("parent"));
+        app.sessions = vec![child.clone(), parent.clone(), sibling.clone()];
+        app.current = Some("child".into());
+        app.view = View::Sessions;
+        app.session_filter.tree = true;
+        app.session_idx = 1;
+        assert_eq!(app.selected_session().unwrap().id, "child");
+        app.on_event(Event::SessionDeleted {
+            id: "parent".into(),
+        });
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "child",
+            "deleting parent cannot move child selection to sibling"
+        );
+        app.key(key(KeyCode::Char(' ')));
+        assert!(app.marked.contains("child") && !app.marked.contains("sibling"));
+        assert!(render(&mut app, 180, 24).contains("parent unavailable: parent"));
+        app.on_event(Event::SessionUpdated {
+            session: parent.clone(),
+        });
+        assert_eq!(app.selected_session().unwrap().id, "child");
+        let mut hidden_parent = parent.clone();
+        hidden_parent.archived = true;
+        app.on_event(Event::SessionUpdated {
+            session: hidden_parent.clone(),
+        });
+        assert_eq!(app.selected_session().unwrap().id, "child");
+        assert!(render(&mut app, 180, 24).contains("parent filtered: parent"));
+        let mut hidden_child = child.clone();
+        hidden_child.archived = true;
+        app.on_event(Event::SessionUpdated {
+            session: hidden_child,
+        });
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "sibling",
+            "a hidden selection must fall back to a visible row"
+        );
+        app.on_event(Event::SessionUpdated {
+            session: child.clone(),
+        });
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "sibling",
+            "showing a previously hidden child must not steal selection"
+        );
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+        app.request(Pending::ListSessions, Request::ListSessions);
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(ServerMessage::Response {
+            id: request.id,
+            ok: true,
+            result: Some(serde_json::json!([sibling, hidden_parent, child])),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "sibling",
+            "a full list refresh must preserve selected ID across order changes"
+        );
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_comparison_is_read_only_strict_and_ignores_obsolete_replies() {
+        let mut app = test_app();
+        let comparison = session_ui::comparison_fixture();
+        app.sessions = vec![
+            comparison.left.session.clone(),
+            comparison.right.session.clone(),
+        ];
+        app.current = Some("left".into());
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+        app.slash("compare missing right");
+        assert!(
+            sent.try_recv().is_err(),
+            "unknown Session must not trigger a model comparison or any RPC"
+        );
+        app.slash("compare left right extra");
+        assert!(sent.try_recv().is_err());
+        app.slash("compare left right");
+        let wrong: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let mut reversed = comparison.clone();
+        std::mem::swap(&mut reversed.left, &mut reversed.right);
+        tx.send(ServerMessage::Response {
+            id: wrong.id,
+            ok: true,
+            result: Some(serde_json::to_value(&reversed).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(
+            app.pager.is_none(),
+            "even the first reply must match the ordered requested IDs"
+        );
+        assert!(app
+            .notes
+            .iter()
+            .any(|line| line.contains("requested ordered pair")));
+        assert!(
+            sent.try_recv().is_err(),
+            "rejecting a mismatched response cannot trigger model work"
+        );
+        app.slash("compare left right");
+        let first: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(first.request,Request::CompareSessions{ref left,ref right} if left == "left" && right == "right")
+        );
+        app.slash("compare right left");
+        let second: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(second.request,Request::CompareSessions{ref left,ref right} if left == "right" && right == "left")
+        );
+        tx.send(ServerMessage::Response {
+            id: second.id,
+            ok: true,
+            result: Some(serde_json::to_value(&reversed).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        let retained = app.pager.as_ref().unwrap().lines.clone();
+        assert!(retained
+            .iter()
+            .any(|line| line.contains("Total cost: unknown")));
+        tx.send(ServerMessage::Response {
+            id: first.id,
+            ok: true,
+            result: Some(serde_json::json!({"invalid":"obsolete"})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.pager.as_ref().unwrap().lines, retained);
+        assert!(
+            sent.try_recv().is_err(),
+            "stored diff must not create forks or Runs"
+        );
+        app.pager = None;
+        app.slash("compare-models cheap costly explicit prompt");
+        let paid: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(paid.request,Request::CompareModels{models,prompt:Some(prompt),..} if models == ["cheap","costly"] && prompt == "explicit prompt")
+        );
     }
 
     #[test]

@@ -756,3 +756,75 @@ test('authoritative reconnect attention preserves producer-independent current-R
   assert.equal(c.S.approvals[0].summary,'later AI text');
   assert.equal(JSON.stringify(c.S.approvals[0].context),JSON.stringify(context),'late summaries cannot replace the actual held-call evidence');
 });
+
+test('lineage tree retains every visible identity with bounded cycles and explicit parent labels', () => {
+  const c=setup(['sessionRows']);
+  const s=(id,parent)=>({id,name:id,forked_from:parent,fork_point_seq:parent?3:null});
+  const sessions=[s('child','parent'),s('parent'),s('sibling','parent'),s('orphan','deleted'),s('cycle-a','cycle-b'),s('cycle-b','cycle-a')];
+  const rows=c.sessionRows(sessions,sessions,true);
+  assert.deepEqual(Array.from(rows,r=>[r.session.id,r.depth]),[['parent',0],['child',1],['sibling',1],['orphan',0],['cycle-a',0],['cycle-b',1]]);
+  assert.match(rows[1].note,/fork at seq 3/);assert.match(rows[3].note,/parent unavailable: deleted/);assert.match(rows[4].note,/lineage cycle/);
+  assert.match(c.sessionRows(sessions,[sessions[0]],true)[0].note,/parent filtered: parent/);
+  assert.deepEqual(Array.from(c.sessionRows(sessions,sessions,false),r=>r.session.id),sessions.map(s=>s.id));
+  const deep=Array.from({length:1000},(_,i)=>s('s'+i,i?'s'+(i-1):null));
+  const deepRows=c.sessionRows(deep,deep,true);assert.equal(deepRows.length,1000);assert.equal(deepRows[999].depth,12);assert.match(deepRows[999].note,/indent capped/);
+});
+
+test('web tree toggle and row actions operate on the rendered Session identity', () => {
+  const list=node('ul'),opened=[];
+  const c=setup(['renderSessions','sessionRows'],{$:()=>list,h:node,relTime:()=>'',openSession:id=>opened.push(id),sessionMenu(){},bulkSessions(){}});
+  c.S.running=new Set();c.S.sessions=[{id:'child',name:'Child',forked_from:'parent',fork_point_seq:3},{id:'parent',name:'Parent'},{id:'orphan',name:'Orphan',forked_from:'deleted',fork_point_seq:7}];
+  c.renderSessions();
+  const toggle=all(list).find(n=>n.tag==='button'&&plainText(n)==='Tree off');assert.ok(toggle);toggle.attrs.onclick();
+  const rows=list.children.filter(n=>n.attrs?.class==='session');
+  assert.match(plainText(rows[0]),/Parent/);assert.match(plainText(rows[1]),/Child.*fork at seq 3/);assert.match(plainText(rows[2]),/parent unavailable: deleted/);
+  rows[1].attrs.onclick();assert.deepEqual(opened,['child']);
+  all(rows[1]).find(n=>n.tag==='input').attrs.onclick({stopPropagation(){},target:{checked:true}});
+  assert.equal(c.S.marked.has('child'),true);assert.equal(c.S.marked.has('parent'),false);
+});
+
+function storedComparisonFixture() {
+  const usage={scope:'whole Runs after fork boundary; straddling usage unallocated',recorded_prompt_tokens:21,recorded_completion_tokens:8,recorded_cached_tokens:3,recorded_cache_write_tokens:2,requests:1,unallocated_requests:1,unallocated_prompt_tokens:9,unallocated_completion_tokens:4,unknown_runs:1,usage_complete:false,cost:null,priced_cost_subtotal:0.25,unallocated_priced_cost_subtotal:0.5,known_records_cost_range:[0.25,0.75],estimated_requests:1,unpriced:['private/model'],warnings:['Missing provider usage']};
+  return {left:{session:{id:'left',name:'Left'},usage},right:{session:{id:'right',name:'Right'},usage},common_ancestor:'parent',fork_point_seq:3,diff_from_seq:0,prefix_changed:true,warnings:['Prefix edited'],messages:[{kind:'left_only',left:{id:'m1',seq:4,role:'assistant',content:'private answer\n<script>data only</script>'},right:null}]};
+}
+
+test('Session comparison is strict local read-only data, with honest costs and stale-reply guards', async () => {
+  const pending=[],calls=[],shown=[],notes=[];
+  const c=setup(['compareSessionsCommand','resolveSessionRef','sessionComparisonText'],{h:node,showBidi(){},modal:(title,body)=>shown.push({title,body}),note:(text)=>notes.push(text),act:req=>{calls.push(req);const d=deferred();pending.push(d);return d.promise;}});
+  c.S.sessions=[{id:'left',name:'Left'},{id:'right',name:'Right'},{id:'right-other',name:'Other'}];c.S.channel='online';c.S.conn='conn1';
+  await c.compareSessionsCommand('missing right');await c.compareSessionsCommand('left right extra');await c.compareSessionsCommand('left r');assert.equal(calls.length,0,'invalid or ambiguous identifiers must never invoke model comparisons or any RPC');
+  const wrong=c.compareSessionsCommand('left right');
+  const reversed=storedComparisonFixture();[reversed.left,reversed.right]=[reversed.right,reversed.left];
+  pending[0].resolve(reversed);await wrong;assert.equal(shown.length,0,'first reply with wrong ordered IDs must not open a diff');assert.ok(notes.some(text=>text.includes('requested ordered pair')));
+  const old=c.compareSessionsCommand('left right'),latest=c.compareSessionsCommand('right left');
+  assert.deepEqual(calls.slice(1).map(r=>JSON.parse(JSON.stringify(r))),[{type:'compare_sessions',left:'left',right:'right'},{type:'compare_sessions',left:'right',right:'left'}]);
+  pending[2].resolve(reversed);await latest;assert.equal(shown.length,1);
+  pending[1].resolve({obsolete:'not parsed'});await old;assert.equal(shown.length,1,'obsolete data must not replace newer comparison');
+  const text=plainText(shown[0].body);
+  for(const required of ['no model request','fork point: 3','Copied prefix changed','Prefix edited','21 input / 8 output','9 input / 4 output','missing usage is not zero','Total cost: unknown','subtotal only: $0.250000','allocation range only','excludes missing usage and unpriced rows','Unpriced: private/model','Missing provider usage','private answer','<script>data only</script>'])assert.ok(text.includes(required),required);
+  assert.equal(text.includes('Recorded branch cost:'),false);assert.equal(all(shown[0].body).some(n=>n.tag==='script'),false);
+  const disconnected=c.compareSessionsCommand('left right');c.S.conn='conn2';pending[3].resolve(storedComparisonFixture());await disconnected;assert.equal(shown.length,1,'old-connection replies cannot reopen a comparison');
+});
+
+test('paid model comparison has an explicit distinct command route', async () => {
+  const calls=[];const c=setup(['compareModelsCommand'],{act:async req=>{calls.push(req);return null;},note(){},refreshSessions(){}});
+  await c.compareModelsCommand('cheap costly explicit prompt');
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)),[{type:'compare_models',session_id:'A',models:['cheap','costly'],prompt:'explicit prompt'}]);
+  assert.match(source,/name: "compare",[^\n]*run: compareSessionsCommand/);
+  assert.match(source,/name: "compare-models",[^\n]*run: compareModelsCommand/);
+});
+
+
+test('metadata-only branch changes are quoted text data without executable DOM', async () => {
+  const result=storedComparisonFixture(),shown=[];
+  const leftMeta=JSON.stringify({tool_calls:[{name:'reader',arguments:{path:'left <script>data</script>'}}]});
+  const rightMeta=JSON.stringify({tool_calls:[{name:'reader',arguments:{path:'right \nسلام ไทย'}}]});
+  result.messages=[{kind:'left_only',left:{id:'m1',seq:4,role:'assistant',content:'',meta:leftMeta},right:null},{kind:'right_only',left:null,right:{id:'m2',seq:4,role:'assistant',content:'',meta:rightMeta}}];
+  const c=setup(['compareSessionsCommand','resolveSessionRef','sessionComparisonText'],{h:node,showBidi(){},modal:(title,body)=>shown.push(body),act:async()=>result,note(){}});
+  c.S.sessions=[result.left.session,result.right.session];await c.compareSessionsCommand('left right');
+  const text=plainText(shown[0]),metadata=text.split('\n').filter(line=>line.startsWith('  Metadata (quoted data): '));
+  assert.equal(metadata.length,2);assert.deepEqual(metadata.map(line=>JSON.parse(line.slice('  Metadata (quoted data): '.length))),[leftMeta,rightMeta]);
+  assert.ok(text.includes('left <script>data</script>'));assert.ok(text.includes('سلام ไทย'));
+  assert.equal(all(shown[0]).some(n=>n.tag==='script'),false);assert.deepEqual(all(shown[0]).map(n=>n.tag),['pre']);
+  assert.equal(result.messages[0].left.meta,leftMeta,'rendering must preserve raw stored metadata');
+});

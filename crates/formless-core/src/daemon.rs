@@ -1686,6 +1686,23 @@ impl Daemon {
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
+            Request::CompareSessions { left, right } => {
+                let cfg = Config::load_file_only(&self.paths)?;
+                let comparison = self
+                    .with_reader(|st| st.compare_sessions_for_rpc(&left, &right, &cfg))
+                    .map_err(|error| {
+                        match error.downcast_ref::<crate::storage::SessionComparisonFailure>() {
+                            Some(crate::storage::SessionComparisonFailure::NotFound) => {
+                                anyhow::Error::new(RequestFailure::not_found(error.to_string()))
+                            }
+                            Some(crate::storage::SessionComparisonFailure::ReplyTooLarge {
+                                ..
+                            }) => anyhow::Error::new(RequestFailure::invalid(error.to_string())),
+                            None => error,
+                        }
+                    })?;
+                Ok(serde_json::to_value(comparison)?)
+            }
             Request::SearchSessions { query, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
                     st.search_sessions(&query, limit.unwrap_or(50))
@@ -16818,6 +16835,10 @@ mod provenance_tests;
 #[cfg(test)]
 #[path = "description_daemon_tests.rs"]
 mod description_daemon_tests;
+
+#[cfg(test)]
+#[path = "session_comparison_rpc_tests.rs"]
+mod session_comparison_rpc_tests;
 
 #[cfg(test)]
 #[path = "approval_daemon_tests.rs"]
