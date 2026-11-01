@@ -1,4 +1,4 @@
-//! Private deferred-delivery and compaction boundaries: no model or network.
+//! Private deferred-delivery, fork and compaction fixtures: no external model/network.
 use super::*;
 
 #[tokio::test]
@@ -460,4 +460,307 @@ fn checkpoint_sources_follow_immutable_generation_when_an_edit_reuses_sequences(
     );
     drop(reopened);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// Foreign UUIDs copied through a fork are transcript data, never authority.
+async fn assert_fork_cannot_use_handle(
+    daemon: &Arc<Daemon>,
+    session: &str,
+    handle: &str,
+    cfg: &Config,
+) {
+    for name in [
+        toolreg::AWAIT_INVOCATION,
+        toolreg::CHECK_INVOCATION,
+        toolreg::ABANDON_INVOCATION,
+    ] {
+        let call = ToolCall {
+            id: format!("foreign-{name}"),
+            name: name.into(),
+            arguments: json!({"invocation_id":handle}).to_string(),
+        };
+        let (answer, failed) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            daemon.dispatch_call_checked(
+                session,
+                "foreign-fork-run",
+                &call,
+                cfg,
+                &Arc::new(AtomicBool::new(false)),
+                &CancellationToken::new(),
+                &HashMap::new(),
+                0,
+            ),
+        )
+        .await
+        .expect("foreign await/check/abandon must reject without waiting for work");
+        assert!(failed, "{name}: {answer}");
+        assert!(
+            answer.contains("unknown invocation handle"),
+            "{name}: {answer}"
+        );
+        assert!(!answer.contains("owner-only"), "{name}: {answer}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_fork_cannot_steal_live_completed_or_restarted_pending_handles() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
+    let dir = std::env::temp_dir().join(format!("fl-fork-pending-{}", uuid::Uuid::new_v4()));
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _fixture = Fixture(dir.clone());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route(
+        "/held",
+        axum::routing::get({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "owner-only pending payload"
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    struct Server(tokio::task::JoinHandle<()>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let paths = Paths::from_dirs(dir.join("data"), dir.join("config")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.tools.pending_threshold_secs = 0;
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let (owner, run) = daemon
+        .with_store(|st| {
+            let session = st.create_session(None)?;
+            let caps = Capabilities::parse(&[format!("net:{address}")]).unwrap();
+            let (tool, _) = st.create_tool_version(
+                "owner_only_reader",
+                "Private held reader",
+                "{}",
+                "{}",
+                &format!(
+                    "function run(){{return fetch({}).body;}}",
+                    json!(format!("http://{address}/held"))
+                ),
+                &caps,
+                64,
+                "test",
+            )?;
+            st.set_approval(&tool.id, &caps, 64)?;
+            let run = st.create_run(&session.id)?;
+            Ok((session.id, run))
+        })
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let _cancel_on_failure = cancel.clone().drop_guard();
+    let placeholder = daemon
+        .dispatch_pending(
+            &owner,
+            &run,
+            "owner_only_reader",
+            json!({}),
+            &cfg,
+            &Arc::new(AtomicBool::new(false)),
+            &cancel,
+            0,
+        )
+        .await;
+    let handle = serde_json::from_str::<Value>(&placeholder).unwrap()["invocation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    daemon
+        .with_store(|st| st.append_message(&owner, "tool", &placeholder))
+        .unwrap();
+    daemon.finish_run(owner.clone(), run, "completed").await;
+    let fork = daemon
+        .handle(Request::ForkSession {
+            id: owner.clone(),
+            name: Some("private fork".into()),
+            up_to_seq: None,
+        })
+        .await
+        .unwrap();
+    let fork = fork["id"].as_str().unwrap().to_string();
+    let copied = daemon.with_reader(|st| st.list_messages(&fork)).unwrap();
+    assert!(copied.iter().any(|message| message.content == placeholder));
+    assert_fork_cannot_use_handle(&daemon, &fork, &handle, &cfg).await;
+    {
+        let pending = daemon.pending.locked();
+        let entry = pending.get(&handle).unwrap();
+        assert!(entry.result.locked().is_none());
+        assert!(!entry.cancel.is_cancelled());
+        assert!(!entry.abandoned.load(Ordering::SeqCst));
+        assert!(!entry.delivered.load(Ordering::SeqCst));
+    }
+    assert!(daemon
+        .with_reader(|st| st.session_pending_handle(&owner, &handle))
+        .unwrap()
+        .is_some());
+    assert!(daemon
+        .with_reader(|st| st.session_pending_handle(&fork, &handle))
+        .unwrap()
+        .is_none());
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if daemon
+                .pending
+                .locked()
+                .get(&handle)
+                .unwrap()
+                .result
+                .locked()
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // A fork must not consume even a ready result, nor push-deliver it.
+    assert_fork_cannot_use_handle(&daemon, &fork, &handle, &cfg).await;
+    {
+        let pending = daemon.pending.locked();
+        let entry = pending.get(&handle).unwrap();
+        assert!(!entry.cancel.is_cancelled());
+        assert!(!entry.abandoned.load(Ordering::SeqCst));
+        assert!(!entry.delivered.load(Ordering::SeqCst));
+    }
+    daemon.deliver_completed_pending(&fork);
+    daemon.deliver_completed_pending(&owner);
+    daemon.deliver_completed_pending(&owner);
+    let owner_messages = daemon.with_reader(|st| st.list_messages(&owner)).unwrap();
+    assert_eq!(
+        owner_messages
+            .iter()
+            .filter(|m| m.content.contains("owner-only pending payload"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        owner_messages
+            .iter()
+            .map(|message| message
+                .content
+                .matches("owner-only pending payload")
+                .count())
+            .sum::<usize>(),
+        1,
+        "one result payload, not merely one message containing duplicate deliveries"
+    );
+    assert!(!daemon
+        .with_reader(|st| st.list_messages(&fork))
+        .unwrap()
+        .iter()
+        .any(|m| m.content.contains("owner-only pending payload")));
+    assert!(!daemon.pending.locked().contains_key(&handle));
+    assert!(daemon
+        .with_reader(|st| st.session_pending_handle(&owner, &handle))
+        .unwrap()
+        .is_none());
+
+    // A durable placeholder loses its worker at a real daemon reopen. Fork
+    // again through the protocol so the stale UUID is copied, not guessed.
+    let stale = uuid::Uuid::new_v4().to_string();
+    let stale_placeholder = json!({"status":"pending", "invocation_id":stale}).to_string();
+    daemon
+        .with_store(|st| {
+            st.add_pending_handle(&stale, &owner, "owner-only-lost-reader")?;
+            st.append_message(&owner, "tool", &stale_placeholder)?;
+            Ok(())
+        })
+        .unwrap();
+    let fork = daemon
+        .handle(Request::ForkSession {
+            id: owner.clone(),
+            name: Some("private stale fork".into()),
+            up_to_seq: None,
+        })
+        .await
+        .unwrap();
+    let fork = fork["id"].as_str().unwrap().to_string();
+    assert!(daemon
+        .with_reader(|st| st.list_messages(&fork))
+        .unwrap()
+        .iter()
+        .any(|m| m.content == stale_placeholder));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while Arc::strong_count(&daemon) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("physical pending worker teardown before reopen");
+    drop(daemon);
+    let daemon = Arc::new(Daemon::new(paths).unwrap());
+    assert_eq!(
+        daemon
+            .with_reader(|st| st.session_pending_handle(&owner, &stale))
+            .unwrap()
+            .unwrap()
+            .1,
+        "interrupted"
+    );
+    assert_fork_cannot_use_handle(&daemon, &fork, &stale, &cfg).await;
+    assert!(daemon
+        .with_reader(|st| st.session_pending_handle(&owner, &stale))
+        .unwrap()
+        .is_some());
+    let call = ToolCall {
+        id: "owner-recover".into(),
+        name: toolreg::CHECK_INVOCATION.into(),
+        arguments: json!({"invocation_id":stale}).to_string(),
+    };
+    let (answer, _) = daemon
+        .dispatch_call_checked(
+            &owner,
+            "owner-recovery-run",
+            &call,
+            &cfg,
+            &Arc::new(AtomicBool::new(false)),
+            &CancellationToken::new(),
+            &HashMap::new(),
+            0,
+        )
+        .await;
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(answer["status"], "interrupted");
+    assert_eq!(answer["tool"], "owner-only-lost-reader");
+    assert!(daemon
+        .with_reader(|st| st.session_pending_handle(&owner, &stale))
+        .unwrap()
+        .is_none());
+    assert_fork_cannot_use_handle(&daemon, &owner, &stale, &cfg).await;
+    drop(daemon);
+    server.0.abort();
+    let _ = (&mut server.0).await;
 }

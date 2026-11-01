@@ -1080,6 +1080,15 @@ purity is untouched):
 
 ### 6.4 Outcomes
 
+- Pending-handle references copied by a Session fork are transcript data only;
+  they are not rebound to the fork. Agent `await_invocation`, `check_invocation`
+  and `abandon_invocation` accept only handles owned by their calling Session.
+  Foreign handles answer the same unknown-handle error as nonexistent handles,
+  including persisted interrupted handles after restart; the lookup neither
+  reveals the owner's result nor consumes, abandons or deletes its handle.
+  The original Session keeps its own single delivery. User control requests
+  `CancelInvocation`/`AbandonInvocation` remain intentionally cross-Session (§6.3).
+
 An Invocation ends only by: completion (success/failure by §8), sandbox fault
 (including memory-cap fault), or user cancellation. User-cancelled
 Invocations are tagged distinctly so the optimiser does not “fix” a Tool the
