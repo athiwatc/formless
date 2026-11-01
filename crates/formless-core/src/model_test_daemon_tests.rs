@@ -375,6 +375,20 @@ async fn explicit_probe_uses_factory_daily_budget_and_records_known_usage_once()
     drop(db);
     let mut cfg = f.daemon().config().unwrap();
     cfg.limits.daily_usd = Some(1.0);
+    cfg.provider.prices.insert(
+        "model".into(),
+        crate::config::ModelPrice {
+            input: 1000.0,
+            output: 1000.0,
+            cached_input: None,
+            cache_write_input: None,
+            retrieved_at: None,
+        },
+    );
+    assert_eq!(
+        cfg.cost_of_known("default", "model", 2000, 0, 0, 0, None, false),
+        Some(2.0)
+    );
     cfg.save(&f.daemon().paths).unwrap();
     f.daemon()
         .with_store(|st| {
@@ -385,6 +399,7 @@ async fn explicit_probe_uses_factory_daily_budget_and_records_known_usage_once()
                 "model",
                 &crate::provider::Usage {
                     cost: Some(2.0),
+                    prompt_tokens: 2000,
                     reported: 3,
                     ..Default::default()
                 },

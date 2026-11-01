@@ -554,3 +554,60 @@ async fn probe_http_two_request_cache_check_uses_one_shared_bounded_scope() {
     }
     assert_eq!(policy.report()["requests_sent"], 2);
 }
+
+#[tokio::test]
+async fn probe_http_continual_trickle_cannot_extend_deadline_or_make_interim_usage_final() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let (base,_server)=server(Router::new().route("/chat/completions",post(|| async {
+        let chunks=futures_util::stream::unfold(0u64,|count|async move{
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let event=json!({"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":3,"completion_tokens":count+1,"cost":0.001}});
+            Some((Ok::<_,std::io::Error>(format!("data: {event}\n\n").into_bytes()),count+1))
+        });
+        ([("content-type","text/event-stream")],axum::body::Body::from_stream(chunks)).into_response()
+    }))).await;
+    let billed = Arc::new(AtomicUsize::new(0));
+    let captured = billed.clone();
+    let p = Provider::new(cfg(base, "chat"), "private-dummy".into())
+        .unwrap()
+        .with_usage_hook(Arc::new(move |_, _, _| {
+            captured.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    let policy = ProbePolicy::limited(Duration::from_secs(1), 8);
+    let p = p.scoped_probe(policy.clone()).unwrap();
+    let cancel = CancellationToken::new();
+    let mut deltas = 0;
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        policy.run(
+            p.chat_stream(&[], &[], "probe-model", None, &cancel, |kind, _| {
+                if kind == DeltaKind::Content {
+                    deltas += 1
+                }
+            }),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(err.to_string().contains("logical deadline"));
+    assert!(
+        deltas > 2,
+        "fixture must actually progress before logical timeout"
+    );
+    assert_eq!(billed.load(Ordering::SeqCst), 1);
+    let report = policy.report();
+    assert_eq!(report["deadline_exceeded"], true);
+    assert_eq!(report["requests_sent"], 1);
+    assert_eq!(report["reported_usage"]["prompt_tokens"], 3);
+    assert!(
+        report["reported_usage"]["completion_tokens"]
+            .as_u64()
+            .unwrap()
+            > 2
+    );
+    assert_eq!(report["usage_partial"], true);
+    assert_eq!(report["cost_partial"], true);
+}

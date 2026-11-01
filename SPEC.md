@@ -447,7 +447,9 @@ an empty listing just asks for one.
   Probe transport uses the configured proxy and normal factory TLS trust.
   `TestModel.probe_usage` reports physical sends and only provider-reported
   counters/costs; missing counters remain unknown, with explicit partial-usage
-  and partial-cost flags. Its observer does not commit a second usage charge.
+  and partial-cost flags. A deadline marks even interim reported counters/costs
+  as partial, retaining their known values and exposing `deadline_exceeded`.
+  Its observer does not commit a second usage charge.
   Timeout/cancellation drops the current logical request future rather than
   detaching retries. An already-issued server request may continue or be billed;
   these are client-side request bounds, not a promise of server cancellation.

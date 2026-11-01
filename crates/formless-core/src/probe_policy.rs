@@ -24,6 +24,7 @@ struct Inner {
     ceiling: AtomicU64,
     completion_field: Mutex<Option<bool>>,
     repaired_field: AtomicBool,
+    timed_out: AtomicBool,
     observed: Mutex<Observed>,
 }
 #[derive(Default)]
@@ -55,6 +56,7 @@ impl ProbePolicy {
             ceiling: AtomicU64::new(tokens),
             completion_field: Mutex::new(None),
             repaired_field: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
             observed: Mutex::new(Observed::default()),
         }))
     }
@@ -63,9 +65,13 @@ impl ProbePolicy {
         Self::new(duration, sends, TOKENS)
     }
     pub(crate) async fn run<T>(&self, work: impl Future<Output = T>) -> Result<T> {
-        tokio::time::timeout_at(self.0.deadline, work)
-            .await
-            .map_err(|_| anyhow::anyhow!("model probe logical deadline exceeded"))
+        match tokio::time::timeout_at(self.0.deadline, work).await {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                self.0.timed_out.store(true, Ordering::SeqCst);
+                Err(anyhow::anyhow!("model probe logical deadline exceeded"))
+            }
+        }
     }
     fn check(&self) -> Result<()> {
         if tokio::time::Instant::now() >= self.0.deadline {
@@ -245,6 +251,7 @@ impl ProbePolicy {
     }
     pub(crate) fn report(&self) -> Value {
         let sent = self.0.sends.load(Ordering::SeqCst);
+        let timed_out = self.0.timed_out.load(Ordering::SeqCst);
         let sum = self.0.observed.locked();
         let mut reported = serde_json::Map::new();
         if sum.input_reports > 0 {
@@ -265,7 +272,7 @@ impl ProbePolicy {
         if sum.cost_reports > 0 {
             reported.insert("reported_cost".into(), json!(sum.cost));
         }
-        json!({"requests_sent":sent,"requests_with_reported_usage":sum.reports,"usage_partial":sum.complete<sent,"cost_partial":sum.cost_reports<sent,"reported_usage":if reported.is_empty(){Value::Null}else{Value::Object(reported)}})
+        json!({"requests_sent":sent,"requests_with_reported_usage":sum.reports,"deadline_exceeded":timed_out,"usage_partial":timed_out||sum.complete<sent,"cost_partial":timed_out||sum.cost_reports<sent,"reported_usage":if reported.is_empty(){Value::Null}else{Value::Object(reported)}})
     }
 }
 
