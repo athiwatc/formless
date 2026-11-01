@@ -13,11 +13,17 @@ use std::path::{Path, PathBuf};
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
 pub type GroupedUsage = (String, String, String, i64, i64, i64, i64, Option<f64>);
 
+#[path = "forecast_snapshot.rs"]
+mod forecast_snapshot;
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
     /// (edit/truncate, delete), so [`ContextCache`]s know to rebuild.
     rewrites: std::sync::atomic::AtomicU64,
+    // Connection drops before this private directory; source files are never
+    // held by a forecast reader or touched by close-time optimize.
+    _forecast_snapshot: Option<forecast_snapshot::SnapshotDir>,
 }
 
 #[derive(Debug, Clone)]
@@ -1073,6 +1079,7 @@ impl Store {
         Ok(Self {
             conn,
             rewrites: Default::default(),
+            _forecast_snapshot: None,
         })
     }
 
@@ -1093,18 +1100,31 @@ impl Store {
         Err(damaged(file, &detail.join("; ")))
     }
 
-    /// An extra connection for reads only (the database must already be
-    /// migrated). WAL lets it read while the main connection writes.
-    /// Preview-only connection: never creates, migrates or changes journal mode.
+    /// Private snapshot reader; no SQLite connection ever opens the source.
+    /// Busy/unsupported native locking fails closed instead of changing WAL/SHM.
     pub fn open_forecast_reader(file: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.execute_batch("PRAGMA query_only=ON;")?;
-        Ok(Self {
-            conn,
-            rewrites: Default::default(),
-        })
+        let absolute = std::path::absolute(file)?;
+        let directory = absolute
+            .parent()
+            .context("forecast database has no parent")?
+            .to_path_buf();
+        let paths = crate::Paths {
+            data_dir: directory.clone(),
+            config_dir: directory,
+            profile: "forecast-snapshot".into(),
+        };
+        // This compatibility wrapper protects the data tree. Callers with real
+        // profile Paths can additionally freeze its separate configuration tree.
+        forecast_snapshot::open_file(&paths, &absolute)?.context("forecast database does not exist")
     }
 
+    /// None means genuinely absent: no profile/lock/directory is created.
+    pub fn open_forecast_snapshot(paths: &crate::Paths) -> Result<Option<Self>> {
+        forecast_snapshot::open(paths)
+    }
+
+    /// An extra connection for reads only (the database must already be
+    /// migrated). WAL lets it read while the main connection writes.
     pub fn open_reader(file: &Path) -> Result<Self> {
         let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
         conn.execute_batch(READER_PRAGMAS)?;
@@ -1112,6 +1132,7 @@ impl Store {
         Ok(Self {
             conn,
             rewrites: Default::default(),
+            _forecast_snapshot: None,
         })
     }
 
@@ -1123,6 +1144,7 @@ impl Store {
         Ok(Self {
             conn,
             rewrites: Default::default(),
+            _forecast_snapshot: None,
         })
     }
 
