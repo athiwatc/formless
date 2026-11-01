@@ -57,6 +57,62 @@ fn unspaced(g: &str) -> bool {
 }
 
 impl InputLine {
+    pub(crate) fn cursor_byte(&self) -> usize {
+        self.cursor
+    }
+
+    /// Modal editors use whole grapheme boundaries, not byte/char fragments.
+    pub(crate) fn set_modal_cursor(&mut self, at: usize) {
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain(std::iter::once(self.text.len()))
+            .take_while(|&i| i <= at.min(self.text.len()))
+            .last()
+            .unwrap_or(0);
+    }
+
+    pub(crate) fn modal_replace(
+        &mut self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+    ) -> bool {
+        let boundary =
+            |at| at == self.text.len() || self.text.grapheme_indices(true).any(|(i, _)| i == at);
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !boundary(range.start)
+            || !boundary(range.end)
+        {
+            return false;
+        }
+        self.remove(range.start, range.end);
+        self.cursor = range.start;
+        self.insert_str(replacement);
+        self.search = None;
+        true
+    }
+
+    /// Vim works on actual text. Expand paste placeholders before modal
+    /// editing so a partial operator cannot strand or silently discard a paste.
+    pub(crate) fn modal_expand_pastes(&mut self) {
+        for (placeholder, full) in std::mem::take(&mut self.pastes) {
+            if let Some(start) = self.text.find(&placeholder) {
+                let end = start + placeholder.len();
+                self.cursor = if self.cursor >= end {
+                    self.cursor - placeholder.len() + full.len()
+                } else if self.cursor > start {
+                    start + full.len()
+                } else {
+                    self.cursor
+                };
+                self.text.replace_range(start..end, &full);
+            }
+        }
+        self.set_modal_cursor(self.cursor);
+    }
+
     /// Replace the text, cursor at the end.
     pub fn set(&mut self, s: &str) {
         self.text = s.to_string();

@@ -73,6 +73,15 @@ headless with `formless run "…"`.
     labelled without hiding their children. The stored comparison shows whole
     messages and recorded branch usage; missing usage and unpriced or unallocated
     work are shown explicitly rather than reported as zero cost.
+    To bring a branch's conclusions back, open the target Session and use
+    `/summarise-branch SOURCE_SESSION`. This explicitly generates a candidate
+    using the target's provider. Review the exact note, source, target, served
+    model, reported usage and any omitted source content, then choose Insert
+    one note (`i` in the TUI) or Close review. Closing a review does not stop
+    generation already dispatched: it may finish and record usage, but cannot
+    insert a note without confirmation. Insertion adds one attributed note;
+    it does not copy the transcript or start a Run. Changes to either Session
+    require a fresh candidate. A reconnect closes the review without retrying it.
 15. **Plan a bigger task.** "Migrate this project from Jest to Vitest." The
     agent keeps a checklist pinned above the input (`update_plan`) and a
     "What I did" recap when it finishes.

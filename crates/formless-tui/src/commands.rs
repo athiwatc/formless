@@ -213,6 +213,12 @@ pub const COMMANDS: &[Command] = &[
     cmd("cancel", "", "cancel the stalled or pending Tool call", Run),
     cmd("resend", "", "re-send a stalled provider request", Run),
     cmd(
+        "summarise-branch",
+        "SOURCE_SESSION",
+        "generate a branch summary for review, then insert one note here",
+        Session,
+    ),
+    cmd(
         "compare",
         "SESSION_A SESSION_B",
         "compare stored branches and recorded usage (no model call)",
@@ -494,6 +500,7 @@ pub const COMMANDS: &[Command] = &[
         App,
     ),
     cmd("notes", "", "every note so far, in the pager", App),
+    cmd("vim", "[on|off]", "toggle persistent Vim editing in composer and Tool editor", App),
     cmd(
         "help",
         "",
@@ -611,7 +618,30 @@ pub fn help_lines() -> Vec<String> {
 const KEYS: &[(&str, &str)] = &[
     ("Enter", "send, or steer the running Run"),
     ("Ctrl+J / Ctrl+Enter / Alt+Enter", "queue for after the Run"),
-    ("Esc", "stop the Run / close a dialog"),
+    (
+        "Esc",
+        "stop the Run / close a dialog (Vim Insert: enter Normal first)",
+    ),
+    (
+        "Vim: i/a/I/A, Esc",
+        "enter Insert / return to Normal; mode shown in input border",
+    ),
+    (
+        "Vim: w/b/e/0/$/gg/G, h/j/k/l",
+        "move within composer or Tool editor; list keys unchanged",
+    ),
+    (
+        "Vim: d/c/y + motion or object",
+        "iw/aw, iW/aW, quotes, ()/[]/{}/<>; dd/cc/yy for lines",
+    ),
+    (
+        "Vim: . / p / P",
+        "repeat last change / paste private yank register (no OS clipboard)",
+    ),
+    (
+        "Vim Tool editor: Ctrl+S / Ctrl+Q",
+        "save / explicitly cancel; Esc keeps edited text",
+    ),
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
     ("PgUp / PgDn, ↑ / ↓", "scroll the chat"),

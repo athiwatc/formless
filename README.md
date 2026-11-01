@@ -608,7 +608,8 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | `fs.mkdir` / `fs.remove(path, {recursive})` / `fs.rename(from, to)` | `fs:write` | Tree changes |
 | `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines(path, cb)` | `fs:read` | Streaming reads — never load large data whole |
 | `env.get(key)` | `env` | Read one declared key |
-| `process.run(cmd, args, {cwd, env, stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` | `process` | Execute a declared binary, no shell |
+| `process.run(cmd, args, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout, stderr, timed_out, killed, truncated}` | `process` | Execute a declared binary, no shell; optional timeout kills its group |
+| `process.spawn(cmd, args, opts)` → `{read, wait, kill, close}` | `process` | Read bounded `{stream, data, eof}` chunks; `wait` discards unread output; handles are reaped when the Invocation ends |
 | `tools.call(name, input)` → Promise | — | Composition; await every call, and `Promise.all` runs several in parallel (nested Invocations are recorded and measured) |
 | `clipboard.read()` / `clipboard.write(text)` | `clipboard:read` / `clipboard:write` | v2; OS clipboard |
 | `notify(title, body)` | `notify` | v2; desktop notification |
