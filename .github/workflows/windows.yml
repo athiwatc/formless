@@ -7,7 +7,9 @@ on:
 
 jobs:
   pipe:
-    # First green cold-cache job: 10m43s; ceil(2 x 643 / 60) = 22 minutes.
+    # Prior pipe-only cold-cache job: 10m43s; ceil(2 x 643 / 60) = 22 minutes.
+    # Keep that bound for the first expanded run. Added CLI coverage needs a
+    # fresh duration measurement for #1164; the old timing does not cover it.
     # https://github.com/athiwatc/formless/actions/runs/39622878988/job/119300605255
     timeout-minutes: 22
     runs-on: windows-latest
@@ -18,4 +20,8 @@ jobs:
       - name: Assertion inventory (review aid)
         run: python scripts/test-assertion-inventory.py
       - name: Named pipe security and round trip
-        run: cargo test -p formless-core --test windows_pipe
+        run: cargo test -p formless-core --test windows_pipe --locked
+      - name: Production backup CLI and main-thread stack regression
+        # Same existing job/22-minute bound; no test stack override. This runs
+        # real default-stack child processes plus the production PE-header check.
+        run: cargo test -p formless-bin --test backup_verification --locked
