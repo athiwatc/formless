@@ -475,6 +475,13 @@ Global flags: `--profile <name>`, `--secure` (turn approval prompts on for the d
 * **Data dir:** `~/Library/Application Support/formless` (macOS), `$XDG_DATA_HOME/formless` (Linux), `%APPDATA%\formless` (Windows). Config lives in the matching config dir (`config.toml` plus the OS keychain for secrets).
 * Contents: the SQLite DB (Sessions, Runs, Tool metadata and version index, Invocations, metric tallies, compaction checkpoints, approvals, audit events), Tool version files, artifacts, rotated daemon logs and the audit log.
 * The schema is versioned; the daemon auto-migrates on start and **takes a backup before migrating**. On corruption it refuses to guess: it stops, reports, and points at the backup.
+
+Backup inspection is available with `formless backup list` and
+`formless backup verify FILE`. Use `formless backup restore FILE --dry-run`
+to inspect the stopped-daemon restore plan, and `formless doctor --restore-drill`
+for an isolated offline rehearsal of the newest snapshot. Snapshots contain the
+database only: copy artifact/skill files separately; configuration, credential
+files and OS keyring data are excluded. Recorded paths are not relocated.
 * `FORMLESS_DATA_DIR` / `FORMLESS_CONFIG_DIR` relocate both dirs; `--profile <name>` gives an isolated daemon plus data/config dirs — intended for testing dangerous Tools.
 
 ---

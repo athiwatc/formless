@@ -89,6 +89,16 @@ fn receipt_path(paths: &Paths, file: &Path) -> Result<PathBuf> {
 /// A standalone SQLite snapshot only; a live database with a WAL is not a backup.
 /// Inspect a private immutable copy and compare fingerprints again before receipt.
 pub fn verify(paths: &Paths, file: &Path) -> Result<Verification> {
+    let report = inspect(file)?;
+    crate::config::write_secret_file(
+        &receipt_path(paths, file)?,
+        &serde_json::to_string_pretty(&report)?,
+    )?;
+    Ok(report)
+}
+
+/// Structural check without receipts, also used on restore's migrated stage.
+pub(crate) fn inspect(file: &Path) -> Result<Verification> {
     let source = std::fs::canonicalize(file).context("locate backup")?;
     if !std::fs::metadata(&source)?.is_file() {
         bail!("backup is not a regular file");
@@ -107,7 +117,9 @@ pub fn verify(paths: &Paths, file: &Path) -> Result<Verification> {
         format!("{uri}?immutable=1"),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    let mut integrity = conn.prepare("PRAGMA integrity_check")?;
+    let mut integrity = conn
+        .prepare("PRAGMA integrity_check")
+        .context("SQLite integrity_check")?;
     for result in integrity.query_map([], |r| r.get::<_, String>(0))? {
         let result = result.context("SQLite integrity_check")?;
         if result != "ok" {
@@ -115,7 +127,8 @@ pub fn verify(paths: &Paths, file: &Path) -> Result<Verification> {
         }
     }
     let foreign_keys: bool = conn
-        .prepare("PRAGMA foreign_key_check")?
+        .prepare("PRAGMA foreign_key_check")
+        .context("SQLite foreign_key_check")?
         .query([])?
         .next()?
         .is_some();
@@ -143,6 +156,9 @@ pub fn verify(paths: &Paths, file: &Path) -> Result<Verification> {
             })?;
         tables.insert(name.clone(), count);
     }
+    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+        bail!("backup acquired a live WAL during verification");
+    }
     if fingerprint(&source)? != (sha256.clone(), bytes) {
         bail!("backup changed during verification");
     }
@@ -154,10 +170,6 @@ pub fn verify(paths: &Paths, file: &Path) -> Result<Verification> {
         tables,
         verified_at: chrono::Utc::now().to_rfc3339(),
     };
-    crate::config::write_secret_file(
-        &receipt_path(paths, file)?,
-        &serde_json::to_string_pretty(&report)?,
-    )?;
     Ok(report)
 }
 
@@ -200,9 +212,14 @@ pub fn list(paths: &Paths) -> Value {
         "verified_at":verified(paths,file).map(|r|r.verified_at)})).collect::<Vec<_>>())
 }
 pub fn newest_status(paths: &Paths) -> Value {
-    copies(paths).last().map_or(Value::Null, |file| json!({"file":file,"bytes":housekeeping::path_bytes(file),
-        "age_seconds":std::fs::metadata(file).and_then(|m|m.modified()).ok().and_then(|at|at.elapsed().ok()).map(|age|age.as_secs()),
-        "verified_at":verified(paths,file).map(|r|r.verified_at)}))
+    copies(paths).last().map_or(Value::Null, |file| {
+        let receipt = verified(paths,file);
+        let verification_age = receipt.as_ref().and_then(|r|chrono::DateTime::parse_from_rfc3339(&r.verified_at).ok())
+            .map(|at|(chrono::Utc::now().signed_duration_since(at).num_seconds()).max(0));
+        json!({"file":file,"bytes":housekeeping::path_bytes(file),
+            "age_seconds":std::fs::metadata(file).and_then(|m|m.modified()).ok().and_then(|at|at.elapsed().ok()).map(|age|age.as_secs()),
+            "verified_at":receipt.map(|r|r.verified_at),"verification_age_seconds":verification_age})
+    })
 }
 
 /// Print-only plan; never probes/starts/stops a daemon or opens its live DB.

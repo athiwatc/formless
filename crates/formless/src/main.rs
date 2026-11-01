@@ -2850,7 +2850,8 @@ fn run_restore_drill(paths: &Paths, file: Option<std::path::PathBuf>) -> Result<
         .or_else(|| formless_core::backup_verification::copies(paths).pop())
         .ok_or_else(|| anyhow::anyhow!("no backup available for an offline restore drill"))?;
     let report = tokio::runtime::Runtime::new()?
-        .block_on(formless_core::backup_verification::drill(paths, &file))?;
+        .block_on(formless_core::backup_verification::drill(paths, &file))
+        .context("offline restore drill failed")?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -2966,7 +2967,10 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
                 status["age_seconds"],
                 status["verified_at"]
                     .as_str()
-                    .map(|at| format!("verified at {at}"))
+                    .map(|at| format!(
+                        "verified at {at} ({}s ago)",
+                        status["verification_age_seconds"]
+                    ))
                     .unwrap_or_else(|| "never verified (or bytes changed)".into())
             );
         }

@@ -406,6 +406,8 @@ fn restore_with(
         checkpoint(&staged)?;
         staged.pragma_update(None, "journal_mode", "DELETE")?;
         drop(staged);
+        crate::backup_verification::inspect(&stage.0)
+            .context("verify migrated restore stage before replacing the destination")?;
         sync_file(&stage.0)?;
         // Fold any old WAL into the old canonical file before removing its
         // sidecars. If replacement fails, that old file remains complete.

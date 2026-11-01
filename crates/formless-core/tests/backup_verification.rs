@@ -95,9 +95,10 @@ fn migration_retention_verifies_newest_preserves_pinned_copy_and_audits_actual_d
     let store = Store::open(&paths.db_file()).unwrap();
     let mut files = Vec::new();
     for day in 1..=5 {
-        let file = paths
-            .data_dir
-            .join(format!("formless.db.v23-2026010{day}T000000Z.bak"));
+        let file = paths.data_dir.join(format!(
+            "formless.db.v{}-2026010{day}T000000Z.bak",
+            formless_core::storage::SCHEMA_VERSION
+        ));
         store.backup_into(&file).unwrap();
         files.push(file);
     }
@@ -171,4 +172,27 @@ async fn offline_drill_reads_known_session_and_does_not_run_due_jobs_or_copy_liv
         )
         .unwrap();
     assert_eq!(jobs, 1);
+}
+
+#[test]
+fn restore_refuses_current_stamped_incomplete_schema_without_replacing_destination() {
+    let (f, paths) = Fixture::new();
+    let original = Store::open(&paths.db_file()).unwrap();
+    let known = original
+        .create_session(Some("preserve destination".into()))
+        .unwrap();
+    let source = f.0.join("missing-tools.db");
+    original.backup_into(&source).unwrap();
+    drop(original);
+    let conn = Connection::open(&source).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE tools;")
+        .unwrap();
+    drop(conn);
+    let error = housekeeping::restore(&paths, &source).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("missing table tools"),
+        "{error:#}"
+    );
+    let destination = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(destination.list_sessions().unwrap()[0].id, known.id);
 }
