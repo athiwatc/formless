@@ -257,6 +257,29 @@ struct StructuredCall {
     unconstrained: std::sync::atomic::AtomicBool,
 }
 
+/// Recovery reads protocol diagnostics, never an echoed request or schema.
+/// Keep the error envelope for existing typed param/code classifiers. Non-JSON
+/// endpoints still get their plain-text diagnostic compatibility path.
+fn recovery_diagnostic(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_owned();
+    };
+    let error = value.get("error").unwrap_or(&value);
+    if let Some(message) = error.as_str() {
+        return message.to_owned();
+    }
+    let mut fields = serde_json::Map::new();
+    for key in ["message", "type", "code", "param", "detail"] {
+        if let Some(value) = error
+            .get(key)
+            .filter(|value| value.is_string() || value.is_number())
+        {
+            fields.insert(key.to_owned(), value.clone());
+        }
+    }
+    json!({"error":fields}).to_string()
+}
+
 impl StructuredCall {
     fn apply(&self, body: &mut Value, cfg: &ProviderCfg) {
         if cfg.anthropic() {
@@ -2491,7 +2514,8 @@ impl Provider {
                         // Recovery inspects protocol data, never display text:
                         // masking even a one-character synthetic credential can
                         // remove a keyword or numeric limit from the diagnostic.
-                        let lower = raw_text.to_lowercase();
+                        let diagnostic = recovery_diagnostic(&raw_text);
+                        let lower = diagnostic.to_lowercase();
                         if status.as_u16() == 400
                             && self.structured_output.is_some()
                             && StructuredCall::invalid_schema(&raw_text)
@@ -2510,9 +2534,20 @@ impl Provider {
                             self.note("The endpoint does not support JSON-schema mode; retrying once without that mode and still validating the reply locally.".into());
                             continue;
                         }
-                        let rejected = OPTIONAL_PARAMS
-                            .iter()
-                            .find(|p| body.get(**p).is_some() && lower.contains(**p));
+                        let diagnostic_json = serde_json::from_str::<Value>(&diagnostic).ok();
+                        let rejected_param = diagnostic_json
+                            .as_ref()
+                            .and_then(|value| value["error"]["param"].as_str());
+                        let rejected = OPTIONAL_PARAMS.iter().find(|p| {
+                            body.get(**p).is_some()
+                                && lower.contains(**p)
+                                && rejected_param.is_none_or(|param| {
+                                    param == **p
+                                        || param
+                                            .strip_prefix(**p)
+                                            .is_some_and(|rest| rest.starts_with('.'))
+                                })
+                        });
                         if let (400, Some(param)) = (status.as_u16(), rejected) {
                             tracing::info!(
                                 "provider rejected optional {param}; sending without it"
@@ -2522,7 +2557,7 @@ impl Provider {
                             }
                             continue;
                         }
-                        if status.as_u16() == 400 && with_effort && is_unknown_param(&raw_text) {
+                        if status.as_u16() == 400 && with_effort && is_unknown_param(&diagnostic) {
                             with_effort = false;
                             recovered.dropped_effort = true;
                             continue;
@@ -2533,7 +2568,7 @@ impl Provider {
                         if status.as_u16() == 400 {
                             let mut repaired = b.clone();
                             let fix = if self.cfg.anthropic() {
-                                crate::anthropic::recover(&mut repaired, &raw_text)
+                                crate::anthropic::recover(&mut repaired, &diagnostic)
                             } else if lower.contains("cache_control")
                                 && body.get("__no_cache_control").is_none()
                             {
@@ -2588,7 +2623,7 @@ impl Provider {
                             // logical call; let a configured fallback still run.
                             break 'attempts;
                         }
-                        if is_model_error(status.as_u16(), &raw_text) {
+                        if is_model_error(status.as_u16(), &diagnostic) {
                             permit.failure("model unavailable", true);
                             break; // immediately open, then fail over if configured
                         }
@@ -2596,7 +2631,7 @@ impl Provider {
                             let error = auth.error(format!("provider error: {last_err}"));
                             // Probes consume a typed classification rather than
                             // searching a credential-masked error string.
-                            return Err(if is_tool_choice_rejection(&raw_text) {
+                            return Err(if is_tool_choice_rejection(&diagnostic) {
                                 anyhow!(ToolChoiceRejection).context(error.to_string())
                             } else {
                                 error
@@ -4620,6 +4655,29 @@ mod breaker_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_diagnostics_ignore_echoed_requests_but_keep_real_protocol_fields() {
+        let raw=json!({"error":{"message":"Unknown parameter temperature","param":"temperature","code":"unknown_parameter","request":{"stream_options":{},"input_audio":"unsupported"}},"request":{"stream_options":{},"reasoning_effort":"unsupported","model":"not found"}}).to_string();
+        let diagnostic = recovery_diagnostic(&raw);
+        let parsed: Value = serde_json::from_str(&diagnostic).unwrap();
+        assert_eq!(
+            parsed,
+            json!({"error":{"message":"Unknown parameter temperature","param":"temperature","code":"unknown_parameter"}})
+        );
+        assert!(!diagnostic.contains("stream_options"));
+        assert!(!is_unknown_param(&diagnostic));
+        assert_eq!(
+            recovery_diagnostic("stream_options unsupported"),
+            "stream_options unsupported"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&recovery_diagnostic(
+                r#"{"message":"max_tokens 128 > 64","type":"invalid_request_error"}"#
+            ))
+            .unwrap()["error"]["message"],
+            "max_tokens 128 > 64"
+        );
+    }
     #[test]
     fn diagnostic_payload_patterns_use_actual_parts_and_recognize_cropped_json_echoes() {
         let payload = "opaque_attachment_bytes_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
