@@ -14130,20 +14130,20 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let range = METRIC_RANGES[app.metrics_range % METRIC_RANGES.len()].0;
-    let range = format!(
-        "{range} · f forecast vs actual ({} records)",
+    let forecast = format!(
+        "forecast vs actual (f, {} records)",
         app.forecast.metrics.len()
     );
     let title = match app.run_summary.as_ref().filter(|s| s.runs > 0) {
         Some(s) => format!(
-            " Metrics · {range} (r) · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
+            " Metrics · {range} (r) · {forecast} · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
             metrics_summary(&tools),
             s.runs,
             s.completed * 100.0,
             (s.edited + s.corrected) * 100.0,
             s.avg_steps
         ),
-        None => format!(" Metrics · {range} (r) · {} ", metrics_summary(&tools)),
+        None => format!(" Metrics · {range} (r) · {forecast} · {} ", metrics_summary(&tools)),
     };
     let block = ui::panel(title, app.color, Color::Green);
     if rows.is_empty() {
@@ -21989,5 +21989,17 @@ mod tests {
             "current resume"
         );
         assert!(sent.try_recv().is_err());
+    }
+    #[test]
+    fn metrics_shortcuts_keep_range_and_forecast_actions_visible_at_standard_width() {
+        let mut app = test_app();
+        app.view = View::Metrics;
+        let screen = render(&mut app, 80, 30);
+        assert!(screen.contains("all time (r)"), "{screen}");
+        assert!(screen.contains("forecast vs actual (f"), "{screen}");
+        app.key(key(KeyCode::Char('r')));
+        let screen = render(&mut app, 80, 30);
+        assert!(screen.contains("24h (r)"), "{screen}");
+        assert!(screen.contains("forecast vs actual (f"), "{screen}");
     }
 }
