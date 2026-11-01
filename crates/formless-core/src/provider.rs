@@ -2261,14 +2261,14 @@ impl Provider {
                     &credential,
                 )
                 .json(&b);
+                if let Some(policy) = &self.probe_policy {
+                    policy.before_send()?;
+                }
                 if let Some(projection) = &self.native_projection {
                     projection.sent_payloads.locked().observe(&b);
                 }
                 let mut server_wait = None;
                 let reason;
-                if let Some(policy) = &self.probe_policy {
-                    policy.before_send()?;
-                }
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
@@ -4378,6 +4378,10 @@ pub fn probe_blocking(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<P
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(probe(cfg, api_key, model))
 }
+
+#[cfg(test)]
+#[path = "provider_probe_tests.rs"]
+mod probe_tests;
 
 #[cfg(test)]
 #[path = "provider_breaker_tests.rs"]
