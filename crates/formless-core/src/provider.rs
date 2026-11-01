@@ -447,6 +447,41 @@ struct RequestAccounting {
     unknown_cost: bool,
     provider: String,
     model: String,
+    routing: Option<Arc<crate::routing_observation::Attempt>>,
+    chat_single_choice: bool,
+}
+
+// Observe cancellation before the admission lease itself is released, even
+// before a response/accounting owner exists (credential/header/body waits).
+struct ObservedLease {
+    lease: Option<RequestLease>,
+    routing: Option<Arc<crate::routing_observation::Attempt>>,
+}
+impl ObservedLease {
+    fn new(
+        lease: Option<RequestLease>,
+        routing: Option<Arc<crate::routing_observation::Attempt>>,
+    ) -> Self {
+        Self { lease, routing }
+    }
+    fn release(mut self) -> Option<RequestLease> {
+        drop(self.routing.take());
+        self.lease.take()
+    }
+}
+impl Drop for ObservedLease {
+    fn drop(&mut self) {
+        if let Some(routing) = &self.routing {
+            routing.settle(None, false);
+        }
+    }
+}
+impl Drop for RequestAccounting {
+    fn drop(&mut self) {
+        if let Some(routing) = &self.routing {
+            routing.settle(None, false);
+        }
+    }
 }
 
 /// A stream may end by error, cancellation, parser failure or future drop.
@@ -458,6 +493,7 @@ struct AttemptUsage<'a> {
     prompt_estimate: usize,
     unknown_cost: bool,
     recorded: bool,
+    routing: Option<Arc<crate::routing_observation::Attempt>>,
 }
 impl<'a> AttemptUsage<'a> {
     fn new(provider: &'a Provider, model: &str, permit: &BreakerPermit) -> Self {
@@ -468,6 +504,7 @@ impl<'a> AttemptUsage<'a> {
             prompt_estimate: permit.accounting.as_ref().map_or(0, |a| a.prompt_estimate),
             unknown_cost: permit.accounting.as_ref().is_some_and(|a| a.unknown_cost),
             recorded: false,
+            routing: permit.accounting.as_ref().and_then(|a| a.routing.clone()),
         }
     }
     fn observe(&mut self, usage: Option<Usage>) {
@@ -495,7 +532,7 @@ impl<'a> AttemptUsage<'a> {
             self.usage = Some(usage);
         }
     }
-    fn finish(&mut self) -> Result<()> {
+    fn finish(&mut self, response_complete: bool) -> Result<()> {
         let usage = self.usage.take().or_else(|| {
             self.unknown_cost.then_some(Usage {
                 cost_unknown: true,
@@ -503,6 +540,14 @@ impl<'a> AttemptUsage<'a> {
             })
         });
         self.recorded = true;
+        if !response_complete {
+            if let Some(policy) = &self.provider.probe_policy {
+                policy.mark_transport_incomplete();
+            }
+        }
+        if let Some(routing) = &self.routing {
+            routing.settle(usage, response_complete);
+        }
         self.provider.report_usage(&self.model, usage.as_ref())?;
         if let Some(u) = usage.filter(|u| u.reported & 1 != 0) {
             self.provider
@@ -522,6 +567,12 @@ impl Drop for AttemptUsage<'_> {
                 ..Default::default()
             })
         });
+        if let Some(policy) = &self.provider.probe_policy {
+            policy.mark_transport_incomplete();
+        }
+        if let Some(routing) = &self.routing {
+            routing.settle(usage, false);
+        }
         if let Err(error) = self.provider.report_usage(&self.model, usage.as_ref()) {
             // The daemon hook fails future admission closed after a failed
             // commit. Preserve the original stream error/cancellation here.
@@ -563,20 +614,31 @@ impl BreakerPermit {
             accounting: None,
         })
     }
-    fn account_usage(&self, usage: Option<Usage>, comparable: bool) -> Result<()> {
+    fn account_usage(
+        &self,
+        usage: Option<Usage>,
+        comparable: bool,
+        response_complete: bool,
+    ) -> Result<()> {
         if let Some(accounting) = &self.accounting {
-            let Some(mut usage) = usage.or_else(|| {
+            let mut usage = usage.or_else(|| {
                 accounting.unknown_cost.then_some(Usage {
                     cost_unknown: true,
                     ..Default::default()
                 })
-            }) else {
+            });
+            if let Some(usage) = &mut usage {
+                usage.cost_unknown |= accounting.unknown_cost;
+                if usage.cost.is_some() {
+                    usage.cost_unknown = false;
+                }
+            }
+            if let Some(routing) = &accounting.routing {
+                routing.settle(usage, response_complete);
+            }
+            let Some(usage) = usage else {
                 return Ok(());
             };
-            usage.cost_unknown |= accounting.unknown_cost;
-            if usage.cost.is_some() {
-                usage.cost_unknown = false;
-            }
             if let Some(hook) = &accounting.hook {
                 hook(&accounting.provider, &accounting.model, &usage)?;
             }
@@ -683,6 +745,71 @@ impl Drop for BreakerPermit {
     }
 }
 
+/// Finish-only evidence is sufficient only for the final wire body's single
+/// choice contract. Unknown vendor multiplicity needs an explicit [DONE].
+fn chat_single_choice(body: &Value) -> bool {
+    const KEYS: &[&str] = &[
+        "n",
+        "best_of",
+        "num_return_sequences",
+        "num_outputs",
+        "num_generations",
+        "candidate_count",
+        "candidateCount",
+        "num_beams",
+        "beam_width",
+    ];
+    [Some(body), body.get("options")]
+        .into_iter()
+        .flatten()
+        .all(|object| {
+            KEYS.iter()
+                .all(|key| object.get(*key).is_none_or(|v| v.as_u64() == Some(1)))
+                && object
+                    .get("use_beam_search")
+                    .is_none_or(|v| v.as_bool() == Some(false))
+        })
+}
+struct ChatTerminal {
+    single: bool,
+    finish: bool,
+    done: bool,
+}
+impl ChatTerminal {
+    fn new(single: bool) -> Self {
+        Self {
+            single,
+            finish: false,
+            done: false,
+        }
+    }
+    fn observe(&mut self, v: &Value) {
+        let Some(choices) = v.get("choices").and_then(Value::as_array) else {
+            self.single = false;
+            return;
+        };
+        if choices.is_empty() {
+            return;
+        }
+        if choices.len() != 1
+            || choices[0]
+                .get("index")
+                .is_some_and(|index| index.as_u64() != Some(0))
+        {
+            self.single = false;
+        }
+        if matches!(
+            choices[0]["finish_reason"].as_str(),
+            Some("stop" | "length" | "content_filter" | "tool_calls" | "function_call")
+        ) {
+            self.finish = true;
+        }
+    }
+    fn complete(&self) -> bool {
+        self.done || (self.single && self.finish)
+    }
+}
+
 async fn completed_json(
     resp: reqwest::Response,
     permit: BreakerPermit,
@@ -691,14 +818,20 @@ async fn completed_json(
     match resp.json::<Value>().await {
         Ok(value) => {
             permit.success();
+            if value.get("error").is_none_or(Value::is_null) && value["status"] != "failed" {
+                if let Some(routing) = permit.accounting.as_ref().and_then(|a| a.routing.as_ref()) {
+                    routing.returned();
+                }
+            }
             permit.account_usage(
                 Usage::parse(&value["usage"]),
                 value.get("error").is_none_or(Value::is_null) && value["status"] != "failed",
+                true,
             )?;
             Ok(value)
         }
         Err(error) => {
-            permit.account_usage(None, false)?;
+            permit.account_usage(None, false, false)?;
             permit.failure("response body failed", false);
             Err(error).context(context)
         }
@@ -1313,6 +1446,32 @@ impl AuthRecovery {
     }
 }
 
+/// Routing quality deliberately does not reuse circuit-breaker availability.
+fn http_routing_neutral(status: u16, detail: &str) -> crate::routing_observation::Neutral {
+    use crate::routing_observation::Neutral;
+    let detail = detail.to_ascii_lowercase();
+    match status {
+        401 | 403 => Neutral::Auth,
+        429 => Neutral::RateLimit,
+        404 => Neutral::Unavailable,
+        400..=499
+            if [
+                "context_length_exceeded",
+                "model_context_window_exceeded",
+                "maximum context",
+                "context window",
+            ]
+            .iter()
+            .any(|code| detail.contains(code)) =>
+        {
+            Neutral::Context
+        }
+        400..=499 => Neutral::CallerInput,
+        500..=599 => Neutral::Server,
+        _ => Neutral::Unknown,
+    }
+}
+
 impl Provider {
     pub fn new(cfg: ProviderCfg, api_key: String) -> Result<Self> {
         let http = http_client(&cfg.proxy)?;
@@ -1725,6 +1884,24 @@ impl Provider {
         crate::tokens::request(&body)
     }
 
+    /// Core has already resolved this logical target/forecast exactly once.
+    /// Freeze that identity for serialization, media projection and retries.
+    /// Public raw-input Provider methods keep their existing alias semantics;
+    /// configured fallback/list aliases are resolved once before this clone's
+    /// alias map is cleared. All hooks and operational policies are retained.
+    pub(crate) fn resolved_dispatch(&self, model: &str) -> Self {
+        let mut scoped = self.clone();
+        let resolve =
+            |models: &[String]| models.iter().map(|m| self.cfg.resolve_alias(m)).collect();
+        scoped.cfg.fallback_models = resolve(&self.cfg.fallback_models);
+        scoped.cfg.routing_models = resolve(&self.cfg.routing_models);
+        scoped.cfg.routing_fast_models = resolve(&self.cfg.routing_fast_models);
+        scoped.cfg.routing_strong_models = resolve(&self.cfg.routing_strong_models);
+        scoped.cfg.model = model.to_string();
+        scoped.cfg.aliases.clear();
+        scoped
+    }
+
     /// Name this provider as it is configured.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = name.to_string();
@@ -1746,6 +1923,7 @@ impl Provider {
         model: &str,
         lease: Option<RequestLease>,
         body: &Value,
+        routing: Option<Arc<crate::routing_observation::Attempt>>,
     ) -> RequestAccounting {
         RequestAccounting {
             _lease: lease,
@@ -1758,12 +1936,21 @@ impl Provider {
                 crate::tokens::request(body)
             },
             unknown_cost: crate::tokens::has_native_media(body),
+            chat_single_choice: chat_single_choice(body),
             provider: self.name.clone(),
             model: model.to_string(),
+            routing,
         }
     }
 
-    fn report_error_usage(&self, text: &str, model: &str, unknown_cost: bool) -> Result<()> {
+    fn report_error_usage(
+        &self,
+        text: &str,
+        model: &str,
+        unknown_cost: bool,
+        routing: Option<&crate::routing_observation::Attempt>,
+        response_complete: bool,
+    ) -> Result<()> {
         let mut usage = serde_json::from_str::<Value>(text)
             .ok()
             .and_then(|v| {
@@ -1780,6 +1967,9 @@ impl Provider {
             if usage.cost.is_some() {
                 usage.cost_unknown = false;
             }
+        }
+        if let Some(routing) = routing {
+            routing.settle(usage, response_complete);
         }
         self.report_usage(model, usage.as_ref())
     }
@@ -2296,6 +2486,24 @@ impl Provider {
         })
     }
 
+    fn note_output_contract(
+        &self,
+        routing: Option<&Arc<crate::routing_observation::Call>>,
+        model: &str,
+        error: &StructuredOutputError,
+    ) {
+        if matches!(
+            error,
+            StructuredOutputError::InvalidJson | StructuredOutputError::SchemaViolation
+        ) {
+            if let Some(routing) = routing {
+                routing.claim_contract(crate::routing_observation::Identity::new(
+                    &self.name, &self.cfg, model,
+                ));
+            }
+        }
+    }
+
     async fn complete_options(
         &self,
         messages: &[Value],
@@ -2303,6 +2511,7 @@ impl Provider {
         effort: Option<&str>,
         options: &CompletionOptions,
     ) -> Result<(CompletionResult, Option<Value>)> {
+        let routing = crate::routing_observation::current_call();
         let (result, terminal) = self
             .completion_for_validation(messages, model, effort, options)
             .await?;
@@ -2313,7 +2522,10 @@ impl Provider {
             if result.output_limited {
                 return Err(StructuredOutputError::IncompleteResponse.into());
             }
-            Some(schema.parse_and_validate(&result.text)?)
+            Some(schema.parse_and_validate(&result.text).map_err(|error| {
+                self.note_output_contract(routing.as_ref(), &result.model_used, &error);
+                error
+            })?)
         } else {
             None
         };
@@ -2521,6 +2733,9 @@ impl Provider {
                 if let Some(policy) = &self.probe_policy {
                     policy.finalize(&mut b, &self.cfg, model)?;
                 }
+                let routing = crate::routing_observation::begin_attempt(
+                    crate::routing_observation::Identity::new(&self.name, &self.cfg, model),
+                );
                 if let Some(policy) = &self.request_policy {
                     policy(&b).map_err(|error| auth.annotate(error))?;
                 }
@@ -2528,6 +2743,7 @@ impl Provider {
                     .request_lease()
                     .await
                     .map_err(|error| auth.annotate(error))?;
+                let lease = ObservedLease::new(lease, routing.clone());
                 let credential = self
                     .credential()
                     .await
@@ -2555,23 +2771,43 @@ impl Provider {
                 }
                 let mut server_wait = None;
                 let reason;
+                if let Some(routing) = &routing {
+                    routing.sent();
+                }
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
+                        if let Some(routing) = &routing {
+                            routing.status(status.as_u16());
+                            if !status.is_success() {
+                                routing.neutral(http_routing_neutral(status.as_u16(), ""));
+                            }
+                        }
                         note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
-                            permit.accounting = Some(self.request_accounting(model, lease, &b));
+                            permit.accounting =
+                                Some(self.request_accounting(model, lease.release(), &b, routing));
                             if let Some(hook) = &self.on_input {
                                 hook(&b);
                             }
                             return Ok((resp, recovered, model.clone(), permit));
                         }
                         server_wait = retry_after(resp.headers());
-                        let raw_text = resp.text().await.unwrap_or_default();
+                        let raw_body = resp.text().await;
+                        let response_complete = raw_body.is_ok();
+                        let raw_text = raw_body.unwrap_or_default();
+                        if let Some(routing) = &routing {
+                            routing.neutral(http_routing_neutral(
+                                status.as_u16(),
+                                &recovery_diagnostic(&raw_text),
+                            ));
+                        }
                         self.report_error_usage(
                             &raw_text,
                             model,
                             crate::tokens::has_native_media(&b),
+                            routing.as_deref(),
+                            response_complete,
                         )
                         .map_err(|error| auth.annotate(error))?;
                         let text = self.redact_native_diagnostic(&raw_text, &credential, Some(&b));
@@ -2722,8 +2958,17 @@ impl Provider {
                         };
                     }
                     Err(e) => {
-                        self.report_error_usage("", model, crate::tokens::has_native_media(&b))
-                            .map_err(|error| auth.annotate(error))?;
+                        if let Some(routing) = &routing {
+                            routing.neutral(crate::routing_observation::Neutral::Network);
+                        }
+                        self.report_error_usage(
+                            "",
+                            model,
+                            crate::tokens::has_native_media(&b),
+                            routing.as_deref(),
+                            false,
+                        )
+                        .map_err(|error| auth.annotate(error))?;
                         last_err =
                             self.redact_native_diagnostic(&e.to_string(), &credential, Some(&b));
                         reason = "connection failed".to_string();
@@ -2800,6 +3045,7 @@ impl Provider {
         cancel: &CancellationToken,
         on_delta: F,
     ) -> Result<ChatResult> {
+        let routing = crate::routing_observation::current_call();
         let messages = Self::completion_messages(messages, options);
         let result = self
             .completion_dispatch(options)
@@ -2817,9 +3063,16 @@ impl Provider {
                 return Err(StructuredOutputError::RefusedResponse.into());
             }
             if !result.tool_calls.is_empty() {
-                return Err(StructuredOutputError::SchemaViolation.into());
+                let error = StructuredOutputError::SchemaViolation;
+                self.note_output_contract(routing.as_ref(), &result.model_used, &error);
+                return Err(error.into());
             }
-            schema.parse_and_validate(&result.content)?;
+            schema
+                .parse_and_validate(&result.content)
+                .map_err(|error| {
+                    self.note_output_contract(routing.as_ref(), &result.model_used, &error);
+                    error
+                })?;
         }
         Ok(result)
     }
@@ -2934,6 +3187,7 @@ impl Provider {
                 mut pending,
                 mut usage,
             } = StreamAttempt::default();
+            let mut response_terminal = false;
             // Waiting for the response headers is cancellable too (a slow or
             // stuck endpoint must not outlive an interrupt).
             let (resp, recovered, model_used, permit) = tokio::select! {
@@ -2941,6 +3195,12 @@ impl Provider {
                 r = dispatch.post_provider_with_auth(&mut body, effort, true, &mut auth) => r?,
             };
             let mut charged = AttemptUsage::new(self, &model_used, &permit);
+            let mut chat_terminal = ChatTerminal::new(
+                permit
+                    .accounting
+                    .as_ref()
+                    .is_some_and(|a| a.chat_single_choice),
+            );
             let mut stream = resp.bytes_stream();
             // Raw bytes: a chunk boundary can split a multibyte character, so
             // only complete lines are decoded.
@@ -3010,7 +3270,7 @@ impl Provider {
                             }
                             if let Some(data) = line.strip_prefix("data:") {
                                 let data = data.trim();
-                                if data == "[DONE]" { continue; }
+                                if data == "[DONE]" {if !self.cfg.responses(){chat_terminal.done=true;}continue;}
                                 // Several `data:` lines make one field (SSE): a
                                 // line that isn't JSON alone waits for the next.
                                 let joined = if pending.is_empty() {
@@ -3041,6 +3301,7 @@ impl Provider {
                                     // Responses stopped early for length or a filter:
                                     // the partial answer stands, marked (#615).
                                     if self.cfg.responses() && v["type"] == "response.incomplete" {
+                                        response_terminal=true;
                                         match v["response"]["incomplete_details"]["reason"].as_str() {
                                             Some("max_output_tokens") => {
                                                 truncated = true;
@@ -3063,6 +3324,13 @@ impl Provider {
                                         v["error"].is_object()
                                     };
                                     if failed {
+                                        // A typed full failed response can report final cost
+                                        // without being a successful model-quality result.
+                                        if self.cfg.responses() && v["type"] == "response.failed"
+                                            && v["response"].is_object() && v["response"]["status"] == "failed"
+                                            && Usage::parse(&v["response"]["usage"]).is_some() {
+                                            charged.finish(true)?;
+                                        }
                                         let (retryable, message) = responses_failure(&v);
                                         let nothing_streamed =
                                             content.is_empty() && reasoning.is_empty() && tool_calls.is_empty();
@@ -3132,6 +3400,7 @@ impl Provider {
                                                 }
                                             }
                                             "response.completed" => {
+                                                response_terminal=true;
                                                 usage = Usage::parse(&v["response"]["usage"]).or(usage);
                                                 if content.is_empty() {
                                                     let t = responses_text(&v["response"]);
@@ -3153,6 +3422,7 @@ impl Provider {
                                     // With include_usage the last chunk carries usage
                                     // (and usually no choices).
                                     usage = Usage::parse(&v["usage"]).or(usage);
+                                    chat_terminal.observe(&v);
                                     if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
                                         if fr == "length" {
                                             truncated = true;
@@ -3233,7 +3503,14 @@ impl Provider {
                 }
             }
             let usage = charged.usage.or(usage);
-            charged.finish()?;
+            if let Some(routing) = &charged.routing {
+                routing.returned();
+            }
+            charged.finish(if self.cfg.responses() {
+                response_terminal
+            } else {
+                chat_terminal.complete()
+            })?;
             permit.success();
             break (
                 StreamAttempt {
@@ -3470,7 +3747,10 @@ impl Provider {
             };
             charged.observe(Some(usage));
             let usage = charged.usage.unwrap_or(usage);
-            charged.finish()?;
+            if let Some(routing) = &charged.routing {
+                routing.returned();
+            }
+            charged.finish(true)?;
             return Ok(ChatResult {
                 content: f.text,
                 reasoning: f.thinking,
@@ -3509,10 +3789,14 @@ impl Provider {
         let (resp, permit) = loop {
             // Admission belongs to each physical attempt; OAuth recovery state
             // belongs to this entire logical compaction request.
+            let routing = crate::routing_observation::begin_attempt(
+                crate::routing_observation::Identity::new(&self.name, &self.cfg, model),
+            );
             let lease = self
                 .request_lease()
                 .await
                 .map_err(|error| auth.annotate(error))?;
+            let lease = ObservedLease::new(lease, routing.clone());
             let credential = self
                 .credential()
                 .await
@@ -3526,18 +3810,44 @@ impl Provider {
                 &credential,
             )
             .json(&body);
+            if let Some(routing) = &routing {
+                routing.sent();
+            }
             let resp = match req.send().await {
                 Ok(resp) => resp,
                 Err(error) => {
+                    if let Some(routing) = &routing {
+                        routing.neutral(crate::routing_observation::Neutral::Network);
+                    }
                     permit.failure("connection failed", false);
                     return Err(error).context("POST /compact");
                 }
             };
             let status = resp.status();
+            if let Some(routing) = &routing {
+                routing.status(status.as_u16());
+                if !status.is_success() {
+                    routing.neutral(http_routing_neutral(status.as_u16(), ""));
+                }
+            }
             if !status.is_success() {
-                let raw_text = resp.text().await.unwrap_or_default();
-                self.report_error_usage(&raw_text, model, crate::tokens::has_native_media(&body))
-                    .map_err(|error| auth.annotate(error))?;
+                let raw_body = resp.text().await;
+                let response_complete = raw_body.is_ok();
+                let raw_text = raw_body.unwrap_or_default();
+                if let Some(routing) = &routing {
+                    routing.neutral(http_routing_neutral(
+                        status.as_u16(),
+                        &recovery_diagnostic(&raw_text),
+                    ));
+                }
+                self.report_error_usage(
+                    &raw_text,
+                    model,
+                    crate::tokens::has_native_media(&body),
+                    routing.as_deref(),
+                    response_complete,
+                )
+                .map_err(|error| auth.annotate(error))?;
                 let text = self.redacted_error(&raw_text, &credential);
                 if status.as_u16() == 401 && self.recover_unauthorized(&credential, &mut auth).await
                 {
@@ -3552,7 +3862,8 @@ impl Provider {
                     auth.detail()
                 ));
             }
-            permit.accounting = Some(self.request_accounting(model, lease, &Value::Null));
+            permit.accounting =
+                Some(self.request_accounting(model, lease.release(), &Value::Null, routing));
             if let Some(hook) = &self.on_input {
                 hook(&body);
             }

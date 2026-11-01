@@ -269,31 +269,34 @@ pub(crate) fn estimate_store_with_window(
         .and_then(|r| r.provider.as_deref())
         .unwrap_or(crate::config::DEFAULT_PROVIDER);
     let pcfg = cfg.provider_cfg(Some(name))?;
-    let mut model = pcfg.resolve_alias(rcfg.map_or(wanted.as_str(), |r| {
-        if r.model.is_empty() {
-            pcfg.model.as_str()
-        } else {
-            r.model.as_str()
-        }
-    }));
+    let mut model = rcfg.map_or_else(
+        || wanted.clone(),
+        |r| {
+            pcfg.resolve_alias(if r.model.is_empty() {
+                &pcfg.model
+            } else {
+                &r.model
+            })
+        },
+    );
     if ProviderCfg::is_auto_model(&model) {
         if let Some(r) = rcfg.filter(|r| !r.candidates.is_empty()) {
             let candidates: Vec<_> = r.candidates.iter().map(|m| pcfg.resolve_alias(m)).collect();
-            model = crate::routing::select_task_model(
-                &candidates,
-                &st.task_stats(selected_role.unwrap())?,
-                cfg.tools.task_min_samples,
-                cfg.tools.task_quality_bar,
-                false,
-            )
-            .context("no model candidates")?;
+            model = st
+                .routing_role_choice(cfg, selected_role.unwrap(), name, &candidates, false)?
+                .context("no model candidates")?
+                .model;
         } else {
-            model = crate::routing::select_model(&pcfg, &st.list_model_stats()?, false)
-                .context("no model candidates")?;
+            model = st
+                .routing_auto_choice(cfg, name, false)?
+                .context("no model candidates")?
+                .model;
         }
     }
     if let Some(selected) = selected {
-        model = pcfg.resolve_alias(selected);
+        // This override comes from action_model/consent and is already
+        // resolved, including any auto-routing choice.
+        model = selected.to_string();
     }
     let (window, window_source) = if let Some(window) = pcfg.model_context_tokens.get(&model) {
         (*window, "configured")
@@ -461,6 +464,7 @@ pub(crate) fn estimate_store_with_window(
         reqwest::Client::builder().no_proxy().build()?,
     )
     .with_name(name)
+    .resolved_dispatch(&model)
     .with_attachment_snapshot(st, &ctx)?;
     let key = crate::tokens::provider_key(name, &pcfg);
     let ratio = st.token_ratio(&key, &model)?;

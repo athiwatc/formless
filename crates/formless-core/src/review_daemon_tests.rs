@@ -517,6 +517,7 @@ async fn other_session_completed_awaiting_delivery_allows_file_changes_without_c
         .unwrap();
     let handle = uuid::Uuid::new_v4().to_string();
     let pending = Arc::new(PendingEntry {
+        routing_task: None,
         taint_scope: s.daemon.taint_scope(&other, &run),
         tool_name: "other-background-fixture".into(),
         run_id: run,
@@ -667,6 +668,7 @@ async fn unresolved_pending_memory_blocks_but_completed_awaiting_delivery_is_pre
     let initial = inspect(&s).await;
     let handle = uuid::Uuid::new_v4().to_string();
     let pending = Arc::new(PendingEntry {
+        routing_task: None,
         taint_scope: s.daemon.taint_scope(&s.session, &s.run),
         tool_name: "private-background-fixture".into(),
         run_id: s.run.clone(),

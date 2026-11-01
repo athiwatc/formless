@@ -79,8 +79,9 @@ impl RequestFailure {
     }
 }
 
-/// Admission refusals and local accounting errors provide no model-quality
-/// observation. Preserve real provider faults, even if their prose says budget.
+/// Legacy request-health counters exclude admission and local accounting
+/// errors. Correlated routing-quality eligibility is classified separately.
+/// Preserve real provider faults, even if their prose says budget.
 fn is_model_failure(error: &anyhow::Error) -> bool {
     !error
         .downcast_ref::<RequestFailure>()
@@ -404,6 +405,7 @@ type ExecFuture = std::pin::Pin<
 >;
 
 pub(crate) struct PendingEntry {
+    routing_task: Option<Arc<crate::routing_task_observation::Task>>,
     taint_scope: Arc<crate::approval_preview::RunTaint>,
     tool_name: String,
     run_id: String,
@@ -575,6 +577,7 @@ struct SentEntry {
 struct RunAdmission {
     cfg: Config,
     requested: String,
+    resolved_model: String,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
     first: StdMutex<
@@ -644,6 +647,7 @@ pub struct Daemon {
     /// The latest routing decisions (SPEC §4.6), newest last, at most 50.
     routing_log: StdMutex<std::collections::VecDeque<Value>>,
     model_test_cache: Arc<crate::model_test_cache::ModelTestCache>,
+    routing_recorder: Arc<crate::routing_recorder::Recorder>,
     /// Configured models the endpoints no longer list (SPEC §4.2).
     missing_models: StdMutex<Vec<String>>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
@@ -864,6 +868,7 @@ impl Daemon {
             hunk_reviews: StdMutex::new(Default::default()),
             routing_log: StdMutex::new(Default::default()),
             model_test_cache,
+            routing_recorder: Arc::new(crate::routing_recorder::Recorder::default()),
             missing_models: StdMutex::new(Vec::new()),
             step_sessions: StdMutex::new(Default::default()),
             step_waiters: StdMutex::new(Default::default()),
@@ -1049,16 +1054,36 @@ impl Daemon {
         session_id: &str,
         requested: Option<&str>,
     ) -> Result<Target> {
+        self.target_resolved(cfg, session_id, requested, None).await
+    }
+    async fn target_resolved(
+        &self,
+        cfg: &Config,
+        session_id: &str,
+        requested: Option<&str>,
+        resolved: Option<&str>,
+    ) -> Result<Target> {
         let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
         // Aliases (`provider.aliases`) resolve at use, so changing one moves
         // every Session and Role that names it.
-        let wanted = cfg
-            .provider
-            .resolve_alias(&requested.map(str::to_string).unwrap_or(session_model));
+        let wanted = match resolved {
+            Some(_) => requested
+                .context("resolved target is missing its frozen selection")?
+                .to_string(),
+            None => cfg
+                .provider
+                .resolve_alias(&requested.map(str::to_string).unwrap_or(session_model)),
+        };
         if let Some(role_name) = wanted.strip_prefix("role:") {
             let mut role = cfg.role(role_name)?.clone();
             let pcfg = cfg.provider_cfg(role.provider.as_deref())?;
-            role.model = pcfg.resolve_alias(&role.model);
+            role.model = resolved.map(str::to_string).unwrap_or_else(|| {
+                pcfg.resolve_alias(if role.model.is_empty() {
+                    &pcfg.model
+                } else {
+                    &role.model
+                })
+            });
             role.candidates = role
                 .candidates
                 .iter()
@@ -1069,30 +1094,21 @@ impl Daemon {
                 cfg.provider_cfg(role.provider.as_deref())?.model
             } else if ProviderCfg::is_auto_model(&role.model) && !role.candidates.is_empty() {
                 // Per-task choice: quality gate, then cost (SPEC §4.6).
-                let stats = self.with_reader(|st| st.task_stats(role_name))?;
-                let explore = rand::random::<f64>() < cfg.tools.task_explore_rate;
-                let picked = crate::routing::select_task_model(
-                    &role.candidates,
-                    &stats,
-                    cfg.tools.task_min_samples,
-                    cfg.tools.task_quality_bar,
-                    explore,
-                )
-                .unwrap_or_else(|| role.model.clone());
-                let samples =
-                    |m: &str| stats.iter().find(|s| s.model == m).map_or(0, |s| s.samples);
-                let explored = explore && samples(&picked) < cfg.tools.task_min_samples;
-                let mut why = crate::routing::explain_task_choice(
-                    &role.candidates,
-                    &stats,
-                    cfg.tools.task_min_samples,
-                    cfg.tools.task_quality_bar,
-                    explored,
-                    &picked,
-                );
-                why["kind"] = json!(format!("role:{role_name}"));
-                self.note_routing(session_id, why);
-                picked
+                self.flush_routing()?;
+                let mut choice = self
+                    .with_reader(|st| {
+                        st.routing_role_choice(
+                            cfg,
+                            role_name,
+                            provider.name(),
+                            &role.candidates,
+                            rand::random::<f64>() < cfg.tools.task_explore_rate,
+                        )
+                    })?
+                    .context("no role model candidates")?;
+                choice.explanation["kind"] = json!(format!("role:{role_name}"));
+                self.note_routing(session_id, choice.explanation);
+                choice.model
             } else {
                 role.model.clone()
             };
@@ -1102,7 +1118,7 @@ impl Daemon {
                     .reasoning_effort
             });
             return Ok(Target {
-                provider,
+                provider: provider.resolved_dispatch(&model),
                 model,
                 effort,
                 system: role.system.clone(),
@@ -1110,8 +1126,11 @@ impl Daemon {
             });
         }
         Ok(Target {
-            provider: self.provider(cfg).await?,
-            model: wanted,
+            provider: self
+                .provider(cfg)
+                .await?
+                .resolved_dispatch(resolved.unwrap_or(&wanted)),
+            model: resolved.unwrap_or(&wanted).to_string(),
             effort: session_effort,
             system: None,
             role: None,
@@ -1480,6 +1499,7 @@ impl Daemon {
     }
 
     async fn handle_inner(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
+        self.flush_routing()?;
         match req {
             Request::Ping => Ok(json!({
                 "pong": true,
@@ -2899,11 +2919,16 @@ impl Daemon {
                         r.model.as_str()
                     }
                 });
-                let mut model = pcfg.resolve_alias(wanted);
+                let mut model = if role.is_some() {
+                    pcfg.resolve_alias(wanted)
+                } else {
+                    wanted.to_string()
+                };
                 if ProviderCfg::is_auto_model(&model) {
                     let preview_provider =
                         Provider::with_key(pcfg.clone(), String::new(), self.http.clone())
-                            .with_name(provider_name.unwrap_or(crate::config::DEFAULT_PROVIDER));
+                            .with_name(provider_name.unwrap_or(crate::config::DEFAULT_PROVIDER))
+                            .resolved_dispatch(&model);
                     let role_name = requested.strip_prefix("role:");
                     let role = role_name.and_then(|r| cfg.roles.get(r));
                     if let Some(role) = role.filter(|r| !r.candidates.is_empty()) {
@@ -2912,15 +2937,18 @@ impl Daemon {
                             .iter()
                             .map(|m| pcfg.resolve_alias(m))
                             .collect();
-                        let stats = self.with_reader(|st| st.task_stats(role_name.unwrap()))?;
-                        model = crate::routing::select_task_model(
-                            &candidates,
-                            &stats,
-                            cfg.tools.task_min_samples,
-                            cfg.tools.task_quality_bar,
-                            false,
-                        )
-                        .context("no role model candidates for context estimate")?;
+                        model = self
+                            .with_reader(|st| {
+                                st.routing_role_choice(
+                                    &cfg,
+                                    role_name.unwrap(),
+                                    provider_name.unwrap_or(crate::config::DEFAULT_PROVIDER),
+                                    &candidates,
+                                    false,
+                                )
+                            })?
+                            .context("no role model candidates for context estimate")?
+                            .model;
                     } else {
                         let ctx = self
                             .session_context(
@@ -2936,12 +2964,16 @@ impl Daemon {
                         })?;
                         let complex =
                             self.routing_complex(&preview_provider, &model, &ctx, &defs, &cfg)?;
-                        model = crate::routing::select_model(
-                            &pcfg,
-                            &self.with_reader(|st| st.list_model_stats())?,
-                            complex,
-                        )
-                        .context("no model candidates for context estimate")?;
+                        model = self
+                            .with_reader(|st| {
+                                st.routing_auto_choice(
+                                    &cfg,
+                                    provider_name.unwrap_or(crate::config::DEFAULT_PROVIDER),
+                                    complex,
+                                )
+                            })?
+                            .context("no model candidates for context estimate")?
+                            .model;
                     }
                 }
                 // Keep existing context-window discovery; token estimation itself
@@ -2964,6 +2996,7 @@ impl Daemon {
                         )
                     }
                 };
+                let provider = provider.resolved_dispatch(&model);
                 let ctx = self
                     .session_context(
                         &session_id,
@@ -4652,7 +4685,7 @@ impl Daemon {
         ver: &ToolVersionInfo,
     ) -> Result<String> {
         let target = self.target(cfg, session_id, None).await?;
-        let model = self.resolve_model(&target.model, cfg, false)?;
+        let model = self.resolve_model_named(&target.model, cfg, target.provider.name(), false)?;
         // Quoted to the provider: secrets in the code stay here (#709).
         let code: String =
             crate::secrets::redact(&ver.code.chars().take(8000).collect::<String>()).0;
@@ -4966,12 +4999,14 @@ impl Daemon {
         .0;
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
+            .resolved_dispatch(&forecast.basis.model)
             .with_attachment_snapshot(st, &ctx)?;
         let sources = Arc::new(provider.freeze_attachments(&ctx, &forecast.basis.model, true));
         let checkpoint = crate::forecast::hash(&st.latest_checkpoint_record(session_id)?);
         Ok(Arc::new(RunAdmission {
             cfg: fixed,
             requested,
+            resolved_model: forecast.basis.model.clone(),
             effort,
             recovery_messages,
             first: StdMutex::new(Some((ctx, defs, checkpoint, sources))),
@@ -5026,13 +5061,16 @@ impl Daemon {
         let role_name = wanted.strip_prefix("role:");
         let role = role_name.map(|r| cfg.role(r)).transpose()?;
         let provider = cfg.provider_cfg(role.and_then(|r| r.provider.as_deref()))?;
-        let model = provider.resolve_alias(role.map_or(wanted.as_str(), |r| {
-            if r.model.is_empty() {
-                provider.model.as_str()
-            } else {
-                r.model.as_str()
-            }
-        }));
+        let model = role.map_or_else(
+            || wanted.clone(),
+            |r| {
+                provider.resolve_alias(if r.model.is_empty() {
+                    &provider.model
+                } else {
+                    &r.model
+                })
+            },
+        );
         if !ProviderCfg::is_auto_model(&model) {
             return Ok(model);
         }
@@ -5042,21 +5080,30 @@ impl Daemon {
                 .iter()
                 .map(|m| provider.resolve_alias(m))
                 .collect();
-            return crate::routing::select_task_model(
-                &candidates,
-                &st.task_stats(role_name.unwrap())?,
-                cfg.tools.task_min_samples,
-                cfg.tools.task_quality_bar,
-                rand::random::<f64>() < cfg.tools.task_explore_rate,
-            )
-            .context("no role model candidates");
+            return Ok(st
+                .routing_role_choice(
+                    cfg,
+                    role_name.unwrap(),
+                    role.provider
+                        .as_deref()
+                        .unwrap_or(crate::config::DEFAULT_PROVIDER),
+                    &candidates,
+                    rand::random::<f64>() < cfg.tools.task_explore_rate,
+                )?
+                .context("no role model candidates")?
+                .model);
         }
         let mut max = 0;
         for candidate in provider.routing_candidates() {
             max = max.max(
-                self.forecast_estimate_selected(st, cfg, input, Some(&candidate))?
-                    .basis
-                    .prompt_tokens,
+                self.forecast_estimate_selected(
+                    st,
+                    cfg,
+                    input,
+                    Some(&provider.resolve_alias(&candidate)),
+                )?
+                .basis
+                .prompt_tokens,
             );
         }
         let tools = toolreg::preview_tool_definitions(
@@ -5065,12 +5112,15 @@ impl Daemon {
             cfg.tools.inline_limit,
         )?
         .len();
-        crate::routing::select_model(
-            &provider,
-            &st.list_model_stats()?,
-            crate::routing::is_complex_tokens(max, tools, cfg.provider.routing_complex_chars),
-        )
-        .context("no model candidates")
+        Ok(st
+            .routing_auto_choice(
+                cfg,
+                role.and_then(|r| r.provider.as_deref())
+                    .unwrap_or(crate::config::DEFAULT_PROVIDER),
+                crate::routing::is_complex_tokens(max, tools, cfg.provider.routing_complex_chars),
+            )?
+            .context("no model candidates")?
+            .model)
     }
     fn ensure_session_description_trust(st: &Store, session_id: &str) -> Result<()> {
         if st
@@ -5249,6 +5299,28 @@ impl Daemon {
     }
 
     async fn run_loop(
+        self: Arc<Self>,
+        session_id: String,
+        run_id: String,
+        cancel: CancellationToken,
+        cancel_flag: Arc<AtomicBool>,
+        steer_rx: mpsc::UnboundedReceiver<()>,
+    ) {
+        let task = self.routing_task_for_run(&session_id, &run_id);
+        let producer = crate::routing_task_observation::Producer(task.clone());
+        crate::routing_task_observation::scope(
+            task,
+            self.clone()
+                .run_loop_inner(session_id, run_id, cancel, cancel_flag, steer_rx),
+        )
+        .await;
+        drop(producer);
+        if let Err(error) = self.flush_routing() {
+            tracing::warn!("routing receipts retained after Run: {error:#}");
+        }
+    }
+
+    async fn run_loop_inner(
         self: Arc<Self>,
         session_id: String,
         run_id: String,
@@ -5690,7 +5762,7 @@ impl Daemon {
             .unwrap_or_else(|| cfg.provider.model.clone());
         let model = self.resolve_model(&requested, cfg, false)?;
         let input = crate::skills::distil_input(task, calls, outcome, existing);
-        let distiller = self.provider(cfg).await?;
+        let distiller = self.provider(cfg).await?.resolved_dispatch(&model);
         let reply = counted(
             "skill-distil",
             "",
@@ -5806,7 +5878,18 @@ impl Daemon {
             .as_ref()
             .map(|a| a.requested.as_str())
             .or(once.as_deref());
-        let mut target = self.target(&cfg, session_id, requested).await?;
+        let mut target = match &admitted {
+            Some(a) => {
+                self.target_resolved(
+                    &cfg,
+                    session_id,
+                    Some(&a.requested),
+                    Some(&a.resolved_model),
+                )
+                .await?
+            }
+            None => self.target(&cfg, session_id, requested).await?,
+        };
         if let Some(admitted) = &admitted {
             target.effort = admitted.effort.clone();
         }
@@ -5872,7 +5955,7 @@ impl Daemon {
             &route_defs,
             &cfg,
         )?;
-        let model = self.resolve_model(&requested_model, &cfg, complex)?;
+        let model = self.resolve_model_named(&requested_model, &cfg, provider.name(), complex)?;
         self.run_models
             .lock()
             .unwrap()
@@ -5972,7 +6055,10 @@ impl Daemon {
             let got_bytes = Arc::new(AtomicBool::new(false));
             let started = std::time::Instant::now();
             let mut auto_resends = 0;
-            let outcome = 'request: loop {
+            let routing_call = crate::routing_observation::Call::responsible_step(
+                self.routing_recorder.call_sink(),
+            );
+            let outcome=crate::routing_observation::scope(routing_call.clone(),async { 'request: loop {
                 let (sid, rid) = (session_id.to_string(), run_id.to_string());
                 let subs = self.subs.clone();
                 let (last_byte2, got_bytes2) = (last_byte.clone(), got_bytes.clone());
@@ -6065,10 +6151,31 @@ impl Daemon {
                         stall_noted = false;
                     }
                 }
-            };
+            }}).await;
+            Self::finish_chat_observation(
+                &routing_call,
+                &provider,
+                &outcome,
+                cancel.is_cancelled(),
+            );
+            // Keep the legacy request-health counters independently of the
+            // correlated routing-quality receipt. HTTP availability faults are
+            // neutral for routing, but remain real failures in Metrics. Local
+            // admission/accounting failures still do not blame a model.
+            match &outcome {
+                Ok(result) => self.record_model_outcome(&result.model_used, true, started),
+                Err(error) if !cancel.is_cancelled() && is_model_failure(error) => {
+                    if let Some(identity) = routing_call.last_sent_identity() {
+                        self.record_model_outcome(&identity.model, false, started);
+                    }
+                }
+                _ => {}
+            }
+            drop(routing_call);
+            self.flush_routing()?;
+
             let result = match outcome {
                 Ok(r) => {
-                    self.record_model_outcome(&r.model_used, true, started);
                     let _ = self.with_store(|st| st.bump_run_steps(run_id));
                     if let Ok(mut usage) = self.usage_info(None, Some(run_id), &cfg) {
                         usage.context_used = r.usage.as_ref().map_or(0, |u| u.prompt_tokens as i64);
@@ -6082,9 +6189,6 @@ impl Daemon {
                     r
                 }
                 Err(e) => {
-                    if !cancel.is_cancelled() && is_model_failure(&e) {
-                        self.record_model_outcome(&model, false, started);
-                    }
                     return Err(e);
                 }
             };
@@ -7631,6 +7735,7 @@ impl Daemon {
         }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let ops = Arc::new(NestedOps {
+            routing_task: crate::routing_task_observation::current(),
             read_identity: Some((info.clone(), ver.clone())),
             read_input: input.clone(),
             _taint_scope: self.taint_scope(&session_id, &run_id),
@@ -7900,6 +8005,7 @@ impl Daemon {
     ) -> String {
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
+            routing_task: crate::routing_task_observation::current(),
             taint_scope: self.taint_scope(session_id, run_id),
             tool_name: name.to_string(),
             run_id: run_id.to_string(),
@@ -7941,37 +8047,41 @@ impl Daemon {
                 });
             }
             let (tok, cfg2) = (entry.cancel.clone(), cfg.clone());
-            tokio::spawn(async move {
-                let _done = done.drop_guard();
-                let res = this
-                    .clone()
-                    .execute_tool_at(
-                        sid.clone(),
-                        rid.clone(),
-                        nm.clone(),
-                        args,
-                        0,
-                        None,
-                        flag,
-                        Some(activity),
-                        tok,
-                        cfg2.clone(),
-                        true,
-                        agent_depth,
-                    )
-                    .await;
-                let (ok, text) = match res {
-                    Ok((value, inv_id)) => {
-                        if entry2.abandoned.load(Ordering::SeqCst) {
-                            let _ =
-                                this.with_store(|st| st.set_invocation_tag(&inv_id, "abandoned"));
+            let routing_task = entry2.routing_task.clone();
+            tokio::spawn(crate::routing_task_observation::scope(
+                routing_task,
+                async move {
+                    let _done = done.drop_guard();
+                    let res = this
+                        .clone()
+                        .execute_tool_at(
+                            sid.clone(),
+                            rid.clone(),
+                            nm.clone(),
+                            args,
+                            0,
+                            None,
+                            flag,
+                            Some(activity),
+                            tok,
+                            cfg2.clone(),
+                            true,
+                            agent_depth,
+                        )
+                        .await;
+                    let (ok, text) = match res {
+                        Ok((value, inv_id)) => {
+                            if entry2.abandoned.load(Ordering::SeqCst) {
+                                let _ = this
+                                    .with_store(|st| st.set_invocation_tag(&inv_id, "abandoned"));
+                            }
+                            (true, this.model_text(&sid, &value, &cfg2))
                         }
-                        (true, this.model_text(&sid, &value, &cfg2))
-                    }
-                    Err(e) => (false, format!("error: {e}")),
-                };
-                this.complete_pending(&handle2, &entry2, ok, text);
-            });
+                        Err(e) => (false, format!("error: {e}")),
+                    };
+                    this.complete_pending(&handle2, &entry2, ok, text);
+                },
+            ));
         }
         let threshold = std::time::Duration::from_secs(cfg.tools.pending_threshold_secs);
         match self.wait_pending(&entry, Some(threshold), cancel).await {
@@ -8426,23 +8536,12 @@ impl Daemon {
         cfg: &Config,
         complex: bool,
     ) -> Result<String> {
-        if !ProviderCfg::is_auto_model(requested) {
-            return Ok(requested.to_string());
-        }
-        let stats = self
-            .with_store(|st| st.list_model_stats())
-            .unwrap_or_default();
-        let picked = crate::routing::select_model(&cfg.provider, &stats, complex).context(
-            "provider.model is \"auto\" but no routing candidates are configured; set provider.routing_models (or fallback_models)",
-        )?;
-        let mut why = crate::routing::explain_model_choice(&cfg.provider, &stats, complex, &picked);
-        why["kind"] = json!(if complex {
-            "auto (complex task)"
-        } else {
-            "auto (simple task)"
-        });
-        self.note_routing("", why);
-        Ok(picked)
+        self.resolve_model_named(
+            &cfg.provider.resolve_alias(requested),
+            cfg,
+            crate::config::DEFAULT_PROVIDER,
+            complex,
+        )
     }
 
     /// Keep a routing decision for `/routing` (at most the last 50).
@@ -8859,9 +8958,10 @@ impl Daemon {
                 messages.push(json!({"role":"user","content":crate::provenance::frame(caller_tool,&origins,sys)}));
             }
             messages.push(json!({"role":"user","content":crate::provenance::frame(caller_tool,&origins,task)}));
-            let model = self.resolve_model(
+            let model = self.resolve_model_named(
                 &requested,
                 cfg,
+                provider.name(),
                 self.routing_complex(&provider, &requested, &messages, &sub_defs()?, cfg)?,
             )?;
             let label = match &role {
@@ -8887,7 +8987,13 @@ impl Daemon {
             let mut step = 0i64;
             // No step limit (SPEC principle 3): it ends on a final answer,
             // a fault, or cancellation.
-            let outcome: Result<String> = async {
+            let routing_task = crate::routing_task_observation::Task::with_recorder(
+                role.as_deref().unwrap_or(""),
+                crate::routing_task_observation::current(),
+                self.routing_recorder.clone(),
+            );
+            let routing_producer = crate::routing_task_observation::Producer(routing_task.clone());
+            let outcome: Result<String> = crate::routing_task_observation::scope(routing_task.clone(),async {
                 loop {
                     if cancel.is_cancelled() {
                         return Err(anyhow!("interrupted"));
@@ -8898,7 +9004,8 @@ impl Daemon {
                     self.check_budget(session_id, run_id, &cfg)?;
                     // Rebuilt each step: find_tools/create_tool load new Tools.
                     let defs = sub_defs()?;
-                    let result = counted(
+                    let routing_call=crate::routing_observation::Call::responsible_step(self.routing_recorder.call_sink());
+                    let result=crate::routing_observation::scope(routing_call.clone(),counted(
                         "agent",
                         session_id,
                         run_id,
@@ -8910,8 +9017,11 @@ impl Daemon {
                             cancel,
                             |_, _| {},
                         ),
-                    )
-                    .await?;
+                    )).await;
+                    Self::finish_chat_observation(&routing_call,&provider,&result,cancel.is_cancelled());
+                    drop(routing_call);
+                    self.flush_routing()?;
+                    let result=result?;
                     self.record_data_origin(
                         session_id,
                         run_id,
@@ -8996,8 +9106,10 @@ impl Daemon {
                         messages.push(msg);
                     }
                 }
+            }).await;
+            if let Some(task) = &routing_task {
+                task.finish(task.terminal_outcome(outcome.is_ok()));
             }
-            .await;
             let (status, result) = match &outcome {
                 Ok(text) => ("completed", text.clone()),
                 Err(e) => ("failed", e.to_string()),
@@ -9011,7 +9123,12 @@ impl Daemon {
             // turns of the whole task, and whether it ended well.
             // An interrupt says nothing about the model: not recorded.
             let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
-            if let Some(r) = role.as_ref().filter(|_| !interrupted) {
+            if let Some((r, task, identity)) =
+                role.as_ref().filter(|_| !interrupted).and_then(|r| {
+                    let task = routing_task.as_ref()?;
+                    Some((r, task, task.serving_identity()?))
+                })
+            {
                 let kind = match &outcome {
                     Ok(_) => "completed",
                     Err(e) if e.to_string().contains("turn limit") => "limit",
@@ -9023,9 +9140,10 @@ impl Daemon {
                     .flatten()
                     .map_or(0, |s| s.steps);
                 let _ = self.with_store(|st| {
-                    st.record_task(
+                    st.record_task_with_id(
+                        task.id(),
                         r,
-                        &model,
+                        &identity.model,
                         session_id,
                         run_id,
                         &task_hash,
@@ -9041,6 +9159,11 @@ impl Daemon {
                     session_id: session_id.to_string(),
                     subagent: sub,
                 });
+            }
+            drop(routing_producer);
+            drop(routing_task);
+            if let Err(error) = self.flush_routing() {
+                tracing::warn!("routing receipts retained after agent: {error:#}");
             }
             outcome
         })
@@ -9388,23 +9511,28 @@ impl Daemon {
     /// A primary Run on a role counts as one task for that role's per-task
     /// routing (SPEC §4.6); a later edit or correction marks it bad.
     fn record_primary_task(&self, session_id: &str, run_id: &str, status: &str) {
-        let model = self.run_models.locked().remove(run_id);
+        self.run_models.locked().remove(run_id);
+        let task = crate::routing_task_observation::current();
+        if let Some(task) = &task {
+            task.finish(task.terminal_outcome(status == "completed"));
+        }
         if status == "interrupted" {
             return;
         }
-        let Some(model) = model else { return };
-        let Ok(cfg) = self.config() else { return };
-        let (session_model, _) = self.session_model_effort(session_id, &cfg);
-        let Some(role) = session_model.strip_prefix("role:") else {
+        let Some(task) = task else { return };
+        let Some(identity) = task.serving_identity() else {
             return;
         };
-        let Ok(Some(m)) =
-            self.with_reader(|st| Ok(st.run_metrics(50)?.into_iter().find(|m| m.run_id == run_id)))
-        else {
+        let model = identity.model;
+        let Some(role) = task.role() else {
+            return;
+        };
+        let Ok(Some(m)) = self.with_reader(|st| st.run_metric(run_id)) else {
             return;
         };
         let _ = self.with_store(|st| {
-            st.record_task(
+            st.record_task_with_id(
+                task.id(),
                 role,
                 &model,
                 session_id,
@@ -11510,6 +11638,7 @@ impl Daemon {
         }
         let script_id = uuid::Uuid::new_v4().to_string();
         let ops = Arc::new(NestedOps {
+            routing_task: crate::routing_task_observation::current(),
             read_identity: None,
             read_input: Value::Null,
             _taint_scope: self.taint_scope(&session_id, &run_id),
@@ -11749,6 +11878,7 @@ impl Daemon {
             );
         }
         let ops = Arc::new(NestedOps {
+            routing_task: crate::routing_task_observation::current(),
             read_identity: Some((info.clone(), ver.clone())),
             read_input: input.clone(),
             _taint_scope: self.taint_scope(&session_id, &run_id),
@@ -12971,6 +13101,7 @@ impl Daemon {
                 return outcome.map(|v| (v, inv_id));
             }
             let ops = Arc::new(NestedOps {
+                routing_task: crate::routing_task_observation::current(),
                 read_identity: Some((info.clone(), ver.clone())),
                 read_input: input.clone(),
                 _taint_scope: self.taint_scope(&session_id, &run_id),
@@ -14841,6 +14972,7 @@ fn mcp_state(s: &McpServerInfo) -> &'static str {
 /// blocking QuickJS thread (nested calls on threads of their own) and
 /// block_on the daemon executor.
 struct NestedOps {
+    routing_task: Option<Arc<crate::routing_task_observation::Task>>,
     _taint_scope: Arc<crate::approval_preview::RunTaint>,
     read_identity: Option<(ToolInfo, ToolVersionInfo)>,
     read_input: Value,
@@ -14877,12 +15009,15 @@ impl NestedOps {
         work: impl std::future::Future<Output = Result<T>>,
     ) -> std::result::Result<T, String> {
         let cancel = self.cancel.clone();
-        self.handle.block_on(async move {
-            tokio::select! {
-                _ = cancel.cancelled() => Err("interrupted".to_string()),
-                r = work => r.map_err(|e| e.to_string()),
-            }
-        })
+        self.handle.block_on(crate::routing_task_observation::scope(
+            self.routing_task.clone(),
+            async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => Err("interrupted".to_string()),
+                    r = work => r.map_err(|e| e.to_string()),
+                }
+            },
+        ))
     }
 }
 
@@ -15145,14 +15280,38 @@ impl HostOps for NestedOps {
             .map_err(|e| e.to_string())?;
         let model = self
             .daemon
-            .resolve_model(&requested, &self.cfg, complex)
+            .resolve_model_named(&requested, &self.cfg, provider.name(), complex)
             .map_err(|e| e.to_string())?;
-        let (result, terminal) = self.block_cancellable(counted(
-            "llm",
-            &self.session_id,
-            &self.run_id,
-            provider.completion_for_validation(&messages, &model, effort.as_deref(), options),
-        ))?;
+        let (routing_call, (result, terminal)) = self.block_cancellable(async {
+            let call =
+                crate::routing_observation::Call::new(self.daemon.routing_recorder.call_sink());
+            let result = crate::routing_observation::scope(
+                call.clone(),
+                counted(
+                    "llm",
+                    &self.session_id,
+                    &self.run_id,
+                    provider.completion_for_validation(
+                        &messages,
+                        &model,
+                        effort.as_deref(),
+                        options,
+                    ),
+                ),
+            )
+            .await;
+            match result {
+                Ok(result) => Ok((call, result)),
+                Err(error) => {
+                    call.finish(Daemon::routing_error(
+                        &call,
+                        &error,
+                        self.cancel.is_cancelled(),
+                    ));
+                    Err(error)
+                }
+            }
+        })?;
         self.data_observed("llm", &result.model_used)?;
         let usage = result.usage;
         // A Tool's own model calls count toward its Cost per Success, and
@@ -15174,17 +15333,45 @@ impl HostOps for NestedOps {
                 st.add_invocation_model_use(inv, tokens, cost)
             });
         }
-        match options.output_schema() {
-            Some(schema) => {
-                if let Some(error) = terminal {
-                    return Err(error.to_string());
-                }
-                schema
-                    .parse_and_validate(&result.text)
-                    .map_err(|error| error.to_string())
-            }
+        let terminal_neutral = terminal.is_some() || result.output_limited;
+        let value = match options.output_schema() {
+            Some(schema) => match terminal {
+                Some(error) => Err(error),
+                None => schema.parse_and_validate(&result.text),
+            },
             None => Ok(Value::String(result.text)),
+        };
+        let identity = crate::routing_observation::Identity::new(
+            provider.name(),
+            provider.settings(),
+            &result.model_used,
+        );
+        if matches!(
+            &value,
+            Err(crate::provider::StructuredOutputError::InvalidJson
+                | crate::provider::StructuredOutputError::SchemaViolation)
+        ) {
+            routing_call.claim_contract(identity.clone());
         }
+        let observed = if self.cancel.is_cancelled() {
+            crate::routing_observation::Outcome::Neutral(
+                crate::routing_observation::Neutral::Cancelled,
+            )
+        } else if let Some(contract) = routing_call.contract_identity() {
+            crate::routing_observation::Outcome::ContractFailure(contract)
+        } else if value.is_ok() && !terminal_neutral {
+            crate::routing_observation::Outcome::Success(identity)
+        } else {
+            crate::routing_observation::Outcome::Neutral(
+                crate::routing_observation::Neutral::Unknown,
+            )
+        };
+        routing_call.finish(observed);
+        drop(routing_call);
+        if let Err(error) = self.daemon.flush_routing() {
+            tracing::warn!("routing receipts retained after Tool LLM: {error:#}");
+        }
+        value.map_err(|error| error.to_string())
     }
 
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
@@ -15210,25 +15397,28 @@ impl HostOps for NestedOps {
             self.activity.clone(),
             self.agent_depth,
         );
-        self.handle.block_on(async move {
-            daemon
-                .execute_tool_at(
-                    sid,
-                    rid,
-                    name,
-                    input,
-                    depth,
-                    parent,
-                    flag,
-                    activity,
-                    tok,
-                    cfg,
-                    preapproved,
-                    agent_depth,
-                )
-                .await
-                .map(|(v, _inv)| v)
-        })
+        self.handle.block_on(crate::routing_task_observation::scope(
+            self.routing_task.clone(),
+            async move {
+                daemon
+                    .execute_tool_at(
+                        sid,
+                        rid,
+                        name,
+                        input,
+                        depth,
+                        parent,
+                        flag,
+                        activity,
+                        tok,
+                        cfg,
+                        preapproved,
+                        agent_depth,
+                    )
+                    .await
+                    .map(|(v, _inv)| v)
+            },
+        ))
     }
     fn emit(&self, chunk: &str) -> std::result::Result<(), String> {
         use std::io::Write;
@@ -17339,3 +17529,10 @@ mod artifact_read_tests;
 #[cfg(test)]
 #[path = "relay_connection_tests.rs"]
 mod relay_connection_tests;
+
+#[path = "routing_daemon.rs"]
+mod routing_daemon;
+
+#[cfg(test)]
+#[path = "routing_daemon_tests.rs"]
+mod routing_daemon_tests;

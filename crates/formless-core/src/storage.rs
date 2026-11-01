@@ -370,7 +370,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 63;
+pub const SCHEMA_VERSION: i64 = 64;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -455,7 +455,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 63] = [
+const MIGRATIONS: [(i64, MigrationStep); 64] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -769,6 +769,7 @@ const MIGRATIONS: [(i64, MigrationStep); 63] = [
         )
     }),
     (63, |c| add_column(c, "run_files", "before_metadata TEXT")),
+    (64, |c| Ok(c.execute_batch(routing_storage::SCHEMA)?)),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2413,10 +2414,37 @@ impl Store {
         turns: i64,
         outcome: &str,
     ) -> Result<()> {
+        self.record_task_with_id(
+            &uuid::Uuid::new_v4().to_string(),
+            role,
+            model,
+            session_id,
+            run_id,
+            task_hash,
+            ms,
+            tokens,
+            turns,
+            outcome,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_task_with_id(
+        &self,
+        id: &str,
+        role: &str,
+        model: &str,
+        session_id: &str,
+        run_id: &str,
+        task_hash: &str,
+        ms: i64,
+        tokens: i64,
+        turns: i64,
+        outcome: &str,
+    ) -> Result<()> {
         self.ex(
             "INSERT INTO task_stats(id,role,model,session_id,run_id,task_hash,ms,tokens,turns,outcome,created_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![uuid::Uuid::new_v4().to_string(), role, model, session_id, run_id, task_hash, ms, tokens, turns, outcome, now()],
+            params![id, role, model, session_id, run_id, task_hash, ms, tokens, turns, outcome, now()],
         )?;
         Ok(())
     }
@@ -2914,6 +2942,28 @@ impl Store {
         limit: usize,
         since: Option<&str>,
     ) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
+        self.run_metrics_matching(session_id, limit, since, None)
+    }
+
+    /// One exact Run, independent of pagination or other Sessions' activity.
+    /// Routing completion must not search an unrelated recent-results page.
+    pub(crate) fn run_metric(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<formless_protocol::RunMetricsInfo>> {
+        Ok(self
+            .run_metrics_matching(None, 1, None, Some(run_id))?
+            .into_iter()
+            .next())
+    }
+
+    fn run_metrics_matching(
+        &self,
+        session_id: Option<&str>,
+        limit: usize,
+        since: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         let mut stmt = self.ps(
             "SELECT r.id, r.session_id, r.status, r.followup, r.steps,
                (SELECT COUNT(*) FROM invocations i WHERE i.run_id=r.id),
@@ -2921,10 +2971,11 @@ impl Store {
                (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage u WHERE u.run_id=r.id),
                r.created_at, r.updated_at, r.rating
              FROM runs r WHERE (?2 IS NULL OR r.session_id=?2) AND (?3 IS NULL OR r.created_at >= ?3)
+               AND (?4 IS NULL OR r.id=?4)
              ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64, session_id, since], |r| {
+            .query_map(params![limit as i64, session_id, since, run_id], |r| {
                 let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
                 let duration_ms = match (
                     chrono::DateTime::parse_from_rfc3339(&created),
@@ -7171,3 +7222,6 @@ mod native_cost_basis_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[path = "routing_storage.rs"]
+mod routing_storage;

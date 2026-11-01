@@ -1445,6 +1445,15 @@ async fn run_accounting_failure_is_local_but_actual_http_fault_still_counts() {
             if accounting { 0 } else { 1 },
             "local accounting failure attribution={accounting}"
         );
+        let routing_quality = daemon
+            .with_store(|st| {
+                st.routing_call_stats(&cfg, crate::config::DEFAULT_PROVIDER, chrono::Utc::now())
+            })
+            .unwrap();
+        assert!(
+            routing_quality.is_empty(),
+            "neither a local accounting fault nor HTTP503 is a model-quality sample"
+        );
         drop(db);
         teardown(daemon, server).await;
     }

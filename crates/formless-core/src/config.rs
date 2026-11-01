@@ -714,6 +714,9 @@ pub const SETTABLE: &[&str] = &[
     "provider.routing_fast_models",
     "provider.routing_strong_models",
     "provider.routing_complex_chars",
+    "provider.routing_window_days",
+    "provider.routing_min_samples",
+    "provider.routing_quality_bar",
     "provider.stall_notice_secs",
     "provider.first_byte_timeout_secs",
     "provider.max_backoff_secs",
@@ -974,6 +977,15 @@ pub struct ProviderCfg {
     /// Estimated context characters at/above which routing treats a task as complex.
     #[serde(default = "default_routing_complex_chars")]
     pub routing_complex_chars: usize,
+    /// Recent observation window shared by call and role routing.
+    #[serde(default = "default_routing_window_days")]
+    pub routing_window_days: u32,
+    /// Completed eligible calls required by main-model routing's quality gate.
+    #[serde(default = "default_task_min_samples")]
+    pub routing_min_samples: i64,
+    /// Required success rate for main-model routing (roles use tools.task_quality_bar).
+    #[serde(default = "default_task_quality_bar")]
+    pub routing_quality_bar: f64,
     /// Credential mode: API key (default) or OAuth2 subscription login.
     #[serde(default)]
     pub auth: AuthCfg,
@@ -1069,6 +1081,9 @@ fn default_api_style() -> String {
 fn default_tool_mode() -> String {
     "native".into()
 }
+fn default_routing_window_days() -> u32 {
+    30
+}
 fn default_routing_complex_chars() -> usize {
     20_000
 }
@@ -1097,6 +1112,9 @@ impl Default for ProviderCfg {
             routing_fast_models: Vec::new(),
             routing_strong_models: Vec::new(),
             routing_complex_chars: default_routing_complex_chars(),
+            routing_window_days: default_routing_window_days(),
+            routing_min_samples: default_task_min_samples(),
+            routing_quality_bar: default_task_quality_bar(),
             auth: AuthCfg::default(),
             vision: None,
             audio_input: None,

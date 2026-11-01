@@ -845,3 +845,170 @@ async fn probe_http_choice_multipliers_cannot_expand_the_output_budget() {
     );
     assert_eq!(policy.report()["reported_usage"]["completion_tokens"], 2);
 }
+
+#[tokio::test]
+async fn probe_bare_eof_keeps_interim_reported_usd_partial_with_protocol_controls() {
+    use axum::{response::IntoResponse, routing::post, Json, Router};
+    for (style, marker, incomplete) in [
+        ("chat", "none", true),
+        ("chat", "done", false),
+        ("chat", "finish", false),
+        ("responses", "none", true),
+        ("responses", "done", true),
+        ("responses", "completed", false),
+        ("anthropic", "none", true),
+        ("anthropic", "message_stop", false),
+    ] {
+        let env = crate::credential_env::EnvGuard::isolated();
+        env.set("NO_PROXY", "127.0.0.1,localhost");
+        let endpoint = match style {
+            "responses" => "/responses",
+            "anthropic" => "/messages",
+            _ => "/chat/completions",
+        };
+        let (base,_server)=server(Router::new().route(endpoint,post(move|Json(body):Json<Value>|async move{
+            let usage=json!({"prompt_tokens":3,"completion_tokens":2,"input_tokens":3,"output_tokens":2,"cost":0.001});
+            if body["stream"]!=true {
+                return Json(match style{"anthropic"=>json!({"content":[{"type":"tool_use","id":"private","name":"probe_ping","input":{}}],"usage":usage}),"responses"=>json!({"output":[{"type":"function_call","call_id":"private","name":"probe_ping","arguments":"{}"}],"usage":usage}),_=>json!({"choices":[{"message":{"tool_calls":[{"id":"private","type":"function","function":{"name":"probe_ping","arguments":"{}"}}]}}],"usage":usage})}).into_response();
+            }
+            let events=match style {
+                "anthropic"=>vec![json!({"type":"message_start","message":{"usage":{"input_tokens":3}}}),json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),json!({"type":"content_block_stop","index":0}),json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"cost":0.001}})],
+                "responses"=>vec![json!({"type":"response.output_text.delta","delta":"ok","usage":usage})],
+                _=>vec![json!({"choices":[{"delta":{"content":"ok"},"finish_reason":if marker=="finish"{json!("stop")}else{Value::Null}}],"usage":usage})],
+            };
+            let mut text=events.iter().map(|v|format!("data: {v}\n\n")).collect::<String>();
+            match marker {"done"=>text+="data: [DONE]\n\n","completed"=>text+=&format!("data: {}\n\n",json!({"type":"response.completed","response":{"usage":usage}})),"message_stop"=>text+=&format!("data: {}\n\n",json!({"type":"message_stop"})),_=>{}}
+            ([("content-type","text/event-stream")],text).into_response()
+        }))).await;
+        let billed = Arc::new(AtomicUsize::new(0));
+        let charged = billed.clone();
+        let p = Provider::new(
+            cfg(base, style),
+            format!("private-key-{}", uuid::Uuid::new_v4()),
+        )
+        .unwrap()
+        .with_usage_hook(Arc::new(move |_, _, _| {
+            charged.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let result = p.test_model("probe-model").await;
+        let usage = result.probe_usage.unwrap();
+        assert_eq!(
+            usage["incomplete_transport"], incomplete,
+            "{style}/{marker}"
+        );
+        assert_eq!(usage["usage_partial"], incomplete, "{style}/{marker}");
+        assert_eq!(usage["cost_partial"], incomplete, "{style}/{marker}");
+        assert!(usage["reported_usage"]["reported_cost"].as_f64().unwrap() > 0.0);
+        let sends = if style == "anthropic" && incomplete {
+            1
+        } else {
+            2
+        };
+        assert_eq!(usage["requests_sent"], sends);
+        assert_eq!(
+            billed.load(Ordering::SeqCst),
+            sends,
+            "observer must not bill again"
+        );
+        assert_eq!(
+            result.ok,
+            !(style == "anthropic" && incomplete),
+            "legacy capability behavior {style}/{marker}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_responses_terminal_keeps_final_spend_without_proving_later_reply_complete() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    env.remove("FORMLESS_BASE_URL");
+    env.remove("FORMLESS_MODEL");
+    use crate::routing_observation::{scope, Call, Identity, Outcome, Record};
+    let capture = || {
+        let records = Arc::new(Mutex::new(Vec::<Record>::new()));
+        let sink = records.clone();
+        (Call::new(Arc::new(move |r| sink.locked().push(r))), records)
+    };
+    for (full_failure, final_complete) in [(true, true), (true, false), (false, true)] {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sent = sends.clone();
+        let (base,_server)=server(Router::new().route("/responses",post(move||{
+            let sent=sent.clone(); async move {
+                let n=sent.fetch_add(1,Ordering::SeqCst);
+                let event=if n==0 {
+                    if full_failure {json!({"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"retryable server failure"},"usage":{"input_tokens":3,"output_tokens":2,"cost":0.004}}})}
+                    else {json!({"type":"error","error":{"code":"server_error","message":"retryable server failure"},"usage":{"input_tokens":3,"output_tokens":2,"cost":0.004}})}
+                } else {json!({"type":"response.output_text.delta","delta":"ok","usage":{"input_tokens":3,"output_tokens":2,"cost":0.006}})};
+                let mut text=format!("data: {event}\n\n");
+                if n>0&&final_complete{text+=&format!("data: {}\n\n",json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"cost":0.006}}}));}
+                ([("content-type","text/event-stream")],text)
+            }
+        }))).await;
+        let mut cfg = cfg(base, "responses");
+        cfg.api_style = "responses".into();
+        cfg.max_retries = 1;
+        cfg.max_backoff_secs = 0;
+        let billed = Arc::new(AtomicUsize::new(0));
+        let billing = billed.clone();
+        let p = Provider::new(cfg.clone(), "private-dummy".into())
+            .unwrap()
+            .with_usage_hook(Arc::new(move |_, _, _| {
+                billing.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+        let policy = crate::probe_policy::ProbePolicy::default();
+        let p = p.scoped_probe(policy.clone()).unwrap();
+        let (call, records) = capture();
+        let result = scope(
+            call.clone(),
+            p.chat_stream(
+                &[],
+                &[],
+                "requested",
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+                |_, _| {},
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.content, "ok");
+        call.finish(Outcome::Success(Identity::new(
+            "default",
+            &cfg,
+            &result.model_used,
+        )));
+        drop(call);
+        let rows = records.locked();
+        let record = &rows[0];
+        assert_eq!(record.attempts.len(), 2);
+        assert_eq!(record.attempts[0].response_complete, full_failure);
+        assert_eq!(record.attempts[1].response_complete, final_complete);
+        assert_eq!(
+            matches!(record.outcome, Outcome::Success(_)),
+            final_complete,
+            "earlier failed response must never attest later same-model bare EOF"
+        );
+        assert!(
+            (record
+                .attempts
+                .iter()
+                .map(|a| a.usage.unwrap().cost.unwrap())
+                .sum::<f64>()
+                - 0.01)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            billed.load(Ordering::SeqCst),
+            2,
+            "terminal settling cannot bill twice"
+        );
+        assert_eq!(
+            policy.report()["cost_partial"],
+            !full_failure || !final_complete
+        );
+    }
+}
