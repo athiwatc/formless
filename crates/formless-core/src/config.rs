@@ -385,6 +385,37 @@ impl Config {
         p.cost_of(model, prompt, completion, cached, cache_write, reported)
     }
 
+    /// A durable unknown native-cost basis must never fall back to generic
+    /// text prices, including after settings change or the process restarts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_of_known(
+        &self,
+        provider: &str,
+        model: &str,
+        prompt: i64,
+        completion: i64,
+        cached: i64,
+        cache_write: i64,
+        reported: Option<f64>,
+        unknown: bool,
+    ) -> Option<f64> {
+        reported.or_else(|| {
+            (!unknown)
+                .then(|| {
+                    self.cost_of(
+                        provider,
+                        model,
+                        prompt,
+                        completion,
+                        cached,
+                        cache_write,
+                        None,
+                    )
+                })
+                .flatten()
+        })
+    }
+
     pub fn provider_cfg(&self, name: Option<&str>) -> Result<ProviderCfg> {
         match name.filter(|n| !n.is_empty() && *n != DEFAULT_PROVIDER) {
             None => Ok(self.provider.clone()),

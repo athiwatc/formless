@@ -3241,8 +3241,9 @@ impl Daemon {
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
                 let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
-                for (key, provider, model, p, c, cached, cw, reported) in rows {
-                    let price = cfg.cost_of(&provider, &model, p, c, cached, cw, reported);
+                for (key, provider, model, p, c, cached, cw, reported, unknown) in rows {
+                    let price =
+                        cfg.cost_of_known(&provider, &model, p, c, cached, cw, reported, unknown);
                     match out.last_mut().filter(|o| o.0 == key) {
                         Some(o) => {
                             o.1 += p;
@@ -9646,9 +9647,13 @@ impl Daemon {
             let rows = self.with_reader(|st| st.usage_grouped(Some(&today), "model"))?;
             let day: Option<f64> = rows
                 .iter()
-                .map(|(_, provider, model, p, c, cached, cw, reported)| {
-                    cfg.cost_of(provider, model, *p, *c, *cached, *cw, *reported)
-                })
+                .map(
+                    |(_, provider, model, p, c, cached, cw, reported, unknown)| {
+                        cfg.cost_of_known(
+                            provider, model, *p, *c, *cached, *cw, *reported, *unknown,
+                        )
+                    },
+                )
                 .sum();
             if let Some(cost) = day {
                 checks.push((
@@ -9703,12 +9708,12 @@ impl Daemon {
             ..Default::default()
         };
         let mut cost = Some(0.0);
-        for (provider, model, p, c, cached, cw, reported) in rows {
+        for (provider, model, p, c, cached, cw, reported, unknown) in rows {
             u.prompt_tokens += p;
             u.completion_tokens += c;
             u.cached_tokens += cached;
             u.cache_write_tokens += cw;
-            let one = cfg.cost_of(&provider, &model, p, c, cached, cw, reported);
+            let one = cfg.cost_of_known(&provider, &model, p, c, cached, cw, reported, unknown);
             if one.is_none() && !u.unpriced.contains(&model) {
                 u.unpriced.push(model.clone());
             }

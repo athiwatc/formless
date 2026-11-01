@@ -938,6 +938,16 @@ pasting paths.
   media-token/cost contribution is unknown, and they do not train text-only
   token calibration. Source preparation uses a private frozen-byte map rather
   than introducing file authority into provider JSON.
+  Canonical messages and verified frozen bytes survive the first-model gate;
+  each physical attempt projects for its actual model/API. Content repairs are
+  typed and persist across stream retries, touching only real API content parts,
+  never Tool schemas, defaults/examples, structured arguments or vendor data.
+  Final wire bodies reach input/accounting hooks after optional-body repairs.
+  Strict dollar limits refuse unknown native input costs before HTTP; existing
+  explicit budget waivers retain their meaning. Schema 62 records unknown native
+  cost durably: generic text prices cannot replace an unreported media cost,
+  including after restart or pricing changes. Provider-reported USD wins;
+  reported and estimated rows remain separate cost bases before aggregation.
 - **Retention.** Attachments are artifacts, so `artifacts.*` retention
   removes them too. A removed one is marked expired where it was sent:
   clients show "name · expired" and the model's history says it is no

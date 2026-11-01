@@ -289,6 +289,7 @@ struct RequestAccounting {
     prompt_hook: Option<PromptHook>,
     prompt_key: String,
     prompt_estimate: usize,
+    unknown_cost: bool,
     provider: String,
     model: String,
 }
@@ -300,6 +301,8 @@ struct AttemptUsage<'a> {
     model: String,
     usage: Option<Usage>,
     prompt_estimate: usize,
+    unknown_cost: bool,
+    recorded: bool,
 }
 impl<'a> AttemptUsage<'a> {
     fn new(provider: &'a Provider, model: &str, permit: &BreakerPermit) -> Self {
@@ -308,14 +311,18 @@ impl<'a> AttemptUsage<'a> {
             model: model.to_string(),
             usage: None,
             prompt_estimate: permit.accounting.as_ref().map_or(0, |a| a.prompt_estimate),
+            unknown_cost: permit.accounting.as_ref().is_some_and(|a| a.unknown_cost),
+            recorded: false,
         }
     }
     fn observe(&mut self, usage: Option<Usage>) {
         if let Some(mut usage) = usage {
+            usage.cost_unknown |= self.unknown_cost;
             if let Some(previous) = self.usage {
                 // Usage events are cumulative, and partial updates may omit
                 // counters already reported by message_start/earlier events.
                 usage.reported |= previous.reported;
+                usage.cost_unknown |= previous.cost_unknown;
                 usage.prompt_tokens = usage.prompt_tokens.max(previous.prompt_tokens);
                 usage.completion_tokens = usage.completion_tokens.max(previous.completion_tokens);
                 usage.reasoning_tokens = usage.reasoning_tokens.max(previous.reasoning_tokens);
@@ -327,11 +334,20 @@ impl<'a> AttemptUsage<'a> {
                     (a, b) => a.or(b),
                 };
             }
+            if usage.cost.is_some() {
+                usage.cost_unknown = false;
+            }
             self.usage = Some(usage);
         }
     }
     fn finish(&mut self) -> Result<()> {
-        let usage = self.usage.take();
+        let usage = self.usage.take().or_else(|| {
+            self.unknown_cost.then_some(Usage {
+                cost_unknown: true,
+                ..Default::default()
+            })
+        });
+        self.recorded = true;
         self.provider.report_usage(&self.model, usage.as_ref())?;
         if let Some(u) = usage.filter(|u| u.reported & 1 != 0) {
             self.provider
@@ -342,10 +358,16 @@ impl<'a> AttemptUsage<'a> {
 }
 impl Drop for AttemptUsage<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self
-            .provider
-            .report_usage(&self.model, self.usage.take().as_ref())
-        {
+        if self.recorded {
+            return;
+        }
+        let usage = self.usage.take().or_else(|| {
+            self.unknown_cost.then_some(Usage {
+                cost_unknown: true,
+                ..Default::default()
+            })
+        });
+        if let Err(error) = self.provider.report_usage(&self.model, usage.as_ref()) {
             // The daemon hook fails future admission closed after a failed
             // commit. Preserve the original stream error/cancellation here.
             tracing::warn!("could not commit failed stream usage: {error:#}");
@@ -387,7 +409,19 @@ impl BreakerPermit {
         })
     }
     fn account_usage(&self, usage: Option<Usage>, comparable: bool) -> Result<()> {
-        if let (Some(accounting), Some(usage)) = (&self.accounting, usage) {
+        if let Some(accounting) = &self.accounting {
+            let Some(mut usage) = usage.or_else(|| {
+                accounting.unknown_cost.then_some(Usage {
+                    cost_unknown: true,
+                    ..Default::default()
+                })
+            }) else {
+                return Ok(());
+            };
+            usage.cost_unknown |= accounting.unknown_cost;
+            if usage.cost.is_some() {
+                usage.cost_unknown = false;
+            }
             if let Some(hook) = &accounting.hook {
                 hook(&accounting.provider, &accounting.model, &usage)?;
             }
@@ -509,6 +543,7 @@ async fn completed_json(
             Ok(value)
         }
         Err(error) => {
+            permit.account_usage(None, false)?;
             permit.failure("response body failed", false);
             Err(error).context(context)
         }
@@ -593,6 +628,9 @@ pub struct Usage {
     /// USD the provider billed for the request (OpenRouter's
     /// `usage.cost`); preferred over `provider.prices` when present.
     pub cost: Option<f64>,
+    /// Native media has no reliable generic text-rate cost basis. A provider's
+    /// actual reported cost still takes precedence over this uncertainty.
+    pub cost_unknown: bool,
     /// Coverage bits: 1=input explicitly reported, 2=output explicitly reported.
     /// Cumulative stream snapshots combine these; counter equality ignores it.
     pub reported: u8,
@@ -648,6 +686,7 @@ impl Usage {
                 .max(n(&u["input_tokens_details"]["cache_write_tokens"]))
                 .max(n(&u["cache_creation_input_tokens"])),
             cost: u["cost"].as_f64().filter(|c| c.is_finite() && *c >= 0.0),
+            cost_unknown: false,
             reported: u8::from(
                 u["prompt_tokens"].as_u64().is_some() || u["input_tokens"].as_u64().is_some(),
             ) | (u8::from(
@@ -828,7 +867,7 @@ fn apply_breakpoints(body: &mut Value, on: bool) {
         });
     } else if body["input"].is_array() {
         let mut input = body["input"].take();
-        crate::anthropic::strip_cache_control(&mut input);
+        crate::anthropic::strip_request_cache_control(&mut input);
         if let (true, Some(parts)) = (on, input.as_array_mut()) {
             mark_responses_system(parts);
         }
@@ -873,7 +912,7 @@ fn apply_extra_body(body: &mut Value, cfg: &ProviderCfg, model: &str) {
 
 /// A message whose content is one marked text part, as a plain string.
 fn unmark(mut m: Value) -> Value {
-    crate::anthropic::strip_cache_control(&mut m);
+    crate::anthropic::strip_request_cache_control(&mut m);
     let single = m["content"]
         .as_array()
         .filter(|parts| parts.len() == 1 && parts[0]["type"] == "text")
@@ -1486,18 +1525,31 @@ impl Provider {
             } else {
                 crate::tokens::request(body)
             },
+            unknown_cost: crate::tokens::has_native_media(body),
             provider: self.name.clone(),
             model: model.to_string(),
         }
     }
 
-    fn report_error_usage(&self, text: &str, model: &str) -> Result<()> {
-        if let Ok(value) = serde_json::from_str::<Value>(text) {
-            let usage =
-                Usage::parse(&value["usage"]).or_else(|| Usage::parse(&value["response"]["usage"]));
-            self.report_usage(model, usage.as_ref())?;
+    fn report_error_usage(&self, text: &str, model: &str, unknown_cost: bool) -> Result<()> {
+        let mut usage = serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|v| {
+                Usage::parse(&v["usage"]).or_else(|| Usage::parse(&v["response"]["usage"]))
+            })
+            .or_else(|| {
+                unknown_cost.then_some(Usage {
+                    cost_unknown: true,
+                    ..Default::default()
+                })
+            });
+        if let Some(usage) = &mut usage {
+            usage.cost_unknown |= unknown_cost;
+            if usage.cost.is_some() {
+                usage.cost_unknown = false;
+            }
         }
-        Ok(())
+        self.report_usage(model, usage.as_ref())
     }
 
     async fn request_lease(&self) -> Result<Option<RequestLease>> {
@@ -1941,12 +1993,14 @@ impl Provider {
         effort: Option<&str>,
     ) -> Result<CompletionResult> {
         let dispatch = self.native_dispatch(messages, model);
-        let (v, served) = if self.cfg.anthropic() {
+        let (v, served, unknown_cost) = if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
             let (resp, _, served, permit) = dispatch.post_provider(&mut body, None, true).await?;
+            let unknown = permit.accounting.as_ref().is_some_and(|a| a.unknown_cost);
             (
                 completed_json(resp, permit, "parse Messages response").await?,
                 served,
+                unknown,
             )
         } else {
             let mut body = if self.cfg.responses() {
@@ -1956,7 +2010,10 @@ impl Provider {
             };
             dispatch.post_chat_served(&mut body, effort).await?
         };
-        let usage = Usage::parse(&v["usage"]);
+        let mut usage = Usage::parse(&v["usage"]);
+        if let Some(usage) = &mut usage {
+            usage.cost_unknown = unknown_cost && usage.cost.is_none();
+        }
         let (text, output_limited) = if self.cfg.anthropic() {
             if let Some(why) = crate::anthropic::unusable_stop(&v) {
                 return Err(anyhow!("provider error: {why}"));
@@ -1992,11 +2049,13 @@ impl Provider {
         &self,
         body: &mut Value,
         effort: Option<&str>,
-    ) -> Result<(Value, String)> {
+    ) -> Result<(Value, String, bool)> {
         let (resp, _, served, permit) = self.post_provider(body, effort, true).await?;
+        let unknown = permit.accounting.as_ref().is_some_and(|a| a.unknown_cost);
         Ok((
             completed_json(resp, permit, "parse chat completion").await?,
             served,
+            unknown,
         ))
     }
 
@@ -2119,8 +2178,12 @@ impl Provider {
                         }
                         server_wait = retry_after(resp.headers());
                         let raw_text = resp.text().await.unwrap_or_default();
-                        self.report_error_usage(&raw_text, model)
-                            .map_err(|error| auth.annotate(error))?;
+                        self.report_error_usage(
+                            &raw_text,
+                            model,
+                            crate::tokens::has_native_media(&b),
+                        )
+                        .map_err(|error| auth.annotate(error))?;
                         let text = self.redacted_error(&raw_text, &credential);
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
@@ -2160,9 +2223,12 @@ impl Provider {
                                 && body.get("__no_cache_control").is_none()
                             {
                                 // Not marked again on later attempts.
-                                crate::anthropic::strip_cache_control(&mut repaired);
-                                repaired["__no_cache_control"] = json!(true);
-                                Some(crate::anthropic::Recovery::CacheControl)
+                                if crate::anthropic::strip_request_cache_control(&mut repaired) {
+                                    repaired["__no_cache_control"] = json!(true);
+                                    Some(crate::anthropic::Recovery::CacheControl)
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             };
@@ -2228,6 +2294,8 @@ impl Provider {
                         };
                     }
                     Err(e) => {
+                        self.report_error_usage("", model, crate::tokens::has_native_media(&b))
+                            .map_err(|error| auth.annotate(error))?;
                         last_err = self.redacted_error(&e.to_string(), &credential);
                         reason = "connection failed".to_string();
                     }
@@ -2691,6 +2759,7 @@ impl Provider {
                     }
                 }
             }
+            let usage = charged.usage.or(usage);
             charged.finish()?;
             permit.success();
             break (
@@ -2991,7 +3060,7 @@ impl Provider {
             let status = resp.status();
             if !status.is_success() {
                 let raw_text = resp.text().await.unwrap_or_default();
-                self.report_error_usage(&raw_text, model)
+                self.report_error_usage(&raw_text, model, crate::tokens::has_native_media(&body))
                     .map_err(|error| auth.annotate(error))?;
                 let text = self.redacted_error(&raw_text, &credential);
                 if status.as_u16() == 401 && self.recover_unauthorized(&credential, &mut auth).await
@@ -3133,57 +3202,41 @@ impl NativeRepairs {
             }
         }
         if self.cache {
-            crate::anthropic::strip_cache_control(value);
+            crate::anthropic::strip_request_cache_control(value);
         }
         self.apply_parts(value);
     }
     fn apply_parts(&self, value: &mut Value) {
-        match value {
-            Value::Array(a) => {
-                if self.thinking {
-                    a.retain(|v| {
-                        !matches!(v["type"].as_str(), Some("thinking" | "redacted_thinking"))
-                    });
-                }
-                for v in a {
-                    self.apply_parts(v);
-                }
+        crate::tokens::content_parts_mut(value, |parts| {
+            if self.thinking {
+                parts.retain(|part| {
+                    !matches!(
+                        part["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                });
             }
-            Value::Object(o) => {
-                let kind = o.get("type").and_then(Value::as_str).unwrap_or_default();
-                let omit = (self.images && matches!(kind, "image" | "image_url" | "input_image"))
-                    || (self.audio && kind == "input_audio")
-                    || (self.pdf && matches!(kind, "file" | "input_file" | "document"));
-                if omit {
-                    let part = if kind.starts_with("input_") && kind != "input_audio" {
+            for part in parts {
+                let kind = part["type"].as_str().unwrap_or_default();
+                if self.images && matches!(kind, "image" | "image_url" | "input_image")
+                    || self.audio && kind == "input_audio"
+                    || self.pdf && matches!(kind, "file" | "input_file" | "document")
+                {
+                    let text_type = if matches!(kind, "input_file" | "input_image") {
                         "input_text"
                     } else {
                         "text"
                     };
-                    *value = json!({"type":part,"text":"[attachment not sent: the provider rejected this native modality; artifact reference retained]"});
-                } else {
-                    for v in o.values_mut() {
-                        self.apply_parts(v);
-                    }
+                    *part = json!({"type":text_type,"text":"[attachment not sent: the provider rejected this native modality; artifact reference retained]"});
                 }
             }
-            _ => {}
-        }
+        });
     }
     fn reject_native(&mut self, body: &Value, error: &str) -> Option<&'static str> {
-        fn has(v: &Value, kinds: &[&str]) -> bool {
-            match v {
-                Value::Object(o) => {
-                    o.get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| kinds.contains(&s))
-                        || o.values().any(|v| has(v, kinds))
-                }
-                Value::Array(a) => a.iter().any(|v| has(v, kinds)),
-                _ => false,
-            }
-        }
-        if !self.audio && error.contains("audio") && has(body, &["input_audio"]) {
+        if !self.audio
+            && error.contains("audio")
+            && crate::tokens::has_content_kind(body, &["input_audio"])
+        {
             self.audio = true;
             return Some(
                 "The provider rejected native audio; resent with the artifact reference only.",
@@ -3194,7 +3247,7 @@ impl NativeRepairs {
                 || error.contains("document")
                 || error.contains("file_data")
                 || error.contains("input_file"))
-            && has(body, &["file", "input_file", "document"])
+            && crate::tokens::has_content_kind(body, &["file", "input_file", "document"])
         {
             self.pdf = true;
             return Some(
@@ -4135,6 +4188,37 @@ mod breaker_tests;
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn native_repair_and_detection_are_limited_to_real_content_parts() {
+        let schema = json!({"type":"object","const":{"type":"file","cache_control":{"type":"data"}},"default":{"type":"input_audio"},"examples":[{"type":"thinking"},{"type":"document"},{"type":"input_file"},{"type":"image"}]});
+        for key in ["messages", "input"] {
+            let mut body = json!({"tools":[{"type":"function","function":{"name":"fixture","parameters":schema}}],"guard":{"schema":schema},"response_format":{"json_schema":{"schema":schema}}});
+            body[key] = json!([{"role":"user","content":[{"type":"text","text":"plain"}]}]);
+            let unchanged = body.clone();
+            assert!(!crate::tokens::has_native_media(&body));
+            let repairs = NativeRepairs {
+                thinking: true,
+                images: true,
+                cache: true,
+                audio: true,
+                pdf: true,
+                ..Default::default()
+            };
+            repairs.apply(&mut body);
+            assert_eq!(body, unchanged, "schema values are data");
+            assert!(NativeRepairs::default()
+                .reject_native(&body, "unsupported PDF audio document")
+                .is_none());
+            body[key][0]["content"] = json!([{"type":"text","text":"plain"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"x"}},{"type":"thinking","thinking":"replay"},{"type":"input_audio","input_audio":{"data":"x","format":"wav"}}]);
+            assert!(crate::tokens::has_native_media(&body));
+            repairs.apply(&mut body);
+            assert!(!crate::tokens::has_native_media(&body));
+            assert_eq!(body["tools"], unchanged["tools"]);
+            assert_eq!(body["guard"], unchanged["guard"]);
+            assert_eq!(body["response_format"], unchanged["response_format"]);
+            assert_eq!(body[key][0]["content"].as_array().unwrap().len(), 3);
+        }
+    }
     fn budget_png() -> Vec<u8> {
         let mut bytes = Vec::new();
         image::DynamicImage::new_rgb8(8, 8)
