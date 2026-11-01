@@ -221,7 +221,7 @@ async fn adversarial_page_stays_data_in_chat_responses_and_messages() {
         });
         let paths = Paths::from_dirs(f.0.join("data"), f.0.join("config")).unwrap();
         let mut cfg = Config::default();
-        cfg.provider.base_url = base;
+        cfg.provider.base_url = base.clone();
         cfg.provider.api_style = style.into();
         cfg.provider.model = "fixture".into();
         cfg.provider.max_retries = 0;
@@ -327,7 +327,7 @@ async fn adversarial_page_stays_data_in_chat_responses_and_messages() {
         let origins = st.data_origins(&sid, &rid).unwrap();
         assert!(origins
             .iter()
-            .any(|o| o.tool == "fetch_page" && o.kind == "url" && o.origin.ends_with("/page")));
+            .any(|o| o.tool == "fetch_page" && o.kind == "url" && o.origin == base));
         assert!(!serde_json::to_string(&origins)
             .unwrap()
             .contains("private-origin-token"));
@@ -354,7 +354,7 @@ fn durable_origins_are_bounded_deduplicated_and_isolated_by_session_and_run() {
         let origin = provenance::Origin::new(
             "fetch_page",
             "url",
-            &format!("https://user:opaque@host.example/{n}?token=opaque"),
+            &format!("https://user:opaque@host{n}.example/Zf8G2m7Q9v1H5n6R?token=opaque"),
         );
         st.record_data_origin("s1", "r1", &origin).unwrap();
         st.record_data_origin("s1", "r1", &origin).unwrap();
@@ -363,6 +363,9 @@ fn durable_origins_are_bounded_deduplicated_and_isolated_by_session_and_run() {
     assert_eq!(sources.len(), provenance::MAX_ORIGINS);
     assert_eq!(sources.iter().filter(|o| o.kind == "truncated").count(), 1);
     assert!(!serde_json::to_string(&sources).unwrap().contains("opaque"));
+    assert!(!serde_json::to_string(&sources)
+        .unwrap()
+        .contains("Zf8G2m7Q9v1H5n6R"));
     assert!(st.data_origins("s1", "r2").unwrap().is_empty());
     assert!(st.data_origins("s2", "r1").unwrap().is_empty());
     drop(st);
@@ -534,7 +537,7 @@ async fn skill_artifact_and_error_results_keep_payloads_and_actual_origins() {
                 .unwrap()));
     assert!(skill_origins
         .iter()
-        .any(|o| o["kind"] == "skill" && o["origin"] == "https://author.example/skill"));
+        .any(|o| o["kind"] == "skill" && o["origin"] == "https://author.example"));
     assert!(frames[1]["origins"]
         .as_array()
         .unwrap()

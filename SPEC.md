@@ -4346,7 +4346,9 @@ Conflicting instructions embedded in data are surfaced to the user, never obeyed
 Every model-facing Tool result (including errors, deferred results and legacy
 transcripts) carries a stable source-Tool/provenance envelope. Raw Tool.run and
 direct-call values remain compatible. Actual data origins are bounded per Run
-and persisted without URL userinfo, query values, headers or payload contents.
+and persisted without URL userinfo, paths, query values, fragments, headers or
+payload contents. HTTP/HTTPS sources identify only their canonical scheme, host
+and port (the `url` origin kind); file sources retain canonical file paths.
 Compacted history remains data; summaries do not become new system instructions.
 Tool-supplied `llm.complete` and `agents.run` requests and system hints are also
 framed as data from the calling Tool; they cannot create system authority.
