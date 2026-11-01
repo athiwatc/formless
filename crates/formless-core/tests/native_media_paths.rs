@@ -106,6 +106,16 @@ async fn native_mentions_copy_only_bounded_authorized_files_and_keep_large_refer
                 .to_string()
                 .contains("protected profile")
         );
+        let alias_root = root.join(".ssh");
+        std::os::unix::fs::symlink(&project, &alias_root).unwrap();
+        assert!(
+            attach("document.pdf".into(), alias_root)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("credential"),
+            "configured root's lexical credential namespace remains protected"
+        );
         std::os::unix::fs::symlink(project.join("document.pdf"), project.join(".ssh/safe.pdf"))
             .unwrap();
         assert!(attach(".ssh/safe.pdf".into(), project.clone())
