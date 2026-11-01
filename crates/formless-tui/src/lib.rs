@@ -2,6 +2,8 @@ mod branch_summary;
 pub mod client;
 mod clipimg;
 mod commands;
+mod external_editor;
+mod external_editor_ui;
 mod highlight;
 mod hunk_controller;
 mod hunk_ui;
@@ -1563,6 +1565,7 @@ struct App {
     providers_info: serde_json::Value,
     /// Redraw from scratch (after handing the terminal to $EDITOR).
     force_redraw: bool,
+    external_edit: external_editor_ui::State,
     /// Whether the terminal has focus (focus events; assumed until told).
     focused: bool,
     /// When each Session's current Run started, for the notify threshold.
@@ -1899,6 +1902,7 @@ impl App {
             settings_remove_arm: None,
             providers_info: serde_json::Value::Null,
             force_redraw: false,
+            external_edit: Default::default(),
             focused: true,
             run_started_at: HashMap::new(),
             notifications: Vec::new(),
@@ -6593,6 +6597,7 @@ impl App {
 
     fn slash(&mut self, cmd: &str) {
         match cmd {
+            "editor"=>self.begin_external_edit(),
             "new" => self.request(
                 Pending::CreateSession,
                 Request::CreateSession { name: None },
@@ -8171,6 +8176,10 @@ impl App {
             }
             return;
         }
+        if ctrl && key.code == KeyCode::Char('g') && key.kind == KeyEventKind::Press {
+            self.begin_external_edit();
+            return;
+        }
         if self.vim_mode && ctrl && key.code == KeyCode::Char('q') {
             self.editor = None;
             self.editor_review = None;
@@ -8324,6 +8333,9 @@ impl App {
         }
         if self.hunk_review_is_visible() {
             self.hunk_review_key(key);
+            return;
+        }
+        if self.external_clear_key(&key) {
             return;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -8719,6 +8731,19 @@ impl App {
         if self.view == View::Chat
             && (self.question_key(&key) || self.palette_key(&key) || self.mention_key(&key))
         {
+            return;
+        }
+        // Before Vim touches the input: a failed handoff must preserve even
+        // collapsed paste markers and pending modal edits exactly.
+        if self.view == View::Chat
+            && self.find.is_none()
+            && self.input.searching().is_none()
+            && (!modal_open || self.input_focus)
+            && key.kind == KeyEventKind::Press
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('g')
+        {
+            self.begin_external_edit();
             return;
         }
         if self.vim_mode
@@ -9827,44 +9852,24 @@ impl App {
     /// get the terminal until they exit; GUI editors just start. Returns
     /// a note when something went wrong.
     fn run_editor(&mut self, file: &std::path::Path, line: Option<u32>) -> Option<String> {
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| if cfg!(windows) { "notepad" } else { "vi" }.into());
-        let mut words = editor.split_whitespace();
-        let program = words.next()?.to_string();
-        let mut cmd = std::process::Command::new(&program);
-        cmd.args(words);
-        let gui = editor_takes_goto(&program);
-        let path = file.display().to_string();
-        match (line, gui) {
-            (Some(l), true) => cmd.args(["-g", &format!("{path}:{l}")]),
-            (Some(l), false) if program.ends_with("hx") => cmd.arg(format!("{path}:{l}")),
-            (Some(l), false) if !program.contains("notepad") => cmd.arg(format!("+{l}")).arg(&path),
-            _ => cmd.arg(&path),
+        let spec = match external_editor::EditorCommand::from_env() {
+            Ok(spec) => spec,
+            Err(error) => return Some(error.to_string()),
         };
-        if gui {
-            return cmd
+        let mut command = match spec.command(file, line, false) {
+            Ok(command) => command,
+            Err(error) => return Some(error.to_string()),
+        };
+        if spec.gui() {
+            return command
                 .spawn()
                 .err()
-                .map(|e| format!("could not run {editor}: {e}"));
+                .map(|error| format!("could not start editor: {error}"));
         }
-        let mut out = stdout();
-        let _ = disable_raw_mode();
-        let _ = out.execute(crossterm::event::DisableBracketedPaste);
-        let _ = out.execute(crossterm::event::DisableMouseCapture);
-        let _ = out.execute(LeaveAlternateScreen);
-        let status = cmd.status();
-        let _ = out.execute(EnterAlternateScreen);
-        if self.mouse_capture {
-            let _ = out.execute(crossterm::event::EnableMouseCapture);
-        }
-        let _ = out.execute(crossterm::event::EnableBracketedPaste);
-        let _ = enable_raw_mode();
-        self.force_redraw = true;
-        match status {
-            Ok(s) if s.success() => None,
-            Ok(s) => Some(format!("{editor} exited with {s}")),
-            Err(e) => Some(format!("could not run {editor}: {e} (set $EDITOR)")),
+        match self.run_editor_suspended(&mut command) {
+            Ok(status) if status.success() => None,
+            Ok(status) => Some(format!("editor exited with {status}")),
+            Err(error) => Some(format!("could not run editor: {error}")),
         }
     }
 
@@ -10426,6 +10431,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some(ed) = &app.editor {
         draw_editor(f, ed, app);
+        external_editor_ui::draw_confirmation(f, app);
         return;
     }
     let input_h = input_height(app, f.area().width)
@@ -10573,6 +10579,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             area,
         );
     }
+    external_editor_ui::draw_confirmation(f, app);
 }
 
 fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
@@ -12412,18 +12419,6 @@ fn resolve_path_in(base: &std::path::Path, path: &str) -> Option<std::path::Path
 #[cfg(test)]
 fn resolve_path(path: &str) -> Option<std::path::PathBuf> {
     resolve_path_in(&std::env::current_dir().ok()?, path)
-}
-
-/// GUI editors that take `-g file:line` (VS Code and its forks).
-fn editor_takes_goto(program: &str) -> bool {
-    let name = std::path::Path::new(program)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    matches!(
-        name.as_str(),
-        "code" | "code-insiders" | "codium" | "cursor" | "windsurf"
-    )
 }
 
 /// A pager of numbered, highlighted JavaScript (a Tool's code).
@@ -16566,6 +16561,7 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
         EditMode::Code => " Ctrl+D review diff and checks · Ctrl+S save as new version (smoke-tested) · Esc cancel",
         _ => " Ctrl+S save as new version (smoke-tested) · Esc cancel",
     };
+    let hints = format!("{hints} · Ctrl+G external editor");
     let hints = if app.vim_mode {
         hints.replace(
             "Esc cancel",
@@ -17154,7 +17150,7 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn test_app() -> App {
+    pub(super) fn test_app() -> App {
         let short = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -17244,6 +17240,7 @@ mod tests {
             settings_remove_arm: None,
             providers_info: serde_json::Value::Null,
             force_redraw: false,
+            external_edit: Default::default(),
             focused: true,
             run_started_at: HashMap::new(),
             notifications: Vec::new(),
@@ -21260,7 +21257,16 @@ mod tests {
             "terminal hyperlink must round-trip to the actual native file"
         );
         assert_eq!((found[0].x0, found[0].x1), (4, 16));
-        assert!(editor_takes_goto("/usr/local/bin/code") && !editor_takes_goto("vim"));
+        let file = std::path::Path::new("file with spaces.rs");
+        let code = external_editor::EditorCommand::parse("/usr/local/bin/code")
+            .unwrap()
+            .command(file, Some(4), false)
+            .unwrap();
+        let vim = external_editor::EditorCommand::parse("vim")
+            .unwrap()
+            .command(file, Some(4), false)
+            .unwrap();
+        assert!(code.get_args().any(|arg| arg == "-g") && !vim.get_args().any(|arg| arg == "-g"));
     }
 
     #[test]
@@ -23813,7 +23819,7 @@ mod tests {
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("forecast vs actual (f"), "{screen}");
     }
-    fn description_fixture_detail() -> ToolDetail {
+    pub(super) fn description_fixture_detail() -> ToolDetail {
         ToolDetail {
             description_review: formless_core::descriptions::screen("Plain inventory reader"),
             description_reviews: vec![],

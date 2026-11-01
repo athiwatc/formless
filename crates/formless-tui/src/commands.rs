@@ -111,6 +111,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("sessions", "", "list and switch Sessions (T toggles lineage tree)", Session),
     cmd("fork", "", "fork the current Session", Session),
     cmd("search", "", "search all Sessions", Session),
+    cmd("editor", "", "compose the current buffer in $VISUAL/$EDITOR (also Ctrl+G)", Session),
     cmd(
         "edit",
         "",

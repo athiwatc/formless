@@ -20,6 +20,7 @@ const CHAT: &[Hint] = &[
     h("@", "file", 3),
     h("[ ]", "focus", 4),
     h("Ctrl+F", "find", 5),
+    h("Ctrl+G", "editor", 5),
     h("Ctrl+K", "switch", 5),
     h("Tab", "views", 2),
     h("?", "help", 2),
