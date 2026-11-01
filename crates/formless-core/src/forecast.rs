@@ -410,6 +410,7 @@ pub(crate) fn estimate_store_with_window(
     let mut durations = Vec::new();
     let mut caches = Vec::new();
     let mut crossings = 0;
+    let mut comparables = Vec::new();
     let threshold = window as f64 * cfg.compaction.fraction();
     for (id, old) in &recorded {
         let b = &old.basis;
@@ -443,6 +444,17 @@ pub(crate) fn estimate_store_with_window(
         if peak == 0 || !st.forecast_usage_complete(id)? {
             continue;
         }
+        comparables.push(ForecastComparable {
+            run_id: id.clone(),
+            prompt_tokens: b.prompt_tokens,
+            steps: run.steps,
+            tokens: run.prompt_tokens + run.completion_tokens,
+            duration_ms: run.duration_ms,
+            cost_usd: cost,
+            cached_fraction: (run.prompt_tokens > 0)
+                .then_some(cached as f64 / run.prompt_tokens.max(1) as f64),
+            peak_prompt_tokens: peak,
+        });
         steps.push(run.steps as f64);
         tokens.push((run.prompt_tokens + run.completion_tokens) as f64 * scale);
         durations.push(run.duration_ms as f64);
@@ -481,6 +493,9 @@ pub(crate) fn estimate_store_with_window(
     if !logical.is_empty() {
         warnings.push("Attachment token counts use local dimensions/detail and reference metadata; unsupported media are uncertain".into());
     }
+    if n > 0 && n < 10 {
+        warnings.push(format!("Small empirical sample (N={n}); p50/p90 are observed quantiles, not statistical confidence bounds"));
+    }
     if n == 0 {
         warnings.push(
             "Cache behaviour and future compaction risk unknown without comparable history".into(),
@@ -501,6 +516,7 @@ pub(crate) fn estimate_store_with_window(
         fingerprint: String::new(),
         basis,
         comparable_runs: n,
+        comparables,
         steps: range(steps),
         tokens: range(tokens),
         cost_usd,

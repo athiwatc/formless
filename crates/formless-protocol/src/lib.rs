@@ -819,11 +819,25 @@ pub struct ForecastBasis {
     pub tools_hash: String,
     pub prompt_tokens: usize,
 }
+/// The measured, non-text observations used for one immutable quote.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ForecastComparable {
+    pub run_id: String,
+    pub prompt_tokens: usize,
+    pub steps: i64,
+    pub tokens: i64,
+    pub duration_ms: i64,
+    pub cost_usd: Option<f64>,
+    pub cached_fraction: Option<f64>,
+    pub peak_prompt_tokens: u64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunForecast {
     pub fingerprint: String,
     pub basis: ForecastBasis,
     pub comparable_runs: usize,
+    #[serde(default)]
+    pub comparables: Vec<ForecastComparable>,
     pub steps: Option<ForecastRange>,
     pub tokens: Option<ForecastRange>,
     pub cost_usd: Option<ForecastRange>,

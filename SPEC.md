@@ -4542,15 +4542,42 @@ fractions and compaction probabilities describe comparable history, not guarante
 A draft already above the local compaction trigger is flagged immediately.
 
 TUI/web composer hints debounce and discard stale results after draft, Session,
-model or attachment changes. `formless run --estimate TASK [--session ID]
+model, attachment, persisted context, Tool or settings changes. Retry, edit and
+resume use prospective inputs and preserve the existing transcript, paused status,
+held files and budget waiver when consent is refused. Quiet hints use stable
+local auto-selection; preparing a send selects exploration once and binds consent
+to that selected model. `formless run --estimate TASK [--session ID]
 [--model M] [--json]` uses the same Core engine locally, with no Session creation,
-Run, upload, last-Run marker, credential refresh or provider request.
+Run, upload, last-Run marker, credential refresh or provider request. It may use
+read-only local IPC to an already-running daemon; it never starts one. Offline
+SQLite reads use a private coherent snapshot under maintenance/native locks,
+without opening the source with a SQLite pager or touching its WAL/SHM. Busy,
+unsupported locking or a possible hot rollback journal fails closed. A missing
+profile stays missing. Attachment previews carry client-supplied bytes-derived
+metadata or display-only references; the RPC never reads a client-supplied local
+path. Admissible uploaded attachments are rechecked at admission.
 
 `limits.forecast_confirm_usd` is optional, finite and nonnegative. A priced p90
 above it requires explicit confirmation. `ConfirmForecast` acknowledges a
 short-lived connection-bound preview; the daemon rechecks current inputs before
-appending or consuming attachments. Stale consent fails closed. Headless sends
+appending or consuming attachments. The quote binds Session, history outcomes,
+calibration, prices, selected model and actual held file identity. Store/config
+admission serializes validation, append, held-file consumption, immutable ledger
+and Run creation, capturing the exact first context/Tool snapshot and selected
+configuration before later client changes. Edit/retry/resume mutations occur only
+after their prospective quote is accepted. Stale consent fails closed. Consent
+belongs to the live connection; reconnects require another review. A cached failed
+send intent remains failed, so a newly approved action allocates a fresh intent.
+Queued messages requiring confirmation stay queued and prompt for composer review.
+Headless sends
 without `--yes` fail closed when confirmation is required. Forecasts add no step,
 token or time caps. Admission persists an immutable per-Run forecast and its
 non-text basis; Metrics shows predictions, actuals, errors and coverage, with
-unfinished/unknown outcomes distinguished from completed observations.
+unfinished/unknown outcomes distinguished from completed observations. Each
+snapshot retains its comparable Run ids and measured non-text observations,
+without duplicating prompts. A completed Run counts as a complete observation only
+when every admitted physical request has explicit input and output usage;
+missing/partial usage is unknown, never a fabricated zero-token success. Small N
+ranges are observed quantiles, not confidence bounds. A cached endpoint context
+window is used locally when available; otherwise the window source and uncertainty
+are explicit.
