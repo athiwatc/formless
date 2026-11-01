@@ -1814,9 +1814,13 @@ impl State {
             );
         }
         let req = self.build_request(a, parsed, scope)?;
+        let ops = self.ops.clone();
         let (mut meta, bytes) = self.cancellable(move || {
             let mut resp = send_request(req)?;
             let meta = Self::response_meta(&resp);
+            if let Some(url) = meta["url"].as_str() {
+                ops.data_observed("url", url)?;
+            }
             // The body is read up to the cap and no further (#604).
             let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
             if let Some(len) = resp.content_length().filter(|l| *l > cap) {
@@ -1842,9 +1846,6 @@ impl State {
             }
             Ok((meta, bytes))
         })?;
-        if let Some(url) = meta["url"].as_str() {
-            self.ops.data_observed("url", url)?;
-        }
         meta["body"] = encode(&bytes, enc);
         Ok(meta)
     }

@@ -414,7 +414,8 @@ async fn nested_and_script_returns_stay_raw_and_record_actual_private_file_origi
     let origins = st.data_origins(&sid, "direct").unwrap();
     assert!(origins
         .iter()
-        .any(|o| o.tool == "read_project" && o.origin == file.to_string_lossy()));
+        .any(|o| o.tool == "read_project"
+            && o.origin == file.canonicalize().unwrap().to_string_lossy()));
     drop(st);
     drain(daemon).await;
 }
@@ -524,7 +525,13 @@ async fn skill_artifact_and_error_results_keep_payloads_and_actual_origins() {
     let skill_origins = frames[0]["origins"].as_array().unwrap();
     assert!(skill_origins.iter().any(|o| o["tool"] == "load_skill"
         && o["kind"] == "file"
-        && o["origin"] == skill_dir.join("SKILL.md").to_str().unwrap()));
+        && o["origin"]
+            == skill_dir
+                .join("SKILL.md")
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()));
     assert!(skill_origins
         .iter()
         .any(|o| o["kind"] == "skill" && o["origin"] == "https://author.example/skill"));
@@ -533,12 +540,19 @@ async fn skill_artifact_and_error_results_keep_payloads_and_actual_origins() {
         .unwrap()
         .iter()
         .any(|o| o["tool"] == "read_skill_file"
-            && o["origin"] == skill_dir.join("reference.md").to_str().unwrap()));
+            && o["origin"]
+                == skill_dir
+                    .join("reference.md")
+                    .canonicalize()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()));
     assert!(frames[2]["origins"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|o| o["tool"] == "read_artifact" && o["origin"] == artifact_file.to_str().unwrap()));
+        .any(|o| o["tool"] == "read_artifact"
+            && o["origin"] == artifact_file.canonicalize().unwrap().to_str().unwrap()));
     drop(requests);
     // Explicit skill loads remain reference data after persistence/replay.
     daemon
@@ -645,7 +659,8 @@ async fn nested_models_receive_tool_data_without_system_authority_and_keep_raw_r
         .as_array()
         .unwrap()
         .iter()
-        .any(|o| o["tool"] == "read_project" && o["origin"] == file.to_str().unwrap()));
+        .any(|o| o["tool"] == "read_project"
+            && o["origin"] == file.canonicalize().unwrap().to_str().unwrap()));
     drop(requests);
     let origins = st.data_origins(&sid, "direct").unwrap();
     assert!(origins

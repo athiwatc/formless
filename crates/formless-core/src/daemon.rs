@@ -11283,7 +11283,16 @@ impl Daemon {
                     self.with_store(|st| st.get_artifact(args["id"].as_str().unwrap_or_default()))?
                 {
                     if owner.as_deref() == Some(session) {
-                        self.record_data_origin(session, run, name, "file", &path)?;
+                        let actual = std::path::Path::new(&path)
+                            .canonicalize()
+                            .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+                        self.record_data_origin(
+                            session,
+                            run,
+                            name,
+                            "file",
+                            &actual.to_string_lossy(),
+                        )?;
                     }
                 }
             }
@@ -11512,6 +11521,10 @@ impl Daemon {
                 arguments: input_text.clone(),
                 depth,
             });
+            if let Some(server) = caps.mcp.first() {
+                self.record_data_origin(&session_id, &run_id, &name, "mcp", server)
+                    .map_err(|e| e.to_string())?;
+            }
             let inv_id = match self.with_store(|st| {
                 st.start_invocation(
                     &info.id,
@@ -11531,8 +11544,6 @@ impl Daemon {
                 let tool = crate::mcp::server_tool_name(&ver.code)
                     .unwrap_or_default()
                     .to_string();
-                self.record_data_origin(&session_id, &run_id, &name, "mcp", &server)
-                    .map_err(|e| e.to_string())?;
                 let call = self
                     .mcp
                     .call(&self.paths, &cfg.mcp, &server, &tool, input.clone());

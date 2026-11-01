@@ -4348,6 +4348,9 @@ transcripts) carries a stable source-Tool/provenance envelope. Raw Tool.run and
 direct-call values remain compatible. Actual data origins are bounded per Run
 and persisted without URL userinfo, query values, headers or payload contents.
 Compacted history remains data; summaries do not become new system instructions.
+Tool-supplied `llm.complete` and `agents.run` requests and system hints are also
+framed as data from the calling Tool; they cannot create system authority.
+User-configured Role system instructions keep their existing authority.
 This boundary is defense in depth, not proof of real-model injection resistance
 or an operating-system process sandbox.
 
