@@ -647,7 +647,22 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
         let Some(run) = runs.iter().find(|r| r.run_id == id) else {
             continue;
         };
-        let (cost, _, _) = st.forecast_usage(&id, cfg)?;
+        let (cost, main_peak, _) = st.forecast_usage(&id, cfg)?;
+        let served = st.forecast_models(&id)?;
+        let quoted_provider = f
+            .basis
+            .provider_key
+            .rsplit_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or(crate::config::DEFAULT_PROVIDER);
+        let basis_match = !served.is_empty()
+            && served
+                .iter()
+                .all(|(provider, model)| provider == quoted_provider && model == &f.basis.model);
+        let served_main: Vec<_> = served
+            .into_iter()
+            .map(|(provider, model)| json!({"provider":provider,"model":model}))
+            .collect();
         let complete = st.forecast_usage_complete(&id)?;
         let actual = (run.prompt_tokens + run.completion_tokens) as f64;
         let finished = run.status == "completed" && complete;
@@ -671,7 +686,7 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
             _ => json!({"error":null,"covered_p50_p90":null}),
         };
         let comparisons = json!({"steps":comparison(&f.steps,Some(run.steps as f64)),"tokens":comparison(&f.tokens,complete.then_some(actual)),"cost_usd":comparison(&f.cost_usd,cost.filter(|_|complete)),"duration_ms":comparison(&f.duration_ms,Some(run.duration_ms as f64))});
-        rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"duration_ms":run.duration_ms},"comparison":comparisons,"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished}));
+        rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"peak_main_prompt_tokens":main_peak,"served_main":served_main,"basis_match":basis_match,"duration_ms":run.duration_ms},"comparison":comparisons,"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished && basis_match && main_peak>0}));
     }
     Ok(json!(rows))
 }
@@ -1255,5 +1270,59 @@ mod tests {
             following.cost_usd.unwrap().p50 > 10.0,
             "nested paid work remains in the total"
         );
+    }
+    #[test]
+    fn metrics_exposes_served_identity_and_excludes_fallbacks_from_model_calibration() {
+        let st = Store::open_in_memory().unwrap();
+        let c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        let first = estimate_store(&st, &c, &input).unwrap();
+        completed(&st, &c, &first, 1, "completed");
+        let quoted = estimate_store(&st, &c, &input).unwrap();
+        for (provider, model) in [("default", "fallback"), ("other-provider", "model")] {
+            let id = st.create_run(&sid).unwrap();
+            st.record_forecast(&id, &quoted).unwrap();
+            st.bump_run_steps(&id).unwrap();
+            st.record_forecast_request(&id, "run").unwrap();
+            st.record_usage_full(
+                &sid,
+                &id,
+                provider,
+                model,
+                &crate::provider::Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 40,
+                    reported: 3,
+                    ..Default::default()
+                },
+                "run",
+            )
+            .unwrap();
+            st.set_run_status(&id, "completed").unwrap();
+            let rows = metrics(&st, &c).unwrap();
+            let row = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["run_id"] == id)
+                .unwrap();
+            assert_eq!(row["actual"]["tokens"], 140);
+            assert_eq!(
+                row["actual"]["served_main"],
+                json!([{"provider":provider,"model":model}])
+            );
+            assert_eq!(row["actual"]["basis_match"], false);
+            assert_eq!(row["calibration_eligible"], false);
+            assert_eq!(
+                row["token_error"], 20.0,
+                "forecast errors remain measurable even when dispatch differs"
+            );
+        }
+        assert_eq!(estimate_store(&st, &c, &input).unwrap().comparable_runs, 1);
     }
 }

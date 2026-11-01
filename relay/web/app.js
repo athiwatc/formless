@@ -2096,10 +2096,10 @@
       for (const row of rows) {
         const key = row.model + "/" + row.role;
         const group = groups.get(key) || {n:0,error:0,covered:0,unknown:0};
-        if (row.token_error == null) group.unknown++; else {group.n++;group.error+=row.token_error;group.covered+=row.token_covered_p50_p90 ? 1 : 0;}
+        if (!row.calibration_eligible || row.token_error == null) group.unknown++; else {group.n++;group.error+=row.token_error;group.covered+=row.token_covered_p50_p90 ? 1 : 0;}
         groups.set(key,group);
       }
-      for (const [key,g] of groups) box.append(h("p",null,key+": "+g.n+" completed comparisons · mean token error "+(g.n ? Math.round(g.error/g.n) : "unknown")+" · p50–p90 coverage "+(g.n ? Math.round(100*g.covered/g.n)+"%" : "unknown")+" · "+g.unknown+" interrupted/unknown/no-history"));
+      for (const [key,g] of groups) box.append(h("p",null,key+": "+g.n+" completed comparisons · mean token error "+(g.n ? Math.round(g.error/g.n) : "unknown")+" · p50–p90 coverage "+(g.n ? Math.round(100*g.covered/g.n)+"%" : "unknown")+" · "+g.unknown+" excluded/interrupted/unknown/no-history"));
       for (const row of rows) box.append(h("details",null,h("summary",null,row.model+" · "+row.status+" · "+row.comparable_runs+" comparable Runs · actual "+(row.actual.tokens == null ? "unknown" : row.actual.tokens)+" tokens · error "+(row.token_error == null ? "unknown" : Math.round(row.token_error))),h("pre",null,JSON.stringify({forecast:row.forecast,actual:row.actual},null,2))));
     } catch (_) { /* Metrics are read-only and optional on older daemons. */ }
   }

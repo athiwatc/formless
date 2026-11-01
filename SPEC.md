@@ -4605,7 +4605,10 @@ snapshot retains at most 50 newest comparable Run ids (from the last 2000
 recorded Runs) and measured non-text observations,
 without duplicating prompts. A completed Run counts as a complete observation only
 when every admitted physical request has explicit input and output usage;
-missing/partial usage is unknown, never a fabricated zero-token success. Small N
+missing/partial usage is unknown, never a fabricated zero-token success. Metrics
+also names the served main provider/models and marks a mismatch with the quoted
+basis; known actual-vs-quote errors remain visible, while fallback/mismatched or
+zero-main-prompt outcomes are excluded from per-model calibration. Small N
 ranges are observed quantiles, not confidence bounds. A cached endpoint context
 window is used locally when available; otherwise the window source and uncertainty
 are explicit.
