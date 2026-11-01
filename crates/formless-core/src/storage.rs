@@ -1654,7 +1654,12 @@ impl Store {
                 .unwrap_or(s);
         }
         for (role, content, meta) in messages {
-            self.append_message_meta(&s.id, role, content, meta.clone())?;
+            self.append_message_meta(
+                &s.id,
+                role,
+                content,
+                sanitize_imported_message_meta(meta.as_deref()),
+            )?;
         }
         for (summary, up_to) in checkpoints {
             self.save_checkpoint(&s.id, summary, *up_to)?;
@@ -6426,6 +6431,28 @@ impl ContextCache {
     }
 }
 
+/// An imported transcript carries data, never local attachment authority.
+/// Fork copies use a separate trusted path and retain their recorded lineage.
+fn sanitize_imported_message_meta(meta: Option<&str>) -> Option<String> {
+    let raw = meta?;
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        return Some(raw.into());
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.remove("_attachments");
+        object.remove("_artifact_id");
+        object.remove("_source_session");
+        object.remove("_source_seq");
+        if let Some(attachments) = object.get_mut("attachments").and_then(Value::as_array_mut) {
+            for attachment in attachments {
+                let old = attachment.clone();
+                *attachment = json!({"imported":true,"name":old["name"],"mime":old["mime"],"bytes":old["bytes"]});
+            }
+        }
+    }
+    Some(value.to_string())
+}
+
 pub fn provider_message(m: &MessageInfo) -> Value {
     let meta: Value = m
         .meta
@@ -6518,6 +6545,14 @@ pub fn provider_message(m: &MessageInfo) -> Value {
             let mut content = m.content.clone();
             let mut images = Vec::new();
             for a in atts {
+                if a["imported"] == true {
+                    let name = serde_json::to_string(&crate::daemon::attachment_name(
+                        a["name"].as_str().unwrap_or("file"),
+                    ))
+                    .unwrap_or_default();
+                    content.push_str(&format!("\n[imported attachment {name} ({}, {} bytes); not attached: re-attach the file to allow model access]",a["mime"].as_str().unwrap_or("application/octet-stream"),a["bytes"]));
+                    continue;
+                }
                 if a["reference"] == true {
                     let size = if a["dir"] == true {
                         "directory".to_string()
@@ -6538,10 +6573,10 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                 .unwrap_or_default();
                 // Collected by retention: say so instead of sending the model
                 // to read a file that is gone (#858).
-                let gone = a["expired"] == true
-                    || a["path"]
-                        .as_str()
-                        .is_some_and(|p| !std::path::Path::new(p).exists());
+                // Projection is pure: imported paths may name private files or
+                // Windows UNC shares. Only explicit retention metadata decides
+                // expiry; verified owned access diagnoses missing files later.
+                let gone = a["expired"] == true;
                 if gone {
                     content.push_str(&format!(
                         "\n[attachment {name} is no longer available: it was removed by artifact retention]"
@@ -6559,7 +6594,7 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                     .as_str()
                     .is_some_and(crate::daemon::is_raster_image)
                 {
-                    images.push(json!({"id": a.get("_artifact_id").unwrap_or(&a["id"]), "path": a["path"], "mime": a["mime"], "name": name, "bytes":a["bytes"], "sha256":a["sha256"]}));
+                    images.push(json!({"id": a.get("_artifact_id").unwrap_or(&a["id"]), "_source_session":m.session_id,"_source_seq":m.seq,"path": a["path"], "mime": a["mime"], "name": name, "bytes":a["bytes"], "sha256":a["sha256"]}));
                 }
             }
             let mut msg = json!({"role": "user", "content": content});

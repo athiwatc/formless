@@ -1674,10 +1674,11 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
         .save(&big)
         .unwrap();
     let bytes = std::fs::metadata(&big).unwrap().len();
+    let scope = store.create_session(None).unwrap().id;
     let id = store
-        .save_artifact(None, big.to_str().unwrap(), "", bytes as i64)
+        .save_artifact(Some(&scope), big.to_str().unwrap(), "", bytes as i64)
         .unwrap();
-    let msg = |path: &std::path::Path| json!({"role": "user", "content": "look", "_attachments": [{"id":id,"bytes":bytes,"path": path.to_str().unwrap(), "mime": "image/png", "name": "big.png"}]});
+    let msg = |path: &std::path::Path| json!({"role": "user", "content": "look", "_attachments": [{"id":id,"_source_session":scope,"_source_seq":1,"bytes":bytes,"path": path.to_str().unwrap(), "mime": "image/png", "name": "big.png"}]});
     let mut c = cfg(&base);
     c.fallback_models.clear();
     c.vision = Some(true);

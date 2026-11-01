@@ -867,10 +867,24 @@ pasting paths.
   Available hashes and claimed raster MIME are checked before transmission;
   undecodable bytes never become an image part. Foreign imports/restores keep
   their artifact-reference text and report that the image could not be attached.
-  Forks may retain verified artifacts owned by their original Session. Public
+  The artifact owner must match the actual stored message's Session, or a
+  recorded fork ancestor whose cut includes that message. This evidence is
+  bounded and cycle checked; missing historical edges require re-attachment.
+  New imports retain inert attachment descriptions and strip local authority,
+  including reserved markers. Projection never stats an imported path. Forks
+  may retain verified artifacts owned by their original Session. Public
   key-only providers have no filesystem authority. Offline forecasts resolve
   only owned records from their private snapshot; metadata-only RPC descriptors
   never cause arbitrary host-path reads.
+  Preparation shares one request budget across all messages: at most 16
+  attempted native references, 32 MiB source bytes, 64 MiB header-declared decoded
+  image bytes, 16384 pixels per axis, and 24 MiB final encoded image URLs. Failed
+  attempts retain reserved work; cached and cold requests select the same
+  prefix. Omitted images keep artifact-reference text and one bounded warning
+  per affected message. The image cache holds at most 24 MiB of URLs. New
+  metadata-only previews share the budget with history and conservatively
+  reserve unknown decoded formats and resized output; their resource estimate
+  may change after upload verifies the owned bytes.
 - **Retention.** Attachments are artifacts, so `artifacts.*` retention
   removes them too. A removed one is marked expired where it was sent:
   clients show "name · expired" and the model's history says it is no

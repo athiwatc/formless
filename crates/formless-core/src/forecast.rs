@@ -125,7 +125,7 @@ pub fn reference(path: &std::path::Path, directory: bool, bytes: u64) -> Forecas
 
 /// A tiny local image header carrying dimensions, only for estimator input.
 /// Pixels are never decoded or dispatched: the shared counter reads dimensions.
-fn dimension_image(dims: Option<(u32, u32)>) -> String {
+pub(crate) fn dimension_image(dims: Option<(u32, u32)>) -> String {
     use base64::Engine;
     let Some((w, h)) = dims else {
         return "data:image/png;base64,".into();
@@ -336,14 +336,27 @@ pub(crate) fn estimate_store_with_window(
         .unwrap_or_default();
     let mut logical = Vec::new();
     let mut normalized = held.clone();
-    let held_access =
-        crate::attachment_access::AttachmentAccess::snapshot(st, &[json!({"_attachments":&held})])?;
-    for a in &held {
+    let held_markers: Vec<_> = held
+        .iter()
+        .map(|a| {
+            let mut marker = a.clone();
+            marker["_source_session"] = json!(input.session_id);
+            marker["_source_seq"] = json!(0);
+            marker
+        })
+        .collect();
+    let held_access = crate::attachment_access::AttachmentAccess::snapshot(
+        st,
+        &[json!({"_attachments":held_markers})],
+    )?;
+    for (a, marker) in held.iter().zip(&held_markers) {
         let bytes = (a["reference"] != true)
             .then(|| {
-                held_access
-                    .as_ref()
-                    .and_then(|access| access.read(a, crate::daemon::MAX_ATTACHMENT_BYTES).ok())
+                held_access.as_ref().and_then(|access| {
+                    access
+                        .read(marker, crate::daemon::MAX_ATTACHMENT_BYTES)
+                        .ok()
+                })
             })
             .flatten();
         let mut descriptor = if let Some(bytes) = bytes {
@@ -385,6 +398,13 @@ pub(crate) fn estimate_store_with_window(
             normalized.push(json!({"id":"00000000-0000-0000-0000-000000000000","name":crate::daemon::cap_name(&a.name,120),"mime":a.mime,"bytes":a.bytes}));
         }
     }
+    let preview_images: Vec<_> = input
+        .attachments
+        .iter()
+        .filter(|a| a.reference.is_none() && crate::daemon::is_raster_image(&a.mime))
+        .cloned()
+        .collect();
+    let mut preview_range = None;
     if !input.draft.is_empty() {
         let message = MessageInfo {
             id: "forecast".into(),
@@ -395,7 +415,16 @@ pub(crate) fn estimate_store_with_window(
             created_at: String::new(),
             meta: Some(json!({"attachments":normalized}).to_string()),
         };
-        ctx.push(crate::storage::provider_message(&message));
+        let projected = crate::storage::provider_message(&message);
+        let markers = projected["_attachments"].as_array().map_or(0, Vec::len);
+        if !preview_images.is_empty() {
+            preview_range = Some((
+                ctx.len(),
+                markers.saturating_sub(preview_images.len()),
+                preview_images.as_slice(),
+            ));
+        }
+        ctx.push(projected);
     }
     if let Some(session) = input.session_id.as_deref() {
         ctx.extend(
@@ -415,23 +444,7 @@ pub(crate) fn estimate_store_with_window(
     .with_attachment_snapshot(st, &ctx)?;
     let key = crate::tokens::provider_key(name, &pcfg);
     let ratio = st.token_ratio(&key, &model)?;
-    let mut ctx = provider.prepare_attachments(&ctx, &model);
-    if !input.draft.is_empty() && provider.sends_images(&model) {
-        if let Some(message) = ctx.last_mut() {
-            let mut parts = message["content"]
-                .as_array()
-                .cloned()
-                .unwrap_or_else(|| vec![json!({"type":"text","text":message["content"]})]);
-            for a in input
-                .attachments
-                .iter()
-                .filter(|a| a.reference.is_none() && crate::daemon::is_raster_image(&a.mime))
-            {
-                parts.push(json!({"type":"image_url","image_url":{"url":dimension_image(a.width.zip(a.height).map(|(w,h)|crate::provider::resized_image_dimensions(w,h,pcfg.image_max_px))),"detail":pcfg.image_detail}}));
-            }
-            message["content"] = json!(parts);
-        }
-    }
+    let ctx = provider.prepare_forecast_attachments(&ctx, &model, preview_range);
     let prompt_tokens =
         crate::tokens::calibrated(provider.prompt_tokens(&ctx, &defs, &model), ratio);
     let basis = ForecastBasis {
@@ -550,6 +563,9 @@ pub(crate) fn estimate_store_with_window(
     warnings.push("Crossing the compaction trigger also requires a complete older turn; the flag is not a guarantee".into());
     if !logical.is_empty() {
         warnings.push("Attachment token counts use local dimensions/detail and reference metadata; unsupported media are uncertain".into());
+    }
+    if !preview_images.is_empty() {
+        warnings.push("Metadata-only image previews use conservative decode/encoded-byte reservations; native parts may change after owned bytes are verified".into());
     }
     if n > 0 && n < 10 {
         warnings.push(format!("Small empirical sample (N={n}); p50/p90 are observed quantiles, not statistical confidence bounds"));
@@ -1116,6 +1132,105 @@ mod tests {
             );
             assert_eq!(st.last_run(&sid).unwrap().unwrap().1, "paused");
         }
+    }
+    #[test]
+    fn repeated_owned_images_and_metadata_previews_share_request_wide_preparation() {
+        let root = std::env::temp_dir().join(format!(
+            "fl-forecast-native-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        let st = Store::open(&root.join("formless.db")).unwrap();
+        let sid = st.create_session(None).unwrap().id;
+        let path = root.join("artifacts/image.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let id = st
+            .save_artifact(Some(&sid), path.to_str().unwrap(), "", bytes.len() as i64)
+            .unwrap();
+        let attachment =
+            json!({"id":id,"path":path,"name":"image.png","mime":"image/png","bytes":bytes.len()});
+        for count in [8, 20, 1] {
+            st.append_message_meta(
+                &sid,
+                "user",
+                "repeated images",
+                Some(json!({"attachments":vec![attachment.clone();count]}).to_string()),
+            )
+            .unwrap();
+        }
+        let mut c = config();
+        c.provider.vision = Some(true);
+        let session = st.get_session(&sid).unwrap().unwrap();
+        let prompt = fresh_prompt(&st, &c, Some(&session), &c.provider.model, None).unwrap();
+        let ctx = crate::storage::build_context(
+            &st,
+            &sid,
+            &prompt,
+            c.provider.context_tokens,
+            c.compaction.fraction(),
+        )
+        .unwrap()
+        .0;
+        let defs =
+            crate::tools::preview_tool_definitions(&st, Some(&sid), c.tools.inline_limit).unwrap();
+        let p = Provider::with_key(c.provider.clone(), String::new(), reqwest::Client::new())
+            .with_attachment_snapshot(&st, &ctx)
+            .unwrap();
+        let prepared = p.prepare_attachments(&ctx, &c.provider.model);
+        let images = prepared
+            .iter()
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .filter(|v| v["type"] == "image_url")
+            .count();
+        assert_eq!(images, 16);
+        assert_eq!(
+            p.prepare_attachments(&ctx, &c.provider.model),
+            prepared,
+            "cache cannot change bounded prefix"
+        );
+        let quote = estimate_store(
+            &st,
+            &c,
+            &ForecastInput {
+                session_id: Some(sid.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            quote.basis.prompt_tokens,
+            p.prompt_tokens(&ctx, &defs, &c.provider.model)
+        );
+        // A new metadata-only draft shares the same exhausted count budget;
+        // preview upload nonce/held identity cannot reset it.
+        let descriptor = super::attachment("image.png".into(), &bytes);
+        let preview = estimate_store(
+            &st,
+            &c,
+            &ForecastInput {
+                session_id: Some(sid.clone()),
+                draft: "next".into(),
+                attachments: vec![descriptor],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        st.add_pending_attachment(&sid, &attachment).unwrap();
+        let held = estimate_store(
+            &st,
+            &c,
+            &ForecastInput {
+                session_id: Some(sid),
+                draft: "next".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.basis.prompt_tokens, held.basis.prompt_tokens);
+        assert_eq!(preview.fingerprint, held.fingerprint);
+        drop(st);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn attachment_preview_matches_resize_prompt_tools_and_reference_semantics() {

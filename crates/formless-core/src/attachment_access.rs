@@ -11,12 +11,15 @@ use std::{
     sync::Arc,
 };
 
-type Records = HashMap<String, (String, i64)>;
+type Record = (Option<String>, String, i64);
+type Records = HashMap<String, Record>;
+type Lineage = HashMap<String, Vec<(String, i64)>>;
+const MAX_LINEAGE_DEPTH: usize = 64;
 
 #[derive(Clone)]
 enum Resolver {
     Profile(PathBuf),
-    Snapshot(Arc<Records>),
+    Snapshot(Arc<Records>, Arc<Lineage>),
 }
 
 #[derive(Clone)]
@@ -40,42 +43,115 @@ impl AttachmentAccess {
             return Ok(None);
         };
         let mut records = Records::new();
+        let mut lineage = Lineage::new();
         for message in messages {
             for attachment in message["_attachments"].as_array().into_iter().flatten() {
                 let Some(id) = attachment["id"].as_str() else {
                     continue;
                 };
                 if !records.contains_key(id) {
-                    if let Some((_, path, bytes)) = store.get_artifact(id)? {
-                        records.insert(id.into(), (path, bytes));
+                    if let Some(record) = store.get_artifact(id)? {
+                        records.insert(id.into(), record);
+                    }
+                }
+                if let Some(scope) = attachment["_source_session"].as_str() {
+                    if !lineage.contains_key(scope) {
+                        let mut chain = Vec::new();
+                        let mut current = scope.to_string();
+                        let mut seen = std::collections::HashSet::from([current.clone()]);
+                        let mut cutoff = i64::MAX;
+                        for _ in 0..MAX_LINEAGE_DEPTH {
+                            let Some(session) = store.get_session(&current)? else {
+                                break;
+                            };
+                            let (Some(parent), Some(point)) =
+                                (session.forked_from, session.fork_point_seq)
+                            else {
+                                break;
+                            };
+                            if point < 0 || !seen.insert(parent.clone()) {
+                                break;
+                            }
+                            cutoff = cutoff.min(point);
+                            chain.push((parent.clone(), cutoff));
+                            current = parent;
+                        }
+                        lineage.insert(scope.into(), chain);
                     }
                 }
             }
         }
         Ok(Some(Self {
             root,
-            resolver: Resolver::Snapshot(Arc::new(records)),
+            resolver: Resolver::Snapshot(Arc::new(records), Arc::new(lineage)),
         }))
     }
 
-    fn record(&self, id: &str) -> Option<(String, i64)> {
+    fn record(&self, id: &str, scope: &str, seq: i64) -> Option<Record> {
+        let allowed = |owner: &Option<String>, chain: &[(String, i64)]| {
+            owner.as_deref() == Some(scope)
+                || (seq > 0
+                    && owner.as_ref().is_some_and(|owner| {
+                        chain
+                            .iter()
+                            .any(|(parent, cutoff)| parent == owner && seq <= *cutoff)
+                    }))
+        };
         match &self.resolver {
-            Resolver::Snapshot(records) => records.get(id).cloned(),
+            Resolver::Snapshot(records, lineage) => {
+                let record = records.get(id)?;
+                allowed(&record.0, lineage.get(scope).map_or(&[], Vec::as_slice))
+                    .then(|| record.clone())
+            }
             Resolver::Profile(db) => {
-                // No CREATE, migration or optimize. Managed live providers may
-                // read the current registry, including a newly steered upload.
                 let conn = rusqlite::Connection::open_with_flags(
                     db,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
                 .ok()?;
-                conn.query_row(
-                    "SELECT path,bytes FROM artifacts WHERE id=?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .ok()
+                let record: Record = conn
+                    .query_row(
+                        "SELECT session_id,path,bytes FROM artifacts WHERE id=?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok()?;
+                if record.0.as_deref() == Some(scope) {
+                    return Some(record);
+                }
+                if seq <= 0 {
+                    return None;
+                }
+                let mut current = scope.to_string();
+                let mut seen = std::collections::HashSet::from([current.clone()]);
+                let mut cutoff = i64::MAX;
+                for _ in 0..MAX_LINEAGE_DEPTH {
+                    let (parent, point): (Option<String>, Option<i64>) = conn
+                        .query_row(
+                            "SELECT forked_from,fork_point_seq FROM sessions WHERE id=?1",
+                            [&current],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .ok()?;
+                    let (Some(parent), Some(point)) = (parent, point) else {
+                        return None;
+                    };
+                    if point < 0 || !seen.insert(parent.clone()) {
+                        return None;
+                    }
+                    cutoff = cutoff.min(point);
+                    if seq > cutoff {
+                        return None;
+                    }
+                    // The persisted direct edge is evidence even if the parent
+                    // row was deleted. Missing intermediate edges fail closed.
+                    if record.0.as_deref() == Some(parent.as_str()) {
+                        return Some(record);
+                    }
+                    current = parent;
+                }
+                None
             }
         }
     }
@@ -85,10 +161,25 @@ impl AttachmentAccess {
         attachment: &Value,
         max_bytes: usize,
     ) -> std::result::Result<Vec<u8>, String> {
+        let mut remaining = max_bytes;
+        self.read_charged(attachment, max_bytes, &mut remaining)
+    }
+
+    /// Reserve registered source bytes before opening/reading. Failed attempts
+    /// retain their reservation, bounding work even for corrupt/hash-mismatched
+    /// images repeatedly named in an imported conversation.
+    pub(crate) fn read_charged(
+        &self,
+        attachment: &Value,
+        max_bytes: usize,
+        remaining: &mut usize,
+    ) -> std::result::Result<Vec<u8>, String> {
         let denied = || "no verified owned artifact reference".to_string();
         let id = attachment["id"].as_str().ok_or_else(denied)?;
         let claimed = attachment["path"].as_str().ok_or_else(denied)?;
-        let (path, recorded_bytes) = self.record(id).ok_or_else(denied)?;
+        let scope = attachment["_source_session"].as_str().ok_or_else(denied)?;
+        let seq = attachment["_source_seq"].as_i64().ok_or_else(denied)?;
+        let (_, path, recorded_bytes) = self.record(id, scope, seq).ok_or_else(denied)?;
         if claimed != path || recorded_bytes < 0 {
             return Err(denied());
         }
@@ -101,6 +192,11 @@ impl AttachmentAccess {
         if recorded_bytes as u64 > max_bytes as u64 {
             return Err("the stored attachment exceeds the source size limit".into());
         }
+        let reserved = usize::try_from(recorded_bytes).map_err(|_| denied())?;
+        if reserved > *remaining {
+            return Err("the request's attachment source-byte budget is exhausted".into());
+        }
+        *remaining -= reserved;
         let root = std::path::absolute(&self.root).map_err(|_| denied())?;
         let path = std::path::absolute(Path::new(&path)).map_err(|_| denied())?;
         let relative = path.strip_prefix(&root).map_err(|_| {
@@ -283,4 +379,92 @@ fn open_rooted(root: &Path, relative: &Path, _: &std::fs::Metadata) -> std::io::
 #[cfg(not(any(unix, windows)))]
 fn open_rooted(_: &Path, _: &Path, _: &std::fs::Metadata) -> std::io::Result<File> {
     Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn row_scope_fork_cutoff_and_cycles_are_checked_by_live_and_snapshot_resolvers() {
+        let root = std::env::temp_dir().join(format!("fl-artifact-scope-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        std::fs::create_dir_all(paths.data_dir.join("artifacts")).unwrap();
+        let st = Store::open(&paths.db_file()).unwrap();
+        let parent = st.create_session(None).unwrap().id;
+        let path = paths.data_dir.join("artifacts/file");
+        std::fs::write(&path, b"data").unwrap();
+        let id = st
+            .save_artifact(Some(&parent), path.to_str().unwrap(), "", 4)
+            .unwrap();
+        st.append_message(&parent, "user", "copied history")
+            .unwrap();
+        let fork = st.fork_session(&parent, None, None).unwrap().unwrap().id;
+        let other = st.create_session(None).unwrap().id;
+        let marker = |scope: &str, seq: i64| json!({"id":id,"path":path,"bytes":4,"_source_session":scope,"_source_seq":seq});
+        let candidates = [
+            (marker(&parent, 1), true),
+            (marker(&fork, 1), true),
+            (marker(&fork, 2), false),
+            (marker(&fork, 0), false),
+            (marker(&other, 1), false),
+        ];
+        for (a, allowed) in &candidates {
+            for access in [
+                AttachmentAccess::profile(&paths),
+                AttachmentAccess::snapshot(&st, &[json!({"_attachments":[a]})])
+                    .unwrap()
+                    .unwrap(),
+            ] {
+                assert_eq!(access.read(a, 100).is_ok(), *allowed, "{a}");
+            }
+        }
+        let access = AttachmentAccess::profile(&paths);
+        let mut remaining = 4;
+        assert_eq!(
+            access
+                .read_charged(&marker(&parent, 1), 100, &mut remaining)
+                .unwrap(),
+            b"data"
+        );
+        assert_eq!(remaining, 0);
+        assert!(access
+            .read_charged(&marker(&parent, 1), 100, &mut remaining)
+            .unwrap_err()
+            .contains("source-byte budget"));
+        // A direct recorded edge survives deletion. Missing intermediate
+        // evidence and cycles never manufacture access to an unrelated owner.
+        st.delete_session(&parent).unwrap();
+        let a = marker(&fork, 1);
+        for access in [
+            AttachmentAccess::profile(&paths),
+            AttachmentAccess::snapshot(&st, &[json!({"_attachments":[a]})])
+                .unwrap()
+                .unwrap(),
+        ] {
+            assert_eq!(access.read(&a, 100).unwrap(), b"data");
+        }
+        let conn = rusqlite::Connection::open(paths.db_file()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET forked_from=?2,fork_point_seq=1 WHERE id=?1",
+            [&fork, &other],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET forked_from=?2,fork_point_seq=1 WHERE id=?1",
+            [&other, &fork],
+        )
+        .unwrap();
+        for access in [
+            AttachmentAccess::profile(&paths),
+            AttachmentAccess::snapshot(&st, &[json!({"_attachments":[a]})])
+                .unwrap()
+                .unwrap(),
+        ] {
+            assert!(access.read(&a, 100).is_err());
+        }
+        drop(conn);
+        drop(st);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
