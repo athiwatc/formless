@@ -267,12 +267,50 @@ impl AttachmentAccess {
     }
 }
 
+/// Shared text/client artifact reads have their own bounded source budget.
+/// Registry rows authorize an ID, never an arbitrary filesystem path.
+pub(crate) const MAX_ARTIFACT_TEXT_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) fn read_artifact_record(
+    paths: &Paths,
+    path: &str,
+    recorded_bytes: i64,
+) -> Result<Vec<u8>> {
+    let size = usize::try_from(recorded_bytes)
+        .ok()
+        .filter(|size| *size <= MAX_ARTIFACT_TEXT_BYTES)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "artifact exceeds the 32 MiB text-reader limit or has an invalid recorded size"
+            )
+        })?;
+    let root = std::path::absolute(paths.data_dir.join("artifacts"))?;
+    let path = std::path::absolute(path)?;
+    let bytes = read_rooted_file(&root, &path, size).map_err(|_| {
+        anyhow::anyhow!("artifact is missing, changed, nonregular, or outside its owned directory")
+    })?;
+    anyhow::ensure!(
+        bytes.len() == size,
+        "artifact size changed since it was stored"
+    );
+    Ok(bytes)
+}
+
 /// Explicit @path intake has already authorized a working/home root. Reuse
 /// the same native no-follow handles, without granting provider file authority.
 pub(crate) fn read_rooted_file(
     root: &Path,
     path: &Path,
     max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    read_rooted_file_checked(root, path, max_bytes, None)
+}
+
+fn read_rooted_file_checked(
+    root: &Path,
+    path: &Path,
+    max_bytes: usize,
+    expected_bytes: Option<u64>,
 ) -> std::io::Result<Vec<u8>> {
     let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
     let relative = path.strip_prefix(root).map_err(|_| denied())?;
@@ -288,7 +326,11 @@ pub(crate) fn read_rooted_file(
         return Err(denied());
     }
     let file = open_rooted(root, relative, &info)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.len() > max_bytes as u64
+        || expected_bytes.is_some_and(|expected| metadata.len() != expected)
+    {
         return Err(denied());
     }
     let mut bytes = Vec::new();

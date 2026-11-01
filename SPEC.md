@@ -2823,6 +2823,13 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   filesystem path, because transcripts also reach remote web clients.
   `GetArtifact {id, offset?, length?}` returns a text slice (200 000
   characters by default) with `total_chars` and `end`, never the path.
+  Both client and agent readers open only regular files beneath this profile's
+  artifact directory using rooted no-follow handles, reject changed recorded
+  sizes, and read at most 32 MiB plus one growth-detection byte before slicing
+  or grep. Larger artifacts return an explicit text-reader limit error.
+  Client ID access remains profile-wide; agent `read_artifact` still requires
+  exact ownership by its current Session. A restored registry path alone cannot
+  authorize a host-file read.
   - TUI: a tool result that references an artifact shows `/open <id>`,
     and `/open` (the newest) or `/open <id-prefix>` shows a full-screen
     pager (↑↓, PgUp/PgDn, g/G, Esc).
