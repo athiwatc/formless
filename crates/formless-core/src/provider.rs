@@ -204,6 +204,7 @@ pub struct Provider {
     /// Told of every request's reported usage (model, usage), so the
     /// daemon's own calls are counted too (#806).
     on_usage: Option<UsageHook>,
+    on_prompt: Option<PromptHook>,
     on_request: Option<RequestHook>,
     /// The configured provider's name (`default` or a `[providers.<name>]`
     /// key), for pricing usage from its own table (#810).
@@ -211,6 +212,7 @@ pub struct Provider {
 }
 
 pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
+pub type PromptHook = Arc<dyn Fn(&str, &str, usize, u64) + Send + Sync>;
 pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) -> Result<()> + Send + Sync>;
 /// A local persistence failure is not evidence that the serving model failed.
 #[derive(Debug, thiserror::Error)]
@@ -275,6 +277,9 @@ struct BreakerPermit {
 struct RequestAccounting {
     _lease: Option<RequestLease>,
     hook: Option<UsageHook>,
+    prompt_hook: Option<PromptHook>,
+    prompt_key: String,
+    prompt_estimate: usize,
     provider: String,
     model: String,
 }
@@ -285,13 +290,15 @@ struct AttemptUsage<'a> {
     provider: &'a Provider,
     model: String,
     usage: Option<Usage>,
+    prompt_estimate: usize,
 }
 impl<'a> AttemptUsage<'a> {
-    fn new(provider: &'a Provider, model: &str) -> Self {
+    fn new(provider: &'a Provider, model: &str, permit: &BreakerPermit) -> Self {
         Self {
             provider,
             model: model.to_string(),
             usage: None,
+            prompt_estimate: permit.accounting.as_ref().map_or(0, |a| a.prompt_estimate),
         }
     }
     fn observe(&mut self, usage: Option<Usage>) {
@@ -314,13 +321,21 @@ impl<'a> AttemptUsage<'a> {
         }
     }
     fn finish(&mut self) -> Result<()> {
-        self.provider
-            .report_usage(&self.model, self.usage.take().as_ref())
+        let usage = self.usage.take();
+        self.provider.report_usage(&self.model, usage.as_ref())?;
+        if let Some(u) = usage {
+            self.provider
+                .observe_prompt(&self.model, self.prompt_estimate, u.prompt_tokens);
+        }
+        Ok(())
     }
 }
 impl Drop for AttemptUsage<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.finish() {
+        if let Err(error) = self
+            .provider
+            .report_usage(&self.model, self.usage.take().as_ref())
+        {
             // The daemon hook fails future admission closed after a failed
             // commit. Preserve the original stream error/cancellation here.
             tracing::warn!("could not commit failed stream usage: {error:#}");
@@ -361,10 +376,20 @@ impl BreakerPermit {
             accounting: None,
         })
     }
-    fn account_usage(&self, usage: Option<Usage>) -> Result<()> {
+    fn account_usage(&self, usage: Option<Usage>, comparable: bool) -> Result<()> {
         if let (Some(accounting), Some(usage)) = (&self.accounting, usage) {
             if let Some(hook) = &accounting.hook {
                 hook(&accounting.provider, &accounting.model, &usage)?;
+            }
+            if comparable && usage.prompt_tokens > 0 && accounting.prompt_estimate > 0 {
+                if let Some(hook) = &accounting.prompt_hook {
+                    hook(
+                        &accounting.prompt_key,
+                        &accounting.model,
+                        accounting.prompt_estimate,
+                        usage.prompt_tokens,
+                    );
+                }
             }
         }
         Ok(())
@@ -463,7 +488,10 @@ async fn completed_json(
     match resp.json::<Value>().await {
         Ok(value) => {
             permit.success();
-            permit.account_usage(Usage::parse(&value["usage"]))?;
+            permit.account_usage(
+                Usage::parse(&value["usage"]),
+                value.get("error").is_none_or(Value::is_null) && value["status"] != "failed",
+            )?;
             Ok(value)
         }
         Err(error) => {
@@ -1061,6 +1089,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_prompt: None,
             on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
@@ -1084,6 +1113,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_prompt: None,
             on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
@@ -1136,6 +1166,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_prompt: None,
             on_request: None,
             name: name.to_string(),
             http,
@@ -1239,6 +1270,63 @@ impl Provider {
         self
     }
 
+    pub fn with_prompt_hook(mut self, hook: PromptHook) -> Self {
+        self.on_prompt = Some(hook);
+        self
+    }
+
+    fn observe_prompt(&self, model: &str, raw: usize, reported: u64) {
+        if raw > 0 && reported > 0 {
+            if let Some(hook) = &self.on_prompt {
+                hook(
+                    &crate::tokens::provider_key(&self.name, &self.cfg),
+                    model,
+                    raw,
+                    reported,
+                );
+            }
+        }
+    }
+
+    /// Same API conversion and prompt-tool fallback as dispatch, without
+    /// credentials, network, output limits, or provider tokenizer calls.
+    pub fn prompt_tokens(&self, messages: &[Value], tools: &[Value], model: &str) -> usize {
+        let mut prepared = self.prepare_attachments(messages, model);
+        if !self.cfg.anthropic() {
+            for message in &mut prepared {
+                if let Some(object) = message.as_object_mut() {
+                    object.remove("thinking_blocks");
+                    object.remove("_is_error");
+                }
+            }
+        }
+        let prompt_mode = self.cfg.prompt_tools() && !tools.is_empty();
+        let messages = if prompt_mode {
+            with_prompt_tools(&prepared, tools)
+        } else {
+            prepared
+        };
+        let tools = if prompt_mode { &[][..] } else { tools };
+        let mut body = if self.cfg.anthropic() {
+            crate::anthropic::body(
+                model,
+                &messages,
+                tools,
+                self.cfg.cache_breakpoints(model),
+                None,
+                false,
+            )
+        } else if self.cfg.responses() {
+            json!({"input": responses_input(&messages), "tools": responses_tools(tools)})
+        } else {
+            json!({"messages": messages, "tools": tools})
+        };
+        if !self.cfg.anthropic() {
+            apply_breakpoints(&mut body, self.cfg.cache_breakpoints(model));
+        }
+        crate::tokens::request(&body)
+    }
+
     /// Name this provider as it is configured.
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = name.to_string();
@@ -1255,10 +1343,18 @@ impl Provider {
         self
     }
 
-    fn request_accounting(&self, model: &str, lease: Option<RequestLease>) -> RequestAccounting {
+    fn request_accounting(
+        &self,
+        model: &str,
+        lease: Option<RequestLease>,
+        body: &Value,
+    ) -> RequestAccounting {
         RequestAccounting {
             _lease: lease,
             hook: self.on_usage.clone(),
+            prompt_hook: self.on_prompt.clone(),
+            prompt_key: crate::tokens::provider_key(&self.name, &self.cfg),
+            prompt_estimate: crate::tokens::request(body),
             provider: self.name.clone(),
             model: model.to_string(),
         }
@@ -1759,7 +1855,7 @@ impl Provider {
                         let status = resp.status();
                         note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
-                            permit.accounting = Some(self.request_accounting(model, lease));
+                            permit.accounting = Some(self.request_accounting(model, lease, &b));
                             return Ok((resp, recovered, model.clone(), permit));
                         }
                         server_wait = retry_after(resp.headers());
@@ -2027,7 +2123,7 @@ impl Provider {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 r = self.post_provider_with_auth(&mut body, effort, true, &mut auth) => r?,
             };
-            let mut charged = AttemptUsage::new(self, &model_used);
+            let mut charged = AttemptUsage::new(self, &model_used, &permit);
             let mut stream = resp.bytes_stream();
             // Raw bytes: a chunk boundary can split a multibyte character, so
             // only complete lines are decoded.
@@ -2423,7 +2519,7 @@ impl Provider {
             let mut stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             let mut f = crate::anthropic::Folded::default();
-            let mut charged = AttemptUsage::new(self, &model_used);
+            let mut charged = AttemptUsage::new(self, &model_used, &permit);
             let mut failed: Option<String> = None;
             let fold = |f: &mut crate::anthropic::Folded,
                         raw: &[u8],
@@ -2626,7 +2722,7 @@ impl Provider {
                     auth.detail()
                 ));
             }
-            permit.accounting = Some(self.request_accounting(model, lease));
+            permit.accounting = Some(self.request_accounting(model, lease, &Value::Null));
             break (resp, permit);
         };
         let v = completed_json(resp, permit, "parse /compact").await?;

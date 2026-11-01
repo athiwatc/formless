@@ -129,7 +129,10 @@ without redesign.
   and latency per model, smoothed toward a neutral prior with a small
   exploration bonus for under-sampled models; optional
   `routing_fast_models` / `routing_strong_models` subsets constrain
-  simple vs complex tasks (`routing_complex_chars`). No vendor ranking
+  simple vs complex tasks (`routing_complex_chars`, converted to a token
+  threshold at four characters per token). Context size uses the shared,
+  model-calibrated prompt estimator, including Tool schemas and images; an
+  unresolved auto choice conservatively uses the largest candidate estimate. No vendor ranking
   is hard-coded. Stats are visible in the Metrics view and `doctor`.
   **Deprecated (§4.6):** a global `provider.model = "auto"` is migrated on
   daemon start. A `primary` role is created with `model = "auto"` and the
@@ -3593,10 +3596,22 @@ run_tool = "network_policy"     # a registry Tool, or…
   else `context_tokens`). It's amber above 70% and red above 90%, so
   compaction (§11) isn't a surprise. `RunUsage` carries `context_used`
   and `context_tokens` after each step, and `ContextUsage {session_id}`
-  gives the same for a Session on demand, falling back to an estimate
-  before any prompt is measured. `/context` (or clicking the segment on
+  estimates the current rebuilt prompt for a Session on demand using the
+  persisted calibration. It reports `measured: false`: a previous measured
+  prompt is not substituted for changed history, schemas or images. `/context` (or clicking the segment on
   the web) adds an estimated breakdown: system prompt, Tool schemas,
   history, and the number of attachments.
+  All preflight counts share one Unicode/JSON estimator (including Tool-call
+  metadata). Images use their dimensions and detail, with a nonzero fallback
+  when dimensions are unknown; encoded image bytes are never counted as text.
+  Counts are approximate, not a tokenizer or a forecast. Each configured
+  provider/endpoint and serving model has a persisted calibration ratio:
+  observed prompt tokens divided by the estimate of that exact dispatched
+  request, exponentially smoothed at 0.2 and clamped to 0.25–8. Missing/zero
+  prompt usage and rejected requests do not train it. Repeated cumulative
+  stream snapshots train once per HTTP attempt, including fallback models.
+  Compaction, context reports and routing apply that same ratio; calibration
+  does not require a provider request or credential refresh.
 - **Notifications.** While the TUI's terminal isn't focused (focus
   events) or the web tab is hidden, Formless tells you when a Run
   finishes (if it took at least `tui.notify_min_secs`, default 20), is
@@ -4129,7 +4144,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.proxy` | "" | HTTP(S) proxy for the daemon's requests, from start; empty uses `HTTPS_PROXY` / `NO_PROXY` (§4.2) |
 | `provider.routing_models` | [] | Candidates for `model="auto"` measured routing |
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
-| `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |
+| `provider.routing_complex_chars` | 20000 | Character-equivalent threshold (÷4 tokens) for calibrated prompt complexity |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
 | `provider.image_max_px` | 1568 | Longest side, in pixels, of an attached image sent to a vision model; bigger ones are scaled down once per Session and the encoded image kept for later steps (0: never scale). An image that can't be sent (gone, unreadable, over 8 MB) leaves a marker for the model and a note for the user (§4.2) |
 | `provider.image_detail` | auto | The `detail` asked of vision models for attached images: `auto`, `low` or `high`; images go to Chat Completions as `image_url` parts and to the Responses API as `input_image` parts (§4.2) |

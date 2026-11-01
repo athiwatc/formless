@@ -37,6 +37,7 @@ pub mod service;
 pub mod setup_draft;
 pub mod skills;
 pub mod storage;
+pub mod tokens;
 pub mod tools;
 pub mod transcript;
 pub mod webui;
