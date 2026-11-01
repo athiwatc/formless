@@ -55,11 +55,19 @@ async fn local_web_ui_is_locked_to_this_origin_and_a_one_time_token() {
     for (path, kind) in [
         ("/manifest.webmanifest", "application/manifest+json"),
         ("/sw.js", "text/javascript"),
+        ("/transport.mjs", "text/javascript"),
         ("/icon-192.png", "image/png"),
     ] {
         let r = http.get(format!("{origin}{path}")).send().await.unwrap();
         assert_eq!(r.status(), 200, "{path}");
         assert_eq!(r.headers()["content-type"], kind, "{path}");
+        if path == "/transport.mjs" {
+            assert!(r
+                .text()
+                .await
+                .unwrap()
+                .contains("export class WireEndpoint"));
+        }
     }
     let csp = http
         .get(format!("{origin}/"))

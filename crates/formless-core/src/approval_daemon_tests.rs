@@ -32,7 +32,7 @@ fn subscribe(daemon: &Daemon) -> mpsc::Receiver<ServerMessage> {
     let (tx, rx) = mpsc::channel(256);
     daemon.subs.locked().push(Subscriber {
         conn: 1,
-        tx,
+        tx: tx.into(),
         filter: Arc::new(StdMutex::new(EventFilter::default())),
         kick: CancellationToken::new(),
         gaps: BTreeMap::new(),

@@ -273,7 +273,7 @@ async fn unknown_and_below_limit_floors_keep_compatibility_and_honest_eighty_per
             let (tx, mut rx) = mpsc::channel(8);
             daemon.subs.locked().push(Subscriber {
                 conn: 987,
-                tx,
+                tx: tx.into(),
                 filter: Arc::new(StdMutex::new(EventFilter::default())),
                 kick: CancellationToken::new(),
                 gaps: Default::default(),

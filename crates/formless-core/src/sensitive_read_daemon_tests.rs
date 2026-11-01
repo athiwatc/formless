@@ -58,7 +58,7 @@ impl Fixture {
         let (tx, rx) = mpsc::channel(64);
         self.daemon().subs.locked().push(Subscriber {
             conn: 708,
-            tx,
+            tx: tx.into(),
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
             gaps: BTreeMap::new(),

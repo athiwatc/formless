@@ -17,11 +17,11 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
   both sides, HKDF-SHA256 session key) and numbers its frames, with the
   sequence number and direction in the AES-GCM associated data, so
   captured frames cannot be replayed or reflected.
-- Each browser gets its own logical daemon connection: the daemon
-  connects with `?mux=1`, the room tags every client socket with an id,
-  tells the daemon `{"relay":"client_open"|"client_close","cid":…}`, and
-  routes `{"cid","f"}` frames between them. Daemons without `mux=1` still
-  get raw frames broadcast to every client.
+- Each browser gets its own logical daemon connection. Matching clients use
+  `?transport=1`; the daemon also uses `mux=1`. Native frames carry bounded
+  opaque fragments, with server-issued send grants and distinct destination
+  receipts. The Worker never decrypts or reassembles a logical message. Legacy
+  raw/broadcast transports are refused rather than used as an unbounded fallback.
 - The web frontend in `web/` (`index.html`, `app.css`, `app.js`) is
   served by the same Worker as static assets, with a strict CSP
   (`script-src 'self'`, no inline script or style) and `no-referrer`.
@@ -41,7 +41,65 @@ The claim is HKDF-SHA256(pairing key, empty salt,
 16 bytes as lowercase hex; `Authorization: Bearer <64 lowercase hex digits>`
 carries the claim. Production transports remain TLS; loopback dev is the local
 fixture exception. Claims are not stored in socket attachments or logged.
-Connection/frame/rate/queue hardening is tracked separately in #638.
+Bounded transport v1 is a separate framing layer; E2E frame v2 and daemon
+claim v3 remain unchanged. Worker, browser and daemon transport changes must be
+integrated together before use. Source changes perform no deployment.
+
+## Bounded room transport (#638)
+
+The logical IPC ceiling stays **32 MiB**. Encrypted envelopes travel in 64 KiB
+ASCII fragments; individual native text messages are at most 64 KiB + 1024
+bytes. Before authenticated readiness only canonical v2 handshake/control
+messages of at most 2048 bytes are allowed, with six handshake messages per
+CID/direction within the absolute 30-second handshake deadline. Neither a
+public room id nor a sender-visible grant proves a destination drained data.
+Ready controls must be consumed and ACKed by both endpoints before that
+endpoint can receive bulk fragments.
+
+A room retains at most 16 CIDs, including closing/orphaned ones. One fragment
+progress reserve per CID/direction plus shared excess prevents one stalled CID
+from borrowing another's reserve. Eight grants/receipts per direction bound
+native queues; a completed logical message's final receipt remains outstanding
+through the endpoint consumer. ACK deadlines are ten seconds; reassembly has
+an absolute 30-second deadline. Either expiry first closes only the offending
+CID and queues its cancellation control. The daemon has a separate ten-second
+control-drain grace; only failure to consume that shared control may close its
+native link. A responsive daemon's missing old data receipt remains charged in
+a bounded orphan slot until that exact receipt or actual destination teardown;
+timeout alone never refunds it. CID-local faults and responses racing browser
+close do not tear down the daemon's other channels. Per-native input is limited
+to 8192 application packets and 128 MiB per one-second window, with the separate
+small pre-ready handshake allowance described above.
+
+One bounded SQLite row stores only lifecycle/receipt metadata, never payloads
+or handshake proofs. A browser close does not release bytes already sent to the
+daemon. Only its actual destination receipt or actual daemon teardown releases
+those charges. Closing sockets remain counted until actual teardown, even if logical
+cancellation was ACKed and all data receipts settled. Error alone retires the
+logical device/channel promptly without claiming its native queue disappeared;
+controls and orphaned deliveries survive hibernation in that same ledger.
+Unidentifiable live socket attachments block new authority and keep all unmatched
+ledger charges until actual inventory is unambiguous; an unknown owner is never
+interpreted as proof of teardown. Pending
+client-open/close notices are bounded metadata, retried when control credit
+returns. A replacement daemon retires the old immutable socket identity (4003)
+and requires affected browsers to open fresh channels (4002). Actual daemon
+teardown does the same; an existing bound CID/generation is never recycled for
+a different daemon. Initial offline browsers never bound to a daemon can bind
+their first one within the original handshake deadline. A retired daemon
+may settle its old receipts but cannot send new data, ready, push or disconnect
+commands. Two daemon sockets including a closing predecessor and 18 native
+sockets total are the admission bounds.
+
+Data reservations have a fourfold known-copy charge; control reservations,
+metadata and transient processing have separate bounds within the proposed
+16 MiB logical retained-data room policy. This is **not an OS/RSS or garbage
+collector cap**. Platform-owned protocol queues are not a measured RSS claim.
+Browser/Rust plaintext, crypto, producer and handler budgets need their own
+integration proof. This Worker/dev checkpoint alone does not complete #638.
+See [room-budget-design.md](room-budget-design.md) and
+[transport-design.md](transport-design.md) for exact accounting boundaries.
+
 
 ## Layout
 
@@ -49,7 +107,9 @@ Connection/frame/rate/queue hardening is tracked separately in #638.
 |---|---|
 | `worker.js` | Worker entry: `/relay/<room>` → Durable Object room, `/health`, assets + `SECURITY_HEADERS` |
 | `web/` | The browser app (no build step; one vendored file, `web/vendor/mermaid.min.js`) |
-| `dev.mjs` | Local stand-in for the Worker, for frontend work |
+| `dev.mjs`, `dev-storage.mjs` | Local native-socket adapter and real Node SQLite storage |
+| `room-budget.mjs` | Bounded durable metadata-only lifecycle and credit authority |
+| `room-budget.test.mjs`, `room-bounds.test.mjs`, `room-bounds-wire.test.mjs` | SQLite/Worker state transitions and actual private dev-socket resource proofs |
 | `push.mjs` | Payload-free Web Push signed with VAPID (shared by the Worker and `dev.mjs`) |
 | `vapid-keys.mjs` | Makes the VAPID key pair for push |
 | `conformance.mjs` | `node relay/conformance.mjs [BASE]` (one HTTP and room-frame matrix; starts `dev.mjs` without BASE, or checks e.g. `wrangler dev`) |
@@ -72,11 +132,18 @@ The `#k=` fragment is never sent to any server.
 ## Local development
 
 `dev.mjs` runs the Worker's own code: each room is `worker.js`'s
-`RelayRoom` over an in-memory stand-in for the Durable Object, and every
+`RelayRoom` over a real SQLite ledger through Node's built-in `node:sqlite`
+(Node 22.13+), and every
 HTTP request goes through the Worker's fetch handler (so `web/`, `/health`
 and `/push/key` answer exactly as in production, headers included). Only
-the WebSocket framing (masked frames required, 64 MB cap, closes echoed)
-and the mock provider are its own. A real daemon can connect to it. With
+the native WebSocket framing and mock provider are its own. Native input is
+bounded before body allocation, pre-ready messages stay small, invalid UTF-8
+is refused and at most 128 native continuation frames form one message. Ping/
+Pong/Close output has a separate 4 KiB pending native-control cap; a native
+close request does not imply queued writes are gone. Local native close has a
+one-second grace before the owned socket is destroyed; only its actual close
+event releases ledger ownership. Capacity is checked before a 101 upgrade so
+rejected peers cannot accumulate untracked WebSockets. A real daemon can connect to it. With
 `--mock-provider` it also serves a scripted OpenAI-compatible endpoint
 that streams reasoning, creates and calls a Tool (triggering the
 approval dialog), and answers in Markdown. Send `markdown demo` to get a

@@ -18,8 +18,10 @@
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DevStorage } from "./dev-storage.mjs";
+import { LIMITS } from "./web/transport.mjs";
 import { verifyDaemonClaim } from "./daemon-claim.mjs";
 import worker, { RelayRoom, SECURITY_HEADERS } from "./worker.js";
 
@@ -34,7 +36,7 @@ const port = portIndex < 0 ? 8787 : Number(args[portIndex + 1]);
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("invalid port");
 const mock = args.includes("--mock-provider");
 const webRoot = fileURLToPath(new URL("./web/", import.meta.url));
-const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".webmanifest": "application/manifest+json" };
+const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 
 // The Worker's environment: the process's (VAPID keys, PUSH_HOSTS), a
 // push service on 127.0.0.1 allowed for the tests, and the static assets.
@@ -57,99 +59,85 @@ const env = {
 };
 
 // ------------------------------------------------------------ websockets
-/** Biggest message accepted from a peer. */
-const MAX_MESSAGE = 64 * 1024 * 1024;
-
-function wsAccept(req, socket) {
-  const accept = createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
-  socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n");
-  const conn = { socket, open: true, onText: () => {}, onClose: () => {} };
-  let buf = Buffer.alloc(0);
-  let fragments = [];
-  let pending = 0;
-  socket.on("data", (chunk) => {
-    buf = Buffer.concat([buf, chunk]);
-    for (;;) {
-      if (buf.length < 2) return;
-      const fin = buf[0] & 0x80, op = buf[0] & 0x0f, masked = buf[1] & 0x80;
-      // RFC 6455: a client's frames are masked; anything else is a
-      // protocol error.
-      if (!masked) return closeWith(conn, 1002, "unmasked frame");
-      let len = buf[1] & 0x7f, off = 2;
-      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
-      else if (len === 127) {
-        if (buf.length < 10) return;
-        const big = buf.readBigUInt64BE(2);
-        if (big > BigInt(MAX_MESSAGE)) return closeWith(conn, 1009, "message too big");
-        len = Number(big); off = 10;
-      }
-      if (pending + len > MAX_MESSAGE) return closeWith(conn, 1009, "message too big");
-      const maskOff = off;
-      off += 4;
-      if (buf.length < off + len) return;
-      const payload = Buffer.from(buf.subarray(off, off + len));
-      for (let i = 0; i < len; i++) payload[i] ^= buf[maskOff + (i % 4)];
-      buf = buf.subarray(off + len);
-      // A close is answered with a close before the socket ends.
-      if (op === 0x8) { sendFrame(conn, 0x8, payload.subarray(0, 2)); return close(conn); }
-      if (op === 0x9) { sendFrame(conn, 0xa, payload); continue; }
-      if (op === 0x1 || op === 0x0) {
-        fragments.push(payload);
-        pending += len;
-        if (fin) { const text = Buffer.concat(fragments).toString("utf8"); fragments = []; pending = 0; conn.onText(text); }
-      }
-    }
-  });
-  socket.on("end", () => close(conn)); // peer went away (e.g. a killed daemon)
-  socket.on("close", () => close(conn));
-  socket.on("error", () => close(conn));
-  return conn;
+/** Parse at most one bounded native frame's retained bytes, even if a TCP
+ * read coalesces many messages. The application still carries 32MiB logically
+ * through 64KiB opaque fragments; native WS messages are not that envelope. */
+const NATIVE_CLOSE_GRACE_MS=1000;
+function wsAccept(req,socket){
+ const accept=createHash("sha1").update(req.headers["sec-websocket-key"]+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+ socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+accept+"\r\n\r\n");
+ const conn={socket,open:true,closed:false,maxMessage:LIMITS.preReady,nativeControlBytes:0,nativeRate:[Date.now(),0],closeTimer:null,onText:()=>{},onClose:()=>{}};
+ let buf=Buffer.alloc(0),parts=[],pending=0,fragmented=false;
+ const parse=()=>{
+  for(;;){
+   if(buf.length<2)return;
+   const fin=!!(buf[0]&128),op=buf[0]&15,masked=!!(buf[1]&128);
+   if((buf[0]&112)||!masked)return closeWith(conn,1002,"invalid native frame");
+   let len=buf[1]&127,off=2;
+   if(len===126){if(buf.length<4)return;len=buf.readUInt16BE(2);off=4;}
+   else if(len===127){if(buf.length<10)return;const big=buf.readBigUInt64BE(2);if(big>BigInt(conn.maxMessage))return closeWith(conn,1009,"frame too big");len=Number(big);off=10;}
+   if(len>conn.maxMessage||(op<8&&pending+len>conn.maxMessage))return closeWith(conn,1009,"message too big");
+   if(op>=8&&(!fin||len>125))return closeWith(conn,1002,"invalid control frame");
+   const maskOff=off;off+=4;if(buf.length<off+len)return;
+   if(Date.now()-conn.nativeRate[0]>=1000)conn.nativeRate=[Date.now(),0];
+   if(++conn.nativeRate[1]>8192)return closeWith(conn,1008,"native frame rate exceeded");
+   const payload=Buffer.from(buf.subarray(off,off+len));for(let i=0;i<len;i++)payload[i]^=buf[maskOff+i%4];buf=buf.subarray(off+len);
+   if(op===8){sendFrame(conn,8,payload.subarray(0,2));return close(conn);}
+   if(op===9){sendFrame(conn,10,payload);continue;}if(op===10)continue;
+   if(op!==1&&op!==0)return closeWith(conn,1003,"text frames required");
+   if((op===0&&!fragmented)||(op===1&&fragmented))return closeWith(conn,1002,"invalid continuation");
+   parts.push(payload);pending+=len;if(parts.length>128)return closeWith(conn,1009,"too many native fragments");
+   if(fin){let text;try{text=new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(parts,pending));}catch(_){return closeWith(conn,1007,"invalid text encoding");}parts=[];pending=0;fragmented=false;conn.onText(text);}else fragmented=true;
+   if(!conn.open)return;
+  }
+ };
+ socket.on("data",chunk=>{
+  let offset=0;
+  while(conn.open&&offset<chunk.length){
+   const take=Math.min(chunk.length-offset,LIMITS.wire+14-buf.length);
+   if(take<=0)return closeWith(conn,1009,"native buffer limit");
+   buf=Buffer.concat([buf,chunk.subarray(offset,offset+take)]);offset+=take;parse();
+  }
+ });
+ socket.on("end",()=>close(conn));
+ socket.on("error",()=>close(conn));
+ socket.on("close",()=>{if(conn.closed)return;if(conn.closeTimer)clearTimeout(conn.closeTimer);conn.closeTimer=null;conn.closed=true;conn.open=false;buf=Buffer.alloc(0);parts=[];conn.onClose();});
+ return conn;
 }
-function sendFrame(conn, op, payload) {
-  if (!conn.open) return;
-  const len = payload.length;
-  const head = len < 126 ? Buffer.from([0x80 | op, len])
-    : len < 65536 ? Buffer.from([0x80 | op, 126, len >> 8, len & 255])
-    : Buffer.concat([Buffer.from([0x80 | op, 127]), (() => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(len)); return b; })()]);
-  conn.socket.write(Buffer.concat([head, payload]));
+function sendFrame(conn,op,payload){
+ if(!conn.open)return;const len=payload.length;
+ if(len>LIMITS.wire)return closeWith(conn,1009,"outbound wire limit");
+ const head=len<126?Buffer.from([128|op,len]):len<65536?Buffer.from([128|op,126,len>>8,len&255]):Buffer.concat([Buffer.from([128|op,127]),(()=>{const b=Buffer.alloc(8);b.writeBigUInt64BE(BigInt(len));return b;})()]);
+ const nativeControl=op>=8?head.length+payload.length:0;
+ if(nativeControl&&conn.nativeControlBytes+nativeControl>4096){conn.open=false;conn.socket.destroy();return;}
+ conn.nativeControlBytes+=nativeControl;
+ conn.socket.write(Buffer.concat([head,payload]),()=>{conn.nativeControlBytes-=nativeControl;});
 }
-function closeWith(conn, code, reason) {
-  const body = Buffer.concat([Buffer.from([code >> 8, code & 255]), Buffer.from(reason, "utf8")]);
-  sendFrame(conn, 0x8, body);
-  close(conn);
-}
-function close(conn) {
-  if (!conn.open) return;
-  conn.open = false;
-  try { conn.socket.end(); } catch (_) {}
-  conn.onClose();
+function closeWith(conn,code,reason){if(!conn.open)return;sendFrame(conn,8,Buffer.concat([Buffer.from([code>>8,code&255]),Buffer.from(reason,'utf8')]));close(conn);}
+function close(conn){if(!conn.open)return;conn.open=false;try{conn.socket.end();}catch(_){}
+ // A hostile half-open peer cannot retain a local native socket forever.
+ // Destruction merely requests eviction; only actual 'close' proves teardown.
+ conn.closeTimer=setTimeout(()=>conn.socket.destroy(),NATIVE_CLOSE_GRACE_MS);conn.closeTimer.unref();
 }
 
 // ----------------------------------------------------------------- rooms
 /** The Durable Object state RelayRoom uses: tagged sockets and storage. */
 class DevState {
-  constructor() {
-    this.webSockets = [];
-    this.data = new Map();
-    const data = this.data;
-    this.storage = {
-      async list({ prefix }) { return new Map([...data].filter(([k]) => k.startsWith(prefix))); },
-      async put(k, v) { data.set(k, v); },
-      async delete(k) { data.delete(k); },
-    };
-  }
-  acceptWebSocket(ws, tags) { ws.tags = tags; this.webSockets.push(ws); }
-  getWebSockets(tag) { return this.webSockets.filter((ws) => !tag || ws.tags.includes(tag)); }
+ constructor(){this.webSockets=[];this.storage=new DevStorage(()=>this.room?.alarm());this.data=this.storage.data;}
+ acceptWebSocket(ws,tags){ws.tags=tags;this.webSockets.push(ws);}
+ getWebSockets(tag){return this.webSockets.filter(ws=>ws.readyState!==3&&(!tag||ws.tags.includes(tag)));}
+ waitUntil(promise){promise.catch(()=>console.error("relay: background storage failed"));}
 }
 
 /** A Node connection as the WebSocket a Durable Object hands RelayRoom. */
 function roomSocket(conn) {
   let att = null;
   return {
-    get readyState() { return conn.open ? 1 : 3; },
+    get readyState() { return conn.closed ? 3 : conn.open ? 1 : 2; },
     send(text) { sendFrame(conn, 0x1, Buffer.from(text, "utf8")); },
     close(code, reason) { closeWith(conn, code || 1000, reason || ""); },
-    serializeAttachment(a) { att = a; },
+    setMessageLimit(bytes) { conn.maxMessage=bytes; },
+    serializeAttachment(a) { att = structuredClone(a); },
     deserializeAttachment() { return att; },
   };
 }
@@ -159,18 +147,25 @@ function joinRoom(id, role, mux, ua, req, socket) {
   let r = rooms.get(id);
   if (!r) {
     const state = new DevState();
-    r = { state, room: new RelayRoom(state, env) };
+    r = { state, room: new RelayRoom(state, env) };state.room=r.room;
     rooms.set(id, r);
+  }
+  if(!r.room.canAdmit(role)){
+    const timer=setTimeout(()=>socket.destroy(),NATIVE_CLOSE_GRACE_MS);timer.unref();socket.once("close",()=>clearTimeout(timer));
+    socket.end("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",()=>socket.destroy());return;
   }
   const conn = wsAccept(req, socket);
   const ws = roomSocket(conn);
-  r.room.admit(ws, role, mux, ua, role === "daemon");
+  try { r.room.admit(ws, role, mux, ua, role === "daemon"); } catch (_) {
+    if(r.state.webSockets.includes(ws))ws.close(1008,"room capacity exhausted");
+    else{conn.open=false;socket.destroy();} // Never retain an untracked 101 socket.
+  }
   conn.onText = (text) => r.room.webSocketMessage(ws, text).catch((e) => console.log("relay: " + e.message));
   conn.onClose = () => {
     r.state.webSockets = r.state.webSockets.filter((w) => w !== ws);
     r.room.webSocketClose(ws);
     // An empty room with nothing stored is forgotten.
-    if (!r.state.webSockets.length && !r.state.data.size) rooms.delete(id);
+    if (!r.state.webSockets.length && !r.state.data.size) { r.state.storage.close();rooms.delete(id); }
   };
   console.log("relay: " + role + " joined " + id.slice(0, 8) + "… (" + r.state.getWebSockets("client").length + " client(s))");
 }
@@ -241,7 +236,7 @@ async function mockChat(body, res) {
 }
 
 // ---------------------------------------------------------------- server
-const server = createServer(async (req, res) => {
+export const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   if (mock && url.pathname.startsWith("/mock/v1/")) {
     if (url.pathname.endsWith("/models")) {
@@ -268,9 +263,10 @@ server.on("upgrade", async (req, socket) => {
     socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
     return;
   }
+  if (url.searchParams.get("transport")!=="1"||(role==="daemon"&&url.searchParams.get("mux")!=="1")) {socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");return;}
   if (socket.destroyed) return;
   joinRoom(m[1], role, url.searchParams.get("mux") === "1", req.headers["user-agent"] || "", req, socket);
 });
-server.listen(port, "127.0.0.1", () => {
+if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))server.listen(port, "127.0.0.1", () => {
   console.log("formless dev relay on http://127.0.0.1:" + server.address().port + (mock ? " (mock provider at /mock/v1)" : ""));
 });

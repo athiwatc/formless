@@ -1,54 +1,25 @@
-// node relay/room.test.mjs
-// Room teardown (#910): an error alone, or an error then a close, tells
-// the other side exactly once; the daemon's disconnect codes reach the
-// browser (#905); production pages connect to their own origin only (#907).
-import assert from "node:assert/strict";
-import { RelayRoom, SECURITY_HEADERS } from "./worker.js";
-
-function socket(att) {
-  return {
-    att, readyState: 1, sent: [], closed: null,
-    deserializeAttachment() { return this.att; },
-    send(t) { this.sent.push(t); },
-    close(code, reason) { this.closed = { code, reason }; this.readyState = 3; },
-  };
-}
-const daemon = socket({ role: "daemon", mux: true, authenticated: 3 });
-const browser = socket({ role: "client", cid: "c1" });
-const tags = { daemon: [daemon], client: [browser], c1: [browser] };
-const room = new RelayRoom({ getWebSockets: (t) => tags[t] || [] }, {});
-
-// A browser whose socket errors: the daemon hears client_close once.
-await room.webSocketError(browser);
-await room.webSocketClose(browser);
-const closes = daemon.sent.filter((t) => JSON.parse(t).relay === "client_close");
-assert.equal(closes.length, 1, daemon.sent.join("\n"));
-assert.equal(JSON.parse(closes[0]).cid, "c1");
-
-// A daemon whose socket errors: browsers hear daemon_offline once.
-const b2 = socket({ role: "client", cid: "c2" });
-tags.client = [b2];
-await room.webSocketError(daemon);
-await room.webSocketClose(daemon);
-assert.equal(b2.sent.filter((t) => JSON.parse(t).relay === "daemon_offline").length, 1);
-
-// Disconnect codes: 4002 for a broken channel, else 4001.
-const d2 = socket({ role: "daemon", mux: true, authenticated: 3 });
-const b3 = socket({ role: "client", cid: "c3" });
-const b4 = socket({ role: "client", cid: "c4" });
-tags.c3 = [b3];
-tags.c4 = [b4];
-await room.webSocketMessage(d2, JSON.stringify({ relay: "disconnect", cid: "c3", code: 4002 }));
-await room.webSocketMessage(d2, JSON.stringify({ relay: "disconnect", cid: "c4" }));
-assert.equal(b3.closed.code, 4002);
-assert.equal(b4.closed.code, 4001);
-
-assert.match(SECURITY_HEADERS["content-security-policy"], /connect-src 'self';/);
-console.log("room ok");
-
-// /health says whether push works, without secret material (#838).
-const worker = (await import("./worker.js")).default;
-const health = await (await worker.fetch(new Request("https://relay.test/health"), { VAPID_PUBLIC_KEY: "x", VAPID_PRIVATE_JWK: "{bad" })).json();
-assert.equal(health.push, "misconfigured");
-assert.ok(!JSON.stringify(health).includes("{bad"));
-console.log("health ok");
+// Room teardown and controls use the production bounded protocol over real
+// SQLite, with only native WebSocket runtime objects replaced by fixtures.
+import assert from 'node:assert/strict';
+import {SECURITY_HEADERS} from './worker.js';
+import {roomFixture,controls,ackControls} from './test-room-state.mjs';
+const f=roomFixture();
+try{
+ const daemon=f.socket(),browser=f.socket();f.room.admit(daemon,'daemon',true,'',true);f.room.admit(browser,'client',true,'');await ackControls(f.room,daemon);await ackControls(f.room,browser);
+ await f.room.webSocketError(browser);
+ assert.equal(controls(daemon).filter(m=>m.relay==='client_close').length,1,'error alone retires logical device work without requiring a close callback');
+ assert.ok(f.room.budget.describe().natives.some(n=>n.sid===browser.att.sid&&n.closing),'logical cleanup is not native teardown proof');
+ browser.finish();await f.room.webSocketClose(browser);await f.room.webSocketClose(browser);
+ assert.equal(controls(daemon).filter(m=>m.relay==='client_close'&&m.cid===browser.att.cid).length,1);
+ const b2=f.socket();f.room.admit(b2,'client',true,'');await ackControls(f.room,b2);
+ await f.room.webSocketError(daemon);daemon.finish();await f.room.webSocketClose(daemon);await f.room.webSocketClose(daemon);
+ assert.equal(controls(b2).filter(m=>m.relay==='daemon_offline').length,1);
+ const d2=f.socket();f.room.admit(d2,'daemon',true,'',true);const b3=f.socket(),b4=f.socket();f.room.admit(b3,'client',true,'');f.room.admit(b4,'client',true,'');
+ await f.room.webSocketMessage(d2,JSON.stringify({relay:'disconnect',cid:b3.att.cid,code:4002}));await f.room.webSocketMessage(d2,JSON.stringify({relay:'disconnect',cid:b4.att.cid,code:4001}));
+ assert.equal(b3.closed.code,4002);assert.equal(b4.closed.code,4001);
+ assert.match(SECURITY_HEADERS['content-security-policy'],/connect-src 'self';/);
+ console.log('room ok');
+}finally{f.close();}
+const worker=(await import('./worker.js')).default;
+const health=await(await worker.fetch(new Request('https://relay.test/health'),{VAPID_PUBLIC_KEY:'x',VAPID_PRIVATE_JWK:'{bad'})).json();
+assert.equal(health.push,'misconfigured');assert.ok(!JSON.stringify(health).includes('{bad'));console.log('health ok');
