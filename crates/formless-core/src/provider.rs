@@ -1810,7 +1810,7 @@ impl Provider {
         self.prepare_attachments_inner(messages, model, previews, &frozen)
     }
 
-    fn accepts_attachment(&self, mime: &str, model: &str) -> bool {
+    pub(crate) fn accepts_attachment(&self, mime: &str, model: &str) -> bool {
         if crate::daemon::is_raster_image(mime) {
             self.sends_images(model)
         } else if mime == "application/pdf" {
@@ -1881,7 +1881,15 @@ impl Provider {
             let mut m = Value::Object(original.as_object().unwrap().iter()
                 .filter(|(key,_)| key.as_str() != "_attachments")
                 .map(|(key,value)|(key.clone(),value.clone())).collect());
-            if !vision && atts.iter().all(|a|crate::daemon::is_raster_image(a["mime"].as_str().unwrap_or_default())) { return m; }
+            let image_only=atts.iter().all(|a|crate::daemon::is_raster_image(a["mime"].as_str().unwrap_or_default()));
+            let plural=if image_only {"images"} else {"attachments"};
+            if !vision && image_only {
+                // Snapshot/source capture count all positional native refs.
+                // An unsupported-image message cannot reset the later draft's
+                // metadata-preview/native-attachment attempt budget.
+                budget.attempts=budget.attempts.saturating_add(atts.len()).min(MAX_NATIVE_ATTACHMENTS);
+                return m;
+            }
             let mut parts = vec![json!({"type":"text","text":m["content"]})];
             let mut omitted = 0usize;
             let mut first_failure = None;
@@ -1935,12 +1943,12 @@ impl Provider {
                 }
                 if budget.attempts >= MAX_NATIVE_ATTACHMENTS && attachment_index+1 < atts.len() {
                     omitted += atts.len()-attachment_index-1;
-                    first_failure.get_or_insert(("additional images".into(),"the request's 16 attempted native-attachment limit is reached".into()));
+                    first_failure.get_or_insert((format!("additional {plural}"),"the request's 16 attempted native-attachment limit is reached".into()));
                     break;
                 }
             }
             if let Some((name,why)) = first_failure {
-                let rest = if omitted > 1 {format!("; {} additional images were omitted",omitted-1)} else {String::new()};
+                let rest = if omitted > 1 {format!("; {} additional {plural} were omitted",omitted-1)} else {String::new()};
                 let label=if atts.iter().all(|a|crate::daemon::is_raster_image(a["mime"].as_str().unwrap_or_default())) {"image"} else {"attachment"};
                 parts.push(json!({"type":"text","text":format!("[{label} {name} could not be attached: {why}{rest}]")}));
                 self.note(format!("The {label} {name} wasn't sent to the model: {why}{rest}."));
@@ -4188,6 +4196,35 @@ mod breaker_tests;
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn unsupported_history_images_cannot_reset_native_preview_attempt_prefix() {
+        let p = Provider::new(
+            ProviderCfg {
+                vision: Some(false),
+                audio_input: Some(true),
+                ..Default::default()
+            },
+            String::new(),
+        )
+        .unwrap();
+        let history = json!({"role":"user","content":"old image references","_attachments":vec![json!({"mime":"image/png","name":"old.png"});16]});
+        let draft = json!({"role":"user","content":"new audio","_attachments":[{"mime":"audio/wav","name":"new.wav"}]});
+        let descriptor = formless_protocol::ForecastAttachment {
+            name: "new.wav".into(),
+            mime: "audio/wav".into(),
+            bytes: 48,
+            ..Default::default()
+        };
+        let prepared = p.prepare_forecast_attachments(
+            &[history, draft],
+            "fixture",
+            Some((1, 0, &[descriptor])),
+        );
+        assert!(!crate::tokens::has_native_media(&json!(prepared)));
+        assert!(prepared[1]
+            .to_string()
+            .contains("16 attempted native-attachment limit"));
+    }
     #[test]
     fn native_repair_and_detection_are_limited_to_real_content_parts() {
         let schema = json!({"type":"object","const":{"type":"file","cache_control":{"type":"data"}},"default":{"type":"input_audio"},"examples":[{"type":"thinking"},{"type":"document"},{"type":"input_file"},{"type":"image"}]});
