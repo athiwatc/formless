@@ -289,3 +289,51 @@ async fn failed_model_selection_never_starts_an_opted_in_background_test() {
     conn.execute_batch("DROP TRIGGER private_reject_model;")
         .unwrap();
 }
+
+#[tokio::test]
+async fn chained_alias_uses_the_same_background_reservation_and_result_label() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, true).await;
+    let mut cfg = f.daemon().config().unwrap();
+    // The fixture already maps alias -> model. Keep provider-level alias
+    // behavior unchanged; test only matching reservation/result identities.
+    cfg.provider
+        .aliases
+        .insert("model".into(), "physical-model".into());
+    cfg.save(&f.daemon().paths).unwrap();
+    let task = f.daemon().test_new_model(&f.session, "alias").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), f.entered.notified())
+        .await
+        .unwrap();
+    f.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let results = f.daemon().model_tests();
+    assert!(results.contains_key(&format!("{} model", f.base)));
+    assert!(!results.contains_key(&format!("{} physical-model", f.base)));
+    assert_eq!(f.count.load(Ordering::SeqCst), 2);
+    assert!(f.daemon().test_new_model(&f.session, "alias").is_none());
+    f.selected("alias").await;
+    assert_eq!(
+        f.count.load(Ordering::SeqCst),
+        2,
+        "cached selection starts no second background task"
+    );
+    // Explicit Test is intentional new work, regardless of that cache.
+    f.release.add_permits(1);
+    let fresh = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.daemon().handle(Request::TestModel {
+            model: "alias".into(),
+            provider: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fresh["model"], "model");
+    assert_eq!(fresh["ok"], true);
+    assert_eq!(f.count.load(Ordering::SeqCst), 4);
+}

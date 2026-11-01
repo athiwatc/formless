@@ -8295,7 +8295,11 @@ impl Daemon {
         if model.starts_with("role:") || ProviderCfg::is_auto_model(model) || model.is_empty() {
             return None;
         }
-        let model = cfg.provider.resolve_alias(model);
+        // The execution entry resolves the original selection once. Keep
+        // that selection separate from this reservation label so aliases
+        // pointing at another alias are not resolved an extra time here.
+        let selection = model.to_string();
+        let model = cfg.provider.resolve_alias(&selection);
         let reservation = match self
             .model_test_cache
             .reserve(&cfg.provider.base_url, &model)
@@ -8313,7 +8317,7 @@ impl Daemon {
         let (this, sid) = (self.clone(), session_id.to_string());
         Some(tokio::spawn(async move {
             let _reservation = reservation;
-            match this.test_model(&cfg, None, &model).await {
+            match this.test_model(&cfg, None, &selection).await {
                 Ok(t) if !t.ok => this.broadcast(Event::Note {
                     session_id: Some(sid),
                     text: format!(
