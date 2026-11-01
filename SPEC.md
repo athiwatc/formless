@@ -1274,7 +1274,8 @@ pattern (§4.4).
 | Capability | Scoping | Notes |
 |---|---|---|
 | `net` | optionally per-domain | Unscoped `net` allowed but flagged “broad” at approval |
-| `fs:read` | path list | Canonicalised; symlink escapes denied (§14) |
+| `fs:read` | path list | Canonicalised; symlink escapes denied (§14); credential-read gate below |
+| `fs:read-sensitive` | one exact absolute identity | Operation-time credential consent; grants no filesystem authority |
 | `fs:write` | path list | Same containment rules |
 | `env` | named keys | Only listed keys visible |
 | `process` | named commands | Executed without a shell; unscoped flagged “broad” |
@@ -1284,6 +1285,31 @@ pattern (§4.4).
 | `agent` | optionally per-model | v2; sub-agents from inside Tools (§7.6) |
 | `store` / `store:<ns>` | own / named shared namespace | Key-value state between Invocations; not sensitive (no approval) |
 | `harness:<scope>` | `read`, `mcp`, `skills`, `models`, `providers`, `roles`, `config` | Read or change the harness itself (§7.13); every change is approved with a diff |
+
+- **Credential reads (#708).** Ordinary project reads, including input-bound
+  reads, stay quiet. Builtin credential directories (`.ssh`, `.aws`, `.gnupg`,
+  `.pki`), `.env*`, `*.pem`, `*.key`, shell histories and native/browser
+  credential stores require separate exact-path consent. This gate applies
+  even with `security.secure = false`; broad read grants and trusted folders
+  cannot cover it. Its synthetic Capability grants no file, network or process
+  authority. The prompt uses the actual Invocation's Tool/version, Run/source
+  context and computed concrete path. Refusal/cancellation prevents access.
+  The daemon's active data/config roots and key fallback are hard denied
+  before grants, checking both configured namespaces and current/captured
+  canonical identities. Reads, chunks, metadata, detailed listings, implicit
+  prior-content reads and source relocation use the same boundary. Moving or
+  deleting a directory containing the profile is also denied. Default hosts
+  without interactive consent, smoke tests and optimiser replay fail closed
+  for credential reads; dry-run reads still require consent.
+  `security.sensitive_paths` adds typed `{kind, value}` rules: `subtree`
+  (absolute or `~/`), `basename_prefix` and `basename_suffix` (nonempty literal
+  strings without separators or wildcards). It cannot remove builtins or the
+  profile boundary and is configured through the owner's config file.
+  Explicit process path operands and working directories are checked before
+  launch, including relative `cat` operands and file URIs; this is not OS
+  confinement of arbitrary programs or interpretation of arbitrary scripts.
+  Paths are rechecked after approval and before access, without claiming an
+  atomic check/open, hard-link tracking or information-flow sandbox.
 
 - **Input-bound scopes (v2.1).** `fs:read`, `fs:write` and `net` may be
   scoped to an input field instead of a fixed value: `fs:read:$input.path`,
@@ -3104,7 +3130,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   lines of 300 characters, and `v` opens it whole.
 - **Trusted folders.** `[security] trusted_paths = ["~/code/app", …]`
   lists folders whose file access needs no approval.
-  - **What's covered:** reading files never asks. A call whose only
+  - **What's covered:** ordinary reads stay quiet; credential reads require
+    separate exact-path consent (§7.4). A call whose only
     sensitive Capabilities are `fs:write` inside a trusted folder (input
     bound or fixed, resolved per call) runs without asking, and is logged
     as `tool.approve_trusted`.

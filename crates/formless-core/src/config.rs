@@ -39,12 +39,12 @@ pub struct Config {
 }
 
 /// Folders whose file access needs no approval (SPEC §10.3). Reading
-/// files never asks; writing inside a trusted folder doesn't either.
+/// ordinary files stays quiet; credential reads always require exact-path consent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SecurityCfg {
     /// Ask for approval before sensitive Tool calls (SPEC §10.3). Off by
-    /// default: calls run without prompts. `formless --secure` (or
+    /// default for ordinary capabilities; credential reads still ask. `formless --secure` (or
     /// `FORMLESS_SECURE=1`) turns it on.
     pub secure: bool,
     /// Absolute paths (or `~/…`).
@@ -59,6 +59,8 @@ pub struct SecurityCfg {
     /// Extra secret shapes (regular expressions) blanked wherever Formless
     /// stores or quotes text, beside the built-in ones (SPEC §15).
     pub secret_patterns: Vec<String>,
+    /// Additive credential-read rules; builtins and profile hard denies remain.
+    pub sensitive_paths: Vec<formless_runtime::sensitive_paths::SensitivePathRule>,
 }
 
 impl Default for SecurityCfg {
@@ -69,6 +71,7 @@ impl Default for SecurityCfg {
             trust_writes: true,
             trusted_hosts: Vec::new(),
             secret_patterns: Vec::new(),
+            sensitive_paths: Vec::new(),
         }
     }
 }

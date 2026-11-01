@@ -1059,6 +1059,16 @@ struct ReplayOps {
 }
 
 impl HostOps for ReplayOps {
+    fn path_policy(
+        &self,
+    ) -> std::result::Result<formless_runtime::sensitive_paths::PathPolicy, String> {
+        let cfg = self.daemon.config().map_err(|e| e.to_string())?;
+        crate::sensitive_reads::policy(
+            &self.daemon.paths,
+            &cfg.security,
+            &self.daemon.sensitive_anchors,
+        )
+    }
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
         let daemon = self.daemon.clone();
         // Replay never reaches a real MCP server (ADR 0004): a nested MCP

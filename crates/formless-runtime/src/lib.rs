@@ -4,6 +4,7 @@
 
 pub mod caps;
 mod dns;
+pub mod sensitive_paths;
 pub mod sync;
 pub use caps::Capabilities;
 pub use sync::LockExt;
@@ -50,6 +51,19 @@ pub fn new_overlay() -> Overlay {
 
 /// Operations only the daemon can provide (nested Tools, artifact emit).
 pub trait HostOps: Send + Sync {
+    /// Hard boundaries and additive credential rules for this host profile.
+    fn path_policy(&self) -> Result<sensitive_paths::PathPolicy, String> {
+        Ok(sensitive_paths::PathPolicy::default())
+    }
+    /// Exact-path credential consent, independent of ordinary fs grants.
+    fn approve_sensitive_read(
+        &self,
+        _path: &Path,
+        _operation: &str,
+        _reason: &str,
+    ) -> Result<(), String> {
+        Err("credential read needs an interactive approval host".into())
+    }
     fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
         Err("tools.call is not available in this context".into())
     }
@@ -202,6 +216,14 @@ pub fn set_max_parallel_calls(n: u64) {
 pub struct NoHostOps;
 impl HostOps for NoHostOps {}
 
+/// Smoke/module hosts know the profile boundary, but cannot ask for consent.
+pub struct GuardedNoHostOps(pub sensitive_paths::PathPolicy);
+impl HostOps for GuardedNoHostOps {
+    fn path_policy(&self) -> Result<sensitive_paths::PathPolicy, String> {
+        Ok(self.0.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
     pub code: String,
@@ -273,6 +295,7 @@ struct Stream {
 }
 
 struct State {
+    read_consents: Mutex<std::collections::HashSet<PathBuf>>,
     caps: Capabilities,
     mode: HostMode,
     ops: Arc<dyn HostOps>,
@@ -1394,6 +1417,7 @@ impl State {
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {}
                 }
+                self.guard_read(a["path"].as_str().unwrap_or_default(), &p, "file contents")?;
                 read_capped(&p).map(|b| encode(&b, enc))
             }
             "fs_write" => {
@@ -1401,6 +1425,13 @@ impl State {
                 let data = decode(a["content"].as_str().unwrap_or_default(), enc)?;
                 let append = a["append"].as_bool().unwrap_or(false);
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), true)?;
+                if append {
+                    self.guard_read(
+                        a["path"].as_str().unwrap_or_default(),
+                        &p,
+                        "append prior contents",
+                    )?;
+                }
                 if self.mode.is_overlay() {
                     // Capability must still be declared; the write lands in
                     // the overlay (readable this run, never on disk) (§8.4).
@@ -1443,9 +1474,7 @@ impl State {
                 Ok(json!(data.len()))
             }
             "fs_exists" => {
-                let Ok(p) = self.resolve(a["path"].as_str().unwrap_or_default(), false) else {
-                    return Ok(json!(false));
-                };
+                let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
                 Ok(json!(match self.overlay_get(&p) {
                     Some(v) => v.is_some(),
                     None => p.exists(),
@@ -1483,6 +1512,9 @@ impl State {
             }
             "fs_remove" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), true)?;
+                if a["recursive"].as_bool().unwrap_or(false) {
+                    self.guard_container(&p)?;
+                }
                 if self.mode.is_overlay() {
                     if self.mode == HostMode::DryRun {
                         self.would(format!("delete {}", p.display()));
@@ -1508,6 +1540,18 @@ impl State {
             "fs_rename" => {
                 let from = self.resolve(a["from"].as_str().unwrap_or_default(), true)?;
                 let to = self.resolve(a["to"].as_str().unwrap_or_default(), true)?;
+                self.guard_read(
+                    a["from"].as_str().unwrap_or_default(),
+                    &from,
+                    "rename source contents",
+                )?;
+                if from.is_dir() {
+                    self.guard_container(&from)?;
+                }
+                if to.is_dir() {
+                    self.guard_container(&to)?;
+                }
+
                 if self.mode.is_overlay() {
                     let bytes = match self.overlay_get(&from) {
                         Some(Some(b)) => b,
@@ -1515,7 +1559,7 @@ impl State {
                         None if from.is_dir() => {
                             return Err("renaming a directory is not supported in replay".into())
                         }
-                        None => std::fs::read(&from).map_err(|e| e.to_string())?,
+                        None => read_capped(&from)?,
                     };
                     if self.mode == HostMode::DryRun {
                         self.would(format!("rename {} to {}", from.display(), to.display()));
@@ -1537,6 +1581,7 @@ impl State {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
                 let offset = a["offset"].as_u64().unwrap_or(0);
                 let size = a["size"].as_u64().unwrap_or(65536).clamp(4, 1 << 20) as usize;
+                self.guard_read(a["path"].as_str().unwrap_or_default(), &p, "file chunk")?;
                 let (buf, total) = match self.overlay_get(&p) {
                     Some(Some(bytes)) => {
                         let start = (offset as usize).min(bytes.len());
@@ -1600,6 +1645,21 @@ impl State {
                 for e in rd {
                     let e = e.map_err(|e| e.to_string())?;
                     let name = e.file_name().to_string_lossy().to_string();
+                    let entry_path = e.path();
+                    let raw_entry = entry_path
+                        .to_str()
+                        .ok_or_else(|| denied("directory entry path is not UTF-8"))?;
+                    let canonical_entry = caps::canonical_path(raw_entry).map_err(denied)?;
+                    if self.path_decision(raw_entry, &canonical_entry)?
+                        == sensitive_paths::PathDecision::Forbidden
+                    {
+                        continue;
+                    }
+                    if !details {
+                        entries.insert(name.clone(), json!({"name":name}));
+                        continue;
+                    }
+                    self.guard_read(raw_entry, &canonical_entry, "directory entry metadata")?;
                     let info = match e.path().symlink_metadata() {
                         Ok(m) => json!({"name": name, "type": file_type(&m), "size": m.len()}),
                         Err(_) => json!({"name": name, "type": "other", "size": 0}),
@@ -1611,22 +1671,36 @@ impl State {
             }
         }
         if self.mode.is_overlay() {
-            let g = self.overlay.lock().map_err(|e| e.to_string())?;
-            for (k, v) in g.iter() {
-                let kp = Path::new(k);
-                if kp.parent() != Some(p.as_path()) {
-                    continue;
-                }
+            // Only metadata is copied under the overlay lock. Consent may wait
+            // on another Tool/client, so never hold this shared lock across it.
+            let overlay_entries: Vec<_> = self
+                .overlay
+                .lock()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .filter(|(key, _)| Path::new(key).parent() == Some(p.as_path()))
+                .map(|(key, value)| (key.clone(), value.as_ref().map(Vec::len)))
+                .collect();
+            for (key, bytes) in overlay_entries {
+                let kp = Path::new(&key);
                 let name = kp
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                match v {
-                    Some(b) => {
+                let canonical = caps::canonical_path(&key).map_err(denied)?;
+                if self.path_decision(&key, &canonical)? == sensitive_paths::PathDecision::Forbidden
+                {
+                    continue;
+                }
+                if details && bytes.is_some() {
+                    self.guard_read(&key, &canonical, "overlay entry metadata")?;
+                }
+                match bytes {
+                    Some(bytes) => {
                         entries.insert(
                             name.clone(),
-                            json!({"name": name, "type": "file", "size": b.len()}),
+                            json!({"name":name,"type":"file","size":bytes}),
                         );
                     }
                     None => {
@@ -1974,16 +2048,10 @@ impl State {
         }
         // A working folder is a place the Tool may read (#608): inside
         // its fs grants, never anywhere on disk.
-        if let Some(cwd) = a["cwd"].as_str() {
-            if self.mode == HostMode::Live
-                && self.resolve(cwd, false).is_err()
-                && self.resolve(cwd, true).is_err()
-            {
-                return Err(denied(format!(
-                    "cwd {cwd} is outside this Tool's fs grants; declare fs:read:{cwd} to run there"
-                )));
-            }
-        }
+        let cwd = a["cwd"]
+            .as_str()
+            .map(|raw| self.process_cwd(raw))
+            .transpose()?;
         if self.mode == HostMode::Replay {
             return Err(denied("process denied in replay"));
         }
@@ -2017,6 +2085,10 @@ impl State {
             Some(s) => Some(decode(s, enc_of(&a["stdin_encoding"])?)?),
             None => None,
         };
+        let effective_cwd = cwd
+            .clone()
+            .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?);
+        self.process_operand_paths(cmd, &args, &effective_cwd)?;
         let mut command = std::process::Command::new(cmd);
         // Git under a sub-command grant (`process:git:status|log`) runs
         // without the repository settings that start programs: fsmonitor,
@@ -2057,7 +2129,7 @@ impl State {
             })
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        if let Some(cwd) = a["cwd"].as_str() {
+        if let Some(cwd) = &cwd {
             command.current_dir(cwd);
         }
         // Children see only a minimal base environment plus the keys the
@@ -2092,6 +2164,10 @@ impl State {
         // and its children), not just the direct child.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        self.process_operand_paths(cmd, &args, &effective_cwd)?;
+        if let Some(cwd) = &cwd {
+            self.recheck_path(a["cwd"].as_str().unwrap(), cwd)?;
+        }
         let mut child = command.spawn().map_err(|e| format!("{cmd}: {e}"))?;
         // Feed stdin and drain stdout/stderr on their own threads so a
         // chatty child cannot deadlock against a full pipe, and the wait
@@ -2168,6 +2244,187 @@ impl State {
     /// Canonical containment check (SPEC §14): target must be inside a
     /// granted root, symlinks resolved. In Smoke mode a path that only an
     /// input-bound template could grant is a stub denial (inconclusive).
+    fn guard_container(&self, path: &Path) -> Result<(), String> {
+        if self
+            .ops
+            .path_policy()
+            .map_err(denied)?
+            .contains_profile(path)
+            .map_err(denied)?
+        {
+            return Err(denied(
+                "directory operation would move/remove a protected profile",
+            ));
+        }
+        Ok(())
+    }
+
+    fn process_cwd(&self, raw: &str) -> Result<PathBuf, String> {
+        let canonical = caps::canonical_path(raw).map_err(denied)?;
+        self.protected_path(raw, &canonical)?;
+        let contained = self
+            .caps
+            .fs_read
+            .iter()
+            .chain(&self.caps.fs_write)
+            .filter(|root| !root.starts_with(INPUT_PREFIX))
+            .any(|root| caps::canonical_path(root).is_ok_and(|root| canonical.starts_with(root)));
+        if self.mode == HostMode::Live && !contained {
+            return Err(denied(format!(
+                "cwd {raw} is outside this Tool's fs grants; declare fs:read:{raw} to run there"
+            )));
+        }
+        self.guard_read(raw, &canonical, "process working directory")?;
+        Ok(canonical)
+    }
+
+    fn process_operand_paths(&self, cmd: &str, args: &[String], cwd: &Path) -> Result<(), String> {
+        // Explicit operands are checked; arbitrary approved program code is
+        // not confined by this scan or by an OS filesystem sandbox.
+        let cwd_text = cwd
+            .to_str()
+            .ok_or_else(|| denied("process cwd is not UTF-8"))?;
+        self.guard_read(cwd_text, cwd, "process working directory")?;
+        let mut literal_arguments = false;
+        let mut operands = Vec::new();
+        operands.push(cmd);
+        // Inspect a bare executable's current PATH resolution too. This
+        // does not confine code it subsequently loads or executes.
+        let executable = if !cmd.contains(['/', '\\']) {
+            which(cmd)
+        } else {
+            None
+        };
+        if let Some(path) = &executable {
+            operands.push(
+                path.to_str()
+                    .ok_or_else(|| denied("process executable is not UTF-8"))?,
+            );
+        }
+        for value in args.iter().map(String::as_str) {
+            if value == "--" && !literal_arguments {
+                literal_arguments = true;
+                continue;
+            }
+            if !literal_arguments && value.starts_with('-') {
+                if let Some((_, value)) = value.split_once('=') {
+                    operands.push(value);
+                }
+                continue;
+            }
+            operands.push(value);
+            // Some programs use @response files, while cat treats @ literally.
+            // Inspect both spellings; never rewrite the child's actual argv.
+            if let Some(response_file) = value.strip_prefix('@') {
+                operands.push(response_file);
+            }
+        }
+        for operand in operands {
+            if operand.is_empty() {
+                continue;
+            }
+            let file_uri = operand
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"));
+            if operand.contains("://") && !file_uri {
+                continue;
+            }
+            let explicit_path = file_uri
+                || Path::new(operand).has_root()
+                || operand.contains('/')
+                || (cfg!(windows) && operand.contains('\\'))
+                || operand.starts_with('.');
+            let path = if file_uri {
+                reqwest::Url::parse(operand)
+                    .map_err(|e| denied(e.to_string()))?
+                    .to_file_path()
+                    .map_err(|_| denied("invalid file operand URI"))?
+            } else {
+                PathBuf::from(operand)
+            };
+            let path = caps::lexical_absolute(cwd, &path).map_err(denied)?;
+            let raw = path
+                .to_str()
+                .ok_or_else(|| denied("process operand is not UTF-8"))?;
+            let canonical = match caps::canonical_path(raw) {
+                Ok(path) => path,
+                Err(_)
+                    if !explicit_path
+                        && self.path_decision(raw, &path)?
+                            == sensitive_paths::PathDecision::Ordinary =>
+                {
+                    continue
+                }
+                Err(error) => return Err(denied(error)),
+            };
+            self.guard_read(raw, &canonical, "process path operand")?;
+        }
+        Ok(())
+    }
+
+    fn path_decision(
+        &self,
+        raw: &str,
+        canonical: &Path,
+    ) -> Result<sensitive_paths::PathDecision, String> {
+        let configured = caps::lexical_absolute(
+            &std::env::current_dir().map_err(|e| denied(e.to_string()))?,
+            Path::new(raw),
+        )
+        .map_err(denied)?;
+        self.ops
+            .path_policy()
+            .map_err(denied)?
+            .classify(&configured, canonical)
+            .map_err(denied)
+    }
+
+    fn protected_path(&self, raw: &str, canonical: &Path) -> Result<(), String> {
+        if self.path_decision(raw, canonical)? == sensitive_paths::PathDecision::Forbidden {
+            return Err(denied(format!(
+                "direct access to the Formless profile is forbidden: {}",
+                canonical.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn recheck_path(&self, raw: &str, expected: &Path) -> Result<(), String> {
+        let current = caps::canonical_path(raw).map_err(denied)?;
+        if current != expected {
+            return Err(denied("path changed while awaiting credential consent"));
+        }
+        self.protected_path(raw, &current)
+    }
+
+    fn guard_read(&self, raw: &str, canonical: &Path, operation: &str) -> Result<(), String> {
+        match self.path_decision(raw, canonical)? {
+            sensitive_paths::PathDecision::Forbidden => self.protected_path(raw, canonical)?,
+            sensitive_paths::PathDecision::Ordinary => {}
+            sensitive_paths::PathDecision::Sensitive(reason) => {
+                if matches!(self.mode, HostMode::Smoke | HostMode::Replay) {
+                    let error = denied(format!(
+                        "credential read unavailable in noninteractive mode: {}",
+                        canonical.display()
+                    ));
+                    return Err(if self.mode == HostMode::Smoke {
+                        self.stub(error)
+                    } else {
+                        error
+                    });
+                }
+                let allowed = self.read_consents.locked().contains(canonical);
+                if !allowed {
+                    self.ops
+                        .approve_sensitive_read(canonical, operation, &reason)
+                        .map_err(denied)?;
+                    self.read_consents.locked().insert(canonical.to_path_buf());
+                }
+            }
+        }
+        self.recheck_path(raw, canonical)
+    }
+
     fn resolve(&self, raw: &str, write: bool) -> Result<PathBuf, String> {
         let roots = if write {
             &self.caps.fs_write
@@ -2185,6 +2442,12 @@ impl State {
                 "fs:{kind} is input-bound and not granted in the smoke test"
             )))
         };
+        let canonical = match caps::canonical_path(raw) {
+            Ok(canonical) => canonical,
+            Err(_) if smoke_stub => return Err(stub_denial()),
+            Err(error) => return Err(denied(error)),
+        };
+        self.protected_path(raw, &canonical)?;
         if fixed.is_empty() {
             return Err(if smoke_stub {
                 stub_denial()
@@ -2192,18 +2455,28 @@ impl State {
                 denied(format!("fs:{kind} not declared"))
             });
         }
-        let canonical = match caps::canonical_path(raw) {
-            Ok(c) => c,
-            Err(_) if smoke_stub => return Err(stub_denial()),
-            Err(e) => return Err(denied(e)),
-        };
+
         for r in fixed {
             let root = caps::canonical_path(r).unwrap_or_else(|_| PathBuf::from(r));
             if canonical.starts_with(&root) {
+                // A write may implicitly read old contents for append/diff
+                // snapshots. Protect existing files before that callback too.
+                if !write || canonical.is_file() {
+                    self.guard_read(
+                        raw,
+                        &canonical,
+                        if write {
+                            "existing file change (may retain prior contents)"
+                        } else {
+                            "filesystem read"
+                        },
+                    )?;
+                }
                 if !write {
                     self.ops
                         .data_observed("file", &canonical.to_string_lossy())?;
                 }
+                self.recheck_path(raw, &canonical)?;
                 return Ok(canonical);
             }
         }
@@ -2630,6 +2903,7 @@ fn nested_error<'js>(
 pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, ExecError> {
     let (settled_tx, settled_rx) = std::sync::mpsc::channel();
     let state = Arc::new(State {
+        read_consents: Mutex::new(Default::default()),
         caps: req.caps.clone(),
         mode: req.mode,
         ops,
@@ -3722,3 +3996,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod sensitive_read_tests;

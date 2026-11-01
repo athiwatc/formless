@@ -591,6 +591,7 @@ struct ForecastConsent {
 }
 
 pub struct Daemon {
+    pub(crate) sensitive_anchors: Vec<std::path::PathBuf>,
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
     /// Read-only connections for client queries (lists, search, exports),
@@ -750,6 +751,18 @@ impl Daemon {
             bail!("a daemon is already running for this data dir");
         }
         let store = Store::open(&paths.db_file())?;
+        let cwd = std::env::current_dir()?;
+        let sensitive_anchors = [&paths.data_dir, &paths.config_dir]
+            .into_iter()
+            .map(|root| {
+                let absolute =
+                    formless_runtime::caps::lexical_absolute(&cwd, root).map_err(|e| anyhow!(e))?;
+                formless_runtime::caps::canonical_path(
+                    absolute.to_str().context("profile path is not UTF-8")?,
+                )
+                .map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
         // A damaged database stops the daemon with the backup to restore,
         // instead of failing wherever it first bites (SPEC §16).
         store.check_integrity(&paths.db_file())?;
@@ -861,6 +874,7 @@ impl Daemon {
             shutdown: CancellationToken::new(),
             build: build_id(),
             started: std::time::Instant::now(),
+            sensitive_anchors,
             _ownership: ownership,
         })
     }
@@ -7369,6 +7383,8 @@ impl Daemon {
         }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let ops = Arc::new(NestedOps {
+            read_identity: Some((info.clone(), ver.clone())),
+            read_input: input.clone(),
             _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: info.name.clone(),
@@ -8486,7 +8502,7 @@ impl Daemon {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let limit = std::time::Duration::from_secs(cfg.tools.smoke_timeout_secs.max(1));
-        match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), Some(cancel.clone()), limit).await {
+        match execute_bounded(req, Arc::new(formless_runtime::GuardedNoHostOps(crate::sensitive_reads::policy(&self.paths, &cfg.security, &self.sensitive_anchors).map_err(|e| anyhow!(e))?)), Some(cancel.clone()), limit).await {
             Bounded::Done(Ok(_)) => {}
             Bounded::Done(Err(e)) if e.after_stub => {}
             Bounded::Done(Err(e)) => return Err(anyhow!("module smoke test failed: {}", e.message)),
@@ -8801,7 +8817,7 @@ impl Daemon {
         // Bounded and cancellable (SPEC §7.1): it is a validation gate on
         // synthetic input, not user work.
         let limit = std::time::Duration::from_secs(cfg.tools.smoke_timeout_secs.max(1));
-        let note = match execute_bounded(req, Arc::new(formless_runtime::NoHostOps), cancel, limit).await {
+        let note = match execute_bounded(req, Arc::new(formless_runtime::GuardedNoHostOps(crate::sensitive_reads::policy(&self.paths, &cfg.security, &self.sensitive_anchors).map_err(|e| anyhow!(e))?)), cancel, limit).await {
             Bounded::Done(Ok(_)) => None,
             Bounded::Done(Err(e)) if e.after_stub && e.kind != ExecErrorKind::Resource => Some(format!(
                 "inconclusive (failed after a stubbed effect: {}); call the Tool or test_tool it with real input",
@@ -11141,6 +11157,8 @@ impl Daemon {
         }
         let script_id = uuid::Uuid::new_v4().to_string();
         let ops = Arc::new(NestedOps {
+            read_identity: None,
+            read_input: Value::Null,
             _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: "run_script".into(),
@@ -11378,6 +11396,8 @@ impl Daemon {
             );
         }
         let ops = Arc::new(NestedOps {
+            read_identity: Some((info.clone(), ver.clone())),
+            read_input: input.clone(),
             _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: d.name.clone(),
@@ -11468,6 +11488,58 @@ impl Daemon {
         input: Option<&Value>,
         cancel: &CancellationToken,
     ) -> bool {
+        // Concrete protected targets are never offered for consent. Broad
+        // scopes remain usable for ordinary files; the runtime excludes the
+        // protected subtree at each actual operation regardless of that grant.
+        let policy = match crate::sensitive_reads::policy(
+            &self.paths,
+            &cfg.security,
+            &self.sensitive_anchors,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!("invalid credential-read policy: {error}");
+                return false;
+            }
+        };
+        for path in caps
+            .fs_read
+            .iter()
+            .chain(&caps.fs_write)
+            .chain(&caps.sensitive_read)
+        {
+            if path.starts_with("$input.") {
+                continue;
+            }
+            let canonical = match formless_runtime::caps::canonical_path(path) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let raw = match formless_runtime::caps::lexical_absolute(
+                &std::env::current_dir().unwrap_or_default(),
+                std::path::Path::new(path),
+            ) {
+                Ok(path) => path,
+                Err(_) => return false,
+            };
+            match policy.classify(&raw, &canonical) {
+                Ok(formless_runtime::sensitive_paths::PathDecision::Forbidden) | Err(_) => {
+                    let _ = self.with_store(|st| {
+                        st.audit(
+                            "daemon",
+                            "tool.deny_profile",
+                            &format!(
+                                "{}: protected profile path {}",
+                                info.name,
+                                canonical.display()
+                            ),
+                        )
+                    });
+                    return false;
+                }
+                _ => {}
+            }
+        }
         let needs = caps.is_sensitive() || ver.memory_mb > cfg.tools.default_memory_mb;
         if !needs {
             return true;
@@ -11494,7 +11566,7 @@ impl Daemon {
         }
         // Approvals are opt-in (`security.secure`); denials apply anyway.
         // Record the allow decision, not an execution or successful outcome.
-        if !cfg.security.secure {
+        if !cfg.security.secure && caps.sensitive_read.is_empty() {
             let _ = self.with_store(|st| {
                 st.audit(
                     "approvals-off",
@@ -12544,6 +12616,8 @@ impl Daemon {
                 return outcome.map(|v| (v, inv_id));
             }
             let ops = Arc::new(NestedOps {
+                read_identity: Some((info.clone(), ver.clone())),
+                read_input: input.clone(),
                 _taint_scope: self.taint_scope(&session_id, &run_id),
                 daemon: self.clone(),
                 tool_name: info.name.clone(),
@@ -14291,6 +14365,8 @@ fn mcp_state(s: &McpServerInfo) -> &'static str {
 /// block_on the daemon executor.
 struct NestedOps {
     _taint_scope: Arc<crate::approval_preview::RunTaint>,
+    read_identity: Option<(ToolInfo, ToolVersionInfo)>,
+    read_input: Value,
     daemon: Arc<Daemon>,
     tool_name: String,
     /// The Tool's own store namespace ("tool:<id>"; "test:<name>" drafts).
@@ -14334,6 +14410,58 @@ impl NestedOps {
 }
 
 impl HostOps for NestedOps {
+    fn path_policy(
+        &self,
+    ) -> std::result::Result<formless_runtime::sensitive_paths::PathPolicy, String> {
+        let cfg = self.daemon.config().map_err(|e| e.to_string())?;
+        crate::sensitive_reads::policy(
+            &self.daemon.paths,
+            &cfg.security,
+            &self.daemon.sensitive_anchors,
+        )
+    }
+
+    fn approve_sensitive_read(
+        &self,
+        path: &std::path::Path,
+        operation: &str,
+        reason: &str,
+    ) -> std::result::Result<(), String> {
+        let (info, ver) = self
+            .read_identity
+            .as_ref()
+            .ok_or("no invocation identity for credential consent")?;
+        let path = path
+            .to_str()
+            .ok_or("credential path cannot be represented as UTF-8 JSON")?;
+        let caps = Capabilities {
+            sensitive_read: vec![path.to_string()],
+            ..Default::default()
+        };
+        let input = json!({"invocation":self.read_input, "runtime_access":{"path":path, "operation":operation, "credential_rule":reason}});
+        let cfg = self.daemon.config().map_err(|e| e.to_string())?;
+        let allowed = self.block_cancellable(async {
+            Ok(self
+                .daemon
+                .ensure_approval(
+                    &cfg,
+                    &self.session_id,
+                    &self.run_id,
+                    info,
+                    ver,
+                    &caps,
+                    Some(&input),
+                    &self.cancel,
+                )
+                .await)
+        })?;
+        if allowed {
+            Ok(())
+        } else {
+            Err("credential read approval denied".into())
+        }
+    }
+
     fn data_observed(&self, kind: &str, origin: &str) -> std::result::Result<(), String> {
         self.daemon
             .record_data_origin(

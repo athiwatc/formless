@@ -9,20 +9,50 @@ The full technical definition is in [SPEC §7.4](../SPEC.md#74-capabilities-clos
 
 ## Are you asked?
 
-By default approvals are **off**: Tools run without asking, and every
-sensitive call is recorded in the audit log (`formless approvals list`,
+By default ordinary capability approvals are **off**. Credential-shaped
+file reads still require exact-path consent; the active Formless profile
+is inaccessible to Tools. Other sensitive calls are recorded in the audit log (`formless approvals list`,
 `/audit`). Start with `formless --secure` (or set `security.secure = true`)
 to be asked before a Tool first uses a sensitive Capability. Not every
 Capability is asked about:
 
 <!-- Checked against the code by caps.rs `the_docs_list_what_is_asked`. -->
 - Asked before first use: `net`, `process`, `fs:write:~`, `env:HOME`, `clipboard:read`, `clipboard:write`, `notify`, `llm`, `agent`, `mcp:github`, `harness:mcp`
-- Never asked, even with `--secure`: `fs:read:~`, `store`, `harness:read`
+- Never asked as ordinary grants: `fs:read:~`, `store`, `harness:read`
 
-So **reading files is never approval-gated**: a Tool that declares
-`fs:read:~` can read anything in your home folder, including `~/.ssh`,
-without a prompt. It still can't send what it reads anywhere without `net`,
-`process` or another Capability you are asked about.
+An ordinary project-file read stays quiet, including an input-bound read.
+Reading credential paths such as `.ssh/config`, `.aws/credentials`, `.env*`,
+`*.pem`, `*.key`, shell histories and native credential stores asks with the
+computed concrete path, even when `security.secure = false`. Broad filesystem
+grants and trusted folders do not cover this consent. The synthetic
+`fs:read-sensitive:<absolute-path>` consent covers exactly that identity and
+confers no filesystem, process or network access of its own.
+
+The active daemon's data and config directories, including its key fallback,
+are denied regardless of grants. Configured namespaces and resolved targets
+are checked, including aliases and moves that could expose their contents.
+Smoke tests and optimiser replay cannot approve credential reads. Reads in a
+dry run still need consent. Explicit process operands (including a `cat`
+filename relative to its `cwd`) receive the same checks; arbitrary approved
+programs are not confined by an OS filesystem sandbox.
+
+Add rules in `config.toml`; these supplement the builtins and cannot remove
+the profile boundary:
+
+```toml
+[security]
+sensitive_paths = [
+  { kind = "subtree", value = "~/private" },
+  { kind = "basename_prefix", value = "private-" },
+  { kind = "basename_suffix", value = ".p12" },
+]
+```
+
+Subtrees must be absolute (or start with `~/`); basename prefixes and suffixes
+are literal, nonempty strings without separators or wildcards. Checks repeat
+after approval and before access. They do not make filesystem checks and
+opens atomic, track renamed hard links, or confine an external program's
+internal file accesses.
 
 Either way:
 
@@ -74,12 +104,11 @@ host it was called with, nothing more. This is how one general Tool (say,
   then.
 - **Your everyday machine:** turn approvals on (`formless --secure`), and
   add your project folders to `security.trusted_paths` so routine writes
-  there don't ask. Reads are not asked about, so check the `fs:read`
-  paths when you approve a Tool's other Capabilities.
+  there don't ask. Ordinary reads stay quiet; check the `fs:read` paths as well as the
+  separate credential-read consent.
 - **Shared or work machines:** approvals on, no trusted folders outside
   projects, deny bare `net` and bare `process`, and deny any Tool whose
-  `fs:read` covers your home folder (reads are never asked about on their
-  own, so do it when its other Capabilities are).
+  `fs:read` covers your home folder (ordinary reads remain quiet).
 - **Headless (`formless run`):** approvals fail closed unless you pass
   `--yes`, which approves for that Run only.
 
