@@ -145,6 +145,24 @@ fn old_schema_migrates_only_in_private_copy_without_creating_source_sidecars() {
     assert_eq!(tree(&fixture.0), before);
 }
 
+#[test]
+fn possibly_hot_rollback_journal_refuses_without_recovery_or_source_changes() {
+    let (fixture, paths) = Fixture::new();
+    closed_wal(&paths);
+    std::fs::write(
+        format!("{}-journal", paths.db_file().display()),
+        b"unproven rollback state",
+    )
+    .unwrap();
+    let before = tree(&fixture.0);
+    let error = match open(&paths) {
+        Ok(_) => panic!("unproven rollback state admitted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("rollback journal"));
+    assert_eq!(tree(&fixture.0), before);
+}
+
 struct External {
     child: Child,
     lines: mpsc::Receiver<String>,

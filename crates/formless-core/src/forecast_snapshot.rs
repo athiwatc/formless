@@ -223,6 +223,16 @@ pub(super) fn open_file(paths: &Paths, file: &Path) -> Result<Option<Store>> {
     }
     let source = std::fs::canonicalize(source)?;
     let native = NativeLock::acquire(&source)?;
+    // A raw lock deliberately performs no pager recovery. A possibly hot
+    // rollback journal could describe uncommitted changes in the main DB.
+    // Refuse even a cold nonempty PERSIST journal rather than bless a copy
+    // without knowing its recovery state; never replay it against the source.
+    match std::fs::metadata(PathBuf::from(format!("{}-journal",source.display()))) {
+        Ok(metadata) if metadata.is_file() && metadata.len()==0=>(),
+        Ok(_)=>bail!("forecast source has a rollback journal; normal SQLite recovery is required before an offline snapshot"),
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>(),
+        Err(error)=>return Err(error).context("inspect forecast rollback journal"),
+    }
     let temporary = SnapshotDir::new()?;
     let copy = temporary.0.join("formless.db");
     native.copy_main(&copy)?;
