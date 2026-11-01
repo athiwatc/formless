@@ -18,6 +18,28 @@ pub struct Painted {
     pub url: String,
 }
 
+/// Encode the native absolute file path, including Windows drive/UNC/verbatim
+/// prefixes, as a standards-compliant terminal hyperlink.
+pub fn file_url(path: &std::path::Path) -> Option<String> {
+    url::Url::from_file_path(path).ok().map(String::from)
+}
+
+/// Parse only numeric suffixes, preserving drive colons and colons in paths.
+pub fn path_and_line(word: &str) -> (&str, Option<u32>) {
+    let Some((head, last)) = word.rsplit_once(':') else {
+        return (word, None);
+    };
+    let Ok(number) = last.parse::<u32>() else {
+        return (word, None);
+    };
+    if let Some((path, line)) = head.rsplit_once(':') {
+        if let Ok(line) = line.parse::<u32>() {
+            return (path, Some(line));
+        }
+    }
+    (head, Some(number))
+}
+
 /// URLs in a line of text, as (start char, end char exclusive, url).
 pub fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
     let chars: Vec<char> = text.chars().collect();
@@ -67,15 +89,14 @@ pub fn find_paths(text: &str) -> Vec<(usize, usize, String, Option<u32>)> {
             continue;
         }
         // `path:line` or `path:line:col`.
-        let mut parts = word.splitn(3, ':');
-        let path = parts.next().unwrap_or_default().to_string();
-        let line = parts.next().and_then(|l| l.parse::<u32>().ok());
+        let (path, line) = path_and_line(&word);
+        let path = path.to_string();
         let ext = path.rsplit_once('.').is_some_and(|(stem, e)| {
             !stem.is_empty()
                 && (1..=6).contains(&e.len())
                 && e.chars().all(|c| c.is_ascii_alphanumeric())
         });
-        let looks = (path.contains('/') && path.len() > 1) || ext;
+        let looks = (path.contains(['/', '\\']) && path.len() > 1) || ext;
         if looks && !path.chars().all(|c| c.is_ascii_digit() || c == '.') {
             out.push((start, end, path, line));
         }
@@ -324,6 +345,63 @@ pub fn open_external(target: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_file_links_round_trip_reserved_and_unicode_path_names() {
+        let dir = std::env::temp_dir().join(format!("fl link {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("report # % ไทย.txt");
+        std::fs::write(&file, b"fixture").unwrap();
+        let canonical = file.canonicalize().unwrap();
+        let target = super::file_url(&canonical).unwrap();
+        assert!(
+            target.contains("%20") && target.contains("%23") && target.contains("%25"),
+            "{target}"
+        );
+        let parsed = url::Url::parse(&target).unwrap();
+        assert_eq!(parsed.scheme(), "file");
+        assert!(parsed.query().is_none() && parsed.fragment().is_none());
+        assert_eq!(
+            parsed.to_file_path().unwrap().canonicalize().unwrap(),
+            canonical
+        );
+        assert_eq!(
+            crate::clipimg::dropped_file(&target)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            canonical
+        );
+        assert!(super::file_url(std::path::Path::new("relative.txt")).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_drive_and_unc_colons_survive_line_suffix_parsing() {
+        assert_eq!(
+            super::path_and_line(r"C:\work\src\lib.rs:10:4"),
+            (r"C:\work\src\lib.rs", Some(10))
+        );
+        assert_eq!(
+            super::path_and_line(r"C:\work\src\lib.rs"),
+            (r"C:\work\src\lib.rs", None)
+        );
+        assert_eq!(
+            super::path_and_line(r"\\server\share\file.txt:7"),
+            (r"\\server\share\file.txt", Some(7))
+        );
+        let paths = super::find_paths(r"see C:\work\src\lib.rs:10 and \\server\share\file.txt:7");
+        assert_eq!(
+            paths
+                .iter()
+                .map(|(_, _, path, line)| (path.as_str(), *line))
+                .collect::<Vec<_>>(),
+            vec![
+                (r"C:\work\src\lib.rs", Some(10)),
+                (r"\\server\share\file.txt", Some(7))
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]

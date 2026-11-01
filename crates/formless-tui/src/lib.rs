@@ -9210,9 +9210,7 @@ impl App {
 
     /// `/open path P[:LINE]`: a file the answer mentions, in the editor.
     fn open_path(&mut self, arg: &str) {
-        let mut parts = arg.splitn(3, ':');
-        let path = parts.next().unwrap_or_default();
-        let line = parts.next().and_then(|l| l.parse::<u32>().ok());
+        let (path, line) = links::path_and_line(arg);
         match resolve_path_in(&self.work_dir(), path) {
             Some(file) if cfg!(test) => self.notes.push(format!(
                 "opening {}{}",
@@ -11727,11 +11725,19 @@ fn session_state(app: &App, s: &SessionInfo) -> (&'static str, Style) {
 /// A directory for display: `~` for home, and only the last two parts
 /// of a long path (`…/work/formless`).
 fn short_dir(dir: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let d = match dir.strip_prefix(&home).filter(|_| !home.is_empty()) {
-        Some(rest) => format!("~{rest}"),
+    let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+    let d = match home
+        .as_deref()
+        .and_then(|home| std::path::Path::new(dir).strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
         None => dir.to_string(),
     };
+    // Only Windows treats backslashes as separators. They are legal filename
+    // characters on Unix and must remain intact there.
+    #[cfg(windows)]
+    let d = d.replace('\\', "/");
     let parts: Vec<&str> = d.split('/').filter(|p| !p.is_empty()).collect();
     if parts.len() > 3 {
         format!("…/{}", parts[parts.len() - 2..].join("/"))
@@ -16313,7 +16319,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     cache
                         .entry(p.to_string())
                         .or_insert_with(|| {
-                            resolve_path_in(&base, p).map(|f| format!("file://{}", f.display()))
+                            resolve_path_in(&base, p).and_then(|f| links::file_url(&f))
                         })
                         .clone()
                 };
@@ -16458,7 +16464,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base = std::path::PathBuf::from(format!("/tmp/fl-tui-{short}"));
+        let base = std::env::temp_dir().join(format!("fl-tui-{short}"));
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         App {
             paths,
@@ -19607,6 +19613,10 @@ mod tests {
         let file = app.paths.data_dir.join("shot.png");
         std::fs::create_dir_all(&app.paths.data_dir).unwrap();
         std::fs::write(&file, vec![0u8; 3000]).unwrap();
+        assert!(
+            file.is_absolute(),
+            "drag fixture must have a native absolute path"
+        );
         // Dragging the file in pastes its (quoted) path: it's attached.
         app.paste(&format!("'{}'", file.display()));
         assert!(app.input.is_empty());
@@ -20519,10 +20529,20 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(area);
         buf.set_string(0, 0, "see src/lib.rs:10 and src/nope.rs", Style::default());
         let found = links::scan(&buf, area, &mut |p| {
-            resolve_path(p).map(|f| format!("file://{}", f.display()))
+            resolve_path(p).and_then(|f| links::file_url(&f))
         });
         assert_eq!(found.len(), 1);
         assert!(found[0].url.starts_with("file://") && found[0].url.ends_with("src/lib.rs"));
+        assert_eq!(
+            url::Url::parse(&found[0].url)
+                .unwrap()
+                .to_file_path()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            resolve_path("src/lib.rs").unwrap(),
+            "terminal hyperlink must round-trip to the actual native file"
+        );
         assert_eq!((found[0].x0, found[0].x1), (4, 16));
         assert!(editor_takes_goto("/usr/local/bin/code") && !editor_takes_goto("vim"));
     }
@@ -21048,6 +21068,8 @@ mod tests {
         assert!(app.notes.last().unwrap().starts_with("working directory: "));
         assert_eq!(short_dir("/a/b/c/d/e"), "…/d/e");
         assert_eq!(short_dir("/a/b"), "/a/b");
+        #[cfg(unix)]
+        assert_eq!(short_dir("/a/folder\\name/leaf"), "/a/folder\\name/leaf");
     }
 
     #[test]

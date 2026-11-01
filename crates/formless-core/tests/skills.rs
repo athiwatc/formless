@@ -4,9 +4,23 @@
 use formless_core::skills::{has_scripts, install, parse_skill_md, read_file};
 use formless_core::{Paths, Store};
 
-fn temp_paths(tag: &str) -> Paths {
+struct Fixture(std::path::PathBuf);
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_paths(tag: &str) -> (Fixture, Paths) {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
-    let base = std::path::PathBuf::from(format!("/tmp/fl-{tag}-{short}"));
+    let base = std::env::temp_dir().join(format!("fl-{tag}-{short}"));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&base).unwrap();
     let paths = Paths {
         data_dir: base.join("d"),
         config_dir: base.join("c"),
@@ -14,7 +28,7 @@ fn temp_paths(tag: &str) -> Paths {
     };
     std::fs::create_dir_all(&paths.data_dir).unwrap();
     std::fs::create_dir_all(&paths.config_dir).unwrap();
-    paths
+    (Fixture(base), paths)
 }
 
 fn write_skill(dir: &std::path::Path, name: &str, body: &str) {
@@ -49,7 +63,7 @@ fn skill_md_frontmatter_is_parsed_and_validated() {
 
 #[test]
 fn skills_install_from_folder_zip_and_git_and_version() {
-    let paths = temp_paths("skills");
+    let (_fixture, paths) = temp_paths("skills");
     let store = Store::open(&paths.db_file()).unwrap();
     let src = paths.data_dir.join("src/report");
     write_skill(&src, "report-writer", "Step 1: read the sheet.");
@@ -85,20 +99,28 @@ fn skills_install_from_folder_zip_and_git_and_version() {
     write_zip(&zip, &entries);
     let v2 = install(&paths, &store, zip.to_str().unwrap(), None, None, "user").unwrap();
     assert_eq!((v2.version, v2.enabled), (2, false));
+    assert_eq!(
+        read_file(&store, "report-writer", "SKILL.md").unwrap(),
+        std::fs::read_to_string(src.join("SKILL.md")).unwrap(),
+        "zip install must contain the updated version's actual files"
+    );
 
     // git (a local bare repo stands in for a URL), with a subdir.
     let repo = paths.data_dir.join("work");
     write_skill(&repo.join("skills/git-skill"), "git-skill", "From git.");
     let git = |args: &[&str], dir: &std::path::Path| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
         assert!(
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .unwrap()
-                .status
-                .success(),
-            "git {args:?}"
+            output.status.success(),
+            "git {args:?} in {}: {}\nstdout: {}\nstderr: {}",
+            dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     };
     git(&["init", "-q"], &repo);
@@ -139,6 +161,15 @@ fn skills_install_from_folder_zip_and_git_and_version() {
     )
     .unwrap();
     assert_eq!(g.name, "git-skill");
+    assert_eq!((g.version, g.enabled, g.has_scripts), (1, false, true));
+    assert_eq!(
+        read_file(&store, "git-skill", "reference.md").unwrap(),
+        "extra notes"
+    );
+    assert_eq!(
+        read_file(&store, "git-skill", "scripts/fix.py").unwrap(),
+        "print('hi')"
+    );
     assert_eq!(store.list_skills().unwrap().len(), 2);
     // Removing deletes rows; files are the caller's to delete.
     assert!(!store.remove_skill("git-skill").unwrap().is_empty());
@@ -149,7 +180,7 @@ fn skills_install_from_folder_zip_and_git_and_version() {
 async fn skills_are_managed_through_the_daemon() {
     use formless_protocol::Request;
     use std::sync::Arc;
-    let paths = temp_paths("skillsd");
+    let (_fixture, paths) = temp_paths("skillsd");
     formless_core::Config::default().save(&paths).unwrap();
     let src = paths.data_dir.join("src/notes");
     write_skill(&src, "note-taker", "Write notes.");
@@ -205,7 +236,7 @@ async fn skills_are_managed_through_the_daemon() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_agent_loads_enabled_skills() {
     use std::sync::Arc;
-    let paths = temp_paths("loadskill");
+    let (_fixture, paths) = temp_paths("loadskill");
     formless_core::Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
     let src = paths.data_dir.join("src/report");
@@ -280,7 +311,7 @@ async fn the_agent_loads_enabled_skills() {
 #[test]
 fn skills_export_and_import_bundles() {
     use formless_core::skills::{commit, export, prepare_bundle};
-    let paths = temp_paths("skbundle");
+    let (_fixture, paths) = temp_paths("skbundle");
     let store = Store::open(&paths.db_file()).unwrap();
     let src = paths.data_dir.join("src/report");
     write_skill(&src, "report-writer", "Step 1: read the sheet.");
@@ -292,7 +323,7 @@ fn skills_export_and_import_bundles() {
     assert!(bundle.get("loads").is_none(), "no metrics in a bundle");
 
     // Into a fresh install: author import, disabled, same files.
-    let other = temp_paths("skbundle2");
+    let (_other_fixture, other) = temp_paths("skbundle2");
     let store2 = Store::open(&other.db_file()).unwrap();
     let staged = prepare_bundle(&other, &bundle).unwrap();
     let info = commit(&other, &store2, &staged, "import").unwrap();
@@ -333,7 +364,7 @@ fn distilled_skills_parse_and_install_as_auto() {
     let input = distil_input("tidy the sheet", &calls, "done", &[]);
     assert!(input.contains("1. read_file [success]") && input.contains("(none)"));
 
-    let paths = temp_paths("autoskill");
+    let (_fixture, paths) = temp_paths("autoskill");
     let store = Store::open(&paths.db_file()).unwrap();
     let info = install_text(&paths, &store, &text, "auto:run r1", "auto").unwrap();
     assert_eq!((info.author.as_str(), info.version), ("auto", 1));
@@ -344,7 +375,7 @@ fn distilled_skills_parse_and_install_as_auto() {
 #[test]
 fn auto_skills_are_measured_and_retired() {
     use formless_core::skills::install_text;
-    let paths = temp_paths("retire");
+    let (_fixture, paths) = temp_paths("retire");
     let store = Store::open(&paths.db_file()).unwrap();
     let md = |n: &str| format!("---\nname: {n}\ndescription: d\n---\nbody\n");
     install_text(&paths, &store, &md("idle-skill"), "auto", "auto").unwrap();
@@ -393,7 +424,7 @@ fn auto_skills_are_measured_and_retired() {
 
 #[test]
 fn run_tool_sequences_are_compared_across_sessions() {
-    let paths = temp_paths("toolseq");
+    let (_fixture, paths) = temp_paths("toolseq");
     let store = Store::open(&paths.db_file()).unwrap();
     let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
     let mut ids = Vec::new();
@@ -458,7 +489,7 @@ fn write_zip(path: &std::path::Path, entries: &[(String, Vec<u8>)]) {
 #[test]
 fn hostile_skill_zips_are_refused_and_leave_nothing() {
     use std::io::Write;
-    let paths = temp_paths("zipbomb");
+    let (_fixture, paths) = temp_paths("zipbomb");
     let store = Store::open(&paths.db_file()).unwrap();
     let skill_md = b"---\nname: bomb\ndescription: d\n---\nbody".to_vec();
     let staging = paths.data_dir.join("skills/.staging");

@@ -6613,7 +6613,9 @@ impl Daemon {
             let Ok(mut input) = serde_json::from_str::<Value>(&tc.arguments) else {
                 continue;
             };
-            self.localize_input(session_id, &ver, &mut input);
+            if self.localize_input(session_id, &ver, &mut input).is_err() {
+                continue;
+            }
             let Ok(caps) = bound_caps(&ver, &input) else {
                 continue;
             };
@@ -6705,7 +6707,9 @@ impl Daemon {
                 let Ok(mut input) = serde_json::from_str::<Value>(&tc.arguments) else {
                     continue;
                 };
-                self.localize_input(session_id, &ver, &mut input);
+                if self.localize_input(session_id, &ver, &mut input).is_err() {
+                    continue;
+                }
                 let Ok(caps) = bound_caps(&ver, &input) else {
                     continue;
                 };
@@ -7329,7 +7333,8 @@ impl Daemon {
         if !input.is_object() {
             bail!("the input must be a JSON object");
         }
-        self.localize_input(session_id, &ver, &mut input);
+        self.localize_input(session_id, &ver, &mut input)
+            .map_err(|e| anyhow!(e))?;
         let schema: Value =
             serde_json::from_str(&ver.input_schema).unwrap_or(json!({"type": "object"}));
         let compiled = toolreg::compile_schema(&schema)
@@ -8358,12 +8363,17 @@ impl Daemon {
 
     /// Relative paths in a Tool's input-bound `fs:` fields, made absolute
     /// against the Session's working directory before binding.
-    fn localize_input(&self, session_id: &str, ver: &ToolVersionInfo, input: &mut Value) {
+    fn localize_input(
+        &self,
+        session_id: &str,
+        ver: &ToolVersionInfo,
+        input: &mut Value,
+    ) -> std::result::Result<(), String> {
         if let Some(cwd) = self.session_cwd(session_id) {
-            if let Ok(caps) = Capabilities::parse(&ver.capabilities) {
-                caps.absolutize_inputs(input, std::path::Path::new(&cwd));
-            }
+            let caps = Capabilities::parse(&ver.capabilities)?;
+            caps.absolutize_inputs(input, std::path::Path::new(&cwd))?;
         }
+        Ok(())
     }
 
     /// The model a Session runs on, with `role:<name>` resolved to the
@@ -11275,8 +11285,14 @@ impl Daemon {
         let coerced = toolreg::coerce_json_strings(&d.input_schema, &mut input);
         self.note_coerced(&d.name, &coerced);
         if let Some(cwd) = self.session_cwd(session_id) {
-            d.caps
-                .absolutize_inputs(&mut input, std::path::Path::new(&cwd));
+            if let Err(e) = d
+                .caps
+                .absolutize_inputs(&mut input, std::path::Path::new(&cwd))
+            {
+                return Ok(
+                    json!({"ok": false, "stage": "input_validation", "error": e}).to_string(),
+                );
+            }
         }
         if let Err(e) =
             toolreg::validate_against(&toolreg::compile_schema(&d.input_schema)?, &input)
@@ -12365,13 +12381,13 @@ impl Daemon {
                 serde_json::from_str(&ver.input_schema).unwrap_or(json!({"type": "object"}));
             let coerced = toolreg::coerce_json_strings(&in_schema, &mut input);
             self.note_coerced(&name, &coerced);
-            self.localize_input(&session_id, &ver, &mut input);
+            let localized = self.localize_input(&session_id, &ver, &mut input);
             let input_text = toolreg::redact(&input).to_string();
             let started = std::time::Instant::now();
             let dur = |s: &std::time::Instant| s.elapsed().as_millis() as i64;
             match toolreg::compile_schema(&in_schema) {
                 Ok(v) => {
-                    if let Err(e) = toolreg::validate_against(&v, &input) {
+                    if let Err(e) = localized.and_then(|_| toolreg::validate_against(&v, &input)) {
                         self.record_inv(
                             &info,
                             ver.version,

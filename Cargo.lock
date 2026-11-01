@@ -1352,6 +1352,7 @@ dependencies = [
  "image",
  "jsonschema",
  "keyring",
+ "libc",
  "pulldown-cmark",
  "rand 0.8.8",
  "regex",
@@ -1425,6 +1426,7 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "url",
  "uuid",
 ]
 
