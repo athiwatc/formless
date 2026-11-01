@@ -171,6 +171,8 @@ enum Pending {
     Compare,
     CompareSessions {
         revision: u64,
+        left: String,
+        right: String,
     },
     /// A step-mode decision (errors keep the step waiting).
     StepDecision,
@@ -2671,7 +2673,9 @@ impl App {
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
+                                let selected = self.selected_session().map(|s| s.id.clone());
                                 self.sessions = v;
+                                self.restore_session_selection(selected.as_deref());
                                 if self.current.is_none() {
                                     if self.offline.is_some() {
                                         if let Some(first) = self.start_session() {
@@ -4135,12 +4139,16 @@ impl App {
                                 }
                             }
                         }
-                        Pending::CompareSessions { revision } => {
+                        Pending::CompareSessions {
+                            revision,
+                            left,
+                            right,
+                        } => {
                             if revision != self.session_comparison_revision {
                                 continue;
                             }
                             match serde_json::from_value::<SessionComparison>(result) {
-                                Ok(comparison) => {
+                                Ok(comparison) if comparison.left.session.id == left && comparison.right.session.id == right => {
                                     self.pager = Some(Pager {
                                         title: "Stored Session comparison".into(),
                                         lines: session_ui::comparison_lines(&comparison),
@@ -4149,6 +4157,7 @@ impl App {
                                         styled: Vec::new(),
                                     })
                                 }
+                                Ok(_) => self.notes.push("Session comparison reply does not match the requested ordered pair; retry /compare.".into()),
                                 Err(error) => self
                                     .notes
                                     .push(format!("Invalid Session comparison: {error}")),
@@ -5411,11 +5420,13 @@ impl App {
                 ));
             }
             Event::SessionUpdated { session } => {
+                let selected = self.selected_session().map(|s| s.id.clone());
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session.id) {
                     *s = session;
                 } else {
                     self.sessions.insert(0, session);
                 }
+                self.restore_session_selection(selected.as_deref());
             }
             Event::MessagesEdited { session_id } => {
                 if self.current.as_deref() == Some(&session_id) {
@@ -5423,8 +5434,10 @@ impl App {
                 }
             }
             Event::SessionDeleted { id } => {
+                let selected = self.selected_session().map(|s| s.id.clone());
                 self.sessions.retain(|s| s.id != id);
                 self.running_sessions.remove(&id);
+                self.restore_session_selection(selected.as_deref());
                 if self.is_current(&id) {
                     self.stash_current_draft(&id);
                     self.current = None;
@@ -7117,7 +7130,7 @@ impl App {
                 if words.len() != 2 { self.notes.push("usage: /compare SESSION_A SESSION_B (stored history only); /compare-models starts paid model comparisons".into()); return; }
                 let pair = session_ui::resolve(&self.sessions, words[0]).and_then(|left| session_ui::resolve(&self.sessions, words[1]).map(|right| (left,right)));
                 match pair {
-                    Ok((left,right)) => self.request(Pending::CompareSessions { revision: self.session_comparison_revision }, Request::CompareSessions {left,right}),
+                    Ok((left,right)) => self.request(Pending::CompareSessions { revision: self.session_comparison_revision, left: left.clone(), right: right.clone() }, Request::CompareSessions {left,right}),
                     Err(error) => self.notes.push(error),
                 }
             }
@@ -8733,6 +8746,13 @@ impl App {
             .into_iter()
             .map(|row| row.index)
             .collect()
+    }
+
+    fn restore_session_selection(&mut self, selected: Option<&str>) {
+        let visible = self.visible_sessions();
+        self.session_idx = selected
+            .and_then(|id| visible.iter().position(|&i| self.sessions[i].id == id))
+            .unwrap_or_else(|| self.session_idx.min(visible.len().saturating_sub(1)));
     }
 
     fn visible_proposals(&self) -> Vec<usize> {
@@ -21194,6 +21214,83 @@ mod tests {
     }
 
     #[test]
+    fn lineage_selection_survives_parent_deletion_archive_and_list_refresh() {
+        let mut app = test_app();
+        let session = |id: &str, parent: Option<&str>| {
+            serde_json::from_value::<SessionInfo>(serde_json::json!({"id":id,"name":id,"created_at":"","updated_at":"","forked_from":parent,"fork_point_seq":parent.map(|_|3)})).unwrap()
+        };
+        let parent = session("parent", None);
+        let child = session("child", Some("parent"));
+        let sibling = session("sibling", Some("parent"));
+        app.sessions = vec![child.clone(), parent.clone(), sibling.clone()];
+        app.current = Some("child".into());
+        app.view = View::Sessions;
+        app.session_filter.tree = true;
+        app.session_idx = 1;
+        assert_eq!(app.selected_session().unwrap().id, "child");
+        app.on_event(Event::SessionDeleted {
+            id: "parent".into(),
+        });
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "child",
+            "deleting parent cannot move child selection to sibling"
+        );
+        app.key(key(KeyCode::Char(' ')));
+        assert!(app.marked.contains("child") && !app.marked.contains("sibling"));
+        assert!(render(&mut app, 180, 24).contains("parent unavailable: parent"));
+        app.on_event(Event::SessionUpdated {
+            session: parent.clone(),
+        });
+        assert_eq!(app.selected_session().unwrap().id, "child");
+        let mut hidden_parent = parent.clone();
+        hidden_parent.archived = true;
+        app.on_event(Event::SessionUpdated {
+            session: hidden_parent.clone(),
+        });
+        assert_eq!(app.selected_session().unwrap().id, "child");
+        assert!(render(&mut app, 180, 24).contains("parent filtered: parent"));
+        let mut hidden_child = child.clone();
+        hidden_child.archived = true;
+        app.on_event(Event::SessionUpdated {
+            session: hidden_child,
+        });
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "sibling",
+            "a hidden selection must fall back to a visible row"
+        );
+        app.on_event(Event::SessionUpdated {
+            session: child.clone(),
+        });
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "sibling",
+            "showing a previously hidden child must not steal selection"
+        );
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+        app.request(Pending::ListSessions, Request::ListSessions);
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(ServerMessage::Response {
+            id: request.id,
+            ok: true,
+            result: Some(serde_json::json!([sibling, hidden_parent, child])),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(
+            app.selected_session().unwrap().id,
+            "sibling",
+            "a full list refresh must preserve selected ID across order changes"
+        );
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
     fn session_comparison_is_read_only_strict_and_ignores_obsolete_replies() {
         let mut app = test_app();
         let comparison = session_ui::comparison_fixture();
@@ -21214,6 +21311,30 @@ mod tests {
         app.slash("compare left right extra");
         assert!(sent.try_recv().is_err());
         app.slash("compare left right");
+        let wrong: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let mut reversed = comparison.clone();
+        std::mem::swap(&mut reversed.left, &mut reversed.right);
+        tx.send(ServerMessage::Response {
+            id: wrong.id,
+            ok: true,
+            result: Some(serde_json::to_value(&reversed).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(
+            app.pager.is_none(),
+            "even the first reply must match the ordered requested IDs"
+        );
+        assert!(app
+            .notes
+            .iter()
+            .any(|line| line.contains("requested ordered pair")));
+        assert!(
+            sent.try_recv().is_err(),
+            "rejecting a mismatched response cannot trigger model work"
+        );
+        app.slash("compare left right");
         let first: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
         assert!(
             matches!(first.request,Request::CompareSessions{ref left,ref right} if left == "left" && right == "right")
@@ -21226,7 +21347,7 @@ mod tests {
         tx.send(ServerMessage::Response {
             id: second.id,
             ok: true,
-            result: Some(serde_json::to_value(&comparison).unwrap()),
+            result: Some(serde_json::to_value(&reversed).unwrap()),
             error: None,
         })
         .unwrap();

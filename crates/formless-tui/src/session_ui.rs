@@ -191,6 +191,12 @@ pub fn comparison_lines(comparison: &formless_protocol::SessionComparison) -> Ve
                     message.role, message.seq, message.id
                 ));
                 lines.extend(message.content.lines().map(|line| format!("  {line}")));
+                if let Some(metadata) = &message.meta {
+                    lines.push(format!(
+                        "  Metadata (quoted data): {}",
+                        serde_json::to_string(metadata).unwrap_or_default()
+                    ));
+                }
                 lines.push(String::new());
             }
         }
@@ -263,6 +269,48 @@ pub(crate) fn comparison_fixture() -> formless_protocol::SessionComparison {
 
 #[cfg(test)]
 mod comparison_tests {
+    #[test]
+    fn metadata_only_changes_remain_visible_as_quoted_data() {
+        let mut comparison = super::comparison_fixture();
+        let left_meta = r#"{"tool_calls":[{"name":"reader","arguments":{"value":"left <script>data</script>"}}]}"#;
+        let right_meta = "{\"tool_calls\":[{\"name\":\"reader\",\"arguments\":{\"value\":\"right سلام ไทย \u{202e}\"}}]}";
+        let mut left = comparison.messages[0].left.clone().unwrap();
+        left.content.clear();
+        left.meta = Some(left_meta.into());
+        let mut right = left.clone();
+        right.id = "m2".into();
+        right.meta = Some(right_meta.into());
+        comparison.messages = vec![
+            formless_protocol::SessionMessageDiff {
+                kind: "left_only".into(),
+                left: Some(left),
+                right: None,
+            },
+            formless_protocol::SessionMessageDiff {
+                kind: "right_only".into(),
+                left: None,
+                right: Some(right),
+            },
+        ];
+        let lines = super::comparison_lines(&comparison).join("\n");
+        assert_eq!(lines.matches("Metadata (quoted data):").count(), 2);
+        assert!(lines.contains("left <script>data</script>"));
+        assert!(lines.contains("right سلام ไทย ⟨U+202E⟩"));
+        assert!(!lines.contains('\u{202e}'));
+        assert!(lines.contains(r#"\"tool_calls\""#));
+        assert!(
+            comparison.messages[1]
+                .right
+                .as_ref()
+                .unwrap()
+                .meta
+                .as_ref()
+                .unwrap()
+                .contains('\u{202e}'),
+            "display escaping must preserve stored metadata"
+        );
+    }
+
     #[test]
     fn comparison_preserves_message_text_and_honest_usage_coverage() {
         let lines = super::comparison_lines(&super::comparison_fixture()).join("\n");

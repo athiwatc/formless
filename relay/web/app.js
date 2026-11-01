@@ -736,7 +736,10 @@
     }
     for (const diff of comparison.messages) {
       for (const [label, message] of [[diff.kind === "unchanged" ? "=" : "< LEFT", diff.left], ["> RIGHT", diff.kind === "unchanged" ? null : diff.right]]) {
-        if (message) lines.push("", label + " " + message.role + " seq " + message.seq + " (" + message.id + ")", message.content);
+        if (message) {
+          lines.push("", label + " " + message.role + " seq " + message.seq + " (" + message.id + ")", message.content);
+          if (message.meta != null) lines.push("  Metadata (quoted data): " + JSON.stringify(message.meta));
+        }
       }
     }
     return lines.join("\n");
@@ -758,6 +761,7 @@
     const channel = S.channel, conn = S.conn;
     const result = await act({ type: "compare_sessions", left, right });
     if (!result || generation !== S.sessionCompareGeneration || channel !== S.channel || conn !== S.conn) return;
+    if (result.left?.session?.id !== left || result.right?.session?.id !== right) return note("Session comparison reply does not match the requested ordered pair; retry /compare.", true);
     const body = h("pre", { class: "session-comparison" }, sessionComparisonText(result));
     showBidi(body);
     modal("Stored Session comparison", body);

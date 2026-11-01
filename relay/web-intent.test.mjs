@@ -793,14 +793,17 @@ test('Session comparison is strict local read-only data, with honest costs and s
   const c=setup(['compareSessionsCommand','resolveSessionRef','sessionComparisonText'],{h:node,showBidi(){},modal:(title,body)=>shown.push({title,body}),note:(text)=>notes.push(text),act:req=>{calls.push(req);const d=deferred();pending.push(d);return d.promise;}});
   c.S.sessions=[{id:'left',name:'Left'},{id:'right',name:'Right'},{id:'right-other',name:'Other'}];c.S.channel='online';c.S.conn='conn1';
   await c.compareSessionsCommand('missing right');await c.compareSessionsCommand('left right extra');await c.compareSessionsCommand('left r');assert.equal(calls.length,0,'invalid or ambiguous identifiers must never invoke model comparisons or any RPC');
+  const wrong=c.compareSessionsCommand('left right');
+  const reversed=storedComparisonFixture();[reversed.left,reversed.right]=[reversed.right,reversed.left];
+  pending[0].resolve(reversed);await wrong;assert.equal(shown.length,0,'first reply with wrong ordered IDs must not open a diff');assert.ok(notes.some(text=>text.includes('requested ordered pair')));
   const old=c.compareSessionsCommand('left right'),latest=c.compareSessionsCommand('right left');
-  assert.deepEqual(calls.map(r=>JSON.parse(JSON.stringify(r))),[{type:'compare_sessions',left:'left',right:'right'},{type:'compare_sessions',left:'right',right:'left'}]);
-  pending[1].resolve(storedComparisonFixture());await latest;assert.equal(shown.length,1);
-  pending[0].resolve({obsolete:'not parsed'});await old;assert.equal(shown.length,1,'obsolete data must not replace newer comparison');
+  assert.deepEqual(calls.slice(1).map(r=>JSON.parse(JSON.stringify(r))),[{type:'compare_sessions',left:'left',right:'right'},{type:'compare_sessions',left:'right',right:'left'}]);
+  pending[2].resolve(reversed);await latest;assert.equal(shown.length,1);
+  pending[1].resolve({obsolete:'not parsed'});await old;assert.equal(shown.length,1,'obsolete data must not replace newer comparison');
   const text=plainText(shown[0].body);
   for(const required of ['no model request','fork point: 3','Copied prefix changed','Prefix edited','21 input / 8 output','9 input / 4 output','missing usage is not zero','Total cost: unknown','subtotal only: $0.250000','allocation range only','excludes missing usage and unpriced rows','Unpriced: private/model','Missing provider usage','private answer','<script>data only</script>'])assert.ok(text.includes(required),required);
   assert.equal(text.includes('Recorded branch cost:'),false);assert.equal(all(shown[0].body).some(n=>n.tag==='script'),false);
-  const disconnected=c.compareSessionsCommand('left right');c.S.conn='conn2';pending[2].resolve(storedComparisonFixture());await disconnected;assert.equal(shown.length,1,'old-connection replies cannot reopen a comparison');
+  const disconnected=c.compareSessionsCommand('left right');c.S.conn='conn2';pending[3].resolve(storedComparisonFixture());await disconnected;assert.equal(shown.length,1,'old-connection replies cannot reopen a comparison');
 });
 
 test('paid model comparison has an explicit distinct command route', async () => {
@@ -809,4 +812,19 @@ test('paid model comparison has an explicit distinct command route', async () =>
   assert.deepEqual(JSON.parse(JSON.stringify(calls)),[{type:'compare_models',session_id:'A',models:['cheap','costly'],prompt:'explicit prompt'}]);
   assert.match(source,/name: "compare",[^\n]*run: compareSessionsCommand/);
   assert.match(source,/name: "compare-models",[^\n]*run: compareModelsCommand/);
+});
+
+
+test('metadata-only branch changes are quoted text data without executable DOM', async () => {
+  const result=storedComparisonFixture(),shown=[];
+  const leftMeta=JSON.stringify({tool_calls:[{name:'reader',arguments:{path:'left <script>data</script>'}}]});
+  const rightMeta=JSON.stringify({tool_calls:[{name:'reader',arguments:{path:'right \nسلام ไทย'}}]});
+  result.messages=[{kind:'left_only',left:{id:'m1',seq:4,role:'assistant',content:'',meta:leftMeta},right:null},{kind:'right_only',left:null,right:{id:'m2',seq:4,role:'assistant',content:'',meta:rightMeta}}];
+  const c=setup(['compareSessionsCommand','resolveSessionRef','sessionComparisonText'],{h:node,showBidi(){},modal:(title,body)=>shown.push(body),act:async()=>result,note(){}});
+  c.S.sessions=[result.left.session,result.right.session];await c.compareSessionsCommand('left right');
+  const text=plainText(shown[0]),metadata=text.split('\n').filter(line=>line.startsWith('  Metadata (quoted data): '));
+  assert.equal(metadata.length,2);assert.deepEqual(metadata.map(line=>JSON.parse(line.slice('  Metadata (quoted data): '.length))),[leftMeta,rightMeta]);
+  assert.ok(text.includes('left <script>data</script>'));assert.ok(text.includes('سلام ไทย'));
+  assert.equal(all(shown[0]).some(n=>n.tag==='script'),false);assert.deepEqual(all(shown[0]).map(n=>n.tag),['pre']);
+  assert.equal(result.messages[0].left.meta,leftMeta,'rendering must preserve raw stored metadata');
 });
