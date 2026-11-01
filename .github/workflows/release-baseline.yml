@@ -1,0 +1,356 @@
+# Test-only timing evidence for #1164; this workflow never publishes a release.
+name: release-baseline
+on:
+  workflow_dispatch:
+
+# Same-run artifact actions use the workflow's scoped artifact-service token.
+# No repository/package write, OIDC, publishing credentials or inherited secrets.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-baseline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Limits remain provisional until the first green Cargo-cold run per runner.
+  # Compare job started_at/completed_at (not queue time), then ceil(2x seconds/60).
+  build:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require a fresh job-local Cargo home and target
+        shell: pwsh
+        run: |
+          $ciCargoHome = Join-Path $env:RUNNER_TEMP 'baseline-cargo'
+          $ciTarget = Join-Path $env:GITHUB_WORKSPACE 'target'
+          if (Test-Path $ciCargoHome) { throw "Cargo home already exists; not a cold baseline" }
+          if (Test-Path $ciTarget) { throw "target already exists; not a cold baseline" }
+          New-Item -ItemType Directory -Path $ciCargoHome | Out-Null
+          "CARGO_HOME=$ciCargoHome" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$ciTarget" >> $env:GITHUB_ENV
+          "FORMLESS_DATA_DIR=$(Join-Path $env:RUNNER_TEMP 'baseline-data')" >> $env:GITHUB_ENV
+          "FORMLESS_CONFIG_DIR=$(Join-Path $env:RUNNER_TEMP 'baseline-config')" >> $env:GITHUB_ENV
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) { throw "checkout differs from measured SHA" }
+          "SHA=$head runner=$env:RUNNER_OS arch=$env:RUNNER_ARCH image=$env:ImageOS version=$env:ImageVersion"
+          "## build $env:TARGET`nSHA: $head`nImage: $env:ImageOS $env:ImageVersion; architecture: $env:RUNNER_ARCH`nCache: fresh Cargo home/target, no restored cache. Toolchain/image/network caches are not claimed cold." >> $env:GITHUB_STEP_SUMMARY
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Record actual toolchain and verify cold state
+        shell: pwsh
+        run: |
+          $expected = Join-Path $env:RUNNER_TEMP 'baseline-cargo'
+          if ([IO.Path]::GetFullPath($env:CARGO_HOME) -ne [IO.Path]::GetFullPath($expected)) { throw "toolchain setup changed the private Cargo home" }
+          if (Test-Path (Join-Path $env:CARGO_HOME 'registry')) { throw "registry cache unexpectedly restored" }
+          if (Test-Path $env:CARGO_TARGET_DIR) { throw "target cache unexpectedly restored" }
+          rustc -Vv
+          cargo --version
+      - name: Workspace tests (Cargo-cold)
+        shell: bash
+        run: time -p cargo test --workspace --locked
+      - name: Release build
+        shell: bash
+        run: time -p cargo build --workspace --release --locked --target "$TARGET"
+      - name: Package and smoke extracted archive (Unix, private files only)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          time -p {
+            name="formless-baseline-$TARGET"
+            mkdir "$name" dist
+            cp "target/$TARGET/release/formless" "$name/"
+            cp README.md SPEC.md LICENSE "$name/"
+            "target/$TARGET/release/formless" man > "$name/formless.1" \
+              || cargo run -q --release --locked --bin formless -- man > "$name/formless.1"
+            tar -czf "dist/$name.tar.gz" "$name"
+            (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+            (cd dist && shasum -a 256 -c "$name.tar.gz.sha256")
+            smoke="$RUNNER_TEMP/baseline-archive-smoke"
+            mkdir "$smoke"
+            tar -xzf "dist/$name.tar.gz" -C "$smoke"
+            "$smoke/$name/formless" --version
+            test -s "$smoke/$name/formless.1"
+            test -f "$smoke/$name/LICENSE"
+          }
+      - name: Package and smoke extracted archive (Windows, private files only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          try {
+            $name = "formless-baseline-$env:TARGET"
+            New-Item -ItemType Directory $name,dist | Out-Null
+            Copy-Item "target/$env:TARGET/release/formless.exe" $name
+            Copy-Item README.md,SPEC.md,LICENSE $name
+            Compress-Archive -Path $name -DestinationPath "dist/$name.zip"
+            $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+            "$hash  $name.zip" | Out-File "dist/$name.zip.sha256" -Encoding ascii
+            $smoke = Join-Path $env:RUNNER_TEMP 'baseline-archive-smoke'
+            Expand-Archive "dist/$name.zip" -DestinationPath $smoke
+            & "$smoke/$name/formless.exe" --version
+            if ($LASTEXITCODE -ne 0) { throw "extracted release binary failed" }
+            if (!(Test-Path "$smoke/$name/LICENSE")) { throw "archive license missing" }
+          } finally {
+            "Package/extracted smoke seconds: $($timer.Elapsed.TotalSeconds)"
+          }
+      # Matrix archives stay in this disposable job. Unlike release.yml, there
+      # is no distribution upload; local extracted smoke is included in timing.
+
+  linux:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    container: rust:1-bullseye
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record source, image and cold state
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          ci_cargo_home="$RUNNER_TEMP/baseline-cargo"
+          ci_target="$GITHUB_WORKSPACE/target"
+          test ! -e "$ci_cargo_home"
+          test ! -e "$ci_target"
+          mkdir -p "$ci_cargo_home"
+          {
+            echo "CARGO_HOME=$ci_cargo_home"
+            echo "CARGO_TARGET_DIR=$ci_target"
+            echo "FORMLESS_DATA_DIR=$RUNNER_TEMP/baseline-data"
+            echo "FORMLESS_CONFIG_DIR=$RUNNER_TEMP/baseline-config"
+          } >> "$GITHUB_ENV"
+          cat /etc/os-release
+          uname -a
+          rustc -Vv
+          cargo --version
+          {
+            echo '## linux (rust:1-bullseye; digest in container setup log)'
+            echo "SHA: $GITHUB_SHA; runner: $RUNNER_OS/$RUNNER_ARCH"
+            echo 'Cache: fresh Cargo home/target; no restored cache. Image/network caches not claimed cold.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Build dependencies (disposable build container only)
+        run: time -p sh -c 'apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config'
+      - name: Workspace tests (Cargo-cold)
+        run: time -p cargo test --workspace --locked
+      - name: Release build
+        run: time -p cargo build --release --locked --bin formless
+      - run: target/release/formless man > target/formless.1
+      - name: Local archive
+        shell: bash
+        run: |
+          time -p {
+            name="formless-baseline-x86_64-unknown-linux-gnu"
+            mkdir -p dist "$name"
+            cp target/release/formless target/formless.1 README.md SPEC.md LICENSE "$name/"
+            tar -czf "dist/$name.tar.gz" "$name"
+          }
+      - name: Install package-building tools into private Cargo home
+        shell: bash
+        run: |
+          time -p cargo install cargo-deb cargo-generate-rpm --locked
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - name: Build local package fixtures (no repository publication)
+        shell: bash
+        run: |
+          time -p {
+            cargo deb -p formless-bin --no-build --output target/debian/
+            cargo generate-rpm -p crates/formless -o target/generate-rpm/
+            cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+            (cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done)
+            dpkg -I dist/*.deb | sed -n '/Depends/p'
+          }
+      - name: Transfer fixtures only to this run's install jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-linux
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+            dist/*.sha256
+
+  linux-install-test:
+    timeout-minutes: 30
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:bookworm", "ubuntu:22.04", "rockylinux:9"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    env:
+      BASELINE_IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: baseline-linux
+          path: pkgs
+      - name: Record exact source and container
+        shell: bash
+        run: |
+          {
+            echo "FORMLESS_DATA_DIR=$RUNNER_TEMP/baseline-data"
+            echo "FORMLESS_CONFIG_DIR=$RUNNER_TEMP/baseline-config"
+          } >> "$GITHUB_ENV"
+          cat /etc/os-release
+          uname -a
+          echo "SHA=$GITHUB_SHA container=$BASELINE_IMAGE runner=$RUNNER_OS/$RUNNER_ARCH"
+          echo "## linux-install-test: $BASELINE_IMAGE; SHA: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify, install and smoke (disposable container only)
+        shell: bash
+        run: |
+          time -p {
+            (cd pkgs && sha256sum -c -- *.sha256)
+            if command -v apt-get >/dev/null; then
+              dpkg-deb --control pkgs/*.deb "$RUNNER_TEMP/baseline-package-control"
+              for script in preinst postinst prerm postrm triggers; do
+                test ! -e "$RUNNER_TEMP/baseline-package-control/$script"
+              done
+              apt-get update && apt-get install -y ./pkgs/*.deb
+            else
+              rpm -qp --scripts pkgs/*.rpm > "$RUNNER_TEMP/baseline-rpm-scripts"
+              rpm -qp --triggers pkgs/*.rpm > "$RUNNER_TEMP/baseline-rpm-triggers"
+              test ! -s "$RUNNER_TEMP/baseline-rpm-scripts"
+              test ! -s "$RUNNER_TEMP/baseline-rpm-triggers"
+              dnf install -y ./pkgs/*.rpm
+            fi
+            formless --version
+            test -f /usr/share/doc/formless/copyright || test -f /usr/share/licenses/formless/LICENSE
+          }
+
+  docker:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      BASELINE_CONTAINER: formless-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+      DOCKER_BUILD_SUMMARY: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Record source and runner
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test ! -e target
+          uname -a
+          docker version
+          echo "## Docker cold-layer baseline; SHA: $GITHUB_SHA; image: $ImageOS/$ImageVersion" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build local image (never log in or push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          no-cache: true
+          pull: true
+          provenance: false
+          sbom: false
+          tags: formless:baseline
+      - name: Record exact build toolchain
+        shell: bash
+        run: |
+          build_image=$(awk '$1 == "FROM" && $3 == "AS" && $4 == "build" { print $2; exit }' Dockerfile)
+          test -n "$build_image"
+          docker run --rm --network none "$build_image" rustc -Vv
+      - name: Smoke private container with positive RPC proof
+        shell: bash
+        run: |
+          docker run --rm --network none formless:baseline --version
+          docker run -d --network none --name "$BASELINE_CONTAINER" formless:baseline
+          python3 - <<'PY'
+          import json, os, subprocess, time
+          name = os.environ["BASELINE_CONTAINER"]
+          deadline = time.monotonic() + 30
+          last = "no response"
+          while time.monotonic() < deadline:
+              remaining = deadline - time.monotonic()
+              try:
+                  response = subprocess.run(["docker", "exec", name, "formless", "daemon", "status", "--json"], capture_output=True, text=True, timeout=min(3, remaining))
+                  last = response.stderr or response.stdout
+                  if response.returncode == 0:
+                      status = json.loads(response.stdout)
+                      if type(status.get("pid")) is int and status["pid"] > 0 and status.get("version"):
+                          print(response.stdout)
+                          break
+              except (subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+                  last = str(error)
+              time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+          else:
+              raise SystemExit("private container daemon never answered status within 30s: " + last)
+          PY
+      - name: Always remove only the owned fixture container and its volumes
+        if: always()
+        shell: bash
+        run: |
+          docker info >/dev/null
+          if docker container inspect "$BASELINE_CONTAINER" >/dev/null 2>&1; then
+            docker logs "$BASELINE_CONTAINER" || true
+            docker rm -fv "$BASELINE_CONTAINER"
+          fi
+
+  # Matches windows.yml's targeted test job, independently Cargo-cold. The
+  # pending inventory UTF-8 fix must be merged before dispatching this baseline.
+  pipe:
+    timeout-minutes: 22
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require and record cold source state
+        shell: pwsh
+        run: |
+          $ciCargoHome = Join-Path $env:RUNNER_TEMP 'baseline-cargo'
+          $ciTarget = Join-Path $env:GITHUB_WORKSPACE 'target'
+          if (Test-Path $ciCargoHome) { throw "Cargo home already exists" }
+          if (Test-Path $ciTarget) { throw "target already exists" }
+          New-Item -ItemType Directory -Path $ciCargoHome | Out-Null
+          "CARGO_HOME=$ciCargoHome" >> $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$ciTarget" >> $env:GITHUB_ENV
+          "FORMLESS_DATA_DIR=$(Join-Path $env:RUNNER_TEMP 'baseline-data')" >> $env:GITHUB_ENV
+          "FORMLESS_CONFIG_DIR=$(Join-Path $env:RUNNER_TEMP 'baseline-config')" >> $env:GITHUB_ENV
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:GITHUB_SHA) { throw "checkout differs from measured SHA" }
+          "SHA=$head runner=$env:RUNNER_OS arch=$env:RUNNER_ARCH image=$env:ImageOS version=$env:ImageVersion"
+          "## pipe; SHA: $head; Image: $env:ImageOS $env:ImageVersion; fresh Cargo home/target" >> $env:GITHUB_STEP_SUMMARY
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Actual toolchain and verified cold state
+        shell: pwsh
+        run: |
+          $expected = Join-Path $env:RUNNER_TEMP 'baseline-cargo'
+          if ([IO.Path]::GetFullPath($env:CARGO_HOME) -ne [IO.Path]::GetFullPath($expected)) { throw "toolchain setup changed the private Cargo home" }
+          if (Test-Path (Join-Path $env:CARGO_HOME 'registry')) { throw "registry cache unexpectedly restored" }
+          if (Test-Path $env:CARGO_TARGET_DIR) { throw "target cache unexpectedly restored" }
+          rustc -Vv
+          cargo --version
+      - name: Assertion inventory (review aid)
+        shell: pwsh
+        run: python scripts/test-assertion-inventory.py
+      - name: Named pipe security and round trip (Cargo-cold)
+        shell: bash
+        run: time -p cargo test -p formless-core --test windows_pipe
