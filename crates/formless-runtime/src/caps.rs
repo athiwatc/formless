@@ -504,6 +504,29 @@ fn lexical_absolute(
     Ok(PathBuf::from(joined))
 }
 
+fn append_missing_tail(
+    mut ancestor: std::path::PathBuf,
+    tail: &[std::ffi::OsString],
+) -> std::path::PathBuf {
+    for component in tail.iter().rev() {
+        // These names were already parsed as Normal components. In particular
+        // a Windows `C:stream` leaf must not be reparsed by PathBuf::join as a
+        // drive-relative path replacing the existing canonical ancestor.
+        if !ancestor
+            .as_os_str()
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
+        {
+            ancestor
+                .as_mut_os_string()
+                .push(std::path::MAIN_SEPARATOR_STR);
+        }
+        ancestor.as_mut_os_string().push(component);
+    }
+    ancestor
+}
+
 // Separate filesystem operations let tests place a creation exactly between
 // canonicalize's NotFound and symlink_metadata, without timing or global hooks.
 fn canonical_path_with(
@@ -582,7 +605,7 @@ fn canonical_path_with(
     loop {
         let unresolved = |e| format!("cannot resolve path {}: {e}", base.display());
         match canonicalize(base) {
-            Ok(c) => return Ok(tail.iter().rev().fold(c, |acc, t| acc.join(t))),
+            Ok(c) => return Ok(append_missing_tail(c, &tail)),
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(unresolved(e)),
         }
@@ -595,7 +618,7 @@ fn canonical_path_with(
                 // missing. Resolve it rather than mistaking a regular file or
                 // directory for a dangling symlink. A failed retry stays closed.
                 let c = canonicalize(base).map_err(unresolved)?;
-                return Ok(tail.iter().rev().fold(c, |acc, t| acc.join(t)));
+                return Ok(append_missing_tail(c, &tail));
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(unresolved(e)),
@@ -1007,6 +1030,81 @@ mod tests {
         .unwrap_err();
         assert!(checked);
         assert!(error.starts_with("cannot resolve path"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_verbatim_tail_never_replaces_its_canonical_ancestor_drive() {
+        use std::io::{Error, ErrorKind};
+        let root = PathFixture::new();
+        let raw = format!(r"{}\C:stream", root.0.display());
+        let expected = std::path::PathBuf::from(&raw);
+        for created_during_probe in [false, true] {
+            let mut attempts = 0;
+            let actual = canonical_path_with(
+                &raw,
+                |path| {
+                    attempts += 1;
+                    if path == root.0 {
+                        Ok(root.0.clone())
+                    } else {
+                        assert_eq!(path, expected);
+                        Err(Error::from(ErrorKind::NotFound))
+                    }
+                },
+                |path| {
+                    assert_eq!(path, expected);
+                    if created_during_probe {
+                        root.0.symlink_metadata()
+                    } else {
+                        Err(Error::from(ErrorKind::NotFound))
+                    }
+                },
+            );
+            if created_during_probe {
+                assert!(actual.is_err(), "a failed same-path retry remains closed");
+            } else {
+                let actual = actual.unwrap();
+                assert_eq!(actual.as_os_str(), expected.as_os_str());
+                assert!(
+                    actual.is_absolute(),
+                    "missing leaf cannot turn the canonical scope drive-relative"
+                );
+                assert!(actual.starts_with(&root.0));
+            }
+            assert_eq!(attempts, 2);
+        }
+        // Cover the creation-race success branch with a pending leaf too.
+        let ancestor = root.0.join("appeared");
+        std::fs::create_dir(&ancestor).unwrap();
+        let raw = format!(r"{}\C:stream", ancestor.display());
+        let mut ancestor_attempts = 0;
+        let actual = canonical_path_with(
+            &raw,
+            |path| {
+                if path == ancestor {
+                    ancestor_attempts += 1;
+                    if ancestor_attempts == 1 {
+                        Err(Error::from(ErrorKind::NotFound))
+                    } else {
+                        Ok(ancestor.clone())
+                    }
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            },
+            |path| {
+                if path == ancestor {
+                    ancestor.symlink_metadata()
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(actual.as_os_str(), std::ffi::OsStr::new(&raw));
+        assert!(actual.is_absolute());
+        assert_eq!(ancestor_attempts, 2);
     }
 
     #[cfg(unix)]
