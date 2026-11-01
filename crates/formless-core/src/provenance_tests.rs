@@ -280,6 +280,7 @@ async fn compaction_and_structured_systems_preserve_the_trust_boundary_on_the_wi
         base_url: format!("http://{}", listener.local_addr().unwrap()),
         model: "fixture".into(),
         max_retries: 0,
+        cache_control: "off".into(),
         ..Default::default()
     };
     let server = tokio::spawn(async move {
@@ -334,15 +335,18 @@ async fn compaction_and_structured_systems_preserve_the_trust_boundary_on_the_wi
         "private summary"
     );
     let blocks = json!([{"type":"text","text":"Trusted structured system instruction"},{"type":"text","text":"Second trusted block","cache_control":{"type":"ephemeral"}}]);
+    let structured = [
+        json!({"role":"system","content":blocks.clone()}),
+        json!({"role":"user","content":"question"}),
+    ];
+    let projected = crate::provenance::project(&structured);
+    assert_eq!(
+        &projected[0]["content"].as_array().unwrap()[1..],
+        blocks.as_array().unwrap().as_slice(),
+        "provenance projection preserves trusted block text, order and metadata"
+    );
     provider
-        .complete(
-            &[
-                json!({"role":"system","content":blocks.clone()}),
-                json!({"role":"user","content":"question"}),
-            ],
-            "fixture",
-            None,
-        )
+        .complete(&structured, "fixture", None)
         .await
         .unwrap();
     {
@@ -366,7 +370,15 @@ async fn compaction_and_structured_systems_preserve_the_trust_boundary_on_the_wi
         assert_eq!(server_frame["content"], history);
         let sent = requests[2].1["messages"][0]["content"].as_array().unwrap();
         assert_eq!(sent[0]["text"], crate::provenance::HIERARCHY);
-        assert_eq!(&sent[1..], blocks.as_array().unwrap().as_slice());
+        // The existing provider-specific wire projection removes Anthropic
+        // cache hints when cache_control is off. That projection must retain
+        // every trusted text block and its order after provenance framing.
+        let mut expected = blocks.clone();
+        expected[1].as_object_mut().unwrap().remove("cache_control");
+        assert_eq!(&sent[1..], expected.as_array().unwrap().as_slice());
+        assert!(sent
+            .iter()
+            .all(|block| block.get("cache_control").is_none()));
     }
     drop(provider);
     server.abort();
