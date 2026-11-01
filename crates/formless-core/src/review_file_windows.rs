@@ -185,7 +185,7 @@ impl Access {
         Ok(())
     }
     pub(super) fn read(&self, raw: &Path, policy: &PathPolicy) -> Result<ReviewImage> {
-        self.read_bounded(raw, policy, MAX_REVIEW_BYTES, false, None)
+        self.read_bounded(raw, policy, MAX_REVIEW_BYTES, false, None, None)
     }
     pub(super) fn read_bounded(
         &self,
@@ -194,6 +194,7 @@ impl Access {
         limit: usize,
         capture: bool,
         alias: Option<&Path>,
+        tracked: Option<&crate::review_retained::RetainedStore>,
     ) -> Result<ReviewImage> {
         self.recheck(raw, policy)?;
         let expected_parent = physical_path(self.guards.last().context("No parent")?)?;
@@ -232,7 +233,9 @@ impl Access {
             return Err(std::io::Error::last_os_error().into());
         }
         let single_link = unsafe { info.assume_init() }.nNumberOfLinks == 1;
-        if !single_link && !capture {
+        let logical_single_link = single_link
+            || tracked.is_some_and(|store| store.verify_live_peer(&file).unwrap_or(false));
+        if !logical_single_link && !capture {
             bail!("Files with multiple hard links are not hunk-editable");
         }
         let streams_complete = match require_default_stream_only(&file) {
@@ -273,7 +276,7 @@ impl Access {
             Err(_) if capture => None,
             Err(error) => return Err(error),
         };
-        let witness = if !capture && single_link && streams_complete {
+        let witness = if !capture && logical_single_link && streams_complete {
             let pin = OpenOptions::new()
                 .access_mode(FILE_READ_ATTRIBUTES)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -294,7 +297,7 @@ impl Access {
             readonly: metadata.permissions().readonly(),
             security,
             security_complete: complete
-                && single_link
+                && logical_single_link
                 && streams_complete
                 && windows_identity.is_some(),
             ..Default::default()
@@ -341,6 +344,214 @@ impl Access {
         }
         Ok(())
     }
+    pub(super) fn namespace_target_matches(
+        &self,
+        raw: &Path,
+        expected: &WindowsIdentity,
+        policy: &PathPolicy,
+    ) -> Result<bool> {
+        self.recheck(raw, policy)?;
+        Ok(
+            identity(self.guards.last().context("No pinned namespace parent")?)?.volume
+                == expected.volume,
+        )
+    }
+    /// Open the exact authorized target link for a namespace operation. This
+    /// rooted synchronous factory grants DELETE but no security setter rights.
+    pub(super) fn namespace_source(
+        &self,
+        raw: &Path,
+        expected: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<File> {
+        use crate::review_windows_namespace as namespace;
+        self.recheck(raw, policy)?;
+        if let Some(reason) = expected.ordinary_write_restriction() {
+            bail!(reason);
+        }
+        let before = expected
+            .bytes
+            .as_deref()
+            .context("Existing namespace source required")?;
+        if before.len() > MAX_REVIEW_BYTES {
+            bail!("Namespace source exceeds review byte limit");
+        }
+        let parent = self.guards.last().context("No parent")?;
+        let leaf = self.path.file_name().context("No leaf")?;
+        let rights = windows_sys::Win32::Foundation::GENERIC_READ
+            | windows_sys::Win32::Foundation::GENERIC_WRITE
+            | 0x0010_0000
+            | 0x0001_0000;
+        let mut file =
+            namespace::open_exclusive(parent, leaf, rights | ACCESS_SYSTEM_SECURITY_RIGHT)
+                .or_else(|error| match error.raw_os_error() {
+                    Some(5 | 1314) => namespace::open_exclusive(parent, leaf, rights),
+                    _ => Err(error),
+                })?;
+        if physical_path(&file)?.parent() != Some(physical_path(parent)?.as_path())
+            || Some(identity(&file)?) != expected.windows_identity
+        {
+            bail!("Namespace source left its exact pinned object or parent");
+        }
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || Some(metadata.file_attributes()) != expected.mode
+            || metadata.permissions().readonly() != expected.readonly
+        {
+            bail!("Namespace source metadata changed");
+        }
+        require_default_stream_only(&file)?;
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if unsafe { info.assume_init() }.nNumberOfLinks != 1 && !store.verify_live_peer(&file)? {
+            bail!("Namespace source has untracked aliases");
+        }
+        let (security, complete) = snapshot_security(&file)?;
+        if Some(security) != expected.security || complete != expected.security_complete {
+            bail!("Namespace source security metadata changed");
+        }
+        let mut actual = Vec::with_capacity(before.len());
+        (&file)
+            .take(MAX_REVIEW_BYTES as u64 + 1)
+            .read_to_end(&mut actual)?;
+        if actual != before {
+            bail!("Namespace source bytes changed");
+        }
+        file.seek(SeekFrom::Start(0))?;
+        self.recheck(raw, policy)?;
+        Ok(file)
+    }
+    pub(super) fn restore_retained(
+        &self,
+        raw: &Path,
+        object: &crate::review_retained::RetainedObject,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<Vec<String>> {
+        use crate::review_windows_namespace as namespace;
+        self.recheck(raw, policy)?;
+        if self
+            .read_bounded(raw, policy, MAX_REVIEW_BYTES, false, None, Some(store))?
+            .bytes
+            .is_some()
+        {
+            bail!("Namespace restore cannot replace an occupied target");
+        }
+        if let Some(reason) = desired.ordinary_write_restriction() {
+            bail!(reason);
+        }
+        if object.before() != desired {
+            bail!("Retained immutable image disagrees with desired restoration");
+        }
+        let bytes = desired
+            .bytes
+            .as_deref()
+            .context("Missing desired restoration image")?;
+        if bytes.len() > MAX_REVIEW_BYTES {
+            bail!("Restoration image exceeds review limit");
+        }
+        // No mutable public alias may exist before ANY retained-body rewrite.
+        object.require_retained_only()?;
+        let mut file = object.open_for_mutation()?;
+        object.require_retained_only()?;
+        if Some(identity(&file)?) != desired.windows_identity {
+            bail!("Retained restoration identity changed");
+        }
+        let (security, complete) = snapshot_security(&file)?;
+        if Some(security) != desired.security || complete != desired.security_complete {
+            bail!("Retained original security descriptor no longer matches");
+        }
+        require_default_stream_only(&file)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(bytes)
+            .context("Retained restoration bytes may be partial; receipt remains prepared")?;
+        file.set_len(bytes.len() as u64)?;
+        let basic = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: desired.mode.context("Missing restored attributes")?,
+        };
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&basic as *const FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut actual = Vec::with_capacity(bytes.len());
+        (&file)
+            .take(MAX_REVIEW_BYTES as u64 + 1)
+            .read_to_end(&mut actual)?;
+        if actual != bytes {
+            bail!("Retained restoration readback differs");
+        }
+        object.require_retained_only()?;
+        self.recheck(raw, policy)?;
+        let parent = self.guards.last().context("No parent")?;
+        let leaf = self.path.file_name().context("No leaf")?;
+        // SAFETY: private factory supplied an exclusively used synchronous file
+        // object; target is the checked pinned parent and exact owned leaf.
+        unsafe {
+            namespace::link_existing(&file, parent, leaf)?;
+        }
+        let linked = namespace::open_existing(parent, leaf, FILE_READ_ATTRIBUTES | 0x0010_0000)?;
+        if identity(&linked)? != identity(&file)?
+            || physical_path(&linked)?.parent() != Some(physical_path(parent)?.as_path())
+        {
+            bail!("Linked restoration could not be verified; retain prepared receipt");
+        }
+        self.recheck(raw, policy)?;
+        Ok(Vec::new())
+    }
+    pub(super) fn remove_retained(
+        &self,
+        raw: &Path,
+        expected: &ReviewImage,
+        object: &crate::review_retained::RetainedObject,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<Vec<String>> {
+        let source = self.namespace_source(raw, expected, policy, store)?;
+        self.remove_prepared(raw, source, expected, object, policy)
+    }
+    pub(super) fn remove_prepared(
+        &self,
+        raw: &Path,
+        source: File,
+        expected: &ReviewImage,
+        object: &crate::review_retained::RetainedObject,
+        policy: &PathPolicy,
+    ) -> Result<Vec<String>> {
+        self.recheck(raw, policy)?;
+        if Some(identity(&source)?) != expected.windows_identity
+            || physical_path(&source)?.parent()
+                != Some(physical_path(self.guards.last().context("No parent")?)?.as_path())
+        {
+            bail!("Prepared unlink lost its exact source object or pinned parent");
+        }
+        object.verify_peer(&source)?;
+        // SAFETY: namespace_source opened this exact public link synchronously
+        // with DELETE and exclusive sharing. Its bytes, identity and pinned
+        // parent remain checked while the same file object is used by unlink.
+        unsafe {
+            crate::review_windows_namespace::unlink_existing(&source)?;
+        }
+        drop(source);
+        Ok(Vec::new())
+    }
     /// Byte-only mutation retains the exact object (including opaque audit/SACL
     /// state). This is recoverable via prepared images, not an atomic replace.
     pub(super) fn replace_existing(
@@ -349,6 +560,16 @@ impl Access {
         expected: &ReviewImage,
         desired: &ReviewImage,
         policy: &PathPolicy,
+    ) -> Result<Vec<String>> {
+        self.replace_existing_tracked(raw, expected, desired, policy, None)
+    }
+    pub(super) fn replace_existing_tracked(
+        &self,
+        raw: &Path,
+        expected: &ReviewImage,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        tracked: Option<&crate::review_retained::RetainedStore>,
     ) -> Result<Vec<String>> {
         self.recheck(raw, policy)?;
         let before = expected
@@ -422,7 +643,9 @@ impl Access {
             if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            if unsafe { info.assume_init() }.nNumberOfLinks != 1 {
+            if unsafe { info.assume_init() }.nNumberOfLinks != 1
+                && !tracked.is_some_and(|store| store.verify_live_peer(file).unwrap_or(false))
+            {
                 bail!("Multiple hard links are not hunk-editable");
             }
             require_default_stream_only(file)?;

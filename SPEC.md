@@ -1331,11 +1331,40 @@ pasting paths.
   Only changes applied by the same still-active review can attach its live object
   witness to Undo receipts. Closing/reopening or restarting without that witness
   leaves the receipt as private recovery data, with explicit Undo unavailability.
-  Windows created/deleted-file rejection stays read-only until durable retained-object
-  recovery is implemented, even when full security metadata happens to be readable. An already-deleted historical object with an
-  uncaptured SACL cannot be reconstructed from bytes and a DACL; it stays read-only.
-  Review never enables privileges, rewrites a DACL to retain an object, or changes
-  OS policy.
+  Windows created/deleted-file rejection requires durable retained-object recovery;
+  readable metadata alone cannot recreate the original object identity. An already-
+  deleted historical object with an uncaptured SACL cannot be reconstructed from bytes and a DACL; it stays read-only.
+  A Windows retained-object store additionally supports namespace recovery when
+  the original object was successfully retained before a tracked Tool change, or
+  a created object was retained before explicit rejection. Its bounded private
+  manifests bind the exact Session, Run, recorded path digest, original object
+  identity, immutable before-bytes and seven-day retention deadline. Internal
+  object names are independently random and never sent in review responses or
+  audit labels. Retained objects preserve their original security descriptor:
+  **the original object's data is not newly owner-only**. Existing authorized
+  readers retain their original rights, including access to a retained name if
+  they learn it; retention extends that object's addressability after unlink.
+  Neither opaque names nor the private parent directory are a confidentiality or
+  revocation guarantee. Only newly written manifest/receipt JSON is owner-only.
+  A private checksum-bound missing-state marker is written before a tracked Tool
+  creates a file; mutable database existence flags alone cannot authorize removal.
+  Created-file inverse preparation upgrades that marker's reserved slot and keeps
+  its original deadline, so a full store can still perform its promised inverse.
+  Recovery eligibility expires after seven days unless a live Run/review lease
+  already retains it. Physical cleanup is opportunistic at Run completion and
+  later capture/inverse actions; errors retain uncertain state and never enable
+  privileges or change a user's file permissions. Completed Run capture leases
+  are released independently of future Tool callbacks. Active review leases keep
+  their full advertised 30-minute lifetime.
+  The pre-change capture hook remains best-effort. Missing retention, capacity,
+  unsupported volume/identity or an interrupted capture leaves the affected
+  creation/deletion read-only, never falsely recoverable. Immutable before-bytes
+  remain separate from the retained hardlink's mutable body. Namespace recovery
+  uses anchored HANDLE operations without replacing an occupied target and
+  accepts additional hardlinks only after proving every allowed internal peer;
+  unrelated aliases remain refused. Historical already-deleted opaque security
+  state is not invented. Review never enables privileges, rewrites a DACL to
+  retain an object, or changes OS policy.
   Windows and macOS native metadata paths require separate platform evidence;
   Linux tests do not establish their execution.
   `CommentReviewHunk` accepts at most 4096 UTF-8 bytes and derives quoted
@@ -5439,3 +5468,34 @@ Configured profile-directory aliases resolve before pinning. Unix traversal
 never follows the artifacts entry or descendants through symlinks; Windows
 static reparse entries are rejected and physical handle containment protects
 deletion when an attribute-only reparse mutation races enumeration.
+
+Windows tracked-file review (#628) retains original file objects in a separate
+profile-private `review-objects` store on the same volume. A private, bounded
+manifest containing the immutable original bytes, metadata, owner Run/path digest,
+file identity, operation and expiry is flushed before creating a retained link or
+moving a created file into the store. An incomplete intent never authorizes
+recreating a file with guessed security metadata. Existing file objects keep
+their exact security descriptors; no security-descriptor setter or privilege
+change is used. Original authorized readers keep their original rights to the
+retained payload: neither its locator nor the payload is claimed secret or
+owner-only. New manifest JSON and its directory have explicit owner-only ACLs.
+Retained hard links share later content writes, so the separate immutable bytes,
+not the retained object's current contents, define the before-image.
+
+Store namespace creation/open/link/rename is relative to pinned directory
+handles. Cross-volume, unknown identity/security, untracked aliases, unsupported
+filesystems or uncertain I/O refuse mutations. Every native hard link waived by
+review is accounted for by a verified store manifest and exact object identity;
+an extra public alias is never treated as an internal retention link. The store
+admits at most 64 manifests and 32 MiB of serialized immutable receipts plus
+reserved bounded object bytes. Seven-day cleanup skips live review leases and
+uses verified original handles, never recursive or database-path deletion.
+The 32 MiB limit is an admission budget for serialized immutable images and
+reserved retained bytes, not an instantaneous OS disk quota. Later writes to a
+shared object and already-open handles can retain additional bytes. Inventory
+charges the actual observed size without reading an oversized body; admission
+refuses excess use. Cleanup can reclaim an inactive verified retained alias as
+soon as it becomes oversized, without waiting seven days or touching its public
+name. Active Run/review leases still protect their owned objects. Unknown entries
+fail closed rather than counting as zero or supplying deletion authority.
+Already-deleted legacy files without a captured original object remain read-only.

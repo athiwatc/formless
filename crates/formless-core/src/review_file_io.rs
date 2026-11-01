@@ -42,7 +42,7 @@ impl ReviewImage {
         }
         self.ordinary_write_restriction()
     }
-    fn ordinary_write_restriction(&self) -> Option<&'static str> {
+    pub(crate) fn ordinary_write_restriction(&self) -> Option<&'static str> {
         if self.readonly {
             return Some("Read-only files are not hunk-editable");
         }
@@ -318,6 +318,87 @@ impl ReviewPath {
     pub(crate) fn read(&self, policy: &PathPolicy) -> Result<ReviewImage> {
         self.read_bounded(policy, MAX_REVIEW_BYTES, false, None)
     }
+    #[cfg(windows)]
+    pub(crate) fn read_tracked(
+        &self,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<ReviewImage> {
+        self.native.read_bounded(
+            &self.path,
+            policy,
+            MAX_REVIEW_BYTES,
+            false,
+            None,
+            Some(store),
+        )
+    }
+    #[cfg(windows)]
+    pub(crate) fn replace_tracked(
+        &self,
+        expected: &ReviewImage,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<Vec<String>> {
+        if self.read_tracked(policy, store)? != *expected {
+            bail!("Tracked review image changed");
+        }
+        self.native
+            .replace_existing_tracked(&self.path, expected, desired, policy, Some(store))
+    }
+    #[cfg(windows)]
+    pub(crate) fn namespace_target_matches(
+        &self,
+        expected: &WindowsIdentity,
+        policy: &PathPolicy,
+    ) -> Result<bool> {
+        self.native
+            .namespace_target_matches(&self.path, expected, policy)
+    }
+    #[cfg(windows)]
+    pub(crate) fn namespace_source(
+        &self,
+        expected: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<std::fs::File> {
+        self.native
+            .namespace_source(&self.path, expected, policy, store)
+    }
+    #[cfg(windows)]
+    pub(crate) fn restore_retained(
+        &self,
+        object: &crate::review_retained::RetainedObject,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<Vec<String>> {
+        self.native
+            .restore_retained(&self.path, object, desired, policy, store)
+    }
+    #[cfg(windows)]
+    pub(crate) fn remove_retained(
+        &self,
+        expected: &ReviewImage,
+        object: &crate::review_retained::RetainedObject,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<Vec<String>> {
+        self.native
+            .remove_retained(&self.path, expected, object, policy, store)
+    }
+    #[cfg(windows)]
+    pub(crate) fn remove_prepared(
+        &self,
+        source: std::fs::File,
+        expected: &ReviewImage,
+        object: &crate::review_retained::RetainedObject,
+        policy: &PathPolicy,
+    ) -> Result<Vec<String>> {
+        self.native
+            .remove_prepared(&self.path, source, expected, object, policy)
+    }
     /// Snapshot bytes and metadata from the SAME opened no-follow descriptor.
     /// Unsupported metadata is recorded as incomplete, never invented.
     #[cfg(test)]
@@ -345,6 +426,36 @@ impl ReviewPath {
         }
         let access = Self::open(&actual, policy)?;
         let mut image = access.read_bounded(policy, 2 * 1024 * 1024, true, Some(path))?;
+        if path != actual {
+            image.security_complete = false;
+        }
+        Ok(image)
+    }
+    #[cfg(windows)]
+    pub(crate) fn capture_snapshot_tracked(
+        path: &Path,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<ReviewImage> {
+        if !path.is_absolute() || !std::fs::symlink_metadata(path)?.is_file() {
+            bail!("Snapshot requires an absolute regular final entry");
+        }
+        let actual = path.canonicalize()?;
+        if !matches!(
+            policy.classify(path, &actual).map_err(anyhow::Error::msg)?,
+            PathDecision::Ordinary
+        ) {
+            bail!("Protected snapshot alias or target");
+        }
+        let access = Self::open(&actual, policy)?;
+        let mut image = access.native.read_bounded(
+            &access.path,
+            policy,
+            2 * 1024 * 1024,
+            true,
+            Some(path),
+            Some(store),
+        )?;
         if path != actual {
             image.security_complete = false;
         }
@@ -430,7 +541,7 @@ impl ReviewPath {
         #[cfg(windows)]
         {
             self.native
-                .read_bounded(&self.path, policy, limit, capture, alias)
+                .read_bounded(&self.path, policy, limit, capture, alias, None)
         }
         #[cfg(not(any(unix, windows)))]
         {
