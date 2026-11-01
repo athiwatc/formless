@@ -125,6 +125,7 @@ impl Connection {
 
 pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Result<()> {
     let mut conn = Connection::connect(paths)?;
+    let inspect = matches!(&action, RunsAction::Show { .. });
     let (value, json) = match action {
         RunsAction::Show { id, json } => (conn.request(Request::GetRun { run_id: id })?, json),
         RunsAction::Cancel { id, json } => {
@@ -138,6 +139,15 @@ pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Resul
             "{}",
             super::comparison_terminal_text(&serde_json::to_string_pretty(&value)?)
         );
+    }
+    if inspect {
+        if let Some(code) = value["status"]
+            .as_str()
+            .and_then(terminal)
+            .filter(|code| *code != 0)
+        {
+            std::process::exit(code);
+        }
     }
     Ok(())
 }

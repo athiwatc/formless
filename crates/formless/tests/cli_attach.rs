@@ -636,3 +636,140 @@ fn ctrl_c_detaches_while_snapshot_reply_is_pending() {
     assert!(started.elapsed() < Duration::from_secs(2));
     peer.join().unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn broad_session_grant_requires_actual_tty_double_confirmation_even_with_yes() {
+    use std::os::fd::FromRawFd;
+    fn tty_approve(f: &Fixture, id: &str, answers: &[u8]) -> Output {
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // The PTY exists only for this owned CLI stdin, not the test runner.
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut cmd = f.command(&["approvals", "approve", id, "--session", "--yes", "--json"]);
+        cmd.stdin(Stdio::from(slave));
+        let child = cmd.spawn().unwrap();
+        master.write_all(answers).unwrap();
+        let out = finish(child);
+        drop(master);
+        out
+    }
+    let f = Fixture::new();
+    let p = Provider::new();
+    let sid = setup(&f, &p.url);
+    let _daemon = daemon(&f);
+    let _chat = start(&f, &sid);
+    let approval = pending(&f);
+    let id = approval["approval_id"].as_str().unwrap();
+    let refused = tty_approve(&f, id, b"yes\nno\n");
+    assert!(!refused.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr)
+            .matches("[y/N]")
+            .count(),
+        2
+    );
+    assert_eq!(pending(&f)["approval_id"], id);
+    let follow = f
+        .command(&["sessions", "show", &sid, "--follow", "--jsonl"])
+        .spawn()
+        .unwrap();
+    let allowed = tty_approve(&f, id, b"yes\nyes\n");
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&allowed.stderr)
+            .matches("[y/N]")
+            .count(),
+        2
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&allowed.stdout).unwrap()["resolved"],
+        true
+    );
+    assert!(finish(follow).status.success());
+    let grants = f.json(&["approvals", "list", "--json"]);
+    assert!(grants
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|grant| grant["scope"] == "session" && grant["granted_by"] == "CLI"));
+}
+
+#[test]
+fn inspecting_and_following_stored_terminal_runs_report_distinct_exit_codes() {
+    let f = Fixture::new();
+    let p = Provider::new();
+    setup(&f, &p.url);
+    let st = Store::open(&f.paths.db_file()).unwrap();
+    let mut cases = Vec::new();
+    for (status, code) in [
+        ("completed", 0),
+        ("paused", 1),
+        ("failed", 1),
+        ("interrupted", 130),
+    ] {
+        let session = st
+            .create_session(Some(format!("terminal633-{status}")))
+            .unwrap();
+        st.append_message(&session.id, "assistant", status).unwrap();
+        let run = st.create_run(&session.id).unwrap();
+        st.set_run_status(&run, status).unwrap();
+        if code == 1 {
+            st.set_run_error(&run, "private633 terminal error").unwrap();
+        }
+        cases.push((session.id, run, status, code));
+    }
+    drop(st);
+    let _daemon = daemon(&f);
+    for (sid, run, status, code) in cases {
+        let shown = finish(
+            f.command(&["runs", "show", &run, "--json"])
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(shown.status.code(), Some(code));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&shown.stdout).unwrap()["status"],
+            status
+        );
+        let follow = finish(
+            f.command(&["sessions", "show", &sid, "--follow", "--jsonl"])
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            follow.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&follow.stderr)
+        );
+        let events: Vec<Value> = String::from_utf8(follow.stdout)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["message"]["content"] == status)
+                .count(),
+            1
+        );
+    }
+}

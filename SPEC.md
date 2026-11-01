@@ -4983,11 +4983,15 @@ An already terminal Run exits after replay. Connection loss is an error.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
-accept unambiguous prefixes. Existing `runs --limit N --json` remains a list.
+accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
+an active Run query exits 0, and cancel exits 0 when its request succeeds.
+Existing `runs --limit N --json` remains a list.
 `approvals pending [--json]` lists outstanding Tool capability requests.
 `approvals approve ID [--once|--session] [--yes] [--json]` defaults to Once;
 `approvals deny ID [--json]` declines without remembering a permanent denial.
 Decisions use the client label CLI in the existing approval audit. A stale
-request fails rather than reporting a grant. New broad Session grants require
+request fails rather than reporting a grant. The decision receipt reports
+`audit_recorded`; if the decision applied but the audit write failed, the CLI
+warns explicitly without suggesting a retry. New broad Session grants require
 two explicit confirmations on a TTY, and --yes off-TTY. Declining confirmation
 leaves the request pending. These commands connect only to an existing daemon.
