@@ -78,6 +78,8 @@ pub fn assert_old_shape(conn: &Connection, checkpoint: i64) {
     assert!(!column(conn, "sessions", "name_source"));
     assert!(!column(conn, "sessions", "forked_from"));
     assert!(!column(conn, "sessions", "fork_point_seq"));
+    assert!(!column(conn, "runs", "start_message_seq"));
+    assert!(!column(conn, "runs", "end_message_seq"));
 }
 
 #[test]

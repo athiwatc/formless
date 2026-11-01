@@ -108,7 +108,7 @@ pub const COMMANDS: &[Command] = &[
         "show or change this Session's working directory",
         Session,
     ),
-    cmd("sessions", "", "list and switch Sessions", Session),
+    cmd("sessions", "", "list and switch Sessions (T toggles lineage tree)", Session),
     cmd("fork", "", "fork the current Session", Session),
     cmd("search", "", "search all Sessions", Session),
     cmd(
@@ -214,6 +214,12 @@ pub const COMMANDS: &[Command] = &[
     cmd("resend", "", "re-send a stalled provider request", Run),
     cmd(
         "compare",
+        "SESSION_A SESSION_B",
+        "compare stored branches and recorded usage (no model call)",
+        Session,
+    ),
+    cmd(
+        "compare-models",
         "A B [prompt]",
         "the same prompt on two models, side by side with time and cost",
         Run,

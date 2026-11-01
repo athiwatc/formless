@@ -13,6 +13,8 @@ pub struct ListFilter {
     pub editing: bool,
     pub sort: usize,
     pub quick: usize,
+    /// Sessions only: group forks under their recorded parent.
+    pub tree: bool,
     /// Tools only: grouping (`TOOL_GROUPS`) and the collapsed groups.
     pub group: usize,
     pub collapsed: HashSet<String>,

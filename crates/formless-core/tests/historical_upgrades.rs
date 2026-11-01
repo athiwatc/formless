@@ -302,6 +302,12 @@ fn rehearse(checkpoint: i64) {
         "old histories do not invent parents"
     );
     assert_eq!(session.fork_point_seq, None);
+    let anchors: (Option<String>, Option<i64>, Option<String>, Option<i64>) = upgraded.query_row("SELECT start_message_id,start_message_seq,end_message_id,end_message_seq FROM runs WHERE id='history-run-old'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(
+        anchors,
+        (None, None, None, None),
+        "old Run boundaries cannot be reconstructed from timestamps"
+    );
     assert_eq!(session.message_count, 3);
     assert_eq!(session.preview.as_deref(), Some(PREVIEW));
     assert_eq!(session.last_run_status.as_deref(), Some("paused"));

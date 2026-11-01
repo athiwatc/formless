@@ -63,9 +63,16 @@ headless with `formless run "…"`.
 
 13. **Remember a preference.** "Always answer in Thai" → saved as a memory
     (`/memory` lists them, `/forget` removes one).
-14. **Compare models.** `/compare gpt-5 claude-sonnet "explain this regex"`
+14. **Compare models.** `/compare-models gpt-5 claude-sonnet "explain this regex"`
     runs the same prompt on both and shows the answers side by side with
     time and cost.
+    To compare existing branches without a model call, use `/compare SESSION_A
+    SESSION_B` with full Session IDs or unambiguous prefixes. In the TUI Sessions
+    view, `T` toggles the lineage tree; the web Sessions list has a Tree button.
+    Fork sequence labels identify the copied boundary. Missing parents remain
+    labelled without hiding their children. The stored comparison shows whole
+    messages and recorded branch usage; missing usage and unpriced or unallocated
+    work are shown explicitly rather than reported as zero cost.
 15. **Plan a bigger task.** "Migrate this project from Jest to Vitest." The
     agent keeps a checklist pinned above the input (`update_plan`) and a
     "What I did" recap when it finishes.
