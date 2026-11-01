@@ -14,6 +14,7 @@ struct Fixture {
 impl Fixture {
     async fn new(env: &crate::credential_env::EnvGuard, auto: bool) -> Self {
         env.set("FORMLESS_API_KEY", "private-loopback-key");
+        env.set("NO_PROXY", "127.0.0.1,localhost");
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -97,7 +98,7 @@ async fn default_model_selection_sends_nothing_but_explicit_test_still_runs() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result["ok"], true);
+    assert_eq!(result["ok"], true, "{result}");
     assert_eq!(result["model"], "model");
     assert_eq!(f.count.load(Ordering::SeqCst), 2);
     assert!(f
@@ -351,7 +352,7 @@ async fn explicit_probe_uses_factory_daily_budget_and_records_known_usage_once()
         })
         .await
         .unwrap();
-    assert_eq!(result["ok"], true);
+    assert_eq!(result["ok"], true, "{result}");
     assert_eq!(result["probe_usage"]["reported_usage"]["prompt_tokens"], 7);
     assert_eq!(
         result["probe_usage"]["reported_usage"]["completion_tokens"],
