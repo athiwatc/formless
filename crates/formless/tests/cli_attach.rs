@@ -47,10 +47,8 @@ impl Fixture {
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_formless"));
         for (key, _) in std::env::vars_os() {
-            if {
-                let k = key.to_string_lossy().to_ascii_uppercase();
-                k.starts_with("FORMLESS_") || k.contains("API_KEY") || k.contains("OAUTH")
-            } {
+            let k = key.to_string_lossy().to_ascii_uppercase();
+            if k.starts_with("FORMLESS_") || k.contains("API_KEY") || k.contains("OAUTH") {
                 c.env_remove(key);
             }
         }
@@ -1013,4 +1011,95 @@ fn ctrl_c_detaches_during_a_saturated_private_socket_connect() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn new_user_message_before_replacement_run_started_stays_out_of_finished_target() {
+    use formless_protocol::{Event, Request};
+    let f = Fixture::new();
+    std::fs::create_dir_all(&f.paths.data_dir).unwrap();
+    let st = Store::open(&f.paths.db_file()).unwrap();
+    let session = st.create_session(Some("before633".into())).unwrap();
+    let first = st.append_message(&session.id, "user", "first633").unwrap();
+    let last = st
+        .append_message(&session.id, "assistant", "target633 final")
+        .unwrap();
+    let other = st
+        .append_message(&session.id, "user", "B USER MUST STAY OUT")
+        .unwrap();
+    drop(st);
+    let sid = session.id.clone();
+    let query = sid.clone();
+    let mut initial = true;
+    let server = peer(&f, move |request| match request {
+        Request::Subscribe { .. } => (vec![], json!({})),
+        Request::ListSessions => (vec![], json!([session])),
+        Request::GetSession { id } => {
+            assert_eq!(id, sid);
+            if initial {
+                initial = false;
+                (
+                    vec![
+                        Event::MessageAppended {
+                            session_id: sid.clone(),
+                            message: other.clone(),
+                        },
+                        Event::RunStarted {
+                            session_id: sid.clone(),
+                            run_id: "replacement633".into(),
+                        },
+                    ],
+                    json!({"messages":[first],"pending_events":[],"latest_run":{"run_id":"target633","status":"running"}}),
+                )
+            } else {
+                (
+                    vec![],
+                    json!({"messages":[first,last,other],"pending_events":[],"latest_run":{"run_id":"replacement633","status":"running"}}),
+                )
+            }
+        }
+        Request::GetRun { run_id } => {
+            assert_eq!(run_id, "target633");
+            (
+                vec![],
+                json!({"run_id":"target633","status":"completed","end_message_seq":last.seq}),
+            )
+        }
+        other => panic!("observer sent action: {other:?}"),
+    });
+    let out = finish(
+        f.command(&["sessions", "show", &query, "--follow", "--jsonl"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["message"]["content"] == "first633")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["message"]["content"] == "target633 final")
+            .count(),
+        1
+    );
+    assert!(!events
+        .iter()
+        .any(|e| e["message"]["content"] == "B USER MUST STAY OUT"
+            || e["run_id"] == "replacement633"));
+    server.join().unwrap();
 }

@@ -339,10 +339,10 @@ impl Observer {
                     return Ok(());
                 }
             }
-            Event::ApprovalRequested { approval_id, .. } => {
-                if !self.approvals.insert(approval_id.clone()) {
-                    return Ok(());
-                }
+            Event::ApprovalRequested { approval_id, .. }
+                if !self.approvals.insert(approval_id.clone()) =>
+            {
+                return Ok(())
             }
             _ => {}
         }
@@ -450,6 +450,24 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
         if ev.session_id() != Some(session.id.as_str()) {
             observer.emit(ev)?;
             continue;
+        }
+        if let Event::MessageAppended { message, .. } = &ev {
+            if !observer.seen.contains(&message.id) {
+                if let Some(target) = run["run_id"].as_str() {
+                    let exact = conn.request(Request::GetRun {
+                        run_id: target.into(),
+                    })?;
+                    if exact["status"].as_str().and_then(terminal).is_some() {
+                        // MessageAppended has no Run id. A new user message
+                        // can precede B's RunStarted after A is already stored
+                        // terminal. Replay A's bounded durable tail instead.
+                        anyhow::ensure!(exact["end_message_seq"].as_i64().is_some(),
+                            "the finished Run has no durable message boundary; cannot safely attach its new messages");
+                        run = exact;
+                        continue;
+                    }
+                }
+            }
         }
         // Another client can start B after A leaves the active map but before
         // A's tail broadcasts RunFinished. Keep A's stream pinned to A.
