@@ -3018,10 +3018,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   call runs unasked when everything sensitive it asks for is a trusted
   write (below) or a `net:` host on the list, and is logged as
   `tool.approve_trusted`.
-  - **Matching:** `api.example.com` matches that host and its subdomains
-    (as a `net:` grant does everywhere); `*.github.com` matches
-    `github.com` and every subdomain. Look-alikes (`evilgithub.com`) don't
-    match.
+  - **Matching:** `api.example.com` matches only that host;
+    `*.github.com` matches proper subdomains and excludes `github.com` itself.
+    Explicit port restrictions are preserved. Look-alikes (`evilgithub.com`)
+    don't match. Settings and `/security` show offline PSL/wildcard warnings
+    for configured trust, including PRIVATE public suffixes such as `github.io`.
   - **Never trusted:** bare `net` (any host), a grant wider than the
     trusted host (`net:example.com` against `api.example.com`), `*` and a
     bare TLD. Like trusted folders, it is set in `config.toml` only.
@@ -3065,8 +3066,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   only the answer that resolves a prompt counts): the call's new sensitive
   Capabilities are remembered (`denials` table, logged
   `tool.deny_always`) and every later call of any Tool that needs access
-  they cover (a denied `net:example.com` covers its subdomains, a bare
-  `net` all hosts) fails without a prompt, logged `tool.deny_remembered`,
+  they cover (a denied `net:example.com` covers that exact host,
+  `net:*.example.com` its proper subdomains, and bare `net` all hosts) fails without a prompt, logged `tool.deny_remembered`,
   even with approvals off (`security.secure = false`).
   The agent's error says so ("the user always denies net:…; don't
   attempt this access with any Tool"). `formless approvals denials`

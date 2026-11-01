@@ -92,10 +92,13 @@ fn trusted_hosts_match_exactly_or_by_wildcard_and_never_everything() {
     };
     assert!(sec.host_trusted("api.example.com"));
     assert!(
-        sec.host_trusted("v2.api.example.com"),
-        "a host grant covers its subdomains"
+        !sec.host_trusted("v2.api.example.com"),
+        "a bare trusted host is exact only"
     );
-    assert!(sec.host_trusted("GitHub.com"));
+    assert!(
+        !sec.host_trusted("GitHub.com"),
+        "an explicit wildcard excludes its apex"
+    );
     assert!(sec.host_trusted("raw.github.com"));
     assert!(!sec.host_trusted("example.com"));
     assert!(
@@ -107,6 +110,26 @@ fn trusted_hosts_match_exactly_or_by_wildcard_and_never_everything() {
         "`*` and a bare TLD trust nothing"
     );
     assert!(!sec.host_trusted(""));
+    let scoped = formless_core::config::SecurityCfg {
+        trusted_hosts: vec![
+            "*.github.io:443".into(),
+            "*.workers.dev".into(),
+            "api.example.com:8443".into(),
+        ],
+        ..Default::default()
+    };
+    assert!(scoped.host_trusted("tenant.github.io:443"));
+    assert!(!scoped.host_trusted("tenant.github.io:80"));
+    assert!(!scoped.host_trusted("github.io:443"));
+    assert!(!scoped.host_trusted("sub.api.example.com:8443"));
+    assert!(scoped
+        .network_scope_warnings()
+        .iter()
+        .any(|warning| warning.contains("PUBLIC SUFFIX") && warning.contains("github.io")));
+    assert!(scoped
+        .network_scope_warnings()
+        .iter()
+        .any(|warning| warning.contains("workers.dev")));
 }
 
 /// A Tool that declares `net:HOST` (and never calls it), run with no

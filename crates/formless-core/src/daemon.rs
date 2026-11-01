@@ -2531,6 +2531,7 @@ impl Daemon {
                     "broad_grants": broad,
                     "denials": denials,
                     "trusted_paths": cfg.security.roots(),
+                    "network_scope_warnings": cfg.security.network_scope_warnings(),
                     "trust_writes": cfg.security.trust_writes,
                     "mcp_servers": servers,
                     "trusted_hooks": hooks,

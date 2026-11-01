@@ -26,6 +26,7 @@ pub const FEATURES: &[&str] = &[
     "ask_user",
     "approval_batches",
     "approval_context",
+    "explicit_net_subdomains",
     "unsupported_error",
     "dropped_event_kinds",
 ];
@@ -180,6 +181,9 @@ pub fn security_report(v: &serde_json::Value) -> String {
             "  ⚠ broad: {}",
             list(&v["broad_grants"]).join(", ")
         ));
+    }
+    for warning in list(&v["network_scope_warnings"]) {
+        out.push(format!("  ⚠ {warning}"));
     }
     out.push(format!("Always denied: {}", v["denials"]));
     let trusted = list(&v["trusted_paths"]);

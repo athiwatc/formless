@@ -3087,6 +3087,7 @@
         ["credential", auth.credential_present ? "present" : "missing"], ["auth mode", auth.mode],
         ["token expires", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : ""]]));
     }
+    for (const warning of ((c && c.security && c.security.scope_warnings) || [])) grid.append(h("p", { class: "error scope-warning" }, "⚠ " + warning));
     grid.append(providersSection());
     grid.append(harnessSection());
     const mcp = S.mcpServers || [];

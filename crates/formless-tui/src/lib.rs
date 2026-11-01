@@ -574,6 +574,50 @@ struct ApprovalReq {
     session_id: Option<String>,
 }
 
+fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<String> {
+    let mut lines = vec![
+        format!("Tool {} v{}", req.tool_name, req.version),
+        format!("Memory: {} MB", req.memory_mb),
+        "Capabilities requested:".into(),
+    ];
+    for capability in &req.capabilities {
+        lines.push(format!(
+            "  {capability}{}",
+            if req.already_allowed.contains(capability) {
+                " (already allowed)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if let Some(session) = &req.session_id {
+        lines.push(format!("Session: {session}"));
+    }
+    if let Some(summary) = summary {
+        lines.push(format!("AI summary (may be wrong): {summary}"));
+    }
+    if let Some(detail) = &req.detail {
+        lines.push("Approval details:".into());
+        lines.extend(detail.lines().map(str::to_string));
+    }
+    if let Some(context) = &req.context {
+        if let Some(run) = &context.run_id {
+            lines.push(format!("Run: {run}"));
+        }
+        lines.extend(formless_protocol::approval_context_lines(context));
+    } else {
+        lines.push("This daemon did not supply call/source evidence.".into());
+    }
+    if let Some(code) = &req.code_preview {
+        lines.push("Code preview for this approval (first lines):".into());
+        lines.extend(code.lines().map(str::to_string));
+    }
+    lines.push(
+        "Close this inspector, then v to fetch the full Tool code for the approval version.".into(),
+    );
+    lines
+}
+
 enum WizardJob {
     Models(u64, Result<Vec<String>, String>),
     Probe(u64, Result<ProbeResult, String>),
@@ -8009,22 +8053,20 @@ impl App {
                 return;
             }
             if c == 'i' {
-                if let Some(req) = self.approvals.front() {
-                    if let Some(context) = &req.context {
-                        let lines = formless_protocol::approval_context_lines(context);
-                        self.pager = Some(Pager {
-                            title: format!(
-                                "{} v{} call and source evidence",
-                                req.tool_name, req.version
-                            ),
-                            lines,
-                            top: 0,
-                            left: 0,
-                            styled: Vec::new(),
-                        });
-                    } else {
-                        self.notes.push("This approval has no call/source evidence (an older daemon may not supply it).".into());
-                    }
+                if let Some(req) = self.approvals.front().or(self.promotions.front()) {
+                    let lines = approval_inspection_lines(
+                        req,
+                        self.approval_summaries
+                            .get(&req.approval_id)
+                            .map(String::as_str),
+                    );
+                    self.pager = Some(Pager {
+                        title: format!("{} v{} full approval", req.tool_name, req.version),
+                        lines,
+                        top: 0,
+                        left: 0,
+                        styled: Vec::new(),
+                    });
                 }
                 return;
             }
@@ -15606,9 +15648,7 @@ fn draw_approval(
             Span::raw(" always deny"),
         ]);
     }
-    if req.context.is_some() {
-        keys.push(Span::raw("   i call + source evidence"));
-    }
+    keys.push(Span::raw("   i full approval"));
     if more > 0 {
         keys.push(Span::styled(
             format!("      +{more} more waiting"),
@@ -15618,13 +15658,49 @@ fn draw_approval(
     footer.push(Line::from(keys));
     footer.push(Line::styled(
         if focused {
-            "v full code · ? explain capabilities · Tab: keep typing your message"
+            "i full approval · v full code · ? explain capabilities · Tab: keep typing"
         } else {
             "You're typing · Tab: back to this approval"
         },
         ui::dim(color),
     ));
 
+    if let Some(context) = &req.context {
+        let mut signals = Vec::new();
+        if !context.scope_warnings.is_empty() {
+            let kind = if context
+                .scope_warnings
+                .iter()
+                .any(|warning| warning.contains("PUBLIC SUFFIX"))
+            {
+                "PUBLIC SUFFIX network grant"
+            } else {
+                "Wildcard network grant"
+            };
+            signals.push(Line::styled(
+                format!("⚠ {kind}: i full approval"),
+                bold_fg(color, Color::Yellow),
+            ));
+        }
+        if let Some(source) = context.sources.first() {
+            signals.push(Line::styled(
+                format!(
+                    "This Run read external content: {}{} (i sources)",
+                    truncate_chars(&source.tool, 40),
+                    if context.sources.len() > 1 {
+                        format!(" +{}", context.sources.len() - 1)
+                    } else {
+                        String::new()
+                    }
+                ),
+                bold_fg(color, Color::Yellow),
+            ));
+        }
+        if !signals.is_empty() {
+            signals.push(Line::raw(""));
+            lines.splice(0..0, signals);
+        }
+    }
     let area = f.area();
     // Names, paths and summaries come from Tools and models: their bidi
     // controls are shown, never obeyed (#791).
@@ -15689,7 +15765,7 @@ fn draw_approval(
     if truncated && body_h > 0 {
         f.render_widget(
             Paragraph::new(Line::styled(
-                "… more above the keys (v to see all)",
+                "… more: i full approval · v full code",
                 ui::dim(color),
             )),
             Rect {
@@ -23009,10 +23085,18 @@ mod tests {
             "Supplied body: 42 bytes",
             "Body preview (redacted)",
             "/private/fixture/report.txt",
-            "i call + source evidence",
+            "i full approval",
             "function run(input)",
         ] {
             assert!(screen.contains(text), "missing {text}: {screen}");
+        }
+        let compact = render(&mut app, 80, 24);
+        for required in [
+            "PUBLIC SUFFIX",
+            "This Run read external content",
+            "i full approval",
+        ] {
+            assert!(compact.contains(required),"80x24 must retain warning/source/inspector discovery: missing {required}: {compact}");
         }
         app.key(key(KeyCode::Char('i')));
         let pager = app
@@ -23022,6 +23106,23 @@ mod tests {
         assert!(pager.title.contains("send_result v3"));
         let evidence = pager.lines.join("\n");
         assert!(evidence.contains("Computed JavaScript destinations remain unresolved"));
+        for required in [
+            "Tool send_result v3",
+            "Memory: 64 MB",
+            "net:*.github.io",
+            "Description warning: first call",
+            "AI summary (may be wrong): AI network helper",
+            "Code preview for this approval",
+            "function run(input) { return input; }",
+            "Run: consumer-run",
+            "/private/fixture/report.txt",
+            "https://approved.example/collect?d=[REDACTED]",
+        ] {
+            assert!(
+                evidence.contains(required),
+                "full inspector lost {required}: {evidence}"
+            );
+        }
         assert!(evidence.contains("Body preview (redacted): public inventory; password=[REDACTED]"));
         assert!(
             sent.try_recv().is_err(),
