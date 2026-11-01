@@ -6955,6 +6955,12 @@ mod session_lineage_tests;
 mod session_comparison;
 pub(crate) use session_comparison::SessionComparisonFailure;
 
+#[path = "branch_summary_storage.rs"]
+mod branch_summary_storage;
+pub(crate) use branch_summary_storage::{
+    summary_hash, BranchSummaryConfirmation, BranchSummaryFailure, BranchSummarySnapshot,
+};
+
 #[cfg(test)]
 #[path = "session_comparison_tests.rs"]
 mod session_comparison_tests;
