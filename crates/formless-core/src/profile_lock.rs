@@ -576,6 +576,54 @@ mod tests {
 
     #[test]
     fn failed_partial_freeze_releases_locks_and_overlapping_roots_do_not_self_deadlock() {
+        // On Unix, another parallel test can fork while a lock is held. Even
+        // CLOEXEC descriptors retain flock ownership in that child until exec,
+        // so closing our descriptor cannot promise an immediate release then.
+        // Run these exact zero-timeout rollback assertions alone after exec;
+        // the fixture itself never forks and still requires immediate release.
+        let mut child = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile_lock::tests::failed_partial_freeze_child_fixture",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("FORMLESS_TEST_PARTIAL_FREEZE_CHILD", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "isolated immediate-release fixture failed: {status}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "isolated immediate-release fixture did not finish within ten seconds"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "private subprocess fixture for exact immediate-release assertions"]
+    fn failed_partial_freeze_child_fixture() {
+        assert_eq!(
+            std::env::var("FORMLESS_TEST_PARTIAL_FREEZE_CHILD")
+                .ok()
+                .as_deref(),
+            Some("1"),
+            "invoke only through the isolated parent test"
+        );
         let (_fixture, base) = Fixture::new();
         let plan = hierarchy_plan(&base, true).unwrap();
         let blocked_path = &plan
