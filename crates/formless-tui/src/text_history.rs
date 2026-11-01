@@ -120,14 +120,18 @@ impl<T: Snapshot> History<T> {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct KillRing {
-    entries: VecDeque<String>,
+    entries: VecDeque<(String, bool)>,
     bytes: usize,
 }
 
 impl KillRing {
-    /// An oversized kill still edits the draft, but must not leave a stale
-    /// previous entry looking like the recoverable contents of that kill.
+    #[cfg(test)]
     pub(crate) fn push(&mut self, text: String) {
+        self.push_with_intent(text, false);
+    }
+    /// The existing bounded entry also retains whether its bytes are message
+    /// data. Identical bytes with different origins remain distinct entries.
+    fn push_with_intent(&mut self, text: String, literal: bool) {
         if text.is_empty() {
             return;
         }
@@ -136,45 +140,54 @@ impl KillRing {
             self.bytes = 0;
             return;
         }
-        if self.entries.front() == Some(&text) {
+        if self
+            .entries
+            .front()
+            .is_some_and(|(previous, intent)| previous == &text && *intent == literal)
+        {
             return;
         }
         self.bytes += text.len();
-        self.entries.push_front(text);
+        self.entries.push_front((text, literal));
         while self.bytes > RING_BYTES || self.entries.len() > RING_ENTRIES {
             self.bytes -= self
                 .entries
                 .pop_back()
                 .expect("nonempty over-budget ring")
+                .0
                 .len();
         }
     }
-
-    pub(crate) fn kill(&mut self, text: String, prepend: bool, consecutive: bool) {
+    pub(crate) fn kill(&mut self, text: String, prepend: bool, consecutive: bool, literal: bool) {
         if !consecutive || self.entries.is_empty() {
-            self.push(text);
+            self.push_with_intent(text, literal);
             return;
         }
-        let previous = self.entries.pop_front().expect("nonempty ring");
+        let (previous, previous_literal) = self.entries.pop_front().expect("nonempty ring");
         self.bytes -= previous.len();
         if previous.len().saturating_add(text.len()) > RING_BYTES {
             self.entries.clear();
             self.bytes = 0;
             return;
         }
-        self.push(if prepend {
-            text + &previous
-        } else {
-            previous + &text
-        });
+        self.push_with_intent(
+            if prepend {
+                text + &previous
+            } else {
+                previous + &text
+            },
+            literal || previous_literal,
+        );
     }
-
     pub(crate) fn get(&self, index: usize) -> Option<&str> {
         if self.entries.is_empty() {
             None
         } else {
-            Some(&self.entries[index % self.entries.len()])
+            Some(&self.entries[index % self.entries.len()].0)
         }
+    }
+    pub(crate) fn literal(&self, index: usize) -> bool {
+        !self.entries.is_empty() && self.entries[index % self.entries.len()].1
     }
 }
 

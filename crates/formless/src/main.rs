@@ -1,4 +1,5 @@
 mod cli_attach;
+mod cli_commands;
 mod cli_pipeline;
 mod table;
 
@@ -95,6 +96,11 @@ enum Cmd {
         /// Where to write it (default: ./formless-bug-report-<time>.md)
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
+    },
+    /// List local user-defined slash commands without starting a daemon
+    Commands {
+        #[command(subcommand)]
+        action: cli_commands::Action,
     },
     /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
     Skills {
@@ -1409,6 +1415,10 @@ fn run_cli(cli: Cli) -> Result<()> {
         render_man(&mut std::io::stdout())?;
         return Ok(());
     }
+    if let Some(Cmd::Commands { action }) = &cli.cmd {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        return cli_commands::run(&paths, action);
+    }
     if matches!(
         cli.cmd,
         Some(Cmd::Daemon {
@@ -1700,7 +1710,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             since,
             lines,
         }) => logs_cmd(&paths, follow, level, since, lines),
-        Some(Cmd::Completions { .. } | Cmd::Man) => {
+        Some(Cmd::Completions { .. } | Cmd::Man | Cmd::Commands { .. }) => {
             unreachable!("handled before the profile is set up")
         }
         Some(Cmd::Roles { action }) => roles_cmd(paths, action),

@@ -26,6 +26,7 @@ mod text;
 mod text_history;
 mod theme;
 mod ui;
+mod user_commands_ui;
 mod vim;
 
 use anyhow::Result;
@@ -1576,6 +1577,8 @@ struct App {
     /// Files and pasted images for the next message, shown as chips in
     /// the input and uploaded when it is sent (SPEC §5.6).
     attachments: Vec<(String, Vec<u8>)>,
+    /// Local prompt-template cache, bound to this Session's working directory.
+    user_commands: std::cell::RefCell<user_commands_ui::State>,
     /// The `/` palette's selected row.
     palette_sel: usize,
     /// The input the palette was dismissed (Esc) for.
@@ -1922,6 +1925,7 @@ impl App {
             import_description_preview: None,
             import_description_requested: None,
             attachments: Vec::new(),
+            user_commands: Default::default(),
             palette_sel: 0,
             palette_hidden: None,
             settings_sel: 0,
@@ -2572,6 +2576,7 @@ impl App {
         if self.input.is_empty() {
             if let Some(text) = self.current.as_deref().and_then(|id| self.sends.unsent(id)) {
                 self.input.set(text);
+                self.input.set_literal(true);
                 self.restored_send = self.current.clone().map(|id| (id, text.to_string()));
             }
         }
@@ -2629,10 +2634,12 @@ impl App {
             let send = self.interrupted_attachment_sends.remove(index).unwrap();
             if current {
                 self.input.set(&send.content);
+                self.input.set_literal(true);
                 self.attachments.splice(0..0, send.attachments);
             } else {
                 let draft = self.drafts.entry(send.session_id).or_default();
                 draft.input.set(&send.content);
+                draft.input.set_literal(true);
                 draft.attachments.splice(0..0, send.attachments);
             }
         }
@@ -2701,10 +2708,12 @@ impl App {
                         {
                             if self.current.as_deref() == Some(&session) && self.input.is_empty() {
                                 self.input.set(&text);
+                                self.input.set_literal(true);
                             } else if self.current.as_deref() != Some(&session) {
                                 let draft = self.drafts.entry(session).or_default();
                                 if draft.input.is_empty() {
                                     draft.input.set(&text);
+                                    draft.input.set_literal(true);
                                 }
                             }
                         }
@@ -2865,6 +2874,7 @@ impl App {
                                 match result["first_message"].as_str() {
                                     Some(first) => {
                                         self.input.set(first);
+                                        self.input.set_literal(true);
                                         self.notes.push(format!(
                                             "new Session from template {name}: edit the first message, then Enter"
                                         ));
@@ -2924,6 +2934,7 @@ impl App {
                                 self.notes.push("session forked".into());
                                 if let Some(text) = self.fork_prefill.take() {
                                     self.input.set(&text);
+                                    self.input.set_literal(true);
                                     self.notes.push(
                                         "the message is in the input: edit it, then Enter".into(),
                                     );
@@ -4004,6 +4015,7 @@ impl App {
                                 self.notes.push("the prompt came back empty".into());
                             } else {
                                 self.input.set(&text);
+                                self.input.set_literal(true);
                                 self.submit_chat(false);
                             }
                         }
@@ -4614,6 +4626,7 @@ impl App {
             "edit" => {
                 self.editing_queued = Some(item.id);
                 self.input.set(&item.content);
+                self.input.set_literal(true);
                 self.notes
                     .push("Editing the queued message — Enter saves, Esc cancels.".into());
             }
@@ -5872,7 +5885,7 @@ impl App {
             || self.current.is_none()
             || self.running()
             || self.input.is_empty()
-            || self.input.expanded().starts_with('/')
+            || (self.input.expanded().starts_with('/') && !self.input.is_literal())
         {
             self.forecast.hint = None;
             self.forecast.generation.clear();
@@ -5967,6 +5980,9 @@ impl App {
     }
 
     fn submit_chat(&mut self, queued: bool) {
+        if !self.expand_user_command() {
+            return;
+        }
         if self.offline.is_some() {
             // Nothing can be sent: keep the draft until the daemon is back.
             self.notes
@@ -5975,7 +5991,7 @@ impl App {
         }
         let text = self.input.expanded();
         if !text.trim().is_empty()
-            && !text.starts_with('/')
+            && (!text.starts_with('/') || self.input.is_literal())
             && !self.running()
             && self.current.is_some()
             && self.editing_queued.is_none()
@@ -5999,13 +6015,14 @@ impl App {
             }
         }
         self.restored_send = None;
+        let literal_input = self.input.is_literal();
         let text = self.input.take();
         self.vim_input.reset();
         let text = text.trim().to_string();
         if text.is_empty() {
             // Enter on an empty input retries a failed or paused Run
             // from the banner, without retyping (SPEC §5.4).
-            if self.run_banner.is_some() && !self.running() && !queued {
+            if !literal_input && self.run_banner.is_some() && !self.running() && !queued {
                 self.slash("resume");
             }
             return;
@@ -6103,9 +6120,11 @@ impl App {
             }
             return;
         }
-        if let Some(cmd) = text.strip_prefix('/') {
-            self.slash(cmd.trim());
-            return;
+        if !literal_input {
+            if let Some(cmd) = text.strip_prefix('/') {
+                self.slash(cmd.trim());
+                return;
+            }
         }
         let Some(session_id) = self.current.clone() else {
             return;
@@ -6442,7 +6461,8 @@ impl App {
         let Some(q) = self.input.strip_prefix('/') else {
             return Vec::new();
         };
-        if self.palette_hidden.as_deref() == Some(&*self.input)
+        if self.input.is_literal()
+            || self.palette_hidden.as_deref() == Some(&*self.input)
             || self.search_mode
             || self.renaming.is_some()
             || self.instructing.is_some()
@@ -6480,7 +6500,7 @@ impl App {
         if q.contains(' ') && !commands::COMMANDS.iter().any(|c| c.name.starts_with(typed)) {
             return Vec::new();
         }
-        commands::matches(q)
+        let mut rows: Vec<_> = commands::matches(q)
             .into_iter()
             .map(|c| PaletteItem {
                 insert: if c.args.is_empty() {
@@ -6492,7 +6512,9 @@ impl App {
                 desc: i18n::tr(c.desc).to_string(),
                 runnable: !c.needs_args(),
             })
-            .collect()
+            .collect();
+        rows.extend(self.user_command_palette(q));
+        rows
     }
 
     /// Keys for the `/` palette; true when the key was used.
@@ -6677,7 +6699,7 @@ impl App {
             "edit" => match self.messages.iter().rev().find(|m| m.role == "user") {
                 Some(m) => {
                     self.editing_id = Some(m.id.clone());
-                    self.input.set(&m.content);
+                    self.input.set(&m.content); self.input.set_literal(true);
                     self.notes
                         .push("Editing your last message — Enter retries from there.".into());
                 }
@@ -7649,9 +7671,10 @@ impl App {
                 }
             }
             "help" => {
+                let lines = self.user_command_help();
                 self.pager = Some(Pager {
                     title: "Help".into(),
-                    lines: commands::help_lines(),
+                    lines,
                     top: 0,
                     left: 0,
                     styled: Vec::new(),
@@ -10200,6 +10223,7 @@ impl App {
                     self.editing_id = Some(m.id.clone());
                     self.edit_armed = false;
                     self.input.set(&m.content);
+                    self.input.set_literal(true);
                     let later = self.messages.iter().filter(|x| x.seq > m.seq).count();
                     self.notes.push(format!(
                         "Editing this message — Enter re-runs from here{}",
@@ -10250,12 +10274,25 @@ impl App {
         let Ok(text) = std::fs::read_to_string(drafts_file(&self.paths)) else {
             return;
         };
-        let saved: HashMap<String, String> = serde_json::from_str(&text).unwrap_or_default();
-        for (sid, t) in saved {
+        let saved: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&text).unwrap_or_default();
+        for (sid, value) in saved {
+            let (text, literal_input) = match &value {
+                serde_json::Value::String(text) => (text.as_str(), false),
+                value if value["literal"].as_bool() == Some(true) => {
+                    let Some(text) = value["text"].as_str() else {
+                        continue;
+                    };
+                    (text, true)
+                }
+                _ => continue,
+            };
+            let mut input = input::InputLine::from(text);
+            input.set_literal(literal_input);
             self.drafts.insert(
                 sid,
                 Draft {
-                    input: input::InputLine::from(t.as_str()),
+                    input,
                     attachments: Vec::new(),
                 },
             );
@@ -10264,14 +10301,21 @@ impl App {
 
     /// Persist every Session's text draft, the current one included.
     fn save_drafts(&self) {
-        let mut out: HashMap<&str, String> = self
+        let encode = |input: &input::InputLine, literal: bool| {
+            if literal {
+                serde_json::json!({"text":input.expanded(),"literal":true})
+            } else {
+                serde_json::json!(input.expanded())
+            }
+        };
+        let mut out: HashMap<&str, serde_json::Value> = self
             .drafts
             .iter()
             .filter(|(_, d)| !d.input.is_empty())
-            .map(|(k, d)| (k.as_str(), d.input.expanded()))
+            .map(|(k, d)| (k.as_str(), encode(&d.input, d.input.is_literal())))
             .collect();
         if let Some(cur) = self.current.as_deref().filter(|_| !self.input.is_empty()) {
-            out.insert(cur, self.input.expanded());
+            out.insert(cur, encode(&self.input, self.input.is_literal()));
         }
         let file = drafts_file(&self.paths);
         if out.is_empty() {
@@ -10296,6 +10340,9 @@ impl App {
     fn input_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.input.is_empty() && !ctrl && !alt && matches!(key.code, KeyCode::Char(_)) {
+            self.input.set_literal(false);
+        }
         if history_key(&mut self.input, key) {
             self.update_mention();
             return;
@@ -10327,7 +10374,9 @@ impl App {
                 KeyCode::Char('r') if ctrl => self.input.search_older(&history),
                 KeyCode::Char('g') if ctrl => self.input.search_cancel(),
                 KeyCode::Esc => self.input.search_cancel(),
-                KeyCode::Enter => self.input.search_accept(&history),
+                KeyCode::Enter => {
+                    self.input.search_accept(&history);
+                }
                 KeyCode::Backspace => self.input.search_type(None, &history),
                 KeyCode::Char(c) if !ctrl && !alt => self.input.search_type(Some(c), &history),
                 _ => {
@@ -17253,6 +17302,19 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     );
 }
 
+/// Canonical reserved slash roots, shared by template discovery and the CLI.
+/// Subcommands reserve their leading root rather than a separate namespace.
+pub fn builtin_command_names() -> Vec<String> {
+    commands::COMMANDS
+        .iter()
+        .filter_map(|command| command.name.split_whitespace().next())
+        .chain(commands::LEGACY_ALIASES.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The keyboard and command reference as Markdown (`docs/keys.md`).
 pub fn keys_reference() -> String {
     commands::reference_markdown()
@@ -17308,6 +17370,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         while !app.should_quit {
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
+            app.user_commands_tick();
             app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
@@ -17574,6 +17637,7 @@ mod tests {
             import_description_preview: None,
             import_description_requested: None,
             attachments: Vec::new(),
+            user_commands: Default::default(),
             palette_sel: 0,
             palette_hidden: None,
             settings_sel: 0,
@@ -25664,5 +25728,428 @@ mod tests {
         assert_eq!(ed.text(), before);
         assert_eq!(ed.cursor, cursor);
         assert_eq!(ed.vim.mode, vim::Mode::Normal);
+    }
+    fn custom_command_fixture(body: &str) -> (App, std::path::PathBuf) {
+        let mut app = test_app();
+        let project = app.paths.data_dir.parent().unwrap().join("private-project");
+        std::fs::create_dir_all(project.join(".formless/commands")).unwrap();
+        std::fs::create_dir_all(app.paths.config_dir.join("commands")).unwrap();
+        let mut session:SessionInfo = serde_json::from_value(serde_json::json!({"id":"s1","name":"Private","model":null,"reasoning_effort":null,"created_at":"","updated_at":"","cwd":project,"message_count":0})).unwrap();
+        session.cwd = Some(project.to_string_lossy().into_owned());
+        app.sessions = vec![session];
+        std::fs::write(
+            project.join(".formless/commands/workflow.md"),
+            format!("---\ndescription: Private review workflow\n---\n{body}"),
+        )
+        .unwrap();
+        (app, project)
+    }
+    #[test]
+    fn custom_commands_hot_reload_palette_help_and_warn_once_with_builtin_precedence() {
+        let (mut app, project) = custom_command_fixture("Review $ARGUMENTS");
+        app.input.set("/workfl");
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("/workflow") && screen.contains("Private review workflow"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/workflow ");
+        std::fs::write(
+            project.join(".formless/commands/workflow.md"),
+            "---\ndescription: Changed workflow\n---\nChanged $ARGUMENTS",
+        )
+        .unwrap();
+        app.user_command_snapshot(true);
+        app.input.set("/workfl");
+        assert!(render(&mut app, 120, 30).contains("Changed workflow"));
+        std::fs::write(
+            app.paths.config_dir.join("commands/quit.md"),
+            "---\ndescription: Never replace Quit\n---\nnot a command",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".formless/commands/bad.md"),
+            "---\ndescription: not closed",
+        )
+        .unwrap();
+        std::fs::write(project.join(".formless/commands/\u{202e}bad.md"), "body").unwrap();
+        app.user_command_snapshot(true);
+        for _ in 0..20 {
+            app.user_commands_tick();
+        }
+        assert!(app.notes.iter().any(|note| note.contains("⟨U+202E⟩")));
+        assert!(app.notes.iter().all(|note| !note.contains('\u{202e}')));
+        assert_eq!(
+            app.notes
+                .iter()
+                .filter(|note| note.contains("commands/bad.md") || note.contains("commands\\bad.md"))
+                .count(),
+            1
+        );
+        app.slash("help");
+        let help = app.pager.as_ref().unwrap().lines.join("\n");
+        assert!(
+            help.contains("Yours")
+                && help.contains("Changed workflow")
+                && help.contains("Shadowed /quit"),
+            "{help}"
+        );
+        app.key(key(KeyCode::Esc));
+        app.input.set("/quit");
+        app.key(key(KeyCode::Enter));
+        assert!(
+            app.should_quit,
+            "built-in dispatch wins even when a template uses its name"
+        );
+    }
+    #[test]
+    fn custom_commands_are_literal_messages_even_when_the_body_looks_executable() {
+        for body in ["/quit", "/exit", "!echo never-execute", "/review recursive"] {
+            let (mut app, _) = custom_command_fixture(body);
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.input.set("/workflow args");
+            app.key(key(KeyCode::Enter));
+            let envelope: RequestEnvelope =
+                serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(
+                matches!(envelope.request, Request::SendMessage{ref content,mode:SendMode::Send,..} if content == body),
+                "{envelope:?}"
+            );
+            assert!(!app.should_quit);
+            assert!(
+                sent.try_recv().is_err(),
+                "expansion never dispatches another slash or shell action"
+            );
+        }
+    }
+    #[test]
+    fn custom_commands_arguments_mentions_and_queue_steer_use_normal_message_intake() {
+        for mode in [SendMode::Send, SendMode::Queue, SendMode::Steer] {
+            let (mut app, project) =
+                custom_command_fixture("Review <$ARGUMENTS> first=<$1> @report.txt");
+            std::fs::write(project.join("report.txt"), "private fixture").unwrap();
+            if mode == SendMode::Steer {
+                app.running_sessions.insert("s1".into());
+            }
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.input.set("/workflow alpha  beta");
+            app.submit_chat(mode == SendMode::Queue);
+            let attachment: RequestEnvelope =
+                serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(
+                matches!(attachment.request,Request::AttachPath{ref path,ref root,..} if path == "report.txt" && root.as_deref() == Some(project.to_str().unwrap())),
+                "{attachment:?}"
+            );
+            assert!(
+                sent.try_recv().is_err(),
+                "send waits for attachment acknowledgement"
+            );
+            app.mention_attached();
+            let send: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(
+                matches!(send.request,Request::SendMessage{ref content,mode:actual,..} if content == "Review <alpha  beta> first=<alpha> @report.txt" && actual == mode),
+                "{send:?}"
+            );
+        }
+    }
+    #[test]
+    fn custom_command_session_binding_and_literal_drafts_survive_restore_without_redispatch() {
+        let (mut app, project) = custom_command_fixture("/quit");
+        assert!(app.expand_user_command()); // Ordinary input is initially empty.
+        app.input.set("/workflow");
+        assert!(app.expand_user_command());
+        assert!(app.input.is_literal());
+        assert!(app.palette_items().is_empty());
+        app.save_drafts();
+        app.input.clear();
+        app.input.set_literal(false);
+        app.drafts.clear();
+        app.load_drafts();
+        let draft = app.drafts.remove("s1").unwrap();
+        assert_eq!(draft.input, "/quit");
+        assert!(draft.input.is_literal());
+        app.input = draft.input;
+
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Enter));
+        let send: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(send.request,Request::SendMessage{ref content,..} if content == "/quit"));
+        assert!(!app.should_quit);
+        let other = project.join("other");
+        std::fs::create_dir_all(other.join(".formless/commands")).unwrap();
+        std::fs::write(other.join(".formless/commands/workflow.md"), "Other root").unwrap();
+        app.sessions[0].cwd = Some(other.to_string_lossy().into_owned());
+        app.input.set("/workflow");
+        app.key(key(KeyCode::Enter));
+        let send: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(send.request,Request::SendMessage{ref content,..} if content == "Other root")
+        );
+    }
+    #[test]
+    fn custom_command_history_reconnect_and_session_switch_never_reexecute_literal_bodies() {
+        let (mut app, _) = custom_command_fixture("/quit");
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("/workflow");
+        app.key(key(KeyCode::Enter));
+        let first: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(first.request,Request::SendMessage{ref content,..} if content == "/quit"));
+        app.daemon_lost();
+        assert_eq!(app.input, "/quit");
+        assert!(app.input.is_literal());
+        let (client, retry) = DaemonClient::recording();
+        app.client = Some(client);
+        app.offline = None;
+        app.key(key(KeyCode::Enter));
+        let restored: RequestEnvelope = serde_json::from_str(&retry.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(restored.request,Request::SendMessage{ref content,..} if content == "/quit")
+        );
+        assert!(!app.should_quit);
+        app.messages=vec![serde_json::from_value(serde_json::json!({"id":"literal","session_id":"s1","seq":1,"role":"user","content":"/quit","created_at":"","meta":null})).unwrap()];
+        app.input.clear();
+        app.key(key(KeyCode::Up));
+        assert_eq!(app.input, "/quit");
+        assert!(app.input.is_literal());
+        app.key(key(KeyCode::Enter));
+        let recalled: RequestEnvelope = serde_json::from_str(&retry.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(recalled.request,Request::SendMessage{ref content,..} if content == "/quit")
+        );
+        assert!(!app.should_quit);
+        app.input.set("/workflow");
+        assert!(app.expand_user_command());
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "/quit");
+        assert!(
+            app.input.is_literal(),
+            "undo after clear cannot grant a template command authority"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert!(app.input.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "/quit");
+        assert!(
+            app.input.is_literal(),
+            "redo/undo restores the same data intent"
+        );
+        let mut second = app.sessions[0].clone();
+        second.id = "s2".into();
+        app.sessions.push(second);
+        app.switch_session("s2".into());
+        app.switch_session("s1".into());
+        assert_eq!(app.input, "/quit");
+        assert!(app.input.is_literal());
+        assert!(app.palette_items().is_empty());
+        while retry.try_recv().is_ok() {}
+        app.key(key(KeyCode::Enter));
+        let switched: RequestEnvelope = serde_json::from_str(&retry.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(switched.request,Request::SendMessage{ref content,..} if content == "/quit")
+        );
+        assert!(!app.should_quit);
+    }
+    #[test]
+    fn custom_command_forecast_confirmation_binds_literal_expansion_and_not_the_template_invocation(
+    ) {
+        let (mut app, _) = custom_command_fixture("/quit");
+        let mut cfg = Config::default();
+        cfg.limits.forecast_confirm_usd = Some(0.0);
+        cfg.save(&app.paths).unwrap();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("/workflow");
+        app.key(key(KeyCode::Enter));
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(preview.request,Request::ForecastRun{ref input,for_send:true} if input.draft == "/quit")
+        );
+        assert_eq!(app.input, "/quit");
+        assert!(app.input.is_literal());
+        tx.send(ServerMessage::Response {
+            id: preview.id,
+            ok: true,
+            result: Some(
+                serde_json::to_value(forecast_reply("Review this expanded prompt", true)).unwrap(),
+            ),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.forecast.modal.is_some());
+        app.key(key(KeyCode::Enter));
+        let confirm: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(confirm.request, Request::ConfirmForecast { .. }));
+        tx.send(ServerMessage::Response {
+            id: confirm.id,
+            ok: true,
+            result: Some(serde_json::json!({"confirmed":true})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        let send: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(send.request,Request::SendMessage{ref content,..} if content == "/quit"));
+        assert!(!app.should_quit);
+        assert!(sent.try_recv().is_err());
+    }
+    #[test]
+    fn custom_commands_preserve_typed_builtin_intent_through_undo_and_redo() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("/quit");
+        assert!(!app.input.is_literal());
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "/quit");
+        assert!(!app.input.is_literal());
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert!(app.input.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "/quit");
+        assert!(!app.input.is_literal());
+        app.key(key(KeyCode::Enter));
+        assert!(app.should_quit, "a typed builtin retains command intent");
+        assert!(
+            sent.try_recv().is_err(),
+            "a builtin is not silently converted into a model message"
+        );
+    }
+    #[test]
+    fn custom_commands_cannot_shadow_unlisted_legacy_builtin_aliases() {
+        for alias in ["pending", "providers", "tags"] {
+            let (mut app, project) = custom_command_fixture("ordinary workflow");
+            std::fs::write(
+                project.join(format!(".formless/commands/{alias}.md")),
+                "HIJACKED ALIAS",
+            )
+            .unwrap();
+            let snapshot = app.user_command_snapshot(true);
+            assert!(snapshot.find(alias).is_none());
+            assert!(snapshot
+                .shadowed
+                .iter()
+                .any(|shadowed| shadowed.name == alias));
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.input.set(&format!("/{alias}"));
+            app.key(key(KeyCode::Enter));
+            let requests: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|text| serde_json::from_str(&text).unwrap())
+                .collect();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !matches!(request.request, Request::SendMessage { .. })),
+                "{alias}: {requests:?}"
+            );
+            match alias {
+                "pending" => assert!(requests
+                    .iter()
+                    .any(|request| matches!(request.request, Request::ListInvocations))),
+                "providers" => assert!(requests
+                    .iter()
+                    .any(|request| matches!(request.request, Request::ListProviders))),
+                "tags" => assert!(app.notes.iter().any(|note| note.contains("no tags"))),
+                _ => unreachable!(),
+            }
+        }
+    }
+    #[test]
+    fn custom_commands_internal_kill_yank_preserves_literal_and_raw_command_intent() {
+        for literal in [true, false] {
+            let (mut app, _) = custom_command_fixture("/quit");
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            if literal {
+                app.input.set("/workflow");
+                assert!(app.expand_user_command());
+            } else {
+                app.input.set("/quit");
+            }
+            app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            assert!(app.input.is_empty());
+            app.input.set("fresh raw state");
+            app.input.clear();
+            app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+            assert_eq!(app.input, "/quit");
+            assert_eq!(
+                app.input.is_literal(),
+                literal,
+                "the killed text keeps its original intent"
+            );
+            app.key(key(KeyCode::Enter));
+            if literal {
+                assert!(!app.should_quit);
+                let request: RequestEnvelope =
+                    serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+                assert!(
+                    matches!(request.request,Request::SendMessage{ref content,..} if content=="/quit")
+                );
+            } else {
+                assert!(app.should_quit);
+                assert!(sent.try_recv().is_err());
+            }
+        }
+    }
+    #[test]
+    fn custom_commands_private_vim_register_and_dot_preserve_origin_without_new_authority() {
+        for literal in [true, false] {
+            let (mut app, _) = custom_command_fixture("/quit");
+            app.vim_mode = true;
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            if literal {
+                app.input.set("/workflow");
+                assert!(app.expand_user_command());
+            } else {
+                app.input.set("/quit");
+            }
+            app.key(key(KeyCode::Esc));
+            assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+            app.key(key(KeyCode::Char('y')));
+            app.key(key(KeyCode::Char('y')));
+            app.input.set("fresh raw state");
+            app.input.clear();
+            app.key(key(KeyCode::Char('P')));
+            assert_eq!(app.input.expanded().trim(), "/quit");
+            assert_eq!(
+                app.input.is_literal(),
+                literal,
+                "private register retains intent"
+            );
+            app.input.clear();
+            app.key(key(KeyCode::Char('.')));
+            assert_eq!(app.input.expanded().trim(), "/quit");
+            assert_eq!(
+                app.input.is_literal(),
+                literal,
+                "dot's captured put retains intent"
+            );
+            app.key(key(KeyCode::Enter));
+            if literal {
+                assert!(!app.should_quit);
+                let request: RequestEnvelope =
+                    serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+                assert!(
+                    matches!(request.request,Request::SendMessage{ref content,..} if content=="/quit")
+                );
+            } else {
+                assert!(app.should_quit);
+                assert!(sent.try_recv().is_err());
+            }
+        }
     }
 }

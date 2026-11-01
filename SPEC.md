@@ -4021,6 +4021,42 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`; later `/retry [--model X]`, `/limit N|off`,
   `/good`, `/bad`, `/unrate`). Plain text is always chat.
+- **Local prompt commands.** Plain Markdown templates in the selected profile's
+  `<config>/commands/NAME.md` and selected Session working directory's
+  `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Names are 1–64 lowercase
+  ASCII letters/digits/underscores/hyphens, starting with a letter. Optional
+  frontmatter accepts only a nonempty `description` string (plain, quoted or
+  block text); malformed templates are excluded with a stable diagnostic, never
+  executed. Valid project templates override global templates. Built-in slash
+  roots always win, including their subcommands; `/help` groups custom commands
+  under **Yours** and identifies shadowed files.
+  The shared Core loader supplies the TUI palette/help and
+  `formless commands list [--json]`. JSON contains command metadata, diagnostics
+  and shadowed-file metadata, never template bodies or expanded arguments.
+  CLI discovery resolves paths read-only before profile/daemon setup and never
+  creates a profile, starts a daemon, invokes a provider or reads `@path` targets.
+  Human-readable file labels escape terminal controls and directional formatting;
+  JSON retains the original metadata path strings.
+  TUI discovery refreshes at most every 250 ms while idle and forces a fresh
+  snapshot for help and explicit expansion; its cache binds the profile path,
+  selected Session and working directory. Diagnostic notes are deduplicated by
+  path/reason in a bounded 1024-entry history. Roots may resolve trusted aliases;
+  command-directory descendants and files use native no-follow reads and refuse
+  reparse points, symlinks, hardlinked files and unsupported namespaces. Each
+  directory is bounded to 256 entries and 128 Markdown templates; files are at
+  most 64 KiB, combined template bytes 1 MiB, and diagnostics at most 64.
+  Expansion is a single literal pass: `$ARGUMENTS` preserves the text after the
+  invocation's first separator; `$1` through `$9` select Unicode-whitespace
+  separated positions. Quotes, environment variables, shell syntax, backticks
+  and substituted text are never evaluated or recursively expanded. Arguments
+  are bounded to 64 KiB and expanded text to 1 MiB. `@path` remains ordinary
+  text until the existing attachment intake and protected-path checks on send.
+  Expanded input carries literal-message intent before forecast confirmation,
+  queueing, steering or dispatch: even a body beginning `/quit`, `/run` or an MCP
+  slash command cannot invoke that command. Draft/history persistence, reconnect,
+  Session switching and editing undo retain that intent. Templates cannot execute
+  anything on discovery or expansion; explicit send follows normal message and
+  attachment handling.
 - **Retry.** `/retry` re-runs your last message without retyping it
   (`RetryRun`); `/retry --model X` runs it on X for that Run only. The
   answer being replaced is kept first in a fork of the Session named

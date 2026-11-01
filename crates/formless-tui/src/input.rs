@@ -8,24 +8,27 @@ const PASTE_COLLAPSE_CHARS: usize = 1500;
 
 #[derive(Debug, Default, Clone)]
 pub struct InputLine {
+    /// Prompt-template/recalled message data has no slash-command authority.
+    literal: bool,
     text: String,
     history: crate::text_history::History<EditSnapshot>,
     ring: crate::text_history::KillRing,
     anchor: Option<usize>,
-    yank: Option<(usize, usize, usize)>,
+    yank: Option<(usize, usize, usize, bool)>,
     last_kill: bool,
     /// Byte offset, always on a char boundary.
     cursor: usize,
     /// Placeholder shown in `text` -> the pasted text it stands for.
     pastes: Vec<(String, String)>,
     /// Browsing history: (index into the history, the draft to restore).
-    browsing: Option<(usize, String)>,
+    browsing: Option<(usize, String, bool)>,
     /// Ctrl+R: the query and the history index it matched.
     search: Option<(String, Option<usize>)>,
 }
 
 #[derive(Debug, Clone)]
 struct EditSnapshot {
+    literal: bool,
     text: String,
     cursor: usize,
     pastes: Vec<(String, String)>,
@@ -83,6 +86,7 @@ impl InputLine {
     /// Rendering must not clone retained undo or kill-ring payloads.
     pub(crate) fn projection(&self) -> Self {
         Self {
+            literal: self.literal,
             text: self.text.clone(),
             cursor: self.cursor,
             pastes: self.pastes.clone(),
@@ -92,6 +96,7 @@ impl InputLine {
     }
     fn snapshot(&self) -> EditSnapshot {
         EditSnapshot {
+            literal: self.literal,
             text: self.text.clone(),
             cursor: self.cursor,
             pastes: self.pastes.clone(),
@@ -99,6 +104,7 @@ impl InputLine {
         }
     }
     fn restore(&mut self, s: EditSnapshot) {
+        self.literal = s.literal;
         self.text = s.text;
         self.cursor = s.cursor;
         self.pastes = s.pastes;
@@ -278,9 +284,19 @@ impl InputLine {
         self.set_modal_cursor(self.cursor);
     }
 
+    pub(crate) fn is_literal(&self) -> bool {
+        self.literal
+    }
+    /// Intent is part of the next editing snapshot; marking an expansion does
+    /// not add a separate text edit or split one undo operation.
+    pub(crate) fn set_literal(&mut self, literal: bool) {
+        self.literal = literal;
+    }
+
     /// Replace the text, cursor at the end.
     pub fn set(&mut self, s: &str) {
         self.before_edit(false);
+        self.literal = false;
         self.anchor = None;
         self.text = s.to_string();
         self.cursor = self.text.len();
@@ -560,8 +576,12 @@ impl InputLine {
         let consecutive = self.last_kill;
         let prepend = start < self.cursor;
         self.before_edit(false);
-        self.ring
-            .kill(self.expanded_range(start, end), prepend, consecutive);
+        self.ring.kill(
+            self.expanded_range(start, end),
+            prepend,
+            consecutive,
+            self.literal,
+        );
         self.remove(start, end);
         self.last_kill = true;
     }
@@ -570,16 +590,18 @@ impl InputLine {
         let Some(text) = self.ring.get(0).map(str::to_owned) else {
             return false;
         };
+        let base_literal = self.literal;
         self.before_edit(false);
         self.remove_selection();
         let start = self.cursor;
         self.insert_raw(&text);
-        self.yank = Some((start, self.cursor, 0));
+        self.literal = base_literal || self.ring.literal(0);
+        self.yank = Some((start, self.cursor, 0, base_literal));
         true
     }
 
     pub(crate) fn cycle_yank(&mut self) -> bool {
-        let Some((start, end, index)) = self.yank else {
+        let Some((start, end, index, base_literal)) = self.yank else {
             return false;
         };
         let Some(text) = self.ring.get(index + 1).map(str::to_owned) else {
@@ -588,7 +610,8 @@ impl InputLine {
         self.before_edit(false);
         self.remove(start, end);
         self.insert_raw(&text);
-        self.yank = Some((start, self.cursor, index + 1));
+        self.literal = base_literal || self.ring.literal(index + 1);
+        self.yank = Some((start, self.cursor, index + 1, base_literal));
         true
     }
 
@@ -639,25 +662,28 @@ impl InputLine {
         if history.is_empty() {
             return;
         }
-        let (idx, draft) = match self.browsing.take() {
-            Some((0, d)) => (0, d),
-            Some((i, d)) => (i - 1, d),
-            None => (history.len() - 1, self.expanded()),
+        let (idx, draft, literal) = match self.browsing.take() {
+            Some((0, d, literal)) => (0, d, literal),
+            Some((i, d, literal)) => (i - 1, d, literal),
+            None => (history.len() - 1, self.expanded(), self.literal),
         };
         self.set(&history[idx]);
-        self.browsing = Some((idx, draft));
+        self.literal = true;
+        self.browsing = Some((idx, draft, literal));
     }
 
     /// Down back towards the draft.
     pub fn history_next(&mut self, history: &[String]) {
-        let Some((idx, draft)) = self.browsing.take() else {
+        let Some((idx, draft, literal)) = self.browsing.take() else {
             return;
         };
         if idx + 1 < history.len() {
             self.set(&history[idx + 1]);
-            self.browsing = Some((idx + 1, draft));
+            self.literal = true;
+            self.browsing = Some((idx + 1, draft, literal));
         } else {
             self.set(&draft);
+            self.literal = literal;
         }
     }
 
@@ -696,6 +722,7 @@ impl InputLine {
     pub fn search_accept(&mut self, history: &[String]) {
         if let Some((_, Some(i))) = self.search.take() {
             self.set(&history[i]);
+            self.literal = true;
         }
     }
 
@@ -1093,5 +1120,52 @@ mod tests {
         let mut i = InputLine::from("hello 世界");
         i.delete_word_back();
         assert_eq!(&*i, "hello 世");
+    }
+    #[test]
+    fn command_intent_is_part_of_undo_redo_and_transcript_history_snapshots() {
+        let mut line = InputLine::from("/quit");
+        line.set_literal(true);
+        line.clear();
+        assert!(!line.is_literal());
+        assert!(line.undo());
+        assert_eq!(line, "/quit");
+        assert!(line.is_literal());
+        assert!(line.redo());
+        assert!(line.is_empty());
+        assert!(!line.is_literal());
+        line.set("/sessions");
+        assert!(!line.is_literal());
+        line.clear();
+        assert!(line.undo());
+        assert_eq!(line, "/sessions");
+        assert!(!line.is_literal());
+        let history = vec!["/quit".to_string()];
+        line.history_prev(&history);
+        assert_eq!(line, "/quit");
+        assert!(line.is_literal());
+        line.history_next(&history);
+        assert_eq!(line, "/sessions");
+        assert!(
+            !line.is_literal(),
+            "returning to a typed draft preserves its original command intent"
+        );
+    }
+    #[test]
+    fn private_kill_ring_keeps_distinct_intents_and_cycles_without_reclassifying_the_draft() {
+        let mut line = InputLine::from("/quit");
+        line.set_literal(true);
+        line.kill_to_start();
+        line.set("/quit");
+        line.kill_to_start();
+        line.clear();
+        assert!(line.yank());
+        assert_eq!(line, "/quit");
+        assert!(!line.is_literal());
+        assert!(line.cycle_yank());
+        assert_eq!(line, "/quit");
+        assert!(line.is_literal());
+        assert!(line.cycle_yank());
+        assert_eq!(line, "/quit");
+        assert!(!line.is_literal());
     }
 }

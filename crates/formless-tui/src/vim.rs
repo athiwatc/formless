@@ -28,11 +28,12 @@ pub(crate) enum Outcome {
 enum Command {
     Operator(char, String, usize),
     Insert(char),
-    Put(bool, String, bool),
+    Put(bool, String, bool, bool),
     Delete(usize),
 }
 #[derive(Debug, Clone)]
 struct Change {
+    literal: bool,
     command: Command,
     edits: Vec<KeyEvent>,
 }
@@ -42,6 +43,7 @@ pub(crate) struct Vim {
     pending: String,
     register: String,
     register_linewise: bool,
+    register_literal: bool,
     last: Option<Change>,
     inserting: Option<Change>,
 }
@@ -70,11 +72,13 @@ impl Vim {
             insert_key(line, key, Surface::Editor);
             self.inserting
                 .get_or_insert(Change {
+                    literal: line.is_literal(),
                     command: Command::Insert('i'),
                     edits: vec![],
                 })
                 .edits
                 .push(key);
+            self.inserting.as_mut().unwrap().literal = line.is_literal();
         }
     }
 
@@ -120,11 +124,13 @@ impl Vim {
             if handled {
                 self.inserting
                     .get_or_insert(Change {
+                        literal: line.is_literal(),
                         command: Command::Insert('i'),
                         edits: Vec::new(),
                     })
                     .edits
                     .push(key);
+                self.inserting.as_mut().unwrap().literal = line.is_literal();
                 return Outcome::Handled;
             }
             return Outcome::Pass;
@@ -149,6 +155,9 @@ impl Vim {
             if let Some(change) = self.last.clone() {
                 if !self.apply(line, change.command.clone()) {
                     return Outcome::Handled;
+                }
+                if !change.edits.is_empty() {
+                    line.set_literal(line.is_literal() || change.literal);
                 }
                 for key in &change.edits {
                     insert_key(line, *key, surface);
@@ -176,9 +185,15 @@ impl Vim {
                 return Outcome::Handled;
             }
             if c == 'p' || c == 'P' {
-                let cmd = Command::Put(c == 'p', self.register.clone(), self.register_linewise);
+                let cmd = Command::Put(
+                    c == 'p',
+                    self.register.clone(),
+                    self.register_linewise,
+                    self.register_literal,
+                );
                 if self.apply(line, cmd.clone()) {
                     self.last = Some(Change {
+                        literal: line.is_literal(),
                         command: cmd,
                         edits: vec![],
                     });
@@ -206,6 +221,7 @@ impl Vim {
             let changed = self.apply(line, cmd.clone());
             if changed && op != 'y' && self.mode != Mode::Insert {
                 self.last = Some(Change {
+                    literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
                 });
@@ -220,6 +236,7 @@ impl Vim {
             self.pending.clear();
             if self.apply(line, cmd.clone()) {
                 self.last = Some(Change {
+                    literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
                 });
@@ -267,6 +284,7 @@ impl Vim {
                 }
                 self.mode = Mode::Insert;
                 self.inserting = Some(Change {
+                    literal: line.is_literal(),
                     command: command.clone(),
                     edits: vec![],
                 });
@@ -284,11 +302,12 @@ impl Vim {
                     return false;
                 }
                 self.register = line[start..end].into();
+                self.register_literal = line.is_literal();
                 self.register_linewise = false;
                 line.modal_replace(start..end, "");
                 normal_cursor(line);
             }
-            Command::Put(after, text, linewise) => {
+            Command::Put(after, text, linewise, literal) => {
                 if text.is_empty() {
                     return false;
                 }
@@ -309,6 +328,7 @@ impl Vim {
                         text.push('\n');
                     }
                     line.modal_replace(at..at, &text);
+                    line.set_literal(line.is_literal() || *literal);
                     line.set_modal_cursor(if text.starts_with('\n') { at + 1 } else { at });
                     normal_cursor(line);
                     return !text.is_empty();
@@ -319,6 +339,7 @@ impl Vim {
                     line.cursor_byte()
                 };
                 line.modal_replace(at..at, text);
+                line.set_literal(line.is_literal() || *literal);
                 if !text.is_empty() {
                     line.left()
                 }
@@ -333,6 +354,7 @@ impl Vim {
                     return false;
                 }
                 self.register = line[range.clone()].into();
+                self.register_literal = line.is_literal();
                 self.register_linewise =
                     motion == &op.to_string() || matches!(motion.as_str(), "gg" | "G" | "j" | "k");
                 if *op == 'y' {
@@ -343,6 +365,7 @@ impl Vim {
                 if *op == 'c' {
                     self.mode = Mode::Insert;
                     self.inserting = Some(Change {
+                        literal: line.is_literal(),
                         command: command.clone(),
                         edits: vec![],
                     })
