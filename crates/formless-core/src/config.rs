@@ -707,6 +707,7 @@ pub const SETTABLE: &[&str] = &[
     "provider.reasoning_effort",
     "provider.context_tokens",
     "provider.model_context_tokens",
+    "provider.auto_test_models",
     "provider.max_retries",
     "provider.fallback_models",
     "provider.routing_models",
@@ -922,6 +923,8 @@ impl RelayCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderCfg {
+    /// Opt into paid background tests on model selection; explicit Test is independent.
+    pub auto_test_models: bool,
     pub base_url: String,
     pub extra_headers: HashMap<String, String>,
     /// Vendor request fields merged into every request body (Ollama's
@@ -1072,6 +1075,7 @@ fn default_routing_complex_chars() -> usize {
 impl Default for ProviderCfg {
     fn default() -> Self {
         Self {
+            auto_test_models: false,
             base_url: String::new(),
             extra_headers: HashMap::new(),
             extra_body: BTreeMap::new(),
@@ -1731,6 +1735,7 @@ impl Config {
             "provider": {
                 "base_url": self.provider.base_url,
                 "model": self.provider.model,
+                "auto_test_models": self.provider.auto_test_models,
                 "reasoning_effort": self.provider.reasoning_effort,
                 "api_style": self.provider.api_style,
                 "tool_mode": self.provider.tool_mode,
