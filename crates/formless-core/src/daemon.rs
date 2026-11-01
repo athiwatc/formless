@@ -14828,6 +14828,24 @@ impl HostOps for NestedOps {
         system: Option<&str>,
         model: Option<&str>,
     ) -> std::result::Result<String, String> {
+        self.llm_complete_with_options(
+            prompt,
+            system,
+            model,
+            &crate::provider::CompletionOptions::default(),
+        )?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "legacy completion was not text".into())
+    }
+
+    fn llm_complete_with_options(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        model: Option<&str>,
+        options: &crate::provider::CompletionOptions,
+    ) -> std::result::Result<Value, String> {
         if self.cancel.is_cancelled() {
             return Err("interrupted".into());
         }
@@ -14866,7 +14884,7 @@ impl HostOps for NestedOps {
             "llm",
             &self.session_id,
             &self.run_id,
-            provider.complete_result(&messages, &model, effort.as_deref()),
+            provider.complete_result_with_options(&messages, &model, effort.as_deref(), options),
         ))?;
         self.data_observed("llm", &result.model_used)?;
         let usage = result.usage;
@@ -14889,7 +14907,12 @@ impl HostOps for NestedOps {
                 st.add_invocation_model_use(inv, tokens, cost)
             });
         }
-        Ok(result.text)
+        match options.output_schema() {
+            Some(schema) => schema
+                .parse_and_validate(&result.text)
+                .map_err(|error| error.to_string()),
+            None => Ok(Value::String(result.text)),
+        }
     }
 
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {

@@ -278,8 +278,10 @@ without redesign.
   provider defaults rule.
 - Structured-output validation foundation (#618): immutable call options default
   to legacy text, or hold an unchanged JSON Schema and an offline validator.
-  This foundation does not yet enable provider transport, `llm.complete` schema
-  arguments or optimiser migration. Schemas are limited to 64 KiB serialized,
+  `complete_result_with_options`, `complete_with_usage_with_options` and
+  `chat_stream_with_options` accept these options; existing signatures keep
+  their text behavior. `complete_json` also returns the parsed value with its
+  usage/served-model metadata. Schemas are limited to 64 KiB serialized,
   4096 JSON nodes and depth 48; local JSON-pointer references to recognized schema
   locations are supported with reference depth 64 and expanded work 16384 nodes.
   External references, resource IDs, dynamic/anchor and recursive references
@@ -289,6 +291,23 @@ without redesign.
   extraction/coercion), at most 1 MiB, 16384 nodes and depth 64. Errors do not echo
   schema/output values. These limits are not a wall-clock deadline or OS sandbox.
   Existing Tool input/output schema handling is unchanged.
+  Chat sends `response_format: {type: json_schema, json_schema: ...}`; Responses
+  sends `text.format: {type: json_schema, ...}`. The exact schema is sent with
+  `strict: false` so arbitrary valid schema data is not rewritten into a vendor's
+  restricted strict-schema subset; the local validator remains authoritative.
+  The call owns this format field after vendor extras/native repairs, before
+  request policy, admission and accounting. A 400 explicitly rejecting the mode
+  retries once without that mode; invalid-schema/unrelated errors do not qualify.
+  This state persists across transient retries, model fallback and stream restart,
+  without changing another call or the configured provider. Anthropic uses no
+  invented format field and is validated locally. Schema-aware replies refuse
+  incomplete/refused answers; partial stream deltas remain text until final
+  validation. Every known physical-attempt charge is committed before validation.
+  `llm.complete(prompt, {schema, system, model, role})` returns a parsed JSON value;
+  omitting `schema` still returns text. Invalid schemas fail before model work;
+  smoke stubs schema results without making a request, and replay denies model
+  calls. Both optimiser candidate and guidance-proposal generation use schemas,
+  while syntax, capability/resource checks and promotion approvals still apply.
 - API key storage: OS keychain (macOS Keychain, Windows Credential Manager,
   Linux Secret Service) with a `0600`-permission file fallback. Keys are
   never written to `config.toml` in plaintext, never logged, never sent

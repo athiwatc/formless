@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+pub use formless_runtime::structured_output::{CompletionOptions, StructuredOutputError};
 use formless_runtime::LockExt as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -14,7 +15,7 @@ use crate::Paths;
 /// bootstrap prompt and the optimiser so they never drift apart.
 macro_rules! host_api_doc {
     () => {
-        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role}) -> text; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
     };
 }
 pub(crate) use host_api_doc;
@@ -196,6 +197,7 @@ pub struct Provider {
     native_sources: Option<Arc<FrozenAttachments>>,
     native_projection: Option<Arc<NativeProjection>>,
     request_policy: Option<RequestPolicy>,
+    structured_output: Option<Arc<StructuredCall>>,
     http: reqwest::Client,
     /// Sent as `prompt_cache_key` so the endpoint routes one Session's
     /// requests to the same cache (see `provider.cache_key`).
@@ -242,6 +244,90 @@ pub struct CompletionResult {
     pub usage: Option<Usage>,
     pub output_limited: bool,
     pub model_used: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructuredCompletionResult {
+    pub value: Value,
+    pub completion: CompletionResult,
+}
+
+struct StructuredCall {
+    options: CompletionOptions,
+    unconstrained: std::sync::atomic::AtomicBool,
+}
+
+impl StructuredCall {
+    fn apply(&self, body: &mut Value, cfg: &ProviderCfg) {
+        if cfg.anthropic() {
+            return;
+        }
+        let disabled = self
+            .unconstrained
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if disabled {
+            if cfg.responses() {
+                if let Some(text) = body.get_mut("text").and_then(Value::as_object_mut) {
+                    text.remove("format");
+                }
+            } else if let Some(body) = body.as_object_mut() {
+                body.remove("response_format");
+            }
+            return;
+        }
+        let schema = self
+            .options
+            .output_schema()
+            .expect("compiled structured call");
+        if cfg.responses() {
+            if !body["text"].is_object() {
+                body["text"] = json!({});
+            }
+            body["text"]["format"] = json!({"type":"json_schema","name":schema.format_name(),"schema":schema.schema(),"strict":false});
+        } else {
+            body["response_format"] = json!({"type":"json_schema","json_schema":{"name":schema.format_name(),"schema":schema.schema(),"strict":false}});
+        }
+    }
+
+    fn unsupported(&self, raw: &str, cfg: &ProviderCfg) -> bool {
+        if cfg.anthropic() {
+            return false;
+        }
+        let lower = raw.to_lowercase();
+        if ["invalid schema", "invalid_schema", "schema is invalid"]
+            .iter()
+            .any(|s| lower.contains(s))
+        {
+            return false;
+        }
+        let field = if cfg.responses() {
+            "text.format"
+        } else {
+            "response_format"
+        };
+        let names_mode = lower.contains(field) || lower.contains("json_schema");
+        let unsupported = [
+            "not supported",
+            "does not support",
+            "unsupported",
+            "unknown parameter",
+            "unrecognized request argument",
+            "not available",
+        ]
+        .iter()
+        .any(|s| lower.contains(s));
+        names_mode
+            && unsupported
+            && self
+                .unconstrained
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+    }
 }
 
 /// Shared, bounded per-provider/model circuit breakers. An acquired permit
@@ -1169,6 +1255,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            structured_output: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1198,6 +1285,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            structured_output: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1255,6 +1343,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            structured_output: None,
             credential_paths: Some(paths),
             cache_key: None,
             on_retry: None,
@@ -1403,6 +1492,16 @@ impl Provider {
     pub(crate) fn with_request_policy(mut self, policy: RequestPolicy) -> Self {
         self.request_policy = Some(policy);
         self
+    }
+    fn completion_dispatch(&self, options: &CompletionOptions) -> Self {
+        let mut scoped = self.clone();
+        scoped.structured_output = options.output_schema().map(|_| {
+            Arc::new(StructuredCall {
+                options: options.clone(),
+                unconstrained: std::sync::atomic::AtomicBool::new(false),
+            })
+        });
+        scoped
     }
     pub(crate) fn with_frozen_attachments(mut self, sources: Arc<FrozenAttachments>) -> Self {
         self.native_sources = Some(sources);
@@ -2012,9 +2111,76 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<CompletionResult> {
-        let messages = crate::provenance::project(messages);
-        self.complete_with_usage_inner(&messages, model, effort)
+        self.complete_result_with_options(messages, model, effort, &CompletionOptions::default())
             .await
+    }
+
+    pub async fn complete_with_usage_with_options(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        options: &CompletionOptions,
+    ) -> Result<(String, Option<Usage>)> {
+        let result = self
+            .complete_result_with_options(messages, model, effort, options)
+            .await?;
+        Ok((result.text, result.usage))
+    }
+
+    pub async fn complete_result_with_options(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        options: &CompletionOptions,
+    ) -> Result<CompletionResult> {
+        Ok(self
+            .complete_options(messages, model, effort, options)
+            .await?
+            .0)
+    }
+
+    pub async fn complete_json(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        options: &CompletionOptions,
+    ) -> Result<StructuredCompletionResult> {
+        if options.output_schema().is_none() {
+            bail!("complete_json requires a compiled output schema");
+        }
+        let (completion, value) = self
+            .complete_options(messages, model, effort, options)
+            .await?;
+        Ok(StructuredCompletionResult {
+            completion,
+            value: value.expect("compiled output schema"),
+        })
+    }
+
+    async fn complete_options(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        options: &CompletionOptions,
+    ) -> Result<(CompletionResult, Option<Value>)> {
+        let messages = crate::provenance::project(messages);
+        let result = self
+            .completion_dispatch(options)
+            .complete_with_usage_inner(&messages, model, effort)
+            .await?;
+        let value = if let Some(schema) = options.output_schema() {
+            if result.output_limited {
+                return Err(StructuredOutputError::IncompleteResponse.into());
+            }
+            Some(schema.parse_and_validate(&result.text)?)
+        } else {
+            None
+        };
+        Ok((result, value))
     }
 
     async fn complete_with_usage_inner(
@@ -2044,6 +2210,20 @@ impl Provider {
         let mut usage = Usage::parse(&v["usage"]);
         if let Some(usage) = &mut usage {
             usage.cost_unknown = unknown_cost && usage.cost.is_none();
+        }
+        if self.structured_output.is_some()
+            && (v["choices"][0]["message"]["refusal"].is_string()
+                || v["choices"][0]["finish_reason"] == "content_filter"
+                || v["output"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["content"]
+                            .as_array()
+                            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal"))
+                    })
+                })
+                || v["stop_reason"] == "refusal")
+        {
+            return Err(StructuredOutputError::RefusedResponse.into());
         }
         let (text, output_limited) = if self.cfg.anthropic() {
             if let Some(why) = crate::anthropic::unusable_stop(&v) {
@@ -2168,6 +2348,9 @@ impl Provider {
                 if let Some(projection) = &self.native_projection {
                     projection.repairs.locked().apply(&mut b);
                 }
+                if let Some(output) = &self.structured_output {
+                    output.apply(&mut b, &self.cfg);
+                }
                 if let Some(policy) = &self.request_policy {
                     policy(&b).map_err(|error| auth.annotate(error))?;
                 }
@@ -2229,6 +2412,15 @@ impl Provider {
                         // masking even a one-character synthetic credential can
                         // remove a keyword or numeric limit from the diagnostic.
                         let lower = raw_text.to_lowercase();
+                        if status.as_u16() == 400
+                            && self
+                                .structured_output
+                                .as_ref()
+                                .is_some_and(|output| output.unsupported(&raw_text, &self.cfg))
+                        {
+                            self.note("The endpoint does not support JSON-schema mode; retrying once without that mode and still validating the reply locally.".into());
+                            continue;
+                        }
                         let rejected = OPTIONAL_PARAMS
                             .iter()
                             .find(|p| body.get(**p).is_some() && lower.contains(**p));
@@ -2381,9 +2573,53 @@ impl Provider {
         cancel: &CancellationToken,
         on_delta: F,
     ) -> Result<ChatResult> {
+        self.chat_stream_with_options(
+            messages,
+            tools,
+            model,
+            effort,
+            &CompletionOptions::default(),
+            cancel,
+            on_delta,
+        )
+        .await
+    }
+
+    /// Content deltas remain partial text; only the final, complete response is
+    /// parsed/validated. Options and their fallback belong to this logical call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chat_stream_with_options<F: FnMut(DeltaKind, &str) + Send>(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        options: &CompletionOptions,
+        cancel: &CancellationToken,
+        on_delta: F,
+    ) -> Result<ChatResult> {
         let messages = crate::provenance::project(messages);
-        self.chat_stream_inner(&messages, tools, model, effort, cancel, on_delta)
-            .await
+        let result = self
+            .completion_dispatch(options)
+            .chat_stream_inner(&messages, tools, model, effort, cancel, on_delta)
+            .await?;
+        if let Some(schema) = options.output_schema() {
+            if result.truncated {
+                return Err(StructuredOutputError::IncompleteResponse.into());
+            }
+            if result
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| matches!(reason, "refusal" | "content_filter"))
+            {
+                return Err(StructuredOutputError::RefusedResponse.into());
+            }
+            if !result.tool_calls.is_empty() {
+                return Err(StructuredOutputError::SchemaViolation.into());
+            }
+            schema.parse_and_validate(&result.content)?;
+        }
+        Ok(result)
     }
 
     async fn chat_stream_inner<F: FnMut(DeltaKind, &str) + Send>(

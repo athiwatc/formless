@@ -117,6 +117,23 @@ pub trait HostOps: Send + Sync {
     ) -> Result<String, String> {
         Err("llm.complete is not available in this context".into())
     }
+    /// Compatibility default for embedders; daemon hosts override this to send
+    /// the schema mode as well. Existing text implementations keep their ABI.
+    fn llm_complete_with_options(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        model: Option<&str>,
+        options: &structured_output::CompletionOptions,
+    ) -> Result<Value, String> {
+        let text = self.llm_complete(prompt, system, model)?;
+        match options.output_schema() {
+            Some(schema) => schema
+                .parse_and_validate(&text)
+                .map_err(|error| error.to_string()),
+            None => Ok(Value::String(text)),
+        }
+    }
 }
 
 /// Process-wide sandbox limits the daemon sets from its config.
@@ -488,7 +505,14 @@ globalThis.store = {
   list: (prefix, o) => __call("kv", { op: "list", key: String(prefix || ""), ns: (o && o.ns) || "" }),
 };
 globalThis.llm = {
-  complete: (prompt, opts) => __call("llm_complete", { prompt: String(prompt), system: (opts && opts.system) || null, model: (opts && opts.role) ? "role:" + opts.role : (opts && opts.model) || null }),
+  complete: (prompt, opts) => {
+    const args = { prompt: String(prompt), system: (opts && opts.system) || null, model: (opts && opts.role) ? "role:" + opts.role : (opts && opts.model) || null };
+    if (opts && Object.prototype.hasOwnProperty.call(opts, "schema")) {
+      if (typeof opts.schema !== "boolean" && (!opts.schema || typeof opts.schema !== "object" || Array.isArray(opts.schema))) throw new Error("llm.complete schema must be a JSON Schema object or boolean");
+      args.schema = opts.schema;
+    }
+    return __call("llm_complete", args);
+  },
 };
 globalThis.agents = {
   run: (task, opts) => __call("agent_run", { task: String(task), system: (opts && opts.system) || null, model: (opts && opts.role) ? "role:" + opts.role : (opts && opts.model) || null }),
@@ -1347,15 +1371,27 @@ impl State {
             }
             "llm_complete" => {
                 let model = scoped_model(&self.caps.llm, a["model"].as_str(), "llm")?;
+                let options = match a.get("schema") {
+                    Some(schema) => {
+                        structured_output::CompletionOptions::json_schema(schema.clone())
+                            .map_err(|error| error.to_string())?
+                    }
+                    None => structured_output::CompletionOptions::default(),
+                };
                 match self.mode {
-                    HostMode::Smoke => Ok(self.stub(json!(""))),
+                    HostMode::Smoke => Ok(self.stub(if options.output_schema().is_some() {
+                        Value::Null
+                    } else {
+                        json!("")
+                    })),
                     HostMode::Replay => Err(denied("llm denied in replay")),
                     // A model call changes nothing: made for real.
-                    HostMode::Live | HostMode::DryRun => Ok(json!(self.ops.llm_complete(
+                    HostMode::Live | HostMode::DryRun => self.ops.llm_complete_with_options(
                         a["prompt"].as_str().unwrap_or_default(),
                         a["system"].as_str(),
                         model,
-                    )?)),
+                        &options,
+                    ),
                 }
             }
             "agent_run" => {

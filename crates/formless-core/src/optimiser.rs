@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::daemon::Daemon;
-use crate::provider::{Provider, ToolCall};
+use crate::provider::{CompletionOptions, Provider, ToolCall};
 use crate::storage::{CandidateData, ReplayItem};
 use crate::tools as toolreg;
 
@@ -256,10 +256,14 @@ impl Daemon {
         ];
         let mut est_tokens = 0i64;
         let mut attempt = 0;
+        let output = proposal_output()?;
         let (kind, content, rationale) = loop {
-            let raw = provider.complete(&messages, &model, effort).await?;
+            let result = provider
+                .complete_json(&messages, &model, effort, &output)
+                .await?;
+            let raw = result.completion.text;
             est_tokens += ((signals.len() + raw.len()) / 4) as i64;
-            let parsed = parse_proposal(&raw)?;
+            let parsed = parse_proposal(&result.value)?;
             match earlier
                 .iter()
                 .find(|p| near_duplicate(&p.content, &parsed.1))
@@ -569,18 +573,21 @@ impl Daemon {
             .reasoning_effort
             .as_deref()
             .or(cfg.provider.reasoning_effort.as_deref());
-        let raw = provider
-            .complete(
+        let output = candidate_output(cfg)?;
+        let result = provider
+            .complete_json(
                 &[
                     json!({"role": "system", "content": OPTIMISER_PROMPT}),
                     json!({"role": "user", "content": prompt}),
                 ],
                 &model,
                 effort,
+                &output,
             )
             .await?;
+        let raw = result.completion.text;
         let est_tokens = ((prompt.len() + raw.len()) / 4) as i64;
-        let cand = parse_candidate(&raw, ver, cfg)?;
+        let cand = parse_candidate(&result.value, ver, cfg)?;
         Ok((cand, est_tokens))
     }
 
@@ -1141,14 +1148,20 @@ impl HostOps for ReplayOps {
     }
 }
 
-fn parse_candidate(raw: &str, ver: &ToolVersionInfo, cfg: &Config) -> Result<CandidateData> {
-    let start = raw
-        .find('{')
-        .ok_or_else(|| anyhow!("candidate is not JSON"))?;
-    let end = raw
-        .rfind('}')
-        .ok_or_else(|| anyhow!("candidate is not JSON"))?;
-    let v: Value = serde_json::from_str(&raw[start..=end])?;
+fn candidate_output(cfg: &Config) -> Result<CompletionOptions> {
+    Ok(CompletionOptions::json_schema(json!({
+        "type":"object","properties":{
+            "description":{"type":"string"},
+            "input_schema":{"type":"object"},"output_schema":{"type":"object"},
+            "implementation_js":{"type":"string","minLength":1},
+            "capabilities":{"type":"array","items":{"type":"string"}},
+            "memory_mb":{"type":"integer","minimum":1,"maximum":cfg.tools.max_memory_mb}
+        },"required":["description","input_schema","output_schema","implementation_js","capabilities","memory_mb"],
+        "additionalProperties":false
+    }))?)
+}
+
+fn parse_candidate(v: &Value, ver: &ToolVersionInfo, cfg: &Config) -> Result<CandidateData> {
     let code = v["implementation_js"]
         .as_str()
         .ok_or_else(|| anyhow!("candidate missing implementation_js"))?
@@ -1496,14 +1509,14 @@ async fn evaluate_prompt(
     Ok((passes as f64 / total.max(1) as f64, total))
 }
 
-fn parse_proposal(raw: &str) -> Result<(String, String, String)> {
-    let start = raw
-        .find('{')
-        .ok_or_else(|| anyhow!("proposal is not JSON"))?;
-    let end = raw
-        .rfind('}')
-        .ok_or_else(|| anyhow!("proposal is not JSON"))?;
-    let v: Value = serde_json::from_str(&raw[start..=end])?;
+fn proposal_output() -> Result<CompletionOptions> {
+    Ok(CompletionOptions::json_schema(json!({"anyOf":[
+        {"type":"object","properties":{"kind":{"const":"none"}},"required":["kind"],"additionalProperties":false},
+        {"type":"object","properties":{"kind":{"const":"prompt"},"content":{"type":"string","minLength":1,"maxLength":800},"rationale":{"type":"string"}},"required":["kind","content","rationale"],"additionalProperties":false}
+    ]}))?)
+}
+
+fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
     if v["kind"].as_str() == Some("none") {
         return Err(anyhow!(
             "no new proposal: the model found nothing new to learn"

@@ -51,11 +51,15 @@ pub enum StructuredOutputError {
     OutputLimit(&'static str),
     InvalidJson,
     SchemaViolation,
+    IncompleteResponse,
+    RefusedResponse,
 }
 
 impl fmt::Display for StructuredOutputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IncompleteResponse => f.write_str("structured output response was incomplete"),
+            Self::RefusedResponse => f.write_str("structured output request was refused"),
             Self::SchemaLimit(limit) => write!(f, "structured output schema exceeds {limit} limit"),
             Self::UnsupportedSchema(reason) => {
                 write!(f, "unsupported structured output schema: {reason}")
