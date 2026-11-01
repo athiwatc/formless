@@ -9,6 +9,11 @@ const PASTE_COLLAPSE_CHARS: usize = 1500;
 #[derive(Debug, Default, Clone)]
 pub struct InputLine {
     text: String,
+    history: crate::text_history::History<EditSnapshot>,
+    ring: crate::text_history::KillRing,
+    anchor: Option<usize>,
+    yank: Option<(usize, usize, usize)>,
+    last_kill: bool,
     /// Byte offset, always on a char boundary.
     cursor: usize,
     /// Placeholder shown in `text` -> the pasted text it stands for.
@@ -17,6 +22,23 @@ pub struct InputLine {
     browsing: Option<(usize, String)>,
     /// Ctrl+R: the query and the history index it matched.
     search: Option<(String, Option<usize>)>,
+}
+
+#[derive(Debug, Clone)]
+struct EditSnapshot {
+    text: String,
+    cursor: usize,
+    pastes: Vec<(String, String)>,
+    anchor: Option<usize>,
+}
+impl crate::text_history::Snapshot for EditSnapshot {
+    fn retained_bytes(&self) -> usize {
+        self.text
+            .len()
+            .saturating_add(self.pastes.iter().fold(0usize, |n, (p, t)| {
+                n.saturating_add(p.len()).saturating_add(t.len())
+            }))
+    }
 }
 
 impl std::ops::Deref for InputLine {
@@ -36,6 +58,7 @@ impl From<&str> for InputLine {
     fn from(s: &str) -> Self {
         let mut i = Self::default();
         i.set(s);
+        i.history = Default::default();
         i
     }
 }
@@ -57,6 +80,138 @@ fn unspaced(g: &str) -> bool {
 }
 
 impl InputLine {
+    /// Rendering must not clone retained undo or kill-ring payloads.
+    pub(crate) fn projection(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            pastes: self.pastes.clone(),
+            anchor: self.anchor,
+            ..Self::default()
+        }
+    }
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            pastes: self.pastes.clone(),
+            anchor: self.anchor,
+        }
+    }
+    fn restore(&mut self, s: EditSnapshot) {
+        self.text = s.text;
+        self.cursor = s.cursor;
+        self.pastes = s.pastes;
+        self.anchor = s.anchor;
+        self.browsing = None;
+        self.search = None;
+        self.yank = None;
+        self.last_kill = false;
+    }
+    fn before_edit(&mut self, typing: bool) {
+        if !self.history.coalesces(typing) {
+            let current = self.snapshot();
+            self.history.before_edit(&current, typing);
+        }
+        self.yank = None;
+        self.last_kill = false;
+    }
+    pub(crate) fn break_edit_group(&mut self) {
+        self.history.break_group();
+        self.yank = None;
+        self.last_kill = false;
+    }
+    pub(crate) fn undo(&mut self) -> bool {
+        let current = self.snapshot();
+        let Some(s) = self.history.undo(&current) else {
+            return false;
+        };
+        self.restore(s);
+        true
+    }
+    pub(crate) fn redo(&mut self) -> bool {
+        let current = self.snapshot();
+        let Some(s) = self.history.redo(&current) else {
+            return false;
+        };
+        self.restore(s);
+        true
+    }
+
+    pub(crate) fn prepare_selection(&mut self, extend: bool) {
+        self.modal_expand_pastes();
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+    }
+
+    pub(crate) fn mouse_cursor(&mut self, at: usize, extend: bool) {
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+        self.set_modal_cursor(at);
+        self.modal_expand_pastes();
+        self.break_edit_group();
+    }
+
+    pub(crate) fn selection(&self) -> Option<std::ops::Range<usize>> {
+        let anchor = self.anchor?;
+        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        self.selection()
+            .map(|r| self.expanded_range(r.start, r.end))
+    }
+
+    pub(crate) fn cut_selection(&mut self) -> Option<String> {
+        let r = self.selection()?;
+        let text = self.expanded_range(r.start, r.end);
+        self.kill_range(r.start, r.end);
+        self.anchor = None;
+        Some(text)
+    }
+
+    fn remove_selection(&mut self) -> bool {
+        let Some(r) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.remove(r.start, r.end);
+        self.anchor = None;
+        true
+    }
+
+    /// Display-only selected spans, retaining the existing wrapped layout.
+    pub(crate) fn styled_rows(
+        &self,
+        width: usize,
+        top: usize,
+        height: usize,
+    ) -> Vec<Vec<(String, bool)>> {
+        let (rows, _) = self.layout(width);
+        let selection = self.selection();
+        let mut offset = 0;
+        rows.into_iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                let at = offset;
+                offset += row.len();
+                if self.text.as_bytes().get(offset) == Some(&b'\n') {
+                    offset += 1;
+                }
+                if i < top || i >= top.saturating_add(height) {
+                    return None;
+                }
+                Some(selection_spans(&row, at, selection.as_ref()))
+            })
+            .collect()
+    }
+
     pub(crate) fn cursor_byte(&self) -> usize {
         self.cursor
     }
@@ -87,9 +242,10 @@ impl InputLine {
         {
             return false;
         }
+        self.before_edit(false);
         self.remove(range.start, range.end);
         self.cursor = range.start;
-        self.insert_str(replacement);
+        self.insert_raw(replacement);
         self.search = None;
         true
     }
@@ -100,6 +256,15 @@ impl InputLine {
         for (placeholder, full) in std::mem::take(&mut self.pastes) {
             if let Some(start) = self.text.find(&placeholder) {
                 let end = start + placeholder.len();
+                self.anchor = self.anchor.map(|at| {
+                    if at >= end {
+                        at - placeholder.len() + full.len()
+                    } else if at > start {
+                        start + full.len()
+                    } else {
+                        at
+                    }
+                });
                 self.cursor = if self.cursor >= end {
                     self.cursor - placeholder.len() + full.len()
                 } else if self.cursor > start {
@@ -115,6 +280,8 @@ impl InputLine {
 
     /// Replace the text, cursor at the end.
     pub fn set(&mut self, s: &str) {
+        self.before_edit(false);
+        self.anchor = None;
         self.text = s.to_string();
         self.cursor = self.text.len();
         self.pastes.clear();
@@ -129,6 +296,7 @@ impl InputLine {
     pub fn take(&mut self) -> String {
         let out = self.expanded();
         self.clear();
+        self.history = Default::default();
         self.search = None;
         out
     }
@@ -146,12 +314,23 @@ impl InputLine {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        self.before_edit(c != '\n' && self.selection().is_none());
+        self.remove_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
         self.browsing = None;
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.before_edit(false);
+        self.remove_selection();
+        self.insert_raw(s);
+    }
+
+    fn insert_raw(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
         self.browsing = None;
@@ -160,14 +339,19 @@ impl InputLine {
     /// A bracketed paste: inserted as one block, never as Enter presses.
     /// Large ones collapse to a placeholder.
     pub fn paste(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.before_edit(false);
+        self.remove_selection();
         let s = s.replace("\r\n", "\n").replace('\r', "\n");
         let lines = s.lines().count();
         if lines > PASTE_COLLAPSE_LINES || s.chars().count() > PASTE_COLLAPSE_CHARS {
             let placeholder = format!("[pasted {lines} lines #{}]", self.pastes.len() + 1);
-            self.insert_str(&placeholder);
+            self.insert_raw(&placeholder);
             self.pastes.push((placeholder, s));
         } else {
-            self.insert_str(&s);
+            self.insert_raw(&s);
         }
     }
 
@@ -190,10 +374,12 @@ impl InputLine {
     }
 
     pub fn left(&mut self) {
+        self.break_edit_group();
         self.cursor = self.prev_boundary(self.cursor);
     }
 
     pub fn right(&mut self) {
+        self.break_edit_group();
         self.cursor = self.next_boundary(self.cursor);
     }
 
@@ -227,10 +413,12 @@ impl InputLine {
     }
 
     pub fn word_left(&mut self) {
+        self.break_edit_group();
         self.cursor = self.word_start_before(self.cursor);
     }
 
     pub fn word_right(&mut self) {
+        self.break_edit_group();
         self.cursor = self.word_end_after(self.cursor);
     }
 
@@ -245,10 +433,12 @@ impl InputLine {
     }
 
     pub fn home(&mut self) {
+        self.break_edit_group();
         self.cursor = self.line_start();
     }
 
     pub fn end(&mut self) {
+        self.break_edit_group();
         self.cursor = self.line_end();
     }
 
@@ -256,6 +446,16 @@ impl InputLine {
     fn remove(&mut self, start: usize, end: usize) {
         if start >= end {
             return;
+        }
+        let mut start = start;
+        let mut end = end;
+        for (placeholder, _) in &self.pastes {
+            if let Some(at) = self.text.find(placeholder) {
+                if start < at + placeholder.len() && end > at {
+                    start = start.min(at);
+                    end = end.max(at + placeholder.len());
+                }
+            }
         }
         self.text.replace_range(start..end, "");
         self.cursor = start;
@@ -265,6 +465,16 @@ impl InputLine {
     }
 
     pub fn backspace(&mut self) {
+        if self.selection().is_some() {
+            self.before_edit(false);
+            self.remove_selection();
+            return;
+        }
+        if self.cursor == 0 {
+            self.break_edit_group();
+            return;
+        }
+        self.before_edit(false);
         // A collapsed paste goes as one unit.
         if let Some((p, _)) = self
             .pastes
@@ -280,6 +490,16 @@ impl InputLine {
     }
 
     pub fn delete(&mut self) {
+        if self.selection().is_some() {
+            self.before_edit(false);
+            self.remove_selection();
+            return;
+        }
+        if self.cursor == self.text.len() {
+            self.break_edit_group();
+            return;
+        }
+        self.before_edit(false);
         let end = self.next_boundary(self.cursor);
         self.remove(self.cursor, end);
     }
@@ -287,25 +507,89 @@ impl InputLine {
     /// Ctrl+W / Alt+Backspace.
     pub fn delete_word_back(&mut self) {
         let start = self.word_start_before(self.cursor);
-        self.remove(start, self.cursor);
+        let end = self.cursor;
+        self.kill_range(start, end);
     }
 
     /// Alt+D.
     pub fn delete_word_forward(&mut self) {
+        let start = self.cursor;
         let end = self.word_end_after(self.cursor);
-        self.remove(self.cursor, end);
+        self.kill_range(start, end);
     }
 
     /// Ctrl+U: to the start of the line.
     pub fn kill_to_start(&mut self) {
         let start = self.line_start();
-        self.remove(start, self.cursor);
+        let end = self.cursor;
+        self.kill_range(start, end);
     }
 
     /// Ctrl+K: to the end of the line.
     pub fn kill_to_end(&mut self) {
+        let start = self.cursor;
         let end = self.line_end();
-        self.remove(self.cursor, end);
+        self.kill_range(start, end);
+    }
+
+    fn expanded_range(&self, start: usize, end: usize) -> String {
+        // Partial selection of a placeholder expands to that entire paste,
+        // rather than copying an unusable fragment of its display label.
+        let mut start = start;
+        let mut end = end;
+        for (p, _) in &self.pastes {
+            if let Some(at) = self.text.find(p) {
+                if start < at + p.len() && end > at {
+                    start = start.min(at);
+                    end = end.max(at + p.len());
+                }
+            }
+        }
+        let mut text = self.text[start..end].to_string();
+        for (p, full) in &self.pastes {
+            text = text.replacen(p, full, 1);
+        }
+        text
+    }
+
+    fn kill_range(&mut self, start: usize, end: usize) {
+        if start == end {
+            self.break_edit_group();
+            return;
+        }
+        let consecutive = self.last_kill;
+        let prepend = start < self.cursor;
+        self.before_edit(false);
+        self.ring
+            .kill(self.expanded_range(start, end), prepend, consecutive);
+        self.remove(start, end);
+        self.last_kill = true;
+    }
+
+    pub(crate) fn yank(&mut self) -> bool {
+        let Some(text) = self.ring.get(0).map(str::to_owned) else {
+            return false;
+        };
+        self.before_edit(false);
+        self.remove_selection();
+        let start = self.cursor;
+        self.insert_raw(&text);
+        self.yank = Some((start, self.cursor, 0));
+        true
+    }
+
+    pub(crate) fn cycle_yank(&mut self) -> bool {
+        let Some((start, end, index)) = self.yank else {
+            return false;
+        };
+        let Some(text) = self.ring.get(index + 1).map(str::to_owned) else {
+            return false;
+        };
+        self.before_edit(false);
+        self.remove(start, end);
+        self.insert_raw(&text);
+        self.yank = Some((start, self.cursor, index + 1));
+        true
     }
 
     pub fn newline(&mut self) {
@@ -322,6 +606,7 @@ impl InputLine {
 
     /// Up/Down inside a multi-line input, keeping the screen column.
     pub fn vertical(&mut self, down: bool) {
+        self.break_edit_group();
         let col = text::width(&self.text[self.line_start()..self.cursor]);
         let target = if down {
             if self.on_last_line() {
@@ -455,6 +740,28 @@ impl InputLine {
     }
 }
 
+/// A single contiguous selection needs at most three spans per visible row,
+/// rather than one heap allocation per grapheme of a very long line.
+pub(crate) fn selection_spans(
+    row: &str,
+    offset: usize,
+    selection: Option<&std::ops::Range<usize>>,
+) -> Vec<(String, bool)> {
+    let mut spans: Vec<(String, bool)> = Vec::new();
+    for (at, g) in row.grapheme_indices(true) {
+        let selected = selection.is_some_and(|r| r.contains(&(offset + at)));
+        if let Some((text, _)) = spans
+            .last_mut()
+            .filter(|(_, previous)| *previous == selected)
+        {
+            text.push_str(g);
+        } else {
+            spans.push((g.to_owned(), selected));
+        }
+    }
+    spans
+}
+
 fn find_back(history: &[String], query: &str, before: usize) -> Option<usize> {
     let q = query.to_lowercase();
     history[..before.min(history.len())]
@@ -465,6 +772,147 @@ fn find_back(history: &[String], query: &str, before: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undo_restores_collapsed_paste_backing_and_cursor() {
+        let mut i = InputLine::from("前");
+        let paste = "long line\n".repeat(20);
+        i.paste(&paste);
+        let shown = i.to_string();
+        let cursor = i.cursor;
+        i.backspace();
+        assert_eq!(i.expanded(), "前");
+        assert!(i.undo());
+        assert_eq!(i.to_string(), shown);
+        assert_eq!(i.cursor, cursor);
+        assert_eq!(i.expanded(), format!("前{paste}"));
+        assert!(i.undo());
+        assert_eq!(i.expanded(), "前");
+        assert!(i.redo());
+        assert_eq!(i.expanded(), format!("前{paste}"));
+    }
+
+    #[test]
+    fn killed_unicode_can_be_yanked_cycled_and_undone() {
+        let mut i = InputLine::from("ไทย hello");
+        i.delete_word_back();
+        i.left();
+        i.right();
+        i.kill_to_start();
+        assert_eq!(i.expanded(), "");
+        assert!(i.yank());
+        assert_eq!(i.expanded(), "ไทย ");
+        assert!(i.cycle_yank());
+        assert_eq!(i.expanded(), "hello");
+        assert!(i.undo());
+        assert_eq!(i.expanded(), "ไทย ");
+        i.left();
+        assert!(!i.cycle_yank(), "navigation ends the yank replacement");
+    }
+
+    #[test]
+    fn history_browsing_is_undoable_and_send_ends_the_draft_history() {
+        let mut i = InputLine::from("draft");
+        i.left();
+        let cursor = i.cursor;
+        i.history_prev(&["old".into()]);
+        assert!(i.undo());
+        assert_eq!(i.expanded(), "draft");
+        assert_eq!(i.cursor, cursor);
+        assert_eq!(i.take(), "draft");
+        assert!(!i.undo(), "a new message cannot restore the sent draft");
+    }
+
+    #[test]
+    fn selection_expands_pastes_and_replaces_whole_graphemes_undoably() {
+        let mut i = InputLine::from("前");
+        let paste = "ไทย\n".repeat(20);
+        i.paste(&paste);
+        i.prepare_selection(true);
+        i.left();
+        i.home();
+        assert_eq!(i.selected_text(), Some("ไทย\n".into()));
+        let selected = i.selected_text().unwrap();
+        assert_eq!(i.cut_selection(), Some(selected));
+        assert!(i.undo());
+        assert_eq!(i.expanded(), format!("前{paste}"));
+        let mut i = InputLine::from("a👩🏽‍💻文");
+        i.prepare_selection(true);
+        i.left();
+        i.left();
+        assert_eq!(i.selected_text(), Some("👩🏽‍💻文".into()));
+        i.insert_char('é');
+        assert_eq!(i.expanded(), "aé");
+        assert!(i.undo());
+        assert_eq!(i.selected_text(), Some("👩🏽‍💻文".into()));
+    }
+
+    #[test]
+    fn consecutive_backward_kills_prepend_in_original_text_order() {
+        let mut i = InputLine::from("one two three");
+        i.delete_word_back();
+        i.delete_word_back();
+        assert_eq!(i.expanded(), "one ");
+        assert!(i.yank());
+        assert_eq!(i.expanded(), "one two three");
+    }
+
+    #[test]
+    fn display_projection_does_not_copy_or_consume_undo_ownership() {
+        let mut i = InputLine::from("base");
+        i.insert_char('é');
+        i.insert_char('文');
+        let mut display = i.projection();
+        assert_eq!(display.expanded(), "baseé文");
+        assert!(!display.undo(), "render projection owns no history");
+        assert!(i.undo());
+        assert_eq!(i.expanded(), "base");
+    }
+
+    #[test]
+    fn killing_inside_a_collapsed_label_keeps_no_orphan_and_is_recoverable() {
+        let mut i = InputLine::from("before ");
+        let paste = "private long text\n".repeat(20);
+        i.paste(&paste);
+        i.delete_word_back();
+        assert_eq!(i.expanded(), "before ");
+        assert!(i.yank());
+        assert_eq!(i.expanded(), format!("before {paste}"));
+        assert!(i.undo());
+        assert!(i.undo());
+        assert_eq!(i.expanded(), format!("before {paste}"));
+        assert_eq!(i.pastes.len(), 1);
+    }
+
+    #[test]
+    fn selection_rendering_groups_long_lines_and_only_styles_visible_rows() {
+        let row = "é".repeat(20_000);
+        let selected = 200..400;
+        let spans = selection_spans(&row, 0, Some(&selected));
+        assert_eq!(
+            spans.len(),
+            3,
+            "long lines do not allocate one span per grapheme"
+        );
+        assert_eq!(
+            spans.iter().map(|(s, _)| s.as_str()).collect::<String>(),
+            row
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|(_, selected)| *selected)
+                .map(|(s, _)| s.len())
+                .sum::<usize>(),
+            200
+        );
+        let i = InputLine::from("abcdefghij\n".repeat(1000).as_str());
+        let visible = i.styled_rows(80, 500, 3);
+        assert_eq!(visible.len(), 3);
+        assert!(visible
+            .iter()
+            .all(|row| row.len() == 1 && row[0].0 == "abcdefghij"));
+    }
 
     fn at(s: &str, cursor: usize) -> InputLine {
         let mut i = InputLine::from(s);

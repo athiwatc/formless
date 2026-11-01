@@ -23,6 +23,7 @@ pub mod qr;
 mod session_ui;
 mod settings;
 mod text;
+mod text_history;
 mod theme;
 mod ui;
 mod vim;
@@ -1118,6 +1119,9 @@ struct EditorReview {
 }
 
 struct EditorState {
+    draft: Option<input::InputLine>,
+    original: Option<String>,
+    confirm_exit: bool,
     review_base_version: Option<i64>,
     vim: vim::Vim,
     tool_id: String,
@@ -1142,13 +1146,37 @@ enum EditMode {
 
 impl EditorState {
     fn modal_line(&self) -> input::InputLine {
-        let mut line = input::InputLine::from(self.text().as_str());
-        line.set_modal_cursor(self.chars[..self.cursor].iter().map(|c| c.len_utf8()).sum());
+        let mut line = self
+            .draft
+            .as_ref()
+            .map(input::InputLine::projection)
+            .unwrap_or_else(|| input::InputLine::from(self.text().as_str()));
+        self.sync_modal_line(&mut line);
         line
     }
-    fn apply_modal_line(&mut self, line: &input::InputLine) {
+    fn take_modal_line(&mut self) -> input::InputLine {
+        let mut line = self
+            .draft
+            .take()
+            .unwrap_or_else(|| input::InputLine::from(self.text().as_str()));
+        self.sync_modal_line(&mut line);
+        line
+    }
+    fn sync_modal_line(&self, line: &mut input::InputLine) {
+        let text = self.text();
+        if &**line != text.as_str() {
+            line.set(&text);
+        }
+        // Schema/examples and other programmatic replacements can shorten the
+        // character buffer before its previous cursor has been synchronized.
+        // Clamp before slicing; InputLine then snaps to a grapheme boundary.
+        let cursor = self.cursor.min(self.chars.len());
+        line.set_modal_cursor(self.chars[..cursor].iter().map(|c| c.len_utf8()).sum());
+    }
+    fn apply_modal_line(&mut self, line: input::InputLine) {
         self.cursor = line[..line.cursor_byte()].chars().count();
         self.chars = line.chars().collect();
+        self.draft = Some(line);
     }
     fn text(&self) -> String {
         self.chars.iter().collect()
@@ -1748,6 +1776,8 @@ struct App {
     /// Clickable regions of the last frame (SPEC §10.5), and the last
     /// click for double-click detection.
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
+    draft_hits: std::cell::RefCell<Vec<(Rect, usize)>>,
+    selecting_draft: bool,
     last_click: Option<(Click, Instant)>,
     /// The streaming answer's settled prefix: (key, rendered lines).
     stream_cache: std::cell::RefCell<Option<(StreamKey, Vec<Line<'static>>)>>,
@@ -1995,6 +2025,8 @@ impl App {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            draft_hits: Default::default(),
+            selecting_draft: false,
             last_click: None,
             stream_cache: Default::default(),
         };
@@ -8136,6 +8168,50 @@ impl App {
         if self.wizard.is_some() {
             return;
         }
+        if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.selecting_draft = false;
+        }
+        if matches!(
+            m.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+        ) {
+            let hit = self
+                .draft_hits
+                .borrow()
+                .iter()
+                .find(|(r, _)| {
+                    (r.x..r.x + r.width).contains(&m.column)
+                        && (r.y..r.y + r.height).contains(&m.row)
+                })
+                .map(|(_, at)| *at);
+            let dragging = matches!(m.kind, MouseEventKind::Drag(_));
+            if let Some(at) = hit.filter(|_| !dragging || self.selecting_draft) {
+                let extend = dragging || m.modifiers.contains(KeyModifiers::SHIFT);
+                if let Some(ed) = &mut self.editor {
+                    if ed.confirm_exit {
+                        return;
+                    }
+                    if ed.original.is_none() {
+                        ed.original = Some(ed.text());
+                    }
+                    let mut line = ed.take_modal_line();
+                    line.mouse_cursor(at, extend);
+                    ed.apply_modal_line(line);
+                    self.editor_generation = self.editor_generation.wrapping_add(1);
+                } else {
+                    self.input.mouse_cursor(at, extend);
+                    self.input_focus = true;
+                }
+                self.selecting_draft = true;
+                return;
+            }
+            if !dragging {
+                self.selecting_draft = false;
+            }
+        }
+        if self.editor.is_some() {
+            return;
+        }
         if self.view != View::Chat && !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
@@ -8176,21 +8252,73 @@ impl App {
             }
             return;
         }
-        if ctrl && key.code == KeyCode::Char('g') && key.kind == KeyEventKind::Press {
-            self.begin_external_edit();
+        if let Some(ed) = &mut self.editor {
+            if ed.original.is_none() {
+                ed.original = Some(ed.text());
+            }
+            if ed.confirm_exit {
+                match key.code {
+                    KeyCode::Char('y' | 'Y') => {
+                        self.editor = None;
+                        self.editor_review = None;
+                    }
+                    KeyCode::Char('n' | 'N') | KeyCode::Esc => ed.confirm_exit = false,
+                    _ => {}
+                }
+                return;
+            }
+        }
+        let exit = (self.vim_mode && ctrl && key.code == KeyCode::Char('q'))
+            || (!self.vim_mode && key.code == KeyCode::Esc);
+        if exit {
+            if let Some(ed) = &mut self.editor {
+                if ed.original.as_deref() != Some(ed.text().as_str()) {
+                    ed.confirm_exit = true;
+                } else {
+                    self.editor = None;
+                    self.editor_review = None;
+                }
+            }
             return;
         }
-        if self.vim_mode && ctrl && key.code == KeyCode::Char('q') {
-            self.editor = None;
-            self.editor_review = None;
+        if let Some(ed) = &mut self.editor {
+            let mut line = ed.take_modal_line();
+            if history_key(&mut line, key) {
+                ed.apply_modal_line(line);
+                self.editor_review = None;
+                return;
+            }
+            if ctrl
+                && key.modifiers.contains(KeyModifiers::SHIFT)
+                && matches!(key.code, KeyCode::Char('c' | 'C' | 'x' | 'X'))
+            {
+                let text = if matches!(key.code, KeyCode::Char('x' | 'X')) {
+                    line.cut_selection()
+                } else {
+                    line.selected_text()
+                };
+                ed.apply_modal_line(line);
+                if let Some(text) = text {
+                    self.copy_text(&text, "selection");
+                }
+                return;
+            }
+            if key.modifiers.contains(KeyModifiers::SHIFT) && selection_navigation(&mut line, key) {
+                ed.apply_modal_line(line);
+                return;
+            }
+            ed.apply_modal_line(line);
+        }
+        if ctrl && key.code == KeyCode::Char('g') && key.kind == KeyEventKind::Press {
+            self.begin_external_edit();
             return;
         }
         // Escape changes Vim state before review/cancel handlers can discard.
         if self.vim_mode && key.code == KeyCode::Esc {
             if let Some(ed) = &mut self.editor {
-                let mut line = ed.modal_line();
+                let mut line = ed.take_modal_line();
                 ed.vim.key(&mut line, key, vim::Surface::Editor);
-                ed.apply_modal_line(&line);
+                ed.apply_modal_line(line);
             }
             return;
         }
@@ -8277,52 +8405,45 @@ impl App {
             return;
         };
         if self.vim_mode {
-            let mut line = ed.modal_line();
+            let mut line = ed.take_modal_line();
             match ed.vim.key(&mut line, key, vim::Surface::Editor) {
                 vim::Outcome::Handled | vim::Outcome::Escape => {
-                    ed.apply_modal_line(&line);
+                    ed.apply_modal_line(line);
                     return;
                 }
                 vim::Outcome::Help => {
+                    ed.apply_modal_line(line);
                     self.vim_help = true;
                     return;
                 }
-                vim::Outcome::Pass => {}
-            }
-        }
-        match key.code {
-            KeyCode::Esc => self.editor = None,
-            KeyCode::Enter => {
-                ed.chars.insert(ed.cursor, '\n');
-                ed.cursor += 1;
-            }
-            KeyCode::Tab => {
-                ed.chars.insert(ed.cursor, ' ');
-                ed.chars.insert(ed.cursor + 1, ' ');
-                ed.cursor += 2;
-            }
-            KeyCode::Backspace => ed.backspace(),
-            KeyCode::Delete => ed.delete(),
-            KeyCode::Left => ed.left(),
-            KeyCode::Right => ed.right(),
-            KeyCode::Up => ed.move_vertical(false),
-            KeyCode::Down => ed.move_vertical(true),
-            KeyCode::Home => {
-                while ed.cursor > 0 && ed.chars[ed.cursor - 1] != '\n' {
-                    ed.cursor -= 1;
+                vim::Outcome::Pass => {
+                    ed.apply_modal_line(line);
                 }
             }
-            KeyCode::End => {
-                while ed.cursor < ed.chars.len() && ed.chars[ed.cursor] != '\n' {
-                    ed.cursor += 1;
-                }
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ed.chars.insert(ed.cursor, c);
-                ed.cursor += 1;
-            }
-            _ => {}
         }
+        let mut line = ed.take_modal_line();
+        if !selection_navigation(&mut line, key) {
+            match key.code {
+                KeyCode::Enter => line.newline(),
+                KeyCode::Tab => line.insert_str("  "),
+                KeyCode::Backspace if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {
+                    line.delete_word_back()
+                }
+                KeyCode::Backspace => line.backspace(),
+                KeyCode::Delete => line.delete(),
+                KeyCode::Char('u') if ctrl => line.kill_to_start(),
+                KeyCode::Char('k') if ctrl => line.kill_to_end(),
+                KeyCode::Char('w') if ctrl => line.delete_word_back(),
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    line.delete_word_forward()
+                }
+                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    line.insert_char(c)
+                }
+                _ => {}
+            }
+        }
+        ed.apply_modal_line(line);
     }
 
     fn key(&mut self, key: KeyEvent) {
@@ -8338,7 +8459,10 @@ impl App {
         if self.external_clear_key(&key) {
             return;
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
             if self.branch_summary.intent.is_some() {
                 self.cancel_branch_summary();
                 self.notes.push("Branch summary review dismissed.".into());
@@ -9102,6 +9226,9 @@ impl App {
                                 let cursor = chars.len();
                                 self.editor_generation = self.editor_generation.wrapping_add(1);
                                 self.editor = Some(EditorState {
+                                    draft: None,
+                                    original: None,
+                                    confirm_exit: false,
                                     review_base_version,
                                     vim: vim::Vim::default(),
                                     tool_id: tool.id.clone(),
@@ -9375,6 +9502,9 @@ impl App {
                 let chars: Vec<char> = code.chars().collect();
                 self.editor_generation = self.editor_generation.wrapping_add(1);
                 self.editor = Some(EditorState {
+                    draft: None,
+                    original: None,
+                    confirm_exit: false,
                     review_base_version: None,
                     vim: vim::Vim::default(),
                     tool_id: m.id,
@@ -10166,6 +10296,31 @@ impl App {
     fn input_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if history_key(&mut self.input, key) {
+            self.update_mention();
+            return;
+        }
+        if ctrl
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('c' | 'C' | 'x' | 'X'))
+        {
+            let selected = if matches!(key.code, KeyCode::Char('x' | 'X')) {
+                self.input.cut_selection()
+            } else {
+                self.input.selected_text()
+            };
+            if let Some(text) = selected {
+                self.copy_text(&text, "selection");
+            }
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && !(ctrl && matches!(key.code, KeyCode::Left | KeyCode::Right))
+            && selection_navigation(&mut self.input, key)
+        {
+            self.update_mention();
+            return;
+        }
         if self.input.searching().is_some() {
             let history = self.input_history();
             match key.code {
@@ -10195,6 +10350,17 @@ impl App {
                 self.input.set(EXAMPLES[d as usize - '1' as usize]);
                 return;
             }
+        }
+        if matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Up
+                | KeyCode::Down
+        ) {
+            self.input.prepare_selection(false);
         }
         let page = self.chat_view_height.saturating_sub(1).max(1);
         let empty = self.input.is_empty();
@@ -10381,16 +10547,21 @@ impl App {
         }
         if let Some(ed) = &mut self.editor {
             self.editor_generation = self.editor_generation.wrapping_add(1);
+            if ed.original.is_none() {
+                ed.original = Some(ed.text());
+            }
             if self.vim_mode {
-                let mut line = ed.modal_line();
+                let mut line = ed.take_modal_line();
                 ed.vim.paste(&mut line, text);
-                ed.apply_modal_line(&line);
+                ed.apply_modal_line(line);
                 return;
             }
-            let chars: Vec<char> = text.replace("\r\n", "\n").chars().collect();
-            let n = chars.len();
-            ed.chars.splice(ed.cursor..ed.cursor, chars);
-            ed.cursor += n;
+            if ed.original.is_none() {
+                ed.original = Some(ed.text());
+            }
+            let mut line = ed.take_modal_line();
+            line.insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+            ed.apply_modal_line(line);
             return;
         }
         if let Some(f) = &mut self.settings_form {
@@ -10420,6 +10591,7 @@ impl App {
 
 fn draw(f: &mut Frame, app: &mut App) {
     app.click_targets.borrow_mut().clear();
+    app.draft_hits.borrow_mut().clear();
     app.refresh_toasts();
     if let Some(w) = &app.wizard {
         draw_wizard(f, w, app.color);
@@ -11116,6 +11288,89 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Shared nonmodal history keys. These work in both Vim modes too.
+fn history_key(line: &mut input::InputLine, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Char('_') if ctrl && shift => {
+            line.redo();
+        }
+        KeyCode::Char('_') | KeyCode::Char('/') if ctrl => {
+            line.undo();
+        }
+        KeyCode::Char('/') if alt => {
+            line.redo();
+        }
+        KeyCode::Char('y') if ctrl => {
+            line.yank();
+        }
+        KeyCode::Char('y' | 'Y') if alt => {
+            line.cycle_yank();
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn selection_navigation(line: &mut input::InputLine, key: KeyEvent) -> bool {
+    if !matches!(
+        key.code,
+        KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Up | KeyCode::Down
+    ) {
+        return false;
+    }
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    line.prepare_selection(shift);
+    let word = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Left if word => line.word_left(),
+        KeyCode::Right if word => line.word_right(),
+        KeyCode::Left => line.left(),
+        KeyCode::Right => line.right(),
+        KeyCode::Home => line.home(),
+        KeyCode::End => line.end(),
+        KeyCode::Up => line.vertical(false),
+        KeyCode::Down => line.vertical(true),
+        _ => unreachable!(),
+    }
+    true
+}
+
+/// Hit regions follow rendered grapheme cells, not UTF-8 bytes or char counts.
+fn draft_row_hits(app: &App, row: &str, byte: usize, area: Rect, left: usize) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut col = 0usize;
+    let mut hits = app.draft_hits.borrow_mut();
+    for (at, g) in row.grapheme_indices(true) {
+        let end = col + text::width(g);
+        if end > left && col < left + area.width as usize {
+            let x = col.saturating_sub(left);
+            let width = end
+                .saturating_sub(left)
+                .min(area.width as usize)
+                .saturating_sub(x);
+            if width > 0 {
+                hits.push((
+                    Rect::new(area.x + x as u16, area.y, width as u16, 1),
+                    byte + at,
+                ));
+            }
+        }
+        col = end;
+    }
+    let end = col.saturating_sub(left).min(area.width as usize);
+    if end < area.width as usize {
+        hits.push((
+            Rect::new(area.x + end as u16, area.y, area.width - end as u16, 1),
+            byte + row.len(),
+        ));
+    }
+}
+
 fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     if let Some(find) = app.find.as_ref().filter(|_| app.view == View::Chat) {
         let n = find.rows.len();
@@ -11192,13 +11447,49 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         let height = area.height.saturating_sub(2).max(1) as usize;
         // Keep the cursor row on screen.
         let top = cur.0.saturating_sub(height - 1);
+        let styled = app.input.styled_rows(avail, top, height);
+        let mut byte = 0;
+        let offsets: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                let at = byte;
+                byte += row.len();
+                if app.input.as_bytes().get(byte) == Some(&b'\n') {
+                    byte += 1;
+                }
+                at
+            })
+            .collect();
         for (i, row) in rows.into_iter().enumerate().skip(top).take(height) {
+            draft_row_hits(
+                app,
+                &row,
+                offsets[i],
+                Rect::new(
+                    area.x + 1 + prompt_w as u16,
+                    area.y + 1 + (i - top) as u16,
+                    avail as u16,
+                    1,
+                ),
+                0,
+            );
             let lead = if i == 0 {
                 Span::styled(prompt, bold_fg(app.color, color))
             } else {
                 Span::raw(" ".repeat(prompt_w))
             };
-            lines.push(Line::from(vec![lead, Span::raw(row)]));
+            let mut spans = vec![lead];
+            spans.extend(styled[i - top].iter().map(|(text, selected)| {
+                Span::styled(
+                    text.clone(),
+                    if *selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                )
+            }));
+            lines.push(Line::from(spans));
         }
         cursor = Some((cur.0 - top, cur.1));
     }
@@ -12920,6 +13211,9 @@ impl App {
             .collect();
         self.editor_generation = self.editor_generation.wrapping_add(1);
         self.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: d.tool.id.clone(),
@@ -13016,6 +13310,9 @@ impl App {
         let chars: Vec<char> = text.chars().collect();
         self.editor_generation = self.editor_generation.wrapping_add(1);
         self.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: d.tool.id.clone(),
@@ -16547,11 +16844,54 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
         })
         .collect();
     f.render_widget(Paragraph::new(gutter), cols[0]);
-    let lines: Vec<Line> = text.split('\n').map(|l| Line::raw(l.to_string())).collect();
-    f.render_widget(
-        Paragraph::new(lines).scroll((scroll_y as u16, scroll_x as u16)),
-        cols[1],
-    );
+    let mut byte = 0;
+    for (i, row) in text.split('\n').enumerate() {
+        if i >= scroll_y && i < scroll_y + height {
+            draft_row_hits(
+                app,
+                row,
+                byte,
+                Rect::new(
+                    cols[1].x,
+                    cols[1].y + (i - scroll_y) as u16,
+                    cols[1].width,
+                    1,
+                ),
+                scroll_x,
+            );
+        }
+        byte += row.len() + 1;
+    }
+    let line = ed.modal_line();
+    let selected = line.selection();
+    let mut offset: usize = text
+        .split('\n')
+        .take(scroll_y)
+        .map(|row| row.len() + 1)
+        .sum();
+    let lines: Vec<Line> = text
+        .split('\n')
+        .skip(scroll_y)
+        .take(height)
+        .map(|row| {
+            let spans: Vec<_> = input::selection_spans(row, offset, selected.as_ref())
+                .into_iter()
+                .map(|(text, selected)| {
+                    Span::styled(
+                        text,
+                        if selected {
+                            Style::default().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        },
+                    )
+                })
+                .collect();
+            offset += row.len() + 1;
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).scroll((0, scroll_x as u16)), cols[1]);
     f.set_cursor_position((
         cols[1].x + (cursor_col - scroll_x) as u16,
         cols[1].y + (cursor_line - scroll_y) as u16,
@@ -16561,7 +16901,11 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
         EditMode::Code => " Ctrl+D review diff and checks · Ctrl+S save as new version (smoke-tested) · Esc cancel",
         _ => " Ctrl+S save as new version (smoke-tested) · Esc cancel",
     };
-    let hints = format!("{hints} · Ctrl+G external editor");
+    let hints = if ed.confirm_exit {
+        " Discard unsaved edit? y discard · n/Esc keep".to_owned()
+    } else {
+        format!("{hints} · Ctrl+G external editor · Ctrl+_ undo · Alt+/ redo")
+    };
     let hints = if app.vim_mode {
         hints.replace(
             "Esc cancel",
@@ -17334,9 +17678,162 @@ mod tests {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            draft_hits: Default::default(),
+            selecting_draft: false,
             last_click: None,
             stream_cache: Default::default(),
         }
+    }
+
+    #[test]
+    fn draft_history_keys_and_selection_restore_pastes_and_cursor() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.input = input::InputLine::from("a👩🏽‍💻文");
+        app.input_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        app.input_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(app.input.selected_text().as_deref(), Some("👩🏽‍💻文"));
+        app.input_key(key(KeyCode::Char('é')));
+        assert_eq!(app.input.expanded(), "aé");
+        app.input_key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.expanded(), "a👩🏽‍💻文");
+        assert_eq!(app.input.selected_text().as_deref(), Some("👩🏽‍💻文"));
+        let rows = app.input.styled_rows(80, 0, 24);
+        assert_eq!(
+            rows[0]
+                .iter()
+                .filter(|(_, selected)| *selected)
+                .map(|(s, _)| s.as_str())
+                .collect::<String>(),
+            "👩🏽‍💻文"
+        );
+    }
+
+    #[test]
+    fn editor_dirty_exit_keeps_buffer_and_undo_until_explicit_discard() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "private".into(),
+            name: "private".into(),
+            chars: "old".chars().collect(),
+            cursor: 3,
+            mode: EditMode::Code,
+        });
+        app.editor_key(key(KeyCode::Char('!')));
+        let generation = app.editor_generation;
+        app.editor_key(key(KeyCode::Esc));
+        assert!(app.editor.as_ref().unwrap().confirm_exit);
+        let screen = render(&mut app, 80, 24);
+        assert!(
+            screen.contains("y discard") && screen.contains("n/Esc keep"),
+            "{screen}"
+        );
+        assert_eq!(app.editor.as_ref().unwrap().text(), "old!");
+        app.editor_key(key(KeyCode::Esc));
+        assert!(!app.editor.as_ref().unwrap().confirm_exit);
+        app.editor_key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "old");
+        assert!(app.editor_generation > generation);
+        app.editor_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "old!");
+        app.editor_key(key(KeyCode::Esc));
+        app.editor_key(key(KeyCode::Char('y')));
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn draft_mouse_selection_renders_reversed_without_copying_automatically() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.input = input::InputLine::from("a文👩🏽‍💻z");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let first = app
+            .draft_hits
+            .borrow()
+            .iter()
+            .find(|(_, at)| *at == 1)
+            .unwrap()
+            .0;
+        let last = app
+            .draft_hits
+            .borrow()
+            .iter()
+            .find(|(_, at)| *at == app.input.len())
+            .unwrap()
+            .0;
+        let notes = app.notes.len();
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first.x,
+            row: first.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: last.x,
+            row: last.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.input.selected_text().as_deref(), Some("文👩🏽‍💻z"));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(terminal.backend().buffer()[(first.x, first.y)]
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert_eq!(
+            app.notes.len(),
+            notes,
+            "selection must not issue an implicit copy"
+        );
+        let selected = app.input.selected_text().unwrap();
+        use base64::Engine;
+        assert!(
+            osc52(&selected).contains(&base64::engine::general_purpose::STANDARD.encode(selected))
+        );
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: last.x,
+            row: last.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.selecting_draft);
+    }
+
+    #[test]
+    fn editor_vim_edits_share_history_and_escape_preserves_it() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
+            review_base_version: Some(7),
+            vim: vim::Vim::default(),
+            tool_id: "private".into(),
+            name: "private".into(),
+            chars: "α".chars().collect(),
+            cursor: 1,
+            mode: EditMode::Code,
+        });
+        app.key(key(KeyCode::Char('β')));
+        app.key(key(KeyCode::Char('文')));
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "αβ文");
+        assert_eq!(app.editor.as_ref().unwrap().vim.mode, vim::Mode::Normal);
+        app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "α");
+        assert_eq!(app.editor.as_ref().unwrap().review_base_version, Some(7));
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "αβ文");
+        assert_eq!(app.editor.as_ref().unwrap().vim.mode, vim::Mode::Normal);
     }
 
     #[test]
@@ -19413,6 +19910,9 @@ mod tests {
     #[test]
     fn editor_works_in_grapheme_clusters() {
         let ed = |s: &str, cursor: usize| EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t".into(),
@@ -19447,9 +19947,46 @@ mod tests {
     }
 
     #[test]
+    fn programmatic_editor_replacement_clamps_stale_cursor_and_preserves_unicode_undo() {
+        let old = "previous schema skeleton ".repeat(6);
+        let mut ed = EditorState {
+            draft: Some(input::InputLine::from(old.as_str())),
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "private".into(),
+            name: "schema".into(),
+            chars: old.chars().collect(),
+            cursor: old.chars().count(),
+            mode: EditMode::Schemas,
+        };
+        let replacement = "a\u{301}👩🏽‍💻";
+        ed.chars = replacement.chars().collect(); // old cursor is intentionally stale.
+        let mut line = ed.take_modal_line();
+        assert_eq!(&*line, replacement);
+        assert_eq!(line.cursor_byte(), replacement.len());
+        assert!(line.undo());
+        assert_eq!(&*line, old.as_str());
+        assert!(line.redo());
+        assert_eq!(&*line, replacement);
+        ed.apply_modal_line(line);
+        assert_eq!(ed.cursor, replacement.chars().count());
+        ed.cursor = 1; // Between a base letter and its combining mark.
+        let line = ed.take_modal_line();
+        assert_eq!(line.cursor_byte(), 0);
+        ed.apply_modal_line(line);
+        assert_eq!(ed.cursor, 0);
+        assert_eq!(ed.text(), replacement);
+    }
+
+    #[test]
     fn editor_edits_text_and_moves_cursor() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t1".into(),
@@ -19470,7 +20007,12 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.editor.as_ref().unwrap().text().starts_with("\nline1"));
         app.key(key(KeyCode::Esc));
-        assert!(app.editor.is_none(), "Esc cancels the editor");
+        assert!(
+            app.editor.as_ref().unwrap().confirm_exit,
+            "first Esc asks before losing the draft"
+        );
+        app.key(key(KeyCode::Char('y')));
+        assert!(app.editor.is_none(), "explicit discard closes the editor");
     }
 
     #[test]
@@ -19977,6 +20519,9 @@ mod tests {
             session_id: None,
         });
         app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t".into(),
@@ -20402,6 +20947,9 @@ mod tests {
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t".into(),
@@ -24851,6 +25399,9 @@ mod tests {
         let mut vim = vim::Vim::default();
         vim.mode = vim::Mode::Normal;
         app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim,
             tool_id: "private".into(),
@@ -24928,6 +25479,9 @@ mod tests {
         let (client, sent) = DaemonClient::recording();
         app.client = Some(client);
         app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "private-tool".into(),
@@ -24953,6 +25507,8 @@ mod tests {
         );
         assert!(app.editor.is_some());
         app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.editor.as_ref().unwrap().confirm_exit);
+        app.key(key(KeyCode::Char('y')));
         assert!(app.editor.is_none());
     }
 
@@ -24976,6 +25532,9 @@ mod tests {
             .any(|line| line.contains("Vim: d/c/y")));
         app.pager = None;
         app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "private".into(),
@@ -25081,6 +25640,9 @@ mod tests {
         let mut app = test_app();
         app.vim_mode = true;
         app.editor = Some(EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "private".into(),

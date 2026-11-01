@@ -3292,7 +3292,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   Insert, with `INSERT` / `NORMAL` shown in their border and `?` help in Normal.
   Insert Esc only enters Normal, preserving text and any active Run. Normal
   composer Esc retains Run-stop/cancel behavior; editor Esc always keeps text,
-  with Ctrl+S save and explicit Ctrl+Q cancel shown in the footer.
+  with Ctrl+S save and explicit Ctrl+Q leave shown in the footer. Leaving a
+  modified editor asks once; y discards and closes, n or Esc keeps the full
+  buffer and undo history. Non-Vim editor Esc uses the same confirmation.
   Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
   those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
   ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
@@ -3872,6 +3874,24 @@ Both config-file and temporary-buffer handoffs reuse
 the same terminal suspension/restoration and force-redraw-from-scratch path.
 
 ### 10.5 Input and keys
+
+The composer and internal Tool editor retain bounded local undo snapshots of
+text, cursor, selection and collapsed-paste backing text. Consecutive typing
+coalesces until navigation or another command. Undo/redo retain at most 128
+snapshots and 16 MiB of payload; the live draft is never truncated. A snapshot
+larger than that bound creates an explicit history boundary. The private kill
+ring retains at most 16 entries and 1 MiB, without splitting Unicode text.
+These buffers belong to the editing surface, never the daemon or transcript.
+`Ctrl+_` (also `Ctrl+/`) undoes; `Ctrl+Shift+_` or `Alt+/` redoes.
+`Ctrl+U/K/W` and `Alt+D` save deleted text privately; consecutive kills join
+in original text order. `Ctrl+Y` yanks and `Alt+Y` cycles only immediately
+following a yank. Shift+arrows/Home/End select grapheme-safe text, expanding
+paste placeholders first; selections render reversed. `Ctrl+Shift+C/X`
+explicitly copy/cut that exact selection through the existing OSC 52 path.
+Mouse click places the draft cursor and drag selects visible grapheme cells in
+both editors; scrolling remains separate. Selection never copies implicitly.
+Tool editor replacement through Ctrl+G or hunk review is one undo step;
+undo, redo and replacements invalidate prior asynchronous editor previews.
 
 - Enter: send / Steer while running. Queue: Ctrl+Enter where the
   terminal supports the kitty keyboard protocol (enabled when available;

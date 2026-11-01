@@ -300,6 +300,9 @@ fn hunk_review_wrong_owner_hidden_modal_and_reconnect_cannot_mutate() {
 fn hunk_tool_editor(app: &mut App) {
     app.editor_generation = 7;
     app.editor = Some(EditorState {
+        draft: None,
+        original: None,
+        confirm_exit: false,
         review_base_version: Some(3),
         vim: vim::Vim::default(),
         tool_id: "tool-id".into(),
@@ -371,6 +374,17 @@ fn hunk_review_tool_replaces_only_matching_draft_and_ctrl_s_keeps_save_gate() {
         matches!(save.request,Request::UpdateToolCode{ref id,ref code} if id=="tool-id"&&code=="old\n")
     );
     assert!(app.hunk_review.context.is_none());
+    let generation = app.editor_generation;
+    app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+    assert_eq!(app.editor.as_ref().unwrap().text(), "new\n");
+    assert!(app.editor_generation > generation);
+    assert_eq!(app.editor.as_ref().unwrap().review_base_version, Some(3));
+    app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+    assert_eq!(app.editor.as_ref().unwrap().text(), "old\n");
+    assert!(
+        sent.try_recv().is_err(),
+        "undo/redo never saves a Tool automatically"
+    );
 }
 
 #[test]

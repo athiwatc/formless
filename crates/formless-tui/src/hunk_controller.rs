@@ -226,12 +226,14 @@ impl App {
                 let mode = editor.vim.mode;
                 editor.vim.reset();
                 editor.vim.mode = mode;
-                editor.chars = code.chars().collect();
-                editor.cursor = editor.cursor.min(editor.chars.len());
-                // A previous char index can land inside a new grapheme.
-                let mut line = editor.modal_line();
-                line.set_modal_cursor(line.cursor_byte());
-                editor.apply_modal_line(&line);
+                if editor.original.is_none() {
+                    editor.original = Some(editor.text());
+                }
+                let mut line = editor.take_modal_line();
+                let at = line.cursor_byte();
+                line.set(code);
+                line.set_modal_cursor(at);
+                editor.apply_modal_line(line);
                 self.editor_generation = self.editor_generation.wrapping_add(1);
             }
             *current_hash = document.candidate_hash.clone().unwrap();

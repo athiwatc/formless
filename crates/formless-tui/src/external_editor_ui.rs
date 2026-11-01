@@ -287,8 +287,12 @@ impl App {
                 self.description_editor_revision = self.description_editor_revision.wrapping_add(1);
                 if let Some(ed) = &mut self.editor {
                     let mode = ed.vim.mode;
-                    ed.chars = text.chars().collect();
-                    ed.cursor = ed.chars.len();
+                    if ed.original.is_none() {
+                        ed.original = Some(ed.text());
+                    }
+                    let mut line = ed.take_modal_line();
+                    line.set(&text);
+                    ed.apply_modal_line(line);
                     ed.vim.reset();
                     ed.vim.mode = mode;
                 }
@@ -412,6 +416,9 @@ mod tests {
     }
     fn editor(text: &str, mode: EditMode) -> EditorState {
         EditorState {
+            draft: None,
+            original: None,
+            confirm_exit: false,
             review_base_version: Some(1),
             vim: vim::Vim::default(),
             tool_id: "private-editor-tool".into(),
@@ -539,11 +546,17 @@ mod tests {
         assert_eq!(app.editor_generation, original_generation.wrapping_add(1));
         assert_eq!(app.editor.as_ref().unwrap().text(), "replacement code");
         assert_eq!(app.editor.as_ref().unwrap().review_base_version, Some(7));
+        app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "unchanged code");
+        assert!(app.editor_generation > original_generation.wrapping_add(1));
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "replacement code");
+        let after_history = app.editor_generation;
         // Reopening an identical buffer cannot revive an earlier operation.
         app.editor = Some(editor("unchanged code", EditMode::Code));
         app.apply_external_edit(&origin, "STALE replacement");
         assert_eq!(app.editor.as_ref().unwrap().text(), "unchanged code");
-        assert_eq!(app.editor_generation, original_generation.wrapping_add(1));
+        assert_eq!(app.editor_generation, after_history);
     }
     #[test]
     fn empty_tool_external_confirmation_requires_both_operation_and_editor_generation() {
