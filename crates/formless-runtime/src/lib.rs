@@ -6,6 +6,7 @@ pub mod caps;
 mod dns;
 mod processes;
 pub mod sensitive_paths;
+pub mod structured_output;
 pub mod sync;
 pub use caps::Capabilities;
 pub use sync::LockExt;

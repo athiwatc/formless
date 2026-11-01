@@ -276,6 +276,19 @@ without redesign.
   parts with `cache_control: {type: ephemeral}`.
 - Sampling params (`temperature`, `max_tokens`) are **not** exposed in v1;
   provider defaults rule.
+- Structured-output validation foundation (#618): immutable call options default
+  to legacy text, or hold an unchanged JSON Schema and an offline validator.
+  This foundation does not yet enable provider transport, `llm.complete` schema
+  arguments or optimiser migration. Schemas are limited to 64 KiB serialized,
+  4096 JSON nodes and depth 48; local JSON-pointer references to recognized schema
+  locations are supported with reference depth 64 and expanded work 16384 nodes.
+  External references, resource IDs, dynamic/anchor and recursive references
+  fail before any request. References inside `const`, `default`, `enum` and
+  `examples` remain ordinary unchanged data. Validation uses bounded regex
+  compilation/backtracking and accepts exactly one whole JSON value (no prose
+  extraction/coercion), at most 1 MiB, 16384 nodes and depth 64. Errors do not echo
+  schema/output values. These limits are not a wall-clock deadline or OS sandbox.
+  Existing Tool input/output schema handling is unchanged.
 - API key storage: OS keychain (macOS Keychain, Windows Credential Manager,
   Linux Secret Service) with a `0600`-permission file fallback. Keys are
   never written to `config.toml` in plaintext, never logged, never sent
