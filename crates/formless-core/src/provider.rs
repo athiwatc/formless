@@ -1007,6 +1007,48 @@ pub fn proxy_in_use(cfg: &ProviderCfg) -> Option<String> {
     .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
+/// One forced refresh for the entire logical call, across model fallbacks,
+/// request repairs and paginated model listings. Failed refresh is context,
+/// not an early return that suppresses the caller's normal failover.
+#[derive(Default)]
+struct AuthRecovery {
+    attempted: bool,
+    failure: Option<String>,
+    original_401: Option<String>,
+}
+
+impl AuthRecovery {
+    fn detail(&self) -> String {
+        self.failure
+            .as_ref()
+            .map(|e| format!("; OAuth refresh failed: {e}"))
+            .unwrap_or_default()
+    }
+
+    fn error(&self, message: impl std::fmt::Display) -> anyhow::Error {
+        let context = self
+            .original_401
+            .as_ref()
+            .map(|original| {
+                format!(
+                    "; initial authentication failure: {original}{}",
+                    self.detail()
+                )
+            })
+            .unwrap_or_default();
+        anyhow!("{message}{context}")
+    }
+
+    fn annotate(&self, error: anyhow::Error) -> anyhow::Error {
+        if self.original_401.is_some() {
+            let message = self.error(format!("{error:#}")).to_string();
+            error.context(message)
+        } else {
+            error
+        }
+    }
+}
+
 impl Provider {
     pub fn new(cfg: ProviderCfg, api_key: String) -> Result<Self> {
         let http = http_client(&cfg.proxy)?;
@@ -1064,7 +1106,27 @@ impl Provider {
         paths: Paths,
         http: reqwest::Client,
     ) -> Result<Self> {
-        let api_key = crate::auth::resolve_provider_token(&paths, &cfg).await?;
+        Self::for_named_profile_with(cfg, paths, http, crate::config::DEFAULT_PROVIDER).await
+    }
+
+    pub async fn for_named_profile_with(
+        cfg: ProviderCfg,
+        paths: Paths,
+        http: reqwest::Client,
+        name: &str,
+    ) -> Result<Self> {
+        let api_key = if !cfg.oauth() && name != crate::config::DEFAULT_PROVIDER {
+            crate::config::provider_key(&paths, name).unwrap_or_default()
+        } else {
+            crate::auth::resolve_provider_token(&paths, &cfg)
+                .await
+                .with_context(|| {
+                    format!(
+                        "provider '{name}': run `{}`",
+                        crate::auth::login_command(name)
+                    )
+                })?
+        };
         Ok(Self {
             cfg,
             api_key,
@@ -1075,16 +1137,71 @@ impl Provider {
             on_breaker_note: None,
             on_usage: None,
             on_request: None,
-            name: crate::config::DEFAULT_PROVIDER.to_string(),
+            name: name.to_string(),
             http,
         })
     }
 
     async fn credential(&self) -> Result<String> {
         match &self.credential_paths {
-            Some(paths) => crate::auth::resolve_provider_token(paths, &self.cfg).await,
+            Some(paths) if !self.cfg.oauth() && self.name != crate::config::DEFAULT_PROVIDER => {
+                Ok(crate::config::provider_key(paths, &self.name).unwrap_or_default())
+            }
+            Some(paths) => crate::auth::resolve_provider_token(paths, &self.cfg)
+                .await
+                .with_context(|| {
+                    format!(
+                        "provider '{}': run `{}`",
+                        self.name,
+                        crate::auth::login_command(&self.name)
+                    )
+                }),
             None => Ok(self.api_key.clone()),
         }
+    }
+
+    async fn recover_unauthorized(&self, rejected: &str, state: &mut AuthRecovery) -> bool {
+        if state.attempted || !self.cfg.oauth() {
+            return false;
+        }
+        let Some(paths) = &self.credential_paths else {
+            return false;
+        };
+        state.attempted = true;
+        match crate::auth::force_refresh_provider_token(paths, &self.cfg, rejected).await {
+            Ok(_) => true,
+            Err(error) => {
+                state.failure = Some(format!("{error:#}"));
+                false
+            }
+        }
+    }
+
+    async fn send_authenticated<F>(
+        &self,
+        build: F,
+        state: &mut AuthRecovery,
+    ) -> Result<(reqwest::Response, String)>
+    where
+        F: Fn(&str) -> reqwest::RequestBuilder,
+    {
+        loop {
+            let credential = self.credential().await?;
+            let response = build(&credential).send().await?;
+            if response.status().as_u16() == 401
+                && self.recover_unauthorized(&credential, state).await
+            {
+                continue;
+            }
+            return Ok((response, credential));
+        }
+    }
+
+    fn redacted_error(&self, text: &str, credential: &str) -> String {
+        let mut known = vec![credential];
+        known.extend(self.cfg.extra_headers.values().map(String::as_str));
+        known.extend(self.cfg.query_params.values().map(String::as_str));
+        crate::secrets::redact_known(text, &known)
     }
 
     /// Route this provider's requests to a stable prompt cache (e.g. one
@@ -1272,7 +1389,7 @@ impl Provider {
             }
         });
         let native = match probe_tool_call(self, model, &tool, true).await {
-            Err(e) if is_tool_choice_rejection(&e.to_string()) => {
+            Err(e) if e.is::<ToolChoiceRejection>() => {
                 probe_tool_call(self, model, &tool, false).await
             }
             r => r,
@@ -1311,26 +1428,32 @@ impl Provider {
     /// (`has_more` / `after_id`), joined into one `data` list.
     async fn models_body(&self) -> Result<Value> {
         const MAX_PAGES: usize = 20;
-        let credential = self.credential().await?;
+        let mut auth = AuthRecovery::default();
         let mut all: Option<Value> = None;
         let mut after: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let mut req = self.http.get(url(&self.cfg.base_url, "models"));
-            if self.cfg.anthropic() {
-                req = req.query(&[("limit", "1000")]);
-                if let Some(id) = &after {
-                    req = req.query(&[("after_id", id.as_str())]);
-                }
-            }
-            let resp = apply_headers(req, &self.cfg, &credential)
-                .send()
+            let (resp, credential) = self
+                .send_authenticated(
+                    |credential| {
+                        let mut req = self.http.get(url(&self.cfg.base_url, "models"));
+                        if self.cfg.anthropic() {
+                            req = req.query(&[("limit", "1000")]);
+                            if let Some(id) = &after {
+                                req = req.query(&[("after_id", id.as_str())]);
+                            }
+                        }
+                        apply_headers(req, &self.cfg, credential)
+                    },
+                    &mut auth,
+                )
                 .await
                 .context("GET /models")?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(anyhow!(
-                    "GET /models failed: {status}: {}",
-                    resp.text().await.unwrap_or_default()
+                    "GET /models failed: {status}: {}{}",
+                    self.redacted_error(&resp.text().await.unwrap_or_default(), &credential),
+                    auth.detail()
                 ));
             }
             let page: Value = resp.json().await.context("parse /models")?;
@@ -1537,6 +1660,17 @@ impl Provider {
         effort: Option<&str>,
         allow_failover: bool,
     ) -> Result<(reqwest::Response, Recovered, String, BreakerPermit)> {
+        self.post_provider_with_auth(body, effort, allow_failover, &mut AuthRecovery::default())
+            .await
+    }
+
+    async fn post_provider_with_auth(
+        &self,
+        body: &mut Value,
+        effort: Option<&str>,
+        allow_failover: bool,
+        auth: &mut AuthRecovery,
+    ) -> Result<(reqwest::Response, Recovered, String, BreakerPermit)> {
         let endpoint = if self.cfg.anthropic() {
             "messages"
         } else if self.cfg.responses() {
@@ -1560,20 +1694,25 @@ impl Provider {
         let mut applied_fixes = Vec::new();
         let mut last_err = String::new();
         for model in &models {
-            let credential = self.credential().await?;
+            let credential = self
+                .credential()
+                .await
+                .map_err(|error| auth.annotate(error))?;
             let Some(mut permit) = self.breaker_permit(model, &credential) else {
                 last_err =
                     format!("model {model}: circuit breaker is open, probing, or at active-identity capacity");
                 continue;
             };
             let mut with_effort = effort.is_some();
-            let mut reauthed = false;
             // Retries count transient failures only; a resend after fixing a
             // rejected request (each fix happens at most once) is not one
             // (#1088), so `sends` just bounds the total.
             let (mut attempt, mut sends) = (0, 0);
             'attempts: while attempt <= self.cfg.max_retries && sends <= attempt + MAX_RESENDS {
-                let lease = self.request_lease().await?;
+                let lease = self
+                    .request_lease()
+                    .await
+                    .map_err(|error| auth.annotate(error))?;
                 sends += 1;
                 let mut b = body.clone();
                 b["model"] = json!(model);
@@ -1594,7 +1733,10 @@ impl Provider {
                         b["reasoning_effort"] = json!(effort);
                     }
                 }
-                let credential = self.credential().await?;
+                let credential = self
+                    .credential()
+                    .await
+                    .map_err(|error| auth.annotate(error))?;
                 // A live key/OAuth refresh must not charge failures to a
                 // different credential identity captured before the refresh.
                 if self.breaker_key(model, &credential) != permit.key {
@@ -1621,15 +1763,20 @@ impl Provider {
                             return Ok((resp, recovered, model.clone(), permit));
                         }
                         server_wait = retry_after(resp.headers());
-                        let text = resp.text().await.unwrap_or_default();
-                        self.report_error_usage(&text, model)?;
+                        let raw_text = resp.text().await.unwrap_or_default();
+                        self.report_error_usage(&raw_text, model)
+                            .map_err(|error| auth.annotate(error))?;
+                        let text = self.redacted_error(&raw_text, &credential);
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
                         last_err = match server_wait {
                             Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
                             None => format!("{status}: {text}"),
                         };
-                        let lower = text.to_lowercase();
+                        // Recovery inspects protocol data, never display text:
+                        // masking even a one-character synthetic credential can
+                        // remove a keyword or numeric limit from the diagnostic.
+                        let lower = raw_text.to_lowercase();
                         let rejected = OPTIONAL_PARAMS
                             .iter()
                             .find(|p| body.get(**p).is_some() && lower.contains(**p));
@@ -1642,7 +1789,7 @@ impl Provider {
                             }
                             continue;
                         }
-                        if status.as_u16() == 400 && with_effort && is_unknown_param(&text) {
+                        if status.as_u16() == 400 && with_effort && is_unknown_param(&raw_text) {
                             with_effort = false;
                             recovered.dropped_effort = true;
                             continue;
@@ -1653,7 +1800,7 @@ impl Provider {
                         if status.as_u16() == 400 {
                             let mut repaired = body.clone();
                             let fix = if self.cfg.anthropic() {
-                                crate::anthropic::recover(&mut repaired, &text)
+                                crate::anthropic::recover(&mut repaired, &raw_text)
                             } else if lower.contains("cache_control")
                                 && body.get("__no_cache_control").is_none()
                             {
@@ -1679,25 +1826,30 @@ impl Provider {
 
                         // A rejected OAuth token (revoked, or clock skew past
                         // the expiry margin): refresh once and resend.
-                        if status.as_u16() == 401 && self.cfg.oauth() && !reauthed {
-                            if let Some(paths) = &self.credential_paths {
-                                reauthed = true;
-                                crate::auth::force_refresh_provider_token(
-                                    paths,
-                                    &self.cfg,
-                                    &credential,
-                                )
-                                .await
-                                .with_context(|| format!("provider error: {last_err}"))?;
+                        if status.as_u16() == 401 && self.cfg.oauth() {
+                            if auth.original_401.is_none() {
+                                auth.original_401 = Some(last_err.clone());
+                            }
+                            if self.recover_unauthorized(&credential, auth).await {
                                 continue;
                             }
+                            // Authentication cannot be repaired again for this
+                            // logical call; let a configured fallback still run.
+                            break 'attempts;
                         }
-                        if is_model_error(status.as_u16(), &text) {
+                        if is_model_error(status.as_u16(), &raw_text) {
                             permit.failure("model unavailable", true);
                             break; // immediately open, then fail over if configured
                         }
                         if !(status.as_u16() == 429 || status.is_server_error()) {
-                            return Err(anyhow!("provider error: {last_err}"));
+                            let error = auth.error(format!("provider error: {last_err}"));
+                            // Probes consume a typed classification rather than
+                            // searching a credential-masked error string.
+                            return Err(if is_tool_choice_rejection(&raw_text) {
+                                anyhow!(ToolChoiceRejection).context(error.to_string())
+                            } else {
+                                error
+                            });
                         }
                         reason = if status.as_u16() == 429 {
                             "rate limited".to_string()
@@ -1706,7 +1858,7 @@ impl Provider {
                         };
                     }
                     Err(e) => {
-                        last_err = e.to_string();
+                        last_err = self.redacted_error(&e.to_string(), &credential);
                         reason = "connection failed".to_string();
                     }
                 }
@@ -1725,7 +1877,7 @@ impl Provider {
                 tracing::warn!("provider model {model} failed ({last_err}); failing over");
             }
         }
-        Err(anyhow!("provider request failed after retries: {last_err}"))
+        Err(auth.error(format!("provider request failed after retries: {last_err}")))
     }
 
     /// Wait before retry `attempt` (0-based): the server's own hint when it
@@ -1854,6 +2006,7 @@ impl Provider {
             b
         };
         let mut attempt = 0;
+        let mut auth = AuthRecovery::default();
         let (state, recovered, model_used) = 'request: loop {
             // All stream assembly belongs to this attempt. Every retry path
             // drops it, including flags/finish reasons from a discarded stream.
@@ -1872,7 +2025,7 @@ impl Provider {
             // stuck endpoint must not outlive an interrupt).
             let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                r = self.post_provider(&mut body, effort, true) => r?,
+                r = self.post_provider_with_auth(&mut body, effort, true, &mut auth) => r?,
             };
             let mut charged = AttemptUsage::new(self, &model_used);
             let mut stream = resp.bytes_stream();
@@ -2254,11 +2407,12 @@ impl Provider {
         let mut notes = crate::anthropic::skipped_images(messages);
         let mut dropped_replayed_thinking = false;
         let mut attempt = 0;
+        let mut auth = AuthRecovery::default();
         let mut shown = false;
         loop {
             let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                r = self.post_provider(&mut body, None, true) => r?,
+                r = self.post_provider_with_auth(&mut body, None, true, &mut auth) => r?,
             };
             for n in recovered.notes {
                 if !notes.contains(&n) {
@@ -2424,37 +2578,57 @@ impl Provider {
     /// Server-side compaction (SPEC §11): POST {base_url}/compact with
     /// {model, input}; accepts {summary}|{output}|{content} responses.
     pub async fn compact_server(&self, text: &str, model: &str) -> Result<String> {
-        let lease = self.request_lease().await?;
         let body = json!({"model": model, "input": text});
-        let credential = self.credential().await?;
-        let mut permit = self.breaker_permit(model, &credential).ok_or_else(|| {
-            anyhow!(
-                "model {model}: circuit breaker is open, probing, or at active-identity capacity"
+        let mut auth = AuthRecovery::default();
+        let (resp, permit) = loop {
+            // Admission belongs to each physical attempt; OAuth recovery state
+            // belongs to this entire logical compaction request.
+            let lease = self
+                .request_lease()
+                .await
+                .map_err(|error| auth.annotate(error))?;
+            let credential = self
+                .credential()
+                .await
+                .map_err(|error| auth.annotate(error))?;
+            let mut permit = self.breaker_permit(model, &credential).ok_or_else(|| {
+                anyhow!("model {model}: circuit breaker is open, probing, or at active-identity capacity")
+            })?;
+            let req = apply_headers(
+                self.http.post(url(&self.cfg.base_url, "compact")),
+                &self.cfg,
+                &credential,
             )
-        })?;
-        permit.accounting = Some(self.request_accounting(model, lease));
-        let req = apply_headers(
-            self.http.post(url(&self.cfg.base_url, "compact")),
-            &self.cfg,
-            &credential,
-        )
-        .json(&body);
-        let resp = match req.send().await {
-            Ok(resp) => resp,
-            Err(error) => {
-                permit.failure("connection failed", false);
-                return Err(error).context("POST /compact");
+            .json(&body);
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    permit.failure("connection failed", false);
+                    return Err(error).context("POST /compact");
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let raw_text = resp.text().await.unwrap_or_default();
+                self.report_error_usage(&raw_text, model)
+                    .map_err(|error| auth.annotate(error))?;
+                let text = self.redacted_error(&raw_text, &credential);
+                if status.as_u16() == 401 && self.recover_unauthorized(&credential, &mut auth).await
+                {
+                    drop(permit);
+                    continue;
+                }
+                if status.as_u16() == 429 || status.is_server_error() {
+                    permit.failure("compaction provider failed", false);
+                }
+                return Err(anyhow!(
+                    "POST /compact failed: {status}: {text}{}",
+                    auth.detail()
+                ));
             }
+            permit.accounting = Some(self.request_accounting(model, lease));
+            break (resp, permit);
         };
-        let status = resp.status();
-        if !status.is_success() {
-            if status.as_u16() == 429 || status.is_server_error() {
-                permit.failure("compaction provider failed", false);
-            }
-            let text = resp.text().await.unwrap_or_default();
-            self.report_error_usage(&text, model)?;
-            return Err(anyhow!("POST /compact failed: {status}: {text}"));
-        }
         let v = completed_json(resp, permit, "parse /compact").await?;
 
         for key in ["summary", "output", "content"] {
@@ -2978,6 +3152,10 @@ pub struct ProbeResult {
     pub prompt_fallback: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("provider rejected forced tool choice")]
+struct ToolChoiceRejection;
+
 fn is_tool_choice_rejection(text: &str) -> bool {
     let t = text.to_lowercase();
     t.contains("tool_choice") && (t.contains("support") || t.contains("thinking"))
@@ -3057,6 +3235,13 @@ async fn probe_prompt_tool_call(p: &Provider, model: &str, tool: &Value) -> Resu
 /// there sets `prompt_fallback` so onboarding can save tool_mode=prompt.
 pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<ProbeResult> {
     let p = Provider::new(cfg.clone(), api_key.to_string())?;
+    probe_provider(&p, model).await
+}
+
+/// Probe through the caller's managed credentials, so OAuth 401 recovery is
+/// available to operational probes as well as ordinary requests.
+pub async fn probe_provider(p: &Provider, model: &str) -> Result<ProbeResult> {
+    let cfg = &p.cfg;
     let models = p.list_models().await.unwrap_or_default();
     // One real streamed reply, so `streaming` says what the endpoint did
     // rather than what Formless hopes (#622).
@@ -3073,7 +3258,7 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
         .await
         .is_ok()
         && deltas > 0;
-    let mut result = probe_tools(&p, cfg, model, models).await?;
+    let mut result = probe_tools(p, cfg, model, models).await?;
     result.streaming = streamed;
     Ok(result)
 }
@@ -3103,9 +3288,7 @@ async fn probe_tools(
     }
     let native = match probe_tool_call(p, model, &tool, true).await {
         Ok(v) => Ok(v),
-        Err(e) if is_tool_choice_rejection(&e.to_string()) => {
-            probe_tool_call(p, model, &tool, false).await
-        }
+        Err(e) if e.is::<ToolChoiceRejection>() => probe_tool_call(p, model, &tool, false).await,
         Err(e) => Err(e),
     };
     match native {
@@ -3156,6 +3339,10 @@ pub fn list_models_blocking(cfg: &ProviderCfg, api_key: &str) -> Result<Vec<Stri
 /// tokens are returned (None when it reports no usage at all).
 pub async fn cache_probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Option<Usage>> {
     let p = Provider::new(cfg.clone(), api_key.to_string())?;
+    cache_probe_provider(&p, model).await
+}
+
+pub async fn cache_probe_provider(p: &Provider, model: &str) -> Result<Option<Usage>> {
     // Long enough for providers that cache only prefixes of 1024+ tokens.
     let filler = "Formless prompt-cache probe. ".repeat(300);
     let messages = [
