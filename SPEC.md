@@ -783,8 +783,15 @@ task, with quality as a gate**.
   wall-clock cap on a Run unless the user sets one. The user is the limit.
 - **Opt-in spending limits.** `[limits]` `daily_usd` (all Sessions, per
   UTC day), `run_usd` and `run_steps` (per Run), all unset by default and
-  settable from Settings. Dollar limits count only while every model used
-  has a `provider.prices` entry; a Run on an unpriced model says so when
+  settable from Settings. Full dollar totals remain unknown when usage has no
+  reported cost or `provider.prices` entry. Known nonnegative finite reported USD
+  and priced usage still form a spending floor: an unpriced group cannot erase
+  it, and that floor triggers the same 80% note and 100% pre-dispatch refusal.
+  Notes identify an incomplete total as "at least" that amount; usage displays
+  still show unknown totals and unpriced models. Unknown-only or below-limit
+  floors keep the existing unpriced compatibility behavior, not a promise to
+  bound the unknown charge. Native-media unknown-cost refusal and explicit
+  Resume waivers remain unchanged. A Run on an unpriced model says so when
   it starts, and `doctor` lists such models. Model calls made on the Run's
   behalf (`llm.complete` from a Tool, each sub-agent step) count toward
   them and toward usage, and are checked too, and so do the daemon's own
