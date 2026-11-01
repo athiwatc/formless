@@ -2992,29 +2992,25 @@ impl Store {
         up_to_seq: i64,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut origins = Vec::new();
+        // Read metadata only, one row at a time: compaction must not reload
+        // arbitrarily large historical Tool payloads or accumulate origins.
+        let mut origins = std::collections::BTreeSet::new();
         if let Some((_, previous)) = self.latest_checkpoint(session_id)? {
             origins.extend(self.data_origins(session_id, &format!("checkpoint:{previous}"))?);
         }
-        for message in self
-            .list_messages_after(session_id, 0)?
-            .into_iter()
-            .filter(|m| m.seq <= up_to_seq)
-        {
-            let meta: Value = message
-                .meta
-                .as_deref()
-                .and_then(|m| serde_json::from_str(m).ok())
-                .unwrap_or(Value::Null);
-            if let Ok(found) = serde_json::from_value::<Vec<crate::provenance::Origin>>(
-                meta["data_origins"].clone(),
-            ) {
-                origins.extend(found);
+        let mut statement = self.ps("SELECT meta FROM messages WHERE session_id=?1 AND seq<=?2 AND meta IS NOT NULL ORDER BY seq")?;
+        let rows =
+            statement.query_map(params![session_id, up_to_seq], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let meta: Value = serde_json::from_str(&row?).unwrap_or(Value::Null);
+            let found: Vec<crate::provenance::Origin> =
+                serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+            for origin in found.into_iter().take(crate::provenance::MAX_ORIGINS) {
+                if origins.len() < crate::provenance::MAX_ORIGINS {
+                    origins.insert(origin);
+                }
             }
         }
-        origins.sort();
-        origins.dedup();
-        origins.truncate(crate::provenance::MAX_ORIGINS);
         for origin in origins {
             self.record_data_origin(session_id, &format!("checkpoint:{up_to_seq}"), &origin)?;
         }

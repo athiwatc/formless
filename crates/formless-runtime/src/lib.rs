@@ -1326,6 +1326,7 @@ impl State {
             }
             "module_load" => {
                 let name = a["name"].as_str().unwrap_or_default();
+                self.ops.data_observed("module", name)?;
                 self.modules
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case(name))

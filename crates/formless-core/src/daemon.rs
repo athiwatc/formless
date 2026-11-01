@@ -2009,8 +2009,21 @@ impl Daemon {
                 if let Some(a) = args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
                     note.push_str(&format!("\n\nArguments: {a}"));
                 }
-                let msg =
-                    self.with_store(|st| st.append_message(&session_id, "system-note", &note))?;
+                self.record_builtin_origin(
+                    &session_id,
+                    "",
+                    toolreg::LOAD_SKILL,
+                    &json!({"name":name}),
+                )?;
+                let msg = self.with_store(|st| {
+                    let origins = st.data_origins(&session_id, "")?;
+                    st.append_message_meta(
+                        &session_id,
+                        "system-note",
+                        &note,
+                        Some(json!({"tool_data":true,"data_origins":origins}).to_string()),
+                    )
+                })?;
                 self.broadcast(Event::MessageAppended {
                     session_id,
                     message: msg,
@@ -6899,19 +6912,30 @@ impl Daemon {
         // transcript (and the cached prefix) is the same however the
         // completions raced.
         ready.sort_by_key(|(_, entry, _)| entry.order);
+        let mut delivered_origins = std::collections::BTreeSet::new();
         let content = std::iter::once("[Pending invocations completed]".to_string())
             .chain(ready.iter().map(|(handle, entry, text)| {
                 let origins = self
                     .with_store(|st| st.data_origins(session_id, &entry.run_id))
                     .unwrap_or_default();
+                delivered_origins.extend(origins.iter().cloned());
                 let frame = crate::provenance::frame(&entry.tool_name, &origins, text);
                 format!("- {handle} (tool {}): {frame}", entry.tool_name)
             }))
             .collect::<Vec<_>>()
             .join("\n");
-        if let Ok(msg) =
-            self.with_store(|st| st.append_message(session_id, "system-note", &content))
-        {
+        let origins: Vec<_> = delivered_origins
+            .into_iter()
+            .take(crate::provenance::MAX_ORIGINS)
+            .collect();
+        if let Ok(msg) = self.with_store(|st| {
+            st.append_message_meta(
+                session_id,
+                "system-note",
+                &content,
+                Some(json!({"tool_data":true,"data_origins":origins}).to_string()),
+            )
+        }) {
             self.broadcast(Event::MessageAppended {
                 session_id: session_id.to_string(),
                 message: msg,
@@ -7782,6 +7806,13 @@ impl Daemon {
                         ),
                     )
                     .await?;
+                    self.record_data_origin(
+                        session_id,
+                        run_id,
+                        "agents.run",
+                        "subagent",
+                        &result.model_used,
+                    )?;
                     step += 1;
                     if let Some(u) = &result.usage {
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
@@ -11225,6 +11256,21 @@ impl Daemon {
                 {
                     self.record_data_origin(session, run, name, "skill", &skill.source)?;
                     self.record_data_origin(session, run, name, "skill_author", &skill.author)?;
+                    let dir = self.with_store(|st| crate::skills::current_dir(st, &skill.name))?;
+                    let file = if name == toolreg::READ_SKILL_FILE {
+                        dir.join(args["path"].as_str().unwrap_or_default())
+                    } else {
+                        dir.join("SKILL.md")
+                    };
+                    if let Ok(file) = file.canonicalize() {
+                        self.record_data_origin(
+                            session,
+                            run,
+                            name,
+                            "file",
+                            &file.to_string_lossy(),
+                        )?;
+                    }
                 }
             }
             toolreg::READ_ARTIFACT => {
@@ -13459,10 +13505,14 @@ impl HostOps for NestedOps {
         let effort = target.effort;
         let requested = target.model;
         let mut messages = Vec::new();
+        let origins = self
+            .daemon
+            .with_store(|st| st.data_origins(&self.session_id, &self.run_id))
+            .map_err(|e| e.to_string())?;
         if let Some(sys) = system {
-            messages.push(json!({"role": "system", "content": sys}));
+            messages.push(json!({"role":"user","content":crate::provenance::frame("llm.complete_system_hint",&origins,sys)}));
         }
-        messages.push(json!({"role": "user", "content": prompt}));
+        messages.push(json!({"role":"user","content":crate::provenance::frame("llm.complete_request",&origins,prompt)}));
         let complex = self
             .daemon
             .routing_complex(&provider, &requested, &messages, &[], &self.cfg)
@@ -13477,6 +13527,7 @@ impl HostOps for NestedOps {
             &self.run_id,
             provider.complete_result(&messages, &model, effort.as_deref()),
         ))?;
+        self.data_observed("llm", &result.model_used)?;
         let usage = result.usage;
         // A Tool's own model calls count toward its Cost per Success, and
         // as its model use (§10.4).
@@ -15531,3 +15582,7 @@ mod budget_admission_tests;
 #[cfg(test)]
 #[path = "daemon_token_tests.rs"]
 mod token_estimator_tests;
+
+#[cfg(test)]
+#[path = "provenance_tests.rs"]
+mod provenance_tests;
