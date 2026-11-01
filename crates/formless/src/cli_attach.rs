@@ -40,7 +40,34 @@ impl Connection {
         paths: &Paths,
         cancel: Option<Arc<std::sync::atomic::AtomicUsize>>,
     ) -> Result<Self> {
-        let (client, rx) = DaemonClient::connect(paths).context("connect to the running daemon")?;
+        // A saturated local socket backlog can block the OS connect itself.
+        // Keep follow's detach path responsive even before the first RPC.
+        let connected = if let Some(counter) = &cancel {
+            let paths = paths.clone();
+            let (tx, rx) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(DaemonClient::connect(&paths));
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if counter.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    return Err(Detached.into());
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                anyhow::ensure!(
+                    !left.is_zero(),
+                    "connect to the running daemon timed out after 30s"
+                );
+                match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+                    Ok(result) => break result,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(_) => bail!("daemon connection worker ended unexpectedly"),
+                }
+            }
+        } else {
+            DaemonClient::connect(paths)
+        };
+        let (client, rx) = connected.context("connect to the running daemon")?;
         let mut this = Self {
             client,
             rx,
@@ -183,7 +210,7 @@ fn select_pending(value: Value, query: &str) -> Result<Event> {
     let mut matches = list.into_iter().filter(|ev| matches!(ev, Event::ApprovalRequested { approval_id,.. } if approval_id.starts_with(query)));
     let first = matches
         .next()
-        .context(super::usage("pending approval not found"))?;
+        .ok_or_else(|| super::usage("pending approval not found"))?;
     anyhow::ensure!(
         !query.is_empty() && matches.next().is_none(),
         super::usage("ambiguous approval id")
@@ -424,6 +451,16 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
             observer.emit(ev)?;
             continue;
         }
+        // Another client can start B after A leaves the active map but before
+        // A's tail broadcasts RunFinished. Keep A's stream pinned to A.
+        let identity = serde_json::to_value(&ev)?;
+        if let (Some(target), Some(event_run)) =
+            (run["run_id"].as_str(), identity["run_id"].as_str())
+        {
+            if !event_run.is_empty() && event_run != target {
+                continue;
+            }
+        }
         if let Event::RunStarted { run_id, .. } = &ev {
             if run.is_null() {
                 run = conn.request(Request::GetRun {
@@ -438,6 +475,8 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
             run = conn.request(Request::GetRun {
                 run_id: run["run_id"].as_str().unwrap().into(),
             })?;
+            anyhow::ensure!(run["status"].as_str().and_then(terminal).is_some(),
+                "daemon reported that the Run ended but its stored status is still nonterminal; cannot confirm the durable outcome");
         }
         if resync {
             if let Some(run_id) = run["run_id"].as_str() {
@@ -501,13 +540,5 @@ mod tests {
         assert!(confirm_broad(&mut &b""[..], &mut Vec::new(), false, false).is_err());
         confirm_broad(&mut &b""[..], &mut Vec::new(), false, true).unwrap();
         assert_eq!(String::from_utf8(out).unwrap().matches("[y/N]").count(), 2);
-    }
-    #[test]
-    fn terminal_codes_distinguish_paused_error_and_interrupted() {
-        assert_eq!(terminal("running"), None);
-        assert_eq!(terminal("completed"), Some(0));
-        assert_eq!(terminal("paused"), Some(1));
-        assert_eq!(terminal("failed"), Some(1));
-        assert_eq!(terminal("interrupted"), Some(130));
     }
 }

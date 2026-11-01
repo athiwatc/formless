@@ -512,6 +512,24 @@ fn follow_resynchronizes_lost_finish_without_switching_to_replacement_run() {
                     };
                     if initial {
                         initial = false;
+                        for event in [
+                            Event::RunStarted {
+                                session_id: sid.clone(),
+                                run_id: "replacement633".into(),
+                            },
+                            Event::MessageDelta {
+                                session_id: sid.clone(),
+                                run_id: "replacement633".into(),
+                                delta: "LIVE REPLACEMENT MUST STAY OUT".into(),
+                            },
+                        ] {
+                            writeln!(
+                                socket,
+                                "{}",
+                                serde_json::to_string(&ServerMessage::Event(event)).unwrap()
+                            )
+                            .unwrap();
+                        }
                         let event = Event::DeltasDropped {
                             session_id: sid.clone(),
                             run_id: "target633".into(),
@@ -576,7 +594,9 @@ fn follow_resynchronizes_lost_finish_without_switching_to_replacement_run() {
     );
     assert!(!values
         .iter()
-        .any(|v| v["message"]["content"] == "replacement must stay out"));
+        .any(|v| v["message"]["content"] == "replacement must stay out"
+            || v["delta"] == "LIVE REPLACEMENT MUST STAY OUT"
+            || v["run_id"] == "replacement633"));
     peer.join().unwrap();
 }
 
@@ -822,4 +842,175 @@ fn headless_denial_resolves_only_that_request_without_remembering_a_denial() {
             .unwrap(),
     );
     assert_eq!(repeat.status.code(), Some(2));
+}
+
+#[cfg(unix)]
+fn peer(
+    f: &Fixture,
+    mut handle: impl FnMut(formless_protocol::Request) -> (Vec<formless_protocol::Event>, Value)
+        + Send
+        + 'static,
+) -> std::thread::JoinHandle<()> {
+    use formless_protocol::{RequestEnvelope, ServerMessage};
+    use std::io::BufRead;
+    std::fs::create_dir_all(&f.paths.data_dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(f.paths.socket_path()).unwrap();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+            let (events, result) = handle(request.request);
+            for ev in events {
+                writeln!(
+                    socket,
+                    "{}",
+                    serde_json::to_string(&ServerMessage::Event(ev)).unwrap()
+                )
+                .unwrap();
+            }
+            writeln!(
+                socket,
+                "{}",
+                serde_json::to_string(&ServerMessage::Response {
+                    id: request.id,
+                    ok: true,
+                    result: Some(result),
+                    error: None
+                })
+                .unwrap()
+            )
+            .unwrap();
+        }
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn finished_event_with_failed_status_persistence_exits_with_diagnostic() {
+    use formless_protocol::{Event, Request};
+    let f = Fixture::new();
+    std::fs::create_dir_all(&f.paths.data_dir).unwrap();
+    let st = Store::open(&f.paths.db_file()).unwrap();
+    let session = st.create_session(Some("status633".into())).unwrap();
+    drop(st);
+    let sid = session.id.clone();
+    let query = sid.clone();
+    let server = peer(&f, move |request| match request {
+        Request::Subscribe { .. } => (vec![], json!({})),
+        Request::ListSessions => (vec![], json!([session])),
+        Request::GetSession { id } => {
+            assert_eq!(id, sid);
+            (
+                vec![Event::RunFinished {
+                    session_id: sid.clone(),
+                    run_id: "status633".into(),
+                    status: "completed".into(),
+                }],
+                json!({"messages":[],"pending_events":[],"latest_run":{"run_id":"status633","status":"running"}}),
+            )
+        }
+        Request::GetRun { run_id } => {
+            assert_eq!(run_id, "status633");
+            (vec![], json!({"run_id":"status633","status":"running"}))
+        }
+        other => panic!("read-only observer sent {other:?}"),
+    });
+    let started = Instant::now();
+    let out = finish(
+        f.command(&["sessions", "show", &query, "--follow", "--jsonl"])
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("durable outcome"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn applied_decision_with_failed_audit_warns_without_retry() {
+    use formless_protocol::{ApprovalScope, Request};
+    let f = Fixture::new();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = count.clone();
+    let server = peer(&f, move |request| match request {
+        Request::Subscribe { client, .. } => {
+            assert_eq!(client.as_deref(), Some("CLI"));
+            (vec![], json!({}))
+        }
+        Request::PendingApprovals => (
+            vec![],
+            json!([{"type":"approval_requested","approval_id":"audit633","session_id":"session633","tool_name":"private633","version":1,"capabilities":["process"],"memory_mb":64}]),
+        ),
+        Request::ApprovalDecision {
+            approval_id,
+            approved,
+            scope,
+            paths,
+            remember_denial,
+        } => {
+            assert_eq!(approval_id, "audit633");
+            assert!(approved);
+            assert_eq!(scope, ApprovalScope::Once);
+            assert!(paths.is_empty());
+            assert!(!remember_denial);
+            counted.fetch_add(1, Ordering::SeqCst);
+            (vec![], json!({"resolved":true,"audit_recorded":false}))
+        }
+        other => panic!("unexpected retry/action: {other:?}"),
+    });
+    let out = finish(
+        f.command(&["approvals", "approve", "audit633", "--once", "--json"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["audit_recorded"],
+        false
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("do not retry"));
+    server.join().unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ctrl_c_detaches_during_a_saturated_private_socket_connect() {
+    use std::os::fd::AsRawFd;
+    let f = Fixture::new();
+    std::fs::create_dir_all(&f.paths.data_dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(f.paths.socket_path()).unwrap();
+    // Linux allows one pending connection with backlog zero. Hold that sole
+    // slot without accepting, so the observer blocks in the OS connect call.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let _full = std::os::unix::net::UnixStream::connect(f.paths.socket_path()).unwrap();
+    let mut child = f
+        .command(&["sessions", "show", "x", "--follow", "--jsonl"])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(child.try_wait().unwrap().is_none());
+    let started = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let out = finish(child);
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
