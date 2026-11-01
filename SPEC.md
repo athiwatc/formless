@@ -4592,9 +4592,9 @@ Session instead. Ordinary comparisons with no required forecast gate behave as b
 Headless sends
 without `--yes` fail closed when confirmation is required. Forecasts add no step,
 token or time caps. Admission persists an immutable per-Run forecast and its
-non-text basis; Metrics shows predictions, actuals, errors and coverage, with
+non-text basis; Metrics shows the latest 200 recorded predictions beside actuals, errors and coverage, with
 unfinished/unknown outcomes distinguished from completed observations. Each
-snapshot retains at most 200 newest comparable Run ids (from the last 2000
+snapshot retains at most 50 newest comparable Run ids (from the last 2000
 recorded Runs) and measured non-text observations,
 without duplicating prompts. A completed Run counts as a complete observation only
 when every admitted physical request has explicit input and output usage;

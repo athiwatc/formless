@@ -504,7 +504,7 @@ pub(crate) fn estimate_store_with_window(
         if run.prompt_tokens > 0 {
             caches.push(cached as f64 / run.prompt_tokens as f64);
         }
-        if comparables.len() == 200 {
+        if comparables.len() == 50 {
             break;
         }
     }
@@ -524,7 +524,7 @@ pub(crate) fn estimate_store_with_window(
     let mut warnings = vec![
         "Local calibrated heuristic; empirical ranges are forecasts, not limits or guarantees"
             .into(),
-        "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded; at most 200 newest comparable observations from the last 2000 recorded Runs".into(),
+        "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded; at most 50 newest comparable observations from the last 2000 recorded Runs".into(),
     ];
     if window_source == "default" {
         warnings.push("Endpoint context window is not cached; compaction risk uses configured/default window and may differ at dispatch".into());
@@ -643,7 +643,7 @@ pub fn describe(f: &RunForecast) -> String {
 pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
     let runs = st.run_metrics(2000)?;
     let mut rows = Vec::new();
-    for (id, f) in st.recorded_forecasts()? {
+    for (id, f) in st.recorded_forecasts_limited(200)? {
         let Some(run) = runs.iter().find(|r| r.run_id == id) else {
             continue;
         };

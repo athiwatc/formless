@@ -2695,13 +2695,21 @@ impl Store {
         Ok(())
     }
     pub fn recorded_forecasts(&self) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
+        self.recorded_forecasts_limited(2000)
+    }
+    pub(crate) fn recorded_forecasts_limited(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
         let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_forecasts')", [], |r| r.get(0))?;
         if !exists {
             return Ok(Vec::new());
         }
         let mut stmt =
-            self.ps("SELECT run_id,forecast FROM run_forecasts ORDER BY rowid DESC LIMIT 2000")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            self.ps("SELECT run_id,forecast FROM run_forecasts ORDER BY rowid DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit.min(2000) as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
         rows.map(|r| {
             let (id, json) = r?;
             Ok((id, serde_json::from_str(&json)?))
