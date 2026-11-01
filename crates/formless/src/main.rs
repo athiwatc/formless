@@ -77,6 +77,9 @@ enum Cmd {
     },
     /// Diagnostics: config, dirs, keychain, endpoint probe
     Doctor {
+        /// Rehearse newest backup in an isolated offline profile, then exit
+        #[arg(long, conflicts_with = "fix")]
+        restore_drill: bool,
         /// Apply the safe fixes: clear a stale socket or lock, restart a
         /// stuck daemon, tighten secret file permissions, then check again
         #[arg(long)]
@@ -236,7 +239,10 @@ enum Cmd {
         dry_run: bool,
     },
     /// Back up the database now (kept with the daily ones in <data>/backups)
-    Backup,
+    Backup {
+        #[command(subcommand)]
+        action: Option<BackupAction>,
+    },
     /// Everything for a new machine in one file: Tools, modules, Skills,
     /// memories, jobs, providers/Roles/MCP servers (no keys or secrets)
     ExportAll {
@@ -326,6 +332,26 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         max_steps: Option<u32>,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum BackupAction {
+    /// List daily, migration and pre-restore copies with sizes and receipts
+    List {
+        /// Machine-readable rows, including exact verification timestamps
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify a standalone snapshot without changing its bytes
+    Verify { file: std::path::PathBuf },
+    /// Restore using exclusive ownership and seven bounded recovery copies
+    Restore {
+        file: std::path::PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Migrate and read a private copy without serving or running any work
+    Drill { file: Option<std::path::PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -1134,6 +1160,8 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
                         "name": p.profile,
                         "current": p.profile == paths.profile,
                         "daemon_running": running,
+                        "backup_bytes": formless_core::backup_verification::copies(p).iter().map(|f|formless_core::housekeeping::path_bytes(f)).sum::<u64>(),
+                        "backups": formless_core::backup_verification::list(p),
                         "last_used": last_used,
                         "data_dir": p.data_dir,
                         "config_dir": p.config_dir,
@@ -1144,7 +1172,8 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
                 return Ok(());
             }
-            let mut tbl = Table::new(&["PROFILE", "DAEMON", "LAST USED", "DATA DIR"]);
+            let mut tbl =
+                Table::new(&["PROFILE", "DAEMON", "LAST USED", "BACKUP BYTES", "DATA DIR"]);
             for r in &rows {
                 let mut name = r["name"].as_str().unwrap_or_default().to_string();
                 if r["current"] == true {
@@ -1158,6 +1187,7 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
                         t("stopped", Tone::Dim)
                     },
                     c(r["last_used"].as_str().unwrap_or("never")),
+                    c(r["backup_bytes"].to_string()),
                     c(r["data_dir"].as_str().unwrap_or_default()),
                 ]);
             }
@@ -1332,6 +1362,22 @@ fn run_cli(cli: Cli) -> Result<()> {
     // Keep every ordinary command's family leased through its final write.
     // Destructive commands resolve read-only and obtain an explicit freeze;
     // `serve` already retains the same shared lease through its owner guard.
+    if let Some(Cmd::Backup {
+        action: Some(BackupAction::Restore {
+            file,
+            dry_run: true,
+        }),
+    }) = &cli.cmd
+    {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&formless_core::backup_verification::restore_plan(
+                &paths, file
+            ))?
+        );
+        return Ok(());
+    }
     let destructive = matches!(
         cli.cmd,
         Some(
@@ -1377,6 +1423,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             };
             run_with(paths, start, "chat")
         }
+        Some(Cmd::Doctor {
+            restore_drill: true,
+            ..
+        }) => run_restore_drill(&paths, None),
         Some(Cmd::Doctor { json: true, .. }) => {
             println!("{}", serde_json::to_string_pretty(&doctor_json(&paths)?)?);
             Ok(())
@@ -1455,7 +1505,35 @@ fn run_cli(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
-        Some(Cmd::Backup) => backup_cmd(&paths),
+        Some(Cmd::Backup { action }) => match action {
+            None => backup_cmd(&paths),
+            Some(BackupAction::List { json }) => {
+                let rows = formless_core::backup_verification::list(&paths);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    let mut table = Table::new(&["FILE", "SIZE", "VERIFIED AT"]);
+                    for row in rows.as_array().into_iter().flatten() {
+                        table.row(vec![
+                            c(row["file"].as_str().unwrap_or_default()),
+                            c(formless_core::housekeeping::human_bytes(
+                                row["bytes"].as_u64().unwrap_or(0),
+                            )),
+                            c(row["verified_at"].as_str().unwrap_or("never verified")),
+                        ]);
+                    }
+                    table.print();
+                }
+                Ok(())
+            }
+            Some(BackupAction::Verify { file }) => {
+                let report = formless_core::backup_verification::verify(&paths, &file)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            Some(BackupAction::Restore { file, .. }) => restore_cmd(&paths, &file),
+            Some(BackupAction::Drill { file }) => run_restore_drill(&paths, file),
+        },
         Some(Cmd::ExportAll { sessions, output }) => {
             formless_core::daemon::ensure_daemon(&paths)?;
             let bundle =
@@ -1526,24 +1604,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             println!("next:      formless auth login / set API keys, then `formless jobs` to enable jobs");
             Ok(())
         }
-        Some(Cmd::Restore { file }) => {
-            if daemon_reachable(&paths) {
-                anyhow::bail!("stop the daemon first: formless daemon stop");
-            }
-            eprintln!("restore: close TUIs and pause any login service that may restart the daemon; exclusive profile ownership is required");
-            let outcome = formless_core::housekeeping::restore_report(&paths, &file)?;
-            println!("restored:  {}", file.display());
-            if outcome.saved.is_file() {
-                println!("previous:  saved as {}", outcome.saved.display());
-            } else {
-                println!("previous:  none (the destination had no database)");
-            }
-            for warning in outcome.warnings() {
-                eprintln!("warning: {warning}");
-            }
-            println!("scope:     database only; external artifact/skill files and recorded paths were not restored or rewritten");
-            Ok(())
-        }
+        Some(Cmd::Restore { file }) => restore_cmd(&paths, &file),
         Some(Cmd::Run {
             task,
             session,
@@ -2627,6 +2688,8 @@ fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
         "profile": paths.profile,
         "data_dir": paths.data_dir.display().to_string(),
         "config_dir": paths.config_dir.display().to_string(),
+        "backup": formless_core::backup_verification::newest_status(paths),
+        "profile_backups": paths.list_profiles().iter().map(|p|serde_json::json!({"profile":p.profile,"newest":formless_core::backup_verification::newest_status(p)})).collect::<Vec<_>>(),
         "db_present": paths.db_file().exists(),
         "log_bytes": formless_core::logs::log_usage(paths),
         "daemon_running": daemon_reachable(paths),
@@ -2778,6 +2841,38 @@ fn gc_cmd(paths: &Paths, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn restore_cmd(paths: &Paths, file: &std::path::Path) -> Result<()> {
+    if daemon_reachable(paths) {
+        anyhow::bail!("stop the daemon first: formless daemon stop");
+    }
+    eprintln!(
+        "restore: close TUIs and pause login services; exclusive profile ownership is required"
+    );
+    let outcome = formless_core::housekeeping::restore_report(paths, file)?;
+    println!("restored:  {}", file.display());
+    if outcome.saved.is_file() {
+        println!("previous:  saved as {}", outcome.saved.display());
+    } else {
+        println!("previous:  none (the destination had no database)");
+    }
+    for warning in outcome.warnings() {
+        eprintln!("warning: {warning}");
+    }
+    println!("scope:     database only; external artifact/skill files and paths were not restored or rewritten");
+    Ok(())
+}
+
+fn run_restore_drill(paths: &Paths, file: Option<std::path::PathBuf>) -> Result<()> {
+    let file = file
+        .or_else(|| formless_core::backup_verification::copies(paths).pop())
+        .ok_or_else(|| anyhow::anyhow!("no backup available for an offline restore drill"))?;
+    let report = tokio::runtime::Runtime::new()?
+        .block_on(formless_core::backup_verification::drill(paths, &file))
+        .context("offline restore drill failed")?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 /// `formless backup`.
 fn backup_cmd(paths: &Paths) -> Result<()> {
     let r = if daemon_reachable(paths) {
@@ -2796,7 +2891,7 @@ fn backup_cmd(paths: &Paths) -> Result<()> {
     println!("scope:     database only; copy artifacts/ and skills/ separately");
     println!("excluded:  config.toml, credential files and OS keyring entries");
     println!("paths:     recorded file paths are not rewritten for another profile or machine");
-    println!("restore:   formless daemon stop && formless restore FILE");
+    println!("restore:   formless backup restore FILE --dry-run");
     Ok(())
 }
 
@@ -2880,6 +2975,23 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         formless_core::housekeeping::RESTORE_BACKUPS_KEEP,
         formless_core::housekeeping::backup_dir(&paths).display()
     );
+    for profile in paths.list_profiles() {
+        let status = formless_core::backup_verification::newest_status(&profile);
+        if !status.is_null() {
+            say!(
+                "newest backup [{}]: {}s old; {}",
+                profile.profile,
+                status["age_seconds"],
+                status["verified_at"]
+                    .as_str()
+                    .map(|at| format!(
+                        "verified at {at} ({}s ago)",
+                        status["verification_age_seconds"]
+                    ))
+                    .unwrap_or_else(|| "never verified (or bytes changed)".into())
+            );
+        }
+    }
     match formless_core::housekeeping::last_backup(&paths) {
         Some((file, at)) => {
             let age = at.elapsed().unwrap_or_default().as_secs();

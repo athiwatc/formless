@@ -2536,6 +2536,30 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   pre-migration copies by their recorded timestamp (not schema version),
   and the database's free pages (VACUUM). Each row
   says how many items and bytes; a real run is audit-logged.
+- **Backup verification and drills.** `formless backup list` lists daily,
+  migration and pre-restore database snapshots with sizes and verification age;
+  `backup list --json` returns stable machine-readable rows.
+  `backup verify FILE` checks an immutable private copy: SQLite integrity,
+  foreign keys, table/column inventory for its stamped schema, and row counts.
+  A private atomic receipt binds verification to the exact source bytes; changed
+  files are never shown as verified. Verification is structural, not proof of
+  profile identity or that external files were recovered. Snapshots contain only
+  the database, not artifacts, skills, configuration, credentials or keyring data.
+  `backup restore FILE --dry-run` prints the exclusive-ownership, safety-copy,
+  staged migration and atomic replacement plan without touching the profile.
+  `backup restore FILE` uses the existing stopped-daemon restore path and its
+  seven bounded `backups/formless.db.pre-restore-*` recovery points.
+  Existing `before-restore-*.db` copies remain recognized and share that bound;
+  no duplicate safety copy is made.
+  `doctor --restore-drill` (or `backup drill FILE`) restores a private throwaway
+  copy, migrates it, constructs an offline daemon and lists Sessions. It never
+  serves, loads live configuration/credentials, starts providers, scheduled jobs,
+  hooks, MCP or background tasks. `daemon.backup_restore_drill = true` opts into
+  a daily drill after a successful automatic backup; it is off by default.
+  Doctor reports newest-backup age and exact-byte verification status per profile.
+  Pre-migration retention keeps two newest copies and any receipt-pinned recovery
+  point, and prunes only after successfully verifying the newest copy; actual
+  removals are logged and audited. Failed verification preserves older copies.
 - **Backups.** The daemon copies the database (`VACUUM INTO`, consistent
   under WAL) to `<data>/backups/formless-<UTC time>.db` when the newest is
   a day old (checked hourly), keeping `daemon.backups_keep` (7; 0 = none).
@@ -2548,7 +2572,7 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   not automatically repair absolute references. `formless
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
-  the current database as `backups/before-restore-<time>.db`, stages and migrates
+  the current database as `backups/formless.db.pre-restore-<stamp>`, stages and migrates
   the selected snapshot in the same directory, fsyncs it, and atomically replaces
   the canonical database while holding exclusive daemon ownership. Current WAL
   data is checkpointed before old sidecars are removed. Failed staging or migration

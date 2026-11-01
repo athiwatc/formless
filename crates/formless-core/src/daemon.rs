@@ -710,6 +710,15 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(paths: Paths) -> Result<Self> {
+        Self::new_mode(paths, false)
+    }
+
+    /// Offline restore rehearsal only: no live config, credentials or workers.
+    pub(crate) fn for_restore_drill(paths: Paths) -> Result<Self> {
+        Self::new_mode(paths, true)
+    }
+
+    fn new_mode(paths: Paths, offline: bool) -> Result<Self> {
         let ownership = crate::profile_lock::ProfileLock::owner(&paths)?;
         if endpoint_occupied(&paths)? {
             bail!("a daemon is already running for this data dir");
@@ -723,7 +732,7 @@ impl Daemon {
         // Deprecated global auto (SPEC §4.6): rewrite the file once and
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
-        if paths.config_file().exists() {
+        if !offline && paths.config_file().exists() {
             if let Ok(mut cfg) = Config::load_file_only(&paths) {
                 if let Some(w) = cfg.migrate_global_auto() {
                     if cfg.save(&paths).is_ok() {
@@ -748,11 +757,15 @@ impl Daemon {
             .map(|_| Store::open_reader(&paths.db_file()).map(StdMutex::new))
             .collect::<Result<Vec<_>>>()?;
         // `provider.proxy` applies from start-up (restart to change it).
-        let http = crate::provider::http_client(
-            &Config::load(&paths)
-                .map(|c| c.provider.proxy)
-                .unwrap_or_default(),
-        )?;
+        let http = if offline {
+            reqwest::Client::builder().no_proxy().build()?
+        } else {
+            crate::provider::http_client(
+                &Config::load(&paths)
+                    .map(|c| c.provider.proxy)
+                    .unwrap_or_default(),
+            )?
+        };
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -12261,7 +12274,19 @@ impl Daemon {
                 });
                 if keep > 0 && due {
                     match self.with_store(|st| crate::housekeeping::backup(&self.paths, st, keep)) {
-                        Ok(f) => tracing::info!("database backed up to {}", f.display()),
+                        Ok(f) => {
+                            tracing::info!("database backed up to {}", f.display());
+                            if cfg.daemon.backup_restore_drill {
+                                match crate::backup_verification::drill(&self.paths, &f).await {
+                                    Ok(report) => {
+                                        tracing::info!("offline restore drill passed: {report}")
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!("offline restore drill failed: {error:#}")
+                                    }
+                                }
+                            }
+                        }
                         Err(e) => tracing::warn!("database backup failed: {e:#}"),
                     }
                 }

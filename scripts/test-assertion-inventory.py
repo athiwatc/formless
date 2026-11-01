@@ -18,7 +18,7 @@ def erase_literals(source):
 print('Rust tests without a direct assert!/assert_eq!/assert_ne!/panic! oracle:')
 count = 0
 for path in sorted(pathlib.Path('crates').glob('**/*.rs')):
-    text = erase_literals(path.read_text())
+    text = erase_literals(path.read_text(encoding='utf-8'))
     for match in re.finditer(r'#\[(?:tokio::)?test(?:\([^\]]*\))?\](?P<attrs>.*?)\b(?:async\s+)?fn\s+(?P<name>\w+)\s*\(', text, re.S):
         # Do not let a malformed candidate span the next function or test.
         if re.search(r'\bfn\b|#\[(?:tokio::)?test', match['attrs']):

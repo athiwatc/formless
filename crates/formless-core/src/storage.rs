@@ -714,6 +714,21 @@ const MIGRATIONS: [(i64, MigrationStep); 58] = [
     }),
 ];
 
+/// Empty schema at a stamped historical version, for offline backup inspection.
+/// Applies the same ordered migration prefix without opening/upgrading a backup.
+pub(crate) fn schema_at(version: i64) -> Result<Connection> {
+    if !(1..=SCHEMA_VERSION).contains(&version) {
+        return Err(anyhow!("unsupported backup schema v{version}"));
+    }
+    let conn = Connection::open_in_memory()?;
+    for (target, step) in MIGRATIONS {
+        if target <= version {
+            step(&conn)?;
+        }
+    }
+    Ok(conn)
+}
+
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
 /// database is backed up first; each step runs in its own transaction
 /// together with its version bump, so a failure leaves the database at

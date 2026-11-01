@@ -43,7 +43,7 @@ pub fn backup_dir(paths: &Paths) -> PathBuf {
 }
 
 /// Copies made before schema migrations, newest first.
-fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
+pub(crate) fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
     let db = paths.db_file();
     let (Some(dir), Some(name)) = (db.parent(), db.file_name().and_then(|n| n.to_str())) else {
         return Vec::new();
@@ -151,21 +151,98 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
     }
     rows.push(json!({"kind": "MCP logs", "items": n, "bytes": bytes,
         "detail": "cut to their last 1 MB"}));
-    // Old pre-migration copies.
-    let old: Vec<PathBuf> = migration_backups(paths)
-        .into_iter()
+    // Recovery copies are removed only after a newer one has actually passed
+    // structural verification. An active failed-migration receipt pins its copy.
+    let migrations = migration_backups(paths);
+    let receipt_path = paths.db_file().with_extension("migration-backup.json");
+    let pin_result: Result<Option<String>> = (|| {
+        let bytes = match std::fs::read(&receipt_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("read pinned migration recovery receipt"),
+        };
+        let receipt: Value =
+            serde_json::from_slice(&bytes).context("parse pinned migration recovery receipt")?;
+        let name = receipt["backup_name"]
+            .as_str()
+            .context("migration recovery receipt has no backup_name")?;
+        let prefix = format!(
+            "{}.v",
+            paths
+                .db_file()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        if Path::new(name).file_name().and_then(|p| p.to_str()) != Some(name)
+            || !name.starts_with(&prefix)
+            || !name.ends_with(".bak")
+        {
+            return Err(anyhow!("invalid pinned migration recovery filename"));
+        }
+        Ok(Some(name.to_string()))
+    })();
+    let (pin, pin_error) = match pin_result {
+        Ok(pin) => (pin, None),
+        Err(error) => {
+            tracing::warn!("migration retention blocked by recovery receipt: {error:#}");
+            (
+                None,
+                Some(format!("recovery receipt unreadable or invalid: {error:#}")),
+            )
+        }
+    };
+    let candidates: Vec<_> = migrations
+        .iter()
         .skip(MIGRATION_BACKUPS_KEEP)
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) != pin.as_deref())
+        .cloned()
         .collect();
-    let bytes: u64 = old.iter().map(|p| path_bytes(p)).sum();
-    if !dry_run {
-        for p in &old {
-            let _ = std::fs::remove_file(p);
+    let mut removed = Vec::new();
+    let mut bytes = 0;
+    let mut verification_error = pin_error;
+    if !candidates.is_empty() && verification_error.is_none() {
+        let newest = migrations
+            .first()
+            .expect("candidates require a newest copy");
+        if dry_run {
+            // A preview never writes verification receipts or guesses that an
+            // unverified snapshot will pass. Show the gate instead.
+            if crate::backup_verification::verified(paths, newest).is_some() {
+                removed = candidates;
+                bytes = removed.iter().map(|p| path_bytes(p)).sum();
+            } else {
+                verification_error = Some("newest copy needs verification".to_string());
+            }
+        } else {
+            match crate::backup_verification::verify(paths, newest) {
+                Ok(_) => {
+                    for path in candidates {
+                        let size = path_bytes(&path);
+                        crate::backup_verification::remove_copy(paths, &path)?;
+                        bytes += size;
+                        tracing::info!("pruned verified migration backup {}", path.display());
+                        store.audit(
+                            "daemon",
+                            "backup.prune",
+                            &format!(
+                                "{} ({size} bytes); newest {} verified",
+                                path.display(),
+                                newest.display()
+                            ),
+                        )?;
+                        removed.push(path);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("migration backup retention skipped: {error:#}");
+                    verification_error = Some(format!("{error:#}"));
+                }
+            }
         }
     }
-    rows.push(
-        json!({"kind": "migration backups", "items": old.len(), "bytes": bytes,
-        "detail": format!("all but the newest {MIGRATION_BACKUPS_KEEP}")}),
-    );
+    rows.push(json!({"kind":"migration backups","items":removed.len(),"bytes":bytes,
+        "detail":format!("keep newest {MIGRATION_BACKUPS_KEEP} and receipt-pinned recovery; verify newest before pruning"),"verification_error":verification_error}));
     // Free pages left behind in the database.
     let free = store.free_bytes()?;
     if !dry_run && free > 0 {
@@ -213,25 +290,71 @@ pub fn backup(paths: &Paths, store: &Store, keep: usize) -> Result<PathBuf> {
     let stamp = backup_stamp();
     let dest = dir.join(format!("formless-{stamp}.db"));
     store.backup_into(&dest)?;
+    crate::backup_verification::verify(paths, &dest)
+        .context("verify new backup before retention")?;
     let mut all = list_backups(paths);
     all.reverse(); // newest first
-    for old in all.iter().skip(keep.max(1)) {
-        let _ = std::fs::remove_file(old);
+                   // Always retain this verified destination, including after clock rollback
+                   // or when an old file has a future timestamp in its name.
+    let mut others_kept = 0usize;
+    for old in &all {
+        if old == &dest {
+            continue;
+        }
+        if others_kept < keep.max(1) - 1 {
+            others_kept += 1;
+            continue;
+        }
+        crate::backup_verification::remove_copy(paths, old)?;
+        tracing::info!("pruned daily backup {}", old.display());
+        store.audit(
+            "daemon",
+            "backup.prune",
+            &format!(
+                "daily {}; newest {} verified",
+                old.display(),
+                dest.display()
+            ),
+        )?;
     }
     Ok(dest)
 }
 
 /// Daily snapshots, oldest first (independent from restore retention).
 pub fn list_backups(paths: &Paths) -> Vec<PathBuf> {
-    list_copies(paths, "formless-")
+    list_copies(paths, "formless-", ".db")
 }
 
 /// Before-restore recovery points, oldest first.
 pub fn list_restore_backups(paths: &Paths) -> Vec<PathBuf> {
-    list_copies(paths, "before-restore-")
+    let mut copies = list_copies(paths, "before-restore-", ".db");
+    copies.extend(list_copies(paths, "formless.db.pre-restore-", ""));
+    copies.sort_by_cached_key(|path| {
+        let at = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|name| {
+                name.strip_prefix("formless.db.pre-restore-").or_else(|| {
+                    name.strip_prefix("before-restore-")
+                        .and_then(|n| n.strip_suffix(".db"))
+                })
+            })
+            .and_then(parse_backup_stamp);
+        (at, path.clone())
+    });
+    copies
 }
 
-fn list_copies(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
+// New names have no extension, so require the *entire* generated stamp. A
+// prefix match alone would mistake a selected snapshot's WAL/SHM for backups.
+fn valid_recovery_stamp(stamp: &str) -> bool {
+    let Some((timestamp, id)) = stamp.split_once('-') else {
+        return false;
+    };
+    parse_backup_stamp(timestamp).is_some() && id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
+}
+
+fn list_copies(paths: &Paths, prefix: &str, suffix: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(backup_dir(paths))
         .into_iter()
         .flatten()
@@ -239,9 +362,11 @@ fn list_copies(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".db"))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(prefix)
+                    && n.ends_with(suffix)
+                    && (suffix != "" || n.strip_prefix(prefix).is_some_and(valid_recovery_stamp))
+            })
         })
         .collect();
     found.sort_by_cached_key(|p| {
@@ -249,7 +374,7 @@ fn list_copies(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_prefix(prefix))
-            .and_then(|n| n.strip_suffix(".db"))
+            .and_then(|n| n.strip_suffix(suffix))
             .and_then(parse_backup_stamp);
         (at, p.clone())
     });
@@ -300,6 +425,17 @@ fn restore_with(
     file: &Path,
     replace: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<RestoreReport> {
+    restore_with_check(paths, file, replace, crate::restore_references::inspect)
+}
+
+// The diagnostic boundary permits a deterministic post-commit failure without
+// malformed source schemas, environment hooks or weakening staged verification.
+fn restore_with_check(
+    paths: &Paths,
+    file: &Path,
+    replace: impl FnOnce(&Path, &Path) -> Result<()>,
+    inspect: impl FnOnce(&Path, &Paths) -> Result<crate::restore_references::Report>,
+) -> Result<RestoreReport> {
     let _gate = crate::profile_lock::ProfileLock::launcher(paths, std::time::Duration::ZERO)?;
     let _owner = crate::profile_lock::ProfileLock::owner(paths)?;
     if crate::daemon::endpoint_occupied(paths)? {
@@ -338,7 +474,7 @@ fn restore_with(
     let db = paths.db_file();
     let dir = backup_dir(paths);
     std::fs::create_dir_all(&dir)?;
-    let saved = dir.join(format!("before-restore-{}.db", backup_stamp()));
+    let saved = dir.join(format!("formless.db.pre-restore-{}", backup_stamp()));
     if db.exists() {
         // Never migrate the current file: it may itself need recovery.
         let current =
@@ -358,8 +494,28 @@ fn restore_with(
         // delete an open old recovery point. Retention also applies on a failed
         // migration, so repeated failures cannot grow recovery copies forever.
         let all = list_restore_backups(paths);
-        for old in all.iter().rev().skip(RESTORE_BACKUPS_KEEP) {
-            std::fs::remove_file(old)?;
+        // Both naming generations share one bound. Preserve the new displaced
+        // copy across clock rollback, and preserve a selected recovery source.
+        let source = std::fs::canonicalize(file).ok();
+        let protected: Vec<_> = all
+            .iter()
+            .filter(|p| {
+                **p == saved
+                    || source.as_ref().is_some_and(|source| {
+                        std::fs::canonicalize(p).ok().as_ref() == Some(source)
+                    })
+            })
+            .collect();
+        let mut remaining = RESTORE_BACKUPS_KEEP.saturating_sub(protected.len());
+        for old in all.iter().rev() {
+            if protected.contains(&old) {
+                continue;
+            }
+            if remaining > 0 {
+                remaining -= 1;
+                continue;
+            }
+            crate::backup_verification::remove_copy(paths, old)?;
         }
         #[cfg(unix)]
         std::fs::File::open(&dir)?.sync_all()?;
@@ -372,6 +528,8 @@ fn restore_with(
         checkpoint(&staged)?;
         staged.pragma_update(None, "journal_mode", "DELETE")?;
         drop(staged);
+        crate::backup_verification::inspect(&stage.0)
+            .context("verify migrated restore stage before replacing the destination")?;
         sync_file(&stage.0)?;
         // Fold any old WAL into the old canonical file before removing its
         // sidecars. If replacement fails, that old file remains complete.
@@ -395,14 +553,14 @@ fn restore_with(
         Ok(())
     })();
     result.with_context(|| {
-        format!(
-            "restore did not complete; recovery copy at {}",
-            saved.display()
-        )
+        if saved.is_file() {
+            format!("restore did not complete; recovery copy at {}",saved.display())
+        } else {
+            "restore did not complete; the destination had no database, so no displaced-database recovery copy was created".to_string()
+        }
     })?;
     // Both ownership guards remain held while checking the restored rows.
-    let references =
-        crate::restore_references::inspect(&db, paths).map_err(|error| format!("{error:#}"));
+    let references = inspect(&db, paths).map_err(|error| format!("{error:#}"));
     let outcome = RestoreReport { saved, references };
     for warning in outcome.warnings() {
         tracing::warn!("{warning}");
@@ -667,10 +825,25 @@ mod tests {
         let store = Store::open(&source).unwrap();
         store.create_session(Some("restored".into())).unwrap();
         drop(store);
-        let conn = rusqlite::Connection::open(&source).unwrap();
-        conn.execute_batch("DROP TABLE skill_versions;").unwrap();
-        drop(conn);
-        let outcome = restore_report(&target, &source).unwrap();
+        let outcome = restore_with_check(
+            &target,
+            &source,
+            |stage, db| {
+                std::fs::rename(stage, db)?;
+                Ok(())
+            },
+            |db, _| {
+                let committed = rusqlite::Connection::open_with_flags(
+                    db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                let name: String =
+                    committed.query_row("SELECT name FROM sessions", [], |row| row.get(0))?;
+                assert_eq!(name, "restored", "injection runs only after commit");
+                Err(anyhow!("injected reference diagnostic unavailable"))
+            },
+        )
+        .unwrap();
         assert!(outcome.references.is_err());
         assert!(outcome.warnings()[0]
             .contains("database restored, but file-reference check could not complete"));
@@ -1003,7 +1176,16 @@ mod tests {
             let copy = paths
                 .data_dir
                 .join(format!("formless.db.v{version}-202601{day:02}T120000Z.bak"));
-            std::fs::write(&copy, "backup").unwrap();
+            // Build the actual migration prefix at its stamped version, rather
+            // than restamping a current schema or using non-SQLite bytes.
+            let historical = crate::storage::schema_at(version).unwrap();
+            historical
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            historical.execute("INSERT INTO sessions(id,name,created_at,updated_at) VALUES('known','historical fixture','','')",[]).unwrap();
+            historical
+                .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+                .unwrap();
             copies.push(copy);
         }
         assert_eq!(
@@ -1011,6 +1193,9 @@ mod tests {
             copies.iter().rev().cloned().collect::<Vec<_>>()
         );
         let cfg = Config::default();
+        let sizes: Vec<_> = copies.iter().map(|copy| path_bytes(copy)).collect();
+        crate::backup_verification::verify(&paths, copies.last().unwrap()).unwrap();
+        let receipt_bytes = path_bytes(&backup_dir(&paths));
         let before = usage(&paths, &store).unwrap();
         let backup_bytes = |u: &Value| {
             u["kinds"]
@@ -1022,16 +1207,44 @@ mod tests {
                 .as_u64()
                 .unwrap()
         };
-        assert_eq!(backup_bytes(&before), 24);
-        gc(&paths, &store, &cfg, true).unwrap();
+        assert_eq!(
+            backup_bytes(&before),
+            sizes.iter().sum::<u64>() + receipt_bytes
+        );
+        let dry = gc(&paths, &store, &cfg, true).unwrap();
+        let migration_row = |report: &Value| {
+            report["kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["kind"] == "migration backups")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(migration_row(&dry)["items"], 2);
+        assert_eq!(migration_row(&dry)["bytes"], sizes[0] + sizes[1]);
+        assert_eq!(
+            path_bytes(&backup_dir(&paths)),
+            receipt_bytes,
+            "dry run never rewrites receipts"
+        );
         assert!(
             copies.iter().all(|p| p.exists()),
             "dry run preserves all copies"
         );
-        gc(&paths, &store, &cfg, false).unwrap();
+        let removed = gc(&paths, &store, &cfg, false).unwrap();
+        assert_eq!(migration_row(&removed)["items"], 2);
+        assert_eq!(migration_row(&removed)["bytes"], sizes[0] + sizes[1]);
         assert!(!copies[0].exists() && !copies[1].exists());
         assert!(copies[2].exists() && copies[3].exists());
-        assert_eq!(backup_bytes(&usage(&paths, &store).unwrap()), 12);
+        assert_eq!(
+            migration_backups(&paths),
+            vec![copies[3].clone(), copies[2].clone()]
+        );
+        assert_eq!(
+            backup_bytes(&usage(&paths, &store).unwrap()),
+            sizes[2] + sizes[3] + path_bytes(&backup_dir(&paths))
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(base);
     }
