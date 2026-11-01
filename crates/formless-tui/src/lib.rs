@@ -589,6 +589,9 @@ fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<St
                 ""
             }
         ));
+        if let Some(warning) = formless_protocol::sensitive_read_warning(capability) {
+            lines.push(format!("  ⚠ {warning}"));
+        }
     }
     if let Some(session) = &req.session_id {
         lines.push(format!("Session: {session}"));
@@ -15678,8 +15681,18 @@ fn draw_approval(
         ui::dim(color),
     ));
 
+    let mut signals = Vec::new();
+    if req
+        .capabilities
+        .iter()
+        .any(|cap| formless_protocol::sensitive_read_warning(cap).is_some())
+    {
+        signals.push(Line::styled(
+            "⚠ Credential read: exact path only · i full approval",
+            bold_fg(color, Color::Yellow),
+        ));
+    }
     if let Some(context) = &req.context {
-        let mut signals = Vec::new();
         if !context.scope_warnings.is_empty() {
             let kind = if context
                 .scope_warnings
@@ -15709,10 +15722,10 @@ fn draw_approval(
                 bold_fg(color, Color::Yellow),
             ));
         }
-        if !signals.is_empty() {
-            signals.push(Line::raw(""));
-            lines.splice(0..0, signals);
-        }
+    }
+    if !signals.is_empty() {
+        signals.push(Line::raw(""));
+        lines.splice(0..0, signals);
     }
     let area = f.area();
     // Names, paths and summaries come from Tools and models: their bidi
@@ -23086,6 +23099,121 @@ mod tests {
             }
         ));
     }
+    #[test]
+    fn credential_read_approval_keeps_exact_scope_and_full_context() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.input_focus = false;
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        let cap = "fs:read-sensitive:/private/fixture/token.json";
+        let context = formless_protocol::ApprovalContext {
+            run_id: Some("consumer-run".into()),
+            call: Some(formless_protocol::ApprovalCallPreview {
+                arguments: serde_json::json!({"invocation":{"name":"private inventory"},"runtime_access":{"path":"/private/fixture/token.json","operation":"read","credential_rule":"credential file"}}),
+                urls: vec![],
+                paths: vec!["/private/fixture/token.json".into()],
+                truncated: false,
+                note: "Actual attempted read, not a directory grant".into(),
+            }),
+            sources: vec![formless_protocol::ApprovalSource {
+                tool: "page_reader".into(),
+                kind: "url".into(),
+                origin: "https://source.example".into(),
+            }],
+            scope_warnings: vec![],
+        };
+        let event = Event::ApprovalRequested {
+            context: Some(context.clone()),
+            approval_id: "credential-read".into(),
+            session_id: "s1".into(),
+            tool_name: "inventory_reader".into(),
+            version: 2,
+            capabilities: vec![cap.into()],
+            memory_mb: 64,
+            detail: Some("Credential path blocked; review exact read".into()),
+            already_allowed: vec![],
+            code_preview: Some("function run(input) { return input; }".into()),
+            tool_id: Some("private-reader".into()),
+            batch: None,
+            path_options: vec![],
+        };
+        app.on_event(event.clone());
+        app.approval_summaries
+            .insert("credential-read".into(), "AI inventory helper".into());
+        let compact = render(&mut app, 80, 24);
+        assert!(
+            compact.contains("Credential read: exact path only"),
+            "{compact}"
+        );
+        assert!(compact.contains("i full approval"), "{compact}");
+        app.key(key(KeyCode::Char('?')));
+        let explained = render(&mut app, 180, 70);
+        assert!(
+            explained.contains("can read credential data at exactly"),
+            "{explained}"
+        );
+        assert!(explained.contains("not descendants"), "{explained}");
+        app.key(key(KeyCode::Char('i')));
+        let inspection = app.pager.as_ref().unwrap().lines.join("\n");
+        for required in [
+            cap,
+            "exact approved path identity only, not descendants",
+            "may flow to the model provider",
+            "Tool inventory_reader v2",
+            "Memory: 64 MB",
+            "Credential path blocked",
+            "AI inventory helper",
+            "function run(input)",
+            "Run: consumer-run",
+            "page_reader (url): https://source.example",
+            "runtime_access",
+            "Actual attempted read",
+        ] {
+            assert!(
+                inspection.contains(required),
+                "lost {required}: {inspection}"
+            );
+        }
+        assert!(
+            sent.try_recv().is_err(),
+            "inspection must be local and read-only"
+        );
+        app.key(key(KeyCode::Esc));
+        app.clear_attention();
+        app.reconnect_request = Some((77, "s1".into()));
+        app.apply_reconnect_snapshot(77, reconnect_snapshot(true, vec![event]));
+        assert_eq!(app.approvals[0].capabilities, [cap]);
+        assert_eq!(app.approvals[0].context.as_ref(), Some(&context));
+        app.input_focus = false;
+        app.key(key(KeyCode::Char('r')));
+        assert!(
+            sent.try_recv().is_err(),
+            "no parent-scope request for a credential read"
+        );
+        app.key(key(KeyCode::Char('s')));
+        let decision: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        match decision.request {
+            Request::ApprovalDecision {
+                approval_id,
+                approved,
+                scope,
+                paths,
+                ..
+            } => {
+                assert_eq!(approval_id, "credential-read");
+                assert!(approved);
+                assert_eq!(scope, ApprovalScope::Session);
+                assert!(
+                    paths.is_empty(),
+                    "exact credential reads cannot widen to a parent"
+                );
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+    }
+
     #[test]
     fn call_evidence_survives_reconnect_and_terminal_inspection_without_approving() {
         let _env = credential_env::EnvGuard::isolated();

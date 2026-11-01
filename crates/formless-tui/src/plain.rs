@@ -171,11 +171,16 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
                     }
                 ),
             };
-            let evidence = context
+            let mut evidence = context
                 .as_ref()
                 .map(formless_protocol::approval_context_lines)
-                .unwrap_or_default()
-                .join("\n");
+                .unwrap_or_default();
+            for capability in capabilities {
+                if let Some(warning) = formless_protocol::sensitive_read_warning(capability) {
+                    evidence.push(format!("⚠ {capability}: {warning}"));
+                }
+            }
+            let evidence = evidence.join("\n");
             let what = if evidence.is_empty() {
                 what
             } else {
@@ -717,6 +722,21 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("or n to deny."));
+        let mut sensitive = approval.clone();
+        if let Event::ApprovalRequested {
+            capabilities,
+            detail,
+            ..
+        } = &mut sensitive
+        {
+            *capabilities = vec!["fs:read-sensitive:/private/project/token.json".into()];
+            *detail = Some("Pinned reader v2 requests credential access".into());
+        }
+        let text = format_event(&sensitive, &mut streaming).unwrap();
+        assert!(text.contains("Pinned reader v2 requests credential access"));
+        assert!(text.contains("fs:read-sensitive:/private/project/token.json"));
+        assert!(text.contains("exact approved path identity only, not descendants"));
+        assert!(text.contains("may flow to the model provider"));
         let no_box_drawing = |s: &str| !s.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c));
         assert!(no_box_drawing(&text));
         let q = Question {

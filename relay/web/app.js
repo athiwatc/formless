@@ -354,6 +354,7 @@
   /** Where an fs: path lies, as [warn, note] or null (SPEC §10.3; the same
    * rule as `path_note` in the protocol crate). */
   function pathNote(cap, cwd) {
+    if (cap.startsWith("fs:read-sensitive:")) return [true, "Credential read: exact approved path identity only, not descendants. Contents may flow to the model provider."];
     const m = /^fs:(read|write):(.*)$/.exec(cap);
     if (!m) return null;
     const path = m[2];

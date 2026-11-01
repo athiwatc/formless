@@ -520,12 +520,21 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
     None
 }
 
+/// Display-only warning for an exact credential-read approval. It does not
+/// interpret, resolve or widen the server's approved path identity.
+pub fn sensitive_read_warning(spec: &str) -> Option<&'static str> {
+    spec.strip_prefix("fs:read-sensitive:").map(|_| {
+        "Credential read: exact approved path identity only, not descendants. Contents may flow to the model provider."
+    })
+}
+
 /// Where an `fs:` Capability's path lies (SPEC §10.3), for approval
-/// prompts: `(warn, note)`. Folders that hold secrets warn whatever the
-/// working folder; otherwise a path outside the Session's working folder
-/// warns and one inside it doesn't. `None` for other Capabilities, or
-/// when there is no working folder and nothing stands out.
+/// prompts: `(warn, note)`. Credential reads always warn, including inside
+/// the working folder. Other secret folders and paths outside it warn too.
 pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
+    if let Some(warning) = sensitive_read_warning(spec) {
+        return Some((true, warning.into()));
+    }
     let path = spec
         .strip_prefix("fs:read:")
         .or_else(|| spec.strip_prefix("fs:write:"))?;
@@ -3176,5 +3185,22 @@ mod tests {
             "no working folder, nothing special"
         );
         assert_eq!(path_note("net:example.com", cwd), None);
+    }
+
+    #[test]
+    fn credential_read_warning_is_exact_and_independent_of_working_directory() {
+        for capability in [
+            "fs:read-sensitive:/private/project/token.json",
+            r"fs:read-sensitive:C:\private\token.json",
+        ] {
+            let warning = sensitive_read_warning(capability).unwrap();
+            assert!(warning.contains("exact approved path identity only, not descendants"));
+            assert!(warning.contains("may flow to the model provider"));
+            for cwd in [None, Some("/private/project"), Some("/different/project")] {
+                assert_eq!(path_note(capability, cwd), Some((true, warning.into())));
+            }
+        }
+        assert_eq!(sensitive_read_warning("fs:read:/private/project"), None);
+        assert_eq!(sensitive_read_warning("fs:write:/private/project"), None);
     }
 }
