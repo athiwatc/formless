@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod mcp_auth;
 pub mod mcp_catalog;
 pub mod memory;
+mod model_test_cache;
 pub mod namer;
 pub mod optimiser;
 pub mod path_scope;
