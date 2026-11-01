@@ -112,7 +112,7 @@ fn process_fixture_helper() {
             println!("\nSTDIN_BYTES={}", input.len());
             std::io::stdout().flush().unwrap();
         }
-        "tree" => {
+        "tree" | "exit_tree" => {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(HELPER_ARGS)
                 .env("FL_FIXTURE_MODE", "hold")
@@ -125,6 +125,9 @@ fn process_fixture_helper() {
             wait_file(Path::new(&std::env::var_os("FL_CHILD_PID_FILE").unwrap()));
             println!("TREE_READY");
             std::io::stdout().flush().unwrap();
+            if mode == "exit_tree" {
+                std::process::exit(0);
+            }
             hold();
             let _ = child.kill();
             let _ = child.wait();
@@ -172,10 +175,17 @@ fn is_running(pid: u32) -> bool {
     use windows_sys::Win32::{
         Foundation::CloseHandle,
         System::Threading::{
-            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+            OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE,
         },
     };
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
     if process.is_null() {
         return false;
     }
@@ -411,4 +421,46 @@ fn environment_scopes_and_non_live_modes_match_run() {
         execute(&req, Arc::new(NoHostOps)).unwrap_err().kind,
         ExecErrorKind::Denied
     );
+}
+
+#[test]
+fn normal_leader_exit_closes_background_group_pipes_before_reaping() {
+    let f = Fixture::new();
+    let value=execute(&f.request(r#"function run(i){const p=process.spawn(i.cmd,i.args,{cwd:i.cwd,env:i.env,timeout_ms:5000});
+      let out='';while(true){const c=p.read();if(c.eof)break;out+=c.data;}return {out,status:p.wait()};}"#,"exit_tree"),Arc::new(NoHostOps)).unwrap().output;
+    assert!(value["out"].as_str().unwrap().contains("TREE_READY"));
+    assert_eq!(value["status"]["code"], 0);
+    assert_eq!(value["status"]["timed_out"], false);
+    assert_reaped(f.pid("parent.pid"));
+    assert!(
+        !is_running(f.pid("child.pid")),
+        "an exited leader left a running background group member"
+    );
+}
+
+#[test]
+fn deadline_still_fires_when_javascript_does_not_drain_full_pipes() {
+    let f = Fixture::new();
+    let req=f.request(r#"function run(i){const p=process.spawn(i.cmd,i.args,{cwd:i.cwd,env:i.env,timeout_ms:100});
+      sleep(500);let n=0;while(true){const c=p.read();if(c.eof)break;n+=c.data.length;}return {n,status:p.wait()};}"#,"duplex");
+    let value = execute(&req, Arc::new(NoHostOps)).unwrap().output;
+    assert_eq!(value["status"]["timed_out"], true);
+    assert!(value["n"].as_u64().unwrap() > 0);
+    assert!(
+        value["n"].as_u64().unwrap() < 1048576,
+        "unread stdout was not backpressured"
+    );
+    assert_reaped(f.pid("parent.pid"));
+}
+
+#[test]
+fn open_handle_limit_fails_before_launch_and_kill_releases_the_slot() {
+    let f = Fixture::new();
+    let req=f.request(r#"function run(i){const options={cwd:i.cwd,env:i.env,timeout_ms:10000};let ps=[];
+      for(let n=0;n<16;n++)ps.push(process.spawn(i.cmd,i.args,options));
+      let denied=false;try{process.spawn(i.cmd,i.args,options);}catch(e){denied=String(e).includes('resource limit');}
+      ps.shift().kill();const replacement=process.spawn(i.cmd,i.args,options);replacement.kill();
+      for(const p of ps)p.kill();return {denied,reused:true};}"#,"hold");
+    let value = execute(&req, Arc::new(NoHostOps)).unwrap().output;
+    assert_eq!(value, json!({"denied":true,"reused":true}));
 }

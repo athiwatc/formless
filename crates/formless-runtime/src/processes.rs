@@ -343,11 +343,23 @@ fn supervise(
                     true,
                 );
             }
-            if let Some(status) = owned.child.try_wait().map_err(|e| e.to_string())? {
-                // A direct child that exits cannot leave background descendants
-                // holding its pipes or its Invocation's authority indefinitely.
+            let exited = match platform::has_exited(&mut owned.child) {
+                Ok(exited) => exited,
+                Err(error) => {
+                    // An external SIGCHLD reaper may have consumed the child.
+                    // Never use a released PID/PGID as authority to kill others.
+                    #[cfg(unix)]
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        owned.terminated = true;
+                    }
+                    return Err(error.to_string());
+                }
+            };
+            if exited {
+                // Keep an exited Unix leader waitable until the group is killed:
+                // reaping first could free its PID/PGID for an unrelated process.
                 owned.terminate();
-                break (status, false, false);
+                break (owned.child.wait().map_err(|e| e.to_string())?, false, false);
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -389,6 +401,23 @@ mod platform {
     pub(super) fn prepare(command: &mut Command) {
         std::os::unix::process::CommandExt::process_group(command, 0);
     }
+    pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: valid initialized native output, our own still-waitable child,
+        // and WNOWAIT deliberately retains its identity until group termination.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { info.si_pid() } != 0)
+    }
     pub(super) struct Group(u32);
     impl Group {
         pub(super) fn attach(child: &Child) -> Result<Self, String> {
@@ -407,6 +436,9 @@ mod platform {
 mod platform {
     use super::*;
     pub(super) fn prepare(_: &mut Command) {}
+    pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
+        child.try_wait().map(|status| status.is_some())
+    }
     pub(super) struct Group;
     impl Group {
         pub(super) fn attach(_: &Child) -> Result<Self, String> {
@@ -442,6 +474,10 @@ mod platform {
     };
     pub(super) fn prepare(command: &mut Command) {
         command.creation_flags(CREATE_SUSPENDED);
+    }
+    pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
+        // The private Job handle retains group identity after the process exits.
+        child.try_wait().map(|status| status.is_some())
     }
     pub(super) struct Group(OwnedHandle);
     impl Group {
