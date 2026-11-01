@@ -8956,14 +8956,32 @@ impl App {
             .unwrap_or_else(|| self.session_idx.min(visible.len().saturating_sub(1)));
     }
 
+    fn branch_summary_review_is_visible(&self) -> bool {
+        match (
+            &self.branch_summary.basis,
+            &self.branch_summary.review,
+            &self.pager,
+        ) {
+            (Some(basis), Some(preview), Some(pager)) => {
+                pager.title == "Branch summary · review exact note"
+                    && pager.lines == branch_summary::review_lines(basis, preview)
+            }
+            _ => false,
+        }
+    }
+
     fn cancel_branch_summary(&mut self) {
-        if self.branch_summary.review.is_some() {
+        if self.branch_summary_review_is_visible() {
             self.pager = None;
         }
         self.branch_summary.clear();
     }
 
     fn insert_branch_summary(&mut self) {
+        if !self.branch_summary_review_is_visible() {
+            self.branch_summary.clear();
+            return;
+        }
         let Some(preview) = self.branch_summary.review.take() else {
             return;
         };
@@ -21592,6 +21610,31 @@ mod tests {
             "disconnected review must not submit"
         );
         assert!(!app.branch_summary.committing);
+    }
+
+    #[test]
+    fn another_pager_cannot_confirm_a_hidden_branch_summary_candidate() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        assert!(app.branch_summary_review_is_visible());
+        app.pager = Some(Pager {
+            title: "Unrelated late artifact".into(),
+            lines: vec!["Different content".into()],
+            top: 0,
+            left: 0,
+            styled: vec![],
+        });
+        app.key(key(KeyCode::Char('i')));
+        assert!(
+            sent.try_recv().is_err(),
+            "Insert cannot confirm a candidate hidden by another response"
+        );
+        assert!(app.branch_summary.review.is_none());
+        assert_eq!(app.pager.as_ref().unwrap().title, "Unrelated late artifact");
+        assert_eq!(app.input.expanded(), "Unsent original draft");
     }
 
     #[test]
