@@ -5,6 +5,14 @@ use formless_protocol::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SessionComparisonFailure {
+    #[error("Session not found")]
+    NotFound,
+    #[error("Comparison exceeds the safe RPC detail budget ({limit} bytes). No partial diff was sent. Use `formless sessions compare --json` with the daemon stopped for complete offline output.")]
+    ReplyTooLarge { limit: usize },
+}
+
 impl Store {
     pub fn compare_sessions(
         &self,
@@ -12,13 +20,53 @@ impl Store {
         right: &str,
         cfg: &crate::Config,
     ) -> Result<SessionComparison> {
+        self.compare_sessions_with_budget(left, right, cfg, None)
+    }
+
+    pub fn compare_sessions_for_rpc(
+        &self,
+        left: &str,
+        right: &str,
+        cfg: &crate::Config,
+    ) -> Result<SessionComparison> {
+        self.compare_sessions_with_budget(
+            left,
+            right,
+            cfg,
+            Some(formless_protocol::MAX_FRAME_BYTES / 4),
+        )
+    }
+
+    pub(super) fn compare_sessions_with_budget(
+        &self,
+        left: &str,
+        right: &str,
+        cfg: &crate::Config,
+        budget: Option<usize>,
+    ) -> Result<SessionComparison> {
         self.read_transaction(|st| {
-            let read = |id: &str| -> Result<SessionInfo> {
-                let session = st.get_session(id)?.context(
-                    formless_protocol::RequestFailure::not_found("Session not found"),
+            for id in [left, right] {
+                let exists: bool = st.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND deleted_at IS NULL)",
+                    params![id], |r| r.get(0),
                 )?;
+                if !exists { return Err(SessionComparisonFailure::NotFound.into()); }
+            }
+            if let Some(limit) = budget {
+                // Worst-case JSON escaping plus per-message keys, before loading
+                // bodies. UNION ALL counts both sides even when IDs are equal.
+                let bytes: i64 = st.conn.query_row("SELECT COALESCE(SUM(bytes),0) FROM (
+                    SELECT 6*(length(CAST(id AS BLOB))+length(CAST(session_id AS BLOB))+length(CAST(role AS BLOB))+length(CAST(created_at AS BLOB))+length(CAST(content AS BLOB))+COALESCE(length(CAST(meta AS BLOB)),0))+512 AS bytes FROM messages WHERE session_id=?1
+                    UNION ALL
+                    SELECT 6*(length(CAST(id AS BLOB))+length(CAST(session_id AS BLOB))+length(CAST(role AS BLOB))+length(CAST(created_at AS BLOB))+length(CAST(content AS BLOB))+COALESCE(length(CAST(meta AS BLOB)),0))+512 AS bytes FROM messages WHERE session_id=?2)",params![left,right],|r|r.get(0))?;
+                if bytes < 0 || bytes as u128 > limit as u128 {
+                    return Err(SessionComparisonFailure::ReplyTooLarge { limit }.into());
+                }
+            }
+            let read = |id: &str| -> Result<SessionInfo> {
+                let session = st.get_session(id)?.context(SessionComparisonFailure::NotFound)?;
                 if st.session_deleted(id)? {
-                    anyhow::bail!(formless_protocol::RequestFailure::not_found("Session not found"));
+                    return Err(SessionComparisonFailure::NotFound.into());
                 }
                 Ok(session)
             };
@@ -65,7 +113,7 @@ impl Store {
             let messages = message_diff(left_tail, right_tail);
             let left_usage = st.branch_usage(&left, cut, &left_messages, cfg)?;
             let right_usage = st.branch_usage(&right, cut, &right_messages, cfg)?;
-            Ok(SessionComparison {
+            let result = SessionComparison {
                 left: SessionComparisonSide { session: left, usage: left_usage },
                 right: SessionComparisonSide { session: right, usage: right_usage },
                 common_ancestor,
@@ -74,7 +122,13 @@ impl Store {
                 prefix_changed,
                 messages,
                 warnings,
-            })
+            };
+            if let Some(limit) = budget {
+                if serde_json::to_vec(&result)?.len() > limit {
+                    return Err(SessionComparisonFailure::ReplyTooLarge { limit }.into());
+                }
+            }
+            Ok(result)
         })
     }
 
@@ -310,17 +364,22 @@ fn message_diff(a: Vec<&MessageInfo>, b: Vec<&MessageInfo>) -> Vec<SessionMessag
             right: right.cloned(),
         };
     // Bound quadratic work without truncating any stored message.
-    if a.len().saturating_mul(b.len()) > 1_000_000 {
+    if a.is_empty() || b.is_empty() || a.len().saturating_mul(b.len()) > 1_000_000 {
         return a
             .into_iter()
             .map(|m| row("left_only", Some(m), None))
             .chain(b.into_iter().map(|m| row("right_only", None, Some(m))))
             .collect();
     }
+    // Hash payloads once, rather than scan megabyte bodies in every DP cell.
+    // Exact verification below prevents even a hash collision from inventing
+    // an unchanged message. Hashing and aligned verification are linear bytes.
+    let left_keys: Vec<_> = a.iter().map(|m| message_key(m)).collect();
+    let right_keys: Vec<_> = b.iter().map(|m| message_key(m)).collect();
     let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
         for j in (0..b.len()).rev() {
-            lcs[i][j] = if same_message(a[i], b[j]) {
+            lcs[i][j] = if left_keys[i] == right_keys[j] {
                 1 + lcs[i + 1][j + 1]
             } else {
                 lcs[i + 1][j].max(lcs[i][j + 1])
@@ -329,8 +388,13 @@ fn message_diff(a: Vec<&MessageInfo>, b: Vec<&MessageInfo>) -> Vec<SessionMessag
     }
     let (mut i, mut j, mut out) = (0, 0, Vec::new());
     while i < a.len() && j < b.len() {
-        if same_message(a[i], b[j]) {
-            out.push(row("unchanged", Some(a[i]), Some(b[j])));
+        if left_keys[i] == right_keys[j] {
+            if same_message(a[i], b[j]) {
+                out.push(row("unchanged", Some(a[i]), Some(b[j])));
+            } else {
+                out.push(row("left_only", Some(a[i]), None));
+                out.push(row("right_only", None, Some(b[j])));
+            }
             i += 1;
             j += 1;
         } else if lcs[i + 1][j] >= lcs[i][j + 1] {
@@ -344,4 +408,21 @@ fn message_diff(a: Vec<&MessageInfo>, b: Vec<&MessageInfo>) -> Vec<SessionMessag
     out.extend(a[i..].iter().map(|m| row("left_only", Some(m), None)));
     out.extend(b[j..].iter().map(|m| row("right_only", None, Some(m))));
     out
+}
+
+fn message_key(message: &MessageInfo) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut key = Sha256::new();
+    for value in [
+        Some(message.role.as_str()),
+        Some(message.content.as_str()),
+        message.meta.as_deref(),
+    ] {
+        key.update([u8::from(value.is_some())]);
+        if let Some(value) = value {
+            key.update((value.len() as u64).to_le_bytes());
+            key.update(value.as_bytes());
+        }
+    }
+    key.finalize().into()
 }

@@ -670,6 +670,13 @@ task, with quality as a gate**.
   excludes missing provider usage and is never an upper bound on the bill.
   Offline comparison reads a private snapshot and file-only prices; it never
   starts a daemon, authenticates, runs jobs or writes the source SQLite files.
+  Message alignment hashes payloads once, compares fixed-size keys within a
+  one-million-pair budget, and verifies aligned messages exactly. Larger
+  comparisons show both complete tails without claiming unchanged matches.
+  RPC details have an explicit 8 MiB safety budget (below the 32 MiB transport
+  cap), checked before loading oversized bodies and again after encoding;
+  overflow returns a typed error instead of a partial reply or dropped frame.
+  Full offline CLI output remains available without this framing limit.
   `formless sessions fork ID [--name NAME] [--up-to-seq N] --json` uses the same
   atomic fork operation as the TUI and other callers; it starts no Run.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**

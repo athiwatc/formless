@@ -6913,6 +6913,7 @@ mod session_lineage_tests;
 
 #[path = "session_comparison.rs"]
 mod session_comparison;
+pub(crate) use session_comparison::SessionComparisonFailure;
 
 #[cfg(test)]
 #[path = "session_comparison_tests.rs"]

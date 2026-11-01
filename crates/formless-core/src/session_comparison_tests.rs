@@ -290,3 +290,96 @@ fn comparison_rejects_hidden_sessions_and_cycles_without_mutating_history() {
         .contains("cyclic"));
     assert!(st.list_messages(&a.id).unwrap().is_empty());
 }
+
+#[test]
+fn large_message_histories_fall_back_without_omission_or_invented_unchanged_rows() {
+    let st = Store::open_in_memory().unwrap();
+    let a = st.create_session(None).unwrap();
+    let b = st.create_session(None).unwrap();
+    st.transaction(|st| {
+        for _ in 0..1001 {
+            st.append_message(&a.id, "assistant", "identical repeated text")?;
+            st.append_message(&b.id, "assistant", "identical repeated text")?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let result = st
+        .compare_sessions_for_rpc(&a.id, &b.id, &crate::Config::default())
+        .unwrap();
+    assert_eq!(result.messages.len(), 2002);
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|row| row.kind == "left_only")
+            .count(),
+        1001
+    );
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|row| row.kind == "right_only")
+            .count(),
+        1001
+    );
+    assert!(result.messages.iter().all(|row| row.kind != "unchanged"));
+    assert_eq!(
+        result.messages.last().unwrap().right.as_ref().unwrap().seq,
+        1001
+    );
+    assert!(result
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("without quadratic")
+            && warning.contains("no messages are omitted")));
+}
+
+#[test]
+fn repeated_large_bodies_align_exactly_but_rpc_budget_fails_with_a_typed_error() {
+    let st = Store::open_in_memory().unwrap();
+    let a = st.create_session(None).unwrap();
+    let b = st.create_session(None).unwrap();
+    let body = "large repeated payload 界\n".repeat(3000);
+    for _ in 0..32 {
+        st.append_message(&a.id, "assistant", &body).unwrap();
+        st.append_message(&b.id, "assistant", &body).unwrap();
+    }
+    let result = st
+        .compare_sessions(&a.id, &b.id, &crate::Config::default())
+        .unwrap();
+    assert_eq!(result.messages.len(), 32);
+    assert!(result.messages.iter().all(|row| row.kind == "unchanged"
+        && row.left.as_ref().unwrap().content == body
+        && row.right.as_ref().unwrap().content == body));
+    let error = st
+        .compare_sessions_for_rpc(&a.id, &b.id, &crate::Config::default())
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SessionComparisonFailure>(),
+        Some(SessionComparisonFailure::ReplyTooLarge { .. })
+    ));
+    assert_eq!(st.list_messages(&a.id).unwrap().len(), 32);
+}
+
+#[test]
+fn final_rpc_budget_also_covers_metadata_and_missing_sessions_stay_typed() {
+    let st = Store::open_in_memory().unwrap();
+    let a = st.create_session(Some("A".repeat(2000))).unwrap();
+    let b = st.create_session(None).unwrap();
+    let error = st
+        .compare_sessions_with_budget(&a.id, &b.id, &crate::Config::default(), Some(1024))
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SessionComparisonFailure>(),
+        Some(SessionComparisonFailure::ReplyTooLarge { limit: 1024 })
+    ));
+    let error = st
+        .compare_sessions_for_rpc("not-found", &b.id, &crate::Config::default())
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<SessionComparisonFailure>(),
+        Some(SessionComparisonFailure::NotFound)
+    ));
+}
