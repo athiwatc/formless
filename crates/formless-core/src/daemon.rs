@@ -635,6 +635,7 @@ pub struct Daemon {
     next_run_model: StdMutex<HashMap<String, String>>,
     /// The latest routing decisions (SPEC §4.6), newest last, at most 50.
     routing_log: StdMutex<std::collections::VecDeque<Value>>,
+    model_test_cache: Arc<crate::model_test_cache::ModelTestCache>,
     /// Configured models the endpoints no longer list (SPEC §4.2).
     missing_models: StdMutex<Vec<String>>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
@@ -816,6 +817,9 @@ impl Daemon {
                     .unwrap_or_default(),
             )?
         };
+        let model_test_cache = Arc::new(crate::model_test_cache::ModelTestCache::new(
+            paths.data_dir.join("model_tests.json"),
+        ));
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -846,6 +850,7 @@ impl Daemon {
             progress_sent: StdMutex::new(Default::default()),
             comparisons: StdMutex::new(Default::default()),
             routing_log: StdMutex::new(Default::default()),
+            model_test_cache,
             missing_models: StdMutex::new(Vec::new()),
             step_sessions: StdMutex::new(Default::default()),
             step_waiters: StdMutex::new(Default::default()),
@@ -1780,7 +1785,7 @@ impl Daemon {
                     other => other,
                 };
                 if let Some(m) = &model {
-                    self.test_new_model(&id, m);
+                    let _ = self.test_new_model(&id, m);
                 }
                 let s = self
                     .with_store(|st| st.set_session_model(&id, model, reasoning_effort))?
@@ -8248,19 +8253,14 @@ impl Daemon {
 
     /// Remembered model tests, keyed `"<base_url> <model>"` (SPEC §4.3).
     fn model_tests(&self) -> serde_json::Map<String, Value> {
-        std::fs::read_to_string(self.paths.data_dir.join("model_tests.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        self.model_test_cache.results().unwrap_or_else(|error| {
+            tracing::warn!("cannot read model test results: {error:#}");
+            Default::default()
+        })
     }
 
-    fn remember_model_test(&self, base_url: &str, test: &crate::provider::ModelTest) {
-        let mut all = self.model_tests();
-        all.insert(format!("{base_url} {}", test.model), json!(test));
-        let _ = std::fs::write(
-            self.paths.data_dir.join("model_tests.json"),
-            serde_json::to_string_pretty(&all).unwrap_or_default(),
-        );
+    fn remember_model_test(&self, base_url: &str, test: &crate::provider::ModelTest) -> Result<()> {
+        self.model_test_cache.remember(base_url, test)
     }
 
     /// Test a model on a provider and remember the result.
@@ -8273,36 +8273,58 @@ impl Daemon {
         let p = self.provider_named(cfg, provider).await?;
         let model = p.settings().resolve_alias(model);
         let t = p.test_model(&model).await;
-        self.remember_model_test(&p.settings().base_url, &t);
+        self.remember_model_test(&p.settings().base_url, &t)
+            .context("model test completed, but its result could not be saved")?;
         Ok(t)
     }
 
     /// A newly chosen model is tested once in the background; a failure is
     /// a note now rather than a failed Run later (SPEC §4.3).
-    fn test_new_model(self: &Arc<Self>, session_id: &str, model: &str) {
-        let Ok(cfg) = self.config() else { return };
+    fn test_new_model(
+        self: &Arc<Self>,
+        session_id: &str,
+        model: &str,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let cfg = self.config().ok()?;
+        if !cfg.provider.auto_test_models {
+            return None;
+        }
         if model.starts_with("role:") || ProviderCfg::is_auto_model(model) || model.is_empty() {
-            return;
+            return None;
         }
         let model = cfg.provider.resolve_alias(model);
-        let key = format!("{} {model}", cfg.provider.base_url);
-        if self.model_tests().contains_key(&key) {
-            return;
-        }
-        let (this, sid) = (self.clone(), session_id.to_string());
-        tokio::spawn(async move {
-            if let Ok(t) = this.test_model(&cfg, None, &model).await {
-                if !t.ok {
-                    this.broadcast(Event::Note {
-                        session_id: Some(sid),
-                        text: format!(
-                            "{model} failed the model test: {}",
-                            t.error.unwrap_or_else(|| "it does not call tools".into())
-                        ),
-                    });
-                }
+        let reservation = match self
+            .model_test_cache
+            .reserve(&cfg.provider.base_url, &model)
+        {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => return None,
+            Err(error) => {
+                self.broadcast(Event::Note {
+                    session_id: Some(session_id.into()),
+                    text: format!("Cannot start automatic model test: {error:#}"),
+                });
+                return None;
             }
-        });
+        };
+        let (this, sid) = (self.clone(), session_id.to_string());
+        Some(tokio::spawn(async move {
+            let _reservation = reservation;
+            match this.test_model(&cfg, None, &model).await {
+                Ok(t) if !t.ok => this.broadcast(Event::Note {
+                    session_id: Some(sid),
+                    text: format!(
+                        "{model} failed the model test: {}",
+                        t.error.unwrap_or_else(|| "it does not call tools".into())
+                    ),
+                }),
+                Err(error) => this.broadcast(Event::Note {
+                    session_id: Some(sid),
+                    text: format!("{model} model test failed: {error:#}"),
+                }),
+                Ok(_) => {}
+            }
+        }))
     }
 
     /// Configured models (default, fallbacks, routing, Roles) missing from
@@ -16826,3 +16848,7 @@ mod approval_daemon_tests;
 #[cfg(test)]
 #[path = "sensitive_read_daemon_tests.rs"]
 mod sensitive_read_daemon_tests;
+
+#[cfg(test)]
+#[path = "model_test_daemon_tests.rs"]
+mod model_test_daemon_tests;
