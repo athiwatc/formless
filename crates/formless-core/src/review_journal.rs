@@ -31,6 +31,8 @@ struct Image {
     security: Option<String>,
     integrity: String,
     security_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_identity: Option<crate::review_file_io::WindowsIdentity>,
 }
 impl Image {
     fn capture(image: &ReviewImage) -> Result<Self> {
@@ -51,6 +53,7 @@ impl Image {
         Ok(Self {
             integrity: image.integrity_hash()?,
             security_complete: image.security_complete,
+            windows_identity: image.windows_identity.clone(),
             base64: image
                 .bytes
                 .as_ref()
@@ -99,7 +102,8 @@ impl Image {
                 || self.readonly
                 || self.owner.is_some()
                 || self.group.is_some()
-                || security.is_some())
+                || security.is_some()
+                || self.windows_identity.is_some())
         {
             bail!("Missing review image contains invalid mode metadata");
         }
@@ -111,6 +115,8 @@ impl Image {
             group: self.group,
             security,
             security_complete: self.security_complete,
+            windows_identity: self.windows_identity.clone(),
+            ..Default::default()
         };
         if image.integrity_hash()? != self.integrity {
             bail!("Private recovery image integrity mismatch");

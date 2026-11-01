@@ -7,6 +7,14 @@ use formless_runtime::sensitive_paths::{PathDecision, PathPolicy};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+/// Durable identity is a comparison value, never authority to reopen an object.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WindowsIdentity {
+    pub volume: u64,
+    pub file: [u8; 16],
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct ReviewImage {
     pub bytes: Option<Vec<u8>>,
@@ -16,6 +24,13 @@ pub(crate) struct ReviewImage {
     pub group: Option<u32>,
     pub security: Option<Vec<u8>>,
     pub security_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_identity: Option<WindowsIdentity>,
+    // Runtime capability is intentionally absent from receipt equality/checksums.
+    // A decoded identity alone can never authorize byte-only Windows writes.
+    #[cfg(windows)]
+    #[serde(skip)]
+    pub witness: windows::Witness,
 }
 impl ReviewImage {
     pub fn write_restriction(&self) -> Option<&'static str> {
@@ -25,6 +40,9 @@ impl ReviewImage {
         if !self.security_complete {
             return Some("Full security metadata (including Windows audit/SACL state) cannot be verified without changing privileges; file writes are refused");
         }
+        self.ordinary_write_restriction()
+    }
+    fn ordinary_write_restriction(&self) -> Option<&'static str> {
         if self.readonly {
             return Some("Read-only files are not hunk-editable");
         }
@@ -50,6 +68,26 @@ impl ReviewImage {
             }
         }
         None
+    }
+    /// Existing-object byte mutation has no security-metadata restoration step.
+    /// Opaque SACL state remains on the same object, guarded by a live witness.
+    pub fn existing_write_restriction(&self) -> Option<&'static str> {
+        #[cfg(windows)]
+        if self.bytes.is_some() && self.witness.matches(self.windows_identity.as_ref()) {
+            return self.ordinary_write_restriction();
+        }
+        self.write_restriction()
+    }
+    #[cfg(windows)]
+    pub fn attach_witness(&mut self, live: &Self) -> Result<()> {
+        if self.windows_identity.is_none()
+            || self.windows_identity != live.windows_identity
+            || !live.witness.matches(live.windows_identity.as_ref())
+        {
+            bail!("Windows review no longer owns the exact retained file object");
+        }
+        self.witness = live.witness.clone();
+        Ok(())
     }
     pub fn retained_bytes(&self) -> usize {
         self.bytes.as_ref().map_or(0, Vec::len) + self.security.as_ref().map_or(0, Vec::len)
@@ -386,6 +424,7 @@ impl ReviewPath {
                 group: Some(metadata.gid()),
                 security: None,
                 security_complete,
+                windows_identity: None,
             })
         }
         #[cfg(windows)]
@@ -443,6 +482,16 @@ impl ReviewPath {
         let current = self.read(policy)?;
         if current != *expected {
             bail!("File content, existence or mode changed; inspect again");
+        }
+        #[cfg(windows)]
+        if expected.bytes.is_none() || desired.bytes.is_none() {
+            bail!("Windows existence-changing review requires retained-object recovery");
+        }
+        #[cfg(windows)]
+        if expected.bytes.is_some() && desired.bytes.is_some() {
+            return self
+                .native
+                .replace_existing(&self.path, expected, desired, policy);
         }
         if let Some(reason) = current
             .write_restriction()
@@ -1032,5 +1081,32 @@ mod compatibility_capture_tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+}
+
+#[cfg(test)]
+mod windows_identity_compatibility_tests {
+    use super::*;
+    #[test]
+    fn legacy_image_serialization_omits_new_identity_and_binds_new_identity() {
+        let legacy = r#"{"bytes":[97],"mode":420,"readonly":false,"owner":null,"group":null,"security":null,"security_complete":true}"#;
+        let image: ReviewImage = serde_json::from_str(legacy).unwrap();
+        assert!(image.windows_identity.is_none());
+        assert_eq!(serde_json::to_string(&image).unwrap(), legacy);
+        let old_hash = image.integrity_hash().unwrap();
+        let mut identified = image;
+        identified.windows_identity = Some(WindowsIdentity {
+            volume: 17,
+            file: [3; 16],
+        });
+        assert_ne!(identified.integrity_hash().unwrap(), old_hash);
+        let metadata = encode_before_metadata(&identified).unwrap();
+        assert_eq!(
+            decode_before_metadata(&metadata, Some(b"a")).unwrap(),
+            identified
+        );
+        let tampered = metadata.replace("\"volume\":17", "\"volume\":18");
+        assert_ne!(tampered, metadata);
+        assert!(decode_before_metadata(&tampered, Some(b"a")).is_err());
     }
 }
