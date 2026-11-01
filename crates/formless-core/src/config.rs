@@ -305,6 +305,9 @@ pub fn documented_shape() -> Config {
     cfg.security.trusted_hosts.push(s("api.example.com"));
     cfg.security.trusted_paths.push(s("/srv"));
     cfg.security.secret_patterns.push(s("ACME-[0-9]+"));
+    cfg.security
+        .sensitive_paths
+        .push(formless_runtime::sensitive_paths::SensitivePathRule::Subtree(s("/srv/private")));
     cfg.tui.colors.insert(s("*"), s("cyan"));
     cfg.hooks.push(HookCfg {
         event: s("pre_tool"),

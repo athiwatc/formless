@@ -14449,21 +14449,20 @@ impl HostOps for NestedOps {
         };
         let input = json!({"invocation":self.read_input, "runtime_access":{"path":path, "operation":operation, "credential_rule":reason}});
         let cfg = self.daemon.config().map_err(|e| e.to_string())?;
-        let allowed = self.block_cancellable(async {
-            Ok(self
-                .daemon
-                .ensure_approval(
-                    &cfg,
-                    &self.session_id,
-                    &self.run_id,
-                    info,
-                    ver,
-                    &caps,
-                    Some(&input),
-                    &self.cancel,
-                )
-                .await)
-        })?;
+        // ensure_approval owns cancellation and removes its waiter, retained
+        // attention and decision metadata before returning. Wrapping it in
+        // block_cancellable's outer select could drop that future at its
+        // await point and let the Invocation finish before cleanup ran.
+        let allowed = self.handle.block_on(self.daemon.ensure_approval(
+            &cfg,
+            &self.session_id,
+            &self.run_id,
+            info,
+            ver,
+            &caps,
+            Some(&input),
+            &self.cancel,
+        ));
         if allowed {
             Ok(())
         } else {

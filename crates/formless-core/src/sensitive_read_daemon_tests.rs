@@ -269,9 +269,10 @@ async fn cancelled_credential_consent_and_active_profile_reads_fail_before_bytes
     let cancel = CancellationToken::new();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let task = f.launch_controlled(&key, cancel.clone(), cancel_flag.clone());
-    let Event::ApprovalRequested { .. } = next_approval(&mut events).await else {
+    let Event::ApprovalRequested { approval_id, .. } = next_approval(&mut events).await else {
         unreachable!()
     };
+    assert!(f.daemon().pending_attention.locked().iter().any(|event| matches!(event, Event::ApprovalRequested { approval_id: id, .. } if id == &approval_id)));
     // InterruptRun uses this same ordering for the runtime flag and token.
     cancel_flag.store(true, Ordering::SeqCst);
     cancel.cancel();
@@ -283,6 +284,32 @@ async fn cancelled_credential_consent_and_active_profile_reads_fail_before_bytes
     );
     assert!(output.is_empty());
     assert!(f.daemon().approvals.locked().is_empty());
+    assert!(f.daemon().approval_paths.locked().is_empty());
+    assert!(f.daemon().approval_by.locked().is_empty());
+    assert!(f.daemon().deny_always.locked().is_empty());
+    assert!(!f.daemon().pending_attention.locked().iter().any(|event| matches!(event, Event::ApprovalRequested { approval_id: id, .. } if id == &approval_id)));
+    // No sleep/yield: completion itself guarantees cleanup. A late decision
+    // cannot resolve or recreate widening/denial metadata for the dead waiter.
+    let late = f
+        .daemon()
+        .handle(Request::ApprovalDecision {
+            approval_id,
+            approved: false,
+            scope: ApprovalScope::Always,
+            paths: [(
+                "fs:read-sensitive:cancelled".into(),
+                f.root.display().to_string(),
+            )]
+            .into(),
+            remember_denial: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(late["resolved"], false);
+    assert!(f.daemon().approvals.locked().is_empty());
+    assert!(f.daemon().approval_paths.locked().is_empty());
+    assert!(f.daemon().approval_by.locked().is_empty());
+    assert!(f.daemon().deny_always.locked().is_empty());
     let profile_key = f.paths.config_dir.join("api_key");
     std::fs::write(&profile_key, "private-profile-fixture").unwrap();
     // A broad legacy grant covering both project and profile cannot offer

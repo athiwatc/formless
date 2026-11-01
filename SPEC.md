@@ -4250,8 +4250,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.max_emit_bytes` | 1073741824 | Everything one Invocation `emit`s to its artifact (1 GB) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
 | `security.trusted_hosts` | [] | Hosts whose `net:` grants need no approval (`api.example.com`, `*.github.com`); config.toml only (§10.3) |
-| `security.secure` | false | Ask before sensitive Tool calls; off runs them unasked (logged). `--secure` / `FORMLESS_SECURE` turn it on at daemon start (§10.3) |
+| `security.secure` | false | Ask before ordinary sensitive Tool calls; credential reads require separate exact consent even when off. Other calls run unasked (logged). `--secure` / `FORMLESS_SECURE` turn it on at daemon start (§10.3) |
 | `security.secret_patterns` | [] | Extra secret shapes (regular expressions) blanked wherever Formless stores or quotes text, beside the built-in ones; config.toml only (§15) |
+| `security.sensitive_paths` | [] | Additive credential-read rules; owner config.toml only, never protocol settings; builtins and Formless credential hard denies cannot be removed (§7.4) |
+| `security.sensitive_paths[].kind` | required per entry | Typed rule selector: subtree, basename_prefix or basename_suffix (§7.4) |
+| `security.sensitive_paths[].value` | required per entry | Subtree uses an absolute path or ~/ prefix; basename rules use a nonempty literal prefix or suffix without separators or wildcards (§7.4) |
 | `security.trusted_paths` | [] | Folders where writes need no approval; config.toml only (§10.3) |
 | `security.trust_writes` | true | false keeps writes in trusted folders asking (§10.3) |
 | `tools.approval_summaries` | true | Ask the model, once per Tool version, for a plain-language summary shown on approval prompts (§10.3) |
