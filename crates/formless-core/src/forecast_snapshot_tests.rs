@@ -3,7 +3,10 @@ use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
 };
 
 struct Fixture(PathBuf);
@@ -32,6 +35,133 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+// A sibling test can fork while MaintenanceGate holds its short-lived Shared
+// descriptor. CLOEXEC releases that inherited descriptor at exec, not fork;
+// its temporary lifetime can make the immediate Shared -> Exclusive freeze
+// fail for an otherwise private profile. Match profile_lock's after-exec
+// fixture pattern: create this profile only inside a single-test child. The
+// only processes it spawns are the controlled External SQLite peers below.
+#[derive(Clone, Copy)]
+enum SnapshotCase {
+    ClosedWal,
+    Historical,
+    HotRollback,
+    ExternalWal,
+    Owner,
+    NativeExclusive,
+    #[cfg(target_os = "macos")]
+    AppleDefault,
+}
+impl SnapshotCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ClosedWal => "ClosedWal",
+            Self::Historical => "Historical",
+            Self::HotRollback => "HotRollback",
+            Self::ExternalWal => "ExternalWal",
+            Self::Owner => "Owner",
+            Self::NativeExclusive => "NativeExclusive",
+            #[cfg(target_os = "macos")]
+            Self::AppleDefault => "AppleDefault",
+        }
+    }
+}
+
+struct IsolatedSnapshot {
+    child: Child,
+    output: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for IsolatedSnapshot {
+    fn drop(&mut self) {
+        // On any assertion failure, stop and reap the owned process before
+        // joining its reader, so a failed containment deadline cannot hang.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(output) = self.output.take() {
+            let _ = output.join();
+        }
+    }
+}
+
+fn isolated_snapshot(case: SnapshotCase) {
+    let marker = format!("FORECAST_SNAPSHOT_CASE_PASSED:{}", case.name());
+    let passed = Arc::new(AtomicBool::new(false));
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "storage::forecast_snapshot::tests::isolated_snapshot_child_fixture",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FORMLESS_PRIVATE_SNAPSHOT_CASE", case.name())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let seen = passed.clone();
+    let output = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read isolated snapshot fixture output");
+            if line.contains(&marker) {
+                seen.store(true, Ordering::SeqCst);
+            }
+            eprintln!("{line}");
+        }
+    });
+    let mut isolated = IsolatedSnapshot {
+        child,
+        output: Some(output),
+    };
+    // Harness containment only. Keep every original External readiness,
+    // release and exit deadline (10 seconds each) unchanged; do not preempt
+    // their combined bound. No lock acquisition or immediate assertion retries.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = isolated.child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "isolated {} failed: {status}",
+                case.name()
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "isolated {} exceeded its containment deadline",
+            case.name()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    isolated.output.take().unwrap().join().unwrap();
+    assert!(
+        passed.load(Ordering::SeqCst),
+        "the exact isolated snapshot case did not execute; a zero-test filter is not success"
+    );
+}
+
+#[test]
+#[ignore = "private after-exec fixture for exact snapshot freeze and release assertions"]
+fn isolated_snapshot_child_fixture() {
+    let case = std::env::var("FORMLESS_PRIVATE_SNAPSHOT_CASE")
+        .expect("invoke through an isolated snapshot parent test");
+    match case.as_str() {
+        "ClosedWal" => closed_wal_assertions(),
+        "Historical" => historical_assertions(),
+        "HotRollback" => hot_rollback_assertions(),
+        "ExternalWal" => external_wal_assertions(),
+        "Owner" => owner_assertions(),
+        "NativeExclusive" => native_exclusive_assertions(),
+        #[cfg(target_os = "macos")]
+        "AppleDefault" => apple_default_assertions(),
+        _ => panic!("unknown private snapshot case: {case}"),
+    }
+    println!("FORECAST_SNAPSHOT_CASE_PASSED:{case}");
+    std::io::stdout().flush().unwrap();
 }
 
 fn tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
@@ -101,6 +231,10 @@ fn missing_profile_stays_absent_without_a_reader_or_temporary_directory() {
 
 #[test]
 fn closed_wal_is_included_and_every_source_byte_and_path_survives_reader_drop() {
+    isolated_snapshot(SnapshotCase::ClosedWal);
+}
+
+fn closed_wal_assertions() {
     let (fixture, paths) = Fixture::new();
     let expected = closed_wal(&paths);
     let before = tree(&fixture.0);
@@ -121,6 +255,10 @@ fn closed_wal_is_included_and_every_source_byte_and_path_survives_reader_drop() 
 
 #[test]
 fn old_schema_migrates_only_in_private_copy_without_creating_source_sidecars() {
+    isolated_snapshot(SnapshotCase::Historical);
+}
+
+fn historical_assertions() {
     let (fixture, paths) = Fixture::new();
     std::fs::create_dir(&paths.data_dir).unwrap();
     let conn = crate::storage::schema_at(23).unwrap();
@@ -147,6 +285,10 @@ fn old_schema_migrates_only_in_private_copy_without_creating_source_sidecars() {
 
 #[test]
 fn possibly_hot_rollback_journal_refuses_without_recovery_or_source_changes() {
+    isolated_snapshot(SnapshotCase::HotRollback);
+}
+
+fn hot_rollback_assertions() {
     let (fixture, paths) = Fixture::new();
     closed_wal(&paths);
     std::fs::write(
@@ -243,6 +385,10 @@ impl Drop for External {
 
 #[test]
 fn independently_held_wal_connection_refuses_without_touching_any_source_file() {
+    isolated_snapshot(SnapshotCase::ExternalWal);
+}
+
+fn external_wal_assertions() {
     let (fixture, paths) = Fixture::new();
     closed_wal(&paths);
     let mut external = External::spawn(&paths.db_file(), "hold");
@@ -266,6 +412,10 @@ fn independently_held_wal_connection_refuses_without_touching_any_source_file() 
 
 #[test]
 fn cooperating_owner_is_refused_without_a_profile_marker_or_source_write() {
+    isolated_snapshot(SnapshotCase::Owner);
+}
+
+fn owner_assertions() {
     let (fixture, paths) = Fixture::new();
     closed_wal(&paths);
     let owner = ProfileLock::owner(&paths).unwrap();
@@ -289,6 +439,10 @@ fn an_unproven_default_vfs_is_refused_before_source_open() {
 
 #[test]
 fn native_exclusive_lock_excludes_independent_wal_append_checkpoint_and_reset() {
+    isolated_snapshot(SnapshotCase::NativeExclusive);
+}
+
+fn native_exclusive_assertions() {
     let (fixture, paths) = Fixture::new();
     let expected = closed_wal(&paths);
     let before = tree(&fixture.0);
@@ -397,6 +551,11 @@ fn external_sqlite_fixture() {
 #[cfg(target_os = "macos")]
 #[test]
 fn apple_default_vfs_uses_explicit_posix_without_source_or_global_changes() {
+    isolated_snapshot(SnapshotCase::AppleDefault);
+}
+
+#[cfg(target_os = "macos")]
+fn apple_default_assertions() {
     let (fixture, paths) = Fixture::new();
     let expected = closed_wal(&paths);
     let before = tree(&fixture.0);
