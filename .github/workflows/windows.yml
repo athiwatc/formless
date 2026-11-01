@@ -48,14 +48,17 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/formless-forecast-target
-      FORMLESS_DATA_DIR: ${{ runner.temp }}/formless-forecast-data
-      FORMLESS_CONFIG_DIR: ${{ runner.temp }}/formless-forecast-config
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - name: Private job-local build and profile paths
+        shell: pwsh
+        run: |
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'formless-forecast-target')" >> $env:GITHUB_ENV
+          "FORMLESS_DATA_DIR=$(Join-Path $env:RUNNER_TEMP 'formless-forecast-data')" >> $env:GITHUB_ENV
+          "FORMLESS_CONFIG_DIR=$(Join-Path $env:RUNNER_TEMP 'formless-forecast-config')" >> $env:GITHUB_ENV
       - name: Storage before forecast tests
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot before-forecast-tests
