@@ -6913,34 +6913,37 @@ impl Daemon {
         // completions raced.
         ready.sort_by_key(|(_, entry, _)| entry.order);
         let mut delivered_origins = std::collections::BTreeSet::new();
-        let content = std::iter::once("[Pending invocations completed]".to_string())
-            .chain(ready.iter().map(|(handle, entry, text)| {
-                let origins = self
-                    .with_store(|st| st.data_origins(session_id, &entry.run_id))
-                    .unwrap_or_default();
-                delivered_origins.extend(origins.iter().cloned());
-                let frame = crate::provenance::frame(&entry.tool_name, &origins, text);
-                format!("- {handle} (tool {}): {frame}", entry.tool_name)
-            }))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let origins: Vec<_> = delivered_origins
-            .into_iter()
-            .take(crate::provenance::MAX_ORIGINS)
-            .collect();
-        if let Ok(msg) = self.with_store(|st| {
+        let mut content = "[Pending invocations completed]".to_string();
+        for (handle, entry, text) in &ready {
+            let Ok(origins) = self.with_store(|st| st.data_origins(session_id, &entry.run_id))
+            else {
+                // Keep the result available for the next boundary rather
+                // than silently dropping known provenance on a store error.
+                return;
+            };
+            for origin in &origins {
+                if delivered_origins.len() < crate::provenance::MAX_ORIGINS {
+                    delivered_origins.insert(origin.clone());
+                }
+            }
+            let frame = crate::provenance::frame(&entry.tool_name, &origins, text);
+            content.push_str(&format!("\n- {handle} (tool {}): {frame}", entry.tool_name));
+        }
+        let origins: Vec<_> = delivered_origins.into_iter().collect();
+        let Ok(msg) = self.with_store(|st| {
             st.append_message_meta(
                 session_id,
                 "system-note",
                 &content,
                 Some(json!({"tool_data":true,"data_origins":origins}).to_string()),
             )
-        }) {
-            self.broadcast(Event::MessageAppended {
-                session_id: session_id.to_string(),
-                message: msg,
-            });
-        }
+        }) else {
+            return;
+        };
+        self.broadcast(Event::MessageAppended {
+            session_id: session_id.to_string(),
+            message: msg,
+        });
         for (handle, entry, _) in ready {
             entry.delivered.store(true, Ordering::SeqCst);
             self.forget_pending(&handle);
@@ -7698,6 +7701,7 @@ impl Daemon {
         self: &'a Arc<Self>,
         session_id: &'a str,
         run_id: &'a str,
+        caller_tool: &'a str,
         task: &'a str,
         system: Option<&'a str>,
         model: Option<&'a str>,
@@ -7749,10 +7753,11 @@ impl Daemon {
             if let Some(sys) = target.system.as_deref() {
                 messages.push(json!({"role": "system", "content": sys}));
             }
+            let origins = self.with_store(|st| st.data_origins(session_id, run_id))?;
             if let Some(sys) = system {
-                messages.push(json!({"role":"user","content":crate::provenance::frame("agents.run_system_hint",&[],sys)}));
+                messages.push(json!({"role":"user","content":crate::provenance::frame(caller_tool,&origins,sys)}));
             }
-            messages.push(json!({"role": "user", "content": task}));
+            messages.push(json!({"role":"user","content":crate::provenance::frame(caller_tool,&origins,task)}));
             let model = self.resolve_model(
                 &requested,
                 cfg,
@@ -13466,11 +13471,13 @@ impl HostOps for NestedOps {
             model.map(str::to_string),
         );
         let parent_inv = self.parent_inv.clone();
+        let caller_tool = self.tool_name.clone();
         self.block_cancellable(async move {
             daemon
                 .run_subagent_text(
                     &session_id,
                     &run_id,
+                    &caller_tool,
                     &task,
                     system.as_deref(),
                     model.as_deref(),
@@ -13510,9 +13517,9 @@ impl HostOps for NestedOps {
             .with_store(|st| st.data_origins(&self.session_id, &self.run_id))
             .map_err(|e| e.to_string())?;
         if let Some(sys) = system {
-            messages.push(json!({"role":"user","content":crate::provenance::frame("llm.complete_system_hint",&origins,sys)}));
+            messages.push(json!({"role":"user","content":crate::provenance::frame(&self.tool_name,&origins,sys)}));
         }
-        messages.push(json!({"role":"user","content":crate::provenance::frame("llm.complete_request",&origins,prompt)}));
+        messages.push(json!({"role":"user","content":crate::provenance::frame(&self.tool_name,&origins,prompt)}));
         let complex = self
             .daemon
             .routing_complex(&provider, &requested, &messages, &[], &self.cfg)
