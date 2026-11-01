@@ -41,13 +41,26 @@ jobs:
             target: x86_64-pc-windows-msvc
             suffix: zip
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Storage before workspace tests
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot before-tests
       - run: cargo test --workspace --locked
+      - name: Reclaim completed workspace test artifacts
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh clean-debug
       - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - name: Storage after release build
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot release-built
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -82,6 +95,10 @@ jobs:
             formless-*.zip
             formless-*.sha256
           if-no-files-found: ignore
+      - name: Final storage (including failed phases)
+        if: always()
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot job-finished
   # The Linux archive, .deb and .rpm (packaging/README.md), built on Debian
   # bullseye so they run on glibc 2.31 and newer (Debian 11+, Ubuntu 20.04+,
   # RHEL/Rocky 9+), not on whatever ubuntu-latest ships.
@@ -90,12 +107,25 @@ jobs:
     needs: version-check
     runs-on: ubuntu-latest
     container: rust:1-bullseye
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - name: Build dependencies
         run: apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+      - name: Storage before workspace tests
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot before-tests
       - run: cargo test --workspace --locked
+      - name: Reclaim completed workspace test artifacts
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh clean-debug
       - run: cargo build --release --locked --bin formless
+      - name: Storage after release build
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot release-built
       - run: target/release/formless man > target/formless.1
       - name: Archive
         shell: bash
@@ -104,7 +134,9 @@ jobs:
           mkdir -p dist "$name"
           cp target/release/formless target/formless.1 README.md SPEC.md LICENSE "$name/"
           tar -czf "dist/$name.tar.gz" "$name"
-      - run: cargo install cargo-deb cargo-generate-rpm --locked
+      - name: Install package-building tools with private intermediates
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh install-package-tools
       - name: Packages
         shell: bash
         run: |
@@ -118,6 +150,10 @@ jobs:
         with:
           name: formless-linux
           path: dist/*
+      - name: Final storage (including failed phases)
+        if: always()
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot job-finished
   # Install each package in a clean system and run it.
   linux-install-test:
     timeout-minutes: 30

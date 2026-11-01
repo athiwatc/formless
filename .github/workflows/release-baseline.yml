@@ -44,6 +44,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       TARGET: ${{ matrix.target }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,12 +79,18 @@ jobs:
           if (Test-Path $env:CARGO_TARGET_DIR) { throw "target cache unexpectedly restored" }
           rustc -Vv
           cargo --version
+      - name: Storage before workspace tests
+        run: bash scripts/ci-storage-budget.sh snapshot before-tests
       - name: Workspace tests (Cargo-cold)
         shell: bash
         run: time -p cargo test --workspace --locked
+      - name: Reclaim completed workspace test artifacts
+        run: bash scripts/ci-storage-budget.sh clean-debug
       - name: Release build
         shell: bash
         run: time -p cargo build --workspace --release --locked --target "$TARGET"
+      - name: Storage after release build
+        run: bash scripts/ci-storage-budget.sh snapshot release-built
       - name: Package and smoke extracted archive (Unix, private files only)
         if: runner.os != 'Windows'
         shell: bash
@@ -124,6 +133,10 @@ jobs:
           } finally {
             "Package/extracted smoke seconds: $($timer.Elapsed.TotalSeconds)"
           }
+      - name: Final storage (including failed phases)
+        if: always()
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot job-finished
       # Matrix archives stay in this disposable job. Unlike release.yml, there
       # is no distribution upload; local extracted smoke is included in timing.
 
@@ -132,6 +145,10 @@ jobs:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     container: rust:1-bullseye
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -178,10 +195,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Build dependencies (disposable build container only)
         run: time -p sh -c 'apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config'
+      - name: Storage before workspace tests
+        run: bash scripts/ci-storage-budget.sh snapshot before-tests
       - name: Workspace tests (Cargo-cold)
         run: time -p cargo test --workspace --locked
+      - name: Reclaim completed workspace test artifacts
+        run: bash scripts/ci-storage-budget.sh clean-debug
       - name: Release build
         run: time -p cargo build --release --locked --bin formless
+      - name: Storage after release build
+        run: bash scripts/ci-storage-budget.sh snapshot release-built
       - run: target/release/formless man > target/formless.1
       - name: Local archive
         shell: bash
@@ -195,7 +218,7 @@ jobs:
       - name: Install package-building tools into private Cargo home
         shell: bash
         run: |
-          time -p cargo install cargo-deb cargo-generate-rpm --locked
+          bash scripts/ci-storage-budget.sh install-package-tools
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Build local package fixtures (no repository publication)
         shell: bash
@@ -218,6 +241,10 @@ jobs:
             dist/*.deb
             dist/*.rpm
             dist/*.sha256
+
+      - name: Final storage (including failed phases)
+        if: always()
+        run: bash scripts/ci-storage-budget.sh snapshot job-finished
 
   linux-install-test:
     if: ${{ inputs.job_family == 'all' || inputs.job_family == 'linux' }}
@@ -350,6 +377,10 @@ jobs:
     if: ${{ inputs.job_family == 'all' || inputs.job_family == 'pipe' }}
     timeout-minutes: 22
     runs-on: windows-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -383,6 +414,15 @@ jobs:
       - name: Assertion inventory (review aid)
         shell: pwsh
         run: python scripts/test-assertion-inventory.py
+      - name: Storage before pipe tests
+        run: bash scripts/ci-storage-budget.sh snapshot before-pipe-tests
       - name: Named pipe security and round trip (Cargo-cold)
         shell: bash
-        run: time -p cargo test -p formless-core --test windows_pipe
+        run: time -p cargo test -p formless-core --test windows_pipe --locked
+      - name: Production backup CLI and main-thread stack regression (same job)
+        shell: bash
+        run: time -p cargo test -p formless-bin --test backup_verification --locked
+      - name: Final storage (including failed phases)
+        if: always()
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot job-finished
