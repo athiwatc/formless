@@ -4,6 +4,7 @@
 
 pub mod caps;
 mod dns;
+mod process_executable;
 mod processes;
 pub mod sensitive_paths;
 pub mod sync;
@@ -2055,7 +2056,12 @@ impl State {
             .as_array()
             .and_then(|v| v.first())
             .and_then(|x| x.as_str());
-        if !allowed.is_empty() && !process_allowed(allowed, cmd, first_arg) {
+        let possible = if self.mode == HostMode::Live {
+            process_executable::possibly_allowed(allowed, cmd, first_arg)
+        } else {
+            allowed.is_empty() || process_allowed(allowed, cmd, first_arg)
+        };
+        if !possible {
             return Err(denied(format!(
                 "process:{cmd}{} not in scope",
                 first_arg.map(|f| format!(" {f}")).unwrap_or_default()
@@ -2114,8 +2120,39 @@ impl State {
         let effective_cwd = cwd
             .clone()
             .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?);
-        self.process_operand_paths(cmd, &args, &effective_cwd)?;
-        let mut command = std::process::Command::new(cmd);
+        let child_env = process_executable::ChildEnv::capture(&self.caps.env, &a["env"]);
+        let executable =
+            process_executable::resolve(cmd, &effective_cwd, &child_env).map_err(|error| {
+                if !allowed.is_empty() && !process_executable::names_request(allowed, cmd) {
+                    // An unresolved path cannot establish identity with a scoped
+                    // executable grant. Keep denial opaque, as before resolution.
+                    denied(format!("process:{cmd} not in scope"))
+                } else {
+                    error
+                }
+            })?;
+        if !process_executable::allowed(
+            allowed,
+            cmd,
+            first_arg,
+            &executable,
+            &effective_cwd,
+            &child_env,
+        ) {
+            return Err(denied(format!(
+                "process:{cmd}{} not in scope",
+                first_arg.map(|arg| format!(" {arg}")).unwrap_or_default()
+            )));
+        }
+        let executable_raw = executable
+            .raw
+            .to_str()
+            .ok_or_else(|| denied("process executable is not UTF-8"))?;
+        self.guard_read(executable_raw, &executable.canonical, "process executable")?;
+        self.process_operand_paths(executable_raw, &args, &effective_cwd)?;
+        // Bind execution to the guarded canonical program. No second PATH search
+        // may choose another executable after a credential-consent callback.
+        let mut command = std::process::Command::new(&executable.canonical);
         // Git under a sub-command grant (`process:git:status|log`) runs
         // without the repository settings that start programs: fsmonitor,
         // pager, credential helpers, external diff and textconv (#1099, #1130).
@@ -2158,35 +2195,10 @@ impl State {
         if let Some(cwd) = &cwd {
             command.current_dir(cwd);
         }
-        // Children see only a minimal base environment plus the keys the
-        // Tool's env Capability grants, never the daemon's secrets.
-        command.env_clear();
-        let inherited = PROCESS_BASE_ENV
-            .iter()
-            .copied()
-            .chain(self.caps.env.iter().map(String::as_str))
-            .filter(|k| !k.to_ascii_uppercase().starts_with("FORMLESS_"));
-        for key in inherited {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        if let Some(env) = a["env"].as_object() {
-            for (k, v) in env {
-                match v {
-                    Value::Null => {
-                        command.env_remove(k);
-                    }
-                    Value::String(s) => {
-                        command.env(k, s);
-                    }
-                    other => {
-                        command.env(k, other.to_string());
-                    }
-                }
-            }
-        }
-        self.process_operand_paths(cmd, &args, &effective_cwd)?;
+        child_env.apply(&mut command);
+        command.current_dir(&effective_cwd);
+        self.process_operand_paths(executable_raw, &args, &effective_cwd)?;
+        self.recheck_path(executable_raw, &executable.canonical)?;
         if let Some(cwd) = &cwd {
             self.recheck_path(a["cwd"].as_str().unwrap(), cwd)?;
         }
