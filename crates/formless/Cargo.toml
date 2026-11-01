@@ -30,6 +30,7 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+formless-runtime = { path = "../formless-runtime" }
 keyring.workspace = true
 
 # Linux packages (packaging/README.md): `cargo deb -p formless-bin` and
@@ -59,3 +60,6 @@ assets = [
     { source = "../../target/formless.1", dest = "/usr/share/man/man1/formless.1", mode = "644", doc = true },
     { source = "../../README.md", dest = "/usr/share/doc/formless/README.md", mode = "644", doc = true },
 ]
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

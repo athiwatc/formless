@@ -2865,6 +2865,32 @@ impl Store {
     }
 
     /// The newest `limit` Runs, of one Session or all.
+    /// Resolve literal prefixes, preferring an exact identity. No LIKE wildcards.
+    pub fn inspect_run(&self, query: &str) -> Result<Option<serde_json::Value>> {
+        let mut stmt = self.ps("SELECT id FROM runs WHERE id=?1 OR substr(id,1,length(?1))=?1 ORDER BY (id=?1) DESC LIMIT 2")?;
+        let ids: Vec<String> = stmt
+            .query_map(params![query], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let Some(id) = ids.first() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !query.is_empty() && (ids.len() == 1 || id == query),
+            "ambiguous Run id"
+        );
+        self.conn.query_row("SELECT id,session_id,status,error,steps,created_at,updated_at,start_message_seq,end_message_seq,
+            (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
+            (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
+            (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+            FROM runs WHERE id=?1", params![id], |r| Ok(serde_json::json!({
+                "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
+                "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
+                "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
+                "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
+                "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
+            }))).optional().map_err(Into::into)
+    }
+
     pub fn run_metrics_for(
         &self,
         session_id: Option<&str>,

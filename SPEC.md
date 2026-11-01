@@ -5055,3 +5055,32 @@ zero-main-prompt outcomes are excluded from per-model calibration. Small N
 ranges are observed quantiles, not confidence bounds. A cached endpoint context
 window is used locally when available; otherwise the window source and uncertainty
 are explicit.
+
+
+### CLI observation and pending approval decisions
+
+`sessions show ID --follow` attaches to the existing daemon, replays stored
+messages and follows that Session's current/latest Run until its terminal state.
+With no Run yet it waits for the first Run. `--jsonl` (or `--follow --json`)
+emits the same tagged Event objects as `run --output jsonl-events`. Snapshot messages use
+MessageAppended. Follow never starts, answers, or interrupts work: Ctrl+C detaches
+with 130. Completed, paused/failed and interrupted outcomes exit 0, 1 and 130.
+An already terminal Run exits after replay. Historical terminal Runs without
+stored message boundaries display a Note and the initial Session snapshot only;
+follow never invents a boundary or refreshes that legacy transcript without one.
+Connection loss is an error.
+
+`runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
+cancels only that exact active Run, never a later Run in the same Session. IDs
+accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
+an active Run query exits 0, and cancel exits 0 when its request succeeds.
+Existing `runs --limit N --json` remains a list.
+`approvals pending [--json]` lists outstanding Tool capability requests.
+`approvals approve ID [--once|--session] [--yes] [--json]` defaults to Once;
+`approvals deny ID [--json]` declines without remembering a permanent denial.
+Decisions use the client label CLI in the existing approval audit. A stale
+request fails rather than reporting a grant. The decision receipt reports
+`audit_recorded`; if the decision applied but the audit write failed, the CLI
+warns explicitly without suggesting a retry. New broad Session grants require
+two explicit confirmations on a TTY, and --yes off-TTY. Declining confirmation
+leaves the request pending. These commands connect only to an existing daemon.

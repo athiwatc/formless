@@ -1,3 +1,4 @@
+mod cli_attach;
 mod table;
 
 use anyhow::{bail, Context, Result};
@@ -166,6 +167,8 @@ enum Cmd {
     },
     /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
     Runs {
+        #[command(subcommand)]
+        action: Option<cli_attach::RunsAction>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
@@ -903,6 +906,29 @@ enum NamingAction {
 
 #[derive(Subcommand)]
 enum ApprovalsAction {
+    /// Outstanding capability requests (no daemon is started)
+    Pending {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer one pending request; Once unless --session is given
+    Approve {
+        id: String,
+        #[arg(long, conflicts_with = "session")]
+        once: bool,
+        #[arg(long)]
+        session: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deny one pending request without a permanent denial
+    Deny {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Every grant: Tool, Capability, scope, when, by which client, last used
     List {
         /// Only this Capability family (fs, net, process, env, …)
@@ -946,6 +972,20 @@ fn cap_family(cap: &str) -> &str {
 }
 
 fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
+    let action = match action {
+        ApprovalsAction::Pending { json } => return cli_attach::pending(paths, json),
+        ApprovalsAction::Approve {
+            id,
+            session,
+            yes,
+            json,
+            ..
+        } => return cli_attach::decide(paths, &id, true, session, yes, json),
+        ApprovalsAction::Deny { id, json } => {
+            return cli_attach::decide(paths, &id, false, false, false, json)
+        }
+        other => other,
+    };
     use formless_protocol::{ApprovalScope, GrantInfo};
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(paths)?;
@@ -963,6 +1003,9 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
         _ => "always",
     };
     match action {
+        ApprovalsAction::Pending { .. }
+        | ApprovalsAction::Approve { .. }
+        | ApprovalsAction::Deny { .. } => unreachable!("handled before daemon startup"),
         ApprovalsAction::Denials { forget, all, json } => {
             if forget.is_some() || all {
                 let r = request_once(paths, Request::ForgetDenial { capability: forget })?;
@@ -1484,6 +1527,34 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    // Attach/control commands require an existing daemon and must not create a
+    // profile (or start scheduled work) merely to observe an absent endpoint.
+    let attach_existing = matches!(
+        &cli.cmd,
+        Some(Cmd::Runs {
+            action: Some(_),
+            ..
+        }) | Some(Cmd::Sessions {
+            action: SessionsAction::Show { follow: true, .. }
+        }) | Some(Cmd::Approvals {
+            action: ApprovalsAction::Pending { .. }
+                | ApprovalsAction::Approve { .. }
+                | ApprovalsAction::Deny { .. }
+        })
+    );
+    if attach_existing {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        return match cli.cmd {
+            Some(Cmd::Runs {
+                action: Some(action),
+                json,
+                ..
+            }) => cli_attach::runs(&paths, action, json),
+            Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
+            Some(Cmd::Approvals { action }) => approvals_cmd(&paths, action),
+            _ => unreachable!("matched an attach command"),
+        };
+    }
     if cli.secure {
         // A daemon started from here inherits it (see `Config::apply_env`).
         std::env::set_var("FORMLESS_SECURE", "1");
@@ -1565,7 +1636,14 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
-        Some(Cmd::Runs { limit, json }) => runs_cmd(paths, limit, json),
+        Some(Cmd::Runs {
+            limit,
+            json,
+            action,
+        }) => match action {
+            Some(action) => cli_attach::runs(&paths, action, json),
+            None => runs_cmd(paths, limit, json),
+        },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Security {
             action: SecurityAction::Status { json },
@@ -4399,7 +4477,13 @@ enum SessionsAction {
     /// Show a Session's transcript
     Show {
         id: String,
-        /// The Session and its messages as JSON
+        /// Observe the current/latest Run without interrupting it on Ctrl+C
+        #[arg(long)]
+        follow: bool,
+        /// Tagged Event lines, as with run --output jsonl-events
+        #[arg(long, requires = "follow")]
+        jsonl: bool,
+        /// The Session and its messages as JSON (Event lines with --follow)
         #[arg(long)]
         json: bool,
     },
@@ -4438,6 +4522,18 @@ enum SessionsAction {
 
 fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
     let action = match action {
+        SessionsAction::Show {
+            id,
+            follow: true,
+            json,
+            jsonl,
+        } => {
+            let code = cli_attach::follow(&paths, &id, json || jsonl)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         SessionsAction::Compare { left, right, json } => {
             return sessions_compare_cmd(&paths, &left, &right, json)
         }
@@ -4494,7 +4590,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             }
             tbl.print();
         }
-        SessionsAction::Show { id, json } => {
+        SessionsAction::Show { id, json, .. } => {
             let s = find_session(&paths, &id)?;
             let r = daemon(Request::GetSession { id: s.id.clone() })?;
             if json {
@@ -5419,7 +5515,8 @@ fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
     println!("{}", formless_core::runs::summary_line(&summary));
     for r in v["runs"].as_array().into_iter().flatten() {
         println!(
-            "{}  {:<11} {:>3} steps {:>3} tools {:>8} tokens {:>6.1}s",
+            "{}  {}  {:<11} {:>3} steps {:>3} tools {:>8} tokens {:>6.1}s",
+            r["run_id"].as_str().unwrap_or_default(),
             r["created_at"]
                 .as_str()
                 .unwrap_or_default()

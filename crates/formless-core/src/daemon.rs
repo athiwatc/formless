@@ -1691,7 +1691,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::GetSession { id } => {
-                let (session, messages, queued, last) = self.with_reader(|st| {
+                let (session, messages, queued, last, latest_run) = self.with_reader(|st| {
                     let s = st
                         .get_session(&id)?
                         .filter(|_| !st.session_deleted(&id).unwrap_or(false))
@@ -1699,7 +1699,12 @@ impl Daemon {
                     let m = st.list_messages(&id)?;
                     let q = (st.queued_items(&id)?, st.session_plan(&id)?);
                     let l = st.unfinished_last_run(&id)?;
-                    Ok((s, m, q, l))
+                    let latest = st
+                        .last_run(&id)?
+                        .map(|(rid, _)| st.inspect_run(&rid))
+                        .transpose()?
+                        .flatten();
+                    Ok((s, m, q, l, latest))
                 })?;
                 // An unfinished last Run (interrupted/paused) gets a banner
                 // with Resume / Abandon in clients (SPEC §5.4).
@@ -1713,7 +1718,7 @@ impl Daemon {
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
                     json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
-                        "pending_events": self.pending_attention.locked().clone() }),
+                        "latest_run": latest_run, "pending_events": self.pending_attention.locked().clone() }),
                 )
             }
             Request::ForkSession {
@@ -3810,6 +3815,36 @@ impl Daemon {
                 ctl.retry.notify_one();
                 Ok(json!({"retrying": true}))
             }
+            Request::GetRun { run_id } => {
+                let run = self
+                    .with_reader(|st| st.inspect_run(&run_id))?
+                    .context(RequestFailure::not_found("Run not found"))?;
+                Ok(run)
+            }
+            Request::CancelRunId { run_id } => {
+                let run = self
+                    .with_reader(|st| st.inspect_run(&run_id))?
+                    .context(RequestFailure::not_found("Run not found"))?;
+                let runs = self.runs.locked();
+                let ctl = runs
+                    .values()
+                    .find(|ctl| Some(ctl.run_id.as_str()) == run["run_id"].as_str());
+                if let Some(ctl) = ctl {
+                    ctl.cancel_flag.store(true, Ordering::SeqCst);
+                    ctl.cancel.cancel();
+                }
+                Ok(json!({"run_id":run["run_id"],"interrupted":ctl.is_some()}))
+            }
+            Request::PendingApprovals => {
+                let pending: Vec<_> = self
+                    .pending_attention
+                    .locked()
+                    .iter()
+                    .filter(|ev| matches!(ev, Event::ApprovalRequested { .. }))
+                    .cloned()
+                    .collect();
+                Ok(serde_json::to_value(pending)?)
+            }
             Request::InterruptRun { session_id } => {
                 let runs = self.runs.locked();
                 if let Some(ctl) = runs.get(&session_id) {
@@ -4481,14 +4516,23 @@ impl Daemon {
                     }
                 };
                 self.remove_attention(&approval_id);
+                let mut audit_recorded = None;
                 if resolved {
+                    // Record the answering client even for Once/Session grants,
+                    // which do not create a durable approvals table row.
+                    let by = current_client().map(|c| c.1).unwrap_or_default();
+                    let detail = json!({"approval_id":approval_id,"approved":approved,"scope":scope,"by":by}).to_string();
+                    audit_recorded = Some(
+                        self.with_store(|st| st.audit("user", "approval.decision", &detail))
+                            .is_ok(),
+                    );
                     self.broadcast(Event::ApprovalAnswered {
                         approval_id,
                         approved,
                         by: current_client().map(|c| c.1),
                     });
                 }
-                Ok(json!({"resolved": resolved}))
+                Ok(json!({"resolved": resolved,"audit_recorded":audit_recorded}))
             }
         }
     }
@@ -15347,6 +15391,7 @@ fn is_control(req: &Request) -> bool {
         Request::Ping
             | Request::Status
             | Request::InterruptRun { .. }
+            | Request::CancelRunId { .. }
             // Un-sticking a stalled Run can't wait behind a slow request (#891).
             | Request::RetryProviderRequest { .. }
             | Request::CancelInvocation { .. }
@@ -17068,6 +17113,10 @@ mod sensitive_read_daemon_tests;
 #[cfg(test)]
 #[path = "model_test_daemon_tests.rs"]
 mod model_test_daemon_tests;
+
+#[cfg(test)]
+#[path = "cli_attach_daemon_tests.rs"]
+mod cli_attach_daemon_tests;
 
 #[cfg(test)]
 #[path = "artifact_read_tests.rs"]
