@@ -421,18 +421,21 @@ globalThis.fs = {
   },
 };
 globalThis.env = { get: (k) => __call("env_get", { key: String(k) }) };
+function __processReq(cmd, args, o) {
+  o = o || {};
+  const timeout = o.timeout_ms ?? o.timeoutMs ?? null;
+  // JSON would otherwise turn NaN/Infinity into null and remove the deadline.
+  if (timeout !== null && (!Number.isInteger(timeout) || timeout < 0 || timeout > 86400000)) {
+    throw new Error("process timeout_ms must be an integer from 0 to 86400000");
+  }
+  return { cmd: String(cmd), args: (args || []).map(String), cwd: o.cwd || null,
+    env: o.env || null, stdin: o.stdin == null ? null : String(o.stdin),
+    stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null, timeout_ms: timeout };
+}
 globalThis.process = {
-  run: (cmd, args, o) => {
-    o = o || {};
-    return __call("process_run", { cmd: String(cmd), args: (args || []).map(String), cwd: o.cwd || null,
-      env: o.env || null, stdin: o.stdin == null ? null : String(o.stdin),
-      stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null, timeout_ms: o.timeout_ms ?? o.timeoutMs ?? null });
-  },
+  run: (cmd, args, o) => __call("process_run", __processReq(cmd, args, o)),
   spawn: (cmd, args, o) => {
-    o = o || {};
-    const h = __call("process_spawn", { cmd: String(cmd), args: (args || []).map(String), cwd: o.cwd || null,
-      env: o.env || null, stdin: o.stdin == null ? null : String(o.stdin),
-      stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null, timeout_ms: o.timeout_ms ?? o.timeoutMs ?? null });
+    const h = __call("process_spawn", __processReq(cmd, args, o));
     let finished = null;
     return {
       read: (size) => finished ? {stream: null, data: "", eof: true} : __call("process_read", {id: h.id, size: size || 65536}),

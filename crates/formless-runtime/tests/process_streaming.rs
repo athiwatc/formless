@@ -137,6 +137,18 @@ fn process_fixture_helper() {
             std::io::stdout().flush().unwrap();
             hold();
         }
+        "binary" => {
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).unwrap();
+            assert_eq!(input, [0, 255, 128]);
+            let mut bytes = b"BINARY_START\0".to_vec();
+            bytes.extend((0..=255).chain(0..=255));
+            bytes.extend_from_slice(b"\0BINARY_END");
+            std::io::stdout().write_all(&bytes).unwrap();
+            std::io::stdout().flush().unwrap();
+            std::io::stderr().write_all(b"err\xfftail").unwrap();
+            std::io::stderr().flush().unwrap();
+        }
         "environment" => {
             let private_present = std::env::vars_os().any(|(k, _)| {
                 k.to_str()
@@ -463,4 +475,66 @@ fn open_handle_limit_fails_before_launch_and_kill_releases_the_slot() {
       for(const p of ps)p.kill();return {denied,reused:true};}"#,"hold");
     let value = execute(&req, Arc::new(NoHostOps)).unwrap().output;
     assert_eq!(value, json!({"denied":true,"reused":true}));
+}
+
+#[test]
+fn binary_chunks_and_base64_stdin_preserve_bytes_without_changing_stderr_text() {
+    use base64::Engine;
+    let f = Fixture::new();
+    let req=f.request(r#"function run(i){const o={cwd:i.cwd,env:i.env,encoding:'base64',stdin:'AP+A',stdinEncoding:'base64'};
+      const run=process.run(i.cmd,i.args,o);const p=process.spawn(i.cmd,i.args,o);let chunks=[],err='';
+      while(true){const c=p.read(7);if(c.eof)break;if(c.stream==='stdout')chunks.push(c.data);else err+=c.data;}
+      return {run,chunks,err,status:p.wait()};}"#,"binary");
+    let value = execute(&req, Arc::new(NoHostOps)).unwrap().output;
+    let encoded = value["run"]["stdout"].as_str().unwrap();
+    let run = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    let mut streamed = Vec::new();
+    for chunk in value["chunks"].as_array().unwrap() {
+        streamed.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(chunk.as_str().unwrap())
+                .unwrap(),
+        );
+    }
+    let marker = b"BINARY_START\0";
+    let wanted: Vec<u8> = (0..=255).chain(0..=255).collect();
+    for bytes in [run, streamed] {
+        let start = bytes
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap()
+            + marker.len();
+        assert_eq!(&bytes[start..start + wanted.len()], wanted);
+        assert_eq!(&bytes[start + wanted.len()..], b"\0BINARY_END");
+    }
+    assert_eq!(value["run"]["stderr"], "err\u{fffd}tail");
+    assert_eq!(value["err"], "err\u{fffd}tail");
+    assert_eq!(value["status"]["code"], 0);
+}
+
+#[test]
+fn invalid_timeouts_and_consumed_native_handles_never_gain_process_authority() {
+    let f = Fixture::new();
+    let req = f.request(
+        r#"function run(i){let rejected=0;
+      for(const timeout_ms of [NaN,Infinity,-1,1.5,'2',86400001])for(const api of ['run','spawn']){
+        try{process[api](i.cmd,i.args,{cwd:i.cwd,env:i.env,timeout_ms});}
+        catch(e){if(String(e).includes('timeout_ms'))rejected++;}
+      }
+      return {rejected,created:fs.exists(i.cwd+'/parent.pid')};}"#,
+        "hold",
+    );
+    assert_eq!(
+        execute(&req, Arc::new(NoHostOps)).unwrap().output,
+        json!({"rejected":12,"created":false})
+    );
+    let req=f.request(r#"function run(i){const h=__call('process_spawn',{cmd:i.cmd,args:i.args,cwd:i.cwd,env:i.env});
+      const status=__call('process_wait',{id:h.id});let rejected=0;
+      for(const op of ['process_read','process_wait','process_kill'])try{__call(op,{id:h.id});}catch(e){if(String(e).includes('closed or unknown'))rejected++;}
+      return {status,rejected};}"#,"environment");
+    let value = execute(&req, Arc::new(NoHostOps)).unwrap().output;
+    assert_eq!(value["status"]["code"], 0);
+    assert_eq!(value["rejected"], 3);
 }
