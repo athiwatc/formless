@@ -178,16 +178,116 @@ fn estimate_new_profile_does_not_create_profile_directories() {
     assert!(!paths.data_dir.exists() && !paths.config_dir.exists());
 }
 
+// Accepted reachability probes may already be closed when the fixture handles
+// them. Use portable nonblocking I/O instead of SO_RCVTIMEO (EINVAL for such
+// sockets on macOS), retaining bytes across WouldBlock and enforcing the same
+// ten-second CLI deadline plus an owned stop flag. Never discard partial frames.
+#[cfg(unix)]
+fn fixture_read_frame(
+    socket: &mut impl Read,
+    pending: &mut Vec<u8>,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> std::io::Result<Option<Vec<u8>>> {
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fixture request exceeded the CLI deadline",
+            ));
+        }
+        if let Some(end) = pending.iter().position(|b| *b == b'\n') {
+            if end > formless_protocol::MAX_FRAME_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fixture request frame exceeds protocol limit",
+                ));
+            }
+            return Ok(Some(pending.drain(..=end).collect()));
+        }
+        if pending.len() > formless_protocol::MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fixture request frame exceeds protocol limit",
+            ));
+        }
+        let mut bytes = [0; 4096];
+        match socket.read(&mut bytes) {
+            Ok(0) if pending.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "fixture peer closed inside an NDJSON frame",
+                ))
+            }
+            Ok(n) => pending.extend_from_slice(&bytes[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && pending.is_empty() => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn fixture_write_frame(
+    socket: &mut impl Write,
+    frame: &formless_protocol::ServerMessage,
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    let mut bytes = serde_json::to_vec(frame).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    let mut sent = 0;
+    while sent < bytes.len() {
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "fixture response exceeded the CLI deadline",
+            ));
+        }
+        match socket.write(&bytes[sent..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "fixture response write made no progress",
+                ))
+            }
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(false)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(unix)]
 #[test]
 fn headless_confirmation_uses_one_connection_and_refuses_without_yes() {
     use formless_protocol::{Event, RequestEnvelope, ServerMessage};
     use serde_json::{json, Value};
-    use std::{
-        io::{BufRead, BufReader},
-        os::unix::net::UnixListener,
-        sync::Mutex,
-    };
+    use std::{os::unix::net::UnixListener, sync::Mutex};
     struct Server {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -244,17 +344,11 @@ fn headless_confirmation_uses_one_connection_and_refuses_without_yes() {
                         let forecast = forecast.clone();
                         let session = session.clone();
                         peers.push(std::thread::spawn(move||{
-                            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-                            let mut reader=BufReader::new(socket.try_clone().unwrap());let mut approved=false;let mut previewed=false;
-                            while !stopped.load(Ordering::SeqCst) {
-                                let mut line=String::new();
-                                match reader.read_line(&mut line) {
-                                    Ok(0)=>break,
-                                    Ok(_)=>{},
-                                    Err(e)if matches!(e.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::TimedOut)=>continue,
-                                    Err(_)=>break,
-                                }
-                                let envelope:RequestEnvelope=serde_json::from_str(&line).unwrap();
+                            socket.set_nonblocking(true).expect("fixture Unix socket must support nonblocking I/O");
+                            let deadline=Instant::now()+Duration::from_secs(10);
+                            let mut pending=Vec::new();let mut approved=false;let mut previewed=false;
+                            while let Some(line)=fixture_read_frame(&mut socket,&mut pending,&stopped,deadline).expect("bounded fixture NDJSON read") {
+                                let envelope:RequestEnvelope=serde_json::from_slice(&line).unwrap();
                                 let request=serde_json::to_value(envelope.request).unwrap();let kind=request["type"].as_str().unwrap().to_string();
                                 observed.lock().unwrap().push((connection,kind.clone(),request.clone()));
                                 let mut finish=false;
@@ -267,10 +361,10 @@ fn headless_confirmation_uses_one_connection_and_refuses_without_yes() {
                                     _=>json!({"ok":true}),
                                 };
                                 let reply=ServerMessage::Response{id:envelope.id,ok:true,result:Some(value),error:None};
-                                if writeln!(socket,"{}",serde_json::to_string(&reply).unwrap()).is_err(){break;}
+                                if !fixture_write_frame(&mut socket,&reply,&stopped,deadline).expect("bounded fixture NDJSON response"){break;}
                                 if finish {
                                     let event=ServerMessage::Event(Event::RunFinished{session_id:session.id.clone(),run_id:"fixture-run".into(),status:"completed".into()});
-                                    let _=writeln!(socket,"{}",serde_json::to_string(&event).unwrap());
+                                    if !fixture_write_frame(&mut socket,&event,&stopped,deadline).expect("bounded fixture NDJSON event"){break;}
                                 }
                             }
                         }));
@@ -324,4 +418,177 @@ fn headless_confirmation_uses_one_connection_and_refuses_without_yes() {
             .iter()
             .any(|(_, k, _)| matches!(k.as_str(), "create_session" | "attach_file")));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn nonblocking_fixture_preserves_fragmented_and_coalesced_utf8_frames() {
+    struct Fragmented(std::collections::VecDeque<std::io::Result<Vec<u8>>>, usize);
+    impl Read for Fragmented {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.1 += 1;
+            let part = self.0.pop_front().unwrap_or(Ok(Vec::new()))?;
+            assert!(part.len() <= buf.len());
+            buf[..part.len()].copy_from_slice(&part);
+            Ok(part.len())
+        }
+    }
+    let mut reader = Fragmented(
+        std::collections::VecDeque::from([
+            Ok(b"{\"word\":\"\xe4".to_vec()),
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            Ok(b"\xbd\xa0\"}\n{\"next\":true}\n".to_vec()),
+        ]),
+        0,
+    );
+    let stop = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pending = Vec::new();
+    let first = fixture_read_frame(&mut reader, &mut pending, &stop, deadline)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&first).unwrap(),
+        serde_json::json!({"word":"你"})
+    );
+    let second = fixture_read_frame(&mut reader, &mut pending, &stop, deadline)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&second).unwrap(),
+        serde_json::json!({"next":true})
+    );
+    assert_eq!(
+        reader.1, 3,
+        "coalesced second frame must not consume another read"
+    );
+    assert!(pending.is_empty());
+    assert!(
+        fixture_read_frame(&mut reader, &mut pending, &stop, deadline)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nonblocking_fixture_retries_partial_response_writes_without_restarting_frames() {
+    struct Fragmented {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+    impl Write for Fragmented {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            match self.calls {
+                2 => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                4 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                n => {
+                    let count = if n == 1 {
+                        3
+                    } else if n == 3 {
+                        5
+                    } else {
+                        buf.len()
+                    };
+                    self.bytes.extend_from_slice(&buf[..count]);
+                    Ok(count)
+                }
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let frame = formless_protocol::ServerMessage::Response {
+        id: 7,
+        ok: true,
+        result: Some(serde_json::json!({"word":"你"})),
+        error: None,
+    };
+    let mut writer = Fragmented {
+        bytes: Vec::new(),
+        calls: 0,
+    };
+    let stopped = AtomicBool::new(false);
+    assert!(fixture_write_frame(
+        &mut writer,
+        &frame,
+        &stopped,
+        Instant::now() + Duration::from_secs(10)
+    )
+    .unwrap());
+    let mut expected = serde_json::to_vec(&frame).unwrap();
+    expected.push(b'\n');
+    assert_eq!(writer.bytes, expected);
+    assert_eq!(writer.calls, 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn nonblocking_fixture_accepts_an_already_closed_reachability_probe() {
+    struct SocketFile(std::path::PathBuf);
+    impl Drop for SocketFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let root = Fixture(std::env::temp_dir().join(format!("fl-fc-probe-{}", unique())));
+    let paths = formless_core::Paths::from_dirs(root.0.join("d"), root.0.join("c")).unwrap();
+    let socket = SocketFile(paths.socket_path());
+    std::fs::create_dir_all(socket.0.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+    let probe = std::os::unix::net::UnixStream::connect(&socket.0).unwrap();
+    drop(probe); // Reproduce the daemon_reachable connect-and-close before accept.
+    let (mut reader, _) = listener.accept().unwrap();
+    reader
+        .set_nonblocking(true)
+        .expect("closed-peer accepted Unix socket remains a valid nonblocking descriptor");
+    assert!(fixture_read_frame(
+        &mut reader,
+        &mut Vec::new(),
+        &AtomicBool::new(false),
+        Instant::now() + Duration::from_secs(10)
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn nonblocking_fixture_rejects_partial_eof_and_obeys_owned_stop_and_original_deadline() {
+    let mut partial = std::io::Cursor::new(b"{\"partial\":".to_vec());
+    let mut pending = Vec::new();
+    let error = fixture_read_frame(
+        &mut partial,
+        &mut pending,
+        &AtomicBool::new(false),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(pending, b"{\"partial\":");
+    let mut unread = std::io::Cursor::new(b"{}\n".to_vec());
+    assert!(fixture_read_frame(
+        &mut unread,
+        &mut Vec::new(),
+        &AtomicBool::new(true),
+        Instant::now() + Duration::from_secs(10)
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(
+        unread.position(),
+        0,
+        "stop must not consume or dispatch a pending frame"
+    );
+    let error = fixture_read_frame(
+        &mut unread,
+        &mut Vec::new(),
+        &AtomicBool::new(false),
+        Instant::now() - Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(unread.position(), 0);
 }

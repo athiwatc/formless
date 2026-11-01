@@ -85,34 +85,12 @@ pub fn dropped_file(pasted: &str) -> Option<std::path::PathBuf> {
         .and_then(|s| s.strip_suffix('\''))
         .or_else(|| t.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
         .unwrap_or(t);
-    let path = if let Some(rest) = unquoted.strip_prefix("file://") {
-        percent_decode(rest)
+    let p = if unquoted.starts_with("file://") {
+        url::Url::parse(unquoted).ok()?.to_file_path().ok()?
     } else {
-        unquoted.replace("\\ ", " ")
+        std::path::PathBuf::from(unquoted.replace("\\ ", " "))
     };
-    let p = std::path::PathBuf::from(path);
     (p.is_absolute() && p.is_file()).then_some(p)
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if let Some(b) = s
-                .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-            {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -133,7 +111,7 @@ mod tests {
     fn recognises_dropped_paths() {
         let dir = std::env::temp_dir().join(format!("fl drop {}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("shot 1.png");
+        let file = dir.join("shot #1 %.png");
         std::fs::write(&file, b"x").unwrap();
         let plain = file.to_string_lossy().to_string();
         assert_eq!(dropped_file(&format!("'{plain}'")).as_ref(), Some(&file));
@@ -142,7 +120,7 @@ mod tests {
             Some(&file)
         );
         assert_eq!(
-            dropped_file(&format!("file://{}", plain.replace(' ', "%20"))).as_ref(),
+            dropped_file(url::Url::from_file_path(&file).unwrap().as_str()).as_ref(),
             Some(&file)
         );
         assert!(dropped_file("just some text").is_none());

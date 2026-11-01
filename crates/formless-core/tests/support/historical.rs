@@ -6,6 +6,12 @@ use std::path::Path;
 
 const PREFIX: &str = include_str!("../fixtures/historical-upgrades/prefix-through-46.sql");
 
+fn migration_header_version(header: &str) -> Result<i64, std::num::ParseIntError> {
+    // Git may check the genuine SQL fixture out as CRLF. Accept exactly one
+    // header terminator; don't trim arbitrary characters or rewrite SQL bytes.
+    header.strip_suffix('\r').unwrap_or(header).parse()
+}
+
 pub fn create(file: &Path, checkpoint: i64) -> Connection {
     assert!((1..=46).contains(&checkpoint));
     assert!(
@@ -18,7 +24,7 @@ pub fn create(file: &Path, checkpoint: i64) -> Connection {
     let mut applied = 0;
     for section in PREFIX.split("\n-- migration ").skip(1) {
         let (version, sql) = section.split_once('\n').unwrap();
-        let version: i64 = version.parse().unwrap();
+        let version = migration_header_version(version).unwrap();
         assert_eq!(version, applied + 1, "historical steps must be ordered");
         if version > checkpoint {
             break;
@@ -70,4 +76,25 @@ pub fn assert_old_shape(conn: &Connection, checkpoint: i64) {
     assert!(!table(conn, "denials"), "v47 must not already exist");
     assert!(!column(conn, "approvals", "code_hash"));
     assert!(!column(conn, "sessions", "name_source"));
+}
+
+#[test]
+fn migration_header_accepts_one_cr_and_preserves_the_entire_sql_payload() {
+    let sql = "SELECT 'payload\rbyte';\r\n-- original SQL comment\r\n";
+    for header in ["23", "23\r"] {
+        let section = format!("{header}\n{sql}");
+        let (header, payload) = section.split_once('\n').unwrap();
+        assert_eq!(migration_header_version(header).unwrap(), 23);
+        assert_eq!(
+            payload.as_bytes(),
+            sql.as_bytes(),
+            "header parsing never normalizes SQL"
+        );
+    }
+    for malformed in ["23\r\r", " 23", "23 ", "23x", "23\n"] {
+        assert!(
+            migration_header_version(malformed).is_err(),
+            "accepted malformed migration header {malformed:?}"
+        );
+    }
 }

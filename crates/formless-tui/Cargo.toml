@@ -21,6 +21,8 @@ ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 serde_json.workspace = true
 unicode-width = "0.2"
 unicode-segmentation.workspace = true
+# Already locked transitively; native file URLs encode Windows prefixes and reserved characters.
+url = "2"
 uuid.workspace = true
 
 [dev-dependencies]

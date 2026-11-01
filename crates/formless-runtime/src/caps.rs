@@ -228,7 +228,11 @@ impl Capabilities {
     /// Make relative paths absolute against `base` in the input fields that
     /// input-bound `fs:` scopes name, before [`Self::bind`]: the Tool then
     /// gets, and is granted, the path the user meant (SPEC §5.1).
-    pub fn absolutize_inputs(&self, input: &mut serde_json::Value, base: &std::path::Path) {
+    pub fn absolutize_inputs(
+        &self,
+        input: &mut serde_json::Value,
+        base: &std::path::Path,
+    ) -> Result<(), String> {
         let fields = self
             .fs_read
             .iter()
@@ -241,21 +245,23 @@ impl Capabilities {
             else {
                 continue;
             };
-            let fix = |s: &mut serde_json::Value| {
+            let fix = |s: &mut serde_json::Value| -> Result<(), String> {
                 if let Some(p) = s.as_str().filter(|p| !p.is_empty()) {
                     let path = std::path::Path::new(p);
                     if path.is_relative() && !p.starts_with('~') {
-                        *s = serde_json::Value::String(
-                            base.join(path).to_string_lossy().into_owned(),
-                        );
+                        let absolute = lexical_absolute(base, path)?;
+                        *s = serde_json::Value::String(absolute.into_os_string().into_string()
+                            .map_err(|_| "Session-relative filesystem path cannot be represented as UTF-8 JSON".to_string())?);
                     }
                 }
+                Ok(())
             };
             match v {
-                serde_json::Value::Array(items) => items.iter_mut().for_each(fix),
-                other => fix(other),
+                serde_json::Value::Array(items) => items.iter_mut().try_for_each(fix)?,
+                other => fix(other)?,
             }
         }
+        Ok(())
     }
 
     /// Resolve `$input.<field>` scopes against one Invocation's input.
@@ -442,6 +448,85 @@ pub fn canonical_path(raw: &str) -> Result<std::path::PathBuf, String> {
     canonical_path_with(raw, |p| p.canonicalize(), |p| p.symlink_metadata())
 }
 
+/// Join without PathBuf::push's Windows verbatim `.`/`..` normalization.
+/// Relative separators are reconstructed natively, so ordinary JS `sub/file`
+/// also works under a canonical Windows Session cwd. OS names stay OsString;
+/// only the JSON-facing caller requires UTF-8.
+fn lexical_absolute(
+    base: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, PathBuf};
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if matches!(path.components().next(), Some(Component::Prefix(_))) {
+        return Err("drive-relative filesystem paths are ambiguous; use an absolute path or a Session-relative path".into());
+    }
+    if !base.is_absolute() {
+        return Err("relative filesystem path requires an absolute working directory".into());
+    }
+    let mut joined =
+        if path.has_root() {
+            #[cfg(windows)]
+            {
+                match base.components().next() {
+                    Some(Component::Prefix(prefix)) => prefix.as_os_str().to_os_string(),
+                    _ => return Err(
+                        "rooted filesystem path requires a working-directory drive or UNC share"
+                            .into(),
+                    ),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                std::ffi::OsString::new()
+            }
+        } else {
+            base.as_os_str().to_os_string()
+        };
+    for component in path.components() {
+        if matches!(component, Component::Prefix(_)) {
+            return Err("unexpected filesystem path prefix".into());
+        }
+        let ends_in_separator = joined
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| b == b'/' || (cfg!(windows) && b == b'\\'));
+        if !ends_in_separator {
+            joined.push(std::path::MAIN_SEPARATOR_STR);
+        }
+        if component != Component::RootDir {
+            joined.push(component.as_os_str());
+        }
+    }
+    Ok(PathBuf::from(joined))
+}
+
+fn append_missing_tail(
+    mut ancestor: std::path::PathBuf,
+    tail: &[std::ffi::OsString],
+) -> std::path::PathBuf {
+    for component in tail.iter().rev() {
+        // These names were already parsed as Normal components. In particular
+        // a Windows `C:stream` leaf must not be reparsed by PathBuf::join as a
+        // drive-relative path replacing the existing canonical ancestor.
+        if !ancestor
+            .as_os_str()
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
+        {
+            ancestor
+                .as_mut_os_string()
+                .push(std::path::MAIN_SEPARATOR_STR);
+        }
+        ancestor.as_mut_os_string().push(component);
+    }
+    ancestor
+}
+
 // Separate filesystem operations let tests place a creation exactly between
 // canonicalize's NotFound and symlink_metadata, without timing or global hooks.
 fn canonical_path_with(
@@ -458,14 +543,69 @@ fn canonical_path_with(
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir().map_err(|e| e.to_string())?.join(p)
+        lexical_absolute(&std::env::current_dir().map_err(|e| e.to_string())?, p)?
     };
+    // Win32 canonicalization may erase `missing/..` before accessing the
+    // filesystem. Check the traversed prefix first, rather than accepting an
+    // existing result whose missing component was silently normalized away.
+    // Real directory/.. paths remain valid (including symlink directories).
+    let mut prefix = std::path::PathBuf::new();
+    for component in abs.components() {
+        #[cfg(windows)]
+        if matches!(component, Component::Normal(name) if name.as_encoded_bytes().contains(&b'/')) {
+            return Err("invalid forward separator in a verbatim filesystem path".into());
+        }
+        if component == Component::ParentDir {
+            let resolved = canonicalize(&prefix)
+                .map_err(|e| format!("cannot resolve path {}: {e}", prefix.display()))?;
+            if !metadata(&resolved)
+                .map_err(|e| format!("cannot resolve path {}: {e}", prefix.display()))?
+                .is_dir()
+            {
+                return Err(format!(
+                    "cannot traverse non-directory: {}",
+                    prefix.display()
+                ));
+            }
+            // Win32 ordinary paths remove parents lexically before opening
+            // them; extended paths do not interpret literal dot components.
+            // Preserve that native destination, but only after proving this
+            // traversed directory exists. Unix keeps its native symlink/..
+            // semantics by passing the original spelling to canonicalize.
+            #[cfg(windows)]
+            {
+                prefix.pop();
+                continue;
+            }
+        }
+        #[cfg(windows)]
+        if component == Component::CurDir {
+            continue;
+        }
+        // A Normal component is already parsed. Never pass it through
+        // PathBuf::push again: Windows may reinterpret `C:stream` as a new
+        // drive prefix or a verbatim component's slash as a fresh separator.
+        if !matches!(component, Component::Prefix(_) | Component::RootDir)
+            && !prefix
+                .as_os_str()
+                .as_encoded_bytes()
+                .last()
+                .is_some_and(|&b| b == b'/' || (cfg!(windows) && b == b'\\'))
+        {
+            prefix
+                .as_mut_os_string()
+                .push(std::path::MAIN_SEPARATOR_STR);
+        }
+        prefix.as_mut_os_string().push(component.as_os_str());
+    }
+    #[cfg(windows)]
+    let abs = prefix;
     let mut base = abs.as_path();
     let mut tail = Vec::new();
     loop {
         let unresolved = |e| format!("cannot resolve path {}: {e}", base.display());
         match canonicalize(base) {
-            Ok(c) => return Ok(tail.iter().rev().fold(c, |acc, t| acc.join(t))),
+            Ok(c) => return Ok(append_missing_tail(c, &tail)),
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(unresolved(e)),
         }
@@ -478,7 +618,7 @@ fn canonical_path_with(
                 // missing. Resolve it rather than mistaking a regular file or
                 // directory for a dangling symlink. A failed retry stays closed.
                 let c = canonicalize(base).map_err(unresolved)?;
-                return Ok(tail.iter().rev().fold(c, |acc, t| acc.join(t)));
+                return Ok(append_missing_tail(c, &tail));
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(unresolved(e)),
@@ -701,12 +841,313 @@ mod tests {
         let root = PathFixture::new();
         let target = root.0.join("missing").join("out.txt");
         assert_eq!(canonical_path(target.to_str().unwrap()).unwrap(), target);
-        let escape = root.0.join("missing").join("..").join("escape.txt");
-        assert!(canonical_path(escape.to_str().unwrap()).is_err());
+        // PathBuf::push normalizes `..` for Windows verbatim prefixes, so
+        // constructing this with join would erase the very traversal tested.
+        let sep = std::path::MAIN_SEPARATOR;
+        let raw_root = std::env::temp_dir().join(root.0.file_name().unwrap());
+        let escape = format!("{}{sep}missing{sep}..{sep}escape.txt", raw_root.display());
+        assert!(canonical_path(&escape).is_err());
+        let bound = Capabilities::parse(&["fs:write:$input.file".into()]).unwrap();
+        assert!(bound.bind(&json!({"file":escape})).is_err());
+        let existing = root.0.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        assert_eq!(
+            canonical_path(&format!(
+                "{}{sep}existing{sep}..{sep}allowed.txt",
+                raw_root.display()
+            ))
+            .unwrap(),
+            root.0.join("allowed.txt"),
+            "an existing directory can be traversed; containment still applies"
+        );
         assert!(canonical_path("").is_err());
         let file = root.0.join("file");
         std::fs::write(&file, "regular file").unwrap();
         assert!(canonical_path(file.join("child").to_str().unwrap()).is_err());
+        assert!(canonical_path(&format!(
+            "{}{sep}file{sep}..{sep}escape.txt",
+            raw_root.display()
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn canonical_path_checks_parent_prefix_before_native_normalization() {
+        let root = PathFixture::new();
+        let sep = std::path::MAIN_SEPARATOR;
+        let raw_root = std::env::temp_dir().join(root.0.file_name().unwrap());
+        let escape = format!("{}{sep}missing{sep}..{sep}escape.txt", raw_root.display());
+        let mut normalized = false;
+        let result = canonical_path_with(
+            &escape,
+            |path| {
+                if path == std::path::Path::new(&escape) {
+                    // Model Win32 resolving the lexically normalized path even
+                    // though its missing prefix could never be traversed.
+                    normalized = true;
+                    Ok(root.0.join("escape.txt"))
+                } else {
+                    path.canonicalize()
+                }
+            },
+            |path| path.symlink_metadata(),
+        );
+        assert!(result.is_err());
+        assert!(
+            !normalized,
+            "must refuse before native normalization can erase missing/.."
+        );
+    }
+
+    #[test]
+    fn session_localization_preserves_relative_parent_components_until_binding() {
+        let root = PathFixture::new();
+        std::fs::create_dir(root.0.join("existing")).unwrap();
+        let caps = caps(&["fs:write:$input.paths"]);
+        let mut input = json!({"paths":["existing/../allowed.txt", "missing/../escape.txt"]});
+        caps.absolutize_inputs(&mut input, &root.0).unwrap();
+        assert!(std::path::Path::new(input["paths"][1].as_str().unwrap())
+            .components()
+            .any(|c| c == std::path::Component::ParentDir));
+        assert!(caps.bind(&input).is_err());
+        let mut valid = json!({"paths":["existing/../allowed.txt", "existing/notes.txt"]});
+        caps.absolutize_inputs(&mut valid, &root.0).unwrap();
+        assert_eq!(
+            caps.bind(&valid).unwrap().fs_write,
+            vec![
+                root.0.join("allowed.txt").to_string_lossy().into_owned(),
+                root.0
+                    .join("existing")
+                    .join("notes.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_parent_traversal_keeps_unix_symlink_target_semantics() {
+        let root = PathFixture::new();
+        let target = root.0.join("target").join("child");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.0.join("link")).unwrap();
+        assert_eq!(
+            canonical_path(
+                root.0
+                    .join("link")
+                    .join("..")
+                    .join("out.txt")
+                    .to_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            root.0.join("target").join("out.txt")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lexical_windows_paths_keep_roots_and_native_separators_without_erasing_traversal() {
+        use std::path::Path;
+        for (base, relative, expected) in [
+            (
+                r"\\?\C:\work\project",
+                "missing/../out.txt",
+                r"\\?\C:\work\project\missing\..\out.txt",
+            ),
+            (
+                r"\\?\C:\work\project",
+                "existing/../allowed.txt",
+                r"\\?\C:\work\project\existing\..\allowed.txt",
+            ),
+            (r"\\?\C:\", "sub/notes.txt", r"\\?\C:\sub\notes.txt"),
+            (
+                r"\\?\C:\work\project",
+                r"\rooted/notes.txt",
+                r"\\?\C:\rooted\notes.txt",
+            ),
+            (
+                r"\\?\UNC\server\share\project",
+                r"\rooted/notes.txt",
+                r"\\?\UNC\server\share\rooted\notes.txt",
+            ),
+            (
+                r"\\?\C:\work",
+                r"\\server\share\notes.txt",
+                r"\\server\share\notes.txt",
+            ),
+            (r"\\?\C:\work", r"D:\notes.txt", r"D:\notes.txt"),
+        ] {
+            assert_eq!(
+                lexical_absolute(Path::new(base), Path::new(relative))
+                    .unwrap()
+                    .as_os_str(),
+                std::ffi::OsStr::new(expected)
+            );
+        }
+        for relative in [r"C:notes.txt", r"C:", r"D:missing\..\out.txt"] {
+            let mut input = json!({"path":relative});
+            let caps = caps(&["fs:write:$input.path"]);
+            let error = caps
+                .absolutize_inputs(&mut input, Path::new(r"\\?\C:\work"))
+                .unwrap_err();
+            assert!(error.contains("drive-relative"), "{error}");
+            assert!(canonical_path(relative)
+                .unwrap_err()
+                .contains("drive-relative"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_normal_components_are_never_reparsed_as_relative_paths() {
+        use std::io::{Error, ErrorKind};
+        let root = PathFixture::new();
+        let mixed = format!(r"{}\missing/../escape.txt", root.0.display());
+        let error = canonical_path_with(
+            &mixed,
+            |_| panic!("mixed verbatim separators must fail before native normalization"),
+            |_| panic!("mixed verbatim separators must fail before metadata access"),
+        )
+        .unwrap_err();
+        assert!(error.contains("verbatim"), "{error}");
+        let colon = format!(r"{}\C:stream", root.0.display());
+        let mut checked = false;
+        let error = canonical_path_with(
+            &colon,
+            |path| {
+                assert_eq!(
+                    path.as_os_str(),
+                    std::ffi::OsStr::new(&colon),
+                    "a Normal component cannot replace the accumulated drive/root"
+                );
+                checked = true;
+                Err(Error::from(ErrorKind::PermissionDenied))
+            },
+            |_| panic!("permission failure cannot fall back to an ancestor"),
+        )
+        .unwrap_err();
+        assert!(checked);
+        assert!(error.starts_with("cannot resolve path"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_verbatim_tail_never_replaces_its_canonical_ancestor_drive() {
+        use std::io::{Error, ErrorKind};
+        let root = PathFixture::new();
+        let raw = format!(r"{}\C:stream", root.0.display());
+        let expected = std::path::PathBuf::from(&raw);
+        for created_during_probe in [false, true] {
+            let mut attempts = 0;
+            let actual = canonical_path_with(
+                &raw,
+                |path| {
+                    attempts += 1;
+                    if path == root.0 {
+                        Ok(root.0.clone())
+                    } else {
+                        assert_eq!(path, expected);
+                        Err(Error::from(ErrorKind::NotFound))
+                    }
+                },
+                |path| {
+                    assert_eq!(path, expected);
+                    if created_during_probe {
+                        root.0.symlink_metadata()
+                    } else {
+                        Err(Error::from(ErrorKind::NotFound))
+                    }
+                },
+            );
+            if created_during_probe {
+                assert!(actual.is_err(), "a failed same-path retry remains closed");
+            } else {
+                let actual = actual.unwrap();
+                assert_eq!(actual.as_os_str(), expected.as_os_str());
+                assert!(
+                    actual.is_absolute(),
+                    "missing leaf cannot turn the canonical scope drive-relative"
+                );
+                assert!(actual.starts_with(&root.0));
+            }
+            assert_eq!(attempts, 2);
+        }
+        // Cover the creation-race success branch with a pending leaf too.
+        let ancestor = root.0.join("appeared");
+        std::fs::create_dir(&ancestor).unwrap();
+        let raw = format!(r"{}\C:stream", ancestor.display());
+        let mut ancestor_attempts = 0;
+        let actual = canonical_path_with(
+            &raw,
+            |path| {
+                if path == ancestor {
+                    ancestor_attempts += 1;
+                    if ancestor_attempts == 1 {
+                        Err(Error::from(ErrorKind::NotFound))
+                    } else {
+                        Ok(ancestor.clone())
+                    }
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            },
+            |path| {
+                if path == ancestor {
+                    ancestor.symlink_metadata()
+                } else {
+                    Err(Error::from(ErrorKind::NotFound))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(actual.as_os_str(), std::ffi::OsStr::new(&raw));
+        assert!(actual.is_absolute());
+        assert_eq!(ancestor_attempts, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_paths_preserve_os_names_but_json_localization_rejects_non_utf8_bases() {
+        use std::os::unix::ffi::OsStringExt;
+        let base =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/private-\xff".to_vec()));
+        let absolute = lexical_absolute(&base, std::path::Path::new("existing/../notes")).unwrap();
+        assert_eq!(
+            absolute.into_os_string().into_vec(),
+            b"/private-\xff/existing/../notes"
+        );
+        let mut input = json!({"path":"notes"});
+        let error = caps(&["fs:write:$input.path"])
+            .absolutize_inputs(&mut input, &base)
+            .unwrap_err();
+        assert!(error.contains("UTF-8 JSON"), "{error}");
+        assert_eq!(
+            input["path"], "notes",
+            "failed conversion never substitutes a lossy path"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lexical_paths_preserve_unpaired_utf16_but_json_localization_refuses_it() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<u16> = r"\\?\C:\private-".encode_utf16().collect();
+        units.push(0xd800);
+        let base = std::path::PathBuf::from(std::ffi::OsString::from_wide(&units));
+        let absolute = lexical_absolute(&base, std::path::Path::new("sub/notes")).unwrap();
+        units.extend(r"\sub\notes".encode_utf16());
+        assert_eq!(
+            absolute.as_os_str().encode_wide().collect::<Vec<_>>(),
+            units
+        );
+        let mut input = json!({"paths":["sub/notes", "other.txt"]});
+        let error = caps(&["fs:write:$input.paths"])
+            .absolutize_inputs(&mut input, &base)
+            .unwrap_err();
+        assert!(error.contains("UTF-8 JSON"), "{error}");
+        assert_eq!(input["paths"][0], "sub/notes");
     }
 
     #[cfg(unix)]

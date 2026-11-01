@@ -37,7 +37,15 @@ fn live(code: &str, input: Value, caps: &[&str]) -> Result<Value, ExecError> {
 }
 
 fn temp_dir(tag: &str) -> String {
-    let d = std::env::temp_dir().canonicalize().unwrap().join(format!(
+    // JS deliberately uses ordinary slash-separated children below. Win32
+    // accepts those for normal absolute paths, but canonicalize() manufactures
+    // a verbatim \\?\ prefix whose API contract disables slash normalization.
+    let base = std::env::temp_dir();
+    // Unix process.cwd assertions deliberately use the physical temp path
+    // (e.g. macOS /var -> /private/var); only Win32 needs ordinary syntax.
+    #[cfg(not(windows))]
+    let base = base.canonicalize().unwrap();
+    let d = base.join(format!(
         "fl-{tag}-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
     ));
@@ -213,11 +221,253 @@ fn fs_refuses_dangling_symlink_escape() {
 }
 
 #[test]
+fn fs_refuses_missing_parent_traversal_but_allows_existing_directory_parent() {
+    let _env = credential_env::EnvGuard::isolated();
+    let dir = temp_dir("parent-traversal");
+    let root = std::path::Path::new(&dir);
+    let missing = root.join("missing").join("..").join("escaped.txt");
+    let denied = live(
+        "function run(input){ fs.write(input.path, 'must not be written'); }",
+        json!({"path":missing}),
+        &[&format!("fs:write:{dir}")],
+    )
+    .unwrap_err();
+    assert_eq!(denied.kind, ExecErrorKind::Denied, "{}", denied.message);
+    assert!(!root.join("escaped.txt").exists());
+    assert!(!root.join("missing").exists());
+
+    std::fs::create_dir(root.join("existing")).unwrap();
+    let existing = root.join("existing").join("..").join("allowed.txt");
+    live(
+        "function run(input){ fs.write(input.path, 'allowed'); return fs.read(input.path); }",
+        json!({"path":existing}),
+        &[&format!("fs:write:{dir}"), &format!("fs:read:{dir}")],
+    )
+    .map(|value| assert_eq!(value, "allowed"))
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("allowed.txt")).unwrap(),
+        "allowed"
+    );
+    let outside = root
+        .parent()
+        .unwrap()
+        .join(format!("fl-outside-{}", uuid::Uuid::new_v4()));
+    let escaped = root
+        .join("existing")
+        .join("..")
+        .join("..")
+        .join(outside.file_name().unwrap());
+    let denied = live(
+        "function run(input){ fs.write(input.path, 'must not escape grant'); }",
+        json!({"path":escaped}),
+        &[&format!("fs:write:{dir}")],
+    )
+    .unwrap_err();
+    assert_eq!(denied.kind, ExecErrorKind::Denied, "{}", denied.message);
+    assert!(!outside.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_relative_input_binding_preserves_missing_parents_and_native_slash_paths() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-offline-path-fixture");
+    let root = std::path::PathBuf::from(temp_dir("session-relative-traversal"));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join("existing")).unwrap();
+    std::fs::create_dir_all(project.join("sub")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.tools.approval_summaries = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let sid = store.create_session(None).unwrap().id;
+    let caps = Capabilities::parse(&[
+        "fs:read:$input.paths".into(),
+        "fs:write:$input.first".into(),
+        "fs:write:$input.paths".into(),
+    ])
+    .unwrap();
+    let (tool, _) = store.create_tool_version(
+        "write_relative_paths", "Private path regression fixture", "{}", "{}",
+        "function run(input){ fs.write(input.first, 'committed'); for (const path of input.paths) fs.write(path, 'committed'); return input.paths.map(path => fs.read(path)); }",
+        &caps, 64, "test",
+    ).unwrap();
+    let approved = Capabilities::parse(&[
+        format!("fs:read:{}", project.display()),
+        format!("fs:write:{}", project.display()),
+    ])
+    .unwrap();
+    store.set_approval(&tool.id, &approved, 64).unwrap();
+    let daemon = Arc::new(Daemon::new(paths).unwrap());
+    let session = daemon
+        .handle(formless_protocol::Request::SetSessionCwd {
+            id: sid.clone(),
+            cwd: Some(project.to_str().unwrap().into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session["cwd"],
+        project.canonicalize().unwrap().to_str().unwrap()
+    );
+    #[cfg(windows)]
+    assert!(
+        session["cwd"].as_str().unwrap().starts_with(r"\\?\"),
+        "exercise the real canonical Windows Session cwd"
+    );
+
+    let (error, ok) = daemon
+        .call_tool_direct_outcome(
+            &sid,
+            &tool.name,
+            json!({"first":"first-must-not-run.txt", "paths":["array-must-not-run.txt", "missing/../escape.txt"]}),
+        )
+        .await;
+    assert!(!ok, "{error}");
+    assert!(error.contains("cannot resolve path"), "{error}");
+    assert!(
+        !project.join("first-must-not-run.txt").exists(),
+        "all bound fields must validate before any JS operation"
+    );
+    assert!(!project.join("escape.txt").exists());
+    assert!(!project.join("array-must-not-run.txt").exists());
+    assert!(!project.join("missing").exists());
+
+    let (result, ok) = daemon
+        .call_tool_direct_outcome(
+            &sid,
+            &tool.name,
+            json!({"first":"./single-field.txt", "paths":["existing/../allowed-parent.txt", "sub/notes.txt", "./existing/dot.txt"]}),
+        )
+        .await;
+    assert!(ok, "{result}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("single-field.txt")).unwrap(),
+        "committed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("allowed-parent.txt")).unwrap(),
+        "committed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("sub").join("notes.txt")).unwrap(),
+        "committed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("existing").join("dot.txt")).unwrap(),
+        "committed"
+    );
+
+    #[cfg(windows)]
+    {
+        let (error, ok) = daemon
+            .call_tool_direct_outcome(
+                &sid,
+                &tool.name,
+                json!({"first":"drive-error-must-not-run.txt", "paths":["array-drive-error-must-not-run.txt", "C:ambiguous.txt"]}),
+            )
+            .await;
+        assert!(!ok, "{error}");
+        assert!(error.contains("drive-relative"), "{error}");
+        assert!(!project.join("drive-error-must-not-run.txt").exists());
+        assert!(!project.join("array-drive-error-must-not-run.txt").exists());
+
+        // Directory junctions require no developer-mode symlink privilege on
+        // NTFS. Keep the command and all names literal inside this owned cwd;
+        // /D disables cmd AutoRun. Failure is a real test failure, never skip.
+        let target = root.join("junction-target").join("child");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("secret.txt"), "outside grant").unwrap();
+        std::fs::write(
+            root.join("junction-target").join("native-parent.txt"),
+            "target parent unchanged",
+        )
+        .unwrap();
+        std::fs::write(project.join("native-parent.txt"), "lexical parent").unwrap();
+        let mut child = std::process::Command::new("cmd.exe")
+            .args([
+                "/D",
+                "/C",
+                "mklink",
+                "/J",
+                "link",
+                r"..\junction-target\child",
+            ])
+            .current_dir(&project)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("owned directory junction creation exceeded 10 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "junction creation failed: {:?}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let native = project
+            .join("link")
+            .join("..")
+            .join("native-parent.txt")
+            .canonicalize()
+            .unwrap();
+        assert_eq!(
+            native,
+            project.join("native-parent.txt").canonicalize().unwrap(),
+            "establish native ordinary Windows link/.. destination"
+        );
+        let (result, ok) = daemon
+            .call_tool_direct_outcome(
+                &sid,
+                &tool.name,
+                json!({"first":"link/../native-parent.txt", "paths":["./sub/notes.txt"]}),
+            )
+            .await;
+        assert!(ok, "{result}");
+        assert_eq!(std::fs::read_to_string(&native).unwrap(), "committed");
+        assert_eq!(
+            std::fs::read_to_string(root.join("junction-target").join("native-parent.txt"))
+                .unwrap(),
+            "target parent unchanged"
+        );
+        let denied = live(
+            "function run(input){return fs.read(input.path);}",
+            json!({"path":project.join("link").join("secret.txt")}),
+            &[&format!("fs:read:{}", project.display())],
+        )
+        .unwrap_err();
+        assert_eq!(denied.kind, ExecErrorKind::Denied, "{}", denied.message);
+        assert_eq!(
+            std::fs::read_to_string(target.join("secret.txt")).unwrap(),
+            "outside grant"
+        );
+        std::fs::remove_dir(project.join("link")).unwrap();
+    }
+    drop(daemon);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn read_chunks_never_split_utf8() {
     let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("utf8");
     let text = "héllo wörld € 😀 ".repeat(50);
-    std::fs::write(format!("{dir}/t.txt"), &text).unwrap();
+    std::fs::write(std::path::Path::new(&dir).join("t.txt"), &text).unwrap();
     let out = live(
         &format!(
             "function run(){{ let s = ''; let bad = 0; fs.readChunks({:?}, 5, c => {{ if (c.indexOf('\\ufffd') >= 0) bad++; s += c; }}); return {{s, bad}}; }}",
@@ -235,7 +485,7 @@ fn read_chunks_never_split_utf8() {
 fn overlay_modes_keep_new_fs_ops_off_disk() {
     let _env = credential_env::EnvGuard::isolated();
     let dir = temp_dir("overlay");
-    std::fs::write(format!("{dir}/keep.txt"), "real").unwrap();
+    std::fs::write(std::path::Path::new(&dir).join("keep.txt"), "real").unwrap();
     let out = exec(
         &format!(
             "function run(){{ const d = {dir:?};
