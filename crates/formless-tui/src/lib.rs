@@ -5,6 +5,7 @@ mod highlight;
 mod i18n;
 mod images;
 mod input;
+mod vim;
 mod keys;
 mod links;
 mod lists;
