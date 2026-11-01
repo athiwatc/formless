@@ -40,6 +40,65 @@ platform app-dirs (SPEC §9.4).
      others, the job summary lists each channel's result, and a re-run
      is safe.
 
+## Test-only release timing baseline
+
+`release-baseline.yml` is a separate, manual-only workflow for measuring the
+nonpublishing work before sizing job timeouts (#1164). After it is merged,
+run it on a reviewed commit through **Actions → release-baseline → Run workflow**.
+Choose `job_family`: `all` (default), `native` (three macOS/Windows build rows),
+`linux` (bullseye build and all three install containers), `docker`, or `pipe`.
+Family-specific concurrency does not cancel other in-progress runs. Rerun an
+unaffected family only when new evidence is needed; a Linux-only retry need not
+repeat expensive native/Docker work.
+Do not use the existing `release` dispatch for this: that workflow has publishing
+permissions, and selecting a version tag can reach its publishing jobs.
+
+The baseline token has only `contents: read`; checkout does not persist its
+credentials. It never creates a tag/release, logs into or pushes a container or
+package registry, updates a tap, submits winget/AUR changes, or uses publishing
+secrets. The bullseye SHA read uses a temporary, command-scoped Git context:
+Git 2.30.2 needs its exact checkout exception in a private XDG global-scope file,
+not `-c safe.directory`. The same private file serves newer Git through
+`GIT_CONFIG_GLOBAL`; ambient broader trust is refused, system config is disabled
+for these commands, `HOME` is unchanged, and the private context is removed on
+step exit. No actual user/system Git configuration is written.
+Only Linux package/checksum fixtures transfer between jobs as private,
+same-run workflow artifacts (one-day retention), not GitHub Release assets or
+GitHub Packages. Package installation is confined to disposable Debian/Ubuntu/
+Rocky job containers. The built package must have no maintainer/trigger scripts
+(including RPM file and transaction-file triggers); query failure also refuses
+installation. Smoke checks run `--version` and check the license, without installing a host service.
+Docker smoke uses an owned, network-isolated fixture container and always removes
+it and its anonymous volumes; it requires a successful status RPC with a positive
+PID, rather than inferring success from missing error text.
+
+The build matrix uses `macos-15` (ARM), `macos-15-intel` (Intel), and
+`windows-latest`. Both labels are also updated in the release workflow:
+`macos-14` [retires on November 2, 2026](https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/),
+and retired `macos-13` is replaced by its [supported Intel successor](https://github.com/actions/runner-images/issues/13045).
+Each baseline starts with fresh job-local Cargo home/target directories and no
+cache restore/save. Toolchain setup, hosted image and network caches are not
+claimed cold. Logs record the exact commit, toolchain, runner/image and
+architecture; `time -p`/Stopwatch records phase timings. The standalone pipe job
+must run after the Windows assertion-inventory UTF-8 fix is merged. A pipe test
+following the whole workspace suite would be warm and cannot serve as its cold
+baseline.
+
+Use each green job's `completed_at - started_at` (excluding queue time) and retain
+its run/job URL, SHA, selected family, runner image and cache state. A skipped
+or failed job supplies no green measurement for that row. To combine rows from
+workflow-only retries, verify that their Rust source, manifests/lockfile and
+relevant build/test/container/package inputs have the same content; retain each
+row's actual SHA and scope. Code/dependency/image/build-recipe changes require
+new measurements of affected rows. Set the corresponding timeout
+to `ceil(2 * seconds / 60)` minutes; for a common matrix timeout, use the slowest
+green matrix row. Current 60/30-minute release caps stay explicitly provisional
+until that evidence exists. Failed, timed-out, unavailable-runner or warm jobs
+are not cold green evidence. Matrix timings include local archive extraction/
+execution but omit distribution artifact upload; Linux build/install jobs retain
+the same internal transfer, and Docker excludes publishing and cache export.
+This baseline does not complete #669's provenance/SBOM/draft-release requirements.
+
 ## Publishing to package managers (maintainer setup, once)
 
 | Where | Set up | Secret |

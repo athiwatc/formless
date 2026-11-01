@@ -3702,6 +3702,13 @@ run_tool = "network_policy"     # a registry Tool, or…
 
 ## 12. CLI
 
+The Windows executable reserves 8 MiB of virtual address space for its main
+thread, committed on demand, to accommodate the finite generated CLI command
+builder and normal command work. It keeps TUI/clipboard operations on the
+original main thread. Verification hash buffers live on the heap; correctness
+checks run through actual CLI child processes without test-stack overrides.
+
+
 - `formless` (no args) launches the TUI (auto-starting the daemon).
 - CLI lists (`tools`, `sessions`, `providers`, `roles`, `jobs`, `mcp`,
   `skills`, `prompts`) share one table renderer: aligned columns with a

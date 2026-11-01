@@ -852,7 +852,9 @@ fn file_sha256(file: &Path) -> Result<String> {
     use std::io::Read;
     let mut input = std::fs::File::open(file)?;
     let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    // Allocate directly on the heap; Box::new([0; N]) can still construct a
+    // large temporary on the Windows main-thread stack in debug builds.
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let count = input.read(&mut buffer)?;
         if count == 0 {
