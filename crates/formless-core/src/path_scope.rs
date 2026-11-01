@@ -46,7 +46,13 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn canonical_home(home: &Path) -> Option<PathBuf> {
-    if !home.is_absolute() {
+    // Windows canonicalisation may remove missing/.. before consulting the
+    // filesystem. Such an input cannot verify the native home relationship.
+    if !home.is_absolute()
+        || home
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
         return None;
     }
     home.canonicalize().ok().filter(|home| home.is_dir())
@@ -254,6 +260,24 @@ mod tests {
         assert!(choices
             .iter()
             .any(|choice| choice.path == "C:/Users/Alice/project/src"));
+    }
+
+    #[test]
+    fn native_home_rejects_parent_traversal_instead_of_normalizing_it_away() {
+        // Keep these candidate inputs in their original spelling. Joining a
+        // parent onto an already-canonical Windows verbatim PathBuf itself
+        // normalizes it, before the verifier can inspect the supplied value.
+        let root = std::env::temp_dir().join(format!("fl-home-traversal-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("child")).unwrap();
+        let canonical = home.canonicalize().unwrap();
+        assert_eq!(canonical_home(&home), Some(canonical.clone()));
+        let existing_parent = home.join("child/..");
+        assert_eq!(existing_parent.canonicalize().unwrap(), canonical);
+        assert!(canonical_home(&existing_parent).is_none());
+        let missing_parent = home.join("missing/..");
+        assert!(canonical_home(&missing_parent).is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

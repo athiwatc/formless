@@ -1637,7 +1637,8 @@ None ship by default (principle 1).
   credential locations and their ancestors, and inspects credential descendants
   within 1,024 entries and 16 directory levels. Incomplete inspection, unreadable
   descendants and unresolved/external links require explicit exposure review.
-  A relative or unresolvable native home never supplies a permissive fallback:
+  A relative, unresolvable, or parent-traversing native home never supplies a
+  permissive fallback (Windows may normalize `missing/..` before checking it):
   `~` expansion fails, and an absolute folder requires explicit exposure
   confirmation when its relationship to home cannot be verified.
 - **Catalog.** A small curated list of popular servers ships in the binary
@@ -3043,7 +3044,9 @@ run_tool = "network_policy"     # a registry Tool, or…
     resolved through its parent); `/` and the home folder (or above) are
     never offered or accepted as wider scopes. Home comes from the OS
     directory API, with canonical forms compared on both sides, including
-    on Windows without `HOME`. If home cannot be resolved safely, wider
+    on Windows without `HOME`. Parent-traversing home paths are unverifiable,
+    even if native canonicalisation normalizes them to an existing directory.
+    If home cannot be resolved safely, wider
     choices are omitted and widening is refused. Anything else is refused: the exact path
     is granted, the user is told in a note, and `tool.widen_refused` is
     logged. A widened grant is logged as `tool.approve_widened` with its
