@@ -111,10 +111,10 @@ impl PathPolicy {
                     }
                     SensitivePathRule::BasenamePrefix(prefix) => path
                         .file_name()
-                        .is_some_and(|name| name.as_encoded_bytes().starts_with(prefix.as_bytes())),
+                        .is_some_and(|name| basename_matches(name, prefix, true)),
                     SensitivePathRule::BasenameSuffix(suffix) => path
                         .file_name()
-                        .is_some_and(|name| name.as_encoded_bytes().ends_with(suffix.as_bytes())),
+                        .is_some_and(|name| basename_matches(name, suffix, false)),
                 };
                 if matches {
                     return Ok(PathDecision::Sensitive("configured sensitive path".into()));
@@ -122,6 +122,38 @@ impl PathPolicy {
             }
         }
         Ok(PathDecision::Ordinary)
+    }
+}
+
+#[cfg(not(windows))]
+fn basename_matches(name: &std::ffi::OsStr, affix: &str, prefix: bool) -> bool {
+    if prefix {
+        name.as_encoded_bytes().starts_with(affix.as_bytes())
+    } else {
+        name.as_encoded_bytes().ends_with(affix.as_bytes())
+    }
+}
+
+#[cfg(windows)]
+fn basename_matches(name: &std::ffi::OsStr, affix: &str, prefix: bool) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let fold = |unit: u16| {
+        if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+            unit + 32
+        } else {
+            unit
+        }
+    };
+    let name: Vec<_> = name
+        .encode_wide()
+        .take_while(|&unit| unit != b':' as u16)
+        .map(fold)
+        .collect();
+    let affix: Vec<_> = affix.encode_utf16().map(fold).collect();
+    if prefix {
+        name.starts_with(&affix)
+    } else {
+        name.ends_with(&affix)
     }
 }
 
@@ -331,6 +363,16 @@ mod tests {
         assert!(contains(
             Path::new(r"\\server\share\Data"),
             Path::new(r"\\SERVER\SHARE\data\file:stream")
+        ));
+        let custom = PathPolicy::new(
+            vec![],
+            vec![SensitivePathRule::BasenameSuffix(".p12".into())],
+        )
+        .unwrap();
+        let custom_path = Path::new(r"C:\work\private.P12:stream");
+        assert!(matches!(
+            custom.classify(custom_path, custom_path).unwrap(),
+            PathDecision::Sensitive(_)
         ));
         for path in [r"C:\work\private.KEY:stream", r"C:\work\.SSH\config:stream"] {
             let path = Path::new(path);
