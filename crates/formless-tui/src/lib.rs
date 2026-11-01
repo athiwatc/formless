@@ -20,6 +20,7 @@ mod settings;
 mod text;
 mod theme;
 mod ui;
+mod vim;
 
 use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -1104,6 +1105,7 @@ struct EditorReview {
 }
 
 struct EditorState {
+    vim: vim::Vim,
     tool_id: String,
     name: String,
     chars: Vec<char>,
@@ -1125,6 +1127,15 @@ enum EditMode {
 }
 
 impl EditorState {
+    fn modal_line(&self) -> input::InputLine {
+        let mut line = input::InputLine::from(self.text().as_str());
+        line.set_modal_cursor(self.chars[..self.cursor].iter().map(|c| c.len_utf8()).sum());
+        line
+    }
+    fn apply_modal_line(&mut self, line: &input::InputLine) {
+        self.cursor = line[..line.cursor_byte()].chars().count();
+        self.chars = line.chars().collect();
+    }
     fn text(&self) -> String {
         self.chars.iter().collect()
     }
@@ -1443,6 +1454,9 @@ struct App {
     animations: bool,
     color: bool,
     multi_pane: bool,
+    vim_mode: bool,
+    vim_input: vim::Vim,
+    vim_help: bool,
     /// Configured model, shown in the status bar.
     model_label: String,
     tick: u64,
@@ -1803,6 +1817,9 @@ impl App {
             show_thinking: true,
             color: colors_enabled(),
             multi_pane: cfg.tui.multi_pane,
+            vim_mode: cfg.tui.vim_mode,
+            vim_input: vim::Vim::default(),
+            vim_help: false,
             show_timestamps: cfg.tui.timestamps,
             animations: {
                 i18n::set(&cfg.tui.language);
@@ -4675,6 +4692,7 @@ impl App {
     /// Make `id` the session on screen, dropping the previous one's live
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
+        self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
             self.cancel_branch_summary();
         }
@@ -5158,6 +5176,13 @@ impl App {
                     self.image_proto = images::detect(&cfg.tui.inline_images);
                     // Changed elsewhere (the web Settings): apply here too.
                     self.multi_pane = cfg.tui.multi_pane;
+                    if self.vim_mode != cfg.tui.vim_mode {
+                        self.vim_input.reset();
+                        if let Some(editor) = &mut self.editor {
+                            editor.vim.reset();
+                        }
+                    }
+                    self.vim_mode = cfg.tui.vim_mode;
                     self.show_timestamps = cfg.tui.timestamps;
                     self.animations = animations_enabled(cfg.tui.animations);
                     i18n::set(&cfg.tui.language);
@@ -5860,6 +5885,7 @@ impl App {
         }
         self.restored_send = None;
         let text = self.input.take();
+        self.vim_input.reset();
         let text = text.trim().to_string();
         if text.is_empty() {
             // Enter on an empty input retries a failed or paused Run
@@ -6708,6 +6734,16 @@ impl App {
                     "multi-pane layout {} (remembered)",
                     if self.multi_pane { "on" } else { "off" }
                 ));
+            }
+            "vim" | "vim on" | "vim off" => {
+                self.vim_mode = match cmd { "vim on" => true, "vim off" => false, _ => !self.vim_mode };
+                self.vim_input.reset();
+                if let Some(editor) = &mut self.editor { editor.vim.reset(); }
+                self.save_setting("tui.vim_mode", serde_json::json!(self.vim_mode));
+                self.notes.push(format!("Vim editing {} · Insert Esc enters Normal · /help lists editing keys", if self.vim_mode {"on"} else {"off"}));
+            }
+            cmd if cmd.starts_with("vim ") => {
+                self.notes.push("usage: /vim [on|off]".into());
             }
             "thinking" => {
                 self.show_thinking = !self.show_thinking;
@@ -8031,6 +8067,26 @@ impl App {
 
     fn editor_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.vim_help {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+                self.vim_help = false;
+            }
+            return;
+        }
+        if self.vim_mode && ctrl && key.code == KeyCode::Char('q') {
+            self.editor = None;
+            self.editor_review = None;
+            return;
+        }
+        // Escape changes Vim state before review/cancel handlers can discard.
+        if self.vim_mode && key.code == KeyCode::Esc {
+            if let Some(ed) = &mut self.editor {
+                let mut line = ed.modal_line();
+                ed.vim.key(&mut line, key, vim::Surface::Editor);
+                ed.apply_modal_line(&line);
+            }
+            return;
+        }
         // Reviewing: Ctrl+S saves, anything else goes back to editing.
         if self.editor_review.is_some() && !(ctrl && key.code == KeyCode::Char('s')) {
             self.editor_review = None;
@@ -8096,6 +8152,20 @@ impl App {
         let Some(ed) = &mut self.editor else {
             return;
         };
+        if self.vim_mode {
+            let mut line = ed.modal_line();
+            match ed.vim.key(&mut line, key, vim::Surface::Editor) {
+                vim::Outcome::Handled | vim::Outcome::Escape => {
+                    ed.apply_modal_line(&line);
+                    return;
+                }
+                vim::Outcome::Help => {
+                    self.vim_help = true;
+                    return;
+                }
+                vim::Outcome::Pass => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => self.editor = None,
             KeyCode::Enter => {
@@ -8512,13 +8582,65 @@ impl App {
                 }
             }
         }
+        // The first composer Insert Escape only changes mode. Thereafter
+        // completion dialogs keep their normal Escape/navigation ownership
+        // before a Normal Escape can stop the Run.
+        if self.vim_mode
+            && self.view == View::Chat
+            && self.find.is_none()
+            && self.current_question().is_none()
+            && (self.approvals.is_empty() || self.input_focus)
+            && self.vim_input.mode == vim::Mode::Insert
+            && key.code == KeyCode::Esc
+        {
+            self.vim_input
+                .key(&mut self.input, key, vim::Surface::Composer);
+            return;
+        }
         if self.view == View::Chat
             && (self.question_key(&key) || self.palette_key(&key) || self.mention_key(&key))
         {
             return;
         }
+        if self.vim_mode
+            && self.view == View::Chat
+            && self.vim_input.mode == vim::Mode::Normal
+            && self.current_question().is_none()
+            && self.find.is_none()
+            && (self.approvals.is_empty() || self.input_focus)
+            && self.call_focus_key(&key)
+        {
+            return;
+        }
+        if self.vim_mode
+            && self.view == View::Chat
+            && self.find.is_none()
+            && self.current_question().is_none()
+            && (self.approvals.is_empty() || self.input_focus)
+            && self.vim_input.mode == vim::Mode::Normal
+        {
+            match self
+                .vim_input
+                .key(&mut self.input, key, vim::Surface::Composer)
+            {
+                vim::Outcome::Handled => {
+                    self.update_mention();
+                    return;
+                }
+                vim::Outcome::Help => {
+                    self.slash("help");
+                    return;
+                }
+                vim::Outcome::Escape => {
+                    self.input_key(key);
+                    return;
+                }
+                vim::Outcome::Pass => {}
+            }
+        }
         if self.view == View::Chat
             && key.code == KeyCode::Char('?')
+            && !self.vim_mode
             && self.input.is_empty()
             && self.approvals.is_empty()
         {
@@ -8835,6 +8957,7 @@ impl App {
                                 let chars: Vec<char> = code.chars().collect();
                                 let cursor = chars.len();
                                 self.editor = Some(EditorState {
+                                    vim: vim::Vim::default(),
                                     tool_id: tool.id.clone(),
                                     name: tool.name.clone(),
                                     chars,
@@ -9105,6 +9228,7 @@ impl App {
                     .unwrap_or_default();
                 let chars: Vec<char> = code.chars().collect();
                 self.editor = Some(EditorState {
+                    vim: vim::Vim::default(),
                     tool_id: m.id,
                     name: m.name,
                     cursor: chars.len(),
@@ -9930,12 +10054,16 @@ impl App {
             }
             return;
         }
-        if self.find_key(&key) || self.call_focus_key(&key) {
+        if self.find_key(&key) || (!self.vim_mode && self.call_focus_key(&key)) {
             return;
         }
         // On the empty-Session screen, 1–4 put an example in the input.
         if let KeyCode::Char(d @ '1'..='4') = key.code {
-            if self.input.is_empty() && self.messages.is_empty() && !self.running() {
+            if !self.vim_mode
+                && self.input.is_empty()
+                && self.messages.is_empty()
+                && !self.running()
+            {
                 self.input.set(EXAMPLES[d as usize - '1' as usize]);
                 return;
             }
@@ -9964,6 +10092,17 @@ impl App {
                     return;
                 }
                 _ => {}
+            }
+        }
+        if self.vim_mode && self.vim_input.mode == vim::Mode::Insert {
+            self.call_focus = None;
+            if self
+                .vim_input
+                .key(&mut self.input, key, vim::Surface::Composer)
+                == vim::Outcome::Handled
+            {
+                self.update_mention();
+                return;
             }
         }
         match key.code {
@@ -10088,7 +10227,12 @@ impl App {
             _ => return,
         }
         self.palette_sel = 0;
-        self.update_mention();
+        // Normal Escape may stop a Run without editing the composer. Do not
+        // rebuild a deliberately dismissed mention from the Normal cursor's
+        // shorter prefix. Escape paths that cleared text still clear mentions.
+        if !self.vim_mode || key.code != KeyCode::Esc || self.input.is_empty() {
+            self.update_mention();
+        }
     }
 
     /// A bracketed paste: one block, wherever text is being typed.
@@ -10100,6 +10244,12 @@ impl App {
             return;
         }
         if let Some(ed) = &mut self.editor {
+            if self.vim_mode {
+                let mut line = ed.modal_line();
+                ed.vim.paste(&mut line, text);
+                ed.apply_modal_line(&line);
+                return;
+            }
             let chars: Vec<char> = text.replace("\r\n", "\n").chars().collect();
             let n = chars.len();
             ed.chars.splice(ed.cursor..ed.cursor, chars);
@@ -10120,7 +10270,11 @@ impl App {
                 self.attach_path_file(&path);
                 return;
             }
-            self.input.paste(text);
+            if self.vim_mode {
+                self.vim_input.paste(&mut self.input, text);
+            } else {
+                self.input.paste(text);
+            }
             self.palette_sel = 0;
             self.update_mention();
         }
@@ -10915,6 +11069,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         Some(name) => format!(" Message › to: {name} "),
         None => String::from(" Message "),
     };
+    if app.vim_mode {
+        title.push_str(&format!("[{}] ", app.vim_input.label()));
+    }
     for (n, (name, bytes)) in app.attachments.iter().enumerate() {
         let label = if name.starts_with("pasted-image") {
             format!("image {}", n + 1)
@@ -12631,6 +12788,7 @@ impl App {
             .chars()
             .collect();
         self.editor = Some(EditorState {
+            vim: vim::Vim::default(),
             tool_id: d.tool.id.clone(),
             name: d.tool.name.clone(),
             cursor: chars.len(),
@@ -12724,6 +12882,7 @@ impl App {
         };
         let chars: Vec<char> = text.chars().collect();
         self.editor = Some(EditorState {
+            vim: vim::Vim::default(),
             tool_id: d.tool.id.clone(),
             name: d.tool.name.clone(),
             cursor: chars.len(),
@@ -16195,6 +16354,19 @@ const APPROVAL_DETAIL_CHARS: usize = 300;
 
 fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     let area = f.area();
+    if app.vim_help {
+        f.render_widget(
+            Paragraph::new(vim::HELP.replace(". ", ".\n\n"))
+                .wrap(Wrap { trim: false })
+                .block(ui::panel(
+                    " Vim editing · Esc closes help ",
+                    app.color,
+                    Color::Yellow,
+                )),
+            area,
+        );
+        return;
+    }
     let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
     if let Some(r) = &app.editor_review {
         draw_editor_review(f, parts[0], parts[1], ed, r, app.color);
@@ -16206,6 +16378,11 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
         EditMode::Schemas => format!(" {} · schemas (JSON) ", ed.name),
         EditMode::Code => format!(" Edit {} ", ed.name),
         EditMode::Module => format!(" Edit module {} ", ed.name),
+    };
+    let title = if app.vim_mode {
+        format!("{title}[{}] · ? help · Ctrl+Q cancel ", ed.vim.label())
+    } else {
+        title
     };
     let block = ui::panel(title, app.color, Color::Yellow);
     let inner = block.inner(parts[0]);
@@ -16244,24 +16421,26 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
         cols[1].x + (cursor_col - scroll_x) as u16,
         cols[1].y + (cursor_line - scroll_y) as u16,
     ));
+    let hints = match ed.mode {
+        EditMode::Run => " Ctrl+S run (asks for approval as usual) · Ctrl+D dry run · Esc cancel",
+        EditMode::Code => " Ctrl+D review diff and checks · Ctrl+S save as new version (smoke-tested) · Esc cancel",
+        _ => " Ctrl+S save as new version (smoke-tested) · Esc cancel",
+    };
+    let hints = if app.vim_mode {
+        hints.replace(
+            "Esc cancel",
+            "Esc Normal (keeps edit) · Ctrl+Q cancel · ? help",
+        )
+    } else {
+        hints.to_string()
+    };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!(" Ln {}, Col {} ", cursor_line + 1, cursor_col + 1),
                 bold_fg(app.color, Color::Yellow),
             ),
-            Span::styled(
-                match ed.mode {
-                    EditMode::Run => {
-                        " Ctrl+S run (asks for approval as usual) · Ctrl+D dry run · Esc cancel"
-                    }
-                    EditMode::Code => {
-                        " Ctrl+D review diff and checks · Ctrl+S save as new version (smoke-tested) · Esc cancel"
-                    }
-                    _ => " Ctrl+S save as new version (smoke-tested) · Esc cancel",
-                },
-                ui::dim(app.color),
-            ),
+            Span::styled(hints, ui::dim(app.color)),
         ])),
         parts[1],
     );
@@ -16862,6 +17041,9 @@ mod tests {
             show_thinking: true,
             color: true,
             multi_pane: false,
+            vim_mode: false,
+            vim_input: vim::Vim::default(),
+            vim_help: false,
             model_label: "test-model".into(),
             tick: 0,
             activity: None,
@@ -19091,6 +19273,7 @@ mod tests {
     #[test]
     fn editor_works_in_grapheme_clusters() {
         let ed = |s: &str, cursor: usize| EditorState {
+            vim: vim::Vim::default(),
             tool_id: "t".into(),
             name: "n".into(),
             chars: s.chars().collect(),
@@ -19126,6 +19309,7 @@ mod tests {
     fn editor_edits_text_and_moves_cursor() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            vim: vim::Vim::default(),
             tool_id: "t1".into(),
             name: "writer".into(),
             chars: "line1\nline2".chars().collect(),
@@ -19651,6 +19835,7 @@ mod tests {
             session_id: None,
         });
         app.editor = Some(EditorState {
+            vim: vim::Vim::default(),
             tool_id: "t".into(),
             name: "t".into(),
             chars: "a\nb".chars().collect(),
@@ -20074,6 +20259,7 @@ mod tests {
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            vim: vim::Vim::default(),
             tool_id: "t".into(),
             name: "echo_text".into(),
             chars: "function run(){}".chars().collect(),
@@ -24172,5 +24358,592 @@ mod tests {
             app.approvals[0].context.as_ref().unwrap().run_id.as_deref(),
             Some("consumer-run")
         );
+    }
+    #[test]
+    fn vim_summary_dismissal_owns_escape_and_ctrl_c_without_consuming_insert_mode() {
+        let _env = credential_env::EnvGuard::isolated();
+        for stage in ["inspect", "generating", "review"] {
+            for control_c in [false, true] {
+                for mode in [vim::Mode::Insert, vim::Mode::Normal] {
+                    let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+                    app.vim_mode = true;
+                    app.vim_input.mode = mode;
+                    app.attachments = vec![("private-draft.txt".into(), vec![11, 22, 33])];
+                    let draft = app.input.expanded();
+                    let attachments = app.attachments.clone();
+                    // Exercise focus defensively even when a live-state snapshot
+                    // reports a Run before the local review has been dismissed.
+                    app.running_sessions.insert("target".into());
+                    let late = if stage == "inspect" {
+                        app.slash("summarise-branch source");
+                        let request: RequestEnvelope =
+                            serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+                        assert!(matches!(
+                            request.request,
+                            Request::InspectBranchSummary { .. }
+                        ));
+                        Some((request.id, serde_json::to_value(&basis).unwrap()))
+                    } else {
+                        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+                        if stage == "review" {
+                            branch_summary_reply(
+                                &tx,
+                                prepare.id,
+                                serde_json::to_value(&preview).unwrap(),
+                            );
+                            app.drain_daemon();
+                            assert!(app.branch_summary_review_is_visible());
+                            let screen = render(&mut app, 180, 70);
+                            assert!(screen.contains("Exact candidate note"));
+                            assert!(screen.contains("Esc Close review"));
+                            None
+                        } else {
+                            Some((prepare.id, serde_json::to_value(&preview).unwrap()))
+                        }
+                    };
+                    let dismiss = if control_c {
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+                    } else {
+                        key(KeyCode::Esc)
+                    };
+                    app.key(dismiss);
+                    assert!(
+                        app.branch_summary.intent.is_none() && app.branch_summary.review.is_none()
+                    );
+                    assert!(!app.branch_summary.committing && app.pager.is_none());
+                    assert_eq!(
+                        app.vim_input.mode, mode,
+                        "summary dismissal owns the key before Vim: {stage}, Ctrl+C={control_c}"
+                    );
+                    assert_eq!(app.input.expanded(), draft);
+                    assert_eq!(app.attachments, attachments);
+                    assert!(app.notes.last().unwrap().contains("review dismissed"));
+                    assert!(
+                        sent.try_recv().is_err(),
+                        "dismissal cannot stop a Run or insert a note"
+                    );
+                    if let Some((id, value)) = late {
+                        branch_summary_reply(&tx, id, value);
+                        app.drain_daemon();
+                        assert!(
+                            sent.try_recv().is_err(),
+                            "late dismissed {stage} reply cannot generate or commit"
+                        );
+                        assert!(app.branch_summary.review.is_none() && app.pager.is_none());
+                    }
+                    if mode == vim::Mode::Insert {
+                        app.key(key(KeyCode::Esc));
+                        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+                        assert!(
+                            sent.try_recv().is_err(),
+                            "the next composer Escape is still its first Insert Escape"
+                        );
+                    }
+                    app.key(key(KeyCode::Esc));
+                    let request: RequestEnvelope =
+                        serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+                    assert!(
+                        matches!(request.request, Request::InterruptRun { session_id } if session_id == "target")
+                    );
+                    assert!(sent.try_recv().is_err());
+                    assert_eq!(app.input.expanded(), draft);
+                    assert_eq!(app.attachments, attachments);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vim_summary_hidden_review_cannot_insert_or_steal_another_pagers_escape() {
+        let _env = credential_env::EnvGuard::isolated();
+        for mode in [vim::Mode::Insert, vim::Mode::Normal] {
+            let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+            app.vim_mode = true;
+            app.vim_input.mode = mode;
+            let draft = app.input.expanded();
+            let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+            branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+            app.drain_daemon();
+            assert!(app.branch_summary_review_is_visible());
+            app.pager = Some(Pager {
+                title: "Unrelated artifact".into(),
+                lines: vec!["Different visible data".into()],
+                top: 0,
+                left: 0,
+                styled: vec![],
+            });
+            app.key(key(KeyCode::Char('i')));
+            assert!(app.branch_summary.review.is_none() && !app.branch_summary.committing);
+            assert_eq!(app.pager.as_ref().unwrap().title, "Unrelated artifact");
+            assert_eq!(
+                app.vim_input.mode, mode,
+                "artifact focus prevents hidden confirmation and Vim insert entry"
+            );
+            assert!(sent.try_recv().is_err());
+            app.key(key(KeyCode::Esc));
+            assert!(app.pager.is_none());
+            assert_eq!(
+                app.vim_input.mode, mode,
+                "the visible artifact owns its Escape"
+            );
+            assert_eq!(app.input.expanded(), draft);
+            assert!(sent.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn vim_summary_session_switch_resets_vim_and_invalidates_review_without_losing_its_draft() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Normal;
+        app.attachments = vec![("private-draft.txt".into(), vec![11, 22, 33])];
+        let draft = app.input.expanded();
+        let attachments = app.attachments.clone();
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        assert!(app.branch_summary_review_is_visible());
+        app.switch_session("source".into());
+        assert_eq!(app.current.as_deref(), Some("source"));
+        assert_eq!(
+            app.vim_input.mode,
+            vim::Mode::Insert,
+            "switch_session must retain the Vim reset"
+        );
+        assert!(
+            app.branch_summary.intent.is_none()
+                && app.branch_summary.review.is_none()
+                && app.pager.is_none(),
+            "switch_session must also retain summary invalidation"
+        );
+        let stored = app.drafts.get("target").unwrap();
+        assert_eq!(stored.input.expanded(), draft);
+        assert_eq!(stored.attachments, attachments);
+        assert!(app.input.is_empty() && app.attachments.is_empty());
+        let requests: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            match request.request {
+                Request::Subscribe {
+                    sessions: Some(ids),
+                    ..
+                } => assert_eq!(ids, ["source"]),
+                Request::ContextUsage { session_id } => assert_eq!(session_id, "source"),
+                Request::RunMetrics {
+                    session_id: Some(id),
+                    ..
+                } => assert_eq!(id, "source"),
+                other => panic!("switching must not commit, send or generate: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn vim_review_completion_escape_and_navigation_belong_to_the_visible_popup() {
+        let _env = credential_env::EnvGuard::isolated();
+        for mention in [false, true] {
+            let mut app = test_app();
+            app.vim_mode = true;
+            app.current = Some("s1".into());
+            app.running_sessions.insert("s1".into());
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            if mention {
+                app.input.set("@fo");
+                app.mention = Some(MentionPopup {
+                    query: "fo".into(),
+                    files: vec![
+                        formless_core::files::FileEntry {
+                            path: "folder/one.txt".into(),
+                            dir: false,
+                            bytes: 1,
+                        },
+                        formless_core::files::FileEntry {
+                            path: "folder/two.txt".into(),
+                            dir: false,
+                            bytes: 2,
+                        },
+                    ],
+                    sel: 0,
+                    dismissed: false,
+                });
+            } else {
+                app.input.set("/");
+                assert!(app.palette_items().len() > 1);
+            }
+            let original = app.input.expanded();
+            app.key(key(KeyCode::Esc));
+            assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+            assert_eq!(app.input.expanded(), original);
+            assert!(
+                sent.try_recv().is_err(),
+                "first Insert Escape must not stop a Run or refresh a changed mention query"
+            );
+            app.key(key(KeyCode::Down));
+            if mention {
+                assert_eq!(app.mention.as_ref().unwrap().sel, 1);
+                assert_eq!(app.mention.as_ref().unwrap().query, "fo");
+            } else {
+                assert_eq!(app.palette_sel, 1);
+            }
+            app.key(key(KeyCode::Esc));
+            if mention {
+                assert!(app.mention.as_ref().unwrap().dismissed);
+            } else {
+                assert!(app.palette_items().is_empty());
+            }
+            assert!(
+                sent.try_recv().is_err(),
+                "Normal Escape must dismiss the completion before it can stop a Run"
+            );
+            assert_eq!(app.input.expanded(), original);
+            app.key(key(KeyCode::Esc));
+            let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(
+                matches!(request.request,Request::InterruptRun{session_id} if session_id=="s1")
+            );
+            let extra: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert!(
+                extra.is_empty(),
+                "Run-stop Escape must not reopen completion or emit extra requests: {extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vim_review_pager_switcher_and_approval_keep_their_focus() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("private draft");
+        app.running_sessions.insert("s1".into());
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.pager = Some(Pager {
+            title: "Read-only view".into(),
+            lines: vec!["private data".into()],
+            top: 0,
+            left: 0,
+            styled: vec![],
+        });
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+        assert_eq!(app.input.expanded(), "private draft");
+        assert!(sent.try_recv().is_err());
+        app.switcher = Some((String::new(), 0));
+        app.key(key(KeyCode::Esc));
+        assert!(app.switcher.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+        assert!(sent.try_recv().is_err());
+        app.on_event(reconnect_approval("held-vim-review", "s1"));
+        app.vim_input.mode = vim::Mode::Normal;
+        app.input_focus = false;
+        app.key(key(KeyCode::Char('i')));
+        assert!(
+            app.pager.is_some(),
+            "approval inspector must own i rather than enter Insert"
+        );
+        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+        assert!(sent.try_recv().is_err());
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+        app.key(key(KeyCode::Char('o')));
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(request.request,Request::ApprovalDecision{approval_id,approved:true,scope:ApprovalScope::Once,..} if approval_id=="held-vim-review")
+        );
+        assert_eq!(app.input.expanded(), "private draft");
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn vim_review_readline_changes_do_not_replay_modifier_keys_with_dot() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("one two three");
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Esc));
+        for c in "0dw".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input.expanded(), "two three");
+        app.key(key(KeyCode::Char('i')));
+        app.key(key(KeyCode::Char('X')));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.expanded(), "two three");
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(app.input.expanded(),"three","dot retains the preceding complete dw change; readline modifiers are never replayed as insertion");
+        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn vim_review_tool_editor_maps_unicode_objects_and_empty_lines_back_to_char_indices() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.vim_mode = true;
+        let text = "👩🏽‍💻 [a\u{301} ไทย]\n\n尾";
+        let mut vim = vim::Vim::default();
+        vim.mode = vim::Mode::Normal;
+        app.editor = Some(EditorState {
+            vim,
+            tool_id: "private".into(),
+            name: "unicode editor".into(),
+            chars: text.chars().collect(),
+            cursor: "👩🏽‍💻 [".chars().count(),
+            mode: EditMode::Code,
+        });
+        for c in "di[".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.text(), "👩🏽‍💻 []\n\n尾");
+        assert_eq!(ed.cursor, "👩🏽‍💻 [".chars().count());
+        assert_eq!(ed.modal_line().cursor_byte(), "👩🏽‍💻 [".len());
+        let blank = "👩🏽‍💻 []\n".chars().count();
+        app.editor.as_mut().unwrap().cursor = blank;
+        for c in "dd".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.text(), "👩🏽‍💻 []\n尾");
+        assert_eq!(ed.cursor, "👩🏽‍💻 []\n".chars().count());
+        assert_eq!(ed.modal_line().cursor_byte(), "👩🏽‍💻 []\n".len());
+        app.key(key(KeyCode::Esc));
+        assert!(
+            app.editor.is_some(),
+            "Normal Escape cannot discard the edited Unicode buffer"
+        );
+    }
+
+    #[test]
+    fn vim_review_insert_digits_are_literal_not_empty_session_example_shortcuts() {
+        let _env = credential_env::EnvGuard::isolated();
+        for c in ['1', '2', '3', '4'] {
+            let mut app = test_app();
+            app.vim_mode = true;
+            app.input.clear();
+            app.messages.clear();
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.key(key(KeyCode::Char(c)));
+            assert_eq!(
+                app.input.expanded(),
+                c.to_string(),
+                "Insert must type the requested digit"
+            );
+            assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+            assert!(sent.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn vim_insert_escape_never_stops_run_and_normal_escape_sends_interrupt() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("private draft");
+        app.running_sessions.insert("s1".into());
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+        assert_eq!(app.input, "private draft");
+        assert!(sent.try_recv().is_err());
+        app.key(key(KeyCode::Esc));
+        let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(envelope.request,Request::InterruptRun{session_id} if session_id=="s1"));
+        assert_eq!(app.input, "private draft");
+    }
+
+    #[test]
+    fn vim_tool_editor_preserves_first_escape_and_routes_operators_save_and_explicit_cancel() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.editor = Some(EditorState {
+            vim: vim::Vim::default(),
+            tool_id: "private-tool".into(),
+            name: "private_editor".into(),
+            chars: "alpha beta".chars().collect(),
+            cursor: 10,
+            mode: EditMode::Code,
+        });
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "alpha beta");
+        assert_eq!(app.editor.as_ref().unwrap().vim.mode, vim::Mode::Normal);
+        assert!(sent.try_recv().is_err());
+        for c in "0daw".chars() {
+            app.key(key(KeyCode::Char(c)))
+        }
+        assert_eq!(app.editor.as_ref().unwrap().text(), "beta");
+        app.key(key(KeyCode::Esc));
+        assert!(app.editor.is_some());
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(envelope.request,Request::UpdateToolCode{id,code} if id=="private-tool"&&code=="beta")
+        );
+        assert!(app.editor.is_some());
+        app.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn vim_mode_renders_in_borders_and_question_mark_help_is_discoverable() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("draft");
+        let screen = render(&mut app, 120, 24);
+        assert!(screen.contains("[INSERT]"), "{screen}");
+        app.key(key(KeyCode::Esc));
+        let screen = render(&mut app, 120, 24);
+        assert!(screen.contains("[NORMAL]"), "{screen}");
+        app.key(key(KeyCode::Char('?')));
+        assert!(app
+            .pager
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.contains("Vim: d/c/y")));
+        app.pager = None;
+        app.editor = Some(EditorState {
+            vim: vim::Vim::default(),
+            tool_id: "private".into(),
+            name: "private_editor".into(),
+            chars: "a".chars().collect(),
+            cursor: 1,
+            mode: EditMode::Code,
+        });
+        app.key(key(KeyCode::Esc));
+        let screen = render(&mut app, 160, 24);
+        assert!(
+            screen.contains("[NORMAL]") && screen.contains("Ctrl+Q cancel"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::Char('?')));
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Vim editing"), "{screen}");
+        app.key(key(KeyCode::Esc));
+        assert!(!app.vim_help && app.editor.is_some());
+    }
+
+    #[test]
+    fn vim_preference_roundtrips_hot_reloads_and_toggle_uses_daemon_settings() {
+        let mut app = test_app();
+        assert!(!app.vim_mode);
+        assert!(!Config::default().tui.vim_mode);
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.slash("vim on");
+        assert!(app.vim_mode);
+        let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(envelope.request,Request::SetSetting{key,value} if key=="tui.vim_mode"&&value==true)
+        );
+        let mut cfg = Config::default();
+        cfg.set_key("tui.vim_mode", serde_json::json!(true))
+            .unwrap();
+        cfg.save(&app.paths).unwrap();
+        assert!(Config::load(&app.paths).unwrap().tui.vim_mode);
+        app.vim_mode = false;
+        app.on_event(Event::SettingsChanged);
+        assert!(app.vim_mode);
+        std::fs::write(app.paths.config_file(), "[tui]\nqueue_key = 'ctrl+enter'\n").unwrap();
+        app.on_event(Event::SettingsChanged);
+        assert!(!app.vim_mode);
+        app.input.clear();
+        app.key(key(KeyCode::Char('w')));
+        assert_eq!(app.input, "w", "default readline typing is unchanged");
+    }
+
+    #[test]
+    fn vim_invalid_arguments_stay_local_and_preserve_the_preference() {
+        for enabled in [false, true] {
+            let mut app = test_app();
+            app.vim_mode = enabled;
+            app.input.set("unsent private draft");
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.slash("vim x");
+            assert_eq!(app.vim_mode, enabled);
+            assert_eq!(app.input, "unsent private draft");
+            assert!(app.notes.iter().any(|note| note == "usage: /vim [on|off]"));
+            assert!(!app
+                .notes
+                .iter()
+                .any(|note| note.contains("unknown command")));
+            assert!(
+                sent.try_recv().is_err(),
+                "invalid options must not send requests"
+            );
+        }
+    }
+
+    #[test]
+    fn vim_does_not_capture_list_navigation_and_pastes_are_literal_insertions() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = [("a", "one"), ("b", "two")]
+            .into_iter()
+            .map(|(id, name)| {
+                serde_json::from_value(
+                    serde_json::json!({"id":id,"name":name,"created_at":"","updated_at":""}),
+                )
+                .unwrap()
+            })
+            .collect();
+        for enabled in [false, true] {
+            app.vim_mode = enabled;
+            app.vim_input.mode = vim::Mode::Normal;
+            app.session_idx = 0;
+            app.key(key(KeyCode::Char('j')));
+            assert_eq!(app.session_idx, 1);
+        }
+        app.view = View::Chat;
+        app.input.clear();
+        app.vim_input.mode = vim::Mode::Normal;
+        app.paste("dw private pasted text");
+        assert_eq!(app.input, "dw private pasted text");
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+    }
+    #[test]
+    fn vim_tool_editor_dot_requires_its_text_object_before_replaying_insert() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.editor = Some(EditorState {
+            vim: vim::Vim::default(),
+            tool_id: "private".into(),
+            name: "private".into(),
+            chars: "\"secret\" plain".chars().collect(),
+            cursor: 0,
+            mode: EditMode::Code,
+        });
+        app.key(key(KeyCode::Esc));
+        for c in "ci\"X".chars() {
+            app.key(key(KeyCode::Char(c)))
+        }
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Char('$')));
+        let before = app.editor.as_ref().unwrap().text();
+        let cursor = app.editor.as_ref().unwrap().cursor;
+        app.key(key(KeyCode::Char('.')));
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.text(), before);
+        assert_eq!(ed.cursor, cursor);
+        assert_eq!(ed.vim.mode, vim::Mode::Normal);
     }
 }
