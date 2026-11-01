@@ -1389,7 +1389,7 @@ impl Provider {
             }
         });
         let native = match probe_tool_call(self, model, &tool, true).await {
-            Err(e) if is_tool_choice_rejection(&e.to_string()) => {
+            Err(e) if e.is::<ToolChoiceRejection>() => {
                 probe_tool_call(self, model, &tool, false).await
             }
             r => r,
@@ -1773,7 +1773,10 @@ impl Provider {
                             Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
                             None => format!("{status}: {text}"),
                         };
-                        let lower = text.to_lowercase();
+                        // Recovery inspects protocol data, never display text:
+                        // masking even a one-character synthetic credential can
+                        // remove a keyword or numeric limit from the diagnostic.
+                        let lower = raw_text.to_lowercase();
                         let rejected = OPTIONAL_PARAMS
                             .iter()
                             .find(|p| body.get(**p).is_some() && lower.contains(**p));
@@ -1786,7 +1789,7 @@ impl Provider {
                             }
                             continue;
                         }
-                        if status.as_u16() == 400 && with_effort && is_unknown_param(&text) {
+                        if status.as_u16() == 400 && with_effort && is_unknown_param(&raw_text) {
                             with_effort = false;
                             recovered.dropped_effort = true;
                             continue;
@@ -1797,7 +1800,7 @@ impl Provider {
                         if status.as_u16() == 400 {
                             let mut repaired = body.clone();
                             let fix = if self.cfg.anthropic() {
-                                crate::anthropic::recover(&mut repaired, &text)
+                                crate::anthropic::recover(&mut repaired, &raw_text)
                             } else if lower.contains("cache_control")
                                 && body.get("__no_cache_control").is_none()
                             {
@@ -1834,12 +1837,19 @@ impl Provider {
                             // logical call; let a configured fallback still run.
                             break 'attempts;
                         }
-                        if is_model_error(status.as_u16(), &text) {
+                        if is_model_error(status.as_u16(), &raw_text) {
                             permit.failure("model unavailable", true);
                             break; // immediately open, then fail over if configured
                         }
                         if !(status.as_u16() == 429 || status.is_server_error()) {
-                            return Err(auth.error(format!("provider error: {last_err}")));
+                            let error = auth.error(format!("provider error: {last_err}"));
+                            // Probes consume a typed classification rather than
+                            // searching a credential-masked error string.
+                            return Err(if is_tool_choice_rejection(&raw_text) {
+                                anyhow!(ToolChoiceRejection).context(error.to_string())
+                            } else {
+                                error
+                            });
                         }
                         reason = if status.as_u16() == 429 {
                             "rate limited".to_string()
@@ -3142,6 +3152,10 @@ pub struct ProbeResult {
     pub prompt_fallback: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("provider rejected forced tool choice")]
+struct ToolChoiceRejection;
+
 fn is_tool_choice_rejection(text: &str) -> bool {
     let t = text.to_lowercase();
     t.contains("tool_choice") && (t.contains("support") || t.contains("thinking"))
@@ -3274,9 +3288,7 @@ async fn probe_tools(
     }
     let native = match probe_tool_call(p, model, &tool, true).await {
         Ok(v) => Ok(v),
-        Err(e) if is_tool_choice_rejection(&e.to_string()) => {
-            probe_tool_call(p, model, &tool, false).await
-        }
+        Err(e) if e.is::<ToolChoiceRejection>() => probe_tool_call(p, model, &tool, false).await,
         Err(e) => Err(e),
     };
     match native {

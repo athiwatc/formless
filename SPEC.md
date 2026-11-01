@@ -335,10 +335,13 @@ without redesign.
   later fallback returns a hard 400/403 or credential resolution fails, and
   attempts configured fallback models; it does not replace the error or reset
   the refresh allowance per model. HTTP rejection and OAuth token error
-  bodies are masked against exact
+  bodies used for diagnostics are masked against exact
   submitted credentials (including opaque access/refresh tokens, authorization
   codes/verifiers and confidential client secrets) before truncation or
   preservation in context. Status and OAuth error codes remain available.
+  Retry classification and request repair inspect the raw response separately;
+  masked text never drives protocol recovery, and probes receive typed rejection
+  classifications without retaining or exposing the raw credential-bearing body.
   API-key/fixed-token and explicit environment overrides do not redeem
   a stored refresh token. `doctor` remains read-only, including its fixed-token
   diagnostic probes; operational probes can use a managed Provider.

@@ -176,6 +176,9 @@ struct Seen {
     calls: Vec<(String, String, String)>,
     fail_refresh: bool,
     echo_credentials: bool,
+    accept_any_credential: bool,
+    reject_forced_choice: bool,
+    forced_rejections: usize,
     fallback_ok: bool,
     reject_new: bool,
     pages: bool,
@@ -254,7 +257,16 @@ async fn endpoint(
         )
             .into_response();
     }
-    let good = (credential.ends_with("new-access") && !seen.reject_new)
+    if seen.reject_forced_choice && payload.get("tool_choice").is_some() {
+        seen.forced_rejections += 1;
+        return (
+            StatusCode::BAD_REQUEST,
+            "Thinking mode does not support this tool_choice",
+        )
+            .into_response();
+    }
+    let good = seen.accept_any_credential
+        || (credential.ends_with("new-access") && !seen.reject_new)
         || (seen.fallback_ok && payload["model"] == "fallback");
     if !good {
         let detail = if seen.echo_credentials {
@@ -303,6 +315,9 @@ async fn endpoint(
     }
     if path.ends_with("/compact") {
         return Json(json!({"summary":"compacted"})).into_response();
+    }
+    if seen.reject_forced_choice && payload.get("tools").is_some() {
+        return Json(json!({"choices":[{"message":{"content":null,"tool_calls":[{"id":"probe","type":"function","function":{"name":"probe_ping","arguments":"{}"}}]}}]})).into_response();
     }
     Json(json!({"choices":[{"message":{"content":"fallback result"}}]})).into_response()
 }
@@ -848,4 +863,42 @@ async fn provider_and_refresh_error_echoes_never_expose_opaque_submitted_credent
         assert_eq!(server.seen.lock().unwrap().refreshes, 1);
         server.close().await;
     }
+}
+
+#[tokio::test]
+async fn probe_recovery_uses_raw_rejection_classification_when_credential_masks_keyword() {
+    let env = credential_env::EnvGuard::isolated();
+    let _fixture = Fixture::new(&env);
+    let server = Server::new(Seen {
+        accept_any_credential: true,
+        reject_forced_choice: true,
+        ..Default::default()
+    })
+    .await;
+    let mut cfg = config(&server.base);
+    cfg.auth.mode = "api_key".into();
+    // The diagnostic must mask this exact value even where it occurs as a
+    // protocol keyword. The typed rejection still permits the unforced probe.
+    let p = Provider::new(cfg, "tool_choice".into()).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        provider::probe_provider(&p, "primary"),
+    )
+    .await
+    .expect("masked probe fixture timeout")
+    .unwrap();
+    assert!(result.tool_calling);
+    assert!(
+        !result.prompt_fallback,
+        "native probe was retried without forced choice"
+    );
+    let seen = server.seen.lock().unwrap();
+    assert_eq!(seen.forced_rejections, 1);
+    assert_eq!(seen.refreshes, 0);
+    assert!(seen
+        .calls
+        .iter()
+        .all(|(_, header, _)| header == "Bearer tool_choice"));
+    drop(seen);
+    server.close().await;
 }
