@@ -365,6 +365,12 @@ fn summary_selection(
 mod tests {
     use super::*;
 
+    fn fixture_config() -> crate::Config {
+        let mut cfg = crate::Config::default();
+        cfg.provider.model = "private-summary-fixture-model".into();
+        cfg
+    }
+
     fn fixture() -> (Store, String, String, crate::Config) {
         let st = Store::open_in_memory().unwrap();
         let source = st.create_session(Some("Evidence branch".into())).unwrap();
@@ -376,7 +382,7 @@ mod tests {
             Some(r#"{"private_metadata":"not projected"}"#.into()),
         )
         .unwrap();
-        (st, source.id, target.id, crate::Config::default())
+        (st, source.id, target.id, fixture_config())
     }
     fn confirmation(basis: &BranchSummaryBasis, candidate: &str) -> BranchSummaryConfirmation {
         BranchSummaryConfirmation {
@@ -387,6 +393,25 @@ mod tests {
             target_revision: basis.target_revision.clone(),
             candidate_hash: summary_hash(candidate),
         }
+    }
+
+    #[test]
+    fn empty_target_model_refuses_basis_without_changing_transcripts() {
+        let (st, source, target, mut cfg) = fixture();
+        cfg.provider.model.clear();
+        let before_source = st.list_messages(&source).unwrap();
+        let before_target = st.list_messages(&target).unwrap();
+        let error = match st.branch_summary_snapshot(&source, &target, &cfg) {
+            Ok(_) => panic!("empty model must not produce a summary basis"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<BranchSummaryFailure>(),
+            Some(BranchSummaryFailure::Invalid(message))
+                if message.contains("non-empty target model")
+        ));
+        assert_eq!(st.list_messages(&source).unwrap(), before_source);
+        assert_eq!(st.list_messages(&target).unwrap(), before_target);
     }
 
     #[test]
@@ -568,7 +593,7 @@ mod tests {
         );
         std::fs::create_dir_all(&dir.0).unwrap();
         let file = dir.0.join("private.db");
-        let cfg = crate::Config::default();
+        let cfg = fixture_config();
         let (key, message) = {
             let st = Store::open(&file).unwrap();
             let a = st.create_session(None).unwrap();
