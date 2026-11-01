@@ -773,3 +773,39 @@ fn inspecting_and_following_stored_terminal_runs_report_distinct_exit_codes() {
         );
     }
 }
+
+#[test]
+fn headless_denial_resolves_only_that_request_without_remembering_a_denial() {
+    let f = Fixture::new();
+    let p = Provider::new();
+    let sid = setup(&f, &p.url);
+    let _daemon = daemon(&f);
+    let _chat = start(&f, &sid);
+    let approval = pending(&f);
+    let id = approval["approval_id"].as_str().unwrap();
+    let follow = f
+        .command(&["sessions", "show", &sid, "--follow", "--jsonl"])
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        f.json(&["approvals", "deny", id, "--json"])["resolved"],
+        true
+    );
+    assert!(finish(follow).status.success());
+    assert!(f
+        .json(&["approvals", "pending", "--json"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(f
+        .json(&["approvals", "denials", "--json"])
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let repeat = finish(
+        f.command(&["approvals", "deny", id, "--json"])
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(repeat.status.code(), Some(2));
+}
