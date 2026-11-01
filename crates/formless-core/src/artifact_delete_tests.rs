@@ -316,7 +316,7 @@ fn actual_unprivileged_permission_failure_preserves_artifacts_and_message_metada
         std::fs::Permissions::from_mode(0o666),
     )
     .unwrap();
-    std::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o0)).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap());
     child
         .args([
