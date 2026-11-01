@@ -660,7 +660,10 @@ async fn preview_makes_zero_requests_and_completed_run_records_exact_wire_usage_
         .iter()
         .find(|r| r["run_id"] == run)
         .unwrap();
-    assert_eq!(actual["actual"]["tokens"], preview.basis.prompt_tokens + 5);
+    assert_eq!(
+        actual["actual"]["tokens"].as_f64(),
+        Some((preview.basis.prompt_tokens + 5) as f64)
+    );
     assert_eq!(actual["calibration_eligible"], true);
     let following = d
         .with_reader(|st| {
