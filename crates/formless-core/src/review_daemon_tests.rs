@@ -110,30 +110,7 @@ fn undo(view: &HunkReview, id: &str) -> Request {
         expected_hash: f.after_hash.clone(),
     }
 }
-async fn writable_fixture_or_verified_windows_refusal(s: &Setup, view: &HunkReview) -> bool {
-    #[cfg(windows)]
-    if view.files[0]
-        .exclusion_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("Full security metadata"))
-    {
-        assert!(view.files[0].hunks.is_empty());
-        let error = s
-            .daemon
-            .handle(decide(view, 0, "reject"))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<RequestFailure>().unwrap().code,
-            codes::INVALID
-        );
-        assert_eq!(std::fs::read(&s.path).unwrap(), s.new.as_bytes());
-        assert!(!s.daemon.paths.data_dir.join("review-receipts").exists());
-        no_network(s);
-        // This is a deliberate functional exclusion, not successful Windows
-        // inverse/Undo evidence. #628 remains open for that platform behavior.
-        return false;
-    }
+async fn writable_fixture(s: &Setup, view: &HunkReview) -> bool {
     assert!(
         view.files[0].exclusion_reason.is_none(),
         "plain private fixture must be reviewable on a supported metadata path"
@@ -154,7 +131,7 @@ async fn run_hunk_reject_undo_accept_and_server_comment_are_exact_without_provid
     let env = crate::credential_env::EnvGuard::isolated();
     let s = setup(&env);
     let view = inspect(&s).await;
-    if !writable_fixture_or_verified_windows_refusal(&s, &view).await {
+    if !writable_fixture(&s, &view).await {
         return;
     }
     assert_eq!(view.files[0].hunks.len(), 2);
@@ -232,12 +209,13 @@ async fn run_hunk_reject_undo_accept_and_server_comment_are_exact_without_provid
     );
     no_network(&s);
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn dismissed_run_action_reopens_with_durable_undo_and_refreshed_ranges_after_undo() {
     let env = crate::credential_env::EnvGuard::isolated();
     let s = setup(&env);
     let view = inspect(&s).await;
-    if !writable_fixture_or_verified_windows_refusal(&s, &view).await {
+    if !writable_fixture(&s, &view).await {
         return;
     }
     let rejected: ReviewDecisionResult =
@@ -423,7 +401,7 @@ async fn other_session_work_blocks_undo_without_changing_file_or_receipt() {
     let env = crate::credential_env::EnvGuard::isolated();
     let s = setup(&env);
     let view = inspect(&s).await;
-    if !writable_fixture_or_verified_windows_refusal(&s, &view).await {
+    if !writable_fixture(&s, &view).await {
         return;
     }
     let rejected: ReviewDecisionResult =
@@ -503,7 +481,7 @@ async fn other_session_completed_awaiting_delivery_allows_file_changes_without_c
     let env = crate::credential_env::EnvGuard::isolated();
     let s = setup(&env);
     let view = inspect(&s).await;
-    if !writable_fixture_or_verified_windows_refusal(&s, &view).await {
+    if !writable_fixture(&s, &view).await {
         return;
     }
     let (other, run) = s
@@ -724,7 +702,7 @@ async fn valid_base64_preimage_corruption_cannot_reach_actual_rpc_undo() {
     let env = crate::credential_env::EnvGuard::isolated();
     let s = setup(&env);
     let initial = inspect(&s).await;
-    if !writable_fixture_or_verified_windows_refusal(&s, &initial).await {
+    if !writable_fixture(&s, &initial).await {
         return;
     }
     let rejected: ReviewDecisionResult = serde_json::from_value(
@@ -1040,5 +1018,69 @@ async fn native_windows_hook_keeps_hardlink_bytes_with_readonly_hunk_metadata() 
     assert!(view.files[0].exclusion_reason.is_some());
     assert!(s.daemon.handle(decide(&view, 0, "reject")).await.is_err());
     assert_eq!(std::fs::read(&s.path).unwrap(), original);
+    no_network(&s);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn ordinary_windows_active_review_undo_is_real_but_reopened_receipts_cannot_mint_witnesses() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let s = setup(&env);
+    let initial = inspect(&s).await;
+    assert!(writable_fixture(&s, &initial).await);
+    let rejected: ReviewDecisionResult = serde_json::from_value(
+        s.daemon
+            .handle(decide(&initial, 0, "reject"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let change = rejected.change_id.clone().unwrap();
+    let rejected_bytes = std::fs::read(&s.path).unwrap();
+    assert_ne!(rejected_bytes, s.new.as_bytes());
+    let undone: ReviewDecisionResult = serde_json::from_value(
+        s.daemon
+            .handle(undo(&rejected.review, &change))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&s.path).unwrap(), s.new.as_bytes());
+    let rejected: ReviewDecisionResult = serde_json::from_value(
+        s.daemon
+            .handle(decide(&undone.review, 0, "reject"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let change = rejected.change_id.clone().unwrap();
+    s.daemon.hunk_reviews.locked().entries.clear();
+    let reopened = inspect(&s).await;
+    assert!(reopened.undo_changes.is_empty());
+    assert!(reopened
+        .warnings
+        .iter()
+        .any(|w| w.contains("original live file object")));
+    let error = s
+        .daemon
+        .handle(Request::UndoReviewChange {
+            review_id: reopened.review_id.clone(),
+            change_id: change.clone(),
+            expected_hash: reopened.files[0].after_hash.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RequestFailure>().unwrap().code,
+        codes::INVALID
+    );
+    assert_eq!(std::fs::read(&s.path).unwrap(), rejected_bytes);
+    assert!(s
+        .daemon
+        .paths
+        .data_dir
+        .join("review-receipts")
+        .join(format!("{change}.json"))
+        .exists());
     no_network(&s);
 }

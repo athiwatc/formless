@@ -1318,10 +1318,24 @@ pasting paths.
   are therefore read-only. Unix UID/GID and mode are preserved; extended
   attributes/ACLs are refused rather than silently discarded. Windows special
   attributes, nondefault streams and unsupported access-control entries are
-  refused. Full Windows audit/SACL and integrity-label state must be verifiable
-  using rights already available to the process: **ordinary unprivileged Windows
-  file hunk writes are currently read-only**, including existing-file replacement
-  and deletion/recreation. Review never enables privileges or changes OS policy.
+  refused. On Windows, ordinary existing-file inverse edits and Undo retain the
+  same file object with an attribute-only HANDLE for the active review's existing
+  30-minute lifetime (at most 128 retained files per review). A volume ID and
+  128-bit FileID bind each checksum-protected image, but are comparison values,
+  never authority to reopen an object. A single exclusive read/write HANDLE
+  performs final byte/identity/metadata checks, write, truncate, flush and readback;
+  no security descriptor setter runs. Opaque audit/SACL state remains on that
+  object and `security_complete` remains false when it cannot be read. Byte-only
+  in-place writes are recoverable, not atomic: partial or uncertain writes retain
+  prepared recovery images and refuse automatic overwrite of unknown states.
+  Only changes applied by the same still-active review can attach its live object
+  witness to Undo receipts. Closing/reopening or restarting without that witness
+  leaves the receipt as private recovery data, with explicit Undo unavailability.
+  Windows created/deleted-file rejection stays read-only until durable retained-object
+  recovery is implemented, even when full security metadata happens to be readable. An already-deleted historical object with an
+  uncaptured SACL cannot be reconstructed from bytes and a DACL; it stays read-only.
+  Review never enables privileges, rewrites a DACL to retain an object, or changes
+  OS policy.
   Windows and macOS native metadata paths require separate platform evidence;
   Linux tests do not establish their execution.
   `CommentReviewHunk` accepts at most 4096 UTF-8 bytes and derives quoted

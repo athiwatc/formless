@@ -25,6 +25,8 @@ struct Entry {
     original_images: BTreeMap<String, ReviewImage>,
     rejected: BTreeMap<String, BTreeSet<String>>,
     draft_undo: BTreeMap<String, DraftUndo>,
+    #[cfg(windows)]
+    live_changes: BTreeSet<String>,
 }
 #[derive(Clone)]
 struct DraftUndo {
@@ -293,6 +295,8 @@ impl Daemon {
             original_images: BTreeMap::new(),
             rejected: BTreeMap::new(),
             draft_undo: BTreeMap::new(),
+            #[cfg(windows)]
+            live_changes: BTreeSet::new(),
         };
         let mut retained = 0usize;
         for record in recorded.files {
@@ -312,6 +316,22 @@ impl Daemon {
                     .push(excluded(&record.path, reason, before_hash, String::new()));
                 continue;
             }
+            #[cfg(windows)]
+            if !record.existed {
+                entry.view.files.push(excluded(&record.path,
+                    "Windows created-file rejection requires retained-object recovery; this file is read-only".into(), before_hash, String::new()));
+                continue;
+            }
+            #[cfg(windows)]
+            if entry.images.len() >= 128 {
+                entry.view.files.push(excluded(
+                    &record.path,
+                    "This review already retains its maximum of 128 Windows file objects".into(),
+                    before_hash,
+                    String::new(),
+                ));
+                continue;
+            }
             let image = match ReviewPath::open(std::path::Path::new(&record.path), &policy)
                 .and_then(|p| p.read(&policy))
             {
@@ -326,6 +346,12 @@ impl Daemon {
                     continue;
                 }
             };
+            #[cfg(windows)]
+            if image.bytes.is_none() {
+                entry.view.files.push(excluded(&record.path,
+                    "Windows deleted-file restoration requires retained original security/object state; this file is read-only".into(), before_hash, image.hash()));
+                continue;
+            }
             let original = record.before_metadata.as_deref().map(|metadata| {
                 crate::review_file_io::decode_before_metadata(metadata, record.before.as_deref())
             });
@@ -355,6 +381,10 @@ impl Daemon {
             if original
                 .as_ref()
                 .is_some_and(|original| original.bytes.is_some() && !original.security_complete)
+                && !(cfg!(windows)
+                    && record.existed
+                    && image.bytes.is_some()
+                    && image.existing_write_restriction().is_none())
             {
                 entry.view.files.push(excluded(&record.path,
                     "Original bytes were captured without fully restorable metadata; this file remains read-only".into(), before_hash, image.hash()));
@@ -372,7 +402,12 @@ impl Daemon {
                     continue;
                 }
             }
-            if let Some(reason) = image.write_restriction() {
+            let restriction = if record.existed && image.bytes.is_some() {
+                image.existing_write_restriction()
+            } else {
+                image.write_restriction()
+            };
+            if let Some(reason) = restriction {
                 entry.view.files.push(excluded(
                     &record.path,
                     reason.into(),
@@ -448,6 +483,14 @@ impl Daemon {
                     }
                 }
             };
+            #[cfg(windows)]
+            {
+                let (before, after) = record.images()?;
+                if before.bytes.is_some() && after.bytes.is_some() {
+                    entry.view.warnings.push(format!("Windows undo receipt {} retains recovery bytes, but this reopened review does not retain the original live file object. Automatic Undo is unavailable; no metadata is reconstructed.", record.id));
+                    continue;
+                }
+            }
             let phase = record.observed_phase(&image)?;
             let undone = matches!(phase, Phase::Undone | Phase::Prepared);
             if phase == Phase::Applied {
@@ -508,6 +551,8 @@ impl Daemon {
             )]),
             rejected: BTreeMap::new(),
             draft_undo: BTreeMap::new(),
+            #[cfg(windows)]
+            live_changes: BTreeSet::new(),
         };
         self.hunk_reviews.locked().insert(entry)
     }
@@ -554,12 +599,20 @@ impl Daemon {
     fn apply_review_file(
         &self,
         mut receipt: Receipt,
+        live: &ReviewImage,
         policy: &formless_runtime::sensitive_paths::PathPolicy,
     ) -> Result<(Receipt, Vec<String>)> {
         // New Invocation starts and snapshot-before-write admission use this
         // same Store mutex. Keep the final known-work check through commit.
         let store = self.store.locked();
         self.review_profile_commit_idle(&store)?;
+        #[cfg(windows)]
+        {
+            let (before, after) = receipt.images()?;
+            if before.bytes.is_none() || after.bytes.is_none() {
+                return Err(invalid("Windows existence-changing review requires retained-object recovery; no receipt or mutation was applied"));
+            }
+        }
         let journal =
             Journal::open(&self.paths, true)?.context("Missing private review journal")?;
         journal.prepare(&mut receipt)?;
@@ -567,6 +620,17 @@ impl Daemon {
             "Audit unavailable; no file was changed. The prepared private receipt is retained.",
         )?;
         let (before, after) = receipt.images()?;
+        #[cfg(windows)]
+        let (before, after) = {
+            let (mut before, mut after) = (before, after);
+            if before.bytes.is_some() && after.bytes.is_some() {
+                before.attach_witness(live)?;
+                after.attach_witness(live)?;
+            }
+            (before, after)
+        };
+        #[cfg(not(windows))]
+        let _ = live;
         let access = ReviewPath::open(std::path::Path::new(&receipt.path), policy)?;
         let outcome = access.replace(&before, &after, policy);
         let observed = access.read(policy);
@@ -725,7 +789,9 @@ impl Daemon {
             ));
         }
         if let Some(receipt) = record {
-            let (_, warnings) = self.apply_review_file(receipt, &policy)?;
+            let (_, warnings) = self.apply_review_file(receipt, &before, &policy)?;
+            #[cfg(windows)]
+            changed.live_changes.insert(change_id.clone());
             changed.view.warnings.extend(warnings);
         }
         *entry = changed;
@@ -805,6 +871,20 @@ impl Daemon {
             if current != after {
                 return Err(invalid("Undo cannot overwrite an unknown image. Undo newer actions first or explicitly repair external changes."));
             }
+            #[cfg(windows)]
+            let (before, after) = {
+                if before.bytes.is_some() && after.bytes.is_some() {
+                    if !entry.live_changes.contains(change_id) {
+                        return Err(invalid("Windows Undo requires this active review's retained file object; reopened receipts are recovery data only"));
+                    }
+                    let (mut before, mut after) = (before, after);
+                    before.attach_witness(&current)?;
+                    after.attach_witness(&current)?;
+                    (before, after)
+                } else {
+                    (before, after)
+                }
+            };
             let access = ReviewPath::open(std::path::Path::new(&receipt.path), &policy)?;
             let outcome = access.replace(&after, &before, &policy);
             let observed = access.read(&policy);

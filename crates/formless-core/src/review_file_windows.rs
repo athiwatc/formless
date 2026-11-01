@@ -1,12 +1,12 @@
 //! Windows review access pins every ancestor against rename/delete and rejects
 //! reparse points. ReplaceFile preserves existing ACLs; its documented partial
 //! failure modes still require reconciliation with the durable prepared receipt.
-use super::{ReviewImage, MAX_REVIEW_BYTES};
+use super::{ReviewImage, WindowsIdentity, MAX_REVIEW_BYTES};
 use anyhow::{bail, Context, Result};
 use formless_runtime::sensitive_paths::{PathDecision, PathPolicy};
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
         fs::{MetadataExt, OpenOptionsExt},
@@ -18,6 +18,47 @@ use windows_sys::Win32::Storage::FileSystem::*;
 
 // Standard access right from WinNT.h; requesting it never enables a privilege.
 const ACCESS_SYSTEM_SECURITY_RIGHT: u32 = 0x0100_0000;
+/// Attribute-only handles retain identity without holding a data-sharing lock.
+/// Equality ignores this nonserialized capability; WindowsIdentity is compared
+/// separately. Only a live active review may attach it to a decoded receipt.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Witness(Option<std::sync::Arc<File>>);
+impl PartialEq for Witness {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Witness {}
+impl Witness {
+    pub(super) fn matches(&self, expected: Option<&WindowsIdentity>) -> bool {
+        self.0
+            .as_ref()
+            .and_then(|file| identity(file).ok())
+            .as_ref()
+            .zip(expected)
+            .is_some_and(|(actual, expected)| actual == expected)
+    }
+}
+fn identity(file: &File) -> Result<WindowsIdentity> {
+    let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: live borrowed HANDLE, properly sized/aligned native output.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(WindowsIdentity {
+        volume: info.VolumeSerialNumber,
+        file: info.FileId.Identifier,
+    })
+}
 pub(super) struct Access {
     path: PathBuf,
     guards: Vec<File>,
@@ -37,10 +78,21 @@ fn append(path: &Path, name: &std::ffi::OsStr) -> PathBuf {
     raw.into()
 }
 fn final_path(file: &File) -> Result<PathBuf> {
+    path_by_handle(file, 0)
+}
+fn physical_path(file: &File) -> Result<PathBuf> {
+    path_by_handle(file, VOLUME_NAME_NT)
+}
+fn path_by_handle(file: &File, flags: u32) -> Result<PathBuf> {
     let mut out = vec![0u16; 32768];
     // SAFETY: live borrowed HANDLE, valid writable UTF-16 output buffer.
     let size = unsafe {
-        GetFinalPathNameByHandleW(file.as_raw_handle(), out.as_mut_ptr(), out.len() as u32, 0)
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            out.as_mut_ptr(),
+            out.len() as u32,
+            flags,
+        )
     } as usize;
     if size == 0 || size >= out.len() {
         return Err(std::io::Error::last_os_error().into());
@@ -94,13 +146,31 @@ impl Access {
         }
         let leaf = names.pop().context("A filesystem root is not reviewable")?;
         for name in names {
+            let expected_parent = physical_path(guards.last().context("No parent")?)?;
             named = append(&named, &name);
-            guards.push(directory(&named)?);
+            let child = directory(&named)?;
+            if physical_path(&child)?.parent() != Some(expected_parent.as_path()) {
+                bail!("Review directory lookup escaped its pinned physical parent");
+            }
+            guards.push(child);
         }
         let path = append(&final_path(guards.last().context("no parent")?)?, &leaf);
         Ok(Self { path, guards })
     }
     pub(super) fn recheck(&self, raw: &Path, policy: &PathPolicy) -> Result<()> {
+        for (index, guard) in self.guards.iter().enumerate() {
+            let metadata = guard.metadata()?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                bail!("Pinned review parent was retagged");
+            }
+            if index > 0
+                && physical_path(guard)?.parent()
+                    != Some(physical_path(&self.guards[index - 1])?.as_path())
+            {
+                bail!("Pinned review parent chain changed physical identity");
+            }
+        }
         let parent = final_path(self.guards.last().context("no anchored parent")?)?;
         let actual = append(
             &parent,
@@ -126,6 +196,7 @@ impl Access {
         alias: Option<&Path>,
     ) -> Result<ReviewImage> {
         self.recheck(raw, policy)?;
+        let expected_parent = physical_path(self.guards.last().context("No parent")?)?;
         let privileged = OpenOptions::new()
             .read(true)
             .access_mode(
@@ -147,6 +218,9 @@ impl Access {
             }
             Err(error) => return Err(error.into()),
         };
+        if physical_path(&file)?.parent() != Some(expected_parent.as_path()) {
+            bail!("Review file lookup escaped its pinned physical parent");
+        }
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             bail!("Only regular non-reparse files are hunk-editable");
@@ -192,12 +266,37 @@ impl Access {
         if let Some(alias) = alias {
             self.verify_snapshot_alias(&file, alias, policy)?;
         }
+        let windows_identity = match identity(&file) {
+            Ok(identity) => Some(identity),
+            // Whole-file snapshots still retain authorized bounded bytes when
+            // this filesystem cannot provide a strong interactive-review ID.
+            Err(_) if capture => None,
+            Err(error) => return Err(error),
+        };
+        let witness = if !capture && single_link && streams_complete {
+            let pin = OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)?;
+            if Some(identity(&pin)?) != windows_identity {
+                bail!("File object changed before review retained it");
+            }
+            Witness(Some(std::sync::Arc::new(pin)))
+        } else {
+            Witness::default()
+        };
         Ok(ReviewImage {
             bytes: Some(bytes),
+            windows_identity: windows_identity.clone(),
+            witness,
             mode: Some(metadata.file_attributes()),
             readonly: metadata.permissions().readonly(),
             security,
-            security_complete: complete && single_link && streams_complete,
+            security_complete: complete
+                && single_link
+                && streams_complete
+                && windows_identity.is_some(),
             ..Default::default()
         })
     }
@@ -242,6 +341,153 @@ impl Access {
         }
         Ok(())
     }
+    /// Byte-only mutation retains the exact object (including opaque audit/SACL
+    /// state). This is recoverable via prepared images, not an atomic replace.
+    pub(super) fn replace_existing(
+        &self,
+        raw: &Path,
+        expected: &ReviewImage,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+    ) -> Result<Vec<String>> {
+        self.recheck(raw, policy)?;
+        let before = expected
+            .bytes
+            .as_deref()
+            .context("Existing file required")?;
+        let after = desired.bytes.as_deref().context("Existing file required")?;
+        if before.len() > MAX_REVIEW_BYTES || after.len() > MAX_REVIEW_BYTES {
+            bail!("Review byte limit exceeded");
+        }
+        if let Some(reason) = expected
+            .existing_write_restriction()
+            .or_else(|| desired.existing_write_restriction())
+        {
+            bail!(reason);
+        }
+        if !expected.witness.matches(expected.windows_identity.as_ref())
+            || !desired.witness.matches(expected.windows_identity.as_ref())
+        {
+            bail!("Byte-only Windows mutation requires the original live review witness");
+        }
+        let mut metadata_only = desired.clone();
+        metadata_only.bytes = expected.bytes.clone();
+        if metadata_only != *expected {
+            bail!("Byte-only Windows review cannot change metadata or object identity");
+        }
+        let open = |extra| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .access_mode(
+                    windows_sys::Win32::Foundation::GENERIC_READ
+                        | windows_sys::Win32::Foundation::GENERIC_WRITE
+                        | extra,
+                )
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&self.path)
+        };
+        let expected_parent = physical_path(self.guards.last().context("No parent")?)?;
+        let mut file = open(ACCESS_SYSTEM_SECURITY_RIGHT).or_else(|_| open(0))?;
+        if physical_path(&file)?.parent() != Some(expected_parent.as_path()) {
+            bail!("Review write lookup escaped its pinned physical parent");
+        }
+        let verify = |file: &File, body: &[u8]| -> Result<()> {
+            self.recheck(raw, policy)?;
+            if physical_path(file)?.parent() != Some(expected_parent.as_path()) {
+                bail!("Review object left its pinned physical parent");
+            }
+            let actual = final_path(file)?;
+            let anchored = append(
+                &final_path(self.guards.last().context("No parent")?)?,
+                self.path.file_name().context("No leaf")?,
+            );
+            if actual != anchored
+                || !matches!(
+                    policy.classify(raw, &actual).map_err(anyhow::Error::msg)?,
+                    PathDecision::Ordinary
+                )
+            {
+                bail!("The opened review object no longer has the ordinary anchored path");
+            }
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || Some(identity(file)?) != expected.windows_identity
+            {
+                bail!("The existing review file object changed");
+            }
+            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if unsafe { info.assume_init() }.nNumberOfLinks != 1 {
+                bail!("Multiple hard links are not hunk-editable");
+            }
+            require_default_stream_only(file)?;
+            let (security, complete) = snapshot_security(file)?;
+            if Some(security) != expected.security
+                || complete != expected.security_complete
+                || Some(metadata.file_attributes()) != expected.mode
+                || metadata.permissions().readonly() != expected.readonly
+                || metadata.len() != body.len() as u64
+            {
+                bail!("Review bytes or metadata changed before verification");
+            }
+            Ok(())
+        };
+        verify(&file, before)?;
+        let mut observed = Vec::with_capacity(before.len());
+        (&file)
+            .take(MAX_REVIEW_BYTES as u64 + 1)
+            .read_to_end(&mut observed)?;
+        if observed != before {
+            bail!("Review bytes changed before commit");
+        }
+        // One exclusive HANDLE is retained through CAS, write, truncate, flush
+        // and readback. No pathname replacement and no security setter occurs.
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(after)
+            .context("In-place write may be partial; reconcile prepared receipt")?;
+        file.set_len(after.len() as u64)
+            .context("In-place truncate may have changed bytes; reconcile prepared receipt")?;
+        file.sync_all()
+            .context("In-place durability uncertain; retain prepared receipt")?;
+        if Some(file.metadata()?.file_attributes()) != expected.mode {
+            // Writes may set ARCHIVE. Restore only known ordinary attributes on
+            // the same HANDLE, never touch any security descriptor component.
+            let basic = FILE_BASIC_INFO {
+                CreationTime: 0,
+                LastAccessTime: 0,
+                LastWriteTime: 0,
+                ChangeTime: 0,
+                FileAttributes: expected.mode.context("Missing ordinary attributes")?,
+            };
+            if unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileBasicInfo,
+                    (&basic as *const FILE_BASIC_INFO).cast(),
+                    std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            file.sync_all()?;
+        }
+        file.seek(SeekFrom::Start(0))?;
+        observed.clear();
+        (&file)
+            .take(MAX_REVIEW_BYTES as u64 + 1)
+            .read_to_end(&mut observed)?;
+        if observed != after {
+            bail!("In-place readback differs; retain prepared recovery receipt");
+        }
+        verify(&file, after)?;
+        Ok(Vec::new())
+    }
     pub(super) fn replace(
         &self,
         raw: &Path,
@@ -250,6 +496,9 @@ impl Access {
         policy: &PathPolicy,
     ) -> Result<Vec<String>> {
         self.recheck(raw, policy)?;
+        if expected.bytes.is_none() || desired.bytes.is_none() {
+            bail!("Windows creation/deletion requires retained-object recovery; this review is read-only");
+        }
         if (expected.bytes.is_some() && !expected.security_complete)
             || (desired.bytes.is_some() && !desired.security_complete)
         {
@@ -684,19 +933,135 @@ mod tests {
         }
         let mut after = before.clone();
         after.bytes = Some(b"review inverse\r\nEOF".to_vec());
-        access.replace(&path, &before, &after, &policy).unwrap();
+        access
+            .replace_existing(&path, &before, &after, &policy)
+            .unwrap();
         assert_eq!(access.read(&path, &policy).unwrap(), after);
-        access.replace(&path, &after, &before, &policy).unwrap();
+        access
+            .replace_existing(&path, &after, &before, &policy)
+            .unwrap();
         assert_eq!(access.read(&path, &policy).unwrap(), before);
-        access
+        assert!(access
             .replace(&path, &before, &ReviewImage::missing(), &policy)
-            .unwrap();
-        assert!(!path.exists());
-        access
+            .is_err());
+        assert!(path.exists());
+        assert!(access
             .replace(&path, &ReviewImage::missing(), &before, &policy)
-            .unwrap();
+            .is_err());
         assert_eq!(access.read(&path, &policy).unwrap(), before);
         assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 1);
+    }
+    #[test]
+    fn ordinary_existing_file_bytes_roundtrip_retains_object_and_visible_security() {
+        let root = Fixture::new();
+        let path = root.0.join("ordinary.txt");
+        std::fs::write(&path, "before\r\n日本語\r\n").unwrap();
+        let policy = PathPolicy::default();
+        let access = super::super::ReviewPath::open(&path, &policy).unwrap();
+        let before = access.read(&policy).unwrap();
+        assert!(before.existing_write_restriction().is_none());
+        let original_identity = before.windows_identity.clone();
+        let mut after = before.clone();
+        after.bytes = Some("after\r\n🦀\r\n".as_bytes().to_vec());
+        access.replace(&before, &after, &policy).unwrap();
+        assert_eq!(access.read(&policy).unwrap(), after);
+        access.replace(&after, &before, &policy).unwrap();
+        let restored = access.read(&policy).unwrap();
+        assert_eq!(restored, before);
+        assert_eq!(restored.windows_identity, original_identity);
+        // Receipt decoding does not retain a HANDLE capability, even when its
+        // durable FileID and checksummed bytes are still exactly correct.
+        let decoded: ReviewImage =
+            serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+        assert_eq!(decoded, before);
+        assert!(!decoded.witness.matches(decoded.windows_identity.as_ref()));
+        assert!(access.replace(&decoded, &after, &policy).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before.bytes.unwrap());
+    }
+    #[test]
+    fn retained_object_rejects_same_bytes_at_a_replaced_path_and_new_hardlinks() {
+        let root = Fixture::new();
+        let path = root.0.join("ordinary.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let policy = PathPolicy::default();
+        let access = super::super::ReviewPath::open(&path, &policy).unwrap();
+        let before = access.read(&policy).unwrap();
+        let mut after = before.clone();
+        after.bytes = Some(b"after".to_vec());
+        let old = root.0.join("old.txt");
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::write(&path, b"before").unwrap();
+        assert!(access.replace(&before, &after, &policy).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&old, &path).unwrap();
+        std::fs::hard_link(&path, &old).unwrap();
+        assert!(access.replace(&before, &after, &policy).is_err());
+        assert_eq!(std::fs::read(&old).unwrap(), b"before");
+    }
+    #[test]
+    fn retagged_pinned_parent_cannot_mint_a_witness_for_an_outside_file() {
+        use windows_sys::Win32::System::{
+            Ioctl::FSCTL_SET_REPARSE_POINT, SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
+            IO::DeviceIoControl,
+        };
+        let root = Fixture::new();
+        let owned = root.0.join("owned");
+        let outside = root.0.join("outside");
+        std::fs::create_dir(&owned).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, b"outside private sentinel").unwrap();
+        let policy = PathPolicy::default();
+        let access = Access::open(&owned.join("victim.txt")).unwrap();
+        let attribute = OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&owned)
+            .unwrap();
+        let destination = outside.canonicalize().unwrap();
+        let destination = destination.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        let target: Vec<u16> = std::ffi::OsStr::new(&format!(r"\??\{destination}"))
+            .encode_wide()
+            .collect();
+        let bytes = u16::try_from(target.len() * 2).unwrap();
+        let mut data = Vec::new();
+        data.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        data.extend((8u16 + bytes + 4).to_le_bytes());
+        data.extend(0u16.to_le_bytes());
+        for field in [0u16, bytes, bytes + 2, 0u16] {
+            data.extend(field.to_le_bytes());
+        }
+        for unit in target {
+            data.extend(unit.to_le_bytes());
+        }
+        data.extend([0u8; 4]);
+        let mut returned = 0;
+        // Private NTFS fixture: mutate only the owned empty directory through
+        // its attribute HANDLE; no signals, settings, or user paths are used.
+        assert_ne!(
+            unsafe {
+                DeviceIoControl(
+                    attribute.as_raw_handle(),
+                    FSCTL_SET_REPARSE_POINT,
+                    data.as_ptr().cast(),
+                    data.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "actual fixture retag must occur"
+        );
+        assert_eq!(
+            std::fs::read(owned.join("victim.txt")).unwrap(),
+            b"outside private sentinel"
+        );
+        assert!(access.read(&owned.join("victim.txt"), &policy).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"outside private sentinel");
     }
     #[test]
     fn malformed_windows_components_never_normalize_to_another_target() {
