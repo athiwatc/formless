@@ -427,9 +427,14 @@ an empty listing just asks for one.
   the answer streamed, whether reasoning streamed, and whether tool calls
   work (natively, or only through the prompt-based fallback). Results are
   kept per (endpoint, model) in `<data>/model_tests.json` and shown in the
-  pickers (`✓ tested` / `✗ test failed`). Choosing a model that has none
-  tests it in the background and notes a failure, so a model without tool
-  calls is caught before a Run rather than in it.
+  pickers (`✓ tested` / `✗ test failed`). Choosing a model does not start a
+  paid test by default. `provider.auto_test_models = true` opts into testing
+  previously untested selected models in the background; explicit Test actions
+  stay available without this setting. Background tests deduplicate concurrent
+  picks by endpoint/model and release their reservation on completion or abort.
+  Result merges are serialized and written privately through a synced temporary
+  file and atomic replacement; save failures are reported, never silently lost.
+  This setting does not bound provider retries or output by itself.
 
 ### 4.4 Provider failure handling
 
@@ -4273,6 +4278,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.model_context_tokens` | {} | Context size per model id, overriding the endpoint-reported size and `context_tokens` for that model (§4.2, §11) |
+| `provider.auto_test_models` | false | Opt into background testing when choosing a previously untested model; tests can spend paid tokens. Explicit Test actions remain available when off (§4.3) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off`. Decided per model tried, so a fallback that isn't Claude gets plain content; applied to one-shot completions (compaction, `llm.complete`) too; a 400 naming `cache_control` resends once without them (§4.2) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
