@@ -460,6 +460,27 @@ fn canonical_path_with(
     } else {
         std::env::current_dir().map_err(|e| e.to_string())?.join(p)
     };
+    // Win32 canonicalization may erase `missing/..` before accessing the
+    // filesystem. Check the traversed prefix first, rather than accepting an
+    // existing result whose missing component was silently normalized away.
+    // Real directory/.. paths remain valid (including symlink directories).
+    let mut prefix = std::path::PathBuf::new();
+    for component in abs.components() {
+        if component == Component::ParentDir {
+            let resolved = canonicalize(&prefix)
+                .map_err(|e| format!("cannot resolve path {}: {e}", prefix.display()))?;
+            if !metadata(&resolved)
+                .map_err(|e| format!("cannot resolve path {}: {e}", prefix.display()))?
+                .is_dir()
+            {
+                return Err(format!(
+                    "cannot traverse non-directory: {}",
+                    prefix.display()
+                ));
+            }
+        }
+        prefix.push(component.as_os_str());
+    }
     let mut base = abs.as_path();
     let mut tail = Vec::new();
     loop {
@@ -701,12 +722,62 @@ mod tests {
         let root = PathFixture::new();
         let target = root.0.join("missing").join("out.txt");
         assert_eq!(canonical_path(target.to_str().unwrap()).unwrap(), target);
-        let escape = root.0.join("missing").join("..").join("escape.txt");
-        assert!(canonical_path(escape.to_str().unwrap()).is_err());
+        // PathBuf::push normalizes `..` for Windows verbatim prefixes, so
+        // constructing this with join would erase the very traversal tested.
+        let sep = std::path::MAIN_SEPARATOR;
+        let raw_root = std::env::temp_dir().join(root.0.file_name().unwrap());
+        let escape = format!("{}{sep}missing{sep}..{sep}escape.txt", raw_root.display());
+        assert!(canonical_path(&escape).is_err());
+        let bound = Capabilities::parse(&["fs:write:$input.file".into()]).unwrap();
+        assert!(bound.bind(&json!({"file":escape})).is_err());
+        let existing = root.0.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        assert_eq!(
+            canonical_path(&format!(
+                "{}{sep}existing{sep}..{sep}allowed.txt",
+                raw_root.display()
+            ))
+            .unwrap(),
+            root.0.join("allowed.txt"),
+            "an existing directory can be traversed; containment still applies"
+        );
         assert!(canonical_path("").is_err());
         let file = root.0.join("file");
         std::fs::write(&file, "regular file").unwrap();
         assert!(canonical_path(file.join("child").to_str().unwrap()).is_err());
+        assert!(canonical_path(&format!(
+            "{}{sep}file{sep}..{sep}escape.txt",
+            raw_root.display()
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn canonical_path_checks_parent_prefix_before_native_normalization() {
+        let root = PathFixture::new();
+        let sep = std::path::MAIN_SEPARATOR;
+        let raw_root = std::env::temp_dir().join(root.0.file_name().unwrap());
+        let escape = format!("{}{sep}missing{sep}..{sep}escape.txt", raw_root.display());
+        let mut normalized = false;
+        let result = canonical_path_with(
+            &escape,
+            |path| {
+                if path == std::path::Path::new(&escape) {
+                    // Model Win32 resolving the lexically normalized path even
+                    // though its missing prefix could never be traversed.
+                    normalized = true;
+                    Ok(root.0.join("escape.txt"))
+                } else {
+                    path.canonicalize()
+                }
+            },
+            |path| path.symlink_metadata(),
+        );
+        assert!(result.is_err());
+        assert!(
+            !normalized,
+            "must refuse before native normalization can erase missing/.."
+        );
     }
 
     #[cfg(unix)]

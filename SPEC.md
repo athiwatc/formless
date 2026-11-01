@@ -4249,6 +4249,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   each access; `..` and symlink escapes outside the granted roots are denied.
   A not-yet-existing path resolves through its deepest existing ancestor;
   a dangling symlink, or `..` in the missing part, is refused.
+  Parent traversal is checked before native path normalization, including on
+  Windows: each prefix traversed by `..` must resolve to an existing directory.
+  Existing-directory parent traversal still resolves normally and remains
+  subject to canonical containment.
   If a missing path or ancestor becomes a regular file or directory during
   resolution, canonicalisation is retried once at that same path before
   appending any missing tail. Permission, symlink-loop and other resolution
