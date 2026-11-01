@@ -4480,7 +4480,7 @@ enum SessionsAction {
         /// Observe the current/latest Run without interrupting it on Ctrl+C
         #[arg(long)]
         follow: bool,
-        /// Tagged Event lines, as with run --jsonl
+        /// Tagged Event lines, as with run --output jsonl-events
         #[arg(long, requires = "follow")]
         jsonl: bool,
         /// The Session and its messages as JSON (Event lines with --follow)

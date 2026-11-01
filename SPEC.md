@@ -4976,7 +4976,7 @@ are explicit.
 `sessions show ID --follow` attaches to the existing daemon, replays stored
 messages and follows that Session's current/latest Run until its terminal state.
 With no Run yet it waits for the first Run. `--jsonl` (or `--follow --json`)
-emits the same tagged Event objects as `run --jsonl`. Snapshot messages use
+emits the same tagged Event objects as `run --output jsonl-events`. Snapshot messages use
 MessageAppended. Follow never starts, answers, or interrupts work: Ctrl+C detaches
 with 130. Completed, paused/failed and interrupted outcomes exit 0, 1 and 130.
 An already terminal Run exits after replay. Connection loss is an error.

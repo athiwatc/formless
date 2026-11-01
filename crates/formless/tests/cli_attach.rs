@@ -180,6 +180,17 @@ impl Provider {
                 let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
                     continue;
                 };
+                let header = String::from_utf8_lossy(&buf[..at]);
+                if header.starts_with("GET ") {
+                    assert!(
+                        header.lines().next().unwrap().contains("/models "),
+                        "unexpected private metadata route"
+                    );
+                    let data =
+                        json!({"data":[{"id":"private633","context_window":65536}]}).to_string();
+                    let _=write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",data.len());
+                    continue;
+                }
                 let body: Value = serde_json::from_slice(&buf[at + 4..]).unwrap();
                 let messages = body["messages"].as_array().unwrap();
                 let done = messages.last().is_some_and(|m| m["role"] == "tool");
@@ -203,7 +214,10 @@ impl Provider {
 impl Drop for Provider {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.take().unwrap().join().unwrap();
+        let result = self.thread.take().unwrap().join();
+        if !std::thread::panicking() {
+            assert!(result.is_ok(), "private provider thread failed");
+        }
     }
 }
 fn setup(f: &Fixture, url: &str) -> String {
