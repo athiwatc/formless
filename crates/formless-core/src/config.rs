@@ -613,7 +613,10 @@ pub const CHOICES: &[(&str, &[&str])] = &[
     ("memory.confirm_writes", &["never", "sensitive", "always"]),
     ("tui.notify", &["off", "bell", "desktop"]),
     ("tui.hyperlinks", &["auto", "on", "off"]),
-    ("tui.theme", &["auto", "dark", "light", "high-contrast"]),
+    (
+        "tui.theme",
+        &["auto", "dark", "light", "high-contrast", "colorblind"],
+    ),
     ("tui.inline_images", &["auto", "off"]),
     ("tui.on_start", &["last", "new", "picker"]),
     ("tui.language", &["auto", "en", "th"]),
@@ -1599,7 +1602,7 @@ pub struct TuiCfg {
     /// Clickable OSC 8 links in the TUI chat: "auto", "on" or "off".
     pub hyperlinks: String,
     /// "auto" (light or dark from the terminal), "dark", "light" or
-    /// "high-contrast".
+    /// "high-contrast" or "colorblind" (blue/orange and redundant status labels).
     pub theme: String,
     /// Per-role colour overrides: user, assistant, tool, note, error,
     /// accent → a colour name or `#rrggbb`.

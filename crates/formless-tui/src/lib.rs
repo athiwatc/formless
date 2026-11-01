@@ -10836,7 +10836,7 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
             truncate_chars(&v.author, 11),
             ui::clock_time(&v.created_at).unwrap_or_else(|| truncate_chars(&v.created_at, 18)),
             m.map_or(0, |m| m.total),
-            ui::rate_text(m.and_then(|m| m.success_rate)),
+            ui::rate_display(app.color, m.and_then(|m| m.success_rate)),
         );
         let style = if i == pick.idx {
             bold_fg(app.color, Color::Yellow)
@@ -11718,7 +11718,22 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 _ => ui::dim(app.color),
             };
             left.push(sep());
-            left.push(Span::styled(format!("ctx {pct}%"), style));
+            left.push(Span::styled(
+                if pct >= 70 {
+                    ui::status_text(
+                        app.color,
+                        if pct >= 90 {
+                            SemanticTone::Bad
+                        } else {
+                            SemanticTone::Warn
+                        },
+                        format!("ctx {pct}%"),
+                    )
+                } else {
+                    format!("ctx {pct}%")
+                },
+                style,
+            ));
         }
     }
     let waiting = app.approvals.len() + app.promotions.len();
@@ -12021,7 +12036,14 @@ fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|(text, _, error)| {
             Line::styled(
-                truncate_chars(text, w as usize - 4),
+                truncate_chars(
+                    &if *error {
+                        ui::status_text(app.color, SemanticTone::Bad, text)
+                    } else {
+                        text.clone()
+                    },
+                    w as usize - 4,
+                ),
                 if *error {
                     bold_fg(app.color, Color::Red)
                 } else {
@@ -13307,9 +13329,11 @@ impl App {
             plain(""),
         ];
         // White on black whatever the theme, so phones can read it.
-        let code = Style::default().fg(Color::White).bg(Color::Black);
-        for l in qr::lines(&url).unwrap_or_default() {
-            styled.push(Line::from(vec![Span::raw("  "), Span::styled(l, code)]));
+        if self.color {
+            let code = Style::default().fg(Color::White).bg(Color::Black);
+            for l in qr::lines(&url).unwrap_or_default() {
+                styled.push(Line::from(vec![Span::raw("  "), Span::styled(l, code)]));
+            }
         }
         styled.push(plain(""));
         styled.push(plain(&url));
@@ -13483,8 +13507,8 @@ impl App {
         for d in result["diff"].as_array().into_iter().flatten() {
             let (op, line) = (d[0].as_str().unwrap_or(" "), d[1].as_str().unwrap_or(""));
             let style = match op {
-                "+" => fg(self.color, Color::Green),
-                "-" => fg(self.color, Color::Red),
+                "+" => bold_fg(self.color, Color::Green),
+                "-" => bold_fg(self.color, Color::Red),
                 _ => ui::dim(self.color),
             };
             styled.push(Line::styled(format!("{op} {line}"), style));
@@ -14281,9 +14305,15 @@ fn tool_call_block(
         r.contains("\"ok\":false") || r.trim_start().to_lowercase().starts_with("error")
     });
     let (mark, mark_style) = match result {
-        None => ("…", ui::dim(app.color)),
-        Some(_) if failed => ("✗", bold_fg(app.color, Color::Red)),
-        Some(_) => ("✓", fg(app.color, Color::Green)),
+        None => ("…".to_owned(), ui::dim(app.color)),
+        Some(_) if failed => (
+            ui::status_text(app.color, SemanticTone::Bad, "✗"),
+            bold_fg(app.color, Color::Red),
+        ),
+        Some(_) => (
+            ui::status_text(app.color, SemanticTone::Good, "✓"),
+            fg(app.color, Color::Green),
+        ),
     };
     let head_style = if focused {
         bold_fg(app.color, Color::Yellow).add_modifier(Modifier::REVERSED)
@@ -14309,11 +14339,11 @@ fn tool_call_block(
         {
             head.push(Span::styled(
                 format!("  +{added}"),
-                fg(app.color, Color::Green),
+                bold_fg(app.color, Color::Green),
             ));
             head.push(Span::styled(
                 format!(" −{removed}"),
-                fg(app.color, Color::Red),
+                bold_fg(app.color, Color::Red),
             ));
         } else if let Some(r) = result {
             head.push(Span::styled(
@@ -14547,9 +14577,22 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             let indent = "  ".repeat(call.depth);
             let branch = if call.depth > 0 { "└ " } else { "" };
             let (mark, style) = match call.status.as_str() {
-                "running" => (app.spinner().to_string(), bold_fg(app.color, Color::Yellow)),
-                "ok" => ("✓".to_string(), fg(app.color, Color::Green)),
-                _ => ("✗".to_string(), fg(app.color, Color::Red)),
+                "running" => (
+                    if theme::redundant(app.color) {
+                        format!("running {}", app.spinner())
+                    } else {
+                        app.spinner().to_string()
+                    },
+                    bold_fg(app.color, Color::Yellow),
+                ),
+                "ok" => (
+                    ui::status_text(app.color, SemanticTone::Good, "✓"),
+                    fg(app.color, Color::Green),
+                ),
+                _ => (
+                    ui::status_text(app.color, SemanticTone::Bad, "✗"),
+                    fg(app.color, Color::Red),
+                ),
             };
             let elapsed = match call.elapsed_ms {
                 Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
@@ -14734,7 +14777,13 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         for (i, line) in lines.iter_mut().enumerate() {
             let here = match_lines.len();
             let (lit, n) = highlight_matches(std::mem::take(line), &find.query, |k| {
-                if here + k == current {
+                if !app.color {
+                    Style::default().add_modifier(if here + k == current {
+                        Modifier::REVERSED | Modifier::BOLD
+                    } else {
+                        Modifier::UNDERLINED
+                    })
+                } else if here + k == current {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::LightYellow)
@@ -15168,7 +15217,10 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
     }
     if let Some(e) = &form.error {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(format!("  ✗ {e}"), fg(color, Color::Red)));
+        lines.push(Line::styled(
+            ui::status_text(color, SemanticTone::Bad, format!("  ✗ {e}")),
+            fg(color, Color::Red),
+        ));
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
@@ -15263,7 +15315,8 @@ fn usage_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         .min(24);
-    let bar_w = (width as usize).saturating_sub(label_w + 32).max(10);
+    let redundant = theme::redundant(app.color);
+    let bar_w = (width as usize).saturating_sub(label_w + 32).max(1);
     let max = rows
         .iter()
         .map(|r| r.prompt_tokens + r.completion_tokens)
@@ -15272,19 +15325,19 @@ fn usage_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .max(1);
     let mut lines: Vec<Line> = rows
         .iter()
-        .map(|r| {
+        .flat_map(|r| {
             let cells = |n: i64| ((n as f64 / max as f64) * bar_w as f64).round() as usize;
             let cached = cells(r.cached_tokens.min(r.prompt_tokens));
             let fresh = cells(r.prompt_tokens).saturating_sub(cached);
             let out = cells(r.completion_tokens);
             let total = r.prompt_tokens + r.completion_tokens;
-            Line::from(vec![
+            let mut lines = vec![Line::from(vec![
                 Span::raw(format!(
                     "{} ",
                     ui::pad(&truncate_chars(&r.key, label_w), label_w)
                 )),
-                Span::styled("█".repeat(cached), ui::dim(app.color)),
-                Span::styled("█".repeat(fresh), fg(app.color, Color::Cyan)),
+                Span::styled("░".repeat(cached), ui::dim(app.color)),
+                Span::styled("▒".repeat(fresh), fg(app.color, Color::Cyan)),
                 Span::styled("█".repeat(out), fg(app.color, Color::Green)),
                 Span::raw(" ".repeat(bar_w.saturating_sub(cached + fresh + out) + 1)),
                 Span::raw(format!("{:>7} tok", short_count(total))),
@@ -15292,7 +15345,17 @@ fn usage_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     r.cost.map(|c| format!("  ${c:.2}")).unwrap_or_default(),
                     fg(app.color, Color::Yellow),
                 ),
-            ])
+            ])];
+            if redundant {
+                lines.push(Line::raw(format!(
+                    "  cached:{} fresh:{} prompt:{} out:{}",
+                    short_count(r.cached_tokens.min(r.prompt_tokens)),
+                    short_count(r.prompt_tokens.saturating_sub(r.cached_tokens)),
+                    short_count(r.prompt_tokens),
+                    short_count(r.completion_tokens),
+                )));
+            }
+            lines
         })
         .collect();
     if lines.is_empty() {
@@ -15327,11 +15390,11 @@ fn tool_glyph(t: &ToolInfo, color: bool) -> Span<'static> {
     if t.retired {
         Span::styled("○ ", ui::dim(color))
     } else if t.disabled {
-        Span::styled("◌ ", fg(color, Color::Yellow))
+        ui::status_span(color, SemanticTone::Warn, "◌ ")
     } else if t.needs_attention {
-        Span::styled("! ", bold_fg(color, Color::Red))
+        ui::status_span(color, SemanticTone::Bad, "! ")
     } else {
-        Span::styled("● ", fg(color, Color::Green))
+        ui::status_span(color, SemanticTone::Good, "● ")
     }
 }
 
@@ -15340,11 +15403,11 @@ fn tool_status(t: &ToolInfo, color: bool) -> Span<'static> {
     if t.retired {
         Span::styled("retired", bold_fg(color, Color::DarkGray))
     } else if t.disabled {
-        Span::styled("off", bold_fg(color, Color::Yellow))
+        ui::status_span(color, SemanticTone::Warn, "off")
     } else if t.needs_attention {
-        Span::styled("attention", bold_fg(color, Color::Red))
+        ui::status_span(color, SemanticTone::Bad, "attention")
     } else {
-        Span::styled("active", fg(color, Color::Green))
+        ui::status_span(color, SemanticTone::Good, "active")
     }
 }
 
@@ -15378,7 +15441,7 @@ fn tool_cells(t: &ToolInfo, color: bool) -> Vec<Cell<'static>> {
         Cell::from(Line::raw(t.invocations.to_string()).right_aligned()),
         Cell::from(
             Line::styled(
-                ui::rate_text(t.success_rate),
+                ui::rate_display(color, t.success_rate),
                 ui::rate_style(color, t.success_rate),
             )
             .right_aligned(),
@@ -15440,7 +15503,8 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
     } else {
         app.builtin_stats.len().min(8) as u16 + 3
     };
-    let usage_h = app.usage_rows.len().clamp(1, 10) as u16 + 2;
+    let usage_stride = if theme::redundant(app.color) { 2 } else { 1 };
+    let usage_h = app.usage_rows.len().clamp(1, 10) as u16 * usage_stride + 2;
     let parts = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(detail_h),
@@ -15458,7 +15522,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             .sum();
         let cost: Option<f64> = app.usage_rows.iter().map(|r| r.cost).sum();
         let title = format!(
-            " Tokens by {by} (b) · {} tok{} · cached / prompt / completion ",
+            " Tokens by {by} (b) · {} tok{} · ░cached / ▒fresh / █completion ",
             short_count(total),
             cost.map(|c| format!(" · ${c:.2}")).unwrap_or_default()
         );
@@ -15466,7 +15530,9 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         let mut lines = usage_lines(app, parts[2].width.saturating_sub(2));
         let room = parts[2].height.saturating_sub(2) as usize;
         if by == "day" && lines.len() > room {
-            lines.drain(..lines.len() - room);
+            let omitted =
+                (lines.len() - room).div_ceil(usage_stride as usize) * usage_stride as usize;
+            lines.drain(..omitted.min(lines.len()));
         }
         f.render_widget(
             Paragraph::new(lines).block(ui::panel(title, app.color, Color::Cyan)),
@@ -15486,8 +15552,11 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                     Cell::from(s.name.clone()),
                     Cell::from(Line::raw(s.calls.to_string()).right_aligned()),
                     Cell::from(
-                        Line::styled(ui::rate_text(rate), ui::rate_style(app.color, rate))
-                            .right_aligned(),
+                        Line::styled(
+                            ui::rate_display(app.color, rate),
+                            ui::rate_style(app.color, rate),
+                        )
+                        .right_aligned(),
                     ),
                     Cell::from(
                         s.kinds
@@ -15505,7 +15574,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                 [
                     Constraint::Length(20),
                     Constraint::Length(7),
-                    Constraint::Length(8),
+                    Constraint::Length(ui::rate_width(app.color)),
                     Constraint::Min(10),
                 ],
             )
@@ -15576,7 +15645,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                     Constraint::Length(28),
                     Constraint::Length(5),
                     Constraint::Length(7),
-                    Constraint::Length(8),
+                    Constraint::Length(ui::rate_width(app.color)),
                     Constraint::Min(10),
                 ],
             )
@@ -15598,10 +15667,13 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         let ms = |v: Option<f64>| v.map(|v| format!("{v:.0}ms")).unwrap_or_else(|| "-".into());
         let lines = vec![
             Line::from(vec![
-                Span::styled("ok ", ui::dim(app.color)),
-                Span::styled(m.success.to_string(), fg(app.color, Color::Green)),
-                Span::styled("  failed ", ui::dim(app.color)),
-                Span::styled(m.failure.to_string(), fg(app.color, Color::Red)),
+                ui::status_span(app.color, SemanticTone::Good, format!("ok {}", m.success)),
+                Span::raw("  "),
+                ui::status_span(
+                    app.color,
+                    SemanticTone::Bad,
+                    format!("failed {}", m.failure),
+                ),
                 Span::styled(
                     format!(
                         "  denied {}  cancelled {}  invalid {}  of {}",
@@ -15613,7 +15685,10 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::styled("rate ", ui::dim(app.color)),
                 Span::styled(
-                    pct(m.success_rate),
+                    m.success_rate.map_or_else(
+                        || "-".into(),
+                        |rate| ui::status_text(app.color, ui::rate_tone(rate), pct(Some(rate))),
+                    ),
                     ui::rate_style(app.color, m.success_rate),
                 ),
                 Span::styled(
@@ -15653,8 +15728,11 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                     Cell::from(st.model.clone()),
                     Cell::from(Line::raw(n.to_string()).right_aligned()),
                     Cell::from(
-                        Line::styled(ui::rate_text(rate), ui::rate_style(app.color, rate))
-                            .right_aligned(),
+                        Line::styled(
+                            ui::rate_display(app.color, rate),
+                            ui::rate_style(app.color, rate),
+                        )
+                        .right_aligned(),
                     ),
                     Cell::from(
                         Line::raw(if n > 0 {
@@ -15674,7 +15752,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                 [
                     Constraint::Min(18),
                     Constraint::Length(7),
-                    Constraint::Length(8),
+                    Constraint::Length(ui::rate_width(app.color)),
                     Constraint::Length(9),
                     Constraint::Length(7),
                 ],
@@ -15734,7 +15812,15 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
             let scores = match (p.baseline_score, p.candidate_score) {
                 (Some(b), Some(c)) => Line::from(vec![
                     Span::styled(
-                        format!("{:.0}%", c * 100.0),
+                        ui::status_text(
+                            app.color,
+                            if c > b {
+                                SemanticTone::Good
+                            } else {
+                                SemanticTone::Bad
+                            },
+                            format!("{:.0}%", c * 100.0),
+                        ),
                         if c > b {
                             fg(app.color, Color::Green)
                         } else {
@@ -15751,7 +15837,11 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
             Row::new(vec![
                 Cell::from(p.kind.clone()),
                 Cell::from(Span::styled(
-                    p.status.clone(),
+                    match p.status.as_str() {
+                        "applied" => ui::status_text(app.color, SemanticTone::Good, &p.status),
+                        "measured" => ui::status_text(app.color, SemanticTone::Warn, &p.status),
+                        _ => p.status.clone(),
+                    },
                     proposal_status_style(app.color, &p.status),
                 )),
                 Cell::from(scores),
@@ -15769,8 +15859,8 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
             rows,
             [
                 Constraint::Length(7),
-                Constraint::Length(12),
-                Constraint::Length(18),
+                Constraint::Length(if theme::redundant(app.color) { 17 } else { 12 }),
+                Constraint::Length(if theme::redundant(app.color) { 23 } else { 18 }),
                 Constraint::Min(20),
             ],
         )
@@ -15853,7 +15943,7 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                                 format!(
                                     "{} {}",
                                     m.success_rate.map(|r| ui::bar(r, 16)).unwrap_or_default(),
-                                    ui::rate_text(m.success_rate)
+                                    ui::rate_display(app.color, m.success_rate)
                                 ),
                                 ui::rate_style(app.color, m.success_rate),
                             ),
@@ -15936,9 +16026,15 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                 for (i, c) in d.recent_calls.iter().enumerate() {
                     let here = app.call_idx == Some(i);
                     let (mark, style) = match c.status.as_str() {
-                        "success" => ("✓", fg(app.color, Color::Green)),
-                        "failure" => ("✗", bold_fg(app.color, Color::Red)),
-                        _ => ("·", ui::dim(app.color)),
+                        "success" => (
+                            ui::status_text(app.color, SemanticTone::Good, "✓"),
+                            fg(app.color, Color::Green),
+                        ),
+                        "failure" => (
+                            ui::status_text(app.color, SemanticTone::Bad, "✗"),
+                            bold_fg(app.color, Color::Red),
+                        ),
+                        _ => ("·".into(), ui::dim(app.color)),
                     };
                     let session = c
                         .session_id
@@ -16001,7 +16097,21 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             .unwrap_or_else(|| "-".into())
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {} ", ui::pad(&a.status, 10)), style),
+                        Span::styled(
+                            format!(
+                                "  {} ",
+                                ui::status_text(
+                                    app.color,
+                                    match a.status.as_str() {
+                                        "promoted" => SemanticTone::Good,
+                                        "failed" | "discarded" => SemanticTone::Bad,
+                                        _ => SemanticTone::Warn,
+                                    },
+                                    &a.status
+                                )
+                            ),
+                            style,
+                        ),
                         Span::raw(format!(
                             "cand {} vs base {} · {} replays  ",
                             score(a.candidate_score),
@@ -16032,8 +16142,8 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                     .take(40)
                 {
                     let style = match l.chars().next() {
-                        Some('+') => fg(app.color, Color::Green),
-                        Some('-') => fg(app.color, Color::Red),
+                        Some('+') => bold_fg(app.color, Color::Green),
+                        Some('-') => bold_fg(app.color, Color::Red),
                         Some('@') => ui::dim(app.color),
                         _ => Style::default(),
                     };
@@ -16238,9 +16348,9 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
                     Constraint::Length(26),
                     Constraint::Length(5),
                     Constraint::Length(7),
-                    Constraint::Length(8),
+                    Constraint::Length(ui::rate_width(app.color)),
                     Constraint::Length(22),
-                    Constraint::Length(9),
+                    Constraint::Length(if theme::redundant(app.color) { 16 } else { 9 }),
                     Constraint::Min(10),
                 ],
             )
@@ -16250,7 +16360,7 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
                     "VER",
                     "CALLS",
                     "SUCCESS",
-                    "LAST 20",
+                    "LAST 20 (▆ok ▂fail)",
                     "STATUS",
                     "CAPABILITIES",
                 ],
@@ -16510,8 +16620,8 @@ fn draw_approval(
         // Unusually broad grants stand out (§10.3).
         if let Some(why) = broad_capability(cap) {
             lines.push(Line::from(vec![
-                Span::styled(format!("  • {cap}"), bold_fg(color, Color::Red)),
-                Span::styled(format!("  broad access: {why}"), fg(color, Color::Red)),
+                ui::status_span(color, SemanticTone::Warn, format!("  • {cap}")),
+                ui::status_span(color, SemanticTone::Warn, format!("  broad access: {why}")),
             ]));
         } else {
             lines.push(Line::raw(format!("  • {cap}")));
@@ -16986,7 +17096,15 @@ fn draw_editor_review(
 ) {
     let mut lines = vec![
         Line::styled(
-            r.verdict.clone(),
+            ui::status_text(
+                color,
+                if r.ok {
+                    SemanticTone::Good
+                } else {
+                    SemanticTone::Bad
+                },
+                &r.verdict,
+            ),
             if r.ok {
                 bold_fg(color, Color::Green)
             } else {
@@ -17000,8 +17118,8 @@ fn draw_editor_review(
     }
     for l in r.diff.lines() {
         lines.push(match l.chars().next() {
-            Some('+') => Line::styled(l.to_string(), fg(color, Color::Green)),
-            Some('-') => Line::styled(l.to_string(), fg(color, Color::Red)),
+            Some('+') => Line::styled(l.to_string(), bold_fg(color, Color::Green)),
+            Some('-') => Line::styled(l.to_string(), bold_fg(color, Color::Red)),
             Some('@') => Line::styled(l.to_string(), fg(color, Color::Cyan)),
             _ => Line::raw(l.to_string()),
         });
@@ -17087,14 +17205,17 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
                         Cell::from(tool_label(t, app.color)),
                         Cell::from(
                             Line::styled(
-                                ui::rate_text(t.success_rate),
+                                ui::rate_display(app.color, t.success_rate),
                                 ui::rate_style(app.color, t.success_rate),
                             )
                             .right_aligned(),
                         ),
                     ])
                 }),
-                [Constraint::Min(8), Constraint::Length(5)],
+                [
+                    Constraint::Min(8),
+                    Constraint::Length(ui::rate_width(app.color)),
+                ],
             )
             .block(ui::panel(" Tools ", app.color, Color::Yellow)),
             left[1],
@@ -17301,6 +17422,8 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         rect,
     );
 }
+
+pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
 /// Subcommands reserve their leading root rather than a separate namespace.
@@ -23563,7 +23686,28 @@ mod tests {
             screen.contains("Tokens by day (b) · 2.0M tok · $1.75"),
             "{screen}"
         );
-        assert!(screen.contains("2026-10-21 ████"), "{screen}");
+        let day = screen
+            .lines()
+            .find(|line| line.contains("2026-10-21"))
+            .unwrap();
+        let bar = day
+            .split_once("2026-10-21 ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let mut components: Vec<char> = bar.chars().collect();
+        components.dedup();
+        assert_eq!(
+            components,
+            ['░', '▒', '█'],
+            "cached, fresh and completion must remain distinct and ordered: {day}"
+        );
+        assert!(
+            screen.contains("░cached / ▒fresh / █completion"),
+            "{screen}"
+        );
         assert!(screen.contains("1.5M tok  $1.25"), "{screen}");
         app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         app.usage_rows = vec![row("deepseek-flash", 10, 5, None)];
@@ -26151,5 +26295,297 @@ mod tests {
                 assert!(sent.try_recv().is_err());
             }
         }
+    }
+    fn colorblind_fixture_tool(name: &str, rate: f64) -> ToolInfo {
+        let mut tool = description_fixture_detail().tool;
+        tool.id = name.into();
+        tool.name = name.into();
+        tool.title = String::new();
+        tool.invocations = 42;
+        tool.success_rate = Some(rate);
+        tool.recent = "sfsf".into();
+        tool
+    }
+    #[test]
+    fn colorblind_tools_and_metrics_render_status_words_and_no_color_retains_every_value() {
+        let _theme = theme::test_theme("colorblind");
+        for view in [View::Tools, View::Metrics] {
+            let mut app = test_app();
+            app.view = view;
+            app.color = true;
+            let good = colorblind_fixture_tool("healthy_reader", 0.95);
+            let mut warning = colorblind_fixture_tool("disabled_reader", 0.75);
+            warning.disabled = true;
+            let mut bad = colorblind_fixture_tool("broken_reader", 0.20);
+            bad.needs_attention = true;
+            app.tools = vec![good, warning, bad];
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(180, 36)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let colored = terminal.backend().buffer().clone();
+            let text = |buffer: &Buffer| {
+                (0..36)
+                    .map(|y| {
+                        (0..180)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                            + "\n"
+                    })
+                    .collect::<String>()
+            };
+            let expected = text(&colored);
+            for token in [
+                "healthy_reader",
+                "disabled_reader",
+                "broken_reader",
+                "ok 95%",
+                "warn 75%",
+                "fail 20%",
+                "42",
+            ] {
+                assert!(expected.contains(token), "{token}: {expected}");
+            }
+            for tone in [SemanticTone::Good, SemanticTone::Warn, SemanticTone::Bad] {
+                let (r, g, b) = colorblind_rgb(tone);
+                assert!(
+                    colored
+                        .content
+                        .iter()
+                        .any(|cell| cell.fg == Color::Rgb(r, g, b)),
+                    "{tone:?}"
+                );
+            }
+            app.color = false;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let plain = terminal.backend().buffer();
+            assert_eq!(
+                text(plain),
+                expected,
+                "colour changes styles, never values or status words"
+            );
+            assert!(plain
+                .content
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+        }
+    }
+    #[test]
+    fn colorblind_tool_call_snapshots_keep_bold_signed_counts_and_real_outcomes() {
+        let _theme = theme::test_theme("colorblind");
+        let mut app = test_app();
+        app.color = true;
+        let call = ("call".into(), "edit_file".into(), "{}".into());
+        let diff = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        let result = serde_json::json!({"diff":diff}).to_string();
+        let rows = tool_call_block(&app, &call, Some(&result));
+        let text = rows
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("ok ✓") && text.contains("+1") && text.contains("−1"),
+            "{text}"
+        );
+        for sign in ["+1", "−1"] {
+            let span = rows[0]
+                .spans
+                .iter()
+                .find(|span| span.content.contains(sign))
+                .unwrap();
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        }
+        let failed = tool_call_block(&app, &call, Some("error: private fixture"));
+        assert!(failed[0].to_string().contains("fail ✗"));
+        app.color = false;
+        let plain = tool_call_block(&app, &call, Some(&result));
+        assert_eq!(
+            plain
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            text
+        );
+    }
+    #[test]
+    fn colorblind_approval_broad_warning_keeps_identity_and_keys_without_color() {
+        let _theme = theme::test_theme("colorblind");
+        let req = ApprovalReq {
+            context: None,
+            approval_id: "private".into(),
+            tool_name: "network_reader".into(),
+            version: 7,
+            capabilities: vec!["net".into()],
+            memory_mb: 64,
+            detail: None,
+            already_allowed: vec![],
+            code_preview: None,
+            tool_id: None,
+            session_id: Some("private".into()),
+        };
+        let mut snapshots = Vec::new();
+        for color in [true, false] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 32)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_approval(
+                        frame,
+                        &req,
+                        "network_reader",
+                        None,
+                        None,
+                        (&[], None),
+                        None,
+                        false,
+                        0,
+                        color,
+                        true,
+                        false,
+                        false,
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..32)
+                .map(|y| {
+                    (0..140)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>();
+            for token in [
+                "network_reader",
+                "v7",
+                "warn",
+                "broad access",
+                "any host",
+                "always",
+                "deny",
+            ] {
+                assert!(text.contains(token), "{token}: {text}");
+            }
+            if !color {
+                assert!(buffer
+                    .content
+                    .iter()
+                    .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+            }
+            snapshots.push(text);
+        }
+        assert_eq!(snapshots[0], snapshots[1]);
+    }
+    #[test]
+    fn colorblind_theme_is_a_real_settings_choice_and_emits_the_existing_set_setting_request() {
+        let _theme = theme::test_theme("colorblind");
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        assert_eq!(cfg.tui.theme, "auto");
+        cfg.set_key("tui.theme", serde_json::json!("colorblind"))
+            .unwrap();
+        assert_eq!(cfg.tui.theme, "colorblind");
+        cfg.tui.theme = "high-contrast".into();
+        cfg.save(&app.paths).unwrap();
+        let rows = app.settings_rows();
+        let index = rows.iter().position(|row| row.key == "tui.theme").unwrap();
+        assert!(
+            matches!(&rows[index].kind,settings::Kind::Choice(values) if values.contains(&"colorblind"))
+        );
+        app.view = View::Settings;
+        app.settings_sel = index;
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Enter));
+        let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(envelope.request,Request::SetSetting{ref key,ref value} if key=="tui.theme" && value=="colorblind")
+        );
+    }
+    #[test]
+    fn colorblind_usage_bars_distinguish_every_component_without_color() {
+        let _theme = theme::test_theme("colorblind");
+        let mut app = test_app();
+        app.color = true;
+        app.usage_rows = vec![UsageRow {
+            key: "private-model".into(),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cached_tokens: 25,
+            cost: Some(0.42),
+        }];
+        let colored = usage_lines(&app, 140);
+        let text = colored
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for value in [
+            "private-model",
+            "░",
+            "▒",
+            "█",
+            "150 tok",
+            "cached:25",
+            "fresh:75",
+            "out:50",
+            "$0.42",
+        ] {
+            assert!(text.contains(value), "{value}: {text}");
+        }
+        app.color = false;
+        let plain = usage_lines(&app, 140);
+        assert_eq!(
+            plain
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            text
+        );
+        assert!(plain
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| span.style.fg.is_none() && span.style.bg.is_none()));
+    }
+    #[test]
+    fn colorblind_usage_at_eighty_columns_keeps_component_counts_and_full_money() {
+        let _theme = theme::test_theme("colorblind");
+        let mut app = test_app();
+        app.view = View::Metrics;
+        app.usage_by = 1;
+        app.usage_rows = vec![UsageRow {
+            key: "abcdefghijklmnopqrstuvwx".into(),
+            prompt_tokens: 100_000,
+            cached_tokens: 25_000,
+            completion_tokens: 50_000,
+            cost: Some(0.42),
+        }];
+        let mut screens = Vec::new();
+        for color in [true, false] {
+            app.color = color;
+            let screen = render(&mut app, 80, 30);
+            for value in [
+                "abcdefghijklmnopqrstuvwx",
+                "150.0k tok",
+                "$0.42",
+                "cached:25.0k",
+                "fresh:75.0k",
+                "prompt:100.0k",
+                "out:50.0k",
+                "░cached / ▒fresh / █completion",
+            ] {
+                assert!(screen.contains(value), "{value}: {screen}");
+            }
+            let money_row = screen
+                .lines()
+                .find(|line| line.contains("abcdefghijklmnopqrstuvwx"))
+                .unwrap();
+            assert!(
+                money_row.contains("$0.42"),
+                "cost must be complete beside its own row: {money_row}"
+            );
+            screens.push(screen);
+        }
+        assert_eq!(screens[0], screens[1]);
     }
 }

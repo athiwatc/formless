@@ -774,9 +774,9 @@ pub(crate) fn diff_line(line: &str, color: bool) -> Span<'static> {
     let style = if line.starts_with("+++") || line.starts_with("---") {
         super::bold_fg(color, Color::White)
     } else if line.starts_with('+') {
-        fg(color, Color::Green)
+        super::bold_fg(color, Color::Green)
     } else if line.starts_with('-') {
-        fg(color, Color::Red)
+        super::bold_fg(color, Color::Red)
     } else if line.starts_with("@@") {
         fg(color, Color::Cyan)
     } else {
@@ -1010,6 +1010,29 @@ mod tests {
             "r",
         ] {
             assert!(Highlighter::new(name, true).is_some(), "{name}");
+        }
+    }
+    #[test]
+    fn colorblind_and_no_color_diffs_keep_exact_bytes_and_bold_signed_gutters() {
+        let _theme = crate::theme::test_theme("colorblind");
+        for (text, tone) in [
+            ("+added ไทย", crate::SemanticTone::Good),
+            ("-removed العربية", crate::SemanticTone::Bad),
+        ] {
+            let span = diff_line(text, true);
+            let (r, g, b) = crate::colorblind_rgb(tone);
+            assert_eq!(span.style.fg, Some(Color::Rgb(r, g, b)));
+            assert!(span
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD));
+            let plain = diff_line(text, false);
+            assert_eq!(span.content, plain.content);
+            assert_eq!(plain.style.fg, None);
+            assert!(plain
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD));
         }
     }
 }

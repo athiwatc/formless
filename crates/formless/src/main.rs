@@ -400,7 +400,7 @@ enum AuthAction {
 /// terminal (it holds the secret, so it never goes into a pipe or a log).
 fn print_pairing_qr(url: &str) {
     use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() {
+    if !std::io::stdout().is_terminal() || !table::color_allowed() {
         return;
     }
     if let Some(code) = formless_tui::qr::ansi(url) {
@@ -1084,9 +1084,9 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                     t(
                         scope_word(g.scope),
                         if g.scope == ApprovalScope::Always {
-                            Tone::Plain
-                        } else {
                             Tone::Warn
+                        } else {
+                            Tone::Plain
                         },
                     ),
                     c(when(&g.granted_at)),
@@ -1396,7 +1396,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
-            .with_ansi(std::io::stderr().is_terminal())
+            .with_ansi(std::io::stderr().is_terminal() && table::color_allowed())
             .init();
     }
     // Completions and the man page need nothing else: no profile, config
@@ -1644,6 +1644,13 @@ fn run_cli(cli: Cli) -> Result<()> {
     } else {
         Paths::resolve(cli.profile.as_deref())?
     };
+    // Metadata-only early commands above deliberately avoid reading config.
+    // Ordinary table surfaces share the TUI colorblind palette for this profile.
+    table::configure_theme(
+        &Config::load_file_only(&paths)
+            .map(|cfg| cfg.tui.theme)
+            .unwrap_or_default(),
+    );
     match cli.cmd {
         None | Some(Cmd::Tui) if cli.plain => formless_tui::plain::run(paths),
         None | Some(Cmd::Tui) => formless_tui::run_with(

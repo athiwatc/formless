@@ -57,24 +57,30 @@ fn diff_line(line: &ReviewLine, color: bool) -> Line<'static> {
     };
     let number = |n: Option<u64>| n.map_or("—".into(), |n| n.to_string());
     let dim = if color {
-        Style::default().fg(Color::DarkGray)
+        crate::fg(color, Color::DarkGray)
     } else {
         Style::default()
     };
-    let mut spans = vec![Span::styled(
-        format!(
-            "{:>6} {:>6} {mark} ",
-            number(line.old_line),
-            number(line.new_line)
+    let mut spans = vec![
+        Span::styled(
+            format!("{:>6} {:>6} ", number(line.old_line), number(line.new_line)),
+            dim,
         ),
-        dim,
-    )];
+        Span::styled(
+            format!("{mark} "),
+            if mark == ' ' {
+                dim
+            } else {
+                crate::bold_fg(color, ink)
+            },
+        ),
+    ];
     for word in &line.text {
         let mut style = Style::default();
         if word.changed {
             style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
             if color {
-                style = style.fg(ink);
+                style = style.patch(crate::fg(color, ink));
             }
         }
         spans.push(Span::styled(display_text(&word.text), style));
@@ -237,5 +243,45 @@ mod tests {
             assert!(!line.to_string().chars().any(char::is_control));
             assert!(!line.to_string().contains('\u{202e}'));
         }
+    }
+    #[test]
+    fn colorblind_hunks_keep_bold_gutters_word_marks_numbers_and_newline_labels() {
+        let _theme = crate::theme::test_theme("colorblind");
+        let files = [file("src/main.rs", None)];
+        let colored = render(&files, 0, true);
+        let plain = render(&files, 0, false);
+        assert_eq!(
+            colored
+                .hunk
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            plain
+                .hunk
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        let added = &colored.hunk[3];
+        let gutter = added
+            .spans
+            .iter()
+            .find(|span| span.content == "+ ")
+            .unwrap();
+        assert!(gutter.style.add_modifier.contains(Modifier::BOLD));
+        let (r, g, b) = crate::colorblind_rgb(crate::SemanticTone::Good);
+        assert_eq!(gutter.style.fg, Some(Color::Rgb(r, g, b)));
+        let word = added.spans.iter().find(|span| span.content == "9").unwrap();
+        assert!(word.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(word.style.fg, Some(Color::Rgb(r, g, b)));
+        assert!(plain.hunk[3]
+            .spans
+            .iter()
+            .find(|span| span.content == "+ ")
+            .unwrap()
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(plain.hunk[2].to_string().contains("CRLF"));
     }
 }
