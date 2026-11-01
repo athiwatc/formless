@@ -1281,7 +1281,17 @@ impl Daemon {
 
     /// Handle one request as a connected client's would be (in-process
     /// callers and tests; `Subscribe` needs a connection).
-    pub async fn handle(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
+    /// Keep the large protocol dispatch state on the heap. Callers (including
+    /// connection scopes and sequential headless requests) must not embed one
+    /// complete match future per awaited RPC on an ordinary worker's stack.
+    pub fn handle(
+        self: &Arc<Self>,
+        req: Request,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value>> + Send + '_ {
+        Box::pin(self.handle_inner(req))
+    }
+
+    async fn handle_inner(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
         match req {
             Request::Ping => Ok(json!({
                 "pong": true,

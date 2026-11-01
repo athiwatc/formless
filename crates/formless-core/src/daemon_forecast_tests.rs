@@ -638,12 +638,18 @@ async fn preview_makes_zero_requests_and_completed_run_records_exact_wire_usage_
     })
     .await
     .expect("mock Run completion");
-    assert_eq!(seen.locked().len(), 1);
+    let st = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(
+        seen.locked().len(),
+        1,
+        "mock call missing: status={:?}, error={:?}",
+        st.run_status(&run).unwrap(),
+        st.run_error(&run).unwrap()
+    );
     assert_eq!(
         preview.basis.prompt_tokens,
         crate::tokens::request(&seen.locked()[0])
     );
-    let st = Store::open(&paths.db_file()).unwrap();
     assert_eq!(st.last_run(&sid).unwrap().unwrap().1, "completed");
     assert!(st.forecast_usage_complete(&run).unwrap());
     let rows = crate::forecast::metrics(&st, &cfg).unwrap();
@@ -750,4 +756,13 @@ async fn priced_comparison_refuses_before_real_forks_messages_runs_or_provider_c
     assert_eq!(st.recorded_forecasts().unwrap(), recorded);
     assert!(d.runs.locked().is_empty() && d.comparisons.locked().is_empty());
     assert!(matches!(endpoint.accept(),Err(e)if e.kind()==std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn production_request_future_is_bounded_for_default_worker_stacks() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, _paths, d, _sid, _cfg) = setup(&env);
+    let request = d.handle(Request::Ping);
+    let bytes = std::mem::size_of_val(&request);
+    assert!(bytes<=16*1024,"public dispatcher future grew to {bytes} bytes; connection scopes must not inline the entire protocol state machine");
 }
