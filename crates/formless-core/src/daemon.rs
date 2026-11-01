@@ -937,6 +937,7 @@ impl Daemon {
                     .await?
                     .with_name(n)
                     .with_usage_hook(self.usage_hook())
+                    .with_prompt_hook(self.prompt_hook())
                     .with_request_hook(self.request_hook())
                     .with_breaker_note_hook(self.provider_breaker_note_hook()),
                 )
@@ -1028,6 +1029,7 @@ impl Daemon {
                 .await?
                 .with_name(crate::config::DEFAULT_PROVIDER)
                 .with_usage_hook(self.usage_hook())
+                .with_prompt_hook(self.prompt_hook())
                 .with_request_hook(self.request_hook())
                 .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
@@ -1115,6 +1117,58 @@ impl Daemon {
                 result.context(crate::provider::UsageAccountingFailure)
             },
         )
+    }
+
+    fn prompt_hook(&self) -> crate::provider::PromptHook {
+        let store = self.store.clone();
+        Arc::new(move |provider, model, raw, reported| {
+            // Calibration is advisory. A failed write does not invalidate
+            // separately committed paid-usage accounting.
+            let result = store
+                .lock()
+                .map_err(|_| anyhow!("calibration store unavailable"))
+                .and_then(|st| st.observe_prompt_tokens(provider, model, raw, reported));
+            if let Err(error) = result {
+                tracing::warn!("could not calibrate prompt estimate: {error:#}");
+            }
+        })
+    }
+
+    fn calibrated_prompt_tokens(
+        &self,
+        provider: &Provider,
+        model: &str,
+        messages: &[Value],
+        tools: &[Value],
+    ) -> Result<usize> {
+        let raw = provider.prompt_tokens(messages, tools, model);
+        let key = crate::tokens::provider_key(provider.name(), provider.settings());
+        let ratio = self.with_reader(|st| st.token_ratio(&key, model))?;
+        Ok(crate::tokens::calibrated(raw, ratio))
+    }
+
+    fn routing_complex(
+        &self,
+        provider: &Provider,
+        requested: &str,
+        messages: &[Value],
+        tools: &[Value],
+        cfg: &Config,
+    ) -> Result<bool> {
+        let models = if ProviderCfg::is_auto_model(requested) {
+            provider.settings().routing_candidates()
+        } else {
+            vec![requested.to_string()]
+        };
+        let mut tokens = 0;
+        for model in models {
+            tokens = tokens.max(self.calibrated_prompt_tokens(provider, &model, messages, tools)?);
+        }
+        Ok(crate::routing::is_complex_tokens(
+            tokens,
+            tools.len(),
+            cfg.provider.routing_complex_chars,
+        ))
     }
 
     fn remove_attention(&self, id: &str) {
@@ -2284,45 +2338,73 @@ impl Daemon {
             Request::ContextUsage { session_id } => {
                 let cfg = self.config()?;
                 let model = self.session_base_model(&session_id, &cfg);
-                let (size, source) = match self.provider(&cfg).await {
-                    Ok(p) => self.context_window(&p, &model).await,
-                    Err(_) => (cfg.provider.context_for(&model), "default"),
+                let (requested, _) = self.session_model_effort(&session_id, &cfg);
+                let provider_name = requested
+                    .strip_prefix("role:")
+                    .and_then(|r| cfg.roles.get(r))
+                    .and_then(|r| r.provider.as_deref());
+                let pcfg = cfg.provider_cfg(provider_name)?;
+                let model = pcfg.resolve_alias(&model);
+                // Keep existing context-window discovery; token estimation itself
+                // is local and never contacts a tokenizer or reads credentials.
+                let provider_result = self.provider_named(&cfg, provider_name).await;
+                let (provider, size, source) = match provider_result {
+                    Ok(p) => {
+                        let (size, source) = self.context_window(&p, &model).await;
+                        (p, size, source)
+                    }
+                    Err(_) => {
+                        let size = pcfg.context_for(&model);
+                        (
+                            Provider::with_key(pcfg.clone(), String::new(), self.http.clone())
+                                .with_name(
+                                    provider_name.unwrap_or(crate::config::DEFAULT_PROVIDER),
+                                ),
+                            size,
+                            "default",
+                        )
+                    }
                 };
-                let prompt = self.session_prompt(&session_id)?;
-                let (tools, history, attachments, measured) = self.with_reader(|st| {
+                let ctx = self
+                    .session_context(
+                        &session_id,
+                        &provider,
+                        &model,
+                        size,
+                        cfg.compaction.fraction(),
+                    )?
+                    .0;
+                let (defs, attachments) = self.with_store(|st| {
                     let defs =
                         toolreg::tool_definitions(st, Some(&session_id), cfg.tools.inline_limit)?;
-                    let msgs = st.list_messages(&session_id)?;
-                    let history: usize = msgs
-                        .iter()
-                        .map(|m| m.content.len() + m.meta.as_deref().map_or(0, str::len))
-                        .sum();
-                    let attachments: usize = msgs
+                    let attachments: usize = st
+                        .list_messages(&session_id)?
                         .iter()
                         .filter_map(|m| m.meta.as_deref())
                         .filter_map(|m| serde_json::from_str::<Value>(m).ok())
                         .map(|m| m["attachments"].as_array().map_or(0, Vec::len))
                         .sum();
-                    Ok((
-                        serde_json::to_string(&defs)?.len(),
-                        history,
-                        attachments,
-                        st.last_prompt_tokens(&session_id)?,
-                    ))
+                    Ok((defs, attachments))
                 })?;
-                let estimate = (prompt.len() + tools + history) / 4;
+                let used = self.calibrated_prompt_tokens(&provider, &model, &ctx, &defs)?;
+                let system = self.calibrated_prompt_tokens(
+                    &provider,
+                    &model,
+                    &ctx[..ctx.len().min(1)],
+                    &[],
+                )?;
+                let tools = self.calibrated_prompt_tokens(&provider, &model, &[], &defs)?;
+                let history = self.calibrated_prompt_tokens(
+                    &provider,
+                    &model,
+                    &ctx[ctx.len().min(1)..],
+                    &[],
+                )?;
                 Ok(json!({
-                    "model": model,
-                    "context_tokens": size,
-                    "context_source": source,
-                    "used_tokens": measured.unwrap_or(estimate as u64),
-                    "measured": measured.is_some(),
-                    "breakdown": {
-                        "system_prompt": prompt.len() / 4,
-                        "tool_schemas": tools / 4,
-                        "history": history / 4,
-                        "attachments": attachments,
-                    },
+                    "model": model, "context_tokens": size, "context_source": source,
+                    "used_tokens": used, "measured": false,
+                    "breakdown": { "system_prompt": system, "tool_schemas": tools,
+                        "history": history, "attachments": attachments },
                 }))
             }
             Request::SessionUsage { session_id } => {
@@ -4731,18 +4813,25 @@ impl Daemon {
                 })
         };
         let requested_model = target.model.clone();
-        let (context_chars, tool_count) = self.with_store(|st| {
-            let chars = st.session_content_chars(session_id).unwrap_or(0);
-            let tools = toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-                .map(|d| d.len())
-                .unwrap_or(0);
-            anyhow::Ok((chars, tools))
+        let route_context = self
+            .session_context(
+                session_id,
+                &provider,
+                &requested_model,
+                provider.settings().context_for(&requested_model),
+                cfg.compaction.fraction(),
+            )?
+            .0;
+        let route_defs = self.with_store(|st| {
+            toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
         })?;
-        let complex = crate::routing::is_complex_task(
-            context_chars,
-            tool_count,
-            cfg.provider.routing_complex_chars,
-        );
+        let complex = self.routing_complex(
+            &provider,
+            &requested_model,
+            &route_context,
+            &route_defs,
+            &cfg,
+        )?;
         let model = self.resolve_model(&requested_model, &cfg, complex)?;
         self.run_models
             .lock()
@@ -4802,7 +4891,13 @@ impl Daemon {
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
             let ctx = self
-                .session_context(session_id, context_tokens, cfg.compaction.fraction())?
+                .session_context(
+                    session_id,
+                    &provider,
+                    &model,
+                    context_tokens,
+                    cfg.compaction.fraction(),
+                )?
                 .0;
             let defs = self.with_store(|st| {
                 toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
@@ -4955,7 +5050,9 @@ impl Daemon {
                 && !context_retried
             {
                 context_retried = true;
-                let up_to = self.session_context(session_id, context_tokens, 0.0)?.2;
+                let up_to = self
+                    .session_context(session_id, &provider, &model, context_tokens, 0.0)?
+                    .2;
                 if up_to > 0 {
                     self.broadcast(Event::Note {
                         session_id: Some(session_id.to_string()),
@@ -7536,18 +7633,6 @@ impl Daemon {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
                 })
             };
-            let tool_count = sub_defs()?.len();
-            let model = self
-                .resolve_model(
-                    &requested,
-                    cfg,
-                    crate::routing::is_complex_task(
-                        task.chars().count(),
-                        tool_count,
-                        cfg.provider.routing_complex_chars,
-                    ),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
             let mut messages = vec![json!({
                 "role": "system",
                 "content": "You are a Formless sub-agent. Complete the single task you are given, building and using Tools as needed, then return a concise final result."
@@ -7559,6 +7644,11 @@ impl Daemon {
                 messages.push(json!({"role": "system", "content": sys}));
             }
             messages.push(json!({"role": "user", "content": task}));
+            let model = self.resolve_model(
+                &requested,
+                cfg,
+                self.routing_complex(&provider, &requested, &messages, &sub_defs()?, cfg)?,
+            )?;
             let label = match &role {
                 Some(r) => format!("{r} · {model}"),
                 None => model.clone(),
@@ -11402,6 +11492,8 @@ impl Daemon {
     fn session_context(
         &self,
         session_id: &str,
+        provider: &Provider,
+        model: &str,
         context_tokens: u32,
         trigger_fraction: f64,
     ) -> Result<crate::storage::BuiltContext> {
@@ -11414,8 +11506,14 @@ impl Daemon {
             .unwrap_or_default();
         let built = self.with_store(|st| {
             let built = cache.build(st, session_id, &prompt, context_tokens, trigger_fraction)?;
-            let known = st.last_prompt_tokens(session_id)?;
-            Ok(cache.with_known_tokens(built, known, context_tokens, trigger_fraction))
+            let defs =
+                toolreg::tool_definitions(st, Some(session_id), self.config()?.tools.inline_limit)?;
+            let key = crate::tokens::provider_key(provider.name(), provider.settings());
+            let estimated = crate::tokens::calibrated(
+                provider.prompt_tokens(&built.0, &defs, model),
+                st.token_ratio(&key, model)?,
+            );
+            Ok(cache.with_prompt_tokens(built, estimated, context_tokens, trigger_fraction))
         });
         if built.is_ok() {
             self.contexts
@@ -11435,8 +11533,13 @@ impl Daemon {
         context_tokens: u32,
         window_source: &str,
     ) -> Result<()> {
-        let (_ctx, needs, compact_up_to) =
-            self.session_context(session_id, context_tokens, cfg.compaction.fraction())?;
+        let (_ctx, needs, compact_up_to) = self.session_context(
+            session_id,
+            &provider,
+            &model,
+            context_tokens,
+            cfg.compaction.fraction(),
+        )?;
         if !needs {
             return Ok(());
         }
@@ -11497,7 +11600,10 @@ impl Daemon {
         // byte-identical at the front of the system message, so the cached
         // prefix survives the compaction. Only when the accumulated summary
         // grows past a quarter of the context is it condensed as a whole.
-        let condense = crate::storage::estimate_tokens(&previous) > context_tokens as usize / 4;
+        let key = crate::tokens::provider_key(provider.name(), provider.settings());
+        let ratio = self.with_reader(|st| st.token_ratio(&key, &cmodel))?;
+        let condense = crate::tokens::calibrated(crate::tokens::text(&previous), ratio)
+            > context_tokens as usize / 4;
         let input = if previous.is_empty() || !condense {
             text
         } else {
@@ -11522,12 +11628,20 @@ impl Daemon {
                         session_id: Some(session_id.to_string()),
                         text: format!("Server-side compaction unavailable ({e}); using daemon-side compaction."),
                     });
-                    summarize_in_chunks(provider, &input, &cmodel, context_tokens, session_id)
-                        .await?
+                    summarize_in_chunks(
+                        provider,
+                        &input,
+                        &cmodel,
+                        context_tokens,
+                        session_id,
+                        ratio,
+                    )
+                    .await?
                 }
             }
         } else {
-            summarize_in_chunks(provider, &input, &cmodel, context_tokens, session_id).await?
+            summarize_in_chunks(provider, &input, &cmodel, context_tokens, session_id, ratio)
+                .await?
         };
         let summary = if previous.is_empty() || condense {
             summary
@@ -13157,23 +13271,19 @@ impl HostOps for NestedOps {
         let provider = target.provider;
         let effort = target.effort;
         let requested = target.model;
-        let model = self
-            .daemon
-            .resolve_model(
-                &requested,
-                &self.cfg,
-                crate::routing::is_complex_task(
-                    prompt.chars().count(),
-                    0,
-                    self.cfg.provider.routing_complex_chars,
-                ),
-            )
-            .map_err(|e| e.to_string())?;
         let mut messages = Vec::new();
         if let Some(sys) = system {
             messages.push(json!({"role": "system", "content": sys}));
         }
         messages.push(json!({"role": "user", "content": prompt}));
+        let complex = self
+            .daemon
+            .routing_complex(&provider, &requested, &messages, &[], &self.cfg)
+            .map_err(|e| e.to_string())?;
+        let model = self
+            .daemon
+            .resolve_model(&requested, &self.cfg, complex)
+            .map_err(|e| e.to_string())?;
         let result = self.block_cancellable(counted(
             "llm",
             &self.session_id,
@@ -14871,9 +14981,11 @@ async fn summarize_in_chunks(
     model: &str,
     context_tokens: u32,
     session_id: &str,
+    ratio: f64,
 ) -> Result<String> {
     let budget = (context_tokens as usize / 2).max(1000);
-    if crate::storage::estimate_tokens(input) <= budget {
+    let estimate = |text: &str| crate::tokens::calibrated(crate::tokens::text(text), ratio);
+    if estimate(input) <= budget {
         return counted(
             "compaction",
             session_id,
@@ -14885,10 +14997,7 @@ async fn summarize_in_chunks(
     let mut chunks: Vec<String> = vec![String::new()];
     for line in input.lines() {
         let last = chunks.last_mut().expect("one chunk");
-        if !last.is_empty()
-            && crate::storage::estimate_tokens(last) + crate::storage::estimate_tokens(line)
-                > budget
-        {
+        if !last.is_empty() && estimate(last) + estimate(line) > budget {
             chunks.push(String::new());
         }
         let last = chunks.last_mut().expect("one chunk");
@@ -14896,7 +15005,10 @@ async fn summarize_in_chunks(
             last.push('\n');
         }
         // A single line longer than the budget is cut to it.
-        let room = budget * 4;
+        let room = ((budget as f64
+            / ratio.clamp(crate::tokens::MIN_RATIO, crate::tokens::MAX_RATIO))
+        .floor() as usize)
+            .saturating_mul(4);
         last.push_str(&line.chars().take(room).collect::<String>());
     }
     let mut parts = Vec::with_capacity(chunks.len());
@@ -15228,3 +15340,7 @@ mod provider_breaker_tests;
 #[cfg(test)]
 #[path = "budget_tests.rs"]
 mod budget_admission_tests;
+
+#[cfg(test)]
+#[path = "daemon_token_tests.rs"]
+mod token_estimator_tests;

@@ -287,6 +287,13 @@ fn rehearse(checkpoint: i64) {
     let store = Store::open(&db).unwrap();
     let upgraded = read_only(&db);
     assert_eq!(historical::version(&upgraded), SCHEMA_VERSION);
+    // Old profiles gain isolated calibration state without rewriting their
+    // historical usage or their pre-migration recovery snapshot.
+    assert_eq!(store.token_ratio("fixture-provider", "model").unwrap(), 1.0);
+    store
+        .observe_prompt_tokens("fixture-provider", "model", 100, 300)
+        .unwrap();
+    assert!((store.token_ratio("fixture-provider", "model").unwrap() - 1.4).abs() < 1e-9);
     assert_retained(&upgraded, checkpoint);
     assert_integrity(&upgraded);
     let session = store.get_session(SESSION).unwrap().unwrap();

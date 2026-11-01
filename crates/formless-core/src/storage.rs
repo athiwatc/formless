@@ -351,7 +351,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 57;
+pub const SCHEMA_VERSION: i64 = 58;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -436,7 +436,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 57] = [
+const MIGRATIONS: [(i64, MigrationStep); 58] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -702,6 +702,14 @@ const MIGRATIONS: [(i64, MigrationStep); 57] = [
             "CREATE TABLE IF NOT EXISTS dismissed_mcp_chains (
                first TEXT NOT NULL, second TEXT NOT NULL, dismissed_at TEXT NOT NULL,
                PRIMARY KEY (first, second));",
+        )?)
+    }),
+    (58, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE token_calibration (
+                provider_key TEXT NOT NULL, model TEXT NOT NULL,
+                ratio REAL NOT NULL, samples INTEGER NOT NULL,
+                PRIMARY KEY(provider_key, model));",
         )?)
     }),
 ];
@@ -5012,6 +5020,45 @@ impl Store {
         Ok(out)
     }
 
+    /// Persist one comparable successful physical request observation. Missing
+    /// usage is never a zero-token training sample.
+    pub fn observe_prompt_tokens(
+        &self,
+        provider: &str,
+        model: &str,
+        raw: usize,
+        reported: u64,
+    ) -> Result<()> {
+        if raw == 0 || reported == 0 {
+            return Ok(());
+        }
+        let sample = (reported as f64 / raw as f64)
+            .clamp(crate::tokens::MIN_RATIO, crate::tokens::MAX_RATIO);
+        self.ex(
+            "INSERT INTO token_calibration(provider_key,model,ratio,samples) VALUES(?1,?2,?3,1)
+             ON CONFLICT(provider_key,model) DO UPDATE SET
+             ratio=MAX(?4,MIN(?5,token_calibration.ratio*(1-?6)+?7*?6)), samples=token_calibration.samples+1",
+            params![provider, model, 1.0 + crate::tokens::ALPHA * (sample - 1.0), crate::tokens::MIN_RATIO, crate::tokens::MAX_RATIO, crate::tokens::ALPHA, sample],
+        )?;
+        Ok(())
+    }
+
+    pub fn token_ratio(&self, provider: &str, model: &str) -> Result<f64> {
+        use rusqlite::OptionalExtension;
+        let ratio: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT ratio FROM token_calibration WHERE provider_key=?1 AND model=?2",
+                params![provider, model],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(ratio
+            .filter(|r| r.is_finite())
+            .unwrap_or(1.0)
+            .clamp(crate::tokens::MIN_RATIO, crate::tokens::MAX_RATIO))
+    }
+
     /// Record one provider request's reported token usage (one Run step).
     pub fn record_usage(
         &self,
@@ -5633,7 +5680,7 @@ impl Store {
 
 /// Rough token estimate (chars/4). Used only for compaction triggering.
 pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4)
+    crate::tokens::text(text)
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
@@ -5694,6 +5741,22 @@ impl ContextCache {
         match self.turn_cut() {
             Some(cut) if over && !needs => (ctx, true, cut),
             _ => (ctx, needs, up_to),
+        }
+    }
+
+    /// Re-evaluate the decision with the complete calibrated prompt, including
+    /// frozen schemas/images. A ratio below one can undo a raw heuristic trigger.
+    pub fn with_prompt_tokens(
+        &self,
+        built: BuiltContext,
+        estimated: usize,
+        window: u32,
+        fraction: f64,
+    ) -> BuiltContext {
+        let (ctx, _, up_to) = built;
+        match self.turn_cut() {
+            Some(cut) if estimated as f64 > window as f64 * fraction => (ctx, true, cut),
+            _ => (ctx, false, up_to),
         }
     }
 
@@ -5768,7 +5831,7 @@ impl ContextCache {
                         (last["content"].as_str(), msg["content"].as_str())
                     {
                         last["content"] = json!(format!("{prev}\n\n{note}"));
-                        let n = estimate_tokens(&last.to_string());
+                        let n = crate::tokens::value(last);
                         *self.tokens.last_mut().expect("tokens track ctx") = n;
                         continue;
                     }
@@ -5805,7 +5868,7 @@ impl ContextCache {
     }
 
     fn push(&mut self, msg: Value) {
-        self.tokens.push(estimate_tokens(&msg.to_string()));
+        self.tokens.push(crate::tokens::value(&msg));
         self.ctx.push(msg);
     }
 }

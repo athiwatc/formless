@@ -3556,8 +3556,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   else `context_tokens`). It's amber above 70% and red above 90%, so
   compaction (§11) isn't a surprise. `RunUsage` carries `context_used`
   and `context_tokens` after each step, and `ContextUsage {session_id}`
-  gives the same for a Session on demand, falling back to an estimate
-  before any prompt is measured. `/context` (or clicking the segment on
+  estimates the current rebuilt prompt for a Session on demand using the
+  persisted calibration. It reports `measured: false`: a previous measured
+  prompt is not substituted for changed history, schemas or images. `/context` (or clicking the segment on
   the web) adds an estimated breakdown: system prompt, Tool schemas,
   history, and the number of attachments.
   All preflight counts share one Unicode/JSON estimator (including Tool-call
@@ -4102,7 +4103,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.proxy` | "" | HTTP(S) proxy for the daemon's requests, from start; empty uses `HTTPS_PROXY` / `NO_PROXY` (§4.2) |
 | `provider.routing_models` | [] | Candidates for `model="auto"` measured routing |
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
-| `provider.routing_complex_chars` | 20000 | Context-chars threshold for complex tasks |
+| `provider.routing_complex_chars` | 20000 | Character-equivalent threshold (÷4 tokens) for calibrated prompt complexity |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
 | `provider.image_max_px` | 1568 | Longest side, in pixels, of an attached image sent to a vision model; bigger ones are scaled down once per Session and the encoded image kept for later steps (0: never scale). An image that can't be sent (gone, unreadable, over 8 MB) leaves a marker for the model and a note for the user (§4.2) |
 | `provider.image_detail` | auto | The `detail` asked of vision models for attached images: `auto`, `low` or `high`; images go to Chat Completions as `image_url` parts and to the Responses API as `input_image` parts (§4.2) |

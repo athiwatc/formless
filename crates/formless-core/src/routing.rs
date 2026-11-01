@@ -14,7 +14,13 @@ use std::collections::HashMap;
 /// A task is complex when its estimated context reaches the configured
 /// threshold or it has many tools available.
 pub fn is_complex_task(context_chars: usize, tool_count: usize, threshold_chars: usize) -> bool {
-    context_chars >= threshold_chars.max(1) || tool_count > 12
+    is_complex_tokens(context_chars.div_ceil(4), tool_count, threshold_chars)
+}
+
+/// Keep the existing character-valued setting compatible while routing on
+/// the same calibrated token count used by compaction and context fill.
+pub fn is_complex_tokens(tokens: usize, tool_count: usize, threshold_chars: usize) -> bool {
+    tokens >= threshold_chars.max(1).div_ceil(4) || tool_count > 12
 }
 
 /// Score one candidate. Higher is better.
