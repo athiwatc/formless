@@ -611,3 +611,52 @@ async fn probe_http_continual_trickle_cannot_extend_deadline_or_make_interim_usa
     assert_eq!(report["usage_partial"], true);
     assert_eq!(report["cost_partial"], true);
 }
+
+#[tokio::test]
+async fn probe_http_managed_oauth_401_cannot_refresh_env_token_or_fail_over() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    env.set(
+        "FORMLESS_OAUTH_ACCESS_TOKEN",
+        "private-unrefreshable-fixture-token",
+    );
+    let sent = Arc::new(AtomicUsize::new(0));
+    let captured = sent.clone();
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let token_posts = refreshes.clone();
+    let (base,_server)=server(Router::new()
+        .route("/chat/completions",post(move |headers:axum::http::HeaderMap,Json(body):Json<Value>| {
+            assert_eq!(headers["authorization"],"Bearer private-unrefreshable-fixture-token");assert_cap(&body,"chat",128);
+            captured.fetch_add(1,Ordering::SeqCst);
+            async{(StatusCode::UNAUTHORIZED,Json(json!({"error":{"message":"invalid_token: private fixture rejected"}})))}
+        }))
+        .route("/token",post(move||{token_posts.fetch_add(1,Ordering::SeqCst);async{"unexpected"}}))).await;
+    struct Profile(std::path::PathBuf);
+    impl Drop for Profile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Profile(
+        std::env::temp_dir().join(format!("fl-private-probe-oauth-{}", uuid::Uuid::new_v4())),
+    );
+    let paths = crate::Paths::from_dirs(root.0.join("data"), root.0.join("config")).unwrap();
+    let mut config = cfg(base.clone(), "chat");
+    config.auth.mode = "oauth".into();
+    config.auth.token_url = format!("{base}/token");
+    config.auth.client_id = "private-fixture-client".into();
+    // The explicit dummy env token takes the managed credential path without
+    // reading/writing token files or touching a native keychain.
+    let provider = Provider::for_profile(config, paths).await.unwrap();
+    let result = provider
+        .test_model_scoped("probe-model", ProbePolicy::default())
+        .await;
+    assert!(!result.ok);
+    assert!(
+        result.error.as_deref().unwrap().contains("401"),
+        "{result:?}"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    assert_eq!(result.probe_usage.unwrap()["requests_sent"], 1);
+}
