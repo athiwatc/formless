@@ -110,7 +110,7 @@ pub fn review_lines(basis: &BranchSummaryBasis, preview: &BranchSummaryPreview) 
     lines.push(String::new());
     lines.extend(preview.candidate.split('\n').map(str::to_string));
     lines.push(String::new());
-    lines.push("i Insert one note · Esc Cancel · arrows/PgUp/PgDn review".into());
+    lines.push("i Insert one note · Esc Close review · arrows/PgUp/PgDn review".into());
     lines
         .into_iter()
         .map(|line| crate::text::escape_bidi(&line).into_owned())

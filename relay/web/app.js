@@ -436,6 +436,9 @@
     input.classList.toggle("hidden", !opts.input);
     input.value = opts.value || "";
     input.placeholder = opts.placeholder || "";
+    const cancel = $("ask-cancel");
+    cancel.textContent = opts.cancelLabel || "Cancel";
+    cancel.classList.toggle("hidden", !!opts.hideCancel);
     const ok = $("ask-ok");
     ok.textContent = opts.ok || "OK";
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
@@ -832,9 +835,9 @@
     stamp.reviewTag = "branch-summary:review:" + stamp.generation;
     S.branchSummaryIntent = { source, target: stamp.target, generateTag: stamp.generateTag, reviewTag: stamp.reviewTag };
     let preparing = true;
-    const pendingBody = h("p", null, "Source: " + source + " → Target: " + stamp.target);
-    ask({ tag: stamp.generateTag, title: "Generating branch summary", body: pendingBody, ok: "Cancel" }).then(() => {
-      if (preparing && branchSummaryCurrent(stamp)) invalidateBranchSummary();
+    const pendingBody = h("p", null, "Source: " + source + " → Target: " + stamp.target + ". Started generation may finish and record usage after review is closed.");
+    ask({ tag: stamp.generateTag, title: "Generating branch summary", body: pendingBody, ok: "Close review", hideCancel: true }).then(() => {
+      if (preparing && branchSummaryCurrent(stamp)) { invalidateBranchSummary(); note("Branch summary review dismissed. Started generation may finish and record usage."); }
     });
     const inspected = await act({ type: "inspect_branch_summary", source_id: source, target_id: stamp.target });
     if (!inspected || !branchSummaryCurrent(stamp)) { preparing = false; cancelAsk(stamp.generateTag); if (branchSummaryCurrent(stamp)) invalidateBranchSummary(); return; }
@@ -842,7 +845,7 @@
     if (basis.source_id !== source || basis.target_id !== stamp.target || !basis.source_revision || !basis.target_revision) {
       preparing = false; invalidateBranchSummary(); return note("Branch summary basis did not match the requested source and target.", true);
     }
-    pendingBody.textContent = "Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model;
+    pendingBody.textContent = "Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model + ". Started generation may finish and record usage after review is closed.";
     const result = await act({ type: "prepare_branch_summary", source_id: source, target_id: stamp.target, source_revision: basis.source_revision, target_revision: basis.target_revision }, null, 120000);
     preparing = false;
     cancelAsk(stamp.generateTag);
@@ -854,8 +857,8 @@
     }
     const body = h("pre", { class: "branch-summary-review" }, branchSummaryReviewText(basis, preview));
     showBidi(body);
-    const accepted = await ask({ tag: stamp.reviewTag, title: "Review branch summary", body, ok: "Insert one note" });
-    if (!accepted) { if (branchSummaryCurrent(stamp)) invalidateBranchSummary(); return; }
+    const accepted = await ask({ tag: stamp.reviewTag, title: "Review branch summary", body, ok: "Insert one note", cancelLabel: "Close review" });
+    if (!accepted) { if (branchSummaryCurrent(stamp)) { invalidateBranchSummary(); note("Branch summary review dismissed."); } return; }
     if (!branchSummaryCurrent(stamp) || !(await branchSummaryPreviewMatches(basis, preview)) || !branchSummaryCurrent(stamp)) return;
     S.branchSummaryIntent = null;
     const applied = await act({ type: "commit_branch_summary", preview_id: preview.preview_id, source_id: source, target_id: stamp.target, source_revision: basis.source_revision, target_revision: basis.target_revision, candidate_hash: preview.candidate_hash });

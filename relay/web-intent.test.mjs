@@ -53,6 +53,18 @@ test('init and hashchange recover malformed links through pairing guidance', () 
     assert.match(c.$('pair-error').textContent, /does not look right/);
   }
 });
+test('summary close-review labels do not leak into later ordinary dialogs', async () => {
+  const c=setup(['ask','showNextAsk','closeAsk']);
+  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];',c);
+  const visibility=[];c.$('ask-cancel').classList.toggle=(name,hidden)=>visibility.push([name,hidden]);
+  const review=c.ask({title:'Generating branch summary',ok:'Close review',cancelLabel:'Close review',hideCancel:true});
+  assert.equal(c.$('ask-ok').textContent,'Close review');assert.equal(c.$('ask-cancel').textContent,'Close review');assert.deepEqual(visibility.at(-1),['hidden',true]);
+  c.closeAsk(true);assert.equal(await review,true);
+  const normal=c.ask({title:'Rename',input:true});
+  assert.equal(c.$('ask-cancel').textContent,'Cancel');assert.deepEqual(visibility.at(-1),['hidden',false]);
+  c.closeAsk(null);assert.equal(await normal,null);
+});
+
 test('overlapping asks preserve typed text and both settle in FIFO order', async () => {
   const c = setup(['ask', 'showNextAsk', 'closeAsk']);
   vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
@@ -862,13 +874,15 @@ async function summaryToReview(h,fixture=summaryFixture()) {
 test('branch summary uses explicit generation, exact revision/hash review and one insert without a Run', {timeout:5000}, async () => {
   const h=summaryHarness(),f=summaryFixture();
   const task=h.c.summariseBranchCommand('source');
-  const inspect=await h.request('inspect_branch_summary');assert.equal(h.calls.length,1);inspect.resolve(f.basis);
+  const inspect=await h.request('inspect_branch_summary');assert.equal(h.calls.length,1);
+  const pendingPrompt=[...h.prompts.values()][0];assert.equal(pendingPrompt.opts.ok,'Close review');assert.equal(pendingPrompt.opts.hideCancel,true);assert.match(plainText(pendingPrompt.opts.body),/Started generation may finish and record usage/);
+  inspect.resolve(f.basis);
   const prepare=await h.request('prepare_branch_summary');
   assert.deepEqual(h.calls[1],{type:'prepare_branch_summary',source_id:'source',target_id:'target',source_revision:f.basis.source_revision,target_revision:f.basis.target_revision});
   prepare.resolve(f.preview);const review=await h.review();assert.equal(h.calls.length,2,'candidate cannot insert itself');
   const text=plainText(review.opts.body);
   for(const expected of ['Source branch (source)','Target Session (target)','Provider: named','requested model: selected-model','served model: fallback-model','7 input / 3 output','1/2 requests reported','missing usage is not zero','Total cost: unknown','subtotal only: $0.250000','1 messages and 256 bytes omitted','metadata omitted','Attachment bodies omitted','Unpriced: named/model','Exact candidate note','سلام','ไทย','⟨U+202E⟩','<script>quoted data</script>'])assert.ok(text.includes(expected),expected);
-  assert.equal(text.includes('\u202e'),false);assert.equal(all(review.opts.body).some(n=>n.tag==='script'),false);assert.equal(review.opts.ok,'Insert one note');
+  assert.equal(text.includes('\u202e'),false);assert.equal(all(review.opts.body).some(n=>n.tag==='script'),false);assert.equal(review.opts.ok,'Insert one note');assert.equal(review.opts.cancelLabel,'Close review');
   review.resolve(true);review.resolve(true);
   const commit=await h.request('commit_branch_summary');
   assert.deepEqual(h.calls[2],{type:'commit_branch_summary',preview_id:f.preview.preview_id,source_id:'source',target_id:'target',source_revision:f.basis.source_revision,target_revision:f.basis.target_revision,candidate_hash:f.preview.candidate_hash});
@@ -881,7 +895,7 @@ test('summary cancellation before basis, during generation and at review never a
   for(const phase of ['basis','generation','review']){
     const h=summaryHarness(),f=summaryFixture(),task=h.c.summariseBranchCommand('source');
     const inspect=await h.request('inspect_branch_summary');
-    if(phase==='basis'){h.c.invalidateBranchSummary();inspect.resolve(f.basis);}
+    if(phase==='basis'){[...h.prompts.values()][0].resolve(true);inspect.resolve(f.basis);}
     else{inspect.resolve(f.basis);const prepare=await h.request('prepare_branch_summary');if(phase==='generation'){h.c.invalidateBranchSummary();prepare.resolve(f.preview);}else{prepare.resolve(f.preview);const review=await h.review();review.resolve(null);}}
     await task;assert.equal(h.calls.some(req=>req.type==='commit_branch_summary'),false,phase);assert.equal(h.events.length,0);
     if(phase==='basis')assert.equal(h.calls.length,1,'cancel before read-only basis response prevents paid generation');

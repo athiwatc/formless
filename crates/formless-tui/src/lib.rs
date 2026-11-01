@@ -7304,7 +7304,7 @@ impl App {
                 if source_id == target_id { self.notes.push("Choose another source branch for this target Session.".into()); return; }
                 if self.offline.is_some() || self.client.is_none() { self.notes.push("Reconnect before generating a branch summary.".into()); return; }
                 self.branch_summary.intent = Some((source_id.clone(),target_id.clone()));
-                self.notes.push("Generating branch summary for review… Esc cancels.".into());
+                self.notes.push("Generating branch summary for review… Esc closes review. Started generation may finish and record usage.".into());
                 self.request(Pending::InspectBranchSummary { generation: self.branch_summary.generation, source_id: source_id.clone(), target_id: target_id.clone() }, Request::InspectBranchSummary { source_id,target_id });
             }
             cmd if cmd == "compare" || cmd.starts_with("compare ") => {
@@ -8140,7 +8140,7 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.branch_summary.intent.is_some() {
                 self.cancel_branch_summary();
-                self.notes.push("Branch summary cancelled.".into());
+                self.notes.push("Branch summary review dismissed.".into());
                 return;
             }
             self.ctrl_c();
@@ -8148,7 +8148,7 @@ impl App {
         }
         if self.branch_summary.intent.is_some() && key.code == KeyCode::Esc {
             self.cancel_branch_summary();
-            self.notes.push("Branch summary cancelled.".into());
+            self.notes.push("Branch summary review dismissed.".into());
             return;
         }
         if self.branch_summary.committing && key.code == KeyCode::Char('i') {
@@ -21579,6 +21579,7 @@ mod tests {
         app.slash("summarise-branch source");
         let inspect: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
         app.key(key(KeyCode::Esc));
+        assert!(app.notes.last().unwrap().contains("review dismissed"));
         branch_summary_reply(&tx, inspect.id, serde_json::to_value(&basis).unwrap());
         app.drain_daemon();
         assert!(
