@@ -337,3 +337,71 @@ async fn chained_alias_uses_the_same_background_reservation_and_result_label() {
     assert_eq!(fresh["ok"], true);
     assert_eq!(f.count.load(Ordering::SeqCst), 4);
 }
+
+#[tokio::test]
+async fn explicit_probe_uses_factory_daily_budget_and_records_known_usage_once() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, false).await;
+    f.release.add_permits(1);
+    let result = f
+        .daemon()
+        .handle(Request::TestModel {
+            model: "model".into(),
+            provider: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["probe_usage"]["reported_usage"]["prompt_tokens"], 7);
+    assert_eq!(
+        result["probe_usage"]["reported_usage"]["completion_tokens"],
+        5
+    );
+    let db = rusqlite::Connection::open(f.daemon().paths.db_file()).unwrap();
+    let (rows,input,output):(i64,i64,i64)=db.query_row("SELECT COUNT(*), SUM(prompt_tokens), SUM(completion_tokens) FROM run_usage WHERE source='internal'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(
+        (rows, input, output),
+        (2, 7, 5),
+        "probe observer must preserve factory usage hooks without duplicate rows"
+    );
+    drop(db);
+    let mut cfg = f.daemon().config().unwrap();
+    cfg.limits.daily_usd = Some(1.0);
+    cfg.save(&f.daemon().paths).unwrap();
+    f.daemon()
+        .with_store(|st| {
+            st.record_usage_full(
+                "",
+                "",
+                "default",
+                "model",
+                &crate::provider::Usage {
+                    cost: Some(2.0),
+                    reported: 3,
+                    ..Default::default()
+                },
+                "internal",
+            )
+        })
+        .unwrap();
+    let count = f.count.load(Ordering::SeqCst);
+    let blocked = f
+        .daemon()
+        .handle(Request::TestModel {
+            model: "model".into(),
+            provider: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(blocked["ok"], false);
+    assert!(
+        blocked["error"].as_str().unwrap().contains("budget"),
+        "{blocked}"
+    );
+    assert_eq!(blocked["probe_usage"]["requests_sent"], 0);
+    assert_eq!(
+        f.count.load(Ordering::SeqCst),
+        count,
+        "exhausted daily budget must prevent every model POST"
+    );
+}

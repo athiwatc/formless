@@ -63,14 +63,11 @@ fn cancelled_refresh_lock_wait_has_no_detached_blocker_or_runtime_shutdown_wait(
     let reader = std::thread::spawn(move || {
         for line in std::io::BufReader::new(stdout).lines() {
             if line.unwrap().contains("PRIVATE_REFRESH_LOCK_HELD") {
-                ready_tx.send(()).unwrap();
-                return;
+                let _ = ready_tx.send(());
             }
         }
-        panic!("owned lock child exited before ready")
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    reader.join().unwrap();
     let worker_paths = paths.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -109,6 +106,7 @@ fn cancelled_refresh_lock_wait_has_no_detached_blocker_or_runtime_shutdown_wait(
         assert!(Instant::now() < until);
         std::thread::sleep(Duration::from_millis(5));
     }
+    reader.join().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

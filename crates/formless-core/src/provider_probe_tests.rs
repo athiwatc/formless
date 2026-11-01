@@ -357,3 +357,129 @@ async fn probe_http_redirect_is_not_followed_and_ordinary_cap_is_unchanged() {
         .await
         .unwrap();
 }
+#[tokio::test]
+async fn probe_http_forced_unforced_and_prompt_fallback_share_policy_and_metering() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let (base,_server)=server(Router::new().route("/chat/completions",post(move |Json(body):Json<Value>| {
+        captured.locked().push(body.clone());
+        async move {
+            if body.get("tool_choice").is_some() {return (StatusCode::BAD_REQUEST,Json(json!({"error":{"message":"tool_choice is not supported"}}))).into_response();}
+            if body.get("tools").is_some() {return ok(&body,"chat");}
+            if body["stream"]!=true {return Json(json!({"choices":[{"message":{"content":"{\"tool_calls\":[{\"name\":\"probe_ping\",\"arguments\":{}}]}"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}})).into_response();}
+            ok(&body,"chat")
+        }
+    }))).await;
+    let billed = Arc::new(AtomicUsize::new(0));
+    let captured = billed.clone();
+    let p = Provider::new(cfg(base, "chat"), "private-dummy".into())
+        .unwrap()
+        .with_usage_hook(Arc::new(move |_, _, _| {
+            captured.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    let result = p
+        .test_model_scoped("probe-model", ProbePolicy::default())
+        .await;
+    assert!(result.ok && result.prompt_fallback, "{result:?}");
+    let rows = seen.locked();
+    assert_eq!(rows.len(), 4);
+    assert!(rows[1].get("tool_choice").is_some());
+    assert!(rows[2].get("tool_choice").is_none());
+    assert!(rows[2].get("tools").is_some());
+    assert!(rows[3].get("tools").is_none());
+    for row in rows.iter() {
+        assert_cap(row, "chat", 128);
+    }
+    assert_eq!(
+        billed.load(Ordering::SeqCst),
+        3,
+        "only three responses reported usage; no double billing"
+    );
+    let usage = result.probe_usage.unwrap();
+    assert_eq!(usage["requests_sent"], 4);
+    assert_eq!(usage["reported_usage"]["prompt_tokens"], 9);
+    assert_eq!(usage["usage_partial"], true);
+}
+
+#[tokio::test]
+async fn probe_http_partial_stream_timeout_accounts_once_before_releasing_admission() {
+    use futures_util::StreamExt;
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let captured = arrived.clone();
+    let (base, _server) = server(Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let arrived = captured.clone();
+            async move {
+                let first = format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"delta":{"content":"partial"}}],"usage":{"prompt_tokens":3}})
+                );
+                let chunks = futures_util::stream::once(async move {
+                    arrived.notify_one();
+                    Ok::<_, std::io::Error>(first.into_bytes())
+                })
+                .chain(futures_util::stream::pending());
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(chunks),
+                )
+                    .into_response()
+            }
+        }),
+    ))
+    .await;
+    struct Lease(Arc<AtomicUsize>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let active = Arc::new(AtomicUsize::new(0));
+    let started = active.clone();
+    let billed = Arc::new(Mutex::new(Vec::new()));
+    let recorded = billed.clone();
+    let held = active.clone();
+    let p = Provider::new(cfg(base, "chat"), "private-dummy".into())
+        .unwrap()
+        .with_request_hook(Arc::new(move || {
+            let active = started.clone();
+            Box::pin(async move {
+                active.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(Lease(active)) as RequestLease)
+            })
+        }))
+        .with_usage_hook(Arc::new(move |_, _, u| {
+            assert_eq!(
+                held.load(Ordering::SeqCst),
+                1,
+                "billing must precede admission release"
+            );
+            recorded.locked().push(*u);
+            Ok(())
+        }));
+    let policy = ProbePolicy::limited(Duration::from_millis(300), 8);
+    let p = p.scoped_probe(policy.clone()).unwrap();
+    let cancel = CancellationToken::new();
+    let err = policy
+        .run(p.chat_stream(&[], &[], "probe-model", None, &cancel, |_, _| {}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("logical deadline"));
+    assert_eq!(
+        active.load(Ordering::SeqCst),
+        0,
+        "no abandoned request lease"
+    );
+    let rows = billed.locked();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].prompt_tokens, 3);
+    assert_eq!(rows[0].reported, 1);
+    let report = policy.report();
+    assert_eq!(report["requests_sent"], 1);
+    assert_eq!(report["usage_partial"], true);
+    assert!(report["reported_usage"].get("completion_tokens").is_none());
+}
