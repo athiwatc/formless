@@ -154,10 +154,44 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
     // Recovery copies are removed only after a newer one has actually passed
     // structural verification. An active failed-migration receipt pins its copy.
     let migrations = migration_backups(paths);
-    let pin = std::fs::read(paths.db_file().with_extension("migration-backup.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|v| v["backup_name"].as_str().map(str::to_string));
+    let receipt_path = paths.db_file().with_extension("migration-backup.json");
+    let pin_result: Result<Option<String>> = (|| {
+        let bytes = match std::fs::read(&receipt_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("read pinned migration recovery receipt"),
+        };
+        let receipt: Value =
+            serde_json::from_slice(&bytes).context("parse pinned migration recovery receipt")?;
+        let name = receipt["backup_name"]
+            .as_str()
+            .context("migration recovery receipt has no backup_name")?;
+        let prefix = format!(
+            "{}.v",
+            paths
+                .db_file()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        if Path::new(name).file_name().and_then(|p| p.to_str()) != Some(name)
+            || !name.starts_with(&prefix)
+            || !name.ends_with(".bak")
+        {
+            return Err(anyhow!("invalid pinned migration recovery filename"));
+        }
+        Ok(Some(name.to_string()))
+    })();
+    let (pin, pin_error) = match pin_result {
+        Ok(pin) => (pin, None),
+        Err(error) => {
+            tracing::warn!("migration retention blocked by recovery receipt: {error:#}");
+            (
+                None,
+                Some(format!("recovery receipt unreadable or invalid: {error:#}")),
+            )
+        }
+    };
     let candidates: Vec<_> = migrations
         .iter()
         .skip(MIGRATION_BACKUPS_KEEP)
@@ -166,8 +200,8 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
         .collect();
     let mut removed = Vec::new();
     let mut bytes = 0;
-    let mut verification_error = None;
-    if !candidates.is_empty() {
+    let mut verification_error = pin_error;
+    if !candidates.is_empty() && verification_error.is_none() {
         let newest = migrations
             .first()
             .expect("candidates require a newest copy");

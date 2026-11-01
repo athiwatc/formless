@@ -42,6 +42,15 @@ impl Drop for PrivateDir {
     }
 }
 
+fn has_live_wal(source: &Path) -> Result<bool> {
+    let wal = PathBuf::from(format!("{}-wal", source.display()));
+    match std::fs::metadata(&wal) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect backup WAL"),
+    }
+}
+
 fn fingerprint(file: &Path) -> Result<(String, u64)> {
     let mut input = std::fs::File::open(file)?;
     let mut hash = Sha256::new();
@@ -103,8 +112,7 @@ pub(crate) fn inspect(file: &Path) -> Result<Verification> {
     if !std::fs::metadata(&source)?.is_file() {
         bail!("backup is not a regular file");
     }
-    let wal = PathBuf::from(format!("{}-wal", source.display()));
-    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+    if has_live_wal(&source)? {
         bail!("backup has a live WAL; take a standalone consistent snapshot first");
     }
     let temporary = PrivateDir::new()?;
@@ -156,7 +164,7 @@ pub(crate) fn inspect(file: &Path) -> Result<Verification> {
             })?;
         tables.insert(name.clone(), count);
     }
-    if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+    if has_live_wal(&source)? {
         bail!("backup acquired a live WAL during verification");
     }
     if fingerprint(&source)? != (sha256.clone(), bytes) {
@@ -175,6 +183,9 @@ pub(crate) fn inspect(file: &Path) -> Result<Verification> {
 
 /// Receipts are hints, never a blessing for subsequently changed bytes.
 pub fn verified(paths: &Paths, file: &Path) -> Option<Verification> {
+    if has_live_wal(file).ok()? {
+        return None;
+    }
     let receipt: Verification =
         serde_json::from_slice(&std::fs::read(receipt_path(paths, file).ok()?).ok()?).ok()?;
     if receipt.source != std::fs::canonicalize(file).ok()?
@@ -245,7 +256,7 @@ pub async fn drill(paths: &Paths, file: &Path) -> Result<Value> {
         bail!("backup changed before drill");
     }
     housekeeping::restore(&trial, &saved)?;
-    let daemon = crate::Daemon::for_restore_drill(trial.clone())?;
+    let daemon = std::sync::Arc::new(crate::Daemon::for_restore_drill(trial.clone())?);
     let sessions = daemon
         .handle(formless_protocol::Request::ListSessions)
         .await?;

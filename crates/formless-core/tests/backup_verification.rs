@@ -109,6 +109,22 @@ fn migration_retention_verifies_newest_preserves_pinned_copy_and_audits_actual_d
             .to_string(),
     )
     .unwrap();
+    let valid_pin = std::fs::read(&pin).unwrap();
+    std::fs::write(&pin, b"partial receipt").unwrap();
+    let blocked = housekeeping::gc(&paths, &store, &Config::default(), false).unwrap();
+    assert!(
+        files.iter().all(|path| path.exists()),
+        "unknown pinned recovery must preserve all copies"
+    );
+    assert!(blocked["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["kind"] == "migration backups"
+            && row["verification_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("recovery receipt"))));
+    std::fs::write(&pin, valid_pin).unwrap();
     let good = std::fs::read(&files[4]).unwrap();
     std::fs::write(&files[4], b"not sqlite").unwrap();
     let report = housekeeping::gc(&paths, &store, &Config::default(), false).unwrap();
@@ -195,4 +211,29 @@ fn restore_refuses_current_stamped_incomplete_schema_without_replacing_destinati
     );
     let destination = Store::open(&paths.db_file()).unwrap();
     assert_eq!(destination.list_sessions().unwrap()[0].id, known.id);
+}
+
+#[test]
+fn a_receipt_never_blesses_later_wal_only_commits() {
+    let (f, paths) = Fixture::new();
+    let file = f.0.join("wal.bak");
+    let conn = historical::create(&file, 3);
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    checks::verify(&paths, &file).unwrap();
+    let before = std::fs::read(&file).unwrap();
+    conn.execute(
+        "INSERT INTO sessions(id,name,created_at,updated_at) VALUES('wal-only','new','','')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        before,
+        "committed update lives only in WAL"
+    );
+    assert!(checks::verified(&paths, &file).is_none());
+    assert!(format!("{:#}", checks::verify(&paths, &file).unwrap_err()).contains("live WAL"));
+    drop(conn);
 }
