@@ -11,8 +11,9 @@ fn setup(env: &crate::credential_env::EnvGuard) -> (Fixture, Paths, Arc<Daemon>,
     env.remove("FORMLESS_BASE_URL");
     env.remove("FORMLESS_MODEL");
     env.remove("FORMLESS_SECURE");
-    env.set("NO_PROXY", "*");
-    env.set("no_proxy", "*");
+    // hyper-util matches literal IPs against IP entries, not hostname wildcards.
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    env.set("no_proxy", "127.0.0.1,localhost");
     let root =
         Fixture(std::env::temp_dir().join(format!("fl-forecast-gate-{}", uuid::Uuid::new_v4())));
     let paths = Paths::from_dirs(root.0.join("data"), root.0.join("config")).unwrap();
