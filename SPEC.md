@@ -4257,6 +4257,13 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   Windows: each prefix traversed by `..` must resolve to an existing directory.
   Existing-directory parent traversal still resolves normally and remains
   subject to canonical containment.
+  Session-relative input localization and process-relative path resolution
+  preserve those literal traversal components before validation, even when
+  Windows supplies a verbatim canonical working directory. Ordinary relative
+  forward slashes are converted to native separators; rooted Windows paths
+  retain the working directory's drive or UNC share. Ambiguous drive-relative
+  paths (`C:notes.txt`) fail closed. A Session-relative path that cannot be
+  represented in UTF-8 JSON is an input error, never a lossy substitute path.
   If a missing path or ancestor becomes a regular file or directory during
   resolution, canonicalisation is retried once at that same path before
   appending any missing tail. Permission, symlink-loop and other resolution
