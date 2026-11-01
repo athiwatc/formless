@@ -139,9 +139,23 @@ jobs:
       - name: Record source, image and cold state
         shell: bash
         run: |
-          # Container UID can differ from checkout owner: trust this exact read
-          # only, without writing global/system Git configuration.
-          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
+          # Bullseye's Git 2.30.2 backport ignores command-scope safe.directory
+          # and GIT_CONFIG_GLOBAL. Use a private XDG global-scope fallback;
+          # newer Git also gets the same file via GIT_CONFIG_GLOBAL. Never
+          # replace HOME or write the user's/system Git configuration.
+          ci_git_context=$(mktemp -d "$RUNNER_TEMP/baseline-git-context.XXXXXX")
+          trap 'rm -rf -- "$ci_git_context"' EXIT
+          mkdir "$ci_git_context/git"
+          ci_git_config="$ci_git_context/git/config"
+          ci_git() {
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$ci_git_config" \
+              XDG_CONFIG_HOME="$ci_git_context" GIT_CEILING_DIRECTORIES="$ci_git_context" git "$@"
+          }
+          ci_git -C "$ci_git_context" config --file "$ci_git_config" safe.directory "$GITHUB_WORKSPACE"
+          # Older Git still reads HOME/.gitconfig: reject any ambient trust
+          # that broadens this exact exception; capture values without logging.
+          test "$(ci_git -C "$ci_git_context" config --get-all safe.directory)" = "$GITHUB_WORKSPACE"
+          test "$(ci_git rev-parse HEAD)" = "$GITHUB_SHA"
           ci_cargo_home="$RUNNER_TEMP/baseline-cargo"
           ci_target="$GITHUB_WORKSPACE/target"
           test ! -e "$ci_cargo_home"
