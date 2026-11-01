@@ -686,6 +686,7 @@ mod tests {
             "\nTool started: fetch."
         );
         let approval = Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a".into(),
             session_id: "s".into(),

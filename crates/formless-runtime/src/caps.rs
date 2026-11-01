@@ -520,7 +520,11 @@ fn canonical_host_scope(raw: &str) -> Result<String, String> {
         return Err(bad());
     }
     let url = reqwest::Url::parse(&format!("http://{raw}/")).map_err(|_| bad())?;
-    let host = url.host_str().ok_or_else(bad)?.trim_end_matches('.');
+    let host = url.host_str().ok_or_else(bad)?;
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.split('.').any(str::is_empty) {
+        return Err(bad());
+    }
     if wildcard
         && host
             .trim_matches(['[', ']'])
@@ -799,6 +803,10 @@ mod tests {
             "net:*.127.0.0.1",
             "net:*.[::1]",
             "net:*.*.example.com",
+            "net:.foo",
+            "net:.a.foo",
+            "net:a..foo",
+            "net:a.foo..",
         ] {
             assert!(Capabilities::parse(&[spec.into()]).is_err(), "{spec}");
         }

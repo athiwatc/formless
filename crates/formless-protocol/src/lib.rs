@@ -25,6 +25,7 @@ pub const FEATURES: &[&str] = &[
     "subscribe_filter",
     "ask_user",
     "approval_batches",
+    "approval_context",
     "unsupported_error",
     "dropped_event_kinds",
 ];
@@ -983,6 +984,39 @@ pub struct MemoryInfo {
     pub updated_at: String,
     /// When a Session's prompt last included it.
     pub last_used: Option<String>,
+}
+
+/// Bounded, display-only call evidence. It does not alter execution arguments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalCallPreview {
+    pub arguments: serde_json::Value,
+    pub urls: Vec<ApprovalUrlPreview>,
+    pub paths: Vec<String>,
+    pub truncated: bool,
+    pub note: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalUrlPreview {
+    pub field: String,
+    pub url: String,
+    pub method: Option<String>,
+    pub body_bytes: Option<u64>,
+    pub body_preview: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalSource {
+    pub tool: String,
+    pub kind: String,
+    pub origin: String,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalContext {
+    pub run_id: Option<String>,
+    pub call: Option<ApprovalCallPreview>,
+    #[serde(default)]
+    pub sources: Vec<ApprovalSource>,
+    #[serde(default)]
+    pub scope_warnings: Vec<String>,
 }
 
 /// A bounded single-line third-party description and its review warnings.
@@ -2530,6 +2564,9 @@ pub enum Event {
         by: Option<String>,
     },
     ApprovalRequested {
+        /// Additive resolved-call/source evidence, also retained for reconnect.
+        #[serde(default)]
+        context: Option<ApprovalContext>,
         approval_id: String,
         session_id: String,
         tool_name: String,
@@ -2969,6 +3006,7 @@ mod tests {
     #[test]
     fn event_session_id_scopes_session_events() {
         let ev = Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a".into(),
             session_id: "s1".into(),

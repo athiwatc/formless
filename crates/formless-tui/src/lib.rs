@@ -557,6 +557,7 @@ impl OpenQuestion {
 
 #[derive(Clone)]
 struct ApprovalReq {
+    context: Option<formless_protocol::ApprovalContext>,
     approval_id: String,
     tool_name: String,
     version: i64,
@@ -5056,6 +5057,7 @@ impl App {
                 }
             }
             Event::ApprovalRequested {
+                context,
                 session_id,
                 approval_id,
                 tool_name,
@@ -5083,6 +5085,7 @@ impl App {
                     self.set_activity("awaiting your approval");
                 }
                 self.approvals.push_back(ApprovalReq {
+                    context,
                     approval_id,
                     tool_name,
                     version,
@@ -5192,6 +5195,7 @@ impl App {
             } => {
                 self.set_activity("awaiting your approval");
                 self.promotions.push_back(ApprovalReq {
+                    context: None,
                     approval_id: promotion_id,
                     tool_name: format!("{tool_name} (promotion: {reason})"),
                     version: 0,
@@ -8014,6 +8018,7 @@ impl App {
                     }
                     // A non-Tool approval (an MCP call): its whole detail.
                     Some(ApprovalReq {
+                        context: None,
                         detail: Some(detail),
                         tool_name,
                         ..
@@ -16823,6 +16828,7 @@ mod tests {
 
     fn reconnect_approval(id: &str, session: &str) -> Event {
         Event::ApprovalRequested {
+            context: None,
             session_id: session.into(),
             approval_id: id.into(),
             tool_name: "tool".into(),
@@ -17886,6 +17892,7 @@ mod tests {
         assert_eq!(app.live_tools[0].elapsed_ms, Some(42));
 
         app.on_event(Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s1".into(),
@@ -18796,6 +18803,7 @@ mod tests {
     fn approval_modal_always_shows_its_keys() {
         let mut app = test_app();
         app.approvals.push_back(ApprovalReq {
+            context: None,
             approval_id: "a".into(),
             tool_name: "page_title".into(),
             version: 1,
@@ -18821,6 +18829,7 @@ mod tests {
         let mut app = test_app();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         app.on_event(Event::ApprovalRequested {
+            context: None,
             approval_id: "m".into(),
             session_id: "s".into(),
             tool_name: "mcp server github".into(),
@@ -18863,6 +18872,7 @@ mod tests {
             ],
         };
         app.on_event(Event::ApprovalRequested {
+            context: None,
             approval_id: "b".into(),
             session_id: "s".into(),
             tool_name: "writer".into(),
@@ -18905,6 +18915,7 @@ mod tests {
             label: label.into(),
         };
         app.on_event(Event::ApprovalRequested {
+            context: None,
             approval_id: "a".into(),
             session_id: "s".into(),
             tool_name: "writer".into(),
@@ -18954,6 +18965,7 @@ mod tests {
             "more\n".repeat(30)
         );
         let req = ApprovalReq {
+            context: None,
             approval_id: "a".into(),
             tool_name: "mcp__composio__COMPOSIO_REMOTE_WORKBENCH".into(),
             version: 0,
@@ -19023,6 +19035,7 @@ mod tests {
             }
         }
         app.approvals.push_back(ApprovalReq {
+            context: None,
             approval_id: "a".into(),
             tool_name: "t".into(),
             version: 1,
@@ -19282,6 +19295,7 @@ mod tests {
         };
         // Focused: nothing.
         app.on_event(Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             session_id: "s".into(),
             approval_id: "a".into(),
@@ -19496,6 +19510,7 @@ mod tests {
             .enumerate()
         {
             app.on_event(Event::ApprovalRequested {
+                context: None,
                 path_options: Default::default(),
                 approval_id: id.to_string(),
                 session_id: "s".into(),
@@ -19537,6 +19552,7 @@ mod tests {
     fn approvals_show_the_ai_summary_when_it_arrives() {
         let mut app = test_app();
         app.on_event(Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s".into(),
@@ -19576,6 +19592,7 @@ mod tests {
         );
         // `1` approves for an hour.
         app.on_event(Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a2".into(),
             session_id: "s".into(),
@@ -19615,6 +19632,7 @@ mod tests {
             instructions: None,
         }];
         app.on_event(Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s".into(),
@@ -19640,6 +19658,7 @@ mod tests {
     fn broad_grants_take_a_second_press() {
         let mut app = test_app();
         app.on_event(Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s".into(),
@@ -20414,6 +20433,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         app.approvals.push_back(ApprovalReq {
+            context: None,
             approval_id: "a".into(),
             tool_name: "fetch_page".into(),
             version: 1,
@@ -20451,6 +20471,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         app.approvals.push_back(ApprovalReq {
+            context: None,
             approval_id: "a".into(),
             tool_name: "save_report".into(),
             version: 3,
@@ -21200,6 +21221,7 @@ mod tests {
         assert!(render(&mut app, 100, 20).contains("sent from web"));
         // An approval answered in the web closes here.
         app.on_event(Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a1".into(),
             session_id: "s1".into(),
@@ -21917,6 +21939,7 @@ mod tests {
         app.slash("approve");
         assert!(app.notes.last().unwrap().contains("no approvals waiting"));
         app.approvals.push_back(ApprovalReq {
+            context: None,
             approval_id: "a".into(),
             tool_name: "fetch_page".into(),
             version: 1,

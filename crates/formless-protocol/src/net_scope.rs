@@ -4,14 +4,19 @@ use std::{collections::HashSet, sync::OnceLock};
 /// Inputs are already canonical host names, with ports separated by the caller.
 /// A wildcard covers proper child labels; it never includes the apex itself.
 pub fn host_covers(granted: &str, requested: &str) -> bool {
-    let granted = granted
-        .trim_matches(['[', ']'])
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    let requested = requested
-        .trim_matches(['[', ']'])
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let normalize = |host: &str| {
+        let host = host.trim_matches(['[', ']']);
+        host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+    };
+    let granted = normalize(granted);
+    let requested = normalize(requested);
+    let valid = |host: &str| {
+        let host = host.strip_prefix("*.").unwrap_or(host);
+        !host.is_empty() && !host.split('.').any(str::is_empty)
+    };
+    if !valid(&granted) || !valid(&requested) {
+        return false;
+    }
     match (granted.strip_prefix("*."), requested.strip_prefix("*.")) {
         (None, None) => granted == requested,
         (Some(base), None) => requested.ends_with(&format!(".{base}")),
@@ -138,6 +143,9 @@ mod tests {
         assert!(!host_covers("sub.example.com", "*.sub.example.com"));
         assert!(!host_covers("*.sub.example.com", "*.example.com"));
         assert!(host_covers("[::1]", "::1"));
+        for bad in [".foo", ".a.foo", "a..foo", "a.foo..", ""] {
+            assert!(!host_covers("*.foo", bad), "{bad}");
+        }
     }
     #[test]
     fn full_offline_psl_includes_private_wildcard_exception_and_idna_rules() {

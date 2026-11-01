@@ -207,12 +207,14 @@ pub struct Provider {
     on_usage: Option<UsageHook>,
     on_prompt: Option<PromptHook>,
     on_request: Option<RequestHook>,
+    on_input: Option<InputHook>,
     /// The configured provider's name (`default` or a `[providers.<name>]`
     /// key), for pricing usage from its own table (#810).
     name: String,
 }
 
 pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
+pub type InputHook = Arc<dyn Fn(&Value) + Send + Sync>;
 pub type PromptHook = Arc<dyn Fn(&str, &str, usize, u64) + Send + Sync>;
 pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) -> Result<()> + Send + Sync>;
 /// A local persistence failure is not evidence that the serving model failed.
@@ -1124,6 +1126,7 @@ impl Provider {
             on_usage: None,
             on_prompt: None,
             on_request: None,
+            on_input: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
@@ -1148,6 +1151,7 @@ impl Provider {
             on_usage: None,
             on_prompt: None,
             on_request: None,
+            on_input: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         }
@@ -1201,6 +1205,7 @@ impl Provider {
             on_usage: None,
             on_prompt: None,
             on_request: None,
+            on_input: None,
             name: name.to_string(),
             http,
         })
@@ -1300,6 +1305,13 @@ impl Provider {
     /// usage).
     pub fn with_usage_hook(mut self, hook: UsageHook) -> Self {
         self.on_usage = Some(hook);
+        self
+    }
+
+    /// Observe only bodies accepted by an actual successful provider response,
+    /// including attempts whose stream later fails. No payload is retained.
+    pub fn with_input_hook(mut self, hook: InputHook) -> Self {
+        self.on_input = Some(hook);
         self
     }
 
@@ -1895,6 +1907,9 @@ impl Provider {
                         note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
                             permit.accounting = Some(self.request_accounting(model, lease, &b));
+                            if let Some(hook) = &self.on_input {
+                                hook(&b);
+                            }
                             return Ok((resp, recovered, model.clone(), permit));
                         }
                         server_wait = retry_after(resp.headers());
@@ -2771,6 +2786,9 @@ impl Provider {
                 ));
             }
             permit.accounting = Some(self.request_accounting(model, lease, &Value::Null));
+            if let Some(hook) = &self.on_input {
+                hook(&body);
+            }
             break (resp, permit);
         };
         let v = completed_json(resp, permit, "parse /compact").await?;
