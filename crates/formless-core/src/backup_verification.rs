@@ -32,7 +32,7 @@ impl PrivateDir {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(&path)?;
+        builder.recursive(false).create(&path)?;
         Ok(Self(path))
     }
 }

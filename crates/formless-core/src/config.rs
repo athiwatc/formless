@@ -2024,12 +2024,16 @@ pub fn reset_all_guarded(
             std::fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
         }
     }
-    // A long data path's socket lives elsewhere (SPEC §9.1).
-    let sock = paths.socket_path();
-    if sock.parent() != Some(paths.data_dir.as_path()) {
-        let _ = std::fs::remove_file(&sock);
-        if let Some(dir) = sock.parent() {
-            let _ = std::fs::remove_dir(dir); // only when empty
+    // Unix sockets for long data paths live elsewhere (SPEC §9.1).
+    // Windows named pipes have no filesystem entry to remove.
+    #[cfg(unix)]
+    {
+        let sock = paths.socket_path();
+        if sock.parent() != Some(paths.data_dir.as_path()) {
+            let _ = std::fs::remove_file(&sock);
+            if let Some(dir) = sock.parent() {
+                let _ = std::fs::remove_dir(dir); // only when empty
+            }
         }
     }
     Ok(warnings)
