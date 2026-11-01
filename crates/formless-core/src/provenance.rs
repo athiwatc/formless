@@ -129,11 +129,18 @@ pub fn project(messages: &[Value]) -> Vec<Value> {
             object.insert("content".into(), json!(frame(&name, &[], &content)));
         }
         if object.get("role").and_then(Value::as_str) == Some("system") && !system {
-            let prompt = object
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            object.insert("content".into(), json!(mandatory_system(prompt)));
+            let content = object.entry("content").or_insert(Value::Null);
+            if let Some(blocks) = content.as_array_mut() {
+                let already = blocks
+                    .first()
+                    .and_then(|block| block["text"].as_str())
+                    .is_some_and(|text| text.starts_with(HIERARCHY));
+                if !already {
+                    blocks.insert(0, json!({"type":"text","text":HIERARCHY}));
+                }
+            } else {
+                *content = json!(mandatory_system(content.as_str().unwrap_or_default()));
+            }
             system = true;
         }
         output.push(message);

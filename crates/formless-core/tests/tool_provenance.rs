@@ -2,7 +2,7 @@
 //! injection resistance. Every endpoint and credential-shaped file is private.
 #[path = "support/env.rs"]
 mod credential_env;
-use formless_core::{provenance, Config, Daemon, Paths, Store};
+use formless_core::{daemon::Daemon, provenance, Config, Paths, Store};
 use formless_protocol::{Request, SendMode};
 use formless_runtime::Capabilities;
 use serde_json::{json, Value};
@@ -601,12 +601,20 @@ async fn nested_models_receive_tool_data_without_system_authority_and_keep_raw_r
         "function run(i){return fs.read(i.path);}",
         &["fs:read:$input.path"],
     );
-    tool(&st,"delegate","async function run(i){const data=await tools.call('read_project',i);const a=agents.run('summarize the project',{system:data});const b=llm.complete(data,{system:data});return {a,b};}",&["agent","llm"]);
+    tool(&st,"delegate","async function run(i){const data=await tools.call('read_project',i);const a=agents.run('summarize the project',{system:data});const b=llm.complete(data,{system:data,role:'private-role'});return {a,b};}",&["agent","llm"]);
     let captured: Arc<Mutex<Vec<Value>>> = Arc::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut cfg = Config::default();
     cfg.provider.base_url = format!("http://{}", listener.local_addr().unwrap());
     cfg.provider.model = "fixture".into();
+    cfg.roles.insert(
+        "private-role".into(),
+        formless_core::config::RoleCfg {
+            model: "fixture".into(),
+            system: Some("Trusted private Role instruction".into()),
+            ..Default::default()
+        },
+    );
     cfg.provider.max_retries = 0;
     cfg.naming.enabled = false;
     cfg.skills.auto_create = false;
@@ -655,6 +663,15 @@ async fn nested_models_receive_tool_data_without_system_authority_and_keep_raw_r
                     .is_ok_and(|v| v["source_tool"] == "delegate" && v["content"] == payload)
             ));
     }
+    assert!(requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "system"
+            && m["content"]
+                .as_str()
+                .unwrap()
+                .contains("Trusted private Role instruction")));
     let child_result: Value = serde_json::from_str(&contents(&requests[1], "chat")[0]).unwrap();
     assert_eq!(child_result["source_tool"], "read_project");
     assert_eq!(child_result["content"], payload);

@@ -2677,7 +2677,15 @@ impl Provider {
     /// Server-side compaction (SPEC §11): POST {base_url}/compact with
     /// {model, input}; accepts {summary}|{output}|{content} responses.
     pub async fn compact_server(&self, text: &str, model: &str) -> Result<String> {
-        let body = json!({"model": model, "input": text});
+        // /compact accepts text rather than role messages. Keep its existing
+        // wire schema while explicitly separating summarizer instructions
+        // from the entire untrusted history (including legacy callers).
+        let input = format!(
+            "{}\n\n{}",
+            crate::provenance::mandatory_system(SUMMARIZE_PROMPT),
+            crate::provenance::frame("conversation_history", &[], text)
+        );
+        let body = json!({"model": model, "input": input});
         let mut auth = AuthRecovery::default();
         let (resp, permit) = loop {
             // Admission belongs to each physical attempt; OAuth recovery state
@@ -2748,7 +2756,7 @@ impl Provider {
             .complete_full(
                 &[
                     json!({"role": "system", "content": SUMMARIZE_PROMPT}),
-                    json!({"role": "user", "content": text}),
+                    json!({"role": "user", "content": crate::provenance::frame("conversation_history", &[], text)}),
                 ],
                 model,
                 None,
@@ -2771,8 +2779,12 @@ fn with_prompt_tools(messages: &[Value], tools: &[Value]) -> Vec<Value> {
     let mut msgs = messages.to_vec();
     match msgs.first_mut() {
         Some(first) if first["role"].as_str() == Some("system") => {
-            let cur = first["content"].as_str().unwrap_or_default().to_string();
-            first["content"] = json!(format!("{cur}{instr}"));
+            if let Some(blocks) = first["content"].as_array_mut() {
+                blocks.push(json!({"type":"text","text":instr.trim_start()}));
+            } else {
+                let cur = first["content"].as_str().unwrap_or_default().to_string();
+                first["content"] = json!(format!("{cur}{instr}"));
+            }
         }
         _ => msgs.insert(0, json!({"role": "system", "content": instr.trim_start()})),
     }

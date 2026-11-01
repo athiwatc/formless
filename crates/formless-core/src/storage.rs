@@ -4,7 +4,7 @@ use formless_protocol::{
     TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -2771,6 +2771,22 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok())
+    }
+
+    /// Recorded handle visible only within its owning Session.
+    pub fn session_pending_handle(
+        &self,
+        session: &str,
+        handle: &str,
+    ) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tool_name,status FROM pending_handles WHERE handle=?1 AND session_id=?2",
+                params![handle, session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// On daemon startup: every handle still pending lost its in-memory
@@ -6017,7 +6033,10 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         let origins: Vec<crate::provenance::Origin> =
             serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
         let mut msg = crate::provenance::framed_tool(
-            meta["name"].as_str().unwrap_or("unknown"),
+            meta["data_source_tool"]
+                .as_str()
+                .or_else(|| meta["name"].as_str())
+                .unwrap_or("unknown"),
             &origins,
             &m.content,
         );

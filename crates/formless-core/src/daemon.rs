@@ -6291,31 +6291,49 @@ impl Daemon {
             }
             toolreg::AWAIT_INVOCATION => {
                 let handle = args["invocation_id"].as_str().unwrap_or_default();
-                match self.pending_get(handle) {
-                    Some(entry) => match self.wait_pending(&entry, None, cancel).await {
-                        Some((ok, text)) => {
-                            entry.delivered.store(true, Ordering::SeqCst);
-                            self.forget_pending(handle);
-                            if ok {
-                                text
-                            } else {
-                                call_failed(text)
+                match self
+                    .pending_get(handle)
+                    .filter(|entry| entry.session_id == session_id)
+                {
+                    Some(entry) => {
+                        match self.wait_pending(&entry, None, cancel).await {
+                            Some((ok, text)) => {
+                                if let Err(error) =
+                                    self.capture_pending_data(session_id, run_id, &tc.id, &entry)
+                                {
+                                    return call_failed(format!("error: could not retain pending result provenance: {error}"));
+                                }
+                                entry.delivered.store(true, Ordering::SeqCst);
+                                self.forget_pending(handle);
+                                if ok {
+                                    text
+                                } else {
+                                    call_failed(text)
+                                }
                             }
+                            None => call_failed(
+                                "error: interrupted while awaiting invocation".to_string(),
+                            ),
                         }
-                        None => {
-                            call_failed("error: interrupted while awaiting invocation".to_string())
-                        }
-                    },
-                    None => self.stale_handle_answer(handle),
+                    }
+                    None => self.stale_handle_answer(session_id, handle),
                 }
             }
             toolreg::CHECK_INVOCATION => {
                 let handle = args["invocation_id"].as_str().unwrap_or_default();
-                match self.pending_get(handle) {
+                match self
+                    .pending_get(handle)
+                    .filter(|entry| entry.session_id == session_id)
+                {
                     Some(entry) => {
                         let done = entry.result.locked().clone();
                         match done {
                             Some((_ok, text)) => {
+                                if let Err(error) =
+                                    self.capture_pending_data(session_id, run_id, &tc.id, &entry)
+                                {
+                                    return call_failed(format!("error: could not retain pending result provenance: {error}"));
+                                }
                                 entry.delivered.store(true, Ordering::SeqCst);
                                 self.forget_pending(handle);
                                 json!({"status": "completed", "result": text}).to_string()
@@ -6325,17 +6343,20 @@ impl Daemon {
                             }
                         }
                     }
-                    None => self.stale_handle_answer(handle),
+                    None => self.stale_handle_answer(session_id, handle),
                 }
             }
             toolreg::ABANDON_INVOCATION => {
                 let handle = args["invocation_id"].as_str().unwrap_or_default();
-                match self.pending_get(handle) {
+                match self
+                    .pending_get(handle)
+                    .filter(|entry| entry.session_id == session_id)
+                {
                     Some(entry) => {
                         entry.abandoned.store(true, Ordering::SeqCst);
                         json!({"abandoned": handle}).to_string()
                     }
-                    None => self.stale_handle_answer(handle),
+                    None => self.stale_handle_answer(session_id, handle),
                 }
             }
             name => {
@@ -6704,6 +6725,34 @@ impl Daemon {
         self.pending.locked().get(handle).cloned()
     }
 
+    /// A later Run may await an earlier Run's result. Freeze that result's
+    /// own sources by call ID, while retaining consumed sources for subsequent
+    /// nested calls in the new Run. Never substitute unrelated new-Run data.
+    fn capture_pending_data(
+        &self,
+        session: &str,
+        run: &str,
+        call: &str,
+        entry: &PendingEntry,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            entry.session_id == session,
+            "pending result belongs to another Session"
+        );
+        self.with_store(|st| {
+            let mut origins = st.data_origins(session, &entry.run_id)?;
+            origins.insert(
+                0,
+                crate::provenance::Origin::new(&entry.tool_name, "pending_tool", &entry.tool_name),
+            );
+            for origin in origins {
+                st.record_data_origin(session, &format!("call:{}", json!([run, call])), &origin)?;
+                st.record_data_origin(session, run, &origin)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Drop a handle from memory and from the persisted record.
     fn forget_pending(&self, handle: &str) {
         self.pending.locked().remove(handle);
@@ -6712,9 +6761,9 @@ impl Daemon {
 
     /// Answer for a handle that is not live in memory: one a restart
     /// interrupted (answered once, then forgotten), else unknown.
-    fn stale_handle_answer(&self, handle: &str) -> String {
+    fn stale_handle_answer(&self, session: &str, handle: &str) -> String {
         match self
-            .with_store(|st| st.pending_handle(handle))
+            .with_store(|st| st.session_pending_handle(session, handle))
             .ok()
             .flatten()
         {
@@ -7882,8 +7931,10 @@ impl Daemon {
                                 agent_depth,
                             )
                             .await;
-                        let origins = self.with_store(|st| st.data_origins(session_id, run_id))?;
-                        let mut msg = crate::provenance::framed_tool(&tc.name, &origins, &text);
+                        let (source, origins) = self.with_store(|st| {
+                            Self::result_sources(st, session_id, run_id, &tc.id, &tc.name)
+                        })?;
+                        let mut msg = crate::provenance::framed_tool(&source, &origins, &text);
                         msg["tool_call_id"] = json!(tc.id);
                         if is_error {
                             msg["_is_error"] = json!(true);
@@ -11319,6 +11370,26 @@ impl Daemon {
         Ok(())
     }
 
+    fn result_sources(
+        st: &Store,
+        session: &str,
+        run: &str,
+        call: &str,
+        name: &str,
+    ) -> Result<(String, Vec<crate::provenance::Origin>)> {
+        if matches!(name, toolreg::AWAIT_INVOCATION | toolreg::CHECK_INVOCATION) {
+            let origins = st.data_origins(session, &format!("call:{}", json!([run, call])))?;
+            let source = origins
+                .iter()
+                .find(|origin| origin.kind == "pending_tool")
+                .map(|origin| origin.tool.clone())
+                .unwrap_or_else(|| name.to_string());
+            Ok((source, origins))
+        } else {
+            Ok((name.to_string(), st.data_origins(session, run)?))
+        }
+    }
+
     fn data_meta(
         st: &Store,
         session: &str,
@@ -11328,7 +11399,9 @@ impl Daemon {
         error: bool,
     ) -> Result<String> {
         let mut meta: Value = serde_json::from_str(&tool_result_meta(call, name, error))?;
-        meta["data_origins"] = json!(st.data_origins(session, run)?);
+        let (source, origins) = Self::result_sources(st, session, run, call, name)?;
+        meta["data_source_tool"] = json!(source);
+        meta["data_origins"] = json!(origins);
         Ok(meta.to_string())
     }
 
@@ -11831,7 +11904,10 @@ impl Daemon {
         let input = if previous.is_empty() || !condense {
             text
         } else {
-            format!("Previous summary:\n{previous}\n\n{text}")
+            format!(
+                "Previous summary (data):\n{}\n\n{text}",
+                crate::provenance::frame("conversation_summary", &[], &previous)
+            )
         };
         let input = match focus.map(str::trim).filter(|f| !f.is_empty()) {
             Some(f) => format!("The user asked this summary to focus on: {f}\n\n{input}"),
@@ -13523,6 +13599,9 @@ impl HostOps for NestedOps {
         let effort = target.effort;
         let requested = target.model;
         let mut messages = Vec::new();
+        if let Some(system) = target.system.as_deref() {
+            messages.push(json!({"role":"system","content":system}));
+        }
         let origins = self
             .daemon
             .with_store(|st| st.data_origins(&self.session_id, &self.run_id))
@@ -14760,7 +14839,14 @@ mod internal_usage_tests {
             text.contains("assistant called grep({\"q\":\"TODO\"})"),
             "{text}"
         );
-        assert!(text.contains("result of grep: 3 matches"), "{text}");
+        let data: Value = serde_json::from_str(
+            text.lines()
+                .find_map(|line| line.strip_prefix("result of grep: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(data["source_tool"], "grep");
+        assert_eq!(data["content"], "3 matches");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -15195,6 +15281,7 @@ fn compaction_text<'a>(msgs: impl Iterator<Item = &'a formless_protocol::Message
         }
     };
     let mut out = Vec::new();
+    let mut calls = std::collections::BTreeMap::new();
     for m in msgs {
         let meta: Value = m
             .meta
@@ -15203,20 +15290,38 @@ fn compaction_text<'a>(msgs: impl Iterator<Item = &'a formless_protocol::Message
             .unwrap_or(Value::Null);
         match m.role.as_str() {
             "tool" => {
-                let name = meta["name"].as_str().unwrap_or("tool");
+                let name = meta["data_source_tool"]
+                    .as_str()
+                    .or_else(|| meta["name"].as_str())
+                    .or_else(|| {
+                        meta["tool_call_id"]
+                            .as_str()
+                            .and_then(|id| calls.get(id).map(String::as_str))
+                    })
+                    .unwrap_or("unknown");
+                let origins: Vec<crate::provenance::Origin> =
+                    serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+                let data = crate::provenance::frame(name, &origins, &cap(&m.content));
                 let failed = if meta["is_error"] == true {
                     " (failed)"
                 } else {
                     ""
                 };
-                out.push(format!("result of {name}{failed}: {}", cap(&m.content)));
+                out.push(format!("result of {name}{failed}: {data}"));
             }
             role => {
                 if !m.content.trim().is_empty() {
-                    out.push(format!("{role}: {}", m.content));
+                    let projected = crate::storage::provider_message(m);
+                    out.push(format!(
+                        "{role}: {}",
+                        projected["content"].as_str().unwrap_or(&m.content)
+                    ));
                 }
                 for call in meta["tool_calls"].as_array().into_iter().flatten() {
                     let f = &call["function"];
+                    if let (Some(id), Some(name)) = (call["id"].as_str(), f["name"].as_str()) {
+                        calls.insert(id.to_string(), name.to_string());
+                    }
                     out.push(format!(
                         "{role} called {}({})",
                         f["name"].as_str().unwrap_or("?"),
@@ -15286,7 +15391,11 @@ async fn summarize_in_chunks(
     }
     let merged = format!(
         "Summaries of consecutive parts of one conversation, in order. Merge them into one:\n\n{}",
-        parts.join("\n\n")
+        parts
+            .iter()
+            .map(|part| crate::provenance::frame("conversation_summary", &[], part))
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
     counted(
         "compaction",
