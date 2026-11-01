@@ -4505,7 +4505,7 @@ impl Daemon {
         )?
         .0;
         let ctx = provider.prepare_attachments(&ctx, &forecast.basis.model);
-        let checkpoint = crate::forecast::hash(&st.latest_checkpoint(session_id)?);
+        let checkpoint = crate::forecast::hash(&st.latest_checkpoint_record(session_id)?);
         Ok(Arc::new(RunAdmission {
             cfg: fixed,
             requested,
@@ -5423,7 +5423,7 @@ impl Daemon {
 
         if let Some((_, _, checkpoint)) = &first {
             if self
-                .with_reader(|st| Ok(crate::forecast::hash(&st.latest_checkpoint(session_id)?)))?
+                .with_reader(|st| Ok(crate::forecast::hash(&st.latest_checkpoint_record(session_id)?)))?
                 != *checkpoint
             {
                 first = None;
