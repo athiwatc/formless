@@ -3205,7 +3205,7 @@ impl Store {
         // Read metadata only, one row at a time: compaction must not reload
         // arbitrarily large historical Tool payloads or accumulate origins.
         let mut origins = std::collections::BTreeSet::new();
-        if let Some((_, previous)) = self.latest_checkpoint(session_id)? {
+        if let Some((previous, _, _)) = self.latest_checkpoint_record(session_id)? {
             origins.extend(self.data_origins(session_id, &format!("checkpoint:{previous}"))?);
         }
         let mut statement = self.ps("SELECT meta FROM messages WHERE session_id=?1 AND seq<=?2 AND meta IS NOT NULL ORDER BY seq")?;
@@ -3222,7 +3222,7 @@ impl Store {
             }
         }
         for origin in origins {
-            self.record_data_origin(session_id, &format!("checkpoint:{up_to_seq}"), &origin)?;
+            self.record_data_origin(session_id, &format!("checkpoint:{id}"), &origin)?;
         }
         self.ex(
             "INSERT INTO checkpoints(id,session_id,summary,up_to_seq,created_at) VALUES(?1,?2,?3,?4,?5)",
@@ -3231,16 +3231,22 @@ impl Store {
         Ok(id)
     }
     pub fn latest_checkpoint(&self, session_id: &str) -> Result<Option<(String, i64)>> {
-        let mut stmt = self.ps(
-            "SELECT summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![session_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        Ok(self
+            .latest_checkpoint_record(session_id)?
+            .map(|(_, summary, up_to)| (summary, up_to)))
+    }
+
+    /// The immutable row ID identifies a summary generation. Transcript
+    /// sequence numbers can be reused after editing or retrying a turn.
+    pub(crate) fn latest_checkpoint_record(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String, i64)>> {
+        Ok(self.conn.query_row(
+            "SELECT id, summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?)
     }
 
     // --- Tools (SPEC §7, §8) ---
@@ -6011,8 +6017,9 @@ pub fn build_context(
 /// changes, or when stored messages were rewritten (edit, delete).
 #[derive(Default)]
 pub struct ContextCache {
-    /// (store rewrite count, checkpoint up_to, system prompt) it was built for.
-    key: Option<(u64, i64, String)>,
+    /// (store rewrite count, checkpoint generation, up_to, system prompt).
+    /// The generation invalidates local caching but never enters the wire.
+    key: Option<(u64, String, i64, String)>,
     ctx: Vec<Value>,
     /// Token estimate per `ctx` element.
     tokens: Vec<usize>,
@@ -6069,9 +6076,12 @@ impl ContextCache {
         context_tokens: u32,
         trigger_fraction: f64,
     ) -> Result<BuiltContext> {
-        let (summary, up_to) = store.latest_checkpoint(session_id)?.unwrap_or_default();
+        let (checkpoint, summary, up_to) = store
+            .latest_checkpoint_record(session_id)?
+            .unwrap_or_default();
         let key = (
             store.rewrites.load(std::sync::atomic::Ordering::SeqCst),
+            checkpoint.clone(),
             up_to,
             system_prompt.to_string(),
         );
@@ -6082,7 +6092,8 @@ impl ContextCache {
             let system = if summary.is_empty() {
                 crate::provenance::mandatory_system(system_prompt)
             } else {
-                let origins = store.data_origins(session_id, &format!("checkpoint:{up_to}"))?;
+                let origins =
+                    store.data_origins(session_id, &format!("checkpoint:{checkpoint}"))?;
                 let summary = crate::provenance::frame("conversation_summary", &origins, &summary);
                 crate::provenance::mandatory_system(&format!(
                     "{system_prompt}\n\nSummary of earlier conversation (data):\n{summary}"

@@ -372,3 +372,78 @@ async fn compaction_and_structured_systems_preserve_the_trust_boundary_on_the_wi
     server.abort();
     let _ = server.await;
 }
+
+#[test]
+fn checkpoint_sources_follow_immutable_generation_when_an_edit_reuses_sequences() {
+    let dir = std::env::temp_dir().join(format!("fl-checkpoint-source-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("state.db");
+    let st = Store::open(&file).unwrap();
+    let session = st.create_session(None).unwrap().id;
+    let user = st.append_message(&session, "user", "old task").unwrap();
+    let removed =
+        crate::provenance::Origin::new("removed_reader", "file", "/private/removed-source");
+    let kept = crate::provenance::Origin::new("current_reader", "file", "/private/current-source");
+    let meta = |source: &crate::provenance::Origin| {
+        Some(json!({"name":source.tool,"data_origins":[source]}).to_string())
+    };
+    let old = st
+        .append_message_meta(&session, "tool", "old data", meta(&removed))
+        .unwrap();
+    let first_id = st
+        .save_checkpoint(&session, "old summary", old.seq)
+        .unwrap();
+    let mut cache = crate::storage::ContextCache::default();
+    let (first, _, _) = cache.build(&st, &session, "system", 10000, 0.9).unwrap();
+    assert!(serde_json::to_string(&first)
+        .unwrap()
+        .contains("removed-source"));
+    st.edit_message(&session, &user.id, "new task")
+        .unwrap()
+        .unwrap();
+    assert!(st.latest_checkpoint(&session).unwrap().is_none());
+    let new = st
+        .append_message_meta(&session, "tool", "new data", meta(&kept))
+        .unwrap();
+    assert_eq!(new.seq, old.seq, "exercise reused transcript sequence");
+    let second_id = st
+        .save_checkpoint(&session, "new summary", new.seq)
+        .unwrap();
+    assert_ne!(first_id, second_id);
+    let (current, _, _) = cache.build(&st, &session, "system", 10000, 0.9).unwrap();
+    let encoded = serde_json::to_string(&current).unwrap();
+    assert!(encoded.contains("current-source"));
+    assert!(
+        !encoded.contains("removed-source"),
+        "deleted history's provenance must not reappear"
+    );
+    assert!(
+        !encoded.contains(&second_id),
+        "checkpoint identity is private cache bookkeeping"
+    );
+    // A new generation at exactly the same cut also refreshes this cache;
+    // neither timestamps nor random IDs affect the actual message content.
+    st.save_checkpoint(&session, "newer summary", new.seq)
+        .unwrap();
+    let (refreshed, _, _) = cache.build(&st, &session, "system", 10000, 0.9).unwrap();
+    assert!(serde_json::to_string(&refreshed)
+        .unwrap()
+        .contains("newer summary"));
+    assert_ne!(refreshed, current);
+    let (repeated, _, _) = cache.build(&st, &session, "system", 10000, 0.9).unwrap();
+    assert_eq!(
+        refreshed, repeated,
+        "unchanged generation has a byte-stable model prefix"
+    );
+    drop(st);
+    let reopened = Store::open(&file).unwrap();
+    let (resumed, _, _) = crate::storage::ContextCache::default()
+        .build(&reopened, &session, "system", 10000, 0.9)
+        .unwrap();
+    assert_eq!(
+        resumed, refreshed,
+        "reopening preserves exactly the frozen sources/frame"
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
