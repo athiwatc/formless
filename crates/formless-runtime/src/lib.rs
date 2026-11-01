@@ -85,6 +85,11 @@ pub trait HostOps: Send + Sync {
     /// to change `path` (each side of a rename): the daemon snapshots the
     /// file first so the Run's changes can be listed and reverted.
     fn file_changing(&self, _path: &std::path::Path) {}
+    /// Actual external data source, recorded by the daemon without payloads.
+    fn data_observed(&self, _kind: &str, _origin: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// `progress(fraction, label)` from a running Tool (SPEC §7.5).
     fn progress(&self, _fraction: Option<f64>, _label: &str) {}
     /// One non-streaming LLM completion via the daemon's provider.
@@ -1156,7 +1161,11 @@ impl State {
                 match self.mode {
                     HostMode::Smoke => Ok(self.stub(json!(""))),
                     HostMode::Replay => Err(denied("clipboard denied in replay")),
-                    HostMode::Live | HostMode::DryRun => Ok(json!(clipboard_read()?)),
+                    HostMode::Live | HostMode::DryRun => {
+                        let content = clipboard_read()?;
+                        self.ops.data_observed("clipboard", "clipboard")?;
+                        Ok(json!(content))
+                    }
                 }
             }
             "clipboard_write" => {
@@ -1832,6 +1841,9 @@ impl State {
             }
             Ok((meta, bytes))
         })?;
+        if let Some(url) = meta["url"].as_str() {
+            self.ops.data_observed("url", url)?;
+        }
         meta["body"] = encode(&bytes, enc);
         Ok(meta)
     }
@@ -1851,6 +1863,9 @@ impl State {
         let req = self.build_request(a, parsed, scope)?;
         let resp = self.cancellable(move || send_request(req))?;
         let mut meta = Self::response_meta(&resp);
+        if let Some(url) = meta["url"].as_str() {
+            self.ops.data_observed("url", url)?;
+        }
         let id = self.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
         self.streams.locked().insert(
             id,
@@ -2108,6 +2123,7 @@ impl State {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
+        self.ops.data_observed("process", cmd)?;
         let (stdout, cut_out) = stdout.join().unwrap_or_default();
         let (stderr, cut_err) = stderr.join().unwrap_or_default();
         if let Some(f) = feeder {
@@ -2162,6 +2178,10 @@ impl State {
         for r in fixed {
             let root = caps::canonical_path(r).unwrap_or_else(|_| PathBuf::from(r));
             if canonical.starts_with(&root) {
+                if !write {
+                    self.ops
+                        .data_observed("file", &canonical.to_string_lossy())?;
+                }
                 return Ok(canonical);
             }
         }

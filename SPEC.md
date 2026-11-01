@@ -4340,6 +4340,17 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
 
+Tool data has no instruction authority: system instructions outrank user
+instructions, and Tool/file/web/skill/module/sub-agent output is untrusted data.
+Conflicting instructions embedded in data are surfaced to the user, never obeyed.
+Every model-facing Tool result (including errors, deferred results and legacy
+transcripts) carries a stable source-Tool/provenance envelope. Raw Tool.run and
+direct-call values remain compatible. Actual data origins are bounded per Run
+and persisted without URL userinfo, query values, headers or payload contents.
+Compacted history remains data; summaries do not become new system instructions.
+This boundary is defense in depth, not proof of real-model injection resistance
+or an operating-system process sandbox.
+
 ## 16. Error handling and edge cases (normative)
 
 - **Endpoint unreachable mid-Run:** retries per §4.4, then Run pauses with
