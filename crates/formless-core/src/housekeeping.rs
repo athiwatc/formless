@@ -294,7 +294,17 @@ pub fn backup(paths: &Paths, store: &Store, keep: usize) -> Result<PathBuf> {
         .context("verify new backup before retention")?;
     let mut all = list_backups(paths);
     all.reverse(); // newest first
-    for old in all.iter().skip(keep.max(1)) {
+                   // Always retain this verified destination, including after clock rollback
+                   // or when an old file has a future timestamp in its name.
+    let mut others_kept = 0usize;
+    for old in &all {
+        if old == &dest {
+            continue;
+        }
+        if others_kept < keep.max(1) - 1 {
+            others_kept += 1;
+            continue;
+        }
         crate::backup_verification::remove_copy(paths, old)?;
         tracing::info!("pruned daily backup {}", old.display());
         store.audit(
@@ -356,6 +366,27 @@ pub fn last_backup(paths: &Paths) -> Option<(PathBuf, std::time::SystemTime)> {
 /// is checked first (a Formless database this build can open), and the
 /// current database is backed up next to it. Returns that backup.
 pub fn restore(paths: &Paths, file: &Path) -> Result<PathBuf> {
+    restore_report(paths, file).map(|outcome| outcome.saved)
+}
+
+#[derive(Debug)]
+pub struct RestoreReport {
+    pub saved: PathBuf,
+    /// A failed diagnostic never turns a completed atomic replacement into a
+    /// purported failed restore. The caller must surface the explicit warning.
+    pub references: std::result::Result<crate::restore_references::Report, String>,
+}
+
+impl RestoreReport {
+    pub fn warnings(&self) -> Vec<String> {
+        match &self.references {
+            Ok(report) => report.warnings(),
+            Err(error) => vec![format!("database restored, but file-reference check could not complete: {error}; file recovery is unverified")],
+        }
+    }
+}
+
+pub fn restore_report(paths: &Paths, file: &Path) -> Result<RestoreReport> {
     restore_with(paths, file, |stage, db| {
         std::fs::rename(stage, db).context("atomically replace the profile database")
     })
@@ -367,7 +398,18 @@ fn restore_with(
     paths: &Paths,
     file: &Path,
     replace: impl FnOnce(&Path, &Path) -> Result<()>,
-) -> Result<PathBuf> {
+) -> Result<RestoreReport> {
+    restore_with_check(paths, file, replace, crate::restore_references::inspect)
+}
+
+// The diagnostic boundary permits a deterministic post-commit failure without
+// malformed source schemas, environment hooks or weakening staged verification.
+fn restore_with_check(
+    paths: &Paths,
+    file: &Path,
+    replace: impl FnOnce(&Path, &Path) -> Result<()>,
+    inspect: impl FnOnce(&Path, &Paths) -> Result<crate::restore_references::Report>,
+) -> Result<RestoreReport> {
     let _gate = crate::profile_lock::ProfileLock::launcher(paths, std::time::Duration::ZERO)?;
     let _owner = crate::profile_lock::ProfileLock::owner(paths)?;
     if crate::daemon::endpoint_occupied(paths)? {
@@ -470,7 +512,13 @@ fn restore_with(
             saved.display()
         )
     })?;
-    Ok(saved)
+    // Both ownership guards remain held while checking the restored rows.
+    let references = inspect(&db, paths).map_err(|error| format!("{error:#}"));
+    let outcome = RestoreReport { saved, references };
+    for warning in outcome.warnings() {
+        tracing::warn!("{warning}");
+    }
+    Ok(outcome)
 }
 
 fn snapshot_into(conn: &rusqlite::Connection, path: &Path) -> Result<()> {
@@ -600,6 +648,162 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn seed_external_references(paths: &Paths, make_files: bool) -> Store {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let artifact = paths.data_dir.join("artifacts/output.txt");
+        store
+            .save_artifact(None, artifact.to_str().unwrap(), "preview", 6)
+            .unwrap();
+        if make_files {
+            std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+            std::fs::write(&artifact, "output").unwrap();
+        }
+        for version in [1, 2] {
+            let directory = paths.data_dir.join(format!("skills/example/v{version}"));
+            store
+                .add_skill_version(
+                    "example",
+                    "fixture skill",
+                    version,
+                    directory.to_str().unwrap(),
+                    "fixture",
+                    "user",
+                    false,
+                )
+                .unwrap();
+            if make_files {
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(directory.join("SKILL.md"), "# Example").unwrap();
+            }
+        }
+        let conn = rusqlite::Connection::open(paths.db_file()).unwrap();
+        conn.execute("UPDATE skills SET retired=1, enabled=0", [])
+            .unwrap();
+        drop(conn);
+        store
+    }
+
+    #[test]
+    fn fresh_restore_reports_missing_artifacts_and_all_skill_versions_without_deleting_rows() {
+        let (fixture, source) = Fixture::new();
+        let store = seed_external_references(&source, false);
+        let backup = fixture.0.join("backup.db");
+        store.backup_into(&backup).unwrap();
+        let expected_artifacts = store.list_artifacts().unwrap();
+        drop(store);
+        let target =
+            Paths::from_dirs(fixture.0.join("new-data"), fixture.0.join("new-config")).unwrap();
+        let outcome = restore_report(&target, &backup).unwrap();
+        let report = outcome.references.as_ref().unwrap();
+        assert_eq!(report.artifacts.total, 1);
+        assert_eq!(report.artifacts.missing, 1);
+        assert_eq!(report.artifacts.foreign, 1);
+        assert_eq!(
+            report.skill_versions.total, 2,
+            "old and current disabled/retired versions are both checked"
+        );
+        assert_eq!(report.skill_versions.missing, 2);
+        assert_eq!(report.skill_versions.foreign, 2);
+        assert_eq!(outcome.warnings().len(), 2);
+        let restored = Store::open(&target.db_file()).unwrap();
+        assert_eq!(
+            restored.list_artifacts().unwrap(),
+            expected_artifacts,
+            "missing rows and paths are recovery clues, not garbage"
+        );
+        let conn = rusqlite::Connection::open_with_flags(
+            target.db_file(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let versions: i64 = conn
+            .query_row("SELECT count(*) FROM skill_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(versions, 2);
+        drop(conn);
+        drop(restored);
+    }
+
+    #[test]
+    fn existing_source_files_are_foreign_to_a_fresh_restore_and_local_files_pass() {
+        let (fixture, source) = Fixture::new();
+        let store = seed_external_references(&source, true);
+        let backup = fixture.0.join("backup.db");
+        store.backup_into(&backup).unwrap();
+        drop(store);
+        let target =
+            Paths::from_dirs(fixture.0.join("new-data"), fixture.0.join("new-config")).unwrap();
+        let foreign = restore_report(&target, &backup).unwrap();
+        let report = foreign.references.as_ref().unwrap();
+        assert_eq!(report.artifacts.missing, 0);
+        assert_eq!(
+            report.artifacts.foreign, 1,
+            "existing old-profile files do not certify portability"
+        );
+        assert_eq!(report.skill_versions.missing, 0);
+        assert_eq!(report.skill_versions.foreign, 2);
+        assert_eq!(foreign.warnings().len(), 2);
+        let local = restore_report(&source, &backup).unwrap();
+        let report = local.references.as_ref().unwrap();
+        assert_eq!(report.artifacts.total, 1);
+        assert_eq!(report.skill_versions.total, 2);
+        assert!(!report.artifacts.has_issues() && !report.skill_versions.has_issues());
+        assert!(local.warnings().is_empty());
+        // A diagnostic alone is read-only, including database bytes and rows.
+        let before = std::fs::read(source.db_file()).unwrap();
+        assert_eq!(
+            crate::restore_references::inspect(&source.db_file(), &source).unwrap(),
+            *report
+        );
+        assert_eq!(std::fs::read(source.db_file()).unwrap(), before);
+        // An existing old-version directory is still incomplete without its
+        // manifest, even when the latest version remains readable.
+        std::fs::remove_file(source.data_dir.join("skills/example/v1/SKILL.md")).unwrap();
+        let incomplete = restore_report(&source, &backup).unwrap();
+        let report = incomplete.references.as_ref().unwrap();
+        assert_eq!(report.skill_versions.total, 2);
+        assert_eq!(report.skill_versions.missing, 1);
+        assert_eq!(report.skill_versions.foreign, 0);
+    }
+
+    #[test]
+    fn reference_diagnostic_failure_is_a_warning_after_a_committed_restore() {
+        let (fixture, target) = Fixture::new();
+        let original = Store::open(&target.db_file()).unwrap();
+        original.create_session(Some("old".into())).unwrap();
+        drop(original);
+        let source = fixture.0.join("source.db");
+        let store = Store::open(&source).unwrap();
+        store.create_session(Some("restored".into())).unwrap();
+        drop(store);
+        let outcome = restore_with_check(
+            &target,
+            &source,
+            |stage, db| {
+                std::fs::rename(stage, db)?;
+                Ok(())
+            },
+            |db, _| {
+                let committed = rusqlite::Connection::open_with_flags(
+                    db,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                let name: String =
+                    committed.query_row("SELECT name FROM sessions", [], |row| row.get(0))?;
+                assert_eq!(name, "restored", "injection runs only after commit");
+                Err(anyhow!("injected reference diagnostic unavailable"))
+            },
+        )
+        .unwrap();
+        assert!(outcome.references.is_err());
+        assert!(outcome.warnings()[0]
+            .contains("database restored, but file-reference check could not complete"));
+        assert!(outcome.saved.is_file());
+        let restored = Store::open(&target.db_file()).unwrap();
+        assert_eq!(restored.list_sessions().unwrap()[0].name, "restored");
+        drop(restored);
     }
 
     #[test]

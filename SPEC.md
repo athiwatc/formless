@@ -2558,7 +2558,13 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
 - **Backups.** The daemon copies the database (`VACUUM INTO`, consistent
   under WAL) to `<data>/backups/formless-<UTC time>.db` when the newest is
   a day old (checked hourly), keeping `daemon.backups_keep` (7; 0 = none).
-  `formless backup` / `Backup` / TUI `/backup` take one now. `formless
+  `formless backup` / `Backup` / TUI `/backup` take one now. These are
+  **database-only** snapshots: copy `artifacts/` and `skills/` separately if they
+  are needed. `config.toml`, credential files and OS keyring entries are excluded.
+  The database can still contain sensitive conversation and Tool data. A separate
+  live folder copy is not a coordinated database/filesystem snapshot. Recorded
+  paths are not rebased: moving the files to a different profile or machine does
+  not automatically repair absolute references. `formless
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
   the current database as `backups/before-restore-<time>.db`, stages and migrates
@@ -2573,6 +2579,16 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   points even within the same second; existing backup destinations are
   never replaced. A failed staged migration identifies any safety copy and leaves
   the old canonical database available; the safety copy remains independently usable.
+  After replacement, while ownership is still held, restore checks artifact rows
+  and **all** skill versions (including old, disabled and retired versions).
+  It reports missing/invalid files or skill directories/`SKILL.md`, unreadable
+  local references, and foreign/unresolved paths outside the destination's
+  `artifacts/` or `skills/` roots separately; counts can overlap. A skill version's
+  directory and `SKILL.md` are resolved independently: either escape marks that
+  version foreign once. Foreign file contents are not opened. Nonzero counts produce explicit warnings; a failed
+  diagnostic says recovery is unverified without misreporting a committed restore
+  as rolled back. Rows are preserved: the check never runs deleting artifact GC,
+  rewrites paths, copies files or certifies their contents/coherence.
   `formless doctor` shows the last backup's age.
 - **Opening a stored output:** the transcript note reads `[full output (N
   bytes) stored as artifact ID; read it with read_artifact]`, with no

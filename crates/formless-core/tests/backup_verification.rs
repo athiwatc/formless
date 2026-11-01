@@ -246,3 +246,45 @@ fn a_receipt_never_blesses_later_wal_only_commits() {
     assert!(format!("{:#}", checks::verify(&paths, &file).unwrap_err()).contains("live WAL"));
     drop(conn);
 }
+
+#[test]
+fn clock_rollback_never_prunes_the_verified_snapshot_that_backup_returns() {
+    let (_fixture, paths) = Fixture::new();
+    let store = Store::open(&paths.db_file()).unwrap();
+    std::fs::create_dir_all(housekeeping::backup_dir(&paths)).unwrap();
+    let future = housekeeping::backup_dir(&paths).join("formless-99990101T000000Z.db");
+    store.backup_into(&future).unwrap();
+    let destination = housekeeping::backup(&paths, &store, 1).unwrap();
+    assert!(destination.is_file());
+    assert!(!future.exists());
+    assert_eq!(
+        housekeeping::list_backups(&paths),
+        vec![destination.clone()]
+    );
+    assert!(checks::verified(&paths, &destination).is_some());
+}
+
+#[tokio::test]
+async fn historical_restore_drill_migrates_real_v23_and_reads_known_session() {
+    let (fixture, paths) = Fixture::new();
+    let file = fixture.0.join("genuine-v23.bak");
+    let conn = historical::create(&file, 23);
+    conn.execute("INSERT INTO sessions(id,name,created_at,updated_at) VALUES('historical-known','Old Session','','')",[]).unwrap();
+    drop(conn);
+    let original = std::fs::read(&file).unwrap();
+    let report = checks::drill(&paths, &file).await.unwrap();
+    assert_eq!(
+        report["schema_version"],
+        formless_core::storage::SCHEMA_VERSION
+    );
+    assert_eq!(
+        report["session_ids"],
+        serde_json::json!(["historical-known"])
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    assert!(
+        !paths.db_file().exists(),
+        "drill never creates the live database"
+    );
+    assert!(!Config::default().daemon.backup_restore_drill);
+}
