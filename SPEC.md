@@ -4994,7 +4994,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tui.animations` | true | Spinners and other moving indicators in the TUI; false (or `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` set to anything but empty, `0`, `false`, `no` or `off`) shows a static `●` and a steady cursor (§10.2) |
 | `tui.language` | auto | UI language: `auto` (the system locale: `LC_ALL`, `LC_MESSAGES`, `LANG`), `en` or `th`; the web follows it, else the browser's language (§10.8) |
 | `tui.hyperlinks` | auto | Clickable OSC 8 links for URLs in the TUI chat: `on`, `off`, or `auto` (on except Terminal.app and the Linux console) (§10.2) |
-| `tui.theme` | auto | `dark` (pinned colours), `light` (deeper hues for white backgrounds), `high-contrast` (bright variants), or `auto` (light when `COLORFGBG` reports a light background, else when the terminal answers an OSC 11 background query within 150 ms; dark otherwise). Every text colour of `dark` and `light` has at least 4.5:1 contrast on its background; a `[tui.colors]` override below that is used but noted at start, and a named override goes through the theme like any other colour (§10.6) |
+| `tui.theme` | auto | `dark` (pinned colours), `light` (deeper hues for white backgrounds), `high-contrast` (bright variants), `colorblind` (Okabe–Ito-derived sky blue/orange differences with yellow warnings and explicit status words), or `auto` (light when `COLORFGBG` reports a light background, else when the terminal answers an OSC 11 background query within 150 ms; dark otherwise). Every text colour of `dark` and `light` has at least 4.5:1 contrast on its background; a `[tui.colors]` override below that is used but noted at start, and a named override goes through the theme like any other colour (§10.6) |
 | `tui.colors` | {} | Per-role colour overrides: `user`, `assistant`, `tool`, `note`, `error`, `accent` → a name (`light-cyan`) or `#rrggbb` (§10.6) |
 | `tui.code_line_numbers` | false | Dim line numbers in the chat's code blocks (§10.2) |
 | `tui.inline_images` | auto | Image thumbnails in the chat on iTerm2, WezTerm, kitty and Ghostty; `off` keeps only the reference (§10.2) |
@@ -5575,3 +5575,31 @@ soon as it becomes oversized, without waiting seven days or touching its public
 name. Active Run/review leases still protect their owned objects. Unknown entries
 fail closed rather than counting as zero or supplying deletion authority.
 Already-deleted legacy files without a captured original object remain read-only.
+
+
+### Colour-independent meaning (§10.6, #635)
+
+`tui.theme = "colorblind"` is available through Settings and `config set`.
+Its shared TUI/CLI status palette uses sky blue `#56B4E9` for good, yellow
+`#F0E442` for warning, and orange `#E69F00` for bad. Diff additions use blue
+and removals orange. Every added/removed diff retains a bold `+`/`-` gutter
+by default, including when colour is disabled. Hunk line numbers, changed-word
+underlining and newline labels remain intact.
+
+When colour is disabled or the colorblind theme is selected, semantic status
+cells include `ok`, `warn` or `fail`; unknown measurements stay unknown rather
+than acquiring a success/failure label. Tool recent-call histories retain all
+20 distinct tall/short glyphs with an explicit `▆ok ▂fail` legend, and trend
+arrows retain their direction. Broader approval grants have an explicit warning;
+buttons retain their named actions and keyboard shortcuts. `NO_COLOR` suppresses
+foreground/background colour while keeping textual statuses, signs, values and
+non-colour emphasis. Search matches use reverse/bold or underline without colour.
+Pairing links remain available when a coloured QR representation is omitted.
+
+The default remains `auto`; named and explicit role colour overrides retain
+their existing precedence. The complete semantic-colour audit is recorded in
+`docs/colorblind-inventory.md`.
+
+The Metrics token-usage chart distinguishes cached, fresh and completion tokens
+with `░`, `▒` and `█` patterns and a legend. Colorblind and NO_COLOR views also
+show the component counts, so coincident palette colours carry no unique data.

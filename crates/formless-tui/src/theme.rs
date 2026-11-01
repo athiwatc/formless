@@ -11,6 +11,38 @@ pub enum Kind {
     Dark,
     Light,
     HighContrast,
+    Colorblind,
+}
+
+/// One status vocabulary and palette, shared by terminal tables and TUI views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticTone {
+    Good,
+    Warn,
+    Bad,
+}
+pub const fn colorblind_rgb(tone: SemanticTone) -> (u8, u8, u8) {
+    match tone {
+        SemanticTone::Good => (86, 180, 233),
+        SemanticTone::Warn => (240, 228, 66),
+        SemanticTone::Bad => (230, 159, 0),
+    }
+}
+pub const fn tone_marker(tone: SemanticTone) -> &'static str {
+    match tone {
+        SemanticTone::Good => "ok",
+        SemanticTone::Warn => "warn",
+        SemanticTone::Bad => "fail",
+    }
+}
+pub(crate) fn redundant(color: bool) -> bool {
+    !color
+        || THEME.with(|theme| {
+            theme
+                .borrow()
+                .as_ref()
+                .is_some_and(|theme| theme.kind == Kind::Colorblind)
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +78,7 @@ pub fn from_config(name: &str, colors: &HashMap<String, String>) -> Theme {
     let kind = match name {
         "light" => Kind::Light,
         "high-contrast" => Kind::HighContrast,
+        "colorblind" => Kind::Colorblind,
         "dark" => Kind::Dark,
         _ => detect(std::env::var("COLORFGBG").ok().as_deref()),
     };
@@ -163,6 +196,29 @@ fn palette(kind: Kind, c: Color) -> Color {
             Color::White => Color::Black,
             other => other,
         },
+        Kind::Colorblind => match c {
+            Color::Green
+            | Color::LightGreen
+            | Color::Blue
+            | Color::LightBlue
+            | Color::Cyan
+            | Color::LightCyan => {
+                let (r, g, b) = colorblind_rgb(SemanticTone::Good);
+                Color::Rgb(r, g, b)
+            }
+            Color::Red | Color::LightRed => {
+                let (r, g, b) = colorblind_rgb(SemanticTone::Bad);
+                Color::Rgb(r, g, b)
+            }
+            Color::Yellow | Color::LightYellow => {
+                let (r, g, b) = colorblind_rgb(SemanticTone::Warn);
+                Color::Rgb(r, g, b)
+            }
+            Color::Magenta | Color::LightMagenta => Color::Rgb(204, 121, 167),
+            Color::Gray => Color::Rgb(171, 178, 191),
+            Color::DarkGray => Color::Rgb(140, 140, 140),
+            other => other,
+        },
         // Bright variants for the most contrast on a dark background.
         Kind::HighContrast => match c {
             Color::Yellow => Color::LightYellow,
@@ -183,7 +239,7 @@ fn palette(kind: Kind, c: Color) -> Color {
 fn background(kind: Kind) -> (u8, u8, u8) {
     match kind {
         Kind::Light => (255, 255, 255),
-        Kind::Dark | Kind::HighContrast => (0x1e, 0x1e, 0x1e),
+        Kind::Dark | Kind::HighContrast | Kind::Colorblind => (0x1e, 0x1e, 0x1e),
     }
 }
 
@@ -345,6 +401,23 @@ pub(crate) fn reset() {
 }
 
 #[cfg(test)]
+pub(crate) struct TestThemeGuard(Option<Theme>);
+#[cfg(test)]
+impl Drop for TestThemeGuard {
+    fn drop(&mut self) {
+        THEME.with(|theme| *theme.borrow_mut() = self.0.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn test_theme(name: &str) -> TestThemeGuard {
+    TestThemeGuard(THEME.with(|theme| {
+        theme
+            .borrow_mut()
+            .replace(from_config(name, &HashMap::new()))
+    }))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -405,7 +478,7 @@ mod tests {
             Color::Gray,
             Color::DarkGray,
         ];
-        for kind in [Kind::Dark, Kind::Light] {
+        for kind in [Kind::Dark, Kind::Light, Kind::Colorblind] {
             for c in text {
                 let drawn = rgb(palette(kind, c)).unwrap();
                 let ratio = contrast(drawn, background(kind));

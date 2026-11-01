@@ -2,7 +2,17 @@
 //! secondary fields dimmed, colour only on a terminal and never with
 //! `NO_COLOR`, and the widest column cut to fit the terminal.
 
+use formless_tui::{colorblind_rgb, tone_marker, SemanticTone};
+use std::cell::Cell;
 use unicode_width::UnicodeWidthStr;
+
+thread_local! { static COLORBLIND: Cell<bool> = const { Cell::new(false) }; }
+
+/// Ordinary CLI commands set this from their own profile. Read-only discovery
+/// paths need no config parse and use the default palette with explicit labels.
+pub fn configure_theme(name: &str) {
+    COLORBLIND.with(|enabled| enabled.set(name == "colorblind"));
+}
 
 /// How a cell is drawn when colour is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,15 +26,38 @@ pub enum Tone {
 }
 
 impl Tone {
-    fn code(self) -> Option<&'static str> {
-        Some(match self {
-            Tone::Plain => return None,
-            Tone::Strong => "1",
-            Tone::Dim => "2",
-            Tone::Good => "32",
-            Tone::Warn => "33",
-            Tone::Bad => "31",
-        })
+    fn semantic(self) -> Option<SemanticTone> {
+        match self {
+            Self::Good => Some(SemanticTone::Good),
+            Self::Warn => Some(SemanticTone::Warn),
+            Self::Bad => Some(SemanticTone::Bad),
+            _ => None,
+        }
+    }
+    fn code(self, colorblind: bool) -> Option<String> {
+        if let Some(tone) = self.semantic().filter(|_| colorblind) {
+            let (r, g, b) = colorblind_rgb(tone);
+            return Some(format!("38;2;{r};{g};{b}"));
+        }
+        Some(
+            match self {
+                Tone::Plain => return None,
+                Tone::Strong => "1",
+                Tone::Dim => "2",
+                Tone::Good => "32",
+                Tone::Warn => "33",
+                Tone::Bad => "31",
+            }
+            .to_string(),
+        )
+    }
+    fn label(self, text: &str, markers: bool) -> String {
+        if !text.is_empty() {
+            if let Some(tone) = self.semantic().filter(|_| markers) {
+                return format!("{} {text}", tone_marker(tone));
+            }
+        }
+        text.to_owned()
     }
 }
 
@@ -62,9 +95,23 @@ impl Table {
     /// The table as text: `color` adds ANSI styles, `width` cuts the
     /// widest column (down to 8) so rows fit.
     pub fn render(&self, color: bool, width: Option<usize>) -> String {
+        self.render_theme(color, width, COLORBLIND.with(Cell::get))
+    }
+
+    fn render_theme(&self, color: bool, width: Option<usize>, colorblind: bool) -> String {
+        // Labels participate in width calculation before clipping/padding.
+        let rows: Vec<Vec<_>> = self
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(text, tone)| (tone.label(text, !color || colorblind), *tone))
+                    .collect()
+            })
+            .collect();
         let n = self.headers.len();
         let mut widths: Vec<usize> = self.headers.iter().map(|h| h.width()).collect();
-        for r in &self.rows {
+        for r in &rows {
             for (i, (text, _)) in r.iter().enumerate().take(n) {
                 widths[i] = widths[i].max(text.width());
             }
@@ -84,7 +131,7 @@ impl Table {
                 widths[i] = w - 1;
             }
         }
-        let paint = |text: &str, tone: Tone| match (color, tone.code()) {
+        let paint = |text: &str, tone: Tone| match (color, tone.code(colorblind)) {
             (true, Some(code)) if !text.is_empty() => format!("\x1b[{code}m{text}\x1b[0m"),
             _ => text.to_string(),
         };
@@ -112,7 +159,7 @@ impl Table {
             .map(|h| (h.to_string(), Tone::Dim))
             .collect();
         let mut out = line(header);
-        for r in &self.rows {
+        for r in &rows {
             out.push_str(&line(r.clone()));
         }
         out
@@ -121,7 +168,7 @@ impl Table {
 
 /// Colour is allowed unless `NO_COLOR` is set to anything (no-color.org).
 pub fn color_allowed() -> bool {
-    std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+    std::env::var_os("NO_COLOR").is_none()
 }
 
 /// `text` cut to `w` columns with an ellipsis.
@@ -187,6 +234,62 @@ mod tests {
         assert!(
             coloured.contains("\x1b[2mUpper-case some text\x1b[0m"),
             "{coloured}"
+        );
+    }
+
+    fn statuses() -> Table {
+        let mut table = Table::new(&["TOOL", "RATE", "STATE"]);
+        for (name, rate, state, tone) in [
+            ("ไทย-ok", "100%", "active", Tone::Good),
+            ("warn", "80%", "off", Tone::Warn),
+            ("failed", "20%", "needs attention", Tone::Bad),
+        ] {
+            table.row(vec![c(name), t(rate, tone), t(state, tone)]);
+        }
+        table
+    }
+
+    #[test]
+    fn semantic_labels_survive_no_color_and_use_the_canonical_colorblind_palette() {
+        let table = statuses();
+        let plain = table.render_theme(false, None, false);
+        for marker in ["ok 100%", "warn 80%", "fail 20%", "fail needs attention"] {
+            assert!(plain.contains(marker), "{plain}");
+        }
+        assert!(!plain.contains('\x1b'));
+        let accessible = table.render_theme(true, None, true);
+        for tone in [SemanticTone::Good, SemanticTone::Warn, SemanticTone::Bad] {
+            let (r, g, b) = colorblind_rgb(tone);
+            assert!(accessible.contains(&format!("\x1b[38;2;{r};{g};{b}m")));
+        }
+        let stripped = regex::Regex::new(r"\x1b\[[0-9;]*m")
+            .unwrap()
+            .replace_all(&accessible, "");
+        assert_eq!(
+            stripped, plain,
+            "colorblind and no-color contain identical status information/layout"
+        );
+        let ordinary = table.render_theme(true, None, false);
+        assert!(ordinary.contains("\x1b[32m100%"));
+        assert!(!ordinary.contains("ok 100%"));
+    }
+
+    #[test]
+    fn marker_widths_are_counted_before_unicode_alignment_and_clipping() {
+        let table = statuses();
+        for colorblind in [false, true] {
+            let out = table.render_theme(false, Some(34), colorblind);
+            assert!(out.lines().all(|line| line.width() <= 34), "{out}");
+            for marker in ["ok ", "warn ", "fail "] {
+                assert!(out.contains(marker), "marker clipped: {out}");
+            }
+            assert!(out.contains("ไทย"), "printable Unicode is retained");
+        }
+        let mut empty = Table::new(&["STATE"]);
+        empty.row(vec![t("", Tone::Good)]);
+        assert!(
+            !empty.render_theme(false, None, false).contains("ok"),
+            "missing values are not announced as success"
         );
     }
 }

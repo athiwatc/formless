@@ -195,7 +195,7 @@ pub fn rows(
             "tui.theme",
             "theme",
             cfg.tui.theme.clone(),
-            Choice(&["auto", "dark", "light", "high-contrast"]),
+            Choice(&["auto", "dark", "light", "high-contrast", "colorblind"]),
         ),
         Row::new(
             "Interface",

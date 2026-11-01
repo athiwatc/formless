@@ -30,6 +30,62 @@ pub(crate) fn dim(color: bool) -> Style {
     }
 }
 
+pub(crate) fn status_text(
+    color: bool,
+    tone: crate::SemanticTone,
+    value: impl AsRef<str>,
+) -> String {
+    let value = value.as_ref();
+    let marker = crate::tone_marker(tone);
+    if crate::theme::redundant(color)
+        && value.trim_start() != marker
+        && !value.trim_start().starts_with(&format!("{marker} "))
+    {
+        format!("{marker} {value}")
+    } else {
+        value.to_owned()
+    }
+}
+pub(crate) fn status_style(color: bool, tone: crate::SemanticTone) -> Style {
+    fg(
+        color,
+        match tone {
+            crate::SemanticTone::Good => Color::Green,
+            crate::SemanticTone::Warn => Color::Yellow,
+            crate::SemanticTone::Bad => Color::Red,
+        },
+    )
+}
+pub(crate) fn status_span(
+    color: bool,
+    tone: crate::SemanticTone,
+    value: impl AsRef<str>,
+) -> Span<'static> {
+    Span::styled(status_text(color, tone, value), status_style(color, tone))
+}
+pub(crate) fn rate_tone(rate: f64) -> crate::SemanticTone {
+    if rate >= 0.9 {
+        crate::SemanticTone::Good
+    } else if rate >= 0.7 {
+        crate::SemanticTone::Warn
+    } else {
+        crate::SemanticTone::Bad
+    }
+}
+pub(crate) fn rate_display(color: bool, rate: Option<f64>) -> String {
+    rate.map_or_else(
+        || "-".into(),
+        |rate| status_text(color, rate_tone(rate), rate_text(Some(rate))),
+    )
+}
+pub(crate) fn rate_width(color: bool) -> u16 {
+    if crate::theme::redundant(color) {
+        12
+    } else {
+        8
+    }
+}
+
 pub(crate) fn rate_text(rate: Option<f64>) -> String {
     rate.map(|r| format!("{:.0}%", r * 100.0))
         .unwrap_or_else(|| "-".into())

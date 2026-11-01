@@ -304,6 +304,14 @@ files; `formless commands list --json` returns the same shared metadata projecti
 used by the TUI. Listing is read-only: it does not start a daemon, create a
 profile, expand a template or open its referenced attachments.
 
+For red/green colour blindness, set `formless config set tui.theme colorblind`
+(or choose **colorblind** in Settings). The TUI and CLI share an Okabe–Ito-derived
+blue/orange status palette. Diffs keep bold `+`/`-` gutters; CLI status cells add
+`ok`, `warn`, and `fail` markers when this theme is active or colour is disabled.
+`NO_COLOR` suppresses ANSI styling without removing status information; printable
+Unicode is preserved. JSON output retains its original machine-readable values.
+
+
 
 Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.3](#53-lifecycle-and-versioning)).
 
