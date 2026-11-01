@@ -8138,6 +8138,11 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.branch_summary.intent.is_some() {
+                self.cancel_branch_summary();
+                self.notes.push("Branch summary cancelled.".into());
+                return;
+            }
             self.ctrl_c();
             return;
         }
@@ -8982,6 +8987,7 @@ impl App {
             self.branch_summary.clear();
             return;
         }
+        self.pager = None;
         let Some(preview) = self.branch_summary.review.take() else {
             return;
         };
@@ -21610,6 +21616,22 @@ mod tests {
             "disconnected review must not submit"
         );
         assert!(!app.branch_summary.committing);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_branch_review_without_clearing_the_unsent_draft() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.pager.is_none() && app.branch_summary.review.is_none());
+        assert_eq!(app.input.expanded(), "Unsent original draft");
+        assert!(
+            sent.try_recv().is_err(),
+            "cancelling review cannot submit or send the draft"
+        );
     }
 
     #[test]
