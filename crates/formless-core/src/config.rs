@@ -1332,6 +1332,14 @@ pub struct OptimiserCfg {
     pub max_attempts_per_day: usize,
     pub give_up_after_failures: usize,
     pub promotion_margin_points: u32,
+    /// Recent unique terminal inputs available to split (hard maximum 512).
+    pub replay_pool_limit: usize,
+    /// Outcome-independent held-out share, 10..=90 percent.
+    pub replay_holdout_percent: u32,
+    /// Distinct held-out inputs required for automatic promotion.
+    pub replay_min_holdout: usize,
+    /// Maximum paired-test p value for automatic promotion (0 < alpha <= .05).
+    pub replay_significance: f64,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub token_budget: Option<u64>,
@@ -1345,6 +1353,27 @@ pub struct OptimiserCfg {
     /// … within this many days (SPEC §8.3).
     pub mcp_chain_days: u32,
 }
+impl OptimiserCfg {
+    /// Invalid statistical settings never make the automatic gate easier.
+    pub fn validate_replay(&self) -> Result<()> {
+        if !(2..=512).contains(&self.replay_pool_limit) {
+            anyhow::bail!("optimiser.replay_pool_limit must be 2..=512");
+        }
+        if !(10..=90).contains(&self.replay_holdout_percent) {
+            anyhow::bail!("optimiser.replay_holdout_percent must be 10..=90");
+        }
+        if !(2..=512).contains(&self.replay_min_holdout) {
+            anyhow::bail!("optimiser.replay_min_holdout must be 2..=512");
+        }
+        if !self.replay_significance.is_finite()
+            || self.replay_significance <= 0.0
+            || self.replay_significance > 0.05
+        {
+            anyhow::bail!("optimiser.replay_significance must be finite and in (0, 0.05]");
+        }
+        Ok(())
+    }
+}
 impl Default for OptimiserCfg {
     fn default() -> Self {
         Self {
@@ -1352,6 +1381,10 @@ impl Default for OptimiserCfg {
             max_attempts_per_day: 3,
             give_up_after_failures: 3,
             promotion_margin_points: 10,
+            replay_pool_limit: 200,
+            replay_holdout_percent: 50,
+            replay_min_holdout: 20,
+            replay_significance: 0.05,
             model: None,
             reasoning_effort: None,
             token_budget: None,

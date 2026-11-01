@@ -604,11 +604,12 @@ Built-ins lead every Session's Tool list, in a fixed order, and are never unload
 
 ```text
 create_tool(name, description, input_schema, output_schema,
-            implementation_js, capabilities[], memory_mb?)
+            implementation_js, capabilities[], memory_mb?, allow_breaking=false)
 ```
 
 * The **agent writes the JavaScript**: plain JS, one self-contained file, no TypeScript, no imports.
 * **Validation gate at creation:** name rules, both schemas validated against JSON Schema draft 2020-12, JS syntax-checked, then **smoke-tested** in the replay-style sandbox with empty input. Any failure rejects creation and nothing broken is saved.
+* Agent-authored schema updates that are breaking or unverified and have live or possible dependents require explicit `allow_breaking: true`; the classified dependency inventory and compatibility verdict are rechecked when the version is saved.
 * `create_tool` is immutable, excluded from Self-Optimisation, and cannot be retired or widened.
 * The smoke test is conclusive only until the Tool first meets a stub (fake fetch body, unbindable `$input` scope, …); a failure after that is reported as *inconclusive* and the Tool is saved.
 
@@ -786,9 +787,9 @@ Measured per Tool, pooled across all Sessions:
 The loop:
 
 1. **Trigger** — success rate below **90%** over the last **≥ 20** Invocations (rolling window of 100).
-2. **Candidate** — a background optimiser job queues and only runs when no active Run is waiting on that Tool, so it never interrupts a Session.
-3. **Sandboxed replay (the gate)** — the replay set is *all recorded failed Invocations plus an equal-sized sample of recorded successes* (a regression guard). It runs in a throwaway copy-on-write overlay: writes are discarded, network is denied by default (recorded responses are served where available), `process` is denied, and no real secrets are injected. A Tool that genuinely needs live network is marked **replay-limited** and can only be promoted with explicit user approval.
-4. **Promotion bar** — the Candidate must score **≥ 10 points above** the current version on the full replay set, **with zero regressions** on previously successful replays. Otherwise it is discarded and logged in the Tool's history.
+2. **Candidate** — a background job runs when no active Run is waiting on that Tool. Before contacting the provider, it freezes a bounded, outcome-independent pool of recent unique inputs (default `optimiser.replay_pool_limit = 200`) and splits it into generation and holdout sets (default `optimiser.replay_holdout_percent = 50`). Only generation examples and their errors reach the candidate model; held-out inputs stay private ([SPEC §8.4](SPEC.md#84-sandboxed-replay-the-promotion-gate)).
+3. **Sandboxed replay (the gate)** — Candidate and baseline run on the **same frozen held-out inputs** in separate throwaway copy-on-write overlays: writes are discarded, network is denied by default (recorded responses are served where available), `process` is denied, and no real secrets are injected. Network/MCP **replay-limited** Candidates still require explicit user approval. Legacy attempts without verifiable frozen provenance must be regenerated rather than treated as held-out evidence.
+4. **Promotion bar** — by default, automatic promotion requires **≥ 10 points improvement**, **zero regressions on recorded-success inputs**, at least **20 held-out inputs** (`optimiser.replay_min_holdout`), and a two-sided exact paired McNemar **p ≤ .05** (`optimiser.replay_significance`). Attempt detail records held-out scores, 95% Wilson confidence intervals, discordant-pair counts and significance without raw held-out inputs. Otherwise-qualifying small-sample or nonsignificant wins go to `awaiting_approval`; capability-widening, schema-compatibility and replay-limited gates still apply. Candidates failing the margin/regression guard are discarded ([SPEC §8.5](SPEC.md#85-promotion)).
 5. **Promotion and rollback** — atomic: running Invocations finish on their starting version, later ones use the promoted version. Every version is kept with one-action rollback in the Tool browser. Promotions, rollbacks, discards and needs-attention flags are audit-logged.
 
 Only the primary metric triggers; the rest inform the optimiser's context.

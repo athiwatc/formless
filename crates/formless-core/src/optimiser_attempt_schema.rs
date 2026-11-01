@@ -3,6 +3,16 @@
 use super::*;
 
 impl Store {
+    pub(crate) fn set_attempt_holdout_detail(&self, id: &str, holdout: &Value) -> Result<()> {
+        let (detail, _, _, _, _) = self.attempt_scores(id)?;
+        let mut detail: Value = serde_json::from_str(&self.attempt_schema_detail(id, &detail)?)?;
+        detail["holdout"] = holdout.clone();
+        self.ex(
+            "UPDATE optimiser_attempts SET detail=?2 WHERE id=?1",
+            params![id, serde_json::to_string_pretty(&detail)?],
+        )?;
+        Ok(())
+    }
     pub(crate) fn attempt_schema_report(
         &self,
         id: &str,
@@ -19,11 +29,24 @@ impl Store {
     }
 
     pub(super) fn attempt_schema_detail(&self, id: &str, summary: &str) -> Result<String> {
-        self.attempt_schema_detail_with_validation(id, summary, false)
+        self.attempt_schema_detail_with_validation(id, summary, None)
     }
     pub(crate) fn mark_attempt_validation_context(&self, id: &str) -> Result<()> {
         let (summary, _, _, _, _) = self.attempt_scores(id)?;
-        let detail = self.attempt_schema_detail_with_validation(id, &summary, true)?;
+        let detail = self.attempt_schema_detail_with_validation(id, &summary, Some(true))?;
+        self.ex(
+            "UPDATE optimiser_attempts SET detail=?2 WHERE id=?1",
+            params![id, detail],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn set_attempt_generation_validation_context(
+        &self,
+        id: &str,
+        validation: bool,
+    ) -> Result<()> {
+        let (summary, _, _, _, _) = self.attempt_scores(id)?;
+        let detail = self.attempt_schema_detail_with_validation(id, &summary, Some(validation))?;
         self.ex(
             "UPDATE optimiser_attempts SET detail=?2 WHERE id=?1",
             params![id, detail],
@@ -34,7 +57,7 @@ impl Store {
         &self,
         id: &str,
         summary: &str,
-        generated_for_validation: bool,
+        generated_for_validation: Option<bool>,
     ) -> Result<String> {
         let previous: Option<String> = self
             .conn
@@ -50,15 +73,22 @@ impl Store {
         let attempt = self
             .get_attempt(id)?
             .context("Optimiser attempt no longer exists")?;
-        let validation_context = generated_for_validation
-            || previous
+        let generation_validation = match self.attempt_replay_snapshot(id)? {
+            Some(snapshot) => crate::optimiser::generation_context(&snapshot)?
+                .iter()
+                .any(|item| !item.recorded_success && item.tag == "validation"),
+            None => self
+                .replay_set(&attempt.tool_id)?
+                .iter()
+                .any(|item| !item.recorded_success && item.tag == "validation"),
+        };
+        let validation_context = generated_for_validation.unwrap_or_else(|| {
+            previous
                 .get("validation_fix_context")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-            || self
-                .replay_set(&attempt.tool_id)?
-                .iter()
-                .any(|item| !item.recorded_success && item.tag == "validation");
+                || generation_validation
+        });
         let (report, warning) = match self.attempt_schema_report(id) {
             Ok(report) => {
                 let warning = validation_context && report.compatibility.is_breaking();
@@ -85,6 +115,7 @@ impl Store {
         Ok(serde_json::to_string_pretty(&json!({
             "format":"optimiser-attempt-schema-v1", "summary":summary,
             "schema_compatibility":report, "validation_fix_context":validation_context,
+            "holdout": previous.get("holdout").cloned().unwrap_or(Value::Null),
             "validation_schema_warning":if warning { Some("Candidate generated to fix validation-tag failures breaks the schema contract; passing recorded replay does not establish dependent compatibility.") } else { None },
         }))?)
     }
