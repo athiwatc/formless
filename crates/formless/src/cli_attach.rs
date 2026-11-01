@@ -432,15 +432,26 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
         )
     });
     conn.event_bytes = 0;
+    if let Some(code) = run["status"]
+        .as_str()
+        .and_then(terminal)
+        .filter(|_| run["end_message_seq"].is_null())
+    {
+        // Historical Runs predate stored message anchors. The initial Session
+        // snapshot is honest; a later unbounded refresh could include a new Run.
+        observer.emit(Event::Note {session_id:Some(session.id.clone()),text:"Historical Run has no stored message boundary; displayed the initial Session snapshot only.".into()})?;
+        return Ok(code);
+    }
     loop {
         if sigints.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             return Ok(130);
         }
         if let Some(code) = run["status"].as_str().and_then(terminal) {
+            let end=run["end_message_seq"].as_i64().context("finished Run has no durable message boundary; cannot safely refresh its transcript")?;
             let snapshot = conn.request(Request::GetSession {
                 id: session.id.clone(),
             })?;
-            observer.snapshot(&snapshot, run["end_message_seq"].as_i64(), false)?;
+            observer.snapshot(&snapshot, Some(end), false)?;
             if let Some(error) = run["error"].as_str() {
                 eprintln!("{}", super::comparison_terminal_text(error));
             }

@@ -4979,7 +4979,10 @@ With no Run yet it waits for the first Run. `--jsonl` (or `--follow --json`)
 emits the same tagged Event objects as `run --output jsonl-events`. Snapshot messages use
 MessageAppended. Follow never starts, answers, or interrupts work: Ctrl+C detaches
 with 130. Completed, paused/failed and interrupted outcomes exit 0, 1 and 130.
-An already terminal Run exits after replay. Connection loss is an error.
+An already terminal Run exits after replay. Historical terminal Runs without
+stored message boundaries display a Note and the initial Session snapshot only;
+follow never invents a boundary or refreshes that legacy transcript without one.
+Connection loss is an error.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs

@@ -1103,3 +1103,65 @@ fn new_user_message_before_replacement_run_started_stays_out_of_finished_target(
             || e["run_id"] == "replacement633"));
     server.join().unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn legacy_terminal_run_discloses_unknown_boundary_without_refreshing_new_work() {
+    use formless_protocol::Request;
+    let f = Fixture::new();
+    std::fs::create_dir_all(&f.paths.data_dir).unwrap();
+    let st = Store::open(&f.paths.db_file()).unwrap();
+    let session = st.create_session(Some("legacy633".into())).unwrap();
+    let message = st
+        .append_message(&session.id, "assistant", "legacy633 history")
+        .unwrap();
+    drop(st);
+    let query = session.id.clone();
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = requests.clone();
+    let server = peer(&f, move |request| match request {
+        Request::Subscribe { .. } => (vec![], json!({})),
+        Request::ListSessions => (vec![], json!([session])),
+        Request::GetSession { .. } => {
+            assert_eq!(
+                counted.fetch_add(1, Ordering::SeqCst),
+                0,
+                "legacy follow must not refresh after its initial snapshot"
+            );
+            (
+                vec![],
+                json!({"messages":[message],"pending_events":[],"latest_run":{"run_id":"legacy633","status":"completed","end_message_seq":null}}),
+            )
+        }
+        other => panic!("legacy observer issued unexpected request: {other:?}"),
+    });
+    let out = finish(
+        f.command(&["sessions", "show", &query, "--follow", "--jsonl"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert!(events.iter().any(|e| e["type"] == "note"
+        && e["text"]
+            .as_str()
+            .unwrap()
+            .contains("no stored message boundary")));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["message"]["content"] == "legacy633 history")
+            .count(),
+        1
+    );
+    server.join().unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
