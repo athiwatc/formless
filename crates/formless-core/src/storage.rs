@@ -1528,13 +1528,6 @@ impl Store {
         }
         Ok(copy)
     }
-    pub(crate) fn preview_edit(&self, session: &str, id: &str, content: &str) -> Result<Self> {
-        let copy = self.preview_copy()?;
-        copy.edit_message(session, id, content)?
-            .context("user message not found")?;
-        Ok(copy)
-    }
-
     pub fn append_message(
         &self,
         session_id: &str,

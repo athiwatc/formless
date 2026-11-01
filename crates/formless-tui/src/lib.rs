@@ -5113,7 +5113,13 @@ impl App {
                 (path, stamp)
             })
             .collect();
-        let key = formless_core::forecast::hash(&(&self.current, &text, &buffers, &paths));
+        let key = formless_core::forecast::hash(&(
+            &self.current,
+            &self.editing_id,
+            &text,
+            &buffers,
+            &paths,
+        ));
         if let Some((cached, input)) = &*self.forecast.input_cache.borrow() {
             if cached == &key {
                 return input.clone();
@@ -5250,6 +5256,7 @@ impl App {
         }
     }
     fn forecast_control(&mut self, action: ForecastAction) {
+        self.forecast.revision = self.forecast.revision.wrapping_add(1);
         if self.offline.is_some() {
             return;
         }
@@ -5304,6 +5311,8 @@ impl App {
         {
             let generation = self.forecast_generation();
             if self.forecast.approved.take().as_deref() != Some(generation.as_str()) {
+                self.forecast.revision = self.forecast.revision.wrapping_add(1);
+                let generation = self.forecast_generation();
                 self.request(
                     Pending::ForecastSend {
                         generation,
@@ -21923,5 +21932,62 @@ mod tests {
             });
             assert_eq!(app.input.expanded(), "unrelated draft");
         }
+    }
+    #[test]
+    fn identical_draft_edit_mode_changes_are_not_cached_as_append_forecasts() {
+        let mut app = test_app();
+        app.input.set("same text");
+        assert!(app.forecast_input().edit_message_id.is_none());
+        app.editing_id = Some("old-user".into());
+        assert_eq!(
+            app.forecast_input().edit_message_id.as_deref(),
+            Some("old-user")
+        );
+        app.editing_id = None;
+        assert!(app.forecast_input().edit_message_id.is_none());
+    }
+    #[test]
+    fn later_control_preparation_rejects_old_response_with_unchanged_composer() {
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.limits.forecast_confirm_usd = Some(0.0);
+        cfg.save(&app.paths).unwrap();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("unchanged");
+        app.forecast_control(ForecastAction::Retry {
+            session_id: "s1".into(),
+            model: Some("old".into()),
+            keep_original: true,
+        });
+        let older: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        app.forecast_control(ForecastAction::Resume {
+            session_id: "s1".into(),
+        });
+        let newer: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(ServerMessage::Response {
+            id: older.id,
+            ok: true,
+            result: Some(serde_json::to_value(forecast_reply("old retry", true)).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.forecast.modal.is_none());
+        tx.send(ServerMessage::Response {
+            id: newer.id,
+            ok: true,
+            result: Some(serde_json::to_value(forecast_reply("current resume", true)).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(
+            app.forecast.modal.as_ref().unwrap().1.hint,
+            "current resume"
+        );
+        assert!(sent.try_recv().is_err());
     }
 }

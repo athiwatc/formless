@@ -595,3 +595,21 @@ test('resume and retry require prospective consent before sending their commands
     }
   }
 });
+
+test('edit hints bind prospective truncation and identical-text mode changes invalidate replies', async () => {
+  const old=deferred();const requests=[];
+  const c=forecastContext(['forecastStamp','scheduleForecast'], {request:r=>{requests.push(r);return old.promise;}});
+  c.$('input').value='same text';c.S.editMessageId='old-user';c.scheduleForecast();const finishing=c.fire();
+  assert.equal(requests[0].input.edit_message_id,'old-user');
+  c.S.editMessageId=null;old.resolve({hint:'edited context'});await finishing;
+  assert.equal(c.$('forecast-hint').textContent,'');
+});
+test('a later control intent supersedes an older confirmation with an unchanged composer', async () => {
+  const older=deferred();const calls=[];
+  const c=forecastContext(['forecastStamp','confirmForecast'],{request:r=>{calls.push(r);return calls.length===1?older.promise:Promise.resolve({confirmation_required:false});}});
+  c.$('input').value='unchanged';
+  const first=c.confirmForecast('A','',{retry:true,model:'first'});
+  const second=c.confirmForecast('A','',{resume:true});
+  assert.equal(await second,true);older.resolve({confirmation_required:false});
+  assert.equal(await first,false);
+});

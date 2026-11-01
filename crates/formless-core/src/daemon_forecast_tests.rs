@@ -222,13 +222,14 @@ async fn exact_consent_is_one_shot_and_cached_denial_is_never_replayed_as_approv
             .is_err(),
         "cached refusal cannot become a successful send"
     );
-    let current = d
-        .with_reader(|st| crate::forecast::estimate_store(st, &cfg, &input))
-        .unwrap();
     CLIENT
         .scope((9, "fixture".into()), async {
-            d.check_forecast_consent(&current).unwrap();
-            assert!(d.check_forecast_consent(&current).is_err());
+            d.with_store(|st| {
+                d.consented_forecast(st, &cfg, &input).unwrap();
+                assert!(d.consented_forecast(st, &cfg, &input).is_err());
+                Ok(())
+            })
+            .unwrap();
         })
         .await;
     assert!(!d.runs.locked().contains_key(&sid));
@@ -308,8 +309,14 @@ async fn prospective_edit_retry_and_resume_require_consent_before_any_mutation()
         let st = Store::open(&paths.db_file()).unwrap();
         let user = st.append_message(&sid, "user", "original").unwrap();
         st.append_message(&sid, "assistant", "answer").unwrap();
+        if operation == 2 {
+            st.append_message_meta(&sid,"assistant","",Some(json!({"tool_calls":[{"id":"unfinished","type":"function","function":{"name":"never_replay","arguments":"{}"}}]}).to_string())).unwrap();
+        }
         let paused = st.create_run(&sid).unwrap();
         st.set_run_status(&paused, "paused").unwrap();
+        if operation == 2 {
+            st.set_run_error(&paused, "budget: fixture").unwrap();
+        }
         let before_messages = serde_json::to_value(st.list_messages(&sid).unwrap()).unwrap();
         let before_sessions = st.list_sessions().unwrap().len();
         let before_runs = st.run_metrics(100).unwrap().len();
@@ -409,13 +416,14 @@ async fn prospective_edit_retry_and_resume_require_consent_before_any_mutation()
             assert_eq!(st.list_sessions().unwrap().len(), before_sessions + 1);
         }
         if operation == 2 {
-            assert!(st
-                .list_messages(&sid)
-                .unwrap()
-                .last()
-                .unwrap()
-                .content
-                .contains("previous run was paused"));
+            let messages = st.list_messages(&sid).unwrap();
+            assert!(messages
+                .iter()
+                .any(|m| m.content.contains("previous run was paused")));
+            assert!(messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("not retried")));
+            assert!(st.dangling_tool_calls(&sid).unwrap().is_empty());
             assert!(d.budget_waived.locked().contains(&sid));
         }
         cancel_fixture_run(&d, &sid).await;

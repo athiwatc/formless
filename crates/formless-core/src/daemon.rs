@@ -575,6 +575,7 @@ struct RunAdmission {
     cfg: Config,
     requested: String,
     effort: Option<String>,
+    recovery_messages: Vec<MessageInfo>,
     first: StdMutex<Option<(Vec<Value>, Vec<Value>, String)>>,
 }
 
@@ -4308,25 +4309,6 @@ impl Daemon {
     /// A Run that stopped mid-batch leaves tool calls without results,
     /// which providers reject. Answer them (never re-run: the outcome is
     /// unknown, SPEC §9.5) before the next Run builds its context.
-    fn close_dangling_tool_calls(&self, session_id: &str) -> Result<()> {
-        for (call_id, name) in self.with_store(|st| st.dangling_tool_calls(session_id))? {
-            let msg = self.with_store(|st| {
-                st.append_message_meta(
-                    session_id,
-                    "tool",
-                    "error: the run stopped before this call finished; it was not retried. \
-                     Run it again if it is still needed.",
-                    Some(tool_result_meta(&call_id, &name, true)),
-                )
-            })?;
-            self.broadcast(Event::MessageAppended {
-                session_id: session_id.to_string(),
-                message: msg,
-            });
-        }
-        Ok(())
-    }
-
     async fn send_message(
         self: &Arc<Self>,
         session_id: String,
@@ -4445,6 +4427,10 @@ impl Daemon {
         let session = st
             .get_session(session_id)?
             .context("Session disappeared during admission")?;
+        let recovery_messages = crate::forecast::dangling_messages(st, session_id)?
+            .into_iter()
+            .map(|m| st.append_message_meta(session_id, &m.role, &m.content, m.meta))
+            .collect::<Result<Vec<_>>>()?;
         let prompt = match st.session_system_prompt(session_id)? {
             Some(p) => p,
             None => {
@@ -4520,6 +4506,7 @@ impl Daemon {
             cfg: fixed,
             requested,
             effort,
+            recovery_messages,
             first: StdMutex::new(Some((ctx, defs, checkpoint))),
         }))
     }
@@ -4659,30 +4646,6 @@ impl Daemon {
         Ok(f)
     }
 
-    fn check_forecast_consent(&self, forecast: &RunForecast) -> Result<()> {
-        if !forecast.confirmation_required {
-            return Ok(());
-        }
-        let owner = current_client().map(|(id, _)| id);
-        let mut consents = self.forecast_consents.locked();
-        let id = consents
-            .iter()
-            .find(|(_, c)| {
-                c.approved
-                    && c.owner == owner
-                    && c.at.elapsed().as_secs() < 300
-                    && c.fingerprint == forecast.fingerprint
-            })
-            .map(|(id, _)| id.clone());
-        let Some(id) = id else {
-            return Err(anyhow::Error::new(RequestFailure::invalid(
-                "forecast confirmation required; preview and confirm current inputs before sending",
-            )));
-        };
-        consents.remove(&id);
-        Ok(())
-    }
-
     fn start_run_forecast(
         self: &Arc<Self>,
         session_id: String,
@@ -4694,7 +4657,6 @@ impl Daemon {
                 ctl.run_id
             ))));
         }
-        self.close_dangling_tool_calls(&session_id)?;
         let cfg = self.config()?;
         let (run_id, admission) = self.with_store(|st| {
             st.transaction(|st| {
@@ -4755,7 +4717,13 @@ impl Daemon {
         }
         self.run_admissions
             .locked()
-            .insert(run_id.clone(), admission);
+            .insert(run_id.clone(), admission.clone());
+        for message in &admission.recovery_messages {
+            self.broadcast(Event::MessageAppended {
+                session_id: session_id.clone(),
+                message: message.clone(),
+            });
+        }
         self.broadcast(Event::RunStarted {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
@@ -14193,7 +14161,7 @@ fn call_failed(text: String) -> String {
 
 /// A stored tool message's meta: which call it answers, and whether it
 /// reports a failure (Anthropic `tool_result.is_error`).
-fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
+pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
     let mut meta = json!({"tool_call_id": call_id, "name": name});
     if is_error {
         meta["is_error"] = json!(true);

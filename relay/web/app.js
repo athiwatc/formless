@@ -2050,7 +2050,7 @@
   let forecastRevision = 0;
   function forecastStamp(draft = $("input").value) {
     const session = S.sessions.find((s) => s.id === S.current);
-    return JSON.stringify([S.current, draft, session && session.model, session && session.cwd, S.chips[S.current] || [], S.daemonOnline, S.hello, forecastRevision]);
+    return JSON.stringify([S.current, S.editMessageId, draft, session && session.model, session && session.cwd, S.chips[S.current] || [], S.daemonOnline, S.hello, forecastRevision]);
   }
   function scheduleForecast() {
     const stamp = forecastStamp();
@@ -2065,7 +2065,7 @@
     const sid = S.current;
     forecastTimer = setTimeout(async () => {
       try {
-        const result = await request({type:"forecast_run",input:{session_id:sid,draft}});
+        const result = await request({type:"forecast_run",input:{session_id:sid,draft,edit_message_id:S.editMessageId || null}});
         if (sequence !== forecastSequence || stamp !== forecastStamp()) return;
         if (box) { box.textContent = result.hint; box.title = (result.warnings || []).join("\n"); }
       } catch (_) { /* A failed preview never executes or clears a draft. */ }
@@ -2074,7 +2074,7 @@
   async function confirmForecast(sid, text, operation = {}) {
     // Use the same live transport for preview, consent and the later send.
     const stamp = forecastStamp();
-    const sequence = forecastSequence;
+    const sequence = ++forecastSequence;
     const forecast = await request({type:"forecast_run",for_send:true,input:{session_id:sid,draft:text,edit_message_id:S.editMessageId || null,...operation}});
     if (sid !== S.current || stamp !== forecastStamp() || sequence !== forecastSequence || !S.daemonOnline) return false;
     if (forecast.confirmation_required) {
