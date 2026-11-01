@@ -1163,10 +1163,15 @@ impl EditorState {
         line
     }
     fn sync_modal_line(&self, line: &mut input::InputLine) {
-        if &**line != self.text().as_str() {
-            line.set(&self.text());
+        let text = self.text();
+        if &**line != text.as_str() {
+            line.set(&text);
         }
-        line.set_modal_cursor(self.chars[..self.cursor].iter().map(|c| c.len_utf8()).sum());
+        // Schema/examples and other programmatic replacements can shorten the
+        // character buffer before its previous cursor has been synchronized.
+        // Clamp before slicing; InputLine then snaps to a grapheme boundary.
+        let cursor = self.cursor.min(self.chars.len());
+        line.set_modal_cursor(self.chars[..cursor].iter().map(|c| c.len_utf8()).sum());
     }
     fn apply_modal_line(&mut self, line: input::InputLine) {
         self.cursor = line[..line.cursor_byte()].chars().count();
@@ -19939,6 +19944,40 @@ mod tests {
         }
         let e = ed("表a", 2);
         assert_eq!(e.cursor_col(), 3, "表 is two columns");
+    }
+
+    #[test]
+    fn programmatic_editor_replacement_clamps_stale_cursor_and_preserves_unicode_undo() {
+        let old = "previous schema skeleton ".repeat(6);
+        let mut ed = EditorState {
+            draft: Some(input::InputLine::from(old.as_str())),
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "private".into(),
+            name: "schema".into(),
+            chars: old.chars().collect(),
+            cursor: old.chars().count(),
+            mode: EditMode::Schemas,
+        };
+        let replacement = "a\u{301}👩🏽‍💻";
+        ed.chars = replacement.chars().collect(); // old cursor is intentionally stale.
+        let mut line = ed.take_modal_line();
+        assert_eq!(&*line, replacement);
+        assert_eq!(line.cursor_byte(), replacement.len());
+        assert!(line.undo());
+        assert_eq!(&*line, old.as_str());
+        assert!(line.redo());
+        assert_eq!(&*line, replacement);
+        ed.apply_modal_line(line);
+        assert_eq!(ed.cursor, replacement.chars().count());
+        ed.cursor = 1; // Between a base letter and its combining mark.
+        let line = ed.take_modal_line();
+        assert_eq!(line.cursor_byte(), 0);
+        ed.apply_modal_line(line);
+        assert_eq!(ed.cursor, 0);
+        assert_eq!(ed.text(), replacement);
     }
 
     #[test]
