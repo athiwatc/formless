@@ -4373,6 +4373,14 @@ untrusted framed content actually supplied to the model in this Run, including
 Skill metadata and results without known physical origins. That banner is
 informational, belongs to the explicit Run/Session, survives reconnect with the
 approval, and cannot be cleared by an empty source list or forged payload text.
+Accepted-input fallback evidence is owned by the active Run, nested execution,
+and retained pending handles. A pending call may accept model input after its
+Run ends: its evidence remains available until the result is delivered or the
+handle is forgotten. Providers retain only a weak lookup, so cached providers
+cannot keep completed operation evidence alive. Failed evidence persistence
+keeps known sources in memory; failed deferred delivery retains the handle for
+retry, and never reports a clean consumer because a write failed. Ownership and
+source locks are released before database access or asynchronous waits.
 
 Third-party Tool, MCP, Skill and module descriptions share a 1,024-character
 Unicode limit. Intake and legacy projection normalize newlines, terminal/control

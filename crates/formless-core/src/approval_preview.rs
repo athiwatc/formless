@@ -2,33 +2,57 @@
 use crate::{config::Config, provenance::Origin};
 use formless_protocol::{ApprovalCallPreview, ApprovalUrlPreview};
 use serde_json::{json, Value};
-/// Ephemeral non-Run operations must not retain source evidence after a
-/// cancellation, early return or unwind. Real Runs clean up in finish_run.
-pub(crate) struct TaintCleanup {
-    memory:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), Vec<Origin>>>>,
+/// Only active operations and retained pending handles own evidence. Providers
+/// retain the weak index, never a lease. No index/source lock spans store I/O.
+type TaintSlots =
+    std::sync::Mutex<std::collections::HashMap<(String, String), std::sync::Weak<RunTaint>>>;
+pub(crate) type TaintIndex = std::sync::Arc<TaintSlots>;
+pub(crate) struct RunTaint {
+    index: std::sync::Weak<TaintSlots>,
     key: (String, String),
+    sources: std::sync::Mutex<Vec<Origin>>,
 }
-impl TaintCleanup {
-    pub fn new(
-        memory: std::sync::Arc<
-            std::sync::Mutex<std::collections::HashMap<(String, String), Vec<Origin>>>,
-        >,
-        session: &str,
-        run: &str,
-    ) -> Self {
-        Self {
-            memory,
-            key: (session.into(), run.into()),
+impl RunTaint {
+    pub fn acquire(index: &TaintIndex, session: &str, run: &str) -> std::sync::Arc<Self> {
+        let mut slots = index.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (session.into(), run.into());
+        if let Some(owner) = slots.get(&key).and_then(std::sync::Weak::upgrade) {
+            return owner;
+        }
+        let owner = std::sync::Arc::new(Self {
+            index: std::sync::Arc::downgrade(index),
+            key: key.clone(),
+            sources: Default::default(),
+        });
+        slots.insert(key, std::sync::Arc::downgrade(&owner));
+        owner
+    }
+    pub fn observe(&self, sources: &[Origin]) {
+        let mut memory = self.sources.lock().unwrap_or_else(|e| e.into_inner());
+        for source in sources {
+            if memory.len() < crate::provenance::MAX_ORIGINS && !memory.contains(source) {
+                memory.push(source.clone());
+            }
         }
     }
-}
-impl Drop for TaintCleanup {
-    fn drop(&mut self) {
-        self.memory
+    pub fn sources(&self) -> Vec<Origin> {
+        self.sources
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&self.key);
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+impl Drop for RunTaint {
+    fn drop(&mut self) {
+        if let Some(index) = self.index.upgrade() {
+            let mut slots = index.lock().unwrap_or_else(|e| e.into_inner());
+            if slots
+                .get(&self.key)
+                .is_some_and(|slot| std::ptr::eq(slot.as_ptr(), self))
+            {
+                slots.remove(&self.key);
+            }
+        }
     }
 }
 

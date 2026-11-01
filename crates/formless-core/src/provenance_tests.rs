@@ -37,6 +37,7 @@ async fn pending_delivery_keeps_its_source_run_and_origins_through_compaction_an
         )
         .unwrap();
     let entry = Arc::new(PendingEntry {
+        taint_scope: daemon.taint_scope(&session, "original-run"),
         tool_name: "fetch_page".into(),
         run_id: "original-run".into(),
         started_ms: 0,
@@ -150,6 +151,7 @@ async fn await_and_check_keep_original_sources_and_reject_other_sessions() {
         .unwrap();
         let handle = format!("private-{name}");
         let entry = Arc::new(PendingEntry {
+            taint_scope: daemon.taint_scope(&session, &original),
             tool_name: tool.clone(),
             run_id: original.clone(),
             started_ms: 0,

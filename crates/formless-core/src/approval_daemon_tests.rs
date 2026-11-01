@@ -347,6 +347,8 @@ async fn accepted_parallel_model_inputs_keep_run_sources_when_persistence_fails_
             Ok((((a, ra), (b, rb)), producer))
         })
         .unwrap();
+    let scope_a = daemon.taint_scope(&a.id, &ra);
+    let scope_b = daemon.taint_scope(&b.id, &rb);
     let file = _fixture.0.join("private-first-reference.txt");
     std::fs::write(&file, "private first data").unwrap();
     let old_source = crate::provenance::Origin::new(
@@ -449,11 +451,185 @@ async fn accepted_parallel_model_inputs_keep_run_sources_when_persistence_fails_
         vec![old_source]
     );
     drop(provider);
+    drop(scope_a);
+    drop(scope_b);
     drop(sql);
     daemon.finish_run(a.id.clone(), producer, "completed").await;
     daemon.finish_run(a.id, ra, "completed").await;
     daemon.finish_run(b.id, rb, "completed").await;
     assert!(daemon.input_taint.locked().is_empty());
+    drop(daemon);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn late_pending_model_input_retains_failed_audit_evidence_until_handle_consumption() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    env.set("FORMLESS_API_KEY", "private-call-fixture");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route("/chat/completions", axum::routing::post({
+        let entered = entered.clone(); let release = release.clone();
+        move || { let entered = entered.clone(); let release = release.clone(); async move {
+            entered.notify_one(); release.notified().await;
+            axum::Json(json!({"model":"private-model","choices":[{"message":{"content":"late private result"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}))
+        }}
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (_fixture, daemon) = Fixture::daemon(&env, &base);
+    let (session, producer, consumer) = daemon
+        .with_store(|st| {
+            let session = st.create_session(None)?;
+            let producer = st.create_run(&session.id)?;
+            let consumer = st.create_run(&session.id)?;
+            let caps = Capabilities::parse(&["llm".into()]).unwrap();
+            let (tool, _) = st.create_tool_version(
+                "late_reader",
+                "Read private data",
+                "{}",
+                "{}",
+                "function run(){return llm.complete('private framed reference');}",
+                &caps,
+                64,
+                "user",
+            )?;
+            st.set_approval(&tool.id, &caps, 64)?;
+            Ok((session.id, producer, consumer))
+        })
+        .unwrap();
+    let root_scope = daemon.taint_scope(&session, &producer);
+    let consumer_scope = daemon.taint_scope(&session, &consumer);
+    let mut cfg = daemon.config().unwrap();
+    cfg.tools.pending_threshold_secs = 0;
+    let cancel = CancellationToken::new();
+    let answer = daemon
+        .dispatch_pending(
+            &session,
+            &producer,
+            "late_reader",
+            json!({}),
+            &cfg,
+            &Arc::new(AtomicBool::new(false)),
+            &cancel,
+            0,
+        )
+        .await;
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    let handle = answer["invocation_id"]
+        .as_str()
+        .expect("held model returns a pending handle")
+        .to_string();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    drop(root_scope);
+    daemon
+        .finish_run(session.clone(), producer.clone(), "completed")
+        .await;
+    let entry = daemon.pending.locked().get(&handle).unwrap().clone();
+    let sql = rusqlite::Connection::open(daemon.paths.db_file()).unwrap();
+    // The accepted input's framed-data audit fails; the Tool's separate llm
+    // result origin and paid usage remain recordable, so completion is genuine.
+    sql.execute_batch("CREATE TRIGGER fail_late_input BEFORE INSERT ON audit WHEN NEW.action='tool.data' AND (NEW.detail LIKE '%framed_data%' OR NEW.detail LIKE '%description_metadata%') BEGIN SELECT RAISE(ABORT,'private late source failure'); END;").unwrap();
+    release.notify_one();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        daemon.wait_pending(&entry, None, &cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(result.0, "late nested completion: {}", result.1);
+    assert!(result.1.contains("late private result"));
+    assert!(entry
+        .taint_scope
+        .sources()
+        .iter()
+        .any(|source| source.tool == "late_reader" && source.kind == "framed_data"));
+    assert!(
+        !daemon
+            .with_reader(|st| st.data_origins(&session, &producer))
+            .unwrap()
+            .iter()
+            .any(|source| source.kind == "framed_data"),
+        "injected audit failure actually occurred"
+    );
+    assert!(daemon
+        .capture_pending_data(&session, &consumer, "later-call", &entry)
+        .is_err());
+    assert!(
+        daemon.pending.locked().contains_key(&handle),
+        "failed delivery retains the handle owner"
+    );
+    let context =
+        daemon.approval_context(&cfg, &session, &consumer, &Capabilities::default(), None);
+    assert_eq!(context.run_id.as_deref(), Some(consumer.as_str()));
+    assert!(context
+        .sources
+        .iter()
+        .any(|source| source.tool == "late_reader" && source.kind == "framed_data"));
+    assert!(
+        !daemon
+            .with_reader(|st| st.data_origins(&session, &producer))
+            .unwrap()
+            .iter()
+            .any(|source| source.kind == "pending_tool"),
+        "consumer accounting never rewrites producer ledger"
+    );
+    sql.execute_batch("DROP TRIGGER fail_late_input;").unwrap();
+    daemon
+        .capture_pending_data(&session, &consumer, "later-call", &entry)
+        .unwrap();
+    let metadata = daemon
+        .with_reader(|st| {
+            Daemon::data_meta(
+                st,
+                &session,
+                &consumer,
+                "later-call",
+                "await_invocation",
+                false,
+            )
+        })
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&metadata).unwrap();
+    assert_eq!(metadata["data_source_tool"], "late_reader");
+    let origins: Vec<crate::provenance::Origin> =
+        serde_json::from_value(metadata["data_origins"].clone()).unwrap();
+    assert!(origins
+        .iter()
+        .any(|source| source.tool == "late_reader" && source.kind == "framed_data"));
+    let frame = crate::provenance::frame("late_reader", &origins, &result.1);
+    assert!(frame.contains("late private result"));
+    assert!(frame.contains("framed_data"));
+    daemon.forget_pending(&handle);
+    drop(entry);
+    // Completion publishes its result just before task teardown. Wait on the
+    // actual last owner, without assuming a scheduler tick or sleep duration.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while daemon
+            .input_taint
+            .locked()
+            .contains_key(&(session.clone(), producer.clone()))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("last producer owner drops after handle consumption");
+    assert!(daemon
+        .input_taint
+        .locked()
+        .contains_key(&(session.clone(), consumer.clone())));
+    drop(consumer_scope);
+    assert!(daemon.input_taint.locked().is_empty());
+    drop(sql);
     drop(daemon);
     server.abort();
     let _ = server.await;

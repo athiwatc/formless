@@ -404,6 +404,7 @@ type ExecFuture = std::pin::Pin<
 >;
 
 pub(crate) struct PendingEntry {
+    taint_scope: Arc<crate::approval_preview::RunTaint>,
     tool_name: String,
     run_id: String,
     /// When the call started (epoch ms), for the Invocations panel.
@@ -621,7 +622,7 @@ pub struct Daemon {
     forecast_admission: StdMutex<()>,
     forecast_consents: StdMutex<HashMap<String, ForecastConsent>>,
     run_admissions: StdMutex<HashMap<String, Arc<RunAdmission>>>,
-    input_taint: Arc<StdMutex<HashMap<(String, String), Vec<crate::provenance::Origin>>>>,
+    input_taint: crate::approval_preview::TaintIndex,
     #[cfg(test)]
     forecast_admission_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
@@ -1174,6 +1175,10 @@ impl Daemon {
         )
     }
 
+    fn taint_scope(&self, session: &str, run: &str) -> Arc<crate::approval_preview::RunTaint> {
+        crate::approval_preview::RunTaint::acquire(&self.input_taint, session, run)
+    }
+
     fn input_hook(&self) -> crate::provider::InputHook {
         let store = self.store.clone();
         let memory = self.input_taint.clone();
@@ -1188,19 +1193,15 @@ impl Daemon {
             if sources.is_empty() {
                 return;
             }
-            // Keep bounded in-memory evidence first. A disk failure must not
-            // make the next approval infer that this Run was clean.
-            {
-                let mut memory = memory.locked();
-                let entry = memory
-                    .entry((owner.session_id.clone(), owner.run_id.clone()))
-                    .or_default();
-                for source in &sources {
-                    if entry.len() < crate::provenance::MAX_ORIGINS && !entry.contains(source) {
-                        entry.push(source.clone());
-                    }
-                }
-            }
+            let scope = memory
+                .locked()
+                .get(&(owner.session_id.clone(), owner.run_id.clone()))
+                .and_then(std::sync::Weak::upgrade);
+            // No owner means this callback belongs to an expired operation.
+            let Some(scope) = scope else {
+                return;
+            };
+            scope.observe(&sources);
             let result = store
                 .lock()
                 .map_err(|_| anyhow!("source evidence store unavailable"))
@@ -1236,10 +1237,15 @@ impl Daemon {
                     )]
                 })
         };
-        if let Some(memory) = self.input_taint.locked().get(&(session.into(), run.into())) {
-            for source in memory {
-                if sources.len() < crate::provenance::MAX_ORIGINS && !sources.contains(source) {
-                    sources.push(source.clone());
+        let memory = self
+            .input_taint
+            .locked()
+            .get(&(session.into(), run.into()))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(memory) = memory {
+            for source in memory.sources() {
+                if sources.len() < crate::provenance::MAX_ORIGINS && !sources.contains(&source) {
+                    sources.push(source);
                 }
             }
         }
@@ -4987,6 +4993,7 @@ impl Daemon {
         cancel_flag: Arc<AtomicBool>,
         mut steer_rx: mpsc::UnboundedReceiver<()>,
     ) {
+        let taint_scope = self.taint_scope(&session_id, &run_id);
         let mut final_status = "completed";
         loop {
             match self
@@ -5030,6 +5037,7 @@ impl Daemon {
                 }
             }
         }
+        drop(taint_scope);
         self.finish_run(session_id, run_id, final_status).await;
     }
 
@@ -5050,9 +5058,6 @@ impl Daemon {
     /// run `run_end` hooks, and start the next queued message.
     async fn finish_run(self: &Arc<Self>, session_id: String, run_id: String, final_status: &str) {
         self.run_admissions.locked().remove(&run_id);
-        self.input_taint
-            .locked()
-            .remove(&(session_id.clone(), run_id.clone()));
         use futures_util::FutureExt;
         // run_panicked reaches this outside run_loop's unwind boundary too.
         // Whatever a tail step does, the queue drain remains reachable.
@@ -7335,11 +7340,7 @@ impl Daemon {
         let cfg = self.config()?;
         let cancel = CancellationToken::new();
         let run_id = format!("dry-run:{}", uuid::Uuid::new_v4());
-        let _taint_cleanup = crate::approval_preview::TaintCleanup::new(
-            self.input_taint.clone(),
-            session_id,
-            &run_id,
-        );
+        let _taint_scope = self.taint_scope(session_id, &run_id);
         // Reads are real (files, GETs, env), so the usual approval applies.
         if !self
             .ensure_approval(
@@ -7358,6 +7359,7 @@ impl Daemon {
         }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let ops = Arc::new(NestedOps {
+            _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: info.name.clone(),
             kv_scope: format!("tool:{}", info.id),
@@ -7503,12 +7505,25 @@ impl Daemon {
             entry.session_id == session,
             "pending result belongs to another Session"
         );
+        let mut origins = self.with_reader(|st| st.data_origins(session, &entry.run_id))?;
+        for origin in entry.taint_scope.sources() {
+            if origins.len() < crate::provenance::MAX_ORIGINS && !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+        origins.insert(
+            0,
+            crate::provenance::Origin::new(&entry.tool_name, "pending_tool", &entry.tool_name),
+        );
+        let consumer = self
+            .input_taint
+            .locked()
+            .get(&(session.into(), run.into()))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(consumer) = consumer {
+            consumer.observe(&origins);
+        }
         self.with_store(|st| {
-            let mut origins = st.data_origins(session, &entry.run_id)?;
-            origins.insert(
-                0,
-                crate::provenance::Origin::new(&entry.tool_name, "pending_tool", &entry.tool_name),
-            );
             for origin in origins {
                 st.record_data_origin(session, &format!("call:{}", json!([run, call])), &origin)?;
                 st.record_data_origin(session, run, &origin)?;
@@ -7586,6 +7601,7 @@ impl Daemon {
     ) -> String {
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
+            taint_scope: self.taint_scope(session_id, run_id),
             tool_name: name.to_string(),
             run_id: run_id.to_string(),
             started_ms: epoch_ms(),
@@ -7728,12 +7744,17 @@ impl Daemon {
         let mut delivered_origins = std::collections::BTreeSet::new();
         let mut content = "[Pending invocations completed]".to_string();
         for (handle, entry, text) in &ready {
-            let Ok(origins) = self.with_store(|st| st.data_origins(session_id, &entry.run_id))
+            let Ok(mut origins) = self.with_store(|st| st.data_origins(session_id, &entry.run_id))
             else {
                 // Keep the result available for the next boundary rather
                 // than silently dropping known provenance on a store error.
                 return;
             };
+            for origin in entry.taint_scope.sources() {
+                if origins.len() < crate::provenance::MAX_ORIGINS && !origins.contains(&origin) {
+                    origins.push(origin);
+                }
+            }
             for origin in &origins {
                 if delivered_origins.len() < crate::provenance::MAX_ORIGINS {
                     delivered_origins.insert(origin.clone());
@@ -11090,6 +11111,7 @@ impl Daemon {
         }
         let script_id = uuid::Uuid::new_v4().to_string();
         let ops = Arc::new(NestedOps {
+            _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: "run_script".into(),
             kv_scope: String::new(),
@@ -11320,6 +11342,7 @@ impl Daemon {
             );
         }
         let ops = Arc::new(NestedOps {
+            _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: d.name.clone(),
             kv_scope: format!("test:{}", d.name),
@@ -12485,6 +12508,7 @@ impl Daemon {
                 return outcome.map(|v| (v, inv_id));
             }
             let ops = Arc::new(NestedOps {
+                _taint_scope: self.taint_scope(&session_id, &run_id),
                 daemon: self.clone(),
                 tool_name: info.name.clone(),
                 kv_scope: format!("tool:{}", info.id),
@@ -14230,6 +14254,7 @@ fn mcp_state(s: &McpServerInfo) -> &'static str {
 /// blocking QuickJS thread (nested calls on threads of their own) and
 /// block_on the daemon executor.
 struct NestedOps {
+    _taint_scope: Arc<crate::approval_preview::RunTaint>,
     daemon: Arc<Daemon>,
     tool_name: String,
     /// The Tool's own store namespace ("tool:<id>"; "test:<name>" drafts).
