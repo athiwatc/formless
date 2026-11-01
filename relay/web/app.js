@@ -767,6 +767,106 @@
     modal("Stored Session comparison", body);
   }
 
+  function invalidateBranchSummary() {
+    const intent = S.branchSummaryIntent;
+    S.branchSummaryGeneration = (S.branchSummaryGeneration || 0) + 1;
+    S.branchSummaryIntent = null;
+    if (intent) { cancelAsk(intent.generateTag); cancelAsk(intent.reviewTag); }
+  }
+  function branchSummaryStampMatches(stamp) {
+    return stamp.generation === S.branchSummaryGeneration && stamp.target === S.current
+      && stamp.channel === S.channel && stamp.conn === S.conn && stamp.ws === S.ws;
+  }
+  function branchSummaryCurrent(stamp) {
+    return branchSummaryStampMatches(stamp) && S.branchSummaryIntent
+      && S.branchSummaryIntent.source === stamp.source && S.branchSummaryIntent.target === stamp.target;
+  }
+  function branchSummaryEvent(ev) {
+    const intent = S.branchSummaryIntent;
+    if (!intent) return;
+    const relevant = ["message_appended", "messages_edited", "session_updated", "session_deleted", "run_started", "run_finished", "run_paused", "compaction_notice"];
+    const id = ev.session_id || (ev.session && ev.session.id) || (ev.type === "session_deleted" && ev.id);
+    if (ev.type === "settings_changed" || (relevant.includes(ev.type) && (id === intent.source || id === intent.target))) {
+      invalidateBranchSummary();
+      note("A source or target Session changed; generate a fresh branch summary.");
+    }
+  }
+  async function branchSummaryHash(candidate) {
+    const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(candidate)));
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+  async function branchSummaryPreviewMatches(basis, preview) {
+    return preview && typeof preview.candidate === "string" && typeof preview.preview_id === "string" && preview.preview_id.length > 0
+      && basis.source_id === preview.source_id && basis.target_id === preview.target_id
+      && basis.source_revision === preview.source_revision && basis.target_revision === preview.target_revision
+      && typeof preview.candidate_hash === "string" && await branchSummaryHash(preview.candidate) === preview.candidate_hash
+      && Date.parse(preview.expires_at) > Date.now();
+  }
+  function branchSummaryReviewText(basis, preview) {
+    const usage = preview.usage, projection = preview.projection;
+    const lines = ["Source: " + basis.source_name + " (" + preview.source_id + ")", "Target: " + basis.target_name + " (" + preview.target_id + ")",
+      "Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown"),
+      "Reported usage: " + usage.reported_prompt_tokens + " input / " + usage.reported_completion_tokens + " output tokens · " + usage.reported_cached_tokens + " cached / " + usage.reported_cache_write_tokens + " cache-write · " + usage.reported_requests + "/" + usage.requests + " requests reported",
+      usage.usage_complete ? "Usage coverage: complete" : "Usage coverage: incomplete or unknown; missing usage is not zero",
+      usage.cost != null ? "Recorded cost: $" + usage.cost.toFixed(6) : "Total cost: unknown · priced subtotal only: $" + usage.priced_cost_subtotal.toFixed(6),
+      "Source projection: " + projection.included_messages + "/" + projection.total_messages + " messages and " + projection.included_bytes + "/" + projection.total_bytes + " bytes; " + projection.omitted_messages + " messages and " + projection.omitted_bytes + " bytes omitted; " + projection.truncated_messages + " messages truncated"];
+    if (projection.metadata_omitted) lines.push("Source metadata omitted from generation.");
+    if (projection.attachment_bodies_omitted) lines.push("Attachment bodies omitted from generation.");
+    if (usage.estimated_requests) lines.push(usage.estimated_requests + " request prices estimated from local prices");
+    if ((usage.unpriced || []).length) lines.push("Unpriced: " + usage.unpriced.join(", "));
+    lines.push(...(preview.warnings || []).map(warning => "Note: " + warning),
+      "Insert appends one note to the target Session; it does not merge transcripts or start a Run.", "Exact candidate note (data):", "", preview.candidate);
+    return lines.join("\n");
+  }
+  async function summariseBranchCommand(arg) {
+    invalidateBranchSummary();
+    const ref = (arg || "").trim();
+    if (ref === "cancel") return;
+    if (!S.current) return note("Open the target Session first.", true);
+    if (!globalThis.crypto?.subtle) return note("This browser cannot verify a summary candidate; use the TUI.", true);
+    let source;
+    try { source = resolveSessionRef(ref); } catch (error) { return note(error.message, true); }
+    if (source === S.current) return note("Choose another source branch for this target Session.", true);
+    const stamp = { generation: S.branchSummaryGeneration, source, target: S.current, channel: S.channel, conn: S.conn, ws: S.ws };
+    stamp.generateTag = "branch-summary:generate:" + stamp.generation;
+    stamp.reviewTag = "branch-summary:review:" + stamp.generation;
+    S.branchSummaryIntent = { source, target: stamp.target, generateTag: stamp.generateTag, reviewTag: stamp.reviewTag };
+    let preparing = true;
+    const pendingBody = h("p", null, "Source: " + source + " → Target: " + stamp.target);
+    ask({ tag: stamp.generateTag, title: "Generating branch summary", body: pendingBody, ok: "Cancel" }).then(() => {
+      if (preparing && branchSummaryCurrent(stamp)) invalidateBranchSummary();
+    });
+    const inspected = await act({ type: "inspect_branch_summary", source_id: source, target_id: stamp.target });
+    if (!inspected || !branchSummaryCurrent(stamp)) { preparing = false; cancelAsk(stamp.generateTag); if (branchSummaryCurrent(stamp)) invalidateBranchSummary(); return; }
+    const basis = JSON.parse(JSON.stringify(inspected));
+    if (basis.source_id !== source || basis.target_id !== stamp.target || !basis.source_revision || !basis.target_revision) {
+      preparing = false; invalidateBranchSummary(); return note("Branch summary basis did not match the requested source and target.", true);
+    }
+    pendingBody.textContent = "Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model;
+    const result = await act({ type: "prepare_branch_summary", source_id: source, target_id: stamp.target, source_revision: basis.source_revision, target_revision: basis.target_revision }, null, 120000);
+    preparing = false;
+    cancelAsk(stamp.generateTag);
+    if (!result || !branchSummaryCurrent(stamp)) { if (branchSummaryCurrent(stamp)) invalidateBranchSummary(); return; }
+    const preview = JSON.parse(JSON.stringify(result));
+    if (!(await branchSummaryPreviewMatches(basis, preview)) || !branchSummaryCurrent(stamp)) {
+      if (branchSummaryCurrent(stamp)) { invalidateBranchSummary(); note("Branch summary candidate was stale or did not match its source, target, revisions and exact hash.", true); }
+      return;
+    }
+    const body = h("pre", { class: "branch-summary-review" }, branchSummaryReviewText(basis, preview));
+    showBidi(body);
+    const accepted = await ask({ tag: stamp.reviewTag, title: "Review branch summary", body, ok: "Insert one note" });
+    if (!accepted) { if (branchSummaryCurrent(stamp)) invalidateBranchSummary(); return; }
+    if (!branchSummaryCurrent(stamp) || !(await branchSummaryPreviewMatches(basis, preview)) || !branchSummaryCurrent(stamp)) return;
+    S.branchSummaryIntent = null;
+    const applied = await act({ type: "commit_branch_summary", preview_id: preview.preview_id, source_id: source, target_id: stamp.target, source_revision: basis.source_revision, target_revision: basis.target_revision, candidate_hash: preview.candidate_hash });
+    if (!applied || !branchSummaryStampMatches(stamp)) return;
+    if (applied.preview_id !== preview.preview_id || applied.source_id !== source || applied.target_id !== stamp.target || applied.message?.session_id !== stamp.target || applied.message?.content !== preview.candidate) {
+      return note("Branch summary insertion reply did not match the reviewed candidate; inspect the target Session before retrying.", true);
+    }
+    onEvent({ type: "message_appended", session_id: stamp.target, message: applied.message });
+    note(applied.already_applied ? "This summary note was already inserted; no duplicate was added." : "Inserted one branch summary note; no Run was started.");
+  }
+
   function renderSessions() {
     const list = $("sessions");
     list.replaceChildren();
@@ -3923,6 +4023,7 @@
     for (const q of questions) cancelAsk("question:" + q.id);
   }
   function clearLiveState() {
+    invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
     S.sessionSnapshot = null;
     S.approvals = [];
@@ -3975,6 +4076,7 @@
   /** Open a session; `stay` keeps the current view (initial load). */
   let sessionSeq = 0;
   async function openSession(id, stay) {
+    if (S.current !== id) invalidateBranchSummary();
     const seq = ++sessionSeq;
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
@@ -4426,6 +4528,7 @@
     { name: "status", group: "Settings", desc: "the daemon: memory, CPU, database, running work", run: () => showStatus() },
     { name: "storage", group: "Settings", desc: "disk used by Sessions, artifacts, logs, backups", run: () => showStorage() },
     { name: "gc", group: "Settings", desc: "clean up: shows what it frees first", run: () => showGc() },
+    { name: "summarise-branch", args: "SOURCE_SESSION", group: "Session", desc: "generate a branch summary for review, then insert one note here", run: summariseBranchCommand },
     { name: "compare", args: "SESSION_A SESSION_B", group: "Session", desc: "compare stored branch messages and recorded usage (no model call)", run: compareSessionsCommand },
     { name: "compare-models", args: "MODEL_A MODEL_B [PROMPT]", group: "Run control", desc: "the same prompt on two models, side by side with time and cost", run: compareModelsCommand },
     { name: "step", group: "Run control", desc: "step mode: pause before each Tool call", run: async () => {
@@ -4809,6 +4912,7 @@
   }
 
   function onEvent(ev) {
+    branchSummaryEvent(ev);
     if (["settings_changed", "registry_changed", "session_updated", "messages_edited", "compaction_notice", "tool_updated", "tool_deleted", "message_appended", "message_complete", "run_started", "run_finished", "run_paused"].includes(ev.type)) {
       forecastRevision++;
       scheduleForecast();

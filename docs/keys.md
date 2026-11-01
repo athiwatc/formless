@@ -73,6 +73,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/instructions [TEXT\|clear]` | standing instructions for this Session's agent |
 | `/context` | how full the context window is, and what fills it |
 | `/undo [tool]` | undo the last Session delete; `tool`: the last Tool registry change |
+| `/summarise-branch SOURCE_SESSION` | generate a branch summary for review, then insert one note here |
 | `/compare SESSION_A SESSION_B` | compare stored branches and recorded usage (no model call) |
 
 ### Run control
