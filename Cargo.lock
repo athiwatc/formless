@@ -1383,6 +1383,7 @@ dependencies = [
 name = "formless-protocol"
 version = "0.1.0"
 dependencies = [
+ "idna",
  "serde",
  "serde_json",
 ]
@@ -1393,6 +1394,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "formless-protocol",
  "jsonschema",
  "libc",
  "rand 0.8.8",

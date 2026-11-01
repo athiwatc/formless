@@ -1080,6 +1080,15 @@ purity is untouched):
 
 ### 6.4 Outcomes
 
+- Pending-handle references copied by a Session fork are transcript data only;
+  they are not rebound to the fork. Agent `await_invocation`, `check_invocation`
+  and `abandon_invocation` accept only handles owned by their calling Session.
+  Foreign handles answer the same unknown-handle error as nonexistent handles,
+  including persisted interrupted handles after restart; the lookup neither
+  reveals the owner's result nor consumes, abandons or deletes its handle.
+  The original Session keeps its own single delivery. User control requests
+  `CancelInvocation`/`AbandonInvocation` remain intentionally cross-Session (§6.3).
+
 An Invocation ends only by: completion (success/failure by §8), sandbox fault
 (including memory-cap fault), or user cancellation. User-cancelled
 Invocations are tagged distinctly so the optimiser does not “fix” a Tool the
@@ -3022,10 +3031,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   call runs unasked when everything sensitive it asks for is a trusted
   write (below) or a `net:` host on the list, and is logged as
   `tool.approve_trusted`.
-  - **Matching:** `api.example.com` matches that host and its subdomains
-    (as a `net:` grant does everywhere); `*.github.com` matches
-    `github.com` and every subdomain. Look-alikes (`evilgithub.com`) don't
-    match.
+  - **Matching:** `api.example.com` matches only that host;
+    `*.github.com` matches proper subdomains and excludes `github.com` itself.
+    Explicit port restrictions are preserved. Look-alikes (`evilgithub.com`)
+    don't match. Settings and `/security` show offline PSL/wildcard warnings
+    for configured trust, including PRIVATE public suffixes such as `github.io`.
   - **Never trusted:** bare `net` (any host), a grant wider than the
     trusted host (`net:example.com` against `api.example.com`), `*` and a
     bare TLD. Like trusted folders, it is set in `config.toml` only.
@@ -3069,8 +3079,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   only the answer that resolves a prompt counts): the call's new sensitive
   Capabilities are remembered (`denials` table, logged
   `tool.deny_always`) and every later call of any Tool that needs access
-  they cover (a denied `net:example.com` covers its subdomains, a bare
-  `net` all hosts) fails without a prompt, logged `tool.deny_remembered`,
+  they cover (a denied `net:example.com` covers that exact host,
+  `net:*.example.com` its proper subdomains, and bare `net` all hosts) fails without a prompt, logged `tool.deny_remembered`,
   even with approvals off (`security.secure = false`).
   The agent's error says so ("the user always denies net:…; don't
   attempt this access with any Tool"). `formless approvals denials`
@@ -4365,6 +4375,39 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   the family freeze, so an in-use child or a newly created profile cannot be
   erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
+
+Network grants name an exact host unless their spec explicitly begins `*.`.
+`net:example.com` no longer authorizes `child.example.com`; existing stored grants
+are narrowed without being silently upgraded. `net:*.example.com` authorizes
+proper subdomains (including deeper labels), excludes the apex, and preserves any
+explicit port restriction. Input-bound URL values always resolve to concrete
+hosts and cannot create wildcard authority. Runtime fetches, every redirect hop
+and grant coverage share these rules. Wildcards never authorize private-address
+exceptions: those still require an exact host and matching port.
+
+Approval metadata identifies the actual localized registry arguments being
+reviewed, with bounded redacted URLs (host/path and query keys), file paths and
+non-GET body byte counts/previews where present. Missing or computed JavaScript
+request details are labelled unresolved, never inferred from capability strings.
+This preview adds visibility; it does not scope-check request paths/bodies or
+change existing Always/Session/hour grant lifetimes. Public-suffix scope warnings
+use a pinned offline full ICANN+PRIVATE PSL snapshot, including wildcard and
+exception rules; no runtime download is allowed. Approvals also show sources of
+untrusted framed content actually supplied to the model in this Run, including
+Skill metadata and results without known physical origins. That banner is
+informational, belongs to the explicit Run/Session, survives reconnect with the
+approval, and cannot be cleared by an empty source list or forged payload text.
+Accepted-input fallback evidence is owned by the active Run, nested execution,
+and retained pending handles. A pending call may accept model input after its
+Run ends: its evidence remains available until the result is delivered or the
+handle is forgotten. Abandoning an already completed handle releases it
+immediately; abandoning running work retains ownership until that work exits.
+Session deletion uses the same flag-first completion handshake, so concurrent
+completion cannot strand an abandoned handle. Providers retain only a weak lookup, so cached providers
+cannot keep completed operation evidence alive. Failed evidence persistence
+keeps known sources in memory; failed deferred delivery retains the handle for
+retry, and never reports a clean consumer because a write failed. Ownership and
+source locks are released before database access or asynchronous waits.
 
 Third-party Tool, MCP, Skill and module descriptions share a 1,024-character
 Unicode limit. Intake and legacy projection normalize newlines, terminal/control

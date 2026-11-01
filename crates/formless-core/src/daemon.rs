@@ -404,6 +404,7 @@ type ExecFuture = std::pin::Pin<
 >;
 
 pub(crate) struct PendingEntry {
+    taint_scope: Arc<crate::approval_preview::RunTaint>,
     tool_name: String,
     run_id: String,
     /// When the call started (epoch ms), for the Invocations panel.
@@ -621,6 +622,7 @@ pub struct Daemon {
     forecast_admission: StdMutex<()>,
     forecast_consents: StdMutex<HashMap<String, ForecastConsent>>,
     run_admissions: StdMutex<HashMap<String, Arc<RunAdmission>>>,
+    input_taint: crate::approval_preview::TaintIndex,
     #[cfg(test)]
     forecast_admission_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
@@ -810,6 +812,7 @@ impl Daemon {
             forecast_admission: StdMutex::new(()),
             forecast_consents: StdMutex::new(Default::default()),
             run_admissions: StdMutex::new(Default::default()),
+            input_taint: Arc::new(StdMutex::new(Default::default())),
             #[cfg(test)]
             forecast_admission_test: StdMutex::new(None),
             step_limits: StdMutex::new(Default::default()),
@@ -984,6 +987,7 @@ impl Daemon {
                     .with_name(n)
                     .with_usage_hook(self.usage_hook())
                     .with_prompt_hook(self.prompt_hook())
+                    .with_input_hook(self.input_hook())
                     .with_request_hook(self.request_hook())
                     .with_breaker_note_hook(self.provider_breaker_note_hook()),
                 )
@@ -1076,6 +1080,7 @@ impl Daemon {
                 .with_name(crate::config::DEFAULT_PROVIDER)
                 .with_usage_hook(self.usage_hook())
                 .with_prompt_hook(self.prompt_hook())
+                .with_input_hook(self.input_hook())
                 .with_request_hook(self.request_hook())
                 .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
@@ -1168,6 +1173,95 @@ impl Daemon {
                 result.context(crate::provider::UsageAccountingFailure)
             },
         )
+    }
+
+    fn taint_scope(&self, session: &str, run: &str) -> Arc<crate::approval_preview::RunTaint> {
+        crate::approval_preview::RunTaint::acquire(&self.input_taint, session, run)
+    }
+
+    fn input_hook(&self) -> crate::provider::InputHook {
+        let store = self.store.clone();
+        let memory = self.input_taint.clone();
+        Arc::new(move |body| {
+            let Ok(owner) = USAGE_FOR.try_with(Clone::clone) else {
+                return;
+            };
+            if owner.session_id.is_empty() || owner.run_id.is_empty() || owner.run_id == "direct" {
+                return;
+            }
+            let sources = crate::approval_preview::input_sources(body);
+            if sources.is_empty() {
+                return;
+            }
+            let scope = memory
+                .locked()
+                .get(&(owner.session_id.clone(), owner.run_id.clone()))
+                .and_then(std::sync::Weak::upgrade);
+            // No owner means this callback belongs to an expired operation.
+            let Some(scope) = scope else {
+                return;
+            };
+            scope.observe(&sources);
+            let result = store
+                .lock()
+                .map_err(|_| anyhow!("source evidence store unavailable"))
+                .and_then(|st| {
+                    for source in sources {
+                        st.record_data_origin(&owner.session_id, &owner.run_id, &source)?;
+                    }
+                    Ok(())
+                });
+            if let Err(error) = result {
+                tracing::warn!("could not persist Run source evidence: {error:#}");
+            }
+        })
+    }
+
+    fn approval_context(
+        &self,
+        cfg: &Config,
+        session: &str,
+        run: &str,
+        caps: &Capabilities,
+        input: Option<&Value>,
+    ) -> formless_protocol::ApprovalContext {
+        let mut sources = if run == "direct" {
+            Vec::new()
+        } else {
+            self.with_reader(|st| st.data_origins(session, run))
+                .unwrap_or_else(|_| {
+                    vec![crate::provenance::Origin::new(
+                        "unknown",
+                        "unavailable",
+                        "source evidence unavailable; assume external content",
+                    )]
+                })
+        };
+        let memory = self
+            .input_taint
+            .locked()
+            .get(&(session.into(), run.into()))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(memory) = memory {
+            for source in memory.sources() {
+                if sources.len() < crate::provenance::MAX_ORIGINS && !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
+        formless_protocol::ApprovalContext {
+            run_id: (!run.is_empty() && run != "direct").then(|| run.to_string()),
+            call: Some(crate::approval_preview::call(input, cfg)),
+            sources: sources
+                .iter()
+                .map(crate::approval_preview::source)
+                .collect(),
+            scope_warnings: caps
+                .to_specs()
+                .iter()
+                .filter_map(|spec| formless_protocol::net_scope::scope_warning(spec))
+                .collect(),
+        }
     }
 
     fn prompt_hook(&self) -> crate::provider::PromptHook {
@@ -2443,6 +2537,7 @@ impl Daemon {
                     "broad_grants": broad,
                     "denials": denials,
                     "trusted_paths": cfg.security.roots(),
+                    "network_scope_warnings": cfg.security.network_scope_warnings(),
                     "trust_writes": cfg.security.trust_writes,
                     "mcp_servers": servers,
                     "trusted_hooks": hooks,
@@ -3550,7 +3645,7 @@ impl Daemon {
                     .pending_get(&handle)
                     .context(RequestFailure::not_found("no invocation with that handle"))?;
                 // The agent stops waiting for it; it may still finish.
-                entry.abandoned.store(true, Ordering::SeqCst);
+                self.abandon_pending(&handle, &entry);
                 let _ =
                     self.with_store(|st| st.audit("user", "invocation.abandon", &entry.tool_name));
                 Ok(json!({"abandoned": handle}))
@@ -4393,11 +4488,16 @@ impl Daemon {
             ctl.cancel_flag.store(true, Ordering::SeqCst);
             ctl.cancel.cancel();
         }
-        for entry in self.pending.locked().values() {
-            if entry.session_id == session_id {
-                entry.abandoned.store(true, Ordering::SeqCst);
-                entry.notify.notify_waiters();
-            }
+        let pending: Vec<_> = self
+            .pending
+            .locked()
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(handle, entry)| (handle.clone(), entry.clone()))
+            .collect();
+        for (handle, entry) in pending {
+            self.abandon_pending(&handle, &entry);
+            entry.notify.notify_waiters();
         }
         for _ in 0..100 {
             if !self.runs.locked().contains_key(session_id) {
@@ -4898,6 +4998,7 @@ impl Daemon {
         cancel_flag: Arc<AtomicBool>,
         mut steer_rx: mpsc::UnboundedReceiver<()>,
     ) {
+        let taint_scope = self.taint_scope(&session_id, &run_id);
         let mut final_status = "completed";
         loop {
             match self
@@ -4941,6 +5042,7 @@ impl Daemon {
                 }
             }
         }
+        drop(taint_scope);
         self.finish_run(session_id, run_id, final_status).await;
     }
 
@@ -5862,7 +5964,7 @@ impl Daemon {
                     }
                     for (handle, _n) in &live {
                         if let Some(entry) = self.pending_get(handle) {
-                            entry.abandoned.store(true, Ordering::SeqCst);
+                            self.abandon_pending(handle, &entry);
                         }
                     }
                 }
@@ -6402,6 +6504,7 @@ impl Daemon {
         {
             for capability in caps {
                 out.push(GrantInfo {
+                    scope_warning: None,
                     tool_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
                     capability,
@@ -6441,6 +6544,7 @@ impl Daemon {
                 .unwrap_or_default();
             for capability in specs {
                 out.push(GrantInfo {
+                    scope_warning: None,
                     tool_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
                     capability,
@@ -6470,6 +6574,7 @@ impl Daemon {
                 .unwrap_or_default();
             for capability in specs {
                 out.push(GrantInfo {
+                    scope_warning: None,
                     tool_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
                     capability,
@@ -6488,6 +6593,9 @@ impl Daemon {
             for g in &mut out {
                 g.trusted = self.trust_approves(&cfg, &g.tool_id, &g.capability);
             }
+        }
+        for grant in &mut out {
+            grant.scope_warning = formless_protocol::net_scope::scope_warning(&grant.capability);
         }
         Ok(out)
     }
@@ -6611,7 +6719,16 @@ impl Daemon {
                     continue;
                 };
                 if !self
-                    .ensure_approval(cfg, session_id, &info, &ver, &caps, Some(&input), cancel)
+                    .ensure_approval(
+                        cfg,
+                        session_id,
+                        run_id,
+                        &info,
+                        &ver,
+                        &caps,
+                        Some(&input),
+                        cancel,
+                    )
                     .await
                 {
                     denied.insert(tc.id.clone(), true);
@@ -6759,7 +6876,10 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => call_failed(format!("error: find_tools failed: {e}")),
             },
-            toolreg::ADD_MCP_SERVER => self.agent_add_mcp_server(session_id, &args, cancel).await,
+            toolreg::ADD_MCP_SERVER => {
+                self.agent_add_mcp_server(session_id, run_id, &args, cancel)
+                    .await
+            }
             toolreg::LOAD_SKILL => match self.load_skill_impl(session_id, run_id, &args) {
                 Ok(text) => text,
                 Err(e) => call_failed(format!("error: load_skill failed: {e}")),
@@ -6769,7 +6889,10 @@ impl Daemon {
                 Err(e) => call_failed(format!("error: read_metrics failed: {e}")),
             },
             toolreg::SCHEDULE_RUN => {
-                match self.schedule_run_impl(session_id, &args, cancel).await {
+                match self
+                    .schedule_run_impl(session_id, run_id, &args, cancel)
+                    .await
+                {
                     Ok(text) => text,
                     Err(e) => call_failed(format!("error: schedule_run failed: {e}")),
                 }
@@ -6778,7 +6901,10 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => call_failed(format!("error: ask_user failed: {e}")),
             },
-            toolreg::REMEMBER => match self.remember_impl(session_id, &args, cfg, cancel).await {
+            toolreg::REMEMBER => match self
+                .remember_impl(session_id, run_id, &args, cfg, cancel)
+                .await
+            {
                 Ok(text) => text,
                 Err(e) => call_failed(format!("error: remember failed: {e}")),
             },
@@ -6795,13 +6921,19 @@ impl Daemon {
                 Err(e) => call_failed(format!("error: read_skill_file failed: {e}")),
             },
             toolreg::LIST_MCP_RESOURCES => {
-                match self.list_mcp_resources(session_id, &args, cancel).await {
+                match self
+                    .list_mcp_resources(session_id, run_id, &args, cancel)
+                    .await
+                {
                     Ok(v) => v.to_string(),
                     Err(e) => call_failed(format!("error: list_mcp_resources failed: {e}")),
                 }
             }
             toolreg::READ_MCP_RESOURCE => {
-                match self.read_mcp_resource(session_id, &args, cfg, cancel).await {
+                match self
+                    .read_mcp_resource(session_id, run_id, &args, cfg, cancel)
+                    .await
+                {
                     Ok(text) => text,
                     Err(e) => call_failed(format!("error: read_mcp_resource failed: {e}")),
                 }
@@ -6812,6 +6944,7 @@ impl Daemon {
                 let (approved, _) = self
                     .ask_user_approval(
                         session_id,
+                        run_id,
                         "remove_mcp_server",
                         vec![format!("remove MCP server '{name}'")],
                         format!(
@@ -6982,7 +7115,7 @@ impl Daemon {
                     .filter(|entry| entry.session_id == session_id)
                 {
                     Some(entry) => {
-                        entry.abandoned.store(true, Ordering::SeqCst);
+                        self.abandon_pending(handle, &entry);
                         json!({"abandoned": handle}).to_string()
                     }
                     None => self.stale_handle_answer(session_id, handle),
@@ -7138,6 +7271,7 @@ impl Daemon {
             let (ok, _) = self
                 .ask_user_approval(
                     session_id,
+                    run_id,
                     "hook command",
                     vec![format!("process:{cmd}")],
                     format!(
@@ -7215,20 +7349,32 @@ impl Daemon {
         let caps = bound_caps(&ver, &input).map_err(|e| anyhow!(e))?;
         let cfg = self.config()?;
         let cancel = CancellationToken::new();
+        let run_id = format!("dry-run:{}", uuid::Uuid::new_v4());
+        let _taint_scope = self.taint_scope(session_id, &run_id);
         // Reads are real (files, GETs, env), so the usual approval applies.
         if !self
-            .ensure_approval(&cfg, session_id, &info, &ver, &caps, Some(&input), &cancel)
+            .ensure_approval(
+                &cfg,
+                session_id,
+                &run_id,
+                &info,
+                &ver,
+                &caps,
+                Some(&input),
+                &cancel,
+            )
             .await
         {
             bail!("approval denied");
         }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let ops = Arc::new(NestedOps {
+            _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: info.name.clone(),
             kv_scope: format!("tool:{}", info.id),
             session_id: session_id.to_string(),
-            run_id: "dry-run".into(),
+            run_id: run_id.clone(),
             parent_inv: None,
             activity: None,
             depth: 1,
@@ -7369,18 +7515,56 @@ impl Daemon {
             entry.session_id == session,
             "pending result belongs to another Session"
         );
+        let mut origins = self.with_reader(|st| st.data_origins(session, &entry.run_id))?;
+        for origin in entry.taint_scope.sources() {
+            if origins.len() < crate::provenance::MAX_ORIGINS && !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+        origins.insert(
+            0,
+            crate::provenance::Origin::new(&entry.tool_name, "pending_tool", &entry.tool_name),
+        );
+        let consumer = self
+            .input_taint
+            .locked()
+            .get(&(session.into(), run.into()))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(consumer) = consumer {
+            consumer.observe(&origins);
+        }
         self.with_store(|st| {
-            let mut origins = st.data_origins(session, &entry.run_id)?;
-            origins.insert(
-                0,
-                crate::provenance::Origin::new(&entry.tool_name, "pending_tool", &entry.tool_name),
-            );
             for origin in origins {
                 st.record_data_origin(session, &format!("call:{}", json!([run, call])), &origin)?;
                 st.record_data_origin(session, run, &origin)?;
             }
             Ok(())
         })
+    }
+
+    /// Mark first, then inspect completion. Either this side sees the result,
+    /// or the completing worker sees the flag; neither ordering can strand a
+    /// completed owner. Never acquire the pending map while holding result.
+    fn abandon_pending(&self, handle: &str, entry: &PendingEntry) {
+        entry.abandoned.store(true, Ordering::SeqCst);
+        let completed = entry.result.locked().is_some();
+        if completed {
+            self.forget_pending(handle);
+        }
+    }
+
+    fn complete_pending(&self, handle: &str, entry: &PendingEntry, ok: bool, text: String) {
+        *entry.result.locked() = Some((ok, text));
+        entry.notify.notify_waiters();
+        self.broadcast(Event::InvocationCompleted {
+            session_id: entry.session_id.clone(),
+            handle: handle.to_string(),
+            tool_name: entry.tool_name.clone(),
+            ok,
+        });
+        if entry.abandoned.load(Ordering::SeqCst) {
+            self.forget_pending(handle);
+        }
     }
 
     /// Drop a handle from memory and from the persisted record.
@@ -7452,6 +7636,7 @@ impl Daemon {
     ) -> String {
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
+            taint_scope: self.taint_scope(session_id, run_id),
             tool_name: name.to_string(),
             run_id: run_id.to_string(),
             started_ms: epoch_ms(),
@@ -7521,17 +7706,7 @@ impl Daemon {
                     }
                     Err(e) => (false, format!("error: {e}")),
                 };
-                *entry2.result.locked() = Some((ok, text));
-                entry2.notify.notify_waiters();
-                this.broadcast(Event::InvocationCompleted {
-                    session_id: sid,
-                    handle: handle2.clone(),
-                    tool_name: nm,
-                    ok,
-                });
-                if entry2.abandoned.load(Ordering::SeqCst) {
-                    this.forget_pending(&handle2);
-                }
+                this.complete_pending(&handle2, &entry2, ok, text);
             });
         }
         let threshold = std::time::Duration::from_secs(cfg.tools.pending_threshold_secs);
@@ -7594,12 +7769,17 @@ impl Daemon {
         let mut delivered_origins = std::collections::BTreeSet::new();
         let mut content = "[Pending invocations completed]".to_string();
         for (handle, entry, text) in &ready {
-            let Ok(origins) = self.with_store(|st| st.data_origins(session_id, &entry.run_id))
+            let Ok(mut origins) = self.with_store(|st| st.data_origins(session_id, &entry.run_id))
             else {
                 // Keep the result available for the next boundary rather
                 // than silently dropping known provenance on a store error.
                 return;
             };
+            for origin in entry.taint_scope.sources() {
+                if origins.len() < crate::provenance::MAX_ORIGINS && !origins.contains(&origin) {
+                    origins.push(origin);
+                }
+            }
             for origin in &origins {
                 if delivered_origins.len() < crate::provenance::MAX_ORIGINS {
                     delivered_origins.insert(origin.clone());
@@ -8963,6 +9143,7 @@ impl Daemon {
     pub(crate) async fn harness_call(
         &self,
         session_id: &str,
+        run_id: &str,
         tool: &str,
         op: &str,
         args: &Value,
@@ -8982,6 +9163,7 @@ impl Daemon {
         let (approved, _) = self
             .ask_user_approval(
                 session_id,
+                run_id,
                 &format!("harness {op}"),
                 vec![format!("harness:{scope}")],
                 detail,
@@ -10055,6 +10237,7 @@ impl Daemon {
     async fn schedule_run_impl(
         &self,
         session_id: &str,
+        run_id: &str,
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<String> {
@@ -10076,6 +10259,7 @@ impl Daemon {
                 let (ok, _) = self
                     .ask_user_approval(
                         session_id,
+                        run_id,
                         "schedule_run",
                         vec![format!("cron {c}")],
                         format!(
@@ -10490,6 +10674,7 @@ impl Daemon {
     async fn remember_impl(
         &self,
         session_id: &str,
+        run_id: &str,
         args: &Value,
         cfg: &Config,
         cancel: &CancellationToken,
@@ -10525,6 +10710,7 @@ impl Daemon {
             let (keep, _) = self
                 .ask_user_approval(
                     session_id,
+                    run_id,
                     "memory",
                     vec![format!("memory: {cleaned}")],
                     format!(
@@ -10615,6 +10801,7 @@ impl Daemon {
     async fn mcp_server_allowed(
         &self,
         session_id: &str,
+        run_id: &str,
         server: &str,
         cancel: &CancellationToken,
     ) -> bool {
@@ -10627,6 +10814,7 @@ impl Daemon {
         let (ok, scope) = self
             .ask_user_approval(
                 session_id,
+                run_id,
                 &format!("mcp:{server}"),
                 vec![format!("read resources of MCP server '{server}'")],
                 format!("Allow Formless to use the MCP server '{server}'?"),
@@ -10642,6 +10830,7 @@ impl Daemon {
     async fn list_mcp_resources(
         &self,
         session_id: &str,
+        run_id: &str,
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
@@ -10652,7 +10841,10 @@ impl Daemon {
             if s.disabled || args["server"].as_str().is_some_and(|w| w != name) {
                 continue;
             }
-            if !self.mcp_server_allowed(session_id, name, cancel).await {
+            if !self
+                .mcp_server_allowed(session_id, run_id, name, cancel)
+                .await
+            {
                 continue;
             }
             let conn = self.mcp.connection(&self.paths, &cfg.mcp, name).await?;
@@ -10674,13 +10866,17 @@ impl Daemon {
     async fn read_mcp_resource(
         &self,
         session_id: &str,
+        run_id: &str,
         args: &Value,
         cfg: &Config,
         cancel: &CancellationToken,
     ) -> Result<String> {
         let server = args["server"].as_str().context("server required")?;
         let uri = args["uri"].as_str().context("uri required")?;
-        if !self.mcp_server_allowed(session_id, server, cancel).await {
+        if !self
+            .mcp_server_allowed(session_id, run_id, server, cancel)
+            .await
+        {
             return Ok("error: the user did not approve using this MCP server".into());
         }
         let conn = self.mcp.connection(&self.paths, &cfg.mcp, server).await?;
@@ -10695,6 +10891,7 @@ impl Daemon {
     async fn agent_add_mcp_server(
         &self,
         session_id: &str,
+        run_id: &str,
         args: &Value,
         cancel: &CancellationToken,
     ) -> String {
@@ -10729,6 +10926,7 @@ impl Daemon {
         let (approved, _) = self
             .ask_user_approval(
                 session_id,
+                run_id,
                 "add_mcp_server",
                 items,
                 crate::mcp_catalog::redact_server_text(
@@ -10923,7 +11121,16 @@ impl Daemon {
             }
             let caps = Capabilities::parse(&ver.capabilities).map_err(|e| anyhow!(e))?;
             if !self
-                .ensure_approval(cfg, session_id, &info, &ver, &caps.unbound(), None, cancel)
+                .ensure_approval(
+                    cfg,
+                    session_id,
+                    run_id,
+                    &info,
+                    &ver,
+                    &caps.unbound(),
+                    None,
+                    cancel,
+                )
                 .await
             {
                 bail!("{}", self.denied_text(&name));
@@ -10934,6 +11141,7 @@ impl Daemon {
         }
         let script_id = uuid::Uuid::new_v4().to_string();
         let ops = Arc::new(NestedOps {
+            _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: "run_script".into(),
             kv_scope: String::new(),
@@ -11152,7 +11360,16 @@ impl Daemon {
             code: d.code.clone(),
         };
         if !self
-            .ensure_approval(cfg, session_id, &info, &ver, &caps, None, cancel)
+            .ensure_approval(
+                cfg,
+                session_id,
+                run_id,
+                &info,
+                &ver,
+                &caps,
+                Some(&input),
+                cancel,
+            )
             .await
         {
             return Ok(
@@ -11161,6 +11378,7 @@ impl Daemon {
             );
         }
         let ops = Arc::new(NestedOps {
+            _taint_scope: self.taint_scope(&session_id, &run_id),
             daemon: self.clone(),
             tool_name: d.name.clone(),
             kv_scope: format!("test:{}", d.name),
@@ -11243,6 +11461,7 @@ impl Daemon {
         self: &Arc<Self>,
         cfg: &Config,
         session_id: &str,
+        run_id: &str,
         info: &ToolInfo,
         ver: &ToolVersionInfo,
         caps: &Capabilities,
@@ -11293,7 +11512,7 @@ impl Daemon {
         let mut detail = None;
         if let Some(server) = caps.mcp.first() {
             match self
-                .mcp_preapproval(cfg, session_id, server, info, ver, input, cancel)
+                .mcp_preapproval(cfg, session_id, run_id, server, info, ver, input, cancel)
                 .await
             {
                 McpApproval::Denied => return false,
@@ -11455,6 +11674,7 @@ impl Daemon {
         // New path grants can be widened to a folder or repository.
         let path_options = path_options(caps, prior.as_ref().map(|(p, _)| p));
         self.broadcast(Event::ApprovalRequested {
+            context: Some(self.approval_context(cfg, session_id, run_id, caps, input)),
             approval_id: approval_id.clone(),
             session_id: session_id.to_string(),
             tool_name: info.name.clone(),
@@ -12229,7 +12449,16 @@ impl Daemon {
             };
             if !preapproved
                 && !self
-                    .ensure_approval(&cfg, &session_id, &info, &ver, &caps, Some(&input), &cancel)
+                    .ensure_approval(
+                        &cfg,
+                        &session_id,
+                        &run_id,
+                        &info,
+                        &ver,
+                        &caps,
+                        Some(&input),
+                        &cancel,
+                    )
                     .await
             {
                 self.record_inv(
@@ -12315,6 +12544,7 @@ impl Daemon {
                 return outcome.map(|v| (v, inv_id));
             }
             let ops = Arc::new(NestedOps {
+                _taint_scope: self.taint_scope(&session_id, &run_id),
                 daemon: self.clone(),
                 tool_name: info.name.clone(),
                 kv_scope: format!("tool:{}", info.id),
@@ -12951,6 +13181,7 @@ impl Daemon {
     async fn ask_user_approval(
         &self,
         session_id: &str,
+        run_id: &str,
         what: &str,
         items: Vec<String>,
         detail: String,
@@ -12965,7 +13196,14 @@ impl Daemon {
             .lock()
             .unwrap()
             .insert(approval_id.clone(), tx);
+        let context = self.config().ok().map(|cfg| {
+            let mut context =
+                self.approval_context(&cfg, session_id, run_id, &Capabilities::default(), None);
+            context.call = None;
+            context
+        });
         self.broadcast(Event::ApprovalRequested {
+            context,
             path_options: Default::default(),
             approval_id: approval_id.clone(),
             session_id: session_id.to_string(),
@@ -13002,6 +13240,7 @@ impl Daemon {
         &self,
         cfg: &Config,
         session_id: &str,
+        run_id: &str,
         server: &str,
         info: &ToolInfo,
         ver: &ToolVersionInfo,
@@ -13027,6 +13266,7 @@ impl Daemon {
             let (ok, scope) = self
                 .ask_user_approval(
                     session_id,
+                    run_id,
                     &format!("mcp:{server}"),
                     vec![target.clone()],
                     format!("Allow Formless to use the MCP server '{server}'?\n{target}"),
@@ -13057,7 +13297,9 @@ impl Daemon {
             detail.push_str("\nThe server marks this tool as read-only.");
         }
         if let Some(input) = input {
-            let shown: String = input.to_string().chars().take(400).collect();
+            let shown = crate::approval_preview::call(Some(input), cfg)
+                .arguments
+                .to_string();
             detail.push_str(&format!("\ninput: {shown}"));
         }
         McpApproval::AskTool(detail)
@@ -14048,6 +14290,7 @@ fn mcp_state(s: &McpServerInfo) -> &'static str {
 /// blocking QuickJS thread (nested calls on threads of their own) and
 /// block_on the daemon executor.
 struct NestedOps {
+    _taint_scope: Arc<crate::approval_preview::RunTaint>,
     daemon: Arc<Daemon>,
     tool_name: String,
     /// The Tool's own store namespace ("tool:<id>"; "test:<name>" drafts).
@@ -14156,6 +14399,7 @@ impl HostOps for NestedOps {
             .unwrap_or_else(|| self.kv_scope.clone());
         self.block_cancellable(self.daemon.harness_call(
             &self.session_id,
+            &self.run_id,
             &tool,
             op,
             args,
@@ -14965,6 +15209,7 @@ mod trust_precedence_tests {
             .ensure_approval(
                 &cfg,
                 &sid,
+                "",
                 &info,
                 &ver,
                 &caps,
@@ -15638,7 +15883,7 @@ mod grant_code_tests {
         let cancel = CancellationToken::new();
         assert!(
             daemon
-                .ensure_approval(&cfg, &sid, &info1, &v1, &caps, None, &cancel)
+                .ensure_approval(&cfg, &sid, "", &info1, &v1, &caps, None, &cancel)
                 .await,
             "v1 runs on its grant"
         );
@@ -15661,7 +15906,7 @@ mod grant_code_tests {
         assert_ne!(code_hash(&v1), code_hash(&v2));
         assert!(
             !daemon
-                .ensure_approval(&cfg, &sid, &info2, &v2, &caps, None, &cancel)
+                .ensure_approval(&cfg, &sid, "", &info2, &v2, &caps, None, &cancel)
                 .await,
             "v2 needs a new answer (and nobody is here to give it)"
         );
@@ -15742,6 +15987,7 @@ mod widen_scope_tests {
                     d.ensure_approval(
                         &cfg,
                         &sid,
+                        "",
                         &info,
                         &ver,
                         &caps,
@@ -16115,7 +16361,7 @@ mod mcp_approval_redaction_tests {
             json!({"name":"safe-stdio", "transport":"stdio", "command":"npx", "args":["postgresql://u:pw@h/db"], "reason":"connect postgresql://u:pw@h/db"}),
         ] {
             let cancel = CancellationToken::new();
-            let pending = daemon.agent_add_mcp_server(&sid, &args, &cancel);
+            let pending = daemon.agent_add_mcp_server(&sid, "", &args, &cancel);
             let inspect_and_deny = async {
                 let (approval_id, detail) =
                     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -16272,6 +16518,7 @@ mod live_snapshot_tests {
         daemon.approvals.locked().insert("pending".into(), tx);
         for session in [&sid, &"other-session".to_string()] {
             daemon.broadcast(Event::ApprovalRequested {
+                context: None,
                 approval_id: if session == &sid { "pending" } else { "other" }.into(),
                 session_id: session.clone(),
                 tool_name: "reader".into(),
@@ -16404,3 +16651,7 @@ mod provenance_tests;
 #[cfg(test)]
 #[path = "description_daemon_tests.rs"]
 mod description_daemon_tests;
+
+#[cfg(test)]
+#[path = "approval_daemon_tests.rs"]
+mod approval_daemon_tests;

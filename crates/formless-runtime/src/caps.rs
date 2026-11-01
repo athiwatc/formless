@@ -374,7 +374,7 @@ impl Capabilities {
         scoped_covers(&self.net, &other.net, |a, b| {
             let (ah, ap) = crate::split_grant(a);
             let (bh, bp) = crate::split_grant(b);
-            (ah == bh || bh.ends_with(&format!(".{ah}"))) && ap.is_none_or(|p| Some(p) == bp)
+            formless_protocol::net_scope::host_covers(ah, bh) && ap.is_none_or(|p| Some(p) == bp)
         }) && path_covers(&self.fs_read, &other.fs_read)
             && path_covers(&self.fs_write, &other.fs_write)
             && other.env.iter().all(|k| self.env.contains(k))
@@ -638,6 +638,9 @@ fn canonical_path_with(
 /// Use the HTTP URL parser's host canonicalization so static and input-bound
 /// scopes agree on case, IDNA and IP literals without dropping an explicit port.
 fn canonical_host_scope(raw: &str) -> Result<String, String> {
+    let (wildcard, raw) = raw
+        .strip_prefix("*.")
+        .map_or((false, raw), |base| (true, base));
     let bad = || {
         format!("bad net scope '{raw}': expected a bare host or host:port (for example net:api.example.com), without a scheme or path")
     };
@@ -645,6 +648,9 @@ fn canonical_host_scope(raw: &str) -> Result<String, String> {
         return Err(bad());
     }
     if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        if wildcard {
+            return Err(bad());
+        }
         return Ok(match ip {
             std::net::IpAddr::V4(ip) => ip.to_string(),
             std::net::IpAddr::V6(ip) => format!("[{ip}]"),
@@ -655,6 +661,23 @@ fn canonical_host_scope(raw: &str) -> Result<String, String> {
     }
     let url = reqwest::Url::parse(&format!("http://{raw}/")).map_err(|_| bad())?;
     let host = url.host_str().ok_or_else(bad)?;
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.split('.').any(str::is_empty) {
+        return Err(bad());
+    }
+    if wildcard
+        && host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok()
+    {
+        return Err(bad());
+    }
+    let host = if wildcard {
+        format!("*.{host}")
+    } else {
+        host.to_string()
+    };
     let (_, port) = crate::split_grant(raw);
     Ok(match port {
         Some(p) => format!("{host}:{p}"),
@@ -666,16 +689,20 @@ fn canonical_host_scope(raw: &str) -> Result<String, String> {
 /// A non-default port is kept (`host:8443`), so the grant shown for
 /// approval is exactly that port, never every port (#603).
 fn bound_host(raw: &str) -> Result<String, String> {
+    if raw.contains('*') {
+        return Err("a concrete net binding cannot contain a wildcard".into());
+    }
     if raw.contains("://") {
         let u = reqwest::Url::parse(raw).map_err(|e| format!("bad URL for net binding: {e}"))?;
         let host = u
             .host_str()
             .map(str::to_string)
             .ok_or_else(|| format!("URL has no host: {raw}"))?;
-        return Ok(match u.port() {
+        let scope = match u.port() {
             Some(p) => format!("{host}:{p}"),
             None => host,
-        });
+        };
+        return canonical_host_scope(&scope).map_err(|e| format!("bad concrete URL host: {e}"));
     }
     canonical_host_scope(raw).map_err(|e| format!("bad host for net binding: {e}"))
 }
@@ -1198,6 +1225,47 @@ mod tests {
         assert!(!port_scope.covers(&caps(&["net:api.example.com:443"])));
         assert_eq!(caps(&["net:LOCALHOST:80"]).to_specs(), ["net:localhost:80"]);
         assert!(caps(&["net:::1"]).covers(&caps(&["net:[::1]:8080"])));
+    }
+
+    #[test]
+    fn explicit_wildcards_narrow_existing_grants_without_widening_input_bindings() {
+        let exact = caps(&["net:example.com"]);
+        let wildcard = caps(&["net:*.EXAMPLE.com:8443"]);
+        assert_eq!(wildcard.to_specs(), ["net:*.example.com:8443"]);
+        assert!(!exact.covers(&caps(&["net:api.example.com"])));
+        assert!(!exact.covers(&wildcard));
+        assert!(wildcard.covers(&caps(&["net:a.b.example.com:8443"])));
+        assert!(wildcard.covers(&caps(&["net:*.sub.example.com:8443"])));
+        assert!(!wildcard.covers(&caps(&["net:example.com:8443"])));
+        assert!(!wildcard.covers(&caps(&["net:a.example.com:443"])));
+        assert!(!wildcard.covers(&caps(&["net:evil-example.com:8443"])));
+        for spec in [
+            "net:foo.*.example.com",
+            "net:*",
+            "net:*.127.0.0.1",
+            "net:*.[::1]",
+            "net:*.*.example.com",
+            "net:.foo",
+            "net:.a.foo",
+            "net:a..foo",
+            "net:a.foo..",
+        ] {
+            assert!(Capabilities::parse(&[spec.into()]).is_err(), "{spec}");
+        }
+        let binding = caps(&["net:$input.url"]);
+        for input in [
+            "*.example.com",
+            "https://*.example.com/x",
+            "https://.example.com/x",
+            "https://a..example.com/x",
+        ] {
+            assert!(
+                binding.bind(&json!({"url":input})).is_err(),
+                "concrete input cannot synthesize a wildcard grant: {input}"
+            );
+        }
+        let unicode = caps(&["net:*.bücher.example"]);
+        assert_eq!(unicode.to_specs(), ["net:*.xn--bcher-kva.example"]);
     }
 
     #[test]

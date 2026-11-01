@@ -660,7 +660,7 @@ test('description warnings augment approval identity, memory, capability and AI 
     if (!elements.has(id)) elements.set(id, Object.assign(node('div', {}), { focus() {}, classList: { add() {}, remove() {}, toggle() {} } }));
     return elements.get(id);
   };
-  const c = setup(['renderApproval'], { $, h: node, prefs: { get: () => true },
+  const c = setup(['renderApproval','approvalContextCard'], { $, h: node, prefs: { get: () => true },
     document: { querySelector: () => ({ classList: { add() {} } }) },
     isBroad: () => false, pathNote: () => null, scopePicker: () => null, toolTitleByName: () => null, showBidi() {},
   });
@@ -712,4 +712,28 @@ test('bundle description consent cannot cross a connection change during preview
     assert.equal(await result,null);
     if(phase==='preview')assert.equal(prompts,0,'no dialog from an obsolete daemon');
   }
+});
+
+test('approval call evidence shows concrete redacted request, body, path and sources additively', () => {
+  const elements=new Map();const $=id=>{if(!elements.has(id))elements.set(id,Object.assign(node('div',{}),{focus(){},classList:{add(){},remove(){},toggle(){}}}));return elements.get(id);};
+  const c=setup(['renderApproval','approvalContextCard'],{$,h:node,prefs:{get:()=>true},document:{querySelector:()=>({classList:{add(){}}})},isBroad:()=>false,pathNote:()=>null,scopePicker:()=>null,toolTitleByName:()=>null,showBidi(){}});
+  const context={run_id:'actual-run',scope_warnings:['PUBLIC SUFFIX: independently owned sites'],sources:[{tool:'fetch_page',kind:'url',origin:'https://external.example'}],call:{arguments:{url:'https://approved.example/collect?d=[REDACTED]',method:'POST',path:'/private/fixture/output.txt',body:'[REDACTED]'},urls:[{field:'$.url',url:'https://approved.example/collect?d=[REDACTED]',method:'POST',body_bytes:42,body_preview:'{"public":"<script>private sentinel</script>","password":"[REDACTED]"}'}],paths:['/private/fixture/output.txt'],truncated:false,note:'Computed JavaScript destinations remain unresolved; this preview does not restrict paths or bodies.'}};
+  c.S.approvals=[{kind:'tool',id:'held',tool_id:'registry-tool',tool_name:'http_post',version:3,capabilities:['net:*.github.io'],memory_mb:64,detail:'Description warning: first call',summary:'AI network helper',already:[],code:'function run(input) { return input; }',context}];
+  c.renderApproval();const body=$('modal-body'),text=plainText(body);
+  for(const required of ['http_post','v3','memory 64 MB','AI network helper','Description warning','net:*.github.io','PUBLIC SUFFIX','This Run read external content','fetch_page (url): https://external.example','Resolved call arguments','https://approved.example/collect?d=[REDACTED]','POST','Supplied body: 42 bytes','Body preview (redacted)','/private/fixture/output.txt','Computed JavaScript destinations remain unresolved','function run(input)'])assert.ok(text.includes(required),required);
+  assert.equal(all(body).some(n=>n.tag==='script'),false,'body preview is text, never active DOM');
+});
+
+test('authoritative reconnect attention preserves producer-independent current-Run call evidence', () => {
+  const c=setup(['addApproval','applySessionLiveState'],{cancelAsk(){},showQuestion(){},renderApproval(){},renderComposer(){},renderStatus(){}});
+  c.S.running=new Set();c.S.approvals=[];c.S.questions=[];
+  const context={run_id:'consumer-run',sources:[{tool:'original_reader',kind:'url',origin:'https://source.example'}],scope_warnings:['PUBLIC SUFFIX'],call:{arguments:{path:'/private/fixture/report'},urls:[],paths:['/private/fixture/report'],truncated:false,note:'resolved'}};
+  const held={type:'approval_requested',approval_id:'immutable-held',session_id:'A',tool_id:'tool',tool_name:'send_result',version:2,capabilities:['net:approved.example'],context};
+  c.applySessionLiveState('A',{running:true,pending_events:[held]},[]);
+  assert.equal(c.S.approvals[0].context.run_id,'consumer-run');
+  assert.equal(JSON.stringify(c.S.approvals[0].context),JSON.stringify(context));
+  c.applySessionLiveState('A',{running:true,pending_events:[held]},[{type:'approval_summary',approval_id:'immutable-held',summary:'later AI text'}]);
+  assert.equal(c.S.approvals.length,1);
+  assert.equal(c.S.approvals[0].summary,'later AI text');
+  assert.equal(JSON.stringify(c.S.approvals[0].context),JSON.stringify(context),'late summaries cannot replace the actual held-call evidence');
 });

@@ -53,9 +53,8 @@ pub struct SecurityCfg {
     /// writes asking, as if no folder were trusted.
     pub trust_writes: bool,
     /// Hosts whose `net:` grants need no approval: `api.example.com`, or
-    /// `*.github.com` (the domain itself and every subdomain). A grant for
-    /// a host already covers its subdomains, as everywhere. Bare `net`
-    /// (any host) is never trusted.
+    /// `*.github.com` (proper subdomains, excluding the apex). Bare hosts
+    /// are exact only. Bare `net` (any host) is never trusted.
     pub trusted_hosts: Vec<String>,
     /// Extra secret shapes (regular expressions) blanked wherever Formless
     /// stores or quotes text, beside the built-in ones (SPEC §15).
@@ -77,21 +76,37 @@ impl Default for SecurityCfg {
 impl SecurityCfg {
     /// Is `host` (a `net:` grant's host) one of the trusted hosts?
     pub fn host_trusted(&self, host: &str) -> bool {
-        let host = host.trim().trim_end_matches('.').to_lowercase();
-        if host.is_empty() {
+        use formless_runtime::caps::Capabilities;
+        let Ok(requested) = Capabilities::parse(&[format!("net:{}", host.trim())]) else {
+            return false;
+        };
+        if requested.has_bindings() {
             return false;
         }
-        self.trusted_hosts.iter().any(|t| {
-            let t = t.trim().trim_end_matches('.').to_lowercase();
-            let domain = t.strip_prefix("*.").unwrap_or(&t);
-            // `*` alone, or a bare TLD, would trust the internet.
-            !domain.is_empty()
-                && domain.contains('.')
-                && (host == domain || host.ends_with(&format!(".{domain}")))
+        self.trusted_hosts.iter().any(|trusted| {
+            let trusted = trusted.trim();
+            let base = trusted.strip_prefix("*.").unwrap_or(trusted);
+            // Preserve rejection of bare TLDs, unscoped '*' and templates.
+            if !base.contains('.') {
+                return false;
+            }
+            Capabilities::parse(&[format!("net:{trusted}")])
+                .is_ok_and(|granted| !granted.has_bindings() && granted.covers(&requested))
         })
     }
 
-    /// The trusted folders with `~` expanded and trailing slashes gone.
+    pub fn network_scope_warnings(&self) -> Vec<String> {
+        self.trusted_hosts.iter().filter_map(|trusted| {
+            let trusted=trusted.trim();
+            if !trusted.strip_prefix("*.").unwrap_or(trusted).contains('.') { return Some("Unsupported trusted host rule is ignored; bare suffixes/unscoped hosts cannot bypass approval".into()); }
+            let parsed=formless_runtime::caps::Capabilities::parse(&[format!("net:{}",trusted.trim())]);
+            match parsed {
+                Ok(grant) if !grant.has_bindings()=>grant.to_specs().iter().find_map(|spec|formless_protocol::net_scope::scope_warning(spec)).map(|warning|format!("Trusted host rule: {warning}")),
+                _=>Some("Invalid trusted host rule is ignored; review security.trusted_hosts in config.toml".into()),
+            }
+        }).collect()
+    }
+
     pub fn roots(&self) -> Vec<String> {
         self.roots_checked().0
     }
@@ -1592,6 +1607,7 @@ impl Config {
                 "secure": self.security.secure,
                 "trusted_paths": self.security.roots().len(),
                 "trusted_hosts": self.security.trusted_hosts.len(),
+                "scope_warnings": self.security.network_scope_warnings(),
                 "trust_writes": self.security.trust_writes,
                 "change": format!(
                     "security.secure in {}, or start with `formless --secure`",

@@ -12,6 +12,7 @@
 //!   or meaning, is major: bump [`PROTOCOL_VERSION`], and raise
 //!   [`MIN_PROTOCOL_VERSION`] only when the old shape is no longer served.
 
+pub mod net_scope;
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol this build speaks.
@@ -24,6 +25,8 @@ pub const FEATURES: &[&str] = &[
     "subscribe_filter",
     "ask_user",
     "approval_batches",
+    "approval_context",
+    "explicit_net_subdomains",
     "unsupported_error",
     "dropped_event_kinds",
 ];
@@ -178,6 +181,9 @@ pub fn security_report(v: &serde_json::Value) -> String {
             "  ⚠ broad: {}",
             list(&v["broad_grants"]).join(", ")
         ));
+    }
+    for warning in list(&v["network_scope_warnings"]) {
+        out.push(format!("  ⚠ {warning}"));
     }
     out.push(format!("Always denied: {}", v["denials"]));
     let trusted = list(&v["trusted_paths"]);
@@ -559,6 +565,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
 /// One granted Capability, for the central approvals list (SPEC §10.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GrantInfo {
+    /// Offline PSL/wildcard warning supplied by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_warning: Option<String>,
     pub tool_id: String,
     pub tool_name: String,
     pub capability: String,
@@ -982,6 +991,88 @@ pub struct MemoryInfo {
     pub updated_at: String,
     /// When a Session's prompt last included it.
     pub last_used: Option<String>,
+}
+
+/// Bounded, display-only call evidence. It does not alter execution arguments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalCallPreview {
+    pub arguments: serde_json::Value,
+    pub urls: Vec<ApprovalUrlPreview>,
+    pub paths: Vec<String>,
+    pub truncated: bool,
+    pub note: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalUrlPreview {
+    pub field: String,
+    pub url: String,
+    pub method: Option<String>,
+    pub body_bytes: Option<u64>,
+    pub body_preview: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalSource {
+    pub tool: String,
+    pub kind: String,
+    pub origin: String,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ApprovalContext {
+    pub run_id: Option<String>,
+    pub call: Option<ApprovalCallPreview>,
+    #[serde(default)]
+    pub sources: Vec<ApprovalSource>,
+    #[serde(default)]
+    pub scope_warnings: Vec<String>,
+}
+
+/// Plain text evidence shared by terminal and line-mode clients. The daemon
+/// has already bounded/redacted these display values; no input is resolved here.
+pub fn approval_context_lines(context: &ApprovalContext) -> Vec<String> {
+    let mut lines = Vec::new();
+    for warning in &context.scope_warnings {
+        lines.push(format!("⚠ {warning}"));
+    }
+    if !context.sources.is_empty() {
+        lines.push("This Run read external content:".into());
+        for source in &context.sources {
+            lines.push(format!(
+                "  {} ({}): {}",
+                source.tool, source.kind, source.origin
+            ));
+        }
+    }
+    if let Some(call) = &context.call {
+        lines.push("Resolved call arguments (redacted):".into());
+        for url in &call.urls {
+            lines.push(format!(
+                "  URL {}: {} ({})",
+                url.field,
+                url.url,
+                url.method.as_deref().unwrap_or("method unresolved")
+            ));
+            if let Some(bytes) = url.body_bytes {
+                lines.push(format!("  Supplied body: {bytes} bytes"));
+            }
+            if let Some(preview) = &url.body_preview {
+                lines.push(format!("  Body preview (redacted): {preview}"));
+            }
+        }
+        for path in &call.paths {
+            lines.push(format!("  Path: {path}"));
+        }
+        lines.extend(
+            serde_json::to_string_pretty(&call.arguments)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string),
+        );
+        if call.truncated {
+            lines.push("Preview truncated; omitted values remain unresolved here.".into());
+        }
+        lines.push(call.note.clone());
+    }
+    lines
 }
 
 /// A bounded single-line third-party description and its review warnings.
@@ -2529,6 +2620,9 @@ pub enum Event {
         by: Option<String>,
     },
     ApprovalRequested {
+        /// Additive resolved-call/source evidence, also retained for reconnect.
+        #[serde(default)]
+        context: Option<ApprovalContext>,
         approval_id: String,
         session_id: String,
         tool_name: String,
@@ -2968,6 +3062,7 @@ mod tests {
     #[test]
     fn event_session_id_scopes_session_events() {
         let ev = Event::ApprovalRequested {
+            context: None,
             path_options: Default::default(),
             approval_id: "a".into(),
             session_id: "s1".into(),
