@@ -397,6 +397,10 @@ pub async fn connect_once(
     });
     let key = key_from_secret(secret)?;
     let url = relay_ws_url(base_url, secret)?;
+    // Subscribe before the network handshake: a question or approval can
+    // become ready while connect_async is waiting. Retain those notifications
+    // in the existing bounded broadcast queue until the link can send them.
+    let mut attention = daemon.attention.subscribe();
     let (ws, _resp) = tokio_tungstenite::connect_async(&url)
         .await
         .with_context(|| format!("connect relay {base_url}"))?;
@@ -406,7 +410,6 @@ pub async fn connect_once(
     let mut generation = 0u64;
     // Approvals and questions become Web Pushes to the browsers that opted
     // in, at most one per PUSH_GAP (the relay holds the subscriptions).
-    let mut attention = daemon.attention.subscribe();
     let mut last_push: Option<std::time::Instant> = None;
     // The browsers on this link (`ListRelayClients`) and requests to close
     // one; both forgotten when the link ends.

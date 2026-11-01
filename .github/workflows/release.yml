@@ -141,7 +141,9 @@ jobs:
         shell: bash
         run: |
           cargo deb -p formless-bin --no-build --output target/debian/
-          cargo generate-rpm -p crates/formless -o target/generate-rpm/
+          # --output recognizes directories only when they already exist.
+          mkdir -p target/generate-rpm
+          cargo generate-rpm -p crates/formless --output target/generate-rpm
           cp target/debian/*.deb target/generate-rpm/*.rpm dist/
           cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
           # The recorded dependencies, for the log.
