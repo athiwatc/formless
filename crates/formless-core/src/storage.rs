@@ -719,7 +719,7 @@ const MIGRATIONS: [(i64, MigrationStep); 59] = [
         )?)
     }),
     (59, |c| {
-        c.execute_batch("CREATE TABLE run_forecasts (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, forecast TEXT NOT NULL); CREATE TRIGGER immutable_run_forecast BEFORE UPDATE ON run_forecasts BEGIN SELECT RAISE(ABORT, 'Run forecast is immutable'); END; CREATE TABLE forecast_request_counts(run_id TEXT NOT NULL, source TEXT NOT NULL, expected INTEGER NOT NULL, PRIMARY KEY(run_id,source));")?;
+        c.execute_batch("CREATE TABLE run_forecasts (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, forecast TEXT NOT NULL); CREATE TRIGGER immutable_run_forecast BEFORE UPDATE ON run_forecasts BEGIN SELECT RAISE(ABORT, 'Run forecast is immutable'); END; CREATE TABLE forecast_request_counts(run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, source TEXT NOT NULL, expected INTEGER NOT NULL, PRIMARY KEY(run_id,source));")?;
         add_column(c, "run_usage", "usage_complete INTEGER NOT NULL DEFAULT 0")
     }),
 ];
@@ -2722,7 +2722,7 @@ impl Store {
         if run_id.is_empty() {
             return Ok(());
         }
-        self.ex("INSERT INTO forecast_request_counts(run_id,source,expected) VALUES(?1,?2,1) ON CONFLICT(run_id,source) DO UPDATE SET expected=expected+1",params![run_id,source])?;
+        self.ex("INSERT INTO forecast_request_counts(run_id,source,expected) SELECT ?1,?2,1 WHERE EXISTS(SELECT 1 FROM runs WHERE id=?1) ON CONFLICT(run_id,source) DO UPDATE SET expected=expected+1",params![run_id,source])?;
         Ok(())
     }
     pub fn forecast_usage_complete(&self, run_id: &str) -> Result<bool> {
@@ -6572,5 +6572,33 @@ mod snippet_tests {
         }
         let s = make_snippet("a café here", "cafe\u{301}");
         assert!(s.contains("café"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod forecast_retention_tests {
+    use super::*;
+    #[test]
+    fn physical_request_basis_cascades_with_run_and_ignores_non_run_owners() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_forecast_request("not-a-Run", "llm").unwrap();
+        let sid = st.create_session(None).unwrap().id;
+        let run = st.create_run(&sid).unwrap();
+        st.record_forecast_request(&run, "run").unwrap();
+        assert_eq!(
+            st.conn
+                .query_row("SELECT COUNT(*) FROM forecast_request_counts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        st.delete_session(&sid).unwrap();
+        assert_eq!(
+            st.conn
+                .query_row("SELECT COUNT(*) FROM forecast_request_counts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }
