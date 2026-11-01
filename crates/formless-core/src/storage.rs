@@ -4033,7 +4033,7 @@ impl Store {
         let example = self.tool_example(id)?;
         Ok(Some(formless_protocol::ToolDetail {
             description_review: crate::descriptions::screen(&tool.description),
-            description_reviews: self.description_reviews(None, Some(&tool.name), 20)?,
+            description_reviews: self.description_reviews(Some("tool"), Some(&tool.name), 20)?,
             tool,
             versions,
             metrics,
@@ -6103,7 +6103,7 @@ impl Store {
         name: Option<&str>,
         limit: usize,
     ) -> Result<Vec<formless_protocol::DescriptionReview>> {
-        let mut statement=self.ps("SELECT detail FROM audit WHERE id>='description:' AND id<'description:~' AND (?1 IS NULL OR json_extract(detail,'$.kind')=?1) AND (?2 IS NULL OR json_extract(detail,'$.name')=?2) ORDER BY created_at DESC,rowid DESC LIMIT ?3")?;
+        let mut statement=self.ps("SELECT detail FROM audit WHERE id>='description:' AND id<'description:~' AND (?1 IS NULL OR json_extract(detail,'$.kind')=?1 OR (?1='tool' AND json_extract(detail,'$.kind')='mcp')) AND (?2 IS NULL OR json_extract(detail,'$.name')=?2) ORDER BY created_at DESC,rowid DESC LIMIT ?3")?;
         let rows = statement.query_map(params![kind, name, limit.clamp(1, 200)], |r| {
             r.get::<_, String>(0)
         })?;

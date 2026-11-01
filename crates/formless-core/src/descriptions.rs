@@ -142,3 +142,62 @@ mod tests {
         );
     }
 }
+
+/// Metadata previews read Skill frontmatter from the actual bundled SKILL.md,
+/// never from a potentially inconsistent top-level description field.
+pub fn bundle_candidates(
+    bundle: &serde_json::Value,
+) -> anyhow::Result<Vec<(String, String, DescriptionMetadata)>> {
+    use base64::Engine;
+    let mut entries = Vec::new();
+    let mut collect = |kind: &str, entry: &serde_json::Value| -> anyhow::Result<()> {
+        let (name, description) = if kind == "skill" {
+            let file = entry["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|file| file["path"] == "SKILL.md")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("skill bundle needs SKILL.md for its metadata preview")
+                })?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(file["content_b64"].as_str().unwrap_or_default())?;
+            let meta = crate::skills::parse_skill_md(std::str::from_utf8(&bytes)?)?;
+            (meta.name, meta.description)
+        } else {
+            (
+                entry["name"].as_str().unwrap_or_default().to_string(),
+                entry["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+        entries.push((kind.to_string(), screen(&name).text, screen(&description)));
+        Ok(())
+    };
+    match bundle["format"].as_str().unwrap_or_default() {
+        "formless.tool/1" => collect("tool", bundle)?,
+        "formless.skill/1" => collect("skill", bundle)?,
+        _ => {
+            for tool in bundle["tools"].as_array().into_iter().flatten() {
+                collect("tool", tool)?;
+            }
+            for module in bundle["modules"].as_array().into_iter().flatten() {
+                collect("module", module)?;
+            }
+            for skill in bundle["skills"].as_array().into_iter().flatten() {
+                collect("skill", skill)?;
+            }
+        }
+    }
+    Ok(entries)
+}
+
+pub fn fingerprint(value: &impl serde::Serialize) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).expect("review input is serializable"))
+    )
+}

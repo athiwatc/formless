@@ -1646,6 +1646,10 @@ pub enum Request {
         name: String,
         description: String,
     },
+    /// Inspect actual Tool/module/Skill bundle metadata without installing it.
+    PreviewDescriptionBundle {
+        bundle: serde_json::Value,
+    },
     /// Durable description warnings and before/after changes, newest first.
     ListDescriptionReviews {
         #[serde(default)]
