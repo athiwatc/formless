@@ -300,7 +300,11 @@ without redesign.
   retries once without that mode; invalid-schema/unrelated errors do not qualify.
   This state persists across transient retries, model fallback and stream restart,
   without changing another call or the configured provider. Anthropic uses no
-  invented format field and is validated locally. Schema-aware replies refuse
+  invented format field and is validated locally. Schema calls include one fixed
+  JSON-format instruction and the original schema as explicitly framed user data;
+  schema descriptions never become system instructions. This stable guidance
+  remains when the endpoint rejects its API format mode, and is absent for legacy
+  text calls. Schema-aware replies refuse
   incomplete/refused answers; partial stream deltas remain text until final
   validation. Every known physical-attempt charge is committed before validation.
   `llm.complete(prompt, {schema, system, model, role})` returns a parsed JSON value;
