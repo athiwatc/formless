@@ -230,3 +230,62 @@ async fn background_save_failure_is_a_visible_note_and_preserves_existing_cache(
         "invalid cache prevents another automatic spend"
     );
 }
+
+#[tokio::test]
+async fn failed_model_selection_never_starts_an_opted_in_background_test() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, true).await;
+    let missing = f
+        .daemon()
+        .handle(Request::SetSessionModel {
+            id: "private-missing-session".into(),
+            model: Some("model".into()),
+            reasoning_effort: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing
+            .downcast_ref::<RequestFailure>()
+            .map(|failure| failure.code),
+        Some(codes::NOT_FOUND)
+    );
+    assert_eq!(f.count.load(Ordering::SeqCst), 0);
+    assert!(f.daemon().model_tests().is_empty());
+    assert!(!f.daemon().paths.data_dir.join("model_tests.json").exists());
+    // The background reservation is acquired synchronously before spawning:
+    // obtaining it here proves no latent task can start after this assertion.
+    let reservation = f
+        .daemon()
+        .model_test_cache
+        .reserve(&f.base, "model")
+        .unwrap()
+        .expect("a rejected selection must not hold a background reservation");
+    drop(reservation);
+
+    // Exercise an actual database write refusal as well as a missing ID.
+    // This trigger belongs only to this UUID fixture, never a live profile.
+    let conn = rusqlite::Connection::open(f.daemon().paths.db_file()).unwrap();
+    conn.execute_batch("CREATE TRIGGER private_reject_model BEFORE UPDATE OF model ON sessions BEGIN SELECT RAISE(ABORT, 'private injected model write refusal'); END;").unwrap();
+    let refused = f
+        .daemon()
+        .handle(Request::SetSessionModel {
+            id: f.session.clone(),
+            model: Some("model".into()),
+            reasoning_effort: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{refused:#}").contains("private injected model write refusal"));
+    assert_eq!(f.count.load(Ordering::SeqCst), 0);
+    assert!(!f.daemon().paths.data_dir.join("model_tests.json").exists());
+    let reservation = f
+        .daemon()
+        .model_test_cache
+        .reserve(&f.base, "model")
+        .unwrap()
+        .expect("a failed database mutation must not hold a background reservation");
+    drop(reservation);
+    conn.execute_batch("DROP TRIGGER private_reject_model;")
+        .unwrap();
+}

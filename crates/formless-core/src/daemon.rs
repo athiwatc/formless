@@ -1784,12 +1784,15 @@ impl Daemon {
                     }
                     other => other,
                 };
-                if let Some(m) = &model {
-                    let _ = self.test_new_model(&id, m);
-                }
                 let s = self
                     .with_store(|st| st.set_session_model(&id, model, reasoning_effort))?
                     .context(RequestFailure::not_found("session not found"))?;
+                // Only a successful persisted selection can authorize the
+                // optional paid background test; missing Sessions and failed
+                // writes must have no provider side effects.
+                if let Some(m) = &s.model {
+                    let _ = self.test_new_model(&id, m);
+                }
                 // Every client on the Session sees it; a Run going now keeps
                 // the model it started with (#726).
                 if self.runs.locked().contains_key(&id) {
