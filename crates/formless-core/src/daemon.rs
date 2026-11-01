@@ -10081,21 +10081,35 @@ impl Daemon {
     /// directories go as a reference the agent can read with its Tools.
     fn attach_path(&self, session_id: &str, path: &str, root: Option<&str>) -> Result<Value> {
         let session_root = self.session_cwd(session_id);
-        let root = mention_root(root.or(session_root.as_deref()))?;
-        let requested = root.join(path.strip_prefix("~/").map_or_else(
-            || std::path::PathBuf::from(path),
-            |rest| {
-                directories::BaseDirs::new()
-                    .map(|b| b.home_dir().join(rest))
-                    .unwrap_or_else(|| rest.into())
-            },
-        ));
-        let full = requested
+        let root_hint = root.or(session_root.as_deref());
+        let cwd = std::env::current_dir()?;
+        let raw_root = formless_runtime::caps::lexical_absolute(
+            &cwd,
+            &root_hint
+                .filter(|root| !root.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| cwd.clone()),
+        )
+        .map_err(|error| anyhow!(error))?;
+        let root = mention_root(root_hint)?;
+        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+        let input_path = if let Some(rest) = path.strip_prefix("~/") {
+            home.as_ref()
+                .filter(|home| home.is_absolute())
+                .context("native home is unavailable for this mention")?
+                .join(rest)
+        } else {
+            std::path::PathBuf::from(path)
+        };
+        // Preserve the configured root spelling as well as its resolved
+        // destination: a credential/profile namespace can itself be an alias.
+        let requested = raw_root.join(&input_path);
+        let full = root
+            .join(input_path)
             .canonicalize()
             .with_context(|| format!("no file '{path}'"))?;
         // A mention reaches only the working folder (or ~/ when written so),
         // and never a credential, whoever pasted it (#863).
-        let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
         let inside = full.starts_with(&root)
             || (path.starts_with("~/") && home.as_ref().is_some_and(|h| full.starts_with(h)));
         if !inside {
