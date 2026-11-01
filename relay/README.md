@@ -7,8 +7,12 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
   inbound ports on the user's machine.
 - Browsers connect to the same room. The relay only forwards opaque
   AES-256-GCM ciphertext; the pairing secret (32 random bytes) is the
-  key and never reaches the relay. The room id is a truncated SHA-256
-  of the key.
+  E2E key and never reaches the relay. Room v3 is a truncated SHA-256
+  of a distinct HKDF daemon claim. The daemon sends that derived capability
+  only in its Authorization Upgrade header; the room verifies its commitment
+  before admission. A room id alone cannot claim the daemon slot. A valid
+  restart replaces the old slot (4003), while retired sockets lose authority.
+  The relay can see this slot capability but cannot derive the pairing/E2E key.
 - Each browser connection handshakes with the daemon (fresh nonces from
   both sides, HKDF-SHA256 session key) and numbers its frames, with the
   sequence number and direction in the AES-GCM associated data, so
@@ -22,6 +26,23 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
   served by the same Worker as static assets, with a strict CSP
   (`script-src 'self'`, no inline script or style) and `no-referrer`.
 
+## Room v3 compatibility
+
+Worker, browser and daemon must be updated together. This repository change
+performs no hosted deployment. Pairing fragments and secrets stay unchanged;
+the new derivation changes the room. Reload the updated browser. Existing push
+opt-ins re-register in that room after its authenticated handshake; subscriptions
+are not copied from old rooms, and no new permission is requested automatically.
+Old unauthenticated daemon upgrades are rejected rather than accepted as a
+compatibility fallback. End-to-end frame protocol v2 remains unchanged.
+
+The claim is HKDF-SHA256(pairing key, empty salt,
+`formless-relay/3 daemon-claim`), 32 bytes. The URL room is its SHA-256 first
+16 bytes as lowercase hex; `Authorization: Bearer <64 lowercase hex digits>`
+carries the claim. Production transports remain TLS; loopback dev is the local
+fixture exception. Claims are not stored in socket attachments or logged.
+Connection/frame/rate/queue hardening is tracked separately in #638.
+
 ## Layout
 
 | File | Role |
@@ -32,6 +53,7 @@ with a Durable Object room at <https://formless.athiwat.xyz>.
 | `push.mjs` | Payload-free Web Push signed with VAPID (shared by the Worker and `dev.mjs`) |
 | `vapid-keys.mjs` | Makes the VAPID key pair for push |
 | `conformance.mjs` | `node relay/conformance.mjs [BASE]` (one HTTP and room-frame matrix; starts `dev.mjs` without BASE, or checks e.g. `wrangler dev`) |
+| `daemon-claim.test.mjs`, `daemon-claim-wire.test.mjs` | `node --test relay/daemon-claim*.test.mjs` (fixed vectors, unauthenticated/wrong-proof denial, authenticated preemption and actual local Upgrade wire) |
 | `room.test.mjs` | `node relay/room.test.mjs` (room teardown, disconnect codes, CSP) |
 | `push.test.mjs`, `push.dev-test.mjs` | `node relay/push.test.mjs` (signing), `node relay/push.dev-test.mjs` (end to end through `dev.mjs`) |
 

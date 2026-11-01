@@ -4,6 +4,8 @@
 //   node relay/conformance.mjs http://127.0.0.1:8787   (e.g. `wrangler dev`)
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { daemonClaim, claimRoom, claimAuthorization } from "./daemon-claim.mjs";
+import { wireOpen, wireWait } from "./test-wire.mjs";
 
 let base = process.argv[2];
 let dev = null;
@@ -32,8 +34,10 @@ try {
   assert.equal(missing.headers.get("x-content-type-options"), "nosniff");
 
   // Room: a mux daemon and one browser.
-  const room = Array.from({ length: 32 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
-  const open = (q) => new Promise((resolve, reject) => {
+  const claim = await daemonClaim(crypto.getRandomValues(new Uint8Array(32)));
+  const room = await claimRoom(claim);
+  const authorization = claimAuthorization(claim);
+  const open = (q) => q.includes("role=daemon") ? wireOpen(wsBase + "/relay/" + room + q, authorization) : new Promise((resolve, reject) => {
     const ws = new WebSocket(wsBase + "/relay/" + room + q);
     ws.got = [];
     ws.onmessage = (e) => ws.got.push(String(e.data));
@@ -70,9 +74,11 @@ try {
   daemon.send(JSON.stringify({ relay: "disconnect", cid: opened.cid, code: 4002 }));
   assert.equal(await Promise.race([closed, sleep(2000).then(() => "timeout")]), 4002);
 
-  // A second daemon is refused while one is connected.
-  await assert.rejects(open("?role=daemon&mux=1"));
-  daemon.close();
+  // A room holder cannot squat; an authenticated restart reclaims its slot.
+  await assert.rejects(wireOpen(wsBase + "/relay/" + room + "?role=daemon&mux=1"), /401/);
+  const replacement = await open("?role=daemon&mux=1");
+  assert.equal(await wireWait(daemon, (p) => p.closed), 4003);
+  replacement.close();
   console.log("conformance ok: " + base);
 } finally {
   if (dev) dev.kill();

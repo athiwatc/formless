@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { verifyDaemonClaim } from "./daemon-claim.mjs";
 import worker, { RelayRoom, SECURITY_HEADERS } from "./worker.js";
 
 // Plain ws:// to this machine is allowed here only: production pages may
@@ -28,7 +29,9 @@ const DEV_CSP = SECURITY_HEADERS["content-security-policy"]
   .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*");
 
 const args = process.argv.slice(2);
-const port = Number(args[args.indexOf("--port") + 1]) || 8787;
+const portIndex = args.indexOf("--port");
+const port = portIndex < 0 ? 8787 : Number(args[portIndex + 1]);
+if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("invalid port");
 const mock = args.includes("--mock-provider");
 const webRoot = fileURLToPath(new URL("./web/", import.meta.url));
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".webmanifest": "application/manifest+json" };
@@ -159,14 +162,9 @@ function joinRoom(id, role, mux, ua, req, socket) {
     r = { state, room: new RelayRoom(state, env) };
     rooms.set(id, r);
   }
-  const refused = r.room.refuse(role);
-  if (refused) {
-    socket.end("HTTP/1.1 " + refused[0] + " Conflict\r\n\r\n");
-    return;
-  }
   const conn = wsAccept(req, socket);
   const ws = roomSocket(conn);
-  r.room.admit(ws, role, mux, ua);
+  r.room.admit(ws, role, mux, ua, role === "daemon");
   conn.onText = (text) => r.room.webSocketMessage(ws, text).catch((e) => console.log("relay: " + e.message));
   conn.onClose = () => {
     r.state.webSockets = r.state.webSockets.filter((w) => w !== ws);
@@ -261,13 +259,18 @@ const server = createServer(async (req, res) => {
   res.writeHead(response.status, headers);
   res.end(Buffer.from(await response.arrayBuffer()));
 });
-server.on("upgrade", (req, socket) => {
+server.on("upgrade", async (req, socket) => {
   const url = new URL(req.url, "http://localhost");
   const m = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
   if (!m) return socket.destroy();
   const role = url.searchParams.get("role") === "daemon" ? "daemon" : "client";
+  if (role === "daemon" && !await verifyDaemonClaim(m[1], req.headers.authorization)) {
+    socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    return;
+  }
+  if (socket.destroyed) return;
   joinRoom(m[1], role, url.searchParams.get("mux") === "1", req.headers["user-agent"] || "", req, socket);
 });
 server.listen(port, "127.0.0.1", () => {
-  console.log("formless dev relay on http://127.0.0.1:" + port + (mock ? " (mock provider at /mock/v1)" : ""));
+  console.log("formless dev relay on http://127.0.0.1:" + server.address().port + (mock ? " (mock provider at /mock/v1)" : ""));
 });

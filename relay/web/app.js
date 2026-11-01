@@ -118,8 +118,12 @@
     return btoa(bin);
   }
   async function roomFor(keyBytes) {
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", keyBytes));
-    return Array.from(digest.slice(0, 16), (b) => b.toString(16).padStart(2, "0")).join("");
+    const key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveBits"]);
+    const claim = new Uint8Array(await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: new TextEncoder().encode("formless-relay/3 daemon-claim") }, key, 256));
+    try {
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", claim));
+      return Array.from(digest.slice(0, 16), (b) => b.toString(16).padStart(2, "0")).join("");
+    } finally { claim.fill(0); }
   }
   // Relay frame protocol v2 (must match crates/formless-core/src/relay.rs).
   const FRAME_VERSION = 2;
@@ -3506,6 +3510,19 @@
     }
     renderView();
   }
+  /** Re-register only an existing opt-in after an authenticated connection.
+   * Room-v3 migration never copies subscriptions from an unverified old room. */
+  async function restorePushSubscription(ws) {
+    const room = S.room;
+    if (!("serviceWorker" in navigator)) return;
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      const sub = reg && await reg.pushManager.getSubscription();
+      if (sub && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
+        ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+      }
+    } catch (_) { /* No permission request or automatic new subscription. */ }
+  }
   async function pushOff(sub) {
     try {
       if (S.ws) S.ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint: sub.endpoint }));
@@ -5352,6 +5369,7 @@
         S.ws.send(JSON.stringify({ v: FRAME_VERSION, confirm: bytesToB64(await confirmTag(hello, "b2d")) }));
         clearTimeout(S.handshakeTimer);
         await finishHandshake(hello);
+        restorePushSubscription(ws);
         markStable();
         note("daemon online");
         loadAll();
