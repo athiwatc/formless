@@ -666,7 +666,7 @@ async fn probe_http_schema_mode_and_caps_compose_without_echo_driven_repairs() {
     let env = crate::credential_env::EnvGuard::isolated();
     env.set("NO_PROXY", "127.0.0.1,localhost");
     let schema = json!({"type":"object","properties":{"answer":{"const":7}},
-        "required":["answer"],"additionalProperties":false,"default":{"max_tokens":99999}});
+        "required":["answer"],"additionalProperties":false,"default":{"max_tokens":99999,"n":77}});
     for style in ["chat", "responses", "anthropic"] {
         for unrelated in [false, true] {
             let seen = Arc::new(Mutex::new(Vec::new()));
@@ -701,6 +701,11 @@ async fn probe_http_schema_mode_and_caps_compose_without_echo_driven_repairs() {
             }))).await;
             let mut config = cfg(base, style);
             config.extra_body.insert("max_tokens".into(), json!(99999));
+            config.extra_body.insert("n".into(), json!(7));
+            config.extra_body.insert("best_of".into(), json!(7));
+            config
+                .extra_body
+                .insert("options".into(), json!({"num_return_sequences":7}));
             if style == "chat" {
                 config
                     .extra_body
@@ -748,6 +753,13 @@ async fn probe_http_schema_mode_and_caps_compose_without_echo_driven_repairs() {
             assert_eq!(policy.report()["requests_sent"], rows.len());
             for row in rows.iter() {
                 assert_cap(row, style, 128);
+                if style == "chat" {
+                    assert_eq!(row["n"], 1);
+                } else {
+                    assert!(row.get("n").is_none());
+                }
+                assert!(row.get("best_of").is_none());
+                assert!(row["options"].get("num_return_sequences").is_none());
             }
             if style == "chat" {
                 assert_eq!(rows[0]["response_format"]["json_schema"]["schema"], schema);

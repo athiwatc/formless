@@ -142,6 +142,27 @@ impl ProbePolicy {
         let object = body
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("model probe body is not an object"))?;
+        // Token ceilings apply per choice on Chat. Operational probes must not
+        // inherit owner-configured multi-choice/search costs from ordinary Runs.
+        if !cfg.anthropic() && !cfg.responses() && object.contains_key("n") {
+            object.insert("n".into(), json!(1));
+        } else {
+            object.remove("n");
+        }
+        const MULTIPLIERS: &[&str] = &[
+            "best_of",
+            "num_return_sequences",
+            "num_outputs",
+            "num_generations",
+            "candidate_count",
+            "candidateCount",
+            "num_beams",
+            "beam_width",
+            "use_beam_search",
+        ];
+        for key in MULTIPLIERS {
+            object.remove(*key);
+        }
         for key in [
             "max_tokens",
             "max_completion_tokens",
@@ -168,6 +189,10 @@ impl ProbePolicy {
             }
         }
         if let Some(options) = object.get_mut("options").and_then(Value::as_object_mut) {
+            options.remove("n");
+            for key in MULTIPLIERS {
+                options.remove(*key);
+            }
             options.insert("num_predict".into(), json!(ceiling));
             for key in [
                 "max_tokens",

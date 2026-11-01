@@ -473,7 +473,9 @@ an empty listing just asks for one.
   Every logical operational probe (explicit Test, optional background Test,
   connectivity/tool checks and the two-request cache check) uses one shared
   30-second deadline, at most eight physical model-endpoint POSTs, and a
-  128-output-token ceiling on every attempt. The deadline includes credential
+  128-output-token ceiling and one returned choice on every attempt. Probes
+  override Chat `n` and drop known vendor multi-sample/beam controls at the root
+  and in `options`; ordinary Runs retain their configured sampling. The deadline includes credential
   refresh, admission waits, headers, body/stream parsing, backoff and resends.
   Vendor fields, reasoning settings and typed repairs cannot remove or increase
   the final cap; probes may switch a rejected Chat cap spelling once. The
