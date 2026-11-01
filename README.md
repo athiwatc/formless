@@ -477,6 +477,14 @@ Global flags: `--profile <name>`, `--secure` (turn approval prompts on for the d
 * The schema is versioned; the daemon auto-migrates on start and **takes a backup before migrating**. On corruption it refuses to guess: it stops, reports, and points at the backup.
 * `formless backup` saves the **database only**. Copy `artifacts/` and `skills/` separately if you need their files; `config.toml`, credential files and OS keyring entries are excluded. The database itself may contain sensitive conversation or Tool data. Separate live folder copies are not a coordinated snapshot.
 * `formless restore FILE` preserves a safety copy and replaces the database with the daemon stopped. It warns about missing, unreadable or foreign artifact/skill references without deleting their rows. Recorded paths are not rewritten: copying companion folders to another profile or machine does not automatically repair absolute paths. The warning checks availability, not file contents or whole-profile consistency.
+
+Backup inspection is available with `formless backup list` and
+`formless backup verify FILE`. Use `formless backup restore FILE --dry-run`
+to inspect the stopped-daemon restore plan, and `formless doctor --restore-drill`
+for an isolated offline rehearsal of the newest snapshot. Snapshots contain the
+database only: copy artifact/skill files separately; configuration, credential
+files and OS keyring data are excluded. Recorded paths are not relocated.
+
 * `FORMLESS_DATA_DIR` / `FORMLESS_CONFIG_DIR` relocate both dirs; `--profile <name>` gives an isolated daemon plus data/config dirs — intended for testing dangerous Tools.
 
 ---

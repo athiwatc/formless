@@ -447,8 +447,121 @@ mod tests {
         }
     }
 
+    // A parallel sibling can fork while a short-lived lock/probe is held.
+    // CLOEXEC closes the inherited descriptor at exec, not at fork, so an
+    // unrelated child can temporarily retain it after our drop. Run exact
+    // immediate-release assertions in a single-test child after exec. Its only
+    // process creation is the controlled ownership child, fully waited below.
+    #[derive(Clone, Copy)]
+    enum ImmediateReleaseCase {
+        ParentCleanup,
+        ParentFreeze,
+        #[cfg(unix)]
+        Retargeting,
+        #[cfg(unix)]
+        AliasedParent,
+        PartialFreeze,
+        #[cfg(unix)]
+        ConfiguredAlias,
+        #[cfg(unix)]
+        DistinctAliases,
+        #[cfg(unix)]
+        UnknownCanonical,
+        Marker,
+        CrossProcess,
+    }
+
+    impl ImmediateReleaseCase {
+        fn name(self) -> &'static str {
+            match self {
+                Self::ParentCleanup => "ParentCleanup",
+                Self::ParentFreeze => "ParentFreeze",
+                #[cfg(unix)]
+                Self::Retargeting => "Retargeting",
+                #[cfg(unix)]
+                Self::AliasedParent => "AliasedParent",
+                Self::PartialFreeze => "PartialFreeze",
+                #[cfg(unix)]
+                Self::ConfiguredAlias => "ConfiguredAlias",
+                #[cfg(unix)]
+                Self::DistinctAliases => "DistinctAliases",
+                #[cfg(unix)]
+                Self::UnknownCanonical => "UnknownCanonical",
+                Self::Marker => "Marker",
+                Self::CrossProcess => "CrossProcess",
+            }
+        }
+    }
+
+    fn isolated_immediate_release(case: ImmediateReleaseCase) {
+        let mut child = Process(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "profile_lock::tests::immediate_release_child_fixture",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("FORMLESS_TEST_IMMEDIATE_RELEASE_MODE", case.name())
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        // This is the existing private-fixture containment deadline, not a
+        // retry/timeout for any lock acquisition or post-drop assertion.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "isolated {} fixture failed: {status}",
+                    case.name()
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "isolated {} fixture did not finish within ten seconds",
+                case.name()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "private subprocess fixture for exact immediate-release assertions"]
+    fn immediate_release_child_fixture() {
+        let mode = std::env::var("FORMLESS_TEST_IMMEDIATE_RELEASE_MODE")
+            .expect("invoke only through an isolated immediate-release parent");
+        match mode.as_str() {
+            "ParentCleanup" => parent_cleanup_assertions(),
+            "ParentFreeze" => parent_freeze_assertions(),
+            #[cfg(unix)]
+            "Retargeting" => retargeting_assertions(),
+            #[cfg(unix)]
+            "AliasedParent" => aliased_parent_assertions(),
+            "PartialFreeze" => partial_freeze_assertions(),
+            #[cfg(unix)]
+            "ConfiguredAlias" => configured_alias_assertions(),
+            #[cfg(unix)]
+            "DistinctAliases" => distinct_aliases_assertions(),
+            #[cfg(unix)]
+            "UnknownCanonical" => unknown_canonical_assertions(),
+            "Marker" => marker_assertions(),
+            "CrossProcess" => cross_process_assertions(),
+            _ => panic!("invalid private immediate-release fixture mode: {mode}"),
+        }
+    }
+
     #[test]
     fn parent_cleanup_refuses_named_owner_and_named_profiles_without_touching_sentinels() {
+        isolated_immediate_release(ImmediateReleaseCase::ParentCleanup);
+    }
+
+    fn parent_cleanup_assertions() {
         let _env = crate::credential_env::EnvGuard::isolated();
         let (_fixture, base) = Fixture::new();
         let named = base.named("child");
@@ -482,6 +595,10 @@ mod tests {
 
     #[test]
     fn parent_freeze_blocks_new_profile_creation_operation_and_constructor_until_release() {
+        isolated_immediate_release(ImmediateReleaseCase::ParentFreeze);
+    }
+
+    fn parent_freeze_assertions() {
         let _env = crate::credential_env::EnvGuard::isolated();
         let (_fixture, base) = Fixture::new();
         let frozen = ProfileLock::maintenance(&base, Duration::ZERO)
@@ -512,6 +629,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retargeting_during_preparation_or_after_freeze_cannot_authorize_an_uncovered_tree() {
+        isolated_immediate_release(ImmediateReleaseCase::Retargeting);
+    }
+
+    #[cfg(unix)]
+    fn retargeting_assertions() {
         let _env = crate::credential_env::EnvGuard::isolated();
         let (fixture, base) = Fixture::new();
         let alias_path = fixture.0.join("alias");
@@ -548,6 +670,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn aliased_parent_tree_cannot_freeze_a_descendant_owned_through_real_paths() {
+        isolated_immediate_release(ImmediateReleaseCase::AliasedParent);
+    }
+
+    #[cfg(unix)]
+    fn aliased_parent_assertions() {
         let (fixture, base) = Fixture::new();
         let child = base.named("child");
         Paths::from_dirs(child.data_dir.clone(), child.config_dir.clone()).unwrap();
@@ -576,54 +703,10 @@ mod tests {
 
     #[test]
     fn failed_partial_freeze_releases_locks_and_overlapping_roots_do_not_self_deadlock() {
-        // On Unix, another parallel test can fork while a lock is held. Even
-        // CLOEXEC descriptors retain flock ownership in that child until exec,
-        // so closing our descriptor cannot promise an immediate release then.
-        // Run these exact zero-timeout rollback assertions alone after exec;
-        // the fixture itself never forks and still requires immediate release.
-        let mut child = Process(
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "profile_lock::tests::failed_partial_freeze_child_fixture",
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env("FORMLESS_TEST_PARTIAL_FREEZE_CHILD", "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                assert!(
-                    status.success(),
-                    "isolated immediate-release fixture failed: {status}"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "isolated immediate-release fixture did not finish within ten seconds"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        isolated_immediate_release(ImmediateReleaseCase::PartialFreeze);
     }
 
-    #[test]
-    #[ignore = "private subprocess fixture for exact immediate-release assertions"]
-    fn failed_partial_freeze_child_fixture() {
-        assert_eq!(
-            std::env::var("FORMLESS_TEST_PARTIAL_FREEZE_CHILD")
-                .ok()
-                .as_deref(),
-            Some("1"),
-            "invoke only through the isolated parent test"
-        );
+    fn partial_freeze_assertions() {
         let (_fixture, base) = Fixture::new();
         let plan = hierarchy_plan(&base, true).unwrap();
         let blocked_path = &plan
@@ -668,6 +751,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configured_alias_stays_owned_after_unlink_and_retarget_without_constructor_effects() {
+        isolated_immediate_release(ImmediateReleaseCase::ConfiguredAlias);
+    }
+
+    #[cfg(unix)]
+    fn configured_alias_assertions() {
         let _env = crate::credential_env::EnvGuard::isolated();
         let (fixture, mut paths) = Fixture::new();
         let real = paths.data_dir.clone();
@@ -708,6 +796,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn distinct_existing_aliases_share_canonical_ownership_and_launch_gate() {
+        isolated_immediate_release(ImmediateReleaseCase::DistinctAliases);
+    }
+
+    #[cfg(unix)]
+    fn distinct_aliases_assertions() {
         let (fixture, paths) = Fixture::new();
         let mut first = paths.clone();
         first.data_dir = fixture.0.join("first");
@@ -729,6 +822,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn known_configured_owner_wins_over_unknown_canonical_resolution() {
+        isolated_immediate_release(ImmediateReleaseCase::UnknownCanonical);
+    }
+
+    #[cfg(unix)]
+    fn unknown_canonical_assertions() {
         let (fixture, paths) = Fixture::new();
         let mut alias = paths.clone();
         alias.data_dir = fixture.0.join("alias");
@@ -753,6 +851,10 @@ mod tests {
 
     #[test]
     fn ownership_is_not_a_pid_marker_and_survives_profile_removal() {
+        isolated_immediate_release(ImmediateReleaseCase::Marker);
+    }
+
+    fn marker_assertions() {
         let (_fixture, paths) = Fixture::new();
         std::fs::write(paths.lock_file(), std::process::id().to_string()).unwrap();
         assert!(!owner_held(&paths).unwrap());
@@ -774,6 +876,10 @@ mod tests {
 
     #[test]
     fn ownership_is_exclusive_across_processes_and_released_on_exit() {
+        isolated_immediate_release(ImmediateReleaseCase::CrossProcess);
+    }
+
+    fn cross_process_assertions() {
         let (_fixture, paths) = Fixture::new();
         let child = Command::new(std::env::current_exe().unwrap())
             .args([
