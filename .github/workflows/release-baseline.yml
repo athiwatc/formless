@@ -25,7 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # macos-14 retires 2026-11-02; use its supported ARM successor.
+          # https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
@@ -231,10 +233,12 @@ jobs:
               done
               apt-get update && apt-get install -y ./pkgs/*.deb
             else
-              rpm -qp --scripts pkgs/*.rpm > "$RUNNER_TEMP/baseline-rpm-scripts"
-              rpm -qp --triggers pkgs/*.rpm > "$RUNNER_TEMP/baseline-rpm-triggers"
-              test ! -s "$RUNNER_TEMP/baseline-rpm-scripts"
-              test ! -s "$RUNNER_TEMP/baseline-rpm-triggers"
+              # --filetriggers includes file AND transaction-file scriptlets:
+              # https://github.com/rpm-software-management/rpm/blob/rpm-4.16.1.3/rpmpopt.in#L144
+              for script_query in scripts triggers filetriggers; do
+                rpm -qp "--$script_query" pkgs/*.rpm > "$RUNNER_TEMP/baseline-rpm-$script_query"
+                test ! -s "$RUNNER_TEMP/baseline-rpm-$script_query"
+              done
               dnf install -y ./pkgs/*.rpm
             fi
             formless --version

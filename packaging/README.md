@@ -54,15 +54,17 @@ package registry, updates a tap, submits winget/AUR changes, or uses publishing
 secrets. Only Linux package/checksum fixtures transfer between jobs as private,
 same-run workflow artifacts (one-day retention), not GitHub Release assets or
 GitHub Packages. Package installation is confined to disposable Debian/Ubuntu/
-Rocky job containers. The built package must have no maintainer/trigger scripts;
-smokes run `--version` and check the license, without installing a host service.
+Rocky job containers. The built package must have no maintainer/trigger scripts
+(including RPM file and transaction-file triggers); query failure also refuses
+installation. Smoke checks run `--version` and check the license, without installing a host service.
 Docker smoke uses an owned, network-isolated fixture container and always removes
 it and its anonymous volumes; it requires a successful status RPC with a positive
 PID, rather than inferring success from missing error text.
 
-The build matrix uses `macos-14` (ARM), `macos-15-intel` (Intel), and
-`windows-latest`. The retired `macos-13` label is also replaced in the release
-workflow ([runner announcement](https://github.com/actions/runner-images/issues/13045)).
+The build matrix uses `macos-15` (ARM), `macos-15-intel` (Intel), and
+`windows-latest`. Both labels are also updated in the release workflow:
+`macos-14` [retires on November 2, 2026](https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/),
+and retired `macos-13` is replaced by its [supported Intel successor](https://github.com/actions/runner-images/issues/13045).
 Each baseline starts with fresh job-local Cargo home/target directories and no
 cache restore/save. Toolchain setup, hosted image and network caches are not
 claimed cold. Logs record the exact commit, toolchain, runner/image and
