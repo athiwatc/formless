@@ -1147,6 +1147,40 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn owned_offline_quote_release_is_process_isolated() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "forecast::tests::owned_offline_quote_releases_source_freeze_before_any_output",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > std::time::Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned offline quote fixture did not settle");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    // The positive kernel-release assertion must run without sibling test
+    // processes briefly inheriting its pre-exec lock descriptors.
+    #[test]
+    #[ignore = "private subprocess fixture, exercised by owned_offline_quote_release_is_process_isolated"]
     fn owned_offline_quote_releases_source_freeze_before_any_output() {
         let env = crate::credential_env::EnvGuard::isolated();
         for key in ["FORMLESS_MODEL", "FORMLESS_BASE_URL", "FORMLESS_SECURE"] {

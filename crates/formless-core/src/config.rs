@@ -278,6 +278,7 @@ pub fn documented_shape() -> Config {
     cfg.compaction.trigger_fraction = Some(0.8);
     cfg.limits.daily_usd = Some(1.0);
     cfg.limits.run_usd = Some(1.0);
+    cfg.limits.forecast_confirm_usd = Some(1.0);
     cfg.limits.run_steps = Some(10);
     cfg.optimiser.model = Some(s("m"));
     cfg.optimiser.reasoning_effort = Some(s("low"));
