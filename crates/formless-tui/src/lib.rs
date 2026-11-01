@@ -7987,7 +7987,7 @@ impl App {
             if modal_keys
                 && !matches!(
                     c,
-                    'y' | 'n' | 'N' | 'o' | 's' | '1' | 'v' | '?' | 'p' | 'r' | 'P' | 'R'
+                    'y' | 'n' | 'N' | 'o' | 's' | '1' | 'v' | 'i' | '?' | 'p' | 'r' | 'P' | 'R'
                 )
                 && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
             {
