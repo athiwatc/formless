@@ -36,9 +36,9 @@ async fn a_remembered_denial_refuses_without_asking_and_says_why() {
                 "agent",
             )
             .unwrap();
-        // Denying the parent domain covers its subdomains.
+        // Only an explicit wildcard denies all proper subdomains.
         store
-            .add_denial("net:example.com", "other_tool", "TUI")
+            .add_denial("net:*.example.com", "other_tool", "TUI")
             .unwrap();
         (info.id, store.create_session(None).unwrap().id)
     };
@@ -54,7 +54,7 @@ async fn a_remembered_denial_refuses_without_asking_and_says_why() {
     let text = r["result"].as_str().unwrap_or_default().to_string() + &r.to_string();
     assert!(text.contains("always denies net:api.example.com"), "{text}");
     let listed = daemon.handle(Request::ListDenials).await.unwrap();
-    assert_eq!(listed[0]["capability"], "net:example.com");
+    assert_eq!(listed[0]["capability"], "net:*.example.com");
     let status = daemon.handle(Request::SecurityStatus).await.unwrap();
     assert_eq!(status["denials"], 1);
     assert!(formless_protocol::security_report(&status).contains("Always denied: 1"));

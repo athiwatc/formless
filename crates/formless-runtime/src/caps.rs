@@ -558,10 +558,11 @@ fn bound_host(raw: &str) -> Result<String, String> {
             .host_str()
             .map(str::to_string)
             .ok_or_else(|| format!("URL has no host: {raw}"))?;
-        return Ok(match u.port() {
+        let scope = match u.port() {
             Some(p) => format!("{host}:{p}"),
             None => host,
-        });
+        };
+        return canonical_host_scope(&scope).map_err(|e| format!("bad concrete URL host: {e}"));
     }
     canonical_host_scope(raw).map_err(|e| format!("bad host for net binding: {e}"))
 }
@@ -811,7 +812,12 @@ mod tests {
             assert!(Capabilities::parse(&[spec.into()]).is_err(), "{spec}");
         }
         let binding = caps(&["net:$input.url"]);
-        for input in ["*.example.com", "https://*.example.com/x"] {
+        for input in [
+            "*.example.com",
+            "https://*.example.com/x",
+            "https://.example.com/x",
+            "https://a..example.com/x",
+        ] {
             assert!(
                 binding.bind(&json!({"url":input})).is_err(),
                 "concrete input cannot synthesize a wildcard grant: {input}"

@@ -616,6 +616,9 @@ fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<St
         "Close this inspector, then v to fetch the full Tool code for the approval version.".into(),
     );
     lines
+        .into_iter()
+        .map(|line| text::escape_bidi(&line).into_owned())
+        .collect()
 }
 
 enum WizardJob {
@@ -8061,7 +8064,11 @@ impl App {
                             .map(String::as_str),
                     );
                     self.pager = Some(Pager {
-                        title: format!("{} v{} full approval", req.tool_name, req.version),
+                        title: text::escape_bidi(&format!(
+                            "{} v{} full approval",
+                            req.tool_name, req.version
+                        ))
+                        .into_owned(),
                         lines,
                         top: 0,
                         left: 0,
@@ -23060,7 +23067,9 @@ mod tests {
             memory_mb: 64,
             detail: Some("Description warning: first call".into()),
             already_allowed: vec![],
-            code_preview: Some("function run(input) { return input; }".into()),
+            code_preview: Some(
+                "function run(input) { return input; }\n// سلام ไทย \u{202E}fdp.exe".into(),
+            ),
             tool_id: Some("private-tool".into()),
             batch: None,
             path_options: vec![],
@@ -23128,6 +23137,24 @@ mod tests {
             sent.try_recv().is_err(),
             "inspecting evidence must not send any approval or execution request"
         );
+        assert!(
+            app.approvals[0]
+                .code_preview
+                .as_ref()
+                .unwrap()
+                .contains('\u{202E}'),
+            "immutable approval metadata stays raw internally"
+        );
+        assert!(!evidence.contains('\u{202E}'));
+        assert!(evidence.contains("⟨U+202E⟩"));
+        let pager_screen = render(&mut app, 180, 70);
+        assert!(!pager_screen.contains('\u{202E}'));
+        for shown in ["⟨U+202E⟩", "سلام", "ไทย"] {
+            assert!(
+                pager_screen.contains(shown),
+                "actual inspector rendering lost visible {shown}: {pager_screen}"
+            );
+        }
         app.pager = None;
         app.clear_attention();
         app.reconnect_request = Some((77, "s1".into()));

@@ -59,7 +59,16 @@ fn sensitive(key: &str) -> bool {
     .any(|part| key.contains(part))
 }
 fn clean(text: &str, known: &[&str], max: usize) -> String {
-    let redacted = crate::secrets::redact_known(text, known);
+    let mut redacted = crate::secrets::redact_known(text, known);
+    // A known opaque credential in a URL path may use %20 rather than the
+    // '+' form encoding already handled by the shared secret scanner.
+    for secret in known.iter().filter(|secret| !secret.is_empty()) {
+        let mut url = reqwest::Url::parse("https://redaction.invalid/").expect("static URL");
+        url.path_segments_mut()
+            .expect("hierarchical URL")
+            .push(secret);
+        redacted = redacted.replace(url.path().trim_start_matches('/'), "[REDACTED]");
+    }
     let mut text: String = redacted
         .chars()
         .take(max)
@@ -77,8 +86,18 @@ fn clean(text: &str, known: &[&str], max: usize) -> String {
     text
 }
 fn safe_url(raw: &str, known: &[&str]) -> Option<String> {
-    let mut url = reqwest::Url::parse(raw).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
+    let hierarchical = raw.trim().split_once("://").is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    let mut url = match reqwest::Url::parse(raw) {
+        Ok(url) => url,
+        Err(_) if hierarchical => return Some("[invalid URL; value redacted]".into()),
+        Err(_) => return None,
+    };
+    if !matches!(url.scheme(), "http" | "https") && url.host_str().is_none() {
         return None;
     }
     let _ = url.set_username("");
@@ -187,7 +206,7 @@ impl Screen<'_> {
                             self.paths.push(clean(path, self.known, MAX_TEXT));
                         }
                     }
-                    out.insert(display_key, preview);
+                    self.truncated |= out.insert(display_key, preview).is_some();
                 }
                 Value::Object(out)
             }
@@ -207,6 +226,10 @@ impl Screen<'_> {
                 )
             }
             Value::String(text) => {
+                if let Ok(url) = reqwest::Url::parse(text) {
+                    self.truncated |=
+                        url.query_pairs().count() > 32 || text.chars().count() > MAX_TEXT;
+                }
                 let text = safe_url(text, self.known).unwrap_or_else(|| text.to_string());
                 json!(self.text(&text))
             }
@@ -414,6 +437,52 @@ mod tests {
             "display evidence cannot alter execution inputs"
         );
         assert!(call(None, &cfg).note.contains("unresolved"));
+        cfg.provider
+            .extra_headers
+            .insert("X-Encoded".into(), "opaque/key value".into());
+        let encoded = call(
+            Some(&json!({"url":"https://approved.example/opaque%2Fkey%20value?opaque=secret"})),
+            &cfg,
+        );
+        assert!(!serde_json::to_string(&encoded)
+            .unwrap()
+            .contains("opaque%2Fkey%20value"));
+        let ssh = call(
+            Some(&json!({"url":"ssh://user:opaque-private@approved.example/repo"})),
+            &cfg,
+        );
+        assert!(!serde_json::to_string(&ssh)
+            .unwrap()
+            .contains("opaque-private"));
+        let invalid = call(
+            Some(&json!({"url":"https://user:opaque-private@[invalid/path"})),
+            &cfg,
+        );
+        assert!(!serde_json::to_string(&invalid)
+            .unwrap()
+            .contains("opaque-private"));
+        assert!(invalid.arguments["url"]
+            .as_str()
+            .unwrap()
+            .contains("invalid URL"));
+        let many = format!(
+            "https://approved.example/collect?{}",
+            (0..40)
+                .map(|index| format!("key{index}=private-value-{index}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        let many_input = json!({"url":many});
+        let limited = call(Some(&many_input), &cfg);
+        assert!(
+            limited.truncated,
+            "omitting query keys or shortening URLs must be explicit"
+        );
+        assert!(limited.urls[0].url.chars().count() <= MAX_TEXT + 1);
+        assert!(!serde_json::to_string(&limited)
+            .unwrap()
+            .contains("private-value-"));
+        assert!(limited.urls[0].url.contains("key0="));
         let huge = call(
             Some(&json!({"body":"界".repeat(20_000),"tail":"never unlimited"})),
             &cfg,
