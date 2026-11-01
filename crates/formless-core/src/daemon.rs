@@ -4514,19 +4514,23 @@ impl Daemon {
                     }
                 };
                 self.remove_attention(&approval_id);
+                let mut audit_recorded = None;
                 if resolved {
                     // Record the answering client even for Once/Session grants,
                     // which do not create a durable approvals table row.
                     let by = current_client().map(|c| c.1).unwrap_or_default();
                     let detail = json!({"approval_id":approval_id,"approved":approved,"scope":scope,"by":by}).to_string();
-                    let _ = self.with_store(|st| st.audit("user", "approval.decision", &detail));
+                    audit_recorded = Some(
+                        self.with_store(|st| st.audit("user", "approval.decision", &detail))
+                            .is_ok(),
+                    );
                     self.broadcast(Event::ApprovalAnswered {
                         approval_id,
                         approved,
                         by: current_client().map(|c| c.1),
                     });
                 }
-                Ok(json!({"resolved": resolved}))
+                Ok(json!({"resolved": resolved,"audit_recorded":audit_recorded}))
             }
         }
     }
@@ -17069,3 +17073,7 @@ mod sensitive_read_daemon_tests;
 #[cfg(test)]
 #[path = "model_test_daemon_tests.rs"]
 mod model_test_daemon_tests;
+
+#[cfg(test)]
+#[path = "cli_attach_daemon_tests.rs"]
+mod cli_attach_daemon_tests;

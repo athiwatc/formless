@@ -200,7 +200,7 @@ fn confirm_broad(
         write!(output, "{prompt}")?;
         output.flush()?;
         let mut line = String::new();
-        (&mut *input).take(1024).read_line(&mut line)?;
+        std::io::Read::take(&mut *input, 1024).read_line(&mut line)?;
         anyhow::ensure!(
             matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
             "approval left pending"
@@ -250,13 +250,16 @@ pub(super) fn decide(
         } else {
             ApprovalScope::Once
         },
-        paths: Vec::new(),
+        paths: Default::default(),
         remember_denial: false,
     })?;
     anyhow::ensure!(
         result["resolved"] == true,
         "approval is no longer pending; no decision was applied"
     );
+    if result["audit_recorded"] == false {
+        eprintln!("decision applied, but the daemon could not write its audit record; do not retry this decision");
+    }
     if json {
         println!("{}", serde_json::to_string(&result)?);
     } else {
@@ -329,7 +332,7 @@ impl Observer {
         std::io::stdout().flush()?;
         Ok(())
     }
-    fn snapshot(&mut self, value: &Value, end: Option<i64>) -> Result<()> {
+    fn snapshot(&mut self, value: &Value, end: Option<i64>, attention: bool) -> Result<()> {
         let messages: Vec<formless_protocol::MessageInfo> =
             serde_json::from_value(value["messages"].clone())?;
         for message in messages {
@@ -340,8 +343,10 @@ impl Observer {
                 })?;
             }
         }
-        for event in value["pending_events"].as_array().into_iter().flatten() {
-            self.emit(serde_json::from_value(event.clone())?)?;
+        if attention {
+            for event in value["pending_events"].as_array().into_iter().flatten() {
+                self.emit(serde_json::from_value(event.clone())?)?;
+            }
         }
         Ok(())
     }
@@ -376,7 +381,11 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
         approvals: HashSet::new(),
         json,
     };
-    observer.snapshot(&snapshot, run["end_message_seq"].as_i64())?;
+    observer.snapshot(
+        &snapshot,
+        run["end_message_seq"].as_i64(),
+        run["status"].as_str().and_then(terminal).is_none(),
+    )?;
     // Buffered deltas can predate the stored snapshot, with no message identity
     // to dedupe them. Drop only these ephemeral chunks; complete messages persist.
     conn.events.retain(|ev| {
@@ -394,7 +403,7 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
             let snapshot = conn.request(Request::GetSession {
                 id: session.id.clone(),
             })?;
-            observer.snapshot(&snapshot, run["end_message_seq"].as_i64())?;
+            observer.snapshot(&snapshot, run["end_message_seq"].as_i64(), false)?;
             if let Some(error) = run["error"].as_str() {
                 eprintln!("{}", super::comparison_terminal_text(error));
             }
@@ -429,7 +438,11 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
             let snap = conn.request(Request::GetSession {
                 id: session.id.clone(),
             })?;
-            observer.snapshot(&snap, run["end_message_seq"].as_i64())?;
+            observer.snapshot(
+                &snap,
+                run["end_message_seq"].as_i64(),
+                run["status"].as_str().and_then(terminal).is_none(),
+            )?;
         }
     }
 }

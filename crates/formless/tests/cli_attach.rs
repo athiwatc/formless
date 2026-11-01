@@ -18,7 +18,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        // Keep private socket fixtures short on macOS as well as Linux.
+        #[cfg(unix)]
+        let temp = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!(
             "f633-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -203,6 +208,7 @@ impl Drop for Provider {
 }
 fn setup(f: &Fixture, url: &str) -> String {
     let mut cfg = Config::default();
+    cfg.security.secure = true;
     cfg.provider.base_url = url.into();
     cfg.provider.model = "private633".into();
     cfg.provider.api_style = "openai".into();
@@ -237,8 +243,14 @@ fn setup(f: &Fixture, url: &str) -> String {
     st.create_session(Some("private633".into())).unwrap().id
 }
 fn daemon(f: &Fixture) -> Owned {
+    let cfg = Config::load_file_only(&f.paths).unwrap();
+    assert!(cfg.provider.base_url.starts_with("http://127.0.0.1:"));
     let mut command = f.command(&["daemon", "serve", "--stay"]);
-    command.stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .env("FORMLESS_BASE_URL", &cfg.provider.base_url)
+        .env("FORMLESS_MODEL", &cfg.provider.model)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut daemon = Owned(command.spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(15);
     while !formless_core::daemon::daemon_reachable(&f.paths) {
