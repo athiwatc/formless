@@ -29,6 +29,9 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+keyring.workspace = true
+
 # Linux packages (packaging/README.md): `cargo deb -p formless-bin` and
 # `cargo generate-rpm -p crates/formless` after a release build.
 [package.metadata.deb]

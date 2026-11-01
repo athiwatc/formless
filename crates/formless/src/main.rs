@@ -7048,6 +7048,10 @@ mod tests {
     #[test]
     fn oauth_diagnostics_report_all_providers_without_tokens_or_migration() {
         let _env = super::oauth_credential_env::EnvGuard::isolated();
+        // Diagnostics still try the keyring before falling back to files.
+        // This test binary uses only private in-memory entries; never restore
+        // an OS backend after the serialized fixture has finished.
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
         let (_fixture, mut paths) = MaintenanceFixture::new();
         paths.profile = format!("oauth-status-{}", std::process::id());
         std::fs::create_dir_all(&paths.config_dir).unwrap();
@@ -7057,26 +7061,75 @@ mod tests {
         cfg.provider.auth.client_id = "default-client".into();
         let mut named = cfg.provider.clone();
         named.auth.token_url = "https://work.example/token".into();
+        named.auth.client_id = "work-client".into();
         cfg.providers.insert("work".into(), named.clone());
-        let tokens = serde_json::json!({"access_token":"private-access","refresh_token":"private-refresh","token_type":"Bearer","token_url":named.auth.token_url});
-        formless_core::config::write_secret_file(
-            &formless_core::auth::oauth_tokens_file(&paths, &named.auth),
-            &tokens.to_string(),
-        )
-        .unwrap();
+        let tokens = serde_json::json!({"oauth_record_version":1,"token_endpoint":named.auth.token_url,"client_id":named.auth.client_id,"access_token":"private-work-access","refresh_token":"private-work-refresh","token_type":"Bearer","token_url":formless_core::auth::canonical_token_url(&named.auth.token_url).unwrap()});
+        let work_file = formless_core::auth::oauth_tokens_file(&paths, &named.auth);
+        formless_core::config::write_secret_file(&work_file, &tokens.to_string()).unwrap();
+        let mut legacy = named.clone();
+        legacy.auth.token_url = "https://legacy.example/token/".into();
+        legacy.auth.client_id = "legacy-client".into();
+        cfg.providers.insert("legacy".into(), legacy.clone());
+        let legacy_file = formless_core::auth::oauth_tokens_file(&paths, &legacy.auth);
+        let legacy_tokens = serde_json::json!({"access_token":"private-legacy-access","refresh_token":"private-legacy-refresh","token_type":"Bearer","token_url":legacy.auth.token_url});
+        formless_core::config::write_secret_file(&legacy_file, &legacy_tokens.to_string()).unwrap();
+        let before_work = std::fs::read(&work_file).unwrap();
+        let before_legacy = std::fs::read(&legacy_file).unwrap();
+        let config_files = || {
+            let mut files: Vec<_> = std::fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            files.sort();
+            files
+        };
+        let before_files = config_files();
+        let default_file = formless_core::auth::oauth_tokens_file(&paths, &cfg.provider.auth);
+        assert!(!default_file.exists());
         let statuses = super::oauth_provider_statuses(&paths, &cfg);
-        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses.len(), 3);
         assert_eq!(statuses[0]["name"], "default");
         assert_eq!(statuses[0]["credential_present"], false);
-        assert_eq!(statuses[1]["name"], "work");
-        assert_eq!(statuses[1]["credential_present"], true);
+        assert!(statuses[0]["warning"].is_null());
+        let work = statuses
+            .iter()
+            .find(|status| status["name"] == "work")
+            .unwrap();
+        let legacy = statuses
+            .iter()
+            .find(|status| status["name"] == "legacy")
+            .unwrap();
+        assert_eq!(work["credential_present"], true);
+        assert_eq!(work["has_refresh_token"], true);
+        assert!(work["warning"].is_null());
+        assert_eq!(work["login_command"], "formless auth login --provider work");
+        assert_eq!(legacy["credential_present"], false);
+        assert!(legacy["warning"]
+            .as_str()
+            .unwrap()
+            .contains("sign in again"));
         assert_eq!(
-            statuses[1]["login_command"],
-            "formless auth login --provider work"
+            legacy["login_command"],
+            "formless auth login --provider legacy"
         );
         let json = serde_json::to_string(&statuses).unwrap();
-        assert!(!json.contains("private-access"));
-        assert!(!json.contains("private-refresh"));
+        for secret in [
+            "private-work-access",
+            "private-work-refresh",
+            "private-legacy-access",
+            "private-legacy-refresh",
+        ] {
+            assert!(!json.contains(secret), "diagnostics exposed {secret}");
+        }
+        assert_eq!(super::oauth_provider_statuses(&paths, &cfg), statuses);
+        assert_eq!(std::fs::read(&work_file).unwrap(), before_work);
+        assert_eq!(std::fs::read(&legacy_file).unwrap(), before_legacy);
+        assert_eq!(
+            config_files(),
+            before_files,
+            "read-only diagnostics cannot create migration records"
+        );
+        assert!(!default_file.exists());
         assert!(!paths.oauth_tokens_file().exists());
     }
 
