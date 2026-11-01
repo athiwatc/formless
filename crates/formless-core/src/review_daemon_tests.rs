@@ -1084,3 +1084,408 @@ async fn ordinary_windows_active_review_undo_is_real_but_reopened_receipts_canno
         .exists());
     no_network(&s);
 }
+
+#[cfg(windows)]
+fn decide_path(view: &HunkReview, path: &std::path::Path) -> Request {
+    let file = view
+        .files
+        .iter()
+        .find(|file| file.path == path.to_str().unwrap())
+        .unwrap();
+    assert!(
+        file.exclusion_reason.is_none(),
+        "{:?}",
+        file.exclusion_reason
+    );
+    assert_eq!(file.hunks.len(), 1);
+    Request::DecideReviewHunk {
+        review_id: view.review_id.clone(),
+        file_id: file.id.clone(),
+        hunk_id: file.hunks[0].id.clone(),
+        expected_hash: file.after_hash.clone(),
+        decision: "reject".into(),
+    }
+}
+#[cfg(windows)]
+async fn decision(s: &Setup, request: Request) -> ReviewDecisionResult {
+    serde_json::from_value(s.daemon.handle(request).await.unwrap()).unwrap()
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_created_file_reject_undo_and_redo_reuse_the_exact_retained_object() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut s = setup(&env);
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    s.path = s.path.parent().unwrap().join("created-日.txt");
+    s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
+    let bytes = "created\r\n🦀\r\n".as_bytes();
+    std::fs::write(&s.path, bytes).unwrap();
+    s.daemon
+        .with_store(|st| st.set_run_status(&s.run, "completed"))
+        .unwrap();
+    let policy = s.daemon.review_policy().unwrap();
+    let original = s
+        .daemon
+        .read_review_image(s.path.to_str().unwrap(), &policy)
+        .unwrap();
+    let initial = inspect(&s).await;
+    let rejected = decision(&s, decide_path(&initial, &s.path)).await;
+    assert!(!s.path.exists());
+    let change = rejected.change_id.clone().unwrap();
+    let restored = decision(&s, undo(&rejected.review, &change)).await;
+    assert_eq!(std::fs::read(&s.path).unwrap(), bytes);
+    assert_eq!(
+        s.daemon
+            .read_review_image(s.path.to_str().unwrap(), &policy)
+            .unwrap(),
+        original
+    );
+    let receipts_before = std::fs::read_dir(s.daemon.paths.data_dir.join("review-objects"))
+        .unwrap()
+        .count();
+    let rejected_again = decision(&s, decide_path(&restored.review, &s.path)).await;
+    assert!(!s.path.exists());
+    assert_eq!(
+        std::fs::read_dir(s.daemon.paths.data_dir.join("review-objects"))
+            .unwrap()
+            .count(),
+        receipts_before,
+        "redo reuses its durable original object; no extra retained slot is consumed"
+    );
+    s.daemon.hunk_reviews.locked().entries.clear();
+    let reopened = inspect(&s).await;
+    let change = rejected_again.change_id.unwrap();
+    let _restored = decision(&s, undo(&reopened, &change)).await;
+    assert_eq!(
+        s.daemon
+            .read_review_image(s.path.to_str().unwrap(), &policy)
+            .unwrap(),
+        original
+    );
+    assert!(s.daemon.runs.locked().is_empty());
+    no_network(&s);
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_tracked_delete_restores_immutable_bytes_on_original_object_then_undoes_without_new_slot(
+) {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut s = setup(&env);
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    let bytes = "original\r\n日本語\n".as_bytes();
+    std::fs::write(&s.path, bytes).unwrap();
+    let policy = s.daemon.review_policy().unwrap();
+    let original = s
+        .daemon
+        .read_review_image(s.path.to_str().unwrap(), &policy)
+        .unwrap();
+    s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
+    // The hardlink is not an immutable byte snapshot: the Tool can change it
+    // before deleting the public name. Recovery must use private saved bytes.
+    std::fs::write(&s.path, b"later Tool body\r\n").unwrap();
+    std::fs::remove_file(&s.path).unwrap();
+    s.daemon
+        .with_store(|st| st.set_run_status(&s.run, "completed"))
+        .unwrap();
+    let view = inspect(&s).await;
+    let restored = decision(&s, decide_path(&view, &s.path)).await;
+    assert_eq!(
+        s.daemon
+            .read_review_image(s.path.to_str().unwrap(), &policy)
+            .unwrap(),
+        original
+    );
+    let store_count = std::fs::read_dir(s.daemon.paths.data_dir.join("review-objects"))
+        .unwrap()
+        .count();
+    let change = restored.change_id.clone().unwrap();
+    let removed = decision(&s, undo(&restored.review, &change)).await;
+    assert!(!s.path.exists());
+    assert_eq!(
+        std::fs::read_dir(s.daemon.paths.data_dir.join("review-objects"))
+            .unwrap()
+            .count(),
+        store_count,
+        "Undo removes only the public link and never needs another retention slot"
+    );
+    s.daemon.hunk_reviews.locked().entries.clear();
+    let reopened = inspect(&s).await;
+    let _restored_again = decision(&s, decide_path(&reopened, &s.path)).await;
+    assert_eq!(
+        s.daemon
+            .read_review_image(s.path.to_str().unwrap(), &policy)
+            .unwrap(),
+        original
+    );
+    assert_eq!(removed.review.files[0].after_hash, image_hash(None));
+    no_network(&s);
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_rename_delete_review_obeys_public_alias_and_lifo_undo_guards() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut s = setup(&env);
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    let a = s.path.clone();
+    let b = a.parent().unwrap().join("renamed.txt");
+    std::fs::write(&a, b"original A\r\n").unwrap();
+    s.daemon.snapshot_before_change(&s.session, &s.run, &a);
+    s.daemon.snapshot_before_change(&s.session, &s.run, &b);
+    std::fs::rename(&a, &b).unwrap();
+    std::fs::write(&b, b"modified B\r\n").unwrap();
+    s.daemon
+        .with_store(|st| st.set_run_status(&s.run, "completed"))
+        .unwrap();
+    let initial = inspect(&s).await;
+    assert!(s.daemon.handle(decide_path(&initial, &a)).await.is_err());
+    assert!(!a.exists());
+    assert_eq!(std::fs::read(&b).unwrap(), b"modified B\r\n");
+    let rejected_b = decision(&s, decide_path(&initial, &b)).await;
+    assert!(!b.exists());
+    let rejected_a = decision(&s, decide_path(&rejected_b.review, &a)).await;
+    assert_eq!(std::fs::read(&a).unwrap(), b"original A\r\n");
+    let change_b = rejected_b.change_id.unwrap();
+    assert!(
+        s.daemon
+            .handle(undo(&rejected_a.review, &change_b))
+            .await
+            .is_err(),
+        "out-of-order Undo cannot rewrite the shared object behind live A"
+    );
+    assert_eq!(std::fs::read(&a).unwrap(), b"original A\r\n");
+    assert!(!b.exists());
+    let undone_a = decision(
+        &s,
+        undo(&rejected_a.review, rejected_a.change_id.as_ref().unwrap()),
+    )
+    .await;
+    assert!(!a.exists());
+    let _undone_b = decision(&s, undo(&undone_a.review, &change_b)).await;
+    assert!(!a.exists());
+    assert_eq!(std::fs::read(&b).unwrap(), b"modified B\r\n");
+    assert!(s.daemon.runs.locked().is_empty());
+    no_network(&s);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_forged_database_missing_image_without_private_marker_cannot_remove_a_file() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let s = setup(&env);
+    let current = std::fs::read(&s.path).unwrap();
+    let missing = crate::review_file_io::encode_before_metadata(&ReviewImage::missing()).unwrap();
+    let db = rusqlite::Connection::open(s.daemon.paths.db_file()).unwrap();
+    db.execute(
+        "UPDATE run_files SET existed=0,kept=1,before=NULL,before_metadata=?1 WHERE run_id=?2",
+        rusqlite::params![missing, s.run],
+    )
+    .unwrap();
+    drop(db);
+    let view = inspect(&s).await;
+    assert!(view.files[0]
+        .exclusion_reason
+        .as_deref()
+        .unwrap()
+        .contains("private pre-Tool missing-state marker"));
+    assert!(s.daemon.handle(decide(&view, 0, "reject")).await.is_err());
+    assert_eq!(std::fs::read(&s.path).unwrap(), current);
+    assert!(!s.daemon.paths.data_dir.join("review-receipts").exists());
+    no_network(&s);
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_retention_capacity_failure_preserves_whole_run_before_bytes_and_refuses_unretained_delete(
+) {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut s = setup(&env);
+    let retained = crate::review_retained::RetainedStore::open(&s.daemon.paths, true)
+        .unwrap()
+        .unwrap();
+    let quota_path = s.path.parent().unwrap().join("quota-fixture.txt");
+    std::fs::write(&quota_path, b"small quota object").unwrap();
+    let policy = s.daemon.review_policy().unwrap();
+    let quota_image = s
+        .daemon
+        .read_review_image(quota_path.to_str().unwrap(), &policy)
+        .unwrap();
+    let access = ReviewPath::open(&quota_path, &policy).unwrap();
+    let source = access
+        .namespace_source(&quota_image, &policy, &retained)
+        .unwrap();
+    for i in 0..crate::review_retained::MAX_RECORDS {
+        let owner = crate::review_retained::RetainedOwner {
+            session_id: "private-capacity".into(),
+            run_id: format!("run-{i}"),
+            path_digest: format!("{i:064x}"),
+        };
+        retained.capture(&owner, &source, &quota_image).unwrap();
+    }
+    let extra = crate::review_retained::RetainedOwner {
+        session_id: "private-capacity".into(),
+        run_id: "one-too-many".into(),
+        path_digest: "f".repeat(64),
+    };
+    let error = retained.capture(&extra, &source, &quota_image).unwrap_err();
+    assert!(
+        error.to_string().to_lowercase().contains("capacity"),
+        "wrong full-store failure: {error:#}"
+    );
+    drop(source);
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    let before = "exact before despite retention failure\r\n日\n".as_bytes();
+    std::fs::write(&s.path, before).unwrap();
+    s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
+    let recorded = s.daemon.with_reader(|st| st.run_files(&s.run)).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert!(recorded[0].1 && recorded[0].2);
+    assert_eq!(recorded[0].3.as_deref(), Some(before));
+    std::fs::remove_file(&s.path).unwrap();
+    s.daemon
+        .with_store(|st| st.set_run_status(&s.run, "completed"))
+        .unwrap();
+    let view = inspect(&s).await;
+    assert!(view.files[0]
+        .exclusion_reason
+        .as_deref()
+        .unwrap()
+        .contains("no verified retained original object"));
+    assert!(s.daemon.handle(decide(&view, 0, "reject")).await.is_err());
+    assert!(!s.path.exists());
+    assert_eq!(
+        s.daemon.with_reader(|st| st.run_files(&s.run)).unwrap()[0]
+            .3
+            .as_deref(),
+        Some(before)
+    );
+    no_network(&s);
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_completed_run_releases_capture_pin_but_active_review_suspends_expiry() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut s = setup(&env);
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
+    let retained = crate::review_retained::RetainedStore::open(&s.daemon.paths, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.daemon.retained_capture_leases.locked().len(), 1);
+    assert_eq!(
+        retained.expire(u64::MAX).unwrap(),
+        0,
+        "an active Run pins its original object"
+    );
+    s.daemon.record_run_status(&s.session, &s.run, "completed");
+    assert!(
+        s.daemon.retained_capture_leases.locked().is_empty(),
+        "the last completed Run releases without another Tool callback"
+    );
+    assert_eq!(retained.expire(u64::MAX).unwrap(), 1);
+    assert_eq!(std::fs::read(&s.path).unwrap(), s.new.as_bytes());
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
+    s.daemon.record_run_status(&s.session, &s.run, "completed");
+    let _view = inspect(&s).await;
+    assert_eq!(
+        retained.expire(u64::MAX).unwrap(),
+        0,
+        "a live review token independently retains the full advertised Undo lifetime"
+    );
+    s.daemon.hunk_reviews.locked().entries.clear();
+    assert_eq!(retained.expire(u64::MAX).unwrap(), 1);
+    assert_eq!(std::fs::read(&s.path).unwrap(), s.new.as_bytes());
+    no_network(&s);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_private_before_binding_rejects_rechecksummed_database_tampering() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut s = setup(&env);
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    std::fs::write(&s.path, b"true immutable before\r\n").unwrap();
+    s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
+    let recorded = s
+        .daemon
+        .with_reader(|st| st.recorded_run_review(&s.session, Some(&s.run)))
+        .unwrap();
+    let row = &recorded.files[0];
+    let mut forged = crate::review_file_io::decode_before_metadata(
+        row.before_metadata.as_deref().unwrap(),
+        row.before.as_deref(),
+    )
+    .unwrap();
+    forged.bytes = Some(b"forged inverse bytes\r\n".to_vec());
+    let metadata = crate::review_file_io::encode_before_metadata(&forged).unwrap();
+    std::fs::write(&s.path, b"actual Tool result\r\n").unwrap();
+    s.daemon
+        .with_store(|st| st.set_run_status(&s.run, "completed"))
+        .unwrap();
+    let db = rusqlite::Connection::open(s.daemon.paths.db_file()).unwrap();
+    db.execute(
+        "UPDATE run_files SET before=?1,before_metadata=?2 WHERE run_id=?3",
+        rusqlite::params![forged.bytes.as_deref(), metadata, s.run],
+    )
+    .unwrap();
+    drop(db);
+    let view = inspect(&s).await;
+    assert!(view.files[0]
+        .exclusion_reason
+        .as_deref()
+        .unwrap()
+        .contains("Private immutable first-capture binding"));
+    assert!(s.daemon.handle(decide(&view, 0, "reject")).await.is_err());
+    assert_eq!(std::fs::read(&s.path).unwrap(), b"actual Tool result\r\n");
+    assert!(!s.daemon.paths.data_dir.join("review-receipts").exists());
+    no_network(&s);
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_last_background_completion_releases_completed_run_capture_without_another_callback(
+) {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut s = setup(&env);
+    s.run = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
+    let handle = uuid::Uuid::new_v4().to_string();
+    let pending = Arc::new(PendingEntry {
+        _pipeline: StdMutex::new(None),
+        routing_task: None,
+        taint_scope: s.daemon.taint_scope(&s.session, &s.run),
+        tool_name: "private-retention-completion".into(),
+        run_id: s.run.clone(),
+        started_ms: epoch_ms(),
+        session_id: s.session.clone(),
+        result: StdMutex::new(None),
+        delivered: AtomicBool::new(false),
+        abandoned: AtomicBool::new(false),
+        stalled_noted: AtomicBool::new(false),
+        activity: Arc::new(AtomicU64::new(epoch_ms())),
+        notify: tokio::sync::Notify::new(),
+        cancel: CancellationToken::new(),
+        order: 1,
+    });
+    s.daemon
+        .pending
+        .locked()
+        .insert(handle.clone(), pending.clone());
+    s.daemon.record_run_status(&s.session, &s.run, "completed");
+    assert_eq!(
+        s.daemon.retained_capture_leases.locked().len(),
+        1,
+        "unfinished background work still owns its source object"
+    );
+    s.daemon
+        .complete_pending(&handle, &pending, true, "done".into());
+    assert!(s.daemon.retained_capture_leases.locked().is_empty());
+    assert!(
+        s.daemon.pending.locked().contains_key(&handle),
+        "cleanup never consumes an awaiting-delivery result"
+    );
+    let store = crate::review_retained::RetainedStore::open(&s.daemon.paths, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.expire(u64::MAX).unwrap(), 1);
+    assert_eq!(std::fs::read(&s.path).unwrap(), s.new.as_bytes());
+    no_network(&s);
+}

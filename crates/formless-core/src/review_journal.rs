@@ -142,6 +142,10 @@ pub(crate) struct Receipt {
     platform: String,
     before: Image,
     after: Image,
+    /// Namespace recovery authority is private and independent of target
+    /// existence/metadata equality. Old receipts have no retained object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained: Option<crate::review_retained::RetainedToken>,
 }
 impl Receipt {
     #[allow(clippy::too_many_arguments)]
@@ -171,9 +175,28 @@ impl Receipt {
             platform: std::env::consts::OS.into(),
             before: Image::capture(before)?,
             after: Image::capture(after)?,
+            retained: None,
         };
         receipt.refresh_integrity()?;
         Ok(receipt)
+    }
+    /// Bind trusted newly-created action metadata before callers inspect its
+    /// images. The initial checksum is verified first; disk corruption is never
+    /// repaired by this builder, and committed receipts cannot be rebound.
+    pub fn bind_action(
+        mut self,
+        id: &str,
+        retained: Option<crate::review_retained::RetainedToken>,
+    ) -> Result<Self> {
+        self.images()?;
+        if self.phase != Phase::Prepared || self.sequence != 0 {
+            bail!("Only a new action can be bound");
+        }
+        validate_id(id)?;
+        self.id = id.into();
+        self.retained = retained;
+        self.refresh_integrity()?;
+        Ok(self)
     }
     fn checksum(&self) -> Result<String> {
         use sha2::{Digest, Sha256};
@@ -639,7 +662,7 @@ fn open_private(path: &Path, create: bool) -> Result<File> {
 }
 
 #[cfg(windows)]
-fn windows_private(file: &File) -> Result<()> {
+pub(crate) fn windows_private(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::{
         Foundation::LocalFree,
@@ -785,6 +808,22 @@ mod tests {
             after,
         )
         .unwrap()
+    }
+    #[test]
+    fn binding_new_action_preserves_valid_images_and_never_reseals_a_corrupt_receipt() {
+        let before = image(b"before");
+        let after = image(b"after");
+        let original = receipt(&before, &after);
+        let action = original
+            .clone()
+            .bind_action(&uuid::Uuid::new_v4().to_string(), None)
+            .unwrap();
+        assert_eq!(action.images().unwrap(), (before, after));
+        let mut corrupt = original;
+        corrupt.path.push_str("corrupted");
+        assert!(corrupt
+            .bind_action(&uuid::Uuid::new_v4().to_string(), None)
+            .is_err());
     }
     #[test]
     fn readonly_inspection_does_not_create_absent_profile_or_journal() {

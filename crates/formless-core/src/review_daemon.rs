@@ -12,6 +12,19 @@ const MAX_REVIEWS: usize = 16;
 const MAX_ENTRY: usize = 8 * 1024 * 1024;
 const MAX_STATE: usize = 32 * 1024 * 1024;
 const MAX_CHANGES: usize = 128;
+#[cfg(windows)]
+pub(super) fn retained_owner(
+    session: &str,
+    run: &str,
+    path: &str,
+) -> crate::review_retained::RetainedOwner {
+    use sha2::{Digest, Sha256};
+    crate::review_retained::RetainedOwner {
+        session_id: session.into(),
+        run_id: run.into(),
+        path_digest: format!("{:x}", Sha256::digest(path.as_bytes())),
+    }
+}
 #[derive(Default)]
 pub(super) struct ReviewState {
     entries: HashMap<String, Entry>,
@@ -27,6 +40,10 @@ struct Entry {
     draft_undo: BTreeMap<String, DraftUndo>,
     #[cfg(windows)]
     live_changes: BTreeSet<String>,
+    #[cfg(windows)]
+    retained: BTreeMap<String, crate::review_retained::RetainedToken>,
+    #[cfg(windows)]
+    missing_markers: BTreeMap<String, crate::review_retained::RetainedToken>,
 }
 #[derive(Clone)]
 struct DraftUndo {
@@ -38,7 +55,13 @@ struct DraftUndo {
 }
 impl Entry {
     fn bytes(&self) -> Result<usize> {
-        Ok(serde_json::to_vec(&self.view)?.len()
+        #[cfg(windows)]
+        let retained_metadata =
+            (self.retained.len() + self.missing_markers.len()) * 64 + self.live_changes.len() * 36;
+        #[cfg(not(windows))]
+        let retained_metadata = 0;
+        Ok(retained_metadata
+            + serde_json::to_vec(&self.view)?.len()
             + self
                 .documents
                 .values()
@@ -215,6 +238,59 @@ impl Daemon {
         }
         Ok(())
     }
+    #[cfg(windows)]
+    pub(super) fn prune_retained_capture_leases_in(&self, store: &Store) {
+        // Existing pending/background work can still mutate its source object.
+        // Be conservative on unknown state; this map is independently bounded
+        // by the retained store's fixed owner/manifest capacity.
+        if self.review_pending_status(None).0 {
+            return;
+        }
+        self.retained_capture_leases
+            .locked()
+            .retain(|(_, run, _), _| store.review_retained_run_active(run).unwrap_or(true));
+    }
+    #[cfg(windows)]
+    pub(super) fn expire_retained_now(
+        &self,
+        retained: &crate::review_retained::RetainedStore,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        retained.expire(now)?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    pub(super) fn sweep_retained_before_action(&self) {
+        // Always Store -> capture-map. Drop BOTH before native expiry work;
+        // fresh capture/review token leases protect objects across this gap.
+        {
+            let store = self.store.locked();
+            self.prune_retained_capture_leases_in(&store);
+        }
+        if let Ok(Some(retained)) = crate::review_retained::RetainedStore::open(&self.paths, false)
+        {
+            if self.expire_retained_now(&retained).is_err() {
+                tracing::warn!("Windows review retention cleanup deferred; unknown state retained");
+            }
+        }
+    }
+    fn read_review_image(
+        &self,
+        path: &str,
+        policy: &formless_runtime::sensitive_paths::PathPolicy,
+    ) -> Result<ReviewImage> {
+        let access = ReviewPath::open(std::path::Path::new(path), policy)?;
+        #[cfg(windows)]
+        if let Some(store) = crate::review_retained::RetainedStore::open(&self.paths, false)
+            .ok()
+            .flatten()
+        {
+            return access.read_tracked(policy, &store);
+        }
+        access.read(policy)
+    }
     fn validate_review_image(
         &self,
         entry: &Entry,
@@ -236,8 +312,7 @@ impl Daemon {
             ));
         }
         if entry.view.run_id.is_some() {
-            let current =
-                ReviewPath::open(std::path::Path::new(&shown.path), policy)?.read(policy)?;
+            let current = self.read_review_image(&shown.path, policy)?;
             if &current != expected {
                 return Err(invalid(
                     "File content, existence or mode changed since review; inspect again",
@@ -260,6 +335,11 @@ impl Daemon {
         let recorded = self.with_reader(|st| st.recorded_run_review(session, run))?;
         let mut state = self.hunk_reviews.locked();
         state.prune();
+        #[cfg(windows)]
+        self.with_store(|store| {
+            self.prune_retained_capture_leases_in(store);
+            Ok(())
+        })?;
         for entry in state.entries.values() {
             if entry.view.session_id == session
                 && entry.view.run_id.as_deref() == Some(recorded.run_id.as_str())
@@ -297,6 +377,10 @@ impl Daemon {
             draft_undo: BTreeMap::new(),
             #[cfg(windows)]
             live_changes: BTreeSet::new(),
+            #[cfg(windows)]
+            retained: BTreeMap::new(),
+            #[cfg(windows)]
+            missing_markers: BTreeMap::new(),
         };
         let mut retained = 0usize;
         for record in recorded.files {
@@ -317,12 +401,6 @@ impl Daemon {
                 continue;
             }
             #[cfg(windows)]
-            if !record.existed {
-                entry.view.files.push(excluded(&record.path,
-                    "Windows created-file rejection requires retained-object recovery; this file is read-only".into(), before_hash, String::new()));
-                continue;
-            }
-            #[cfg(windows)]
             if entry.images.len() >= 128 {
                 entry.view.files.push(excluded(
                     &record.path,
@@ -332,9 +410,7 @@ impl Daemon {
                 ));
                 continue;
             }
-            let image = match ReviewPath::open(std::path::Path::new(&record.path), &policy)
-                .and_then(|p| p.read(&policy))
-            {
+            let image = match self.read_review_image(&record.path, &policy) {
                 Ok(image) => image,
                 Err(error) => {
                     entry.view.files.push(excluded(
@@ -346,12 +422,6 @@ impl Daemon {
                     continue;
                 }
             };
-            #[cfg(windows)]
-            if image.bytes.is_none() {
-                entry.view.files.push(excluded(&record.path,
-                    "Windows deleted-file restoration requires retained original security/object state; this file is read-only".into(), before_hash, image.hash()));
-                continue;
-            }
             let original = record.before_metadata.as_deref().map(|metadata| {
                 crate::review_file_io::decode_before_metadata(metadata, record.before.as_deref())
             });
@@ -378,20 +448,122 @@ impl Daemon {
                 }
                 None => None,
             };
+            #[cfg(windows)]
+            let (retained_token, missing_marker) = {
+                let store = crate::review_retained::RetainedStore::open(&self.paths, false)
+                    .ok()
+                    .flatten();
+                let token = if record.existed {
+                    if let Some(store) = &store {
+                        // A known private first-capture binding must never be
+                        // bypassed by treating its verification error as legacy
+                        // SQLite-only history. Missing metadata is deliberately
+                        // not reconstructed: any existing private record rejects
+                        // this incomplete comparison image.
+                        let comparison = original.clone().unwrap_or_else(|| ReviewImage {
+                            bytes: record.before.clone(),
+                            ..Default::default()
+                        });
+                        match store.lookup(
+                            &retained_owner(session, &recorded.run_id, &record.path),
+                            &comparison,
+                        ) {
+                            Ok(token) => token,
+                            Err(_) => {
+                                entry.view.files.push(excluded(&record.path,
+                                    "Private immutable first-capture binding cannot be verified; this file is read-only".into(), before_hash, image.hash()));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let missing_marker = if !record.existed {
+                    original.as_ref().and_then(|missing| {
+                        store.as_ref().and_then(|store| {
+                            store
+                                .lookup_missing(
+                                    &retained_owner(session, &recorded.run_id, &record.path),
+                                    missing,
+                                )
+                                .ok()
+                                .flatten()
+                        })
+                    })
+                } else {
+                    None
+                };
+                if !record.existed && missing_marker.is_none() {
+                    entry.view.files.push(excluded(&record.path,
+                        "Created Windows file has no private pre-Tool missing-state marker; database history alone cannot authorize removal".into(), before_hash, image.hash()));
+                    continue;
+                }
+                if record.existed && image.bytes.is_none() && token.is_none() {
+                    entry.view.files.push(excluded(&record.path,
+                        "Deleted Windows file has no verified retained original object; historical opaque security state cannot be recreated".into(), before_hash, image.hash()));
+                    continue;
+                }
+                if (!record.existed && image.bytes.is_some())
+                    || (record.existed && image.bytes.is_none())
+                {
+                    let source_identity = if image.bytes.is_some() {
+                        image.windows_identity.as_ref()
+                    } else {
+                        original
+                            .as_ref()
+                            .and_then(|image| image.windows_identity.as_ref())
+                    };
+                    let volume_supported = source_identity.is_some_and(|identity| {
+                        store.as_ref().is_some_and(|store| {
+                            store.supports_identity(identity).unwrap_or(false)
+                                && ReviewPath::open(std::path::Path::new(&record.path), &policy)
+                                    .and_then(|access| {
+                                        access.namespace_target_matches(identity, &policy)
+                                    })
+                                    .unwrap_or(false)
+                        })
+                    });
+                    if !volume_supported
+                        || store
+                            .as_ref()
+                            .is_none_or(|store| store.ensure_namespace_capability().is_err())
+                    {
+                        entry.view.files.push(excluded(&record.path,
+                            "Windows namespace recovery is unavailable on this volume; no inverse action was offered".into(), before_hash, image.hash()));
+                        continue;
+                    }
+                }
+                (token, missing_marker)
+            };
             if original
                 .as_ref()
                 .is_some_and(|original| original.bytes.is_some() && !original.security_complete)
                 && !(cfg!(windows)
                     && record.existed
-                    && image.bytes.is_some()
-                    && image.existing_write_restriction().is_none())
+                    && (image.bytes.is_some() && image.existing_write_restriction().is_none() || {
+                        #[cfg(windows)]
+                        {
+                            retained_token.is_some()
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            false
+                        }
+                    }))
             {
                 entry.view.files.push(excluded(&record.path,
                     "Original bytes were captured without fully restorable metadata; this file remains read-only".into(), before_hash, image.hash()));
                 continue;
             }
             if record.existed && image.bytes.is_none() {
-                let reason = original.as_ref().map_or(Some("Deleted file has no recorded original metadata; whole-file restore remains separate."), |original| original.write_restriction());
+                let reason = original.as_ref().map_or(Some("Deleted file has no recorded original metadata; whole-file restore remains separate."), |original| {
+                    #[cfg(windows)]
+                    if retained_token.is_some() { return original.ordinary_write_restriction(); }
+                    original.write_restriction()
+                });
                 if let Some(reason) = reason {
                     entry.view.files.push(excluded(
                         &record.path,
@@ -402,7 +574,7 @@ impl Daemon {
                     continue;
                 }
             }
-            let restriction = if record.existed && image.bytes.is_some() {
+            let restriction = if image.bytes.is_some() {
                 image.existing_write_restriction()
             } else {
                 image.write_restriction()
@@ -440,6 +612,14 @@ impl Daemon {
                 if let Some(original) = original {
                     entry.original_images.insert(shown.id.clone(), original);
                 }
+                #[cfg(windows)]
+                if let Some(token) = retained_token {
+                    entry.retained.insert(shown.id.clone(), token);
+                }
+                #[cfg(windows)]
+                if let Some(marker) = missing_marker {
+                    entry.missing_markers.insert(shown.id.clone(), marker);
+                }
                 entry.images.insert(shown.id.clone(), image);
                 entry.documents.insert(shown.id.clone(), document);
             }
@@ -473,9 +653,7 @@ impl Daemon {
             let image = if let Some(image) = virtual_images.get(&record.path) {
                 image.clone()
             } else {
-                match ReviewPath::open(std::path::Path::new(&record.path), policy)
-                    .and_then(|p| p.read(policy))
-                {
+                match self.read_review_image(&record.path, policy) {
                     Ok(image) => image,
                     Err(_) => {
                         entry.view.warnings.push(format!("Undo receipt {} cannot safely inspect its recorded file; no automatic write is allowed.",record.id));
@@ -486,6 +664,26 @@ impl Daemon {
             #[cfg(windows)]
             {
                 let (before, after) = record.images()?;
+                if before.bytes.is_none() != after.bytes.is_none() {
+                    let object = record.retained.as_ref().and_then(|token| {
+                        crate::review_retained::RetainedStore::open(&self.paths, false)
+                            .ok()
+                            .flatten()
+                            .and_then(|store| {
+                                store
+                                    .open_verified(
+                                        token,
+                                        &retained_owner(&entry.view.session_id, run, &record.path),
+                                    )
+                                    .ok()
+                            })
+                    });
+                    let Some(object) = object else {
+                        entry.view.warnings.push(format!("Namespace receipt {} has no verified retained original object; no automatic Undo is allowed", record.id));
+                        continue;
+                    };
+                    entry.retained.insert(file.id.clone(), object.token());
+                }
                 if before.bytes.is_some() && after.bytes.is_some() {
                     entry.view.warnings.push(format!("Windows undo receipt {} retains recovery bytes, but this reopened review does not retain the original live file object. Automatic Undo is unavailable; no metadata is reconstructed.", record.id));
                     continue;
@@ -553,6 +751,10 @@ impl Daemon {
             draft_undo: BTreeMap::new(),
             #[cfg(windows)]
             live_changes: BTreeSet::new(),
+            #[cfg(windows)]
+            retained: BTreeMap::new(),
+            #[cfg(windows)]
+            missing_markers: BTreeMap::new(),
         };
         self.hunk_reviews.locked().insert(entry)
     }
@@ -601,16 +803,69 @@ impl Daemon {
         mut receipt: Receipt,
         live: &ReviewImage,
         policy: &formless_runtime::sensitive_paths::PathPolicy,
-    ) -> Result<(Receipt, Vec<String>)> {
+    ) -> Result<(Receipt, Vec<String>, ReviewImage)> {
         // New Invocation starts and snapshot-before-write admission use this
         // same Store mutex. Keep the final known-work check through commit.
+        #[cfg(windows)]
+        self.sweep_retained_before_action();
         let store = self.store.locked();
         self.review_profile_commit_idle(&store)?;
         #[cfg(windows)]
-        {
-            let (before, after) = receipt.images()?;
-            if before.bytes.is_none() || after.bytes.is_none() {
-                return Err(invalid("Windows existence-changing review requires retained-object recovery; no receipt or mutation was applied"));
+        self.prune_retained_capture_leases_in(&store);
+        let (before, after) = receipt.images()?;
+        let access = ReviewPath::open(std::path::Path::new(&receipt.path), policy)?;
+        #[cfg(windows)]
+        let retained_store = if before.bytes.is_some() != after.bytes.is_some() {
+            crate::review_retained::RetainedStore::open(&self.paths, true)?
+        } else {
+            // Retention is not a dependency of the accepted ordinary single-
+            // link byte-only path. Its own no-follow/link-count checks remain.
+            crate::review_retained::RetainedStore::open(&self.paths, false)
+                .ok()
+                .flatten()
+        };
+        #[cfg(windows)]
+        let mut prepared_move = None;
+        #[cfg(windows)]
+        let mut prepared_remove = None;
+        #[cfg(windows)]
+        if before.bytes.is_some() != after.bytes.is_some() {
+            let retained = retained_store
+                .as_ref()
+                .context("Retained object store unavailable")?;
+            retained.ensure_namespace_capability()?;
+            let owner = retained_owner(&receipt.session_id, &receipt.run_id, &receipt.path);
+            if before.bytes.is_some() {
+                let source = access.namespace_source(&before, policy, retained)?;
+                if let Some(token) = receipt.retained.as_ref() {
+                    let object = retained.open_verified(token, &owner)?;
+                    if object.before() != &before {
+                        return Err(invalid(
+                            "Retained creation image changed; no namespace mutation was applied",
+                        ));
+                    }
+                    object.verify_peer(&source)?;
+                    receipt.retained = Some(object.token());
+                    prepared_remove = Some((source, object));
+                } else {
+                    let prepared = retained.prepare_move(&owner, &source, &before)?;
+                    receipt.retained = Some(prepared.token().clone());
+                    prepared_move = Some((prepared, source));
+                }
+            } else {
+                let object = retained.open_verified(
+                    receipt
+                        .retained
+                        .as_ref()
+                        .context("Deleted-file recovery has no retained object")?,
+                    &owner,
+                )?;
+                object.require_retained_only()?;
+                if object.before() != &after {
+                    return Err(invalid(
+                        "Retained original image does not match the inverse edit",
+                    ));
+                }
             }
         }
         let journal =
@@ -619,7 +874,6 @@ impl Daemon {
         Self::audit_review_receipt_in(&store, &receipt, "prepared").context(
             "Audit unavailable; no file was changed. The prepared private receipt is retained.",
         )?;
-        let (before, after) = receipt.images()?;
         #[cfg(windows)]
         let (before, after) = {
             let (mut before, mut after) = (before, after);
@@ -631,9 +885,37 @@ impl Daemon {
         };
         #[cfg(not(windows))]
         let _ = live;
-        let access = ReviewPath::open(std::path::Path::new(&receipt.path), policy)?;
+        #[cfg(windows)]
+        let outcome = if let Some((prepared, source)) = prepared_move {
+            retained_store
+                .as_ref()
+                .context("Retained store disappeared")?
+                .commit_move(prepared, &source)
+                .map(|token| {
+                    receipt.retained = Some(token);
+                    Vec::new()
+                })
+        } else if let Some((source, object)) = prepared_remove {
+            access.remove_prepared(source, &before, &object, policy)
+        } else {
+            match &retained_store {
+                Some(retained) if before.bytes.is_none() && after.bytes.is_some() => {
+                    let object = retained.open_verified(
+                        receipt
+                            .retained
+                            .as_ref()
+                            .context("Missing retained inverse object")?,
+                        &retained_owner(&receipt.session_id, &receipt.run_id, &receipt.path),
+                    )?;
+                    access.restore_retained(&object, &after, policy, retained)
+                }
+                Some(retained) => access.replace_tracked(&before, &after, policy, retained),
+                None => access.replace(&before, &after, policy),
+            }
+        };
+        #[cfg(not(windows))]
         let outcome = access.replace(&before, &after, policy);
-        let observed = access.read(policy);
+        let observed = self.read_review_image(&receipt.path, policy);
         let mut warnings=match outcome {
             Ok(warnings)=>warnings,
             Err(error)=>match &observed {
@@ -650,7 +932,11 @@ impl Daemon {
         if Self::audit_review_receipt_in(&store, &receipt, "applied").is_err() {
             warnings.push("File replacement completed, but the audit update failed; the private prepared undo receipt remains available.".into());
         }
-        Ok((receipt, warnings))
+        Ok((
+            receipt,
+            warnings,
+            observed.context("Verified post-image unavailable")?,
+        ))
     }
     pub(super) fn decide_review_hunk(
         &self,
@@ -758,7 +1044,15 @@ impl Daemon {
                 &before,
                 &after,
             )?;
-            receipt.id = change_id.clone();
+            #[cfg(windows)]
+            let retained = if before.bytes.is_some() != after.bytes.is_some() {
+                entry.retained.get(file).cloned()
+            } else {
+                None
+            };
+            #[cfg(not(windows))]
+            let retained = None;
+            receipt = receipt.bind_action(&change_id, retained)?;
             record = Some(receipt);
         } else {
             changed.draft_undo.insert(
@@ -789,9 +1083,19 @@ impl Daemon {
             ));
         }
         if let Some(receipt) = record {
-            let (_, warnings) = self.apply_review_file(receipt, &before, &policy)?;
+            let (applied, warnings, observed) =
+                self.apply_review_file(receipt, &before, &policy)?;
+            #[cfg(not(windows))]
+            let _ = (applied, observed);
             #[cfg(windows)]
-            changed.live_changes.insert(change_id.clone());
+            {
+                changed.live_changes.insert(change_id.clone());
+                if let Some(token) = applied.retained {
+                    changed.retained.insert(file.into(), token);
+                }
+                // A restored target gains its own live attribute witness.
+                changed.changed(file, observed)?;
+            }
             changed.view.warnings.extend(warnings);
         }
         *entry = changed;
@@ -836,8 +1140,12 @@ impl Daemon {
         }
         let mut changed = entry.clone();
         if let Some(run) = entry.view.run_id.as_deref() {
+            #[cfg(windows)]
+            self.sweep_retained_before_action();
             let store = self.store.locked();
             self.review_profile_commit_idle(&store)?;
+            #[cfg(windows)]
+            self.prune_retained_capture_leases_in(&store);
             let journal = Journal::open(&self.paths, false)?
                 .context("Private undo receipt is unavailable")?;
             let receipt = journal.read(change_id)?;
@@ -886,8 +1194,41 @@ impl Daemon {
                 }
             };
             let access = ReviewPath::open(std::path::Path::new(&receipt.path), &policy)?;
+            #[cfg(windows)]
+            let outcome = {
+                let retained_store = if before.bytes.is_some() != after.bytes.is_some() {
+                    crate::review_retained::RetainedStore::open(&self.paths, false)?
+                } else {
+                    crate::review_retained::RetainedStore::open(&self.paths, false)
+                        .ok()
+                        .flatten()
+                };
+                match retained_store {
+                    Some(retained) if before.bytes.is_some() != after.bytes.is_some() => {
+                        retained.ensure_namespace_capability()?;
+                        let object = retained.open_verified(
+                            receipt
+                                .retained
+                                .as_ref()
+                                .context("Namespace Undo has no retained object")?,
+                            &retained_owner(&receipt.session_id, &receipt.run_id, &receipt.path),
+                        )?;
+                        changed
+                            .retained
+                            .insert(descriptor.file_id.clone(), object.token());
+                        if before.bytes.is_some() {
+                            access.restore_retained(&object, &before, &policy, &retained)
+                        } else {
+                            access.remove_retained(&after, &object, &policy, &retained)
+                        }
+                    }
+                    Some(retained) => access.replace_tracked(&after, &before, &policy, &retained),
+                    None => access.replace(&after, &before, &policy),
+                }
+            };
+            #[cfg(not(windows))]
             let outcome = access.replace(&after, &before, &policy);
-            let observed = access.read(&policy);
+            let observed = self.read_review_image(&receipt.path, &policy);
             if observed.as_ref().map_or(true, |image| image != &before) {
                 return Err(invalid(format!("Undo did not reach a verified pre-image and may have changed file state. No automatic retry; private receipt {change_id} is retained.")));
             }
@@ -923,6 +1264,8 @@ impl Daemon {
                 changed.rejected.remove(&descriptor.file_id);
                 changed.view.warnings.push("Undo restored an earlier review image; remaining hunks for this file were refreshed.".into());
             }
+            #[cfg(windows)]
+            let before = observed.context("Verified Undo image unavailable")?;
             changed.changed(&descriptor.file_id, before)?;
             if let Some(ids) = changed.rejected.get_mut(&descriptor.file_id) {
                 ids.remove(&receipt.hunk_id);

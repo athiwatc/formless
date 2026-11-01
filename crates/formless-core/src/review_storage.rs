@@ -25,6 +25,33 @@ pub(crate) struct RecordedRunReview {
     pub files: Vec<RecordedReviewFile>,
 }
 impl Store {
+    #[cfg(windows)]
+    pub(crate) fn review_retained_run_active(&self, run: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1 AND status='running') OR EXISTS(SELECT 1 FROM invocations WHERE run_id=?1 AND status IN ('running','pending'))",
+            params![run], |row| row.get(0),
+        )?)
+    }
+    /// Only the immutable FIRST pre-change row may acquire retained-object
+    /// authority. A later Tool callback must not repair/replace a missing token
+    /// with the object's post-change identity or security metadata.
+    #[cfg(windows)]
+    pub(crate) fn review_snapshot_recorded(
+        &self,
+        session: &str,
+        run: &str,
+        path: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_files WHERE run_id=?1 AND path=?2)",
+            params![run, path],
+            |row| row.get::<_, bool>(0),
+        )? || !self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1 AND session_id=?2)",
+            params![run, session],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
     pub(crate) fn review_session_busy(
         &self,
         session: &str,

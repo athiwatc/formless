@@ -45,6 +45,9 @@ mod relay_input;
 pub mod restore_references;
 mod review_file_io;
 mod review_journal;
+mod review_retained;
+#[cfg(windows)]
+mod review_windows_namespace;
 pub mod routing;
 mod routing_observation;
 pub mod routing_policy;

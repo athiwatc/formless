@@ -665,6 +665,11 @@ pub struct Daemon {
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
     branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
     hunk_reviews: StdMutex<review_daemon::ReviewState>,
+    #[cfg(windows)]
+    retained_capture_leases: StdMutex<
+        std::collections::BTreeMap<(String, String, String), crate::review_retained::RetainedToken>,
+    >,
+
     /// Sessions in step mode (`/step`), and the step decisions awaited.
     step_sessions: StdMutex<std::collections::HashSet<String>>,
     step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
@@ -905,6 +910,8 @@ impl Daemon {
             comparisons: StdMutex::new(Default::default()),
             branch_summary_state: Arc::new(StdMutex::new(Default::default())),
             hunk_reviews: StdMutex::new(Default::default()),
+            #[cfg(windows)]
+            retained_capture_leases: StdMutex::new(Default::default()),
             routing_log: StdMutex::new(Default::default()),
             model_test_cache,
             routing_recorder: Arc::new(crate::routing_recorder::Recorder::default()),
@@ -2449,7 +2456,12 @@ impl Daemon {
                     .filter(|(_, s)| s == "interrupted" || s == "paused");
                 let abandoned = match last {
                     Some((run_id, _)) => {
-                        self.with_store(|st| st.set_run_status(&run_id, "abandoned"))?;
+                        self.with_store(|st| {
+                            st.set_run_status(&run_id, "abandoned")?;
+                            #[cfg(windows)]
+                            self.prune_retained_capture_leases_in(st);
+                            Ok(())
+                        })?;
                         true
                     }
                     None => false,
@@ -5507,7 +5519,19 @@ impl Daemon {
     /// Record a Run's final status; a failed write is logged and told,
     /// never hidden behind a status clients would believe (#1097).
     fn record_run_status(&self, session_id: &str, run_id: &str, status: &str) {
-        if let Err(e) = self.with_store(|st| st.set_run_status(run_id, status)) {
+        let recorded = self.with_store(|st| {
+            st.set_run_status(run_id, status)?;
+            #[cfg(windows)]
+            {
+                self.prune_retained_capture_leases_in(st);
+            }
+            Ok(())
+        });
+        #[cfg(windows)]
+        if recorded.is_ok() {
+            self.sweep_retained_before_action();
+        }
+        if let Err(e) = recorded {
             tracing::error!("could not record run {run_id} as {status}: {e:#}");
             self.broadcast(Event::Note {
                 session_id: Some(session_id.to_string()),
@@ -8196,6 +8220,8 @@ impl Daemon {
         // keeps the result, but need not retain private Run-only instructions.
         entry._pipeline.locked().take();
         self.pipeline_policies.locked().prune();
+        #[cfg(windows)]
+        self.sweep_retained_before_action();
         entry.notify.notify_waiters();
         self.broadcast(Event::InvocationCompleted {
             session_id: entry.session_id.clone(),
@@ -10775,6 +10801,29 @@ impl Daemon {
         let Some(shown) = path.to_str() else {
             return;
         };
+        #[cfg(windows)]
+        self.sweep_retained_before_action();
+        // Serialize first-row ownership with capture: a repeated callback may
+        // never retain post-change state for an already immutable Run snapshot.
+        #[cfg(windows)]
+        let snapshot_store = self.store.locked();
+        #[cfg(windows)]
+        self.prune_retained_capture_leases_in(&snapshot_store);
+        #[cfg(windows)]
+        if snapshot_store
+            .review_snapshot_recorded(session_id, run_id, shown)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        #[cfg(windows)]
+        let retained_store = crate::review_retained::RetainedStore::open(&self.paths, true)
+            .ok()
+            .flatten();
+        #[cfg(windows)]
+        let owner = review_daemon::retained_owner(session_id, run_id, shown);
+        #[cfg(windows)]
+        let mut retained_token = None;
         let capture = (|| -> Result<crate::review_file_io::ReviewImage> {
             let cfg = self.config()?;
             let policy =
@@ -10790,10 +10839,48 @@ impl Daemon {
             }
             match std::fs::symlink_metadata(path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(crate::review_file_io::ReviewImage::missing())
+                    let missing = crate::review_file_io::ReviewImage::missing();
+                    #[cfg(windows)]
+                    if let Some(retained) = &retained_store {
+                        // A private before-Tool marker, never mutable SQLite
+                        // existence flags alone, can authorize created-file Undo.
+                        retained_token = retained.record_missing(&owner, &missing).ok();
+                    }
+                    Ok(missing)
                 }
                 Err(error) => Err(error.into()),
-                Ok(_) => crate::review_file_io::ReviewPath::capture_snapshot(path, &policy),
+                Ok(_) => {
+                    #[cfg(windows)]
+                    {
+                        let image = match &retained_store {
+                            Some(store) => {
+                                crate::review_file_io::ReviewPath::capture_snapshot_tracked(
+                                    path, &policy, store,
+                                )?
+                            }
+                            None => {
+                                crate::review_file_io::ReviewPath::capture_snapshot(path, &policy)?
+                            }
+                        };
+                        if let Some(store) = &retained_store {
+                            // Best-effort object retention never grants Tool authority
+                            // or changes Tool success. Missing proof stays read-only.
+                            retained_token = (|| -> Result<_> {
+                                let actual = path.canonicalize()?;
+                                let access =
+                                    crate::review_file_io::ReviewPath::open(&actual, &policy)?;
+                                let source = access.namespace_source(&image, &policy, store)?;
+                                store.capture(&owner, &source, &image)
+                            })()
+                            .ok();
+                        }
+                        Ok(image)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        crate::review_file_io::ReviewPath::capture_snapshot(path, &policy)
+                    }
+                }
             }
         })();
         let (existed, before, metadata) = match capture {
@@ -10804,6 +10891,34 @@ impl Daemon {
             // Unknown/unreadable is never presented as a known absent file.
             Err(_) => (true, None, None),
         };
+        #[cfg(windows)]
+        {
+            if snapshot_store
+                .snapshot_run_file_with_metadata(
+                    session_id,
+                    run_id,
+                    shown,
+                    existed,
+                    before.as_deref(),
+                    metadata.as_deref(),
+                )
+                .is_ok()
+            {
+                let mut leases = self.retained_capture_leases.locked();
+                if let Some(token) = retained_token {
+                    let key = (owner.session_id, owner.run_id, owner.path_digest);
+                    // Revoked/oversized source objects can leave a stale active
+                    // Run lease until its terminal status. Bound this map even
+                    // when store slots are repeatedly reclaimed in one Run.
+                    if leases.contains_key(&key)
+                        || leases.len() < crate::review_retained::MAX_RECORDS
+                    {
+                        leases.insert(key, token);
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
         let _ = self.with_store(|st| {
             st.snapshot_run_file_with_metadata(
                 session_id,
