@@ -24357,6 +24357,189 @@ mod tests {
         );
     }
     #[test]
+    fn vim_summary_dismissal_owns_escape_and_ctrl_c_without_consuming_insert_mode() {
+        let _env = credential_env::EnvGuard::isolated();
+        for stage in ["inspect", "generating", "review"] {
+            for control_c in [false, true] {
+                for mode in [vim::Mode::Insert, vim::Mode::Normal] {
+                    let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+                    app.vim_mode = true;
+                    app.vim_input.mode = mode;
+                    app.attachments = vec![("private-draft.txt".into(), vec![11, 22, 33])];
+                    let draft = app.input.expanded();
+                    let attachments = app.attachments.clone();
+                    // Exercise focus defensively even when a live-state snapshot
+                    // reports a Run before the local review has been dismissed.
+                    app.running_sessions.insert("target".into());
+                    let late = if stage == "inspect" {
+                        app.slash("summarise-branch source");
+                        let request: RequestEnvelope =
+                            serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+                        assert!(matches!(
+                            request.request,
+                            Request::InspectBranchSummary { .. }
+                        ));
+                        Some((request.id, serde_json::to_value(&basis).unwrap()))
+                    } else {
+                        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+                        if stage == "review" {
+                            branch_summary_reply(
+                                &tx,
+                                prepare.id,
+                                serde_json::to_value(&preview).unwrap(),
+                            );
+                            app.drain_daemon();
+                            assert!(app.branch_summary_review_is_visible());
+                            let screen = render(&mut app, 180, 70);
+                            assert!(screen.contains("Exact candidate note"));
+                            assert!(screen.contains("Esc Close review"));
+                            None
+                        } else {
+                            Some((prepare.id, serde_json::to_value(&preview).unwrap()))
+                        }
+                    };
+                    let dismiss = if control_c {
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+                    } else {
+                        key(KeyCode::Esc)
+                    };
+                    app.key(dismiss);
+                    assert!(
+                        app.branch_summary.intent.is_none() && app.branch_summary.review.is_none()
+                    );
+                    assert!(!app.branch_summary.committing && app.pager.is_none());
+                    assert_eq!(
+                        app.vim_input.mode, mode,
+                        "summary dismissal owns the key before Vim: {stage}, Ctrl+C={control_c}"
+                    );
+                    assert_eq!(app.input.expanded(), draft);
+                    assert_eq!(app.attachments, attachments);
+                    assert!(app.notes.last().unwrap().contains("review dismissed"));
+                    assert!(
+                        sent.try_recv().is_err(),
+                        "dismissal cannot stop a Run or insert a note"
+                    );
+                    if let Some((id, value)) = late {
+                        branch_summary_reply(&tx, id, value);
+                        app.drain_daemon();
+                        assert!(
+                            sent.try_recv().is_err(),
+                            "late dismissed {stage} reply cannot generate or commit"
+                        );
+                        assert!(app.branch_summary.review.is_none() && app.pager.is_none());
+                    }
+                    if mode == vim::Mode::Insert {
+                        app.key(key(KeyCode::Esc));
+                        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+                        assert!(
+                            sent.try_recv().is_err(),
+                            "the next composer Escape is still its first Insert Escape"
+                        );
+                    }
+                    app.key(key(KeyCode::Esc));
+                    let request: RequestEnvelope =
+                        serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+                    assert!(
+                        matches!(request.request, Request::InterruptRun { session_id } if session_id == "target")
+                    );
+                    assert!(sent.try_recv().is_err());
+                    assert_eq!(app.input.expanded(), draft);
+                    assert_eq!(app.attachments, attachments);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vim_summary_hidden_review_cannot_insert_or_steal_another_pagers_escape() {
+        let _env = credential_env::EnvGuard::isolated();
+        for mode in [vim::Mode::Insert, vim::Mode::Normal] {
+            let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+            app.vim_mode = true;
+            app.vim_input.mode = mode;
+            let draft = app.input.expanded();
+            let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+            branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+            app.drain_daemon();
+            assert!(app.branch_summary_review_is_visible());
+            app.pager = Some(Pager {
+                title: "Unrelated artifact".into(),
+                lines: vec!["Different visible data".into()],
+                top: 0,
+                left: 0,
+                styled: vec![],
+            });
+            app.key(key(KeyCode::Char('i')));
+            assert!(app.branch_summary.review.is_none() && !app.branch_summary.committing);
+            assert_eq!(app.pager.as_ref().unwrap().title, "Unrelated artifact");
+            assert_eq!(
+                app.vim_input.mode, mode,
+                "artifact focus prevents hidden confirmation and Vim insert entry"
+            );
+            assert!(sent.try_recv().is_err());
+            app.key(key(KeyCode::Esc));
+            assert!(app.pager.is_none());
+            assert_eq!(
+                app.vim_input.mode, mode,
+                "the visible artifact owns its Escape"
+            );
+            assert_eq!(app.input.expanded(), draft);
+            assert!(sent.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn vim_summary_session_switch_resets_vim_and_invalidates_review_without_losing_its_draft() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Normal;
+        app.attachments = vec![("private-draft.txt".into(), vec![11, 22, 33])];
+        let draft = app.input.expanded();
+        let attachments = app.attachments.clone();
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        assert!(app.branch_summary_review_is_visible());
+        app.switch_session("source".into());
+        assert_eq!(app.current.as_deref(), Some("source"));
+        assert_eq!(
+            app.vim_input.mode,
+            vim::Mode::Insert,
+            "switch_session must retain the Vim reset"
+        );
+        assert!(
+            app.branch_summary.intent.is_none()
+                && app.branch_summary.review.is_none()
+                && app.pager.is_none(),
+            "switch_session must also retain summary invalidation"
+        );
+        let stored = app.drafts.get("target").unwrap();
+        assert_eq!(stored.input.expanded(), draft);
+        assert_eq!(stored.attachments, attachments);
+        assert!(app.input.is_empty() && app.attachments.is_empty());
+        let requests: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            match request.request {
+                Request::Subscribe {
+                    sessions: Some(ids),
+                    ..
+                } => assert_eq!(ids, ["source"]),
+                Request::ContextUsage { session_id } => assert_eq!(session_id, "source"),
+                Request::RunMetrics {
+                    session_id: Some(id),
+                    ..
+                } => assert_eq!(id, "source"),
+                other => panic!("switching must not commit, send or generate: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn vim_review_completion_escape_and_navigation_belong_to_the_visible_popup() {
         let _env = credential_env::EnvGuard::isolated();
         for mention in [false, true] {
