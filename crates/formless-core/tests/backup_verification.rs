@@ -352,3 +352,21 @@ fn nonregular_backup_sources_are_rejected_before_opening_a_fifo() {
         "receipt lookup must reject the replacement FIFO too"
     );
 }
+
+#[test]
+fn fresh_destination_preflight_failure_does_not_claim_a_nonexistent_recovery_copy() {
+    let (fixture, paths) = Fixture::new();
+    let source = fixture.0.join("incomplete.db");
+    let store = Store::open(&source).unwrap();
+    drop(store);
+    let conn = Connection::open(&source).unwrap();
+    conn.execute("DROP TABLE tools", []).unwrap();
+    drop(conn);
+    let error = housekeeping::restore(&paths, &source).unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(detail.contains("destination had no database"), "{detail}");
+    assert!(!detail.contains("recovery copy at"), "{detail}");
+    assert!(detail.contains("missing table tools"), "{detail}");
+    assert!(!paths.db_file().exists());
+    assert!(housekeeping::list_restore_backups(&paths).is_empty());
+}

@@ -542,10 +542,11 @@ fn restore_with_check(
         Ok(())
     })();
     result.with_context(|| {
-        format!(
-            "restore did not complete; recovery copy at {}",
-            saved.display()
-        )
+        if saved.is_file() {
+            format!("restore did not complete; recovery copy at {}",saved.display())
+        } else {
+            "restore did not complete; the destination had no database, so no displaced-database recovery copy was created".to_string()
+        }
     })?;
     // Both ownership guards remain held while checking the restored rows.
     let references = inspect(&db, paths).map_err(|error| format!("{error:#}"));
