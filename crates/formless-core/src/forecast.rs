@@ -338,6 +338,8 @@ pub(crate) fn estimate_store_with_window(
     let mut normalized = held.clone();
     let held_markers: Vec<_> = held
         .iter()
+        .filter(|a| a["reference"] != true)
+        .take(crate::provider::MAX_NATIVE_ATTACHMENTS)
         .map(|a| {
             let mut marker = a.clone();
             marker["_source_session"] = json!(input.session_id);
@@ -349,16 +351,29 @@ pub(crate) fn estimate_store_with_window(
         st,
         &[json!({"_attachments":held_markers})],
     )?;
-    for (a, marker) in held.iter().zip(&held_markers) {
-        let bytes = (a["reference"] != true)
-            .then(|| {
-                held_access.as_ref().and_then(|access| {
-                    access
-                        .read(marker, crate::daemon::MAX_ATTACHMENT_BYTES)
-                        .ok()
-                })
+    let mut descriptor_attempts = 0usize;
+    let mut descriptor_source_remaining = crate::provider::MAX_NATIVE_SOURCE_BYTES;
+    let mut unknown_held = false;
+    for a in &held {
+        let eligible = a["reference"] != true;
+        let bytes = if eligible && descriptor_attempts < crate::provider::MAX_NATIVE_ATTACHMENTS {
+            let marker = &held_markers[descriptor_attempts];
+            descriptor_attempts += 1;
+            held_access.as_ref().and_then(|access| {
+                access
+                    .read_charged(
+                        marker,
+                        crate::daemon::MAX_ATTACHMENT_BYTES,
+                        &mut descriptor_source_remaining,
+                    )
+                    .ok()
             })
-            .flatten();
+        } else {
+            None
+        };
+        if eligible && bytes.is_none() {
+            unknown_held = true;
+        }
         let mut descriptor = if let Some(bytes) = bytes {
             attachment(
                 a["full_name"]
@@ -564,8 +579,14 @@ pub(crate) fn estimate_store_with_window(
     if !logical.is_empty() {
         warnings.push("Attachment token counts use local dimensions/detail and reference metadata; unsupported media are uncertain".into());
     }
-    if !preview_images.is_empty() {
-        warnings.push("Metadata-only image previews use conservative decode/encoded-byte reservations; native parts may change after owned bytes are verified".into());
+    if unknown_held {
+        warnings.push("Some held attachment hashes/dimensions remain unknown: ownership, size, or the bounded descriptor-read budget could not be verified".into());
+    }
+    if logical
+        .iter()
+        .any(|a| crate::daemon::is_raster_image(&a.mime))
+    {
+        warnings.push("Image resource reservations are conservative for metadata-only previews; native parts may change when owned bytes are verified".into());
     }
     if n > 0 && n < 10 {
         warnings.push(format!("Small empirical sample (N={n}); p50/p90 are observed quantiles, not statistical confidence bounds"));
@@ -1131,6 +1152,76 @@ mod tests {
                 serde_json::to_value(&before).unwrap()
             );
             assert_eq!(st.last_run(&sid).unwrap().unwrap().1, "paused");
+        }
+    }
+    #[test]
+    fn held_descriptor_count_and_source_bytes_are_bounded_before_file_reads() {
+        for (size, repeats) in [(1u64, 16usize), (16 * 1024 * 1024, 2)] {
+            let root =
+                std::env::temp_dir().join(format!("fl-held-read-budget-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join("artifacts")).unwrap();
+            let st = Store::open(&root.join("formless.db")).unwrap();
+            let sid = st.create_session(None).unwrap().id;
+            let attach = |name: &str| {
+                let path = root.join("artifacts").join(name);
+                std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+                let id = st
+                    .save_artifact(Some(&sid), path.to_str().unwrap(), "", size as i64)
+                    .unwrap();
+                json!({"id":id,"path":path,"bytes":size,"mime":"application/octet-stream","name":name})
+            };
+            let known = attach("known.bin");
+            let omitted = attach("omitted.bin");
+            // Inert references do not consume the descriptor's candidate cap.
+            for n in 0..16 {
+                st.add_pending_attachment(
+                    &sid,
+                    &json!({"reference":true,"path":format!("inert-{n}"),"bytes":0}),
+                )
+                .unwrap();
+            }
+            for _ in 0..repeats {
+                st.add_pending_attachment(&sid, &known).unwrap();
+            }
+            for _ in 0..100 {
+                st.add_pending_attachment(&sid, &omitted).unwrap();
+            }
+            let input = ForecastInput {
+                session_id: Some(sid),
+                ..Default::default()
+            };
+            let c = config();
+            let first = estimate_store(&st, &c, &input).unwrap();
+            assert!(first
+                .warnings
+                .iter()
+                .any(|w| w.contains("hashes/dimensions remain unknown")));
+            use std::io::{Seek, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(omitted["path"].as_str().unwrap())
+                .unwrap();
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            file.write_all(b"x").unwrap();
+            drop(file);
+            let second = estimate_store(&st, &c, &input).unwrap();
+            assert_eq!(
+                first.fingerprint, second.fingerprint,
+                "outside budget stays unknown, not purportedly hashed"
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(known["path"].as_str().unwrap())
+                .unwrap();
+            file.write_all(b"y").unwrap();
+            drop(file);
+            assert_ne!(
+                first.fingerprint,
+                estimate_store(&st, &c, &input).unwrap().fingerprint,
+                "eligible known bytes still bind identity"
+            );
+            drop(st);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
     #[test]

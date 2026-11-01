@@ -885,6 +885,12 @@ pasting paths.
   metadata-only previews share the budget with history and conservatively
   reserve unknown decoded formats and resized output; their resource estimate
   may change after upload verifies the owned bytes.
+  Forecast descriptor enrichment is a separate bounded pass: at most 16 held
+  non-reference candidates and 32 MiB source bytes. Combined with native
+  preparation, a quote reads at most 64 MiB plus one EOF lookahead byte per
+  attempted read. Snapshot registry/lineage resolution considers only the same
+  bounded positional prefix and caches missing IDs; omitted/unverified held
+  hashes and dimensions remain explicitly unknown.
 - **Retention.** Attachments are artifacts, so `artifacts.*` retention
   removes them too. A removed one is marked expired where it was sent:
   clients show "name · expired" and the model's history says it is no

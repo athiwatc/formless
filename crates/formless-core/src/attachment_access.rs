@@ -16,6 +16,33 @@ type Records = HashMap<String, Record>;
 type Lineage = HashMap<String, Vec<(String, i64)>>;
 const MAX_LINEAGE_DEPTH: usize = 64;
 
+fn prefix(messages: &[Value]) -> impl Iterator<Item = &Value> {
+    messages
+        .iter()
+        .flat_map(|m| m["_attachments"].as_array().into_iter().flatten())
+        .take(crate::provider::MAX_NATIVE_ATTACHMENTS)
+}
+fn snapshot_records(
+    messages: &[Value],
+    mut lookup: impl FnMut(&str) -> Result<Option<Record>>,
+) -> Result<Records> {
+    let mut seen = std::collections::HashSet::new();
+    let mut records = Records::new();
+    // Missing and malformed IDs still consume positions. Negative IDs are
+    // remembered so repeats cannot trigger repeated SQLite lookups.
+    for attachment in prefix(messages) {
+        if let Some(id) = attachment["id"]
+            .as_str()
+            .filter(|id| seen.insert((*id).to_string()))
+        {
+            if let Some(record) = lookup(id)? {
+                records.insert(id.into(), record);
+            }
+        }
+    }
+    Ok(records)
+}
+
 #[derive(Clone)]
 enum Resolver {
     Profile(PathBuf),
@@ -42,42 +69,38 @@ impl AttachmentAccess {
         let Some(root) = store.artifact_root.clone() else {
             return Ok(None);
         };
-        let mut records = Records::new();
+        let records = snapshot_records(messages, |id| store.get_artifact(id))?;
         let mut lineage = Lineage::new();
-        for message in messages {
-            for attachment in message["_attachments"].as_array().into_iter().flatten() {
-                let Some(id) = attachment["id"].as_str() else {
-                    continue;
-                };
-                if !records.contains_key(id) {
-                    if let Some(record) = store.get_artifact(id)? {
-                        records.insert(id.into(), record);
-                    }
-                }
-                if let Some(scope) = attachment["_source_session"].as_str() {
-                    if !lineage.contains_key(scope) {
-                        let mut chain = Vec::new();
-                        let mut current = scope.to_string();
-                        let mut seen = std::collections::HashSet::from([current.clone()]);
-                        let mut cutoff = i64::MAX;
-                        for _ in 0..MAX_LINEAGE_DEPTH {
-                            let Some(session) = store.get_session(&current)? else {
-                                break;
-                            };
-                            let (Some(parent), Some(point)) =
-                                (session.forked_from, session.fork_point_seq)
-                            else {
-                                break;
-                            };
-                            if point < 0 || !seen.insert(parent.clone()) {
-                                break;
-                            }
-                            cutoff = cutoff.min(point);
-                            chain.push((parent.clone(), cutoff));
-                            current = parent;
+        for attachment in prefix(messages) {
+            let Some(id) = attachment["id"].as_str() else {
+                continue;
+            };
+            if !records.contains_key(id) {
+                continue;
+            }
+            if let Some(scope) = attachment["_source_session"].as_str() {
+                if !lineage.contains_key(scope) {
+                    let mut chain = Vec::new();
+                    let mut current = scope.to_string();
+                    let mut seen = std::collections::HashSet::from([current.clone()]);
+                    let mut cutoff = i64::MAX;
+                    for _ in 0..MAX_LINEAGE_DEPTH {
+                        let Some(session) = store.get_session(&current)? else {
+                            break;
+                        };
+                        let (Some(parent), Some(point)) =
+                            (session.forked_from, session.fork_point_seq)
+                        else {
+                            break;
+                        };
+                        if point < 0 || !seen.insert(parent.clone()) {
+                            break;
                         }
-                        lineage.insert(scope.into(), chain);
+                        cutoff = cutoff.min(point);
+                        chain.push((parent.clone(), cutoff));
+                        current = parent;
                     }
+                    lineage.insert(scope.into(), chain);
                 }
             }
         }
@@ -156,6 +179,7 @@ impl AttachmentAccess {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn read(
         &self,
         attachment: &Value,
@@ -221,7 +245,9 @@ impl AttachmentAccess {
             return Err("the stored attachment changed or is not a regular file".into());
         }
         let mut bytes = Vec::new();
-        file.take(max_bytes as u64 + 1)
+        // Bound a concurrent growth race to one EOF lookahead byte rather
+        // than reusing the much larger per-file intake limit.
+        file.take(recorded_bytes as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "the stored attachment could not be read".to_string())?;
         if bytes.len() != recorded_bytes as usize || bytes.len() > max_bytes {
@@ -385,6 +411,33 @@ fn open_rooted(_: &Path, _: &Path, _: &std::fs::Metadata) -> std::io::Result<Fil
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn snapshot_lookup_work_is_prefix_bounded_and_negative_cached() {
+        let mut calls = Vec::new();
+        let mut candidates = vec![json!({}); 8];
+        candidates.extend(vec![json!({"id":"missing"}); 100]);
+        candidates.push(json!({"id":"must-not-query"}));
+        assert!(
+            snapshot_records(&[json!({"_attachments":candidates})], |id| {
+                calls.push(id.to_string());
+                Ok(None)
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(calls, vec!["missing"]);
+        calls.clear();
+        let messages = [
+            json!({"_attachments":(0..8).map(|n|json!({"id":n.to_string()})).collect::<Vec<_>>()}),
+            json!({"_attachments":(8..100).map(|n|json!({"id":n.to_string()})).collect::<Vec<_>>()}),
+        ];
+        snapshot_records(&messages, |id| {
+            calls.push(id.to_string());
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(calls, (0..16).map(|n| n.to_string()).collect::<Vec<_>>());
+    }
     #[test]
     fn row_scope_fork_cutoff_and_cycles_are_checked_by_live_and_snapshot_resolvers() {
         let root = std::env::temp_dir().join(format!("fl-artifact-scope-{}", uuid::Uuid::new_v4()));
