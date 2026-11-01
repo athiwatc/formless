@@ -677,7 +677,22 @@ fn object_range(s: &str, at: usize, motion: &str, count: usize) -> Option<Range<
             .chunks_exact(2)
             .find(|p| p[0] <= at && at <= p[1])
             .or_else(|| quotes.chunks_exact(2).find(|p| p[0] >= at))?;
-        return Some(if around {
+        if around {
+            let mut left = pair[0];
+            let mut right = pair[1] + close.len_utf8();
+            let after = right;
+            while right < end && kind(cluster(s, right), false) == 0 {
+                right = next(s, right);
+            }
+            if right == after || at < pair[0] {
+                right = after;
+                while left > start && kind(cluster(s, prev(s, left)), false) == 0 {
+                    left = prev(s, left);
+                }
+            }
+            return Some(left..right);
+        }
+        return Some(if count == 2 {
             pair[0]..pair[1] + close.len_utf8()
         } else {
             pair[0] + open.len_utf8()..pair[1]
@@ -803,5 +818,64 @@ mod tests {
         assert_eq!(v.mode, Mode::Normal);
         assert_eq!(l.expanded(), paste);
         assert_eq!(v.key(&mut l, escape, Surface::Composer), Outcome::Escape);
+    }
+    #[test]
+    fn counted_operators_inner_around_and_nested_blocks_keep_vim_ranges() {
+        for (text, keys, expected) in [
+            ("one two three", "2dw", "three"),
+            ("one two three", "d2w", "three"),
+            ("one two three", "d2iw", "two three"),
+            ("one two three", "d2aw", "three"),
+            ("alpha-beta tail", "diW", " tail"),
+            ("a\nb\nc", "2dd", "c"),
+            ("\"one\" tail", "da\"", "tail"),
+            ("'one' tail", "da'", "tail"),
+            ("`one` tail", "da`", "tail"),
+        ] {
+            let (mut v, mut l) = normal(text);
+            commands(&mut v, &mut l, keys);
+            assert_eq!(&*l, expected, "{keys}");
+        }
+        let (mut v, mut l) = normal("outer [a [b] c] end");
+        l.set_modal_cursor(l.find('b').unwrap());
+        commands(&mut v, &mut l, "d2i[");
+        assert_eq!(&*l, "outer [] end");
+    }
+
+    #[test]
+    fn backwards_end_line_and_buffer_operators_and_yanks_are_composable() {
+        let (mut v, mut l) = normal("one two three");
+        commands(&mut v, &mut l, "2wdb");
+        assert_eq!(&*l, "one three");
+        commands(&mut v, &mut l, "d$");
+        assert_eq!(&*l, "one ");
+        let (mut v, mut l) = normal("first\nsecond\nthird");
+        commands(&mut v, &mut l, "jydk");
+        // An invalid operator sequence must not alter the document.
+        assert_eq!(&*l, "first\nsecond\nthird");
+        commands(&mut v, &mut l, "Gdgg");
+        assert!(l.is_empty());
+        let (mut v, mut l) = normal("one two");
+        commands(&mut v, &mut l, "dw");
+        commands(&mut v, &mut l, "yiw.");
+        assert!(
+            l.is_empty(),
+            "yank must not replace the previous delete for dot repeat"
+        );
+    }
+
+    #[test]
+    fn dot_replays_literal_multiline_paste_without_running_commands() {
+        let (mut v, mut l) = normal("tail");
+        v.paste(&mut l, "dw\n👩‍💻");
+        assert_eq!(&*l, "dw\n👩‍💻tail");
+        v.key(
+            &mut l,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            Surface::Composer,
+        );
+        commands(&mut v, &mut l, "G$.");
+        assert_eq!(&*l, "dw\n👩‍💻taidw\n👩‍💻l");
+        assert_eq!(v.mode, Mode::Normal);
     }
 }

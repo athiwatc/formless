@@ -3051,6 +3051,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   operator counts are bounded to 999. Yank stays in an internal register;
   no OS clipboard is read or written. Dot repeats the last editing command
   and its unmodified Insert keys/paste; movement and yanks do not replace it.
+  Readline control shortcuts in Insert break the current repeat group.
   Large collapsed pastes expand before modal editing to preserve their actual
   contents. No Visual mode, Ex commands, macros, syntax-aware objects or full
   Vim emulation is promised. Semantics follow the official

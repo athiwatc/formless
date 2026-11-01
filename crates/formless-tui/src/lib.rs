@@ -8373,12 +8373,32 @@ impl App {
                 }
             }
         }
+        // The first composer Insert Escape only changes mode. Thereafter
+        // completion dialogs keep their normal Escape/navigation ownership
+        // before a Normal Escape can stop the Run.
         if self.vim_mode
             && self.view == View::Chat
             && self.find.is_none()
             && self.current_question().is_none()
             && (self.approvals.is_empty() || self.input_focus)
-            && (self.vim_input.mode == vim::Mode::Normal || key.code == KeyCode::Esc)
+            && self.vim_input.mode == vim::Mode::Insert
+            && key.code == KeyCode::Esc
+        {
+            self.vim_input
+                .key(&mut self.input, key, vim::Surface::Composer);
+            return;
+        }
+        if self.view == View::Chat
+            && (self.question_key(&key) || self.palette_key(&key) || self.mention_key(&key))
+        {
+            return;
+        }
+        if self.vim_mode
+            && self.view == View::Chat
+            && self.find.is_none()
+            && self.current_question().is_none()
+            && (self.approvals.is_empty() || self.input_focus)
+            && self.vim_input.mode == vim::Mode::Normal
         {
             match self
                 .vim_input
@@ -8398,11 +8418,6 @@ impl App {
                 }
                 vim::Outcome::Pass => {}
             }
-        }
-        if self.view == View::Chat
-            && (self.question_key(&key) || self.palette_key(&key) || self.mention_key(&key))
-        {
-            return;
         }
         if self.view == View::Chat
             && key.code == KeyCode::Char('?')
