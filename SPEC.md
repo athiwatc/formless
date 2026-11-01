@@ -1324,7 +1324,8 @@ pattern (§4.4).
 | Capability | Scoping | Notes |
 |---|---|---|
 | `net` | optionally per-domain | Unscoped `net` allowed but flagged “broad” at approval |
-| `fs:read` | path list | Canonicalised; symlink escapes denied (§14) |
+| `fs:read` | path list | Canonicalised; symlink escapes denied (§14); credential-read gate below |
+| `fs:read-sensitive` | one exact absolute identity | Operation-time credential consent; grants no filesystem authority |
 | `fs:write` | path list | Same containment rules |
 | `env` | named keys | Only listed keys visible |
 | `process` | named commands | Executed without a shell; unscoped flagged “broad” |
@@ -1334,6 +1335,43 @@ pattern (§4.4).
 | `agent` | optionally per-model | v2; sub-agents from inside Tools (§7.6) |
 | `store` / `store:<ns>` | own / named shared namespace | Key-value state between Invocations; not sensitive (no approval) |
 | `harness:<scope>` | `read`, `mcp`, `skills`, `models`, `providers`, `roles`, `config` | Read or change the harness itself (§7.13); every change is approved with a diff |
+
+- **Credential reads (#708).** Ordinary project reads, including input-bound
+  reads, stay quiet. Builtin credential directories (`.ssh`, `.aws`, `.gnupg`,
+  `.pki`, `.kube`, `.docker`, `.password-store`), `.env*`, `*.pem`, `*.key`,
+  shell histories and native/browser
+  credential stores require separate exact-path consent. This gate applies
+  even with `security.secure = false`; broad read grants and trusted folders
+  cannot cover it. Its synthetic Capability grants no file, network or process
+  authority. The prompt uses the actual Invocation's Tool/version, Run/source
+  context and computed concrete path. Refusal/cancellation prevents access.
+  The daemon's active data/config roots and key fallback are hard denied
+  before grants, checking both configured namespaces and current/captured
+  canonical identities. Path-valued `FORMLESS_API_KEY_FILE` and
+  `FORMLESS_API_KEY_<NAME>_FILE` sources are also hard denied, including
+  ordinary filenames outside the profile. Their namespaces and startup
+  destinations are retained; policy construction inspects paths, not key bytes. Reads, chunks, metadata, detailed listings, implicit
+  prior-content reads and source relocation use the same boundary. Moving or
+  deleting a directory containing the profile is also denied. Renaming a
+  configured sensitive subtree, its ancestor, or contents outside that subtree
+  is refused: a read consent cannot erase the namespace classification.
+  Credential-sensitive directories cannot be renamed, including across
+  sensitive namespaces: exact directory consent does not cover descendant
+  contents. Ancestors forming a prefix of a native-store sequence (for
+  example `Library` in `Library/Keychains`) cannot be renamed either; this
+  conservative rule applies even if empty, without a recursive absence check.
+  Default hosts
+  without interactive consent, smoke tests and optimiser replay fail closed
+  for credential reads; dry-run reads still require consent.
+  `security.sensitive_paths` adds typed `{kind, value}` rules: `subtree`
+  (absolute or `~/`), `basename_prefix` and `basename_suffix` (nonempty literal
+  strings without separators or wildcards). It cannot remove builtins or the
+  profile boundary and is configured through the owner's config file.
+  Explicit process path operands and working directories are checked before
+  launch, including relative `cat` operands and file URIs; this is not OS
+  confinement of arbitrary programs or interpretation of arbitrary scripts.
+  Paths are rechecked after approval and before access, without claiming an
+  atomic check/open, hard-link tracking or information-flow sandbox.
 
 - **Input-bound scopes (v2.1).** `fs:read`, `fs:write` and `net` may be
   scoped to an input field instead of a fixed value: `fs:read:$input.path`,
@@ -3154,7 +3192,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   lines of 300 characters, and `v` opens it whole.
 - **Trusted folders.** `[security] trusted_paths = ["~/code/app", …]`
   lists folders whose file access needs no approval.
-  - **What's covered:** reading files never asks. A call whose only
+  - **What's covered:** ordinary reads stay quiet; credential reads require
+    separate exact-path consent (§7.4). A call whose only
     sensitive Capabilities are `fs:write` inside a trusted folder (input
     bound or fixed, resolved per call) runs without asking, and is logged
     as `tool.approve_trusted`.
@@ -4242,8 +4281,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.max_emit_bytes` | 1073741824 | Everything one Invocation `emit`s to its artifact (1 GB) |
 | `tools.find_tools_max` | 25 | Most results one `find_tools` call returns |
 | `security.trusted_hosts` | [] | Hosts whose `net:` grants need no approval (`api.example.com`, `*.github.com`); config.toml only (§10.3) |
-| `security.secure` | false | Ask before sensitive Tool calls; off runs them unasked (logged). `--secure` / `FORMLESS_SECURE` turn it on at daemon start (§10.3) |
+| `security.secure` | false | Ask before ordinary sensitive Tool calls; credential reads require separate exact consent even when off. Other calls run unasked (logged). `--secure` / `FORMLESS_SECURE` turn it on at daemon start (§10.3) |
 | `security.secret_patterns` | [] | Extra secret shapes (regular expressions) blanked wherever Formless stores or quotes text, beside the built-in ones; config.toml only (§15) |
+| `security.sensitive_paths` | [] | Additive credential-read rules; owner config.toml only, never protocol settings; builtins and Formless credential hard denies cannot be removed (§7.4) |
+| `security.sensitive_paths[].kind` | required per entry | Typed rule selector: subtree, basename_prefix or basename_suffix (§7.4) |
+| `security.sensitive_paths[].value` | required per entry | Subtree uses an absolute path or ~/ prefix; basename rules use a nonempty literal prefix or suffix without separators or wildcards (§7.4) |
 | `security.trusted_paths` | [] | Folders where writes need no approval; config.toml only (§10.3) |
 | `security.trust_writes` | true | false keeps writes in trusted folders asking (§10.3) |
 | `tools.approval_summaries` | true | Ask the model, once per Tool version, for a plain-language summary shown on approval prompts (§10.3) |

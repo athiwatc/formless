@@ -724,6 +724,25 @@ test('approval call evidence shows concrete redacted request, body, path and sou
   assert.equal(all(body).some(n=>n.tag==='script'),false,'body preview is text, never active DOM');
 });
 
+test('credential-read approvals explain exact scope without hiding identity or adding widening controls', () => {
+  const elements=new Map();const $=id=>{if(!elements.has(id))elements.set(id,Object.assign(node('div',{}),{focus(){},classList:{add(){},remove(){},toggle(){}}}));return elements.get(id);};
+  let calls=0;
+  const c=setup(['renderApproval','approvalContextCard','pathNote','scopePicker','pickedPaths'],{$,h:node,prefs:{get:()=>true},document:{querySelector:()=>({classList:{add(){}}})},isBroad:()=>false,toolTitleByName:()=>null,showBidi(){},act(){calls++;}});
+  const capability='fs:read-sensitive:/private/fixture/token.json';
+  const warning='Credential read: exact approved path identity only, not descendants. Contents may flow to the model provider.';
+  for(const cwd of [null,'/private/fixture','/elsewhere']){
+    assert.deepEqual(Array.from(c.pathNote(capability,cwd)),[true,warning]);
+  }
+  assert.equal(c.pathNote('net:example.com',null),null);
+  const context={run_id:'consumer-run',sources:[{tool:'page_reader',kind:'url',origin:'https://source.example'}],scope_warnings:[],call:{arguments:{invocation:{name:'private inventory'},runtime_access:{path:'/private/fixture/token.json',operation:'read',credential_rule:'credential file'}},urls:[],paths:['/private/fixture/token.json'],truncated:false,note:'Actual attempted read, not a directory grant'}};
+  c.S.approvals=[{kind:'tool',id:'held',tool_id:'registry-reader',tool_name:'inventory_reader',version:2,capabilities:[capability],memory_mb:64,detail:'Credential path blocked; review exact read',summary:'AI inventory helper',already:[],code:'function run(input) { return input; }',pathOptions:[],picks:{},context}];
+  c.renderApproval();const body=$('modal-body'),text=plainText(body);
+  for(const required of ['inventory_reader','v2','memory 64 MB','Credential path blocked','AI inventory helper',capability,warning,'This Run read external content','page_reader (url): https://source.example','runtime_access','credential_rule','function run(input)'])assert.ok(text.includes(required),required);
+  assert.equal(all(body).some(n=>n.tag==='select'),false,'no directory/repository widening picker for exact credential identity');
+  assert.equal(JSON.stringify(c.pickedPaths(c.S.approvals[0])),'{}');
+  assert.equal(calls,0,'rendering sensitive approval cannot authorize or read files');
+});
+
 test('authoritative reconnect attention preserves producer-independent current-Run call evidence', () => {
   const c=setup(['addApproval','applySessionLiveState'],{cancelAsk(){},showQuestion(){},renderApproval(){},renderComposer(){},renderStatus(){}});
   c.S.running=new Set();c.S.approvals=[];c.S.questions=[];

@@ -67,7 +67,9 @@ async fn call(daemon: &Arc<Daemon>, session: &str, input: Value) -> Result<Value
 async fn input_bound_scope_grants_exactly_the_called_path() {
     let paths = temp_paths("gen");
     seed_reader(&paths);
-    let dir = paths.data_dir.join("files");
+    // Project input is outside the daemon's protected data/config roots.
+    // Keep both sibling files together so the exact-boundary oracle remains.
+    let dir = paths.data_dir.parent().unwrap().join("project");
     std::fs::create_dir_all(&dir).unwrap();
     let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
     std::fs::write(&a, "alpha").unwrap();
