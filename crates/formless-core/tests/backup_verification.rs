@@ -234,6 +234,15 @@ fn a_receipt_never_blesses_later_wal_only_commits() {
         "committed update lives only in WAL"
     );
     assert!(checks::verified(&paths, &file).is_none());
+    #[cfg(unix)]
+    {
+        let alias = f.0.join("alias.bak");
+        std::os::unix::fs::symlink(&file, &alias).unwrap();
+        assert!(
+            checks::verified(&paths, &alias).is_none(),
+            "aliases cannot hide the real snapshot WAL"
+        );
+    }
     assert!(format!("{:#}", checks::verify(&paths, &file).unwrap_err()).contains("live WAL"));
     drop(conn);
 }

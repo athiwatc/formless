@@ -183,13 +183,14 @@ pub(crate) fn inspect(file: &Path) -> Result<Verification> {
 
 /// Receipts are hints, never a blessing for subsequently changed bytes.
 pub fn verified(paths: &Paths, file: &Path) -> Option<Verification> {
-    if has_live_wal(file).ok()? {
+    let source = std::fs::canonicalize(file).ok()?;
+    if has_live_wal(&source).ok()? {
         return None;
     }
     let receipt: Verification =
         serde_json::from_slice(&std::fs::read(receipt_path(paths, file).ok()?).ok()?).ok()?;
-    if receipt.source != std::fs::canonicalize(file).ok()?
-        || fingerprint(file).ok()? != (receipt.sha256.clone(), receipt.bytes)
+    if receipt.source != source
+        || fingerprint(&source).ok()? != (receipt.sha256.clone(), receipt.bytes)
     {
         return None;
     }
