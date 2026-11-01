@@ -300,15 +300,17 @@ without redesign.
   retain the actual token endpoint separately from canonical lookup identity;
   refresh uses that captured path/query, never a newly configured spelling,
   and token requests refuse redirects. Rotation preserves this endpoint.
-  Older noncanonical raw slots are found using their recorded issuer and
-  verified client-id slot hash. Canonical-only records cannot prove whether
-  the original endpoint had a trailing slash. These ambiguous records and
-  profile-wide, unlabelled or mismatched legacy sets remain untouched and
-  produce a re-login warning, never a guessed transport destination.
+  Every non-versioned legacy record requires re-login: historical migration
+  could derive both its issuer label and raw slot from the current config,
+  so even a matching noncanonical issuer/hash is not transport proof.
+  Canonical-only records also cannot prove whether the original endpoint had
+  a trailing slash. These records remain untouched and produce a re-login
+  warning, never a guessed transport destination.
   Read-only lookup does not rewrite stores; login/refresh saves the canonical
-  slot, and logout removes matching evidenced aliases too. Arbitrary old
+  slot, and logout removes matching discoverable aliases too. Arbitrary old
   keyring-only hashes cannot be enumerated after an endpoint spelling edit;
-  a finite lookup covers the configured raw spelling and its slash variant,
+  a finite lookup covers the configured raw spelling and its slash variants
+  for diagnostics/logout and independently versioned records,
   but arbitrary unknown historical spellings still require re-login.
   Both copies carry the time
   they were saved and the newer one wins; when only one write succeeds,

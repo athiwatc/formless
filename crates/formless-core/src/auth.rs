@@ -148,7 +148,6 @@ struct StoredTokens {
     issuer: Option<String>,
     endpoint: Option<String>,
     client_id: Option<String>,
-    legacy: bool,
 }
 
 fn decode_tokens(text: &str) -> Option<StoredTokens> {
@@ -160,16 +159,12 @@ fn decode_tokens(text: &str) -> Option<StoredTokens> {
         .and_then(|endpoint| transport_token_url(endpoint).ok())
         .map(|endpoint| endpoint.to_string());
     let client_id = v["client_id"].as_str().map(str::to_string);
-    let legacy = v.get("oauth_record_version").is_none()
-        && v.get("token_endpoint").is_none()
-        && v.get("client_id").is_none();
     let tokens: OAuthTokens = serde_json::from_value(v).ok()?;
     (!tokens.access_token.is_empty()).then_some(StoredTokens {
         tokens,
         issuer,
         endpoint,
         client_id,
-        legacy,
     })
 }
 
@@ -288,9 +283,10 @@ fn read_stored(file: &std::path::Path, user: &str) -> Option<StoredTokens> {
     decode_tokens(&store.load()?)
 }
 
-/// Compatibility lookup never assigns an issuer to an unlabelled token.
-/// Old file-backed slots can be discovered by their recorded endpoint and
-/// verified raw slot hash. Keyring-only old hashes cannot be enumerated.
+/// Compatibility lookup locates old stores for diagnostics/logout, and any
+/// versioned records retained under an old name. A raw issuer/hash never
+/// authorizes a credential: old migration could fabricate both from config.
+/// Arbitrary keyring-only old hashes cannot be enumerated.
 fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
     let mut slots = std::collections::BTreeSet::from([
         token_slot(auth),
@@ -349,42 +345,22 @@ fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
         .collect()
 }
 
-/// A recorded identity does not by itself prove a transport destination. Older
-/// raw slots provide evidence only when both their issuer and slot are distinct
-/// from the canonical-only encoding used before exact endpoints were retained.
+/// Only records written by the exact-endpoint codec prove transport. Historical
+/// migration could stamp both issuer and raw slot from the current config,
+/// irrespective of where its profile-wide token set was actually obtained.
 fn proven_stored_tokens(
     auth: &AuthCfg,
-    store: &DualStore,
     stored: StoredTokens,
 ) -> Option<(OAuthTokens, Option<String>)> {
     if !issuer_matches(auth, stored.issuer.as_deref()) {
         return None;
     }
-    let endpoint = if let Some(endpoint) = stored.endpoint {
-        if stored.client_id.as_deref() != Some(auth.client_id.trim())
-            || canonical_token_url(&endpoint).ok() != canonical_token_url(&auth.token_url).ok()
-        {
-            return None;
-        }
-        endpoint
-    } else if stored.legacy {
-        let issuer = stored.issuer.as_deref()?;
-        let slot = store
-            .file
-            .file_name()?
-            .to_str()?
-            .strip_prefix("oauth_tokens-")?
-            .strip_suffix(".json")?;
-        if issuer == canonical_token_url(issuer).ok()?
-            || slot != raw_token_slot(issuer, &auth.client_id)
-            || slot == token_slot(auth)
-        {
-            return None;
-        }
-        transport_token_url(issuer).ok()?.to_string()
-    } else {
+    let endpoint = stored.endpoint?;
+    if stored.client_id.as_deref() != Some(auth.client_id.trim())
+        || canonical_token_url(&endpoint).ok() != canonical_token_url(&auth.token_url).ok()
+    {
         return None;
-    };
+    }
     Some((stored.tokens, Some(endpoint)))
 }
 
@@ -402,14 +378,14 @@ fn load_with_issuer(paths: &Paths, auth: &AuthCfg) -> Option<(OAuthTokens, Optio
     // Prefer the current slot: a refreshed/rotated login supersedes old aliases.
     let current = token_store(paths, auth);
     if let Some(found) = current.load().and_then(|s| decode_tokens(&s)) {
-        return proven_stored_tokens(auth, &current, found);
+        return proven_stored_tokens(auth, found);
     }
     let newest = compatible_token_stores(paths, auth)
         .iter()
         .filter_map(|store| {
             let (at, value) = store.load_versioned()?;
             let found = decode_tokens(&value)?;
-            proven_stored_tokens(auth, store, found).map(|found| (at, found))
+            proven_stored_tokens(auth, found).map(|found| (at, found))
         })
         .max_by_key(|(at, _)| *at);
     if let Some((_, found)) = newest {
@@ -430,7 +406,7 @@ pub fn oauth_storage_warning(paths: &Paths, auth: &AuthCfg) -> Option<String> {
     let invalid = compatible_token_stores(paths, auth)
         .iter()
         .any(|s| s.load().is_some());
-    (legacy || invalid).then(|| "Stored OAuth credentials have no proven matching issuer and exact token endpoint; sign in again. Canonical-only legacy records cannot prove the original endpoint path. Older keyring-only logins with an unknown endpoint spelling cannot be discovered automatically.".into())
+    (legacy || invalid).then(|| "Stored OAuth credentials have no proven matching issuer and exact token endpoint; sign in again. Legacy issuer labels and raw slot hashes could have been derived from configuration, not a token exchange. Older keyring-only logins with an unknown endpoint spelling cannot be discovered automatically.".into())
 }
 
 /// The token set of the provider with `auth`, only with proven issuer identity.

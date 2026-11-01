@@ -131,7 +131,7 @@ fn write_old_slot(paths: &Paths, cfg: &ProviderCfg, issuer: Option<&str>) -> std
 }
 
 #[test]
-fn endpoint_spelling_reuses_login_and_old_raw_slot_without_relabelling() {
+fn endpoint_spelling_reuses_versioned_login_without_adopting_legacy_labels() {
     let env = credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let mut old = config("https://EXAMPLE.com:443");
@@ -143,12 +143,16 @@ fn endpoint_spelling_reuses_login_and_old_raw_slot_without_relabelling() {
         auth::canonical_token_url(&old.auth.token_url).unwrap(),
         auth::canonical_token_url(&new.auth.token_url).unwrap()
     );
-    assert_eq!(auth::load_oauth_tokens(&f.paths, &new.auth), Some(tokens()));
+    assert!(
+        auth::load_oauth_tokens(&f.paths, &new.auth).is_none(),
+        "legacy issuer/hash could have been stamped by config-derived migration"
+    );
     assert!(
         file.exists(),
         "diagnostics/compatibility lookup never rewrite or delete evidence"
     );
     auth::save_oauth_tokens(&f.paths, &old.auth, &tokens()).unwrap();
+    assert_eq!(auth::load_oauth_tokens(&f.paths, &new.auth), Some(tokens()));
     assert_eq!(
         auth::oauth_tokens_file(&f.paths, &old.auth),
         auth::oauth_tokens_file(&f.paths, &new.auth)
@@ -700,7 +704,7 @@ async fn managed_operational_probe_recovers_revoked_token_in_models_stage() {
 }
 
 #[tokio::test]
-async fn equivalent_old_endpoint_spellings_share_refresh_lock_and_canonical_save() {
+async fn equivalent_versioned_endpoints_share_refresh_lock_without_rewriting_legacy_bytes() {
     let env = credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let server = Server::new(Seen {
@@ -713,6 +717,9 @@ async fn equivalent_old_endpoint_spellings_share_refresh_lock_and_canonical_save
     spelling.auth.token_url.push('/');
     let old_file = write_old_slot(&f.paths, &spelling, Some(&spelling.auth.token_url));
     let old_bytes = std::fs::read(&old_file).unwrap();
+    // Explicit re-login supplies independent exact-endpoint evidence; the old
+    // issuer/hash pair alone must never bootstrap a trusted credential.
+    auth::save_oauth_tokens(&f.paths, &spelling.auth, &tokens()).unwrap();
     let one = Provider::for_named_profile_with(
         cfg.clone(),
         f.paths.clone(),
@@ -950,19 +957,35 @@ async fn ambiguous_canonical_legacy_and_invalid_evidence_require_relogin_without
 }
 
 #[test]
-fn finite_raw_keyring_alias_recovery_uses_recorded_endpoint_and_leaves_evidence_intact() {
+fn finite_raw_keyring_alias_recovery_requires_independent_versioned_endpoint_evidence() {
     let env = credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let mut old = config("https://example.com");
     old.auth.token_url = "https://example.com/token/?binding=fixture".into();
+    auth::save_oauth_tokens(&f.paths, &old.auth, &tokens()).unwrap();
+    let canonical_file = auth::oauth_tokens_file(&f.paths, &old.auth);
+    let record: Value = serde_json::from_slice(&std::fs::read(&canonical_file).unwrap()).unwrap();
     let hash = Sha256::digest(format!("{}\n{}", old.auth.token_url, old.auth.client_id));
     let slot: String = hash[..6].iter().map(|b| format!("{b:02x}")).collect();
     let user = format!("oauth-tokens-{}-{slot}", f.paths.profile);
     let entry = keyring::Entry::new("formless", &user).unwrap();
-    let mut value = serde_json::to_value(tokens()).unwrap();
-    value["token_url"] = json!(old.auth.token_url);
-    let before = value.to_string();
+    let before = record["v"].to_string();
     entry.set_password(&before).unwrap();
+    let canonical_slot = canonical_file
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("oauth_tokens-")
+        .unwrap();
+    keyring::Entry::new(
+        "formless",
+        &format!("oauth-tokens-{}-{canonical_slot}", f.paths.profile),
+    )
+    .unwrap()
+    .delete_credential()
+    .unwrap();
+    std::fs::remove_file(&canonical_file).unwrap();
     let mut changed = old.clone();
     changed.auth.token_url = "https://example.com/token?binding=fixture".into();
     assert_eq!(
@@ -1003,13 +1026,87 @@ fn unknown_historical_raw_keyring_hash_is_not_guessed_or_relabelled() {
         "arbitrary old raw-hash keyring names are not discoverable from canonical identity"
     );
     assert_eq!(entry.get_password().unwrap(), before);
-    assert_eq!(
-        auth::load_oauth_tokens(&f.paths, &original.auth),
-        Some(tokens()),
-        "restoring known original spelling recovers its recorded endpoint evidence"
-    );
+    assert!(auth::load_oauth_tokens(&f.paths, &original.auth).is_none(), "even restoring the raw spelling cannot prove an old issuer was not fabricated by migration");
     assert!(!auth::oauth_tokens_file(&f.paths, &changed.auth).exists());
     entry.delete_credential().unwrap();
+}
+
+#[tokio::test]
+async fn historical_config_derived_migration_labels_never_authorize_provider_a_tokens_at_b() {
+    let env = credential_env::EnvGuard::isolated();
+    for keyring_only in [false, true] {
+        for expired in [false, true] {
+            let f = Fixture::new(&env);
+            let server = Server::new(Seen::default()).await;
+            let mut b = config(&server.base);
+            b.auth.token_url.push('/');
+            let mut config_b = Config::default();
+            config_b.provider = b.clone();
+            config_b.save(&f.paths).unwrap();
+            let mut a = tokens();
+            a.access_token = "provider-A-access".into();
+            a.refresh_token = Some("provider-A-refresh".into());
+            if expired {
+                a.expires_at = Some(auth::now_epoch() - 60);
+            }
+            // Exact output of pre-1228 load_with_issuer/save_oauth_tokens at
+            // 8739dd0: it ignored the profile-wide set's issuer, stamped B's
+            // current raw URL, and keyed both copies by SHA256(URL+'\n'+ID)[..6].
+            let mut relabelled = serde_json::to_value(&a).unwrap();
+            relabelled["token_url"] = json!(b.auth.token_url);
+            let wrapped = json!({"v":relabelled,"saved_at":1234}).to_string();
+            let digest = Sha256::digest(format!("{}\n{}", b.auth.token_url, b.auth.client_id));
+            let slot: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+            let old_file = f.paths.config_dir.join(format!("oauth_tokens-{slot}.json"));
+            let entry = keyring::Entry::new(
+                "formless",
+                &format!("oauth-tokens-{}-{slot}", f.paths.profile),
+            )
+            .unwrap();
+            if keyring_only {
+                entry.set_password(&wrapped).unwrap();
+            } else {
+                formless_core::config::write_secret_file(&old_file, &wrapped).unwrap();
+            }
+            assert_ne!(
+                old_file,
+                auth::oauth_tokens_file(&f.paths, &b.auth),
+                "raw noncanonical slot/hash can still have been config-derived"
+            );
+            assert!(auth::resolve_provider_token(&f.paths, &b)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("login required"));
+            assert!(
+                auth::force_refresh_provider_token(&f.paths, &b, "provider-A-access")
+                    .await
+                    .is_err()
+            );
+            assert!(auth::peek_provider_token(&f.paths, &b).is_err());
+            let status = auth::auth_status(&f.paths, &b);
+            assert!(!status.credential_present);
+            assert!(status
+                .warning
+                .unwrap()
+                .contains("could have been derived from configuration"));
+            assert!(
+                server.seen.lock().unwrap().calls.is_empty(),
+                "neither A's access nor refresh token reaches B"
+            );
+            if keyring_only {
+                assert_eq!(entry.get_password().unwrap(), wrapped);
+                entry.delete_credential().unwrap();
+            } else {
+                assert_eq!(std::fs::read_to_string(&old_file).unwrap(), wrapped);
+            }
+            assert!(
+                !auth::oauth_tokens_file(&f.paths, &b.auth).exists(),
+                "lookup cannot convert a forged legacy label into new transport evidence"
+            );
+            server.close().await;
+        }
+    }
 }
 
 #[tokio::test]
