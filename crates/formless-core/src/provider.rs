@@ -293,7 +293,21 @@ impl StructuredCall {
         if cfg.anthropic() {
             return false;
         }
-        let lower = raw.to_lowercase();
+        let parsed = serde_json::from_str::<Value>(raw).ok();
+        let error = parsed
+            .as_ref()
+            .map(|value| value.get("error").unwrap_or(value));
+        let message = error
+            .and_then(|error| error["message"].as_str())
+            .unwrap_or(if parsed.is_none() { raw } else { "" });
+        let lower = message.to_lowercase();
+        let code = error
+            .and_then(|error| error["code"].as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        if Self::invalid_schema(raw) || code.contains("schema") && code.contains("invalid") {
+            return false;
+        }
         if ["invalid schema", "invalid_schema", "schema is invalid"]
             .iter()
             .any(|s| lower.contains(s))
@@ -305,6 +319,12 @@ impl StructuredCall {
         } else {
             "response_format"
         };
+        if error
+            .and_then(|error| error["param"].as_str())
+            .is_some_and(|param| param != field && param != format!("{field}.type"))
+        {
+            return false;
+        }
         let names_mode = lower.contains(field) || lower.contains("json_schema");
         let unsupported = [
             "not supported",
@@ -327,6 +347,28 @@ impl StructuredCall {
                     std::sync::atomic::Ordering::Relaxed,
                 )
                 .is_ok()
+    }
+
+    fn invalid_schema(raw: &str) -> bool {
+        let parsed = serde_json::from_str::<Value>(raw).ok();
+        let error = parsed
+            .as_ref()
+            .map(|value| value.get("error").unwrap_or(value));
+        let message = error
+            .and_then(|error| error["message"].as_str())
+            .unwrap_or(if parsed.is_none() { raw } else { "" })
+            .to_lowercase();
+        let code = error
+            .and_then(|error| error["code"].as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        (code.contains("schema") && code.contains("invalid"))
+            || error
+                .and_then(|error| error["param"].as_str())
+                .is_some_and(|param| param.contains(".schema"))
+            || message.contains("invalid schema")
+            || message.contains("schema is invalid")
+            || message.contains("schema keyword")
     }
 }
 
@@ -2167,12 +2209,13 @@ impl Provider {
         effort: Option<&str>,
         options: &CompletionOptions,
     ) -> Result<(CompletionResult, Option<Value>)> {
-        let messages = crate::provenance::project(messages);
-        let result = self
-            .completion_dispatch(options)
-            .complete_with_usage_inner(&messages, model, effort)
+        let (result, terminal) = self
+            .completion_for_validation(messages, model, effort, options)
             .await?;
         let value = if let Some(schema) = options.output_schema() {
+            if let Some(error) = terminal {
+                return Err(error.into());
+            }
             if result.output_limited {
                 return Err(StructuredOutputError::IncompleteResponse.into());
             }
@@ -2183,12 +2226,27 @@ impl Provider {
         Ok((result, value))
     }
 
+    /// Core callers may first attribute the returned billed usage to their
+    /// Invocation, then surface terminal/JSON/schema failure without losing it.
+    pub(crate) async fn completion_for_validation(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+        options: &CompletionOptions,
+    ) -> Result<(CompletionResult, Option<StructuredOutputError>)> {
+        let messages = crate::provenance::project(messages);
+        self.completion_dispatch(options)
+            .complete_with_usage_inner(&messages, model, effort)
+            .await
+    }
+
     async fn complete_with_usage_inner(
         &self,
         messages: &[Value],
         model: &str,
         effort: Option<&str>,
-    ) -> Result<CompletionResult> {
+    ) -> Result<(CompletionResult, Option<StructuredOutputError>)> {
         let dispatch = self.native_dispatch(messages, model);
         let (v, served, unknown_cost) = if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
@@ -2211,22 +2269,20 @@ impl Provider {
         if let Some(usage) = &mut usage {
             usage.cost_unknown = unknown_cost && usage.cost.is_none();
         }
-        if self.structured_output.is_some()
-            && (v["choices"][0]["message"]["refusal"].is_string()
-                || v["choices"][0]["finish_reason"] == "content_filter"
-                || v["output"].as_array().is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item["content"]
-                            .as_array()
-                            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal"))
-                    })
+        let refused = v["choices"][0]["message"]["refusal"].is_string()
+            || v["choices"][0]["finish_reason"] == "content_filter"
+            || v["output"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["content"]
+                        .as_array()
+                        .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal"))
                 })
-                || v["stop_reason"] == "refusal")
-        {
-            return Err(StructuredOutputError::RefusedResponse.into());
-        }
+            })
+            || v["stop_reason"] == "refusal";
         let (text, output_limited) = if self.cfg.anthropic() {
-            if let Some(why) = crate::anthropic::unusable_stop(&v) {
+            if let Some(why) =
+                crate::anthropic::unusable_stop(&v).filter(|_| self.structured_output.is_none())
+            {
                 return Err(anyhow!("provider error: {why}"));
             }
             (
@@ -2244,12 +2300,24 @@ impl Provider {
                 v["choices"][0]["finish_reason"] == "length",
             )
         };
-        Ok(CompletionResult {
-            text,
-            usage,
-            output_limited,
-            model_used: served,
-        })
+        let terminal = if self.structured_output.is_some() && refused {
+            Some(StructuredOutputError::RefusedResponse)
+        } else if self.structured_output.is_some()
+            && (output_limited || v["stop_reason"] == "model_context_window_exceeded")
+        {
+            Some(StructuredOutputError::IncompleteResponse)
+        } else {
+            None
+        };
+        Ok((
+            CompletionResult {
+                text,
+                usage,
+                output_limited,
+                model_used: served,
+            },
+            terminal,
+        ))
     }
 
     /// POST /chat/completions with bounded retries (SPEC §4.4). Returns the
@@ -2412,6 +2480,15 @@ impl Provider {
                         // masking even a one-character synthetic credential can
                         // remove a keyword or numeric limit from the diagnostic.
                         let lower = raw_text.to_lowercase();
+                        if status.as_u16() == 400
+                            && self.structured_output.is_some()
+                            && StructuredCall::invalid_schema(&raw_text)
+                        {
+                            return Err(anyhow!(StructuredOutputError::InvalidSchema).context(
+                                auth.error(format!("provider error: {last_err}"))
+                                    .to_string(),
+                            ));
+                        }
                         if status.as_u16() == 400
                             && self
                                 .structured_output

@@ -354,12 +354,14 @@ async fn generate_does_not_repeat_or_run_twice() {
         "/chat/completions",
         post({
             let calls = calls.clone();
-            move || {
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     let proposal = r#"{"kind":"prompt","content":"Always stream large files in chunks.","rationale":"oom"}"#;
+                    assert_eq!(body["response_format"]["type"], "json_schema", "real guidance generation uses a schema");
+                    assert!(body["response_format"]["json_schema"]["schema"]["anyOf"].is_array());
                     axum::Json(serde_json::json!({"choices": [{"message": {"content": proposal}}]}))
                 }
             }

@@ -14880,11 +14880,11 @@ impl HostOps for NestedOps {
             .daemon
             .resolve_model(&requested, &self.cfg, complex)
             .map_err(|e| e.to_string())?;
-        let result = self.block_cancellable(counted(
+        let (result, terminal) = self.block_cancellable(counted(
             "llm",
             &self.session_id,
             &self.run_id,
-            provider.complete_result_with_options(&messages, &model, effort.as_deref(), options),
+            provider.completion_for_validation(&messages, &model, effort.as_deref(), options),
         ))?;
         self.data_observed("llm", &result.model_used)?;
         let usage = result.usage;
@@ -14908,9 +14908,14 @@ impl HostOps for NestedOps {
             });
         }
         match options.output_schema() {
-            Some(schema) => schema
-                .parse_and_validate(&result.text)
-                .map_err(|error| error.to_string()),
+            Some(schema) => {
+                if let Some(error) = terminal {
+                    return Err(error.to_string());
+                }
+                schema
+                    .parse_and_validate(&result.text)
+                    .map_err(|error| error.to_string())
+            }
             None => Ok(Value::String(result.text)),
         }
     }
