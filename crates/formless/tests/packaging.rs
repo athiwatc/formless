@@ -218,7 +218,8 @@ fn release_tags_must_match_the_cargo_version() {
 #[cfg(unix)]
 #[test]
 fn install_script_is_atomic_and_preflights() {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
     let which = |tool: &str| {
         [
             "/bin",
@@ -356,17 +357,92 @@ fn install_script_is_atomic_and_preflights() {
     let locked = dir.join("locked");
     std::fs::create_dir_all(locked.join("bin")).unwrap();
     std::fs::set_permissions(locked.join("bin"), std::fs::Permissions::from_mode(0o555)).unwrap();
-    let out = install(
-        &[
-            ("FORMLESS_VERSION", "v0.9.0"),
-            ("FORMLESS_RELEASES_URL", "file:///nonexistent"),
-        ],
-        Some(&locked),
-    );
+    // Container-root can write through 0555. Drop privileges only for these
+    // permission checks, without looking up/changing any host account. uid()
+    // also clears supplementary groups. A failed privilege drop fails the test.
+    let root_owned_fixture = std::fs::metadata(&dir).unwrap().uid() == 0;
+    let permission_child = || {
+        let mut child = std::process::Command::new(sh());
+        if root_owned_fixture {
+            child.gid(65534).uid(65534);
+        }
+        child.env_clear().current_dir(&dir);
+        child
+    };
+    // The checkout may itself be private. Copy only the installer and expose
+    // traversal/read access to this synthetic fixture, never to the checkout.
+    let preflight_script = dir.join("preflight-install.sh");
+    std::fs::copy(root().join("scripts/install.sh"), &preflight_script).unwrap();
+    for path in [&dir, &bin, &locked] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::set_permissions(&preflight_script, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // Prove this exact child really cannot write, rather than assuming modes
+    // imply denial for its credentials or silently skipping a privileged run.
+    let probe = locked.join("bin/direct-write-probe");
+    let out = permission_child()
+        .args(["-c", ": > \"$1\"", "write-probe"])
+        .arg(&probe)
+        .output()
+        .unwrap();
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("is not writable"),
-        "{out:?}"
+        !out.status.success(),
+        "permission fixture is writable: {out:?}"
     );
+    assert!(!probe.exists());
+
+    // A private curl spy forbids network access and observes download ordering.
+    let preflight_bin = dir.join("preflight-path");
+    std::fs::create_dir(&preflight_bin).unwrap();
+    std::fs::set_permissions(&preflight_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for entry in std::fs::read_dir(&bin).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "curl" {
+            symlink(entry.path(), preflight_bin.join(entry.file_name())).unwrap();
+        }
+    }
+    let curl_spy = preflight_bin.join("curl");
+    std::fs::write(
+        &curl_spy,
+        "#!/bin/sh\necho installer-download-reached >&2\nexit 73\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&curl_spy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let preflight = |prefix: &Path| {
+        permission_child()
+            .arg(&preflight_script)
+            .env("PATH", &preflight_bin)
+            .env("HOME", dir.join("home"))
+            .env("PREFIX", prefix)
+            .env("FORMLESS_TARGET", "test-target")
+            .env("FORMLESS_VERSION", "v0.9.0")
+            .env("FORMLESS_RELEASES_URL", "file:///nonexistent")
+            .output()
+            .unwrap()
+    };
+    let out = preflight(&locked);
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("is not writable"), "{out:?}");
+    assert!(!stderr.contains("installer-download-reached"), "{out:?}");
+    assert_eq!(std::fs::read_dir(locked.join("bin")).unwrap().count(), 0);
+
+    // Positive control: the same child, script and PATH reach the curl spy
+    // after a successful write probe. Only these empty dummy directories need
+    // child-write access; the real release/atomic/checksum fixtures stay owned.
+    let writable = dir.join("preflight-writable");
+    std::fs::create_dir_all(writable.join("bin")).unwrap();
+    for path in [&writable, &writable.join("bin")] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let out = preflight(&writable);
+    assert!(
+        !out.status.success(),
+        "the curl spy refuses downloads: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("installer-download-reached"), "{out:?}");
+    assert!(!stderr.contains("is not writable"), "{out:?}");
     std::fs::set_permissions(locked.join("bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
 
     // A rate-limited release lookup says so.
