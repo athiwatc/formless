@@ -10082,15 +10082,15 @@ impl Daemon {
     fn attach_path(&self, session_id: &str, path: &str, root: Option<&str>) -> Result<Value> {
         let session_root = self.session_cwd(session_id);
         let root = mention_root(root.or(session_root.as_deref()))?;
-        let full = root
-            .join(path.strip_prefix("~/").map_or_else(
-                || std::path::PathBuf::from(path),
-                |rest| {
-                    directories::BaseDirs::new()
-                        .map(|b| b.home_dir().join(rest))
-                        .unwrap_or_else(|| rest.into())
-                },
-            ))
+        let requested = root.join(path.strip_prefix("~/").map_or_else(
+            || std::path::PathBuf::from(path),
+            |rest| {
+                directories::BaseDirs::new()
+                    .map(|b| b.home_dir().join(rest))
+                    .unwrap_or_else(|| rest.into())
+            },
+        ));
+        let full = requested
             .canonicalize()
             .with_context(|| format!("no file '{path}'"))?;
         // A mention reaches only the working folder (or ~/ when written so),
@@ -10109,19 +10109,40 @@ impl Daemon {
                 "@{path} looks like a credential ({why}); it is never attached from a mention, use /attach if you mean it"
             ));
         }
+        let policy = crate::sensitive_reads::policy(
+            &self.paths,
+            &self.config()?.security,
+            &self.sensitive_anchors,
+        )
+        .map_err(|error| anyhow!(error))?;
+        match policy.classify(&requested,&full).map_err(|error|anyhow!(error))? {
+            formless_runtime::sensitive_paths::PathDecision::Ordinary=>{},
+            _=>return Err(anyhow!("@{path} is a protected profile or credential path; it is never attached from a mention")),
+        }
         let meta = std::fs::metadata(&full)?;
         let name = full
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
-        let inline_limit = if is_raster_image(guess_mime(&name)) {
-            MAX_INLINE_IMAGE_BYTES
-        } else {
-            MAX_MENTION_INLINE_BYTES
-        };
+        let mime = guess_mime(&name);
+        let inline_limit =
+            if is_raster_image(mime) || mime == "application/pdf" || audio_format_claim(mime) {
+                MAX_INLINE_IMAGE_BYTES
+            } else {
+                MAX_MENTION_INLINE_BYTES
+            };
         if meta.is_file() && meta.len() as usize <= inline_limit {
             use base64::Engine;
-            let data = base64::engine::general_purpose::STANDARD.encode(std::fs::read(&full)?);
+            let authority_root = if full.starts_with(&root) {
+                root.clone()
+            } else {
+                home.as_ref()
+                    .context("authorized home is unavailable")?
+                    .canonicalize()?
+            };
+            let bytes=crate::attachment_access::read_rooted_file(&authority_root,&full,inline_limit)
+                .context("inline attachment could not be read safely; the file may have changed or used a symbolic link")?;
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut r = self.attach_file(session_id, &name, &data, None)?;
             r["reference"] = json!(false);
             return Ok(r);

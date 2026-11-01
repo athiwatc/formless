@@ -987,7 +987,7 @@ pasting paths.
   step by step. Tab or Enter inserts `@path`. On send, each `@path`
   mention that names an existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
-  - text files up to 256 KB and images up to 8 MB are attached as below;
+  - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
     `[referenced: PATH (SIZE | directory); not attached, read it with
     your Tools]`, so the agent reads only what it needs.
