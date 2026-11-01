@@ -79,10 +79,34 @@ and retired `macos-13` is replaced by its [supported Intel successor](https://gi
 Each baseline starts with fresh job-local Cargo home/target directories and no
 cache restore/save. Toolchain setup, hosted image and network caches are not
 claimed cold. Logs record the exact commit, toolchain, runner/image and
-architecture; `time -p`/Stopwatch records phase timings. The standalone pipe job
-must run after the Windows assertion-inventory UTF-8 fix is merged. A pipe test
-following the whole workspace suite would be warm and cannot serve as its cold
-baseline.
+architecture; `time -p`/Stopwatch records phase timings. The standalone pipe
+family runs the same named-pipe and production backup CLI commands as the
+expanded Windows job. Its fresh target measures that whole job;
+a pipe test following the complete workspace suite would already be warm and
+cannot serve as this cold baseline.
+
+Build and pipe jobs in both baseline and production workflows set
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0` and `CARGO_INCREMENTAL=0`.
+These Cargo overrides remove debug symbols/incremental state; they retain test
+selection, debug assertions, overflow checks and release optimization settings.
+See Cargo's [profile settings](https://doc.rust-lang.org/cargo/reference/profiles.html).
+Only after the complete workspace test command succeeds, profile-scoped
+`cargo clean --profile dev` reclaims its generated debug artifacts before the
+release build. It refuses a target outside this checkout or a symlinked target.
+Package-building tools use a fresh runner-temporary target, removed immediately
+after installation (also on failure); installed tools and application release
+artifacts remain available for packaging. No host software or ambient caches
+are deleted. Disk-free and generated-directory sizes are logged around these
+phases. This reduces peak overlap of debug, release and tool intermediates;
+the container image, downloaded registry and release artifacts still consume
+space, so actual cold Linux build plus all install jobs must pass before this
+resource fix or its timeout sizing is considered verified.
+
+Earlier native/pipe measurements, including the historical 10m43s Windows pipe
+run, predate these profile flags and are superseded as sizing evidence. Keep
+them as history; remeasure native, Linux and pipe with the new recipe. Docker's
+release-only workload is unchanged and its prior evidence is unaffected. Do not
+combine differing profile/cleanup recipes into a claimed 2x timeout baseline.
 
 Use each green job's `completed_at - started_at` (excluding queue time) and retain
 its run/job URL, SHA, selected family, runner image and cache state. A skipped
