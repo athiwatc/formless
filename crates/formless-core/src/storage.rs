@@ -6998,7 +6998,9 @@ mod native_cost_basis_tests {
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("formless.db");
         let old = schema_at(61).unwrap();
-        old.execute("INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,created_at) VALUES('s','legacy','model',10,5,'2026-11-01')",[]).unwrap();
+        // Schema 61 requires the physical token counters even for a legacy
+        // text-only row; it has no native-cost-basis column yet.
+        old.execute("INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,created_at) VALUES('s','legacy','model',10,5,0,0,0,'2026-11-01')",[]).unwrap();
         old.execute("VACUUM INTO ?1", [file.to_str().unwrap()])
             .unwrap();
         drop(old);
