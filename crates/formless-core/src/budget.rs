@@ -58,10 +58,13 @@ impl Admission {
             .map_err(|_| anyhow!("budget: usage store is unavailable"))?;
         if let Some(max) = cfg.limits.run_usd.filter(|n| *n > 0.0 && !run.is_empty()) {
             let (rows, _) = st.usage_rows(None, Some(run))?;
+            if rows.iter().any(|row| row.7) {
+                return Err(anyhow!("budget: native media cost is unknown for this Run; strict run_usd cannot authorize more spending"));
+            }
             let cost: Option<f64> = rows
                 .iter()
-                .map(|(provider, model, p, c, cache, write, reported)| {
-                    cfg.cost_of(provider, model, *p, *c, *cache, *write, *reported)
+                .map(|(provider, model, p, c, cache, write, reported, unknown)| {
+                    cfg.cost_of_known(provider, model, *p, *c, *cache, *write, *reported, *unknown)
                 })
                 .sum();
             refuse("run_usd", cost, max)?;
@@ -69,11 +72,18 @@ impl Admission {
         if let Some(max) = cfg.limits.daily_usd.filter(|n| *n > 0.0) {
             let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
             let rows = st.usage_grouped(Some(&day), "model")?;
+            if rows.iter().any(|row| row.8) {
+                return Err(anyhow!("budget: native media cost is unknown today; strict daily_usd cannot authorize more spending"));
+            }
             let cost: Option<f64> = rows
                 .iter()
-                .map(|(_, provider, model, p, c, cache, write, reported)| {
-                    cfg.cost_of(provider, model, *p, *c, *cache, *write, *reported)
-                })
+                .map(
+                    |(_, provider, model, p, c, cache, write, reported, unknown)| {
+                        cfg.cost_of_known(
+                            provider, model, *p, *c, *cache, *write, *reported, *unknown,
+                        )
+                    },
+                )
                 .sum();
             refuse("daily_usd", cost, max)?;
         }

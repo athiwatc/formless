@@ -267,6 +267,41 @@ impl AttachmentAccess {
     }
 }
 
+/// Explicit @path intake has already authorized a working/home root. Reuse
+/// the same native no-follow handles, without granting provider file authority.
+pub(crate) fn read_rooted_file(
+    root: &Path,
+    path: &Path,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let relative = path.strip_prefix(root).map_err(|_| denied())?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(denied());
+    }
+    let info = std::fs::symlink_metadata(root)?;
+    if !info.is_dir() || info.file_type().is_symlink() {
+        return Err(denied());
+    }
+    let file = open_rooted(root, relative, &info)?;
+    if !file.metadata()?.is_file() {
+        return Err(denied());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the inline file grew beyond its size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(unix)]
 fn open_rooted(
     root: &Path,
@@ -411,6 +446,24 @@ fn open_rooted(_: &Path, _: &Path, _: &std::fs::Metadata) -> std::io::Result<Fil
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn rooted_inline_intake_is_bounded_and_rejects_links_and_nonregular_files() {
+        let root = std::env::temp_dir().join(format!("fl-rooted-inline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(read_rooted_file(&root, &file, 1).unwrap(), b"x");
+        std::fs::write(&file, b"grown").unwrap();
+        assert!(read_rooted_file(&root, &file, 1).is_err());
+        assert!(read_rooted_file(&root, &root, 100).is_err());
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(read_rooted_file(&root, &link, 100).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn snapshot_lookup_work_is_prefix_bounded_and_negative_cached() {
         let mut calls = Vec::new();

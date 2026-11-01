@@ -770,3 +770,179 @@ fn production_request_future_is_bounded_for_default_worker_stacks() {
     let bytes = std::mem::size_of_val(&request);
     assert!(bytes<=16*1024,"public dispatcher future grew to {bytes} bytes; connection scopes must not inline the entire protocol state machine");
 }
+
+#[tokio::test]
+async fn admitted_native_sources_survive_later_file_changes_and_initial_model_omission() {
+    use axum::{extract::OriginalUri, response::IntoResponse, routing::post, Json, Router};
+    use base64::Engine;
+    let env = crate::credential_env::EnvGuard::isolated();
+    for style in ["chat", "responses", "anthropic"] {
+        let (_root, paths, d, sid, mut cfg) = setup(&env);
+        let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let capture = seen.clone();
+        let handler = move |OriginalUri(uri): OriginalUri, Json(body): Json<Value>| {
+            capture.locked().push(body.clone());
+            async move {
+                if body["model"] == "model" {
+                    return (axum::http::StatusCode::NOT_FOUND, "model not found").into_response();
+                }
+                let events = if uri.path() == "/messages" {
+                    vec![
+                        json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+                        json!({"type":"message_stop"}),
+                    ]
+                } else if uri.path() == "/responses" {
+                    vec![
+                        json!({"type":"response.output_text.delta","delta":"ok"}),
+                        json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":2}}}),
+                    ]
+                } else {
+                    vec![
+                        json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}),
+                    ]
+                };
+                let mut text = events
+                    .into_iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>();
+                if uri.path() == "/chat/completions" {
+                    text.push_str("data: [DONE]\n\n");
+                }
+                ([("content-type", "text/event-stream")], text).into_response()
+            }
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(handler.clone()))
+            .route("/responses", post(handler.clone()))
+            .route("/messages", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        cfg.provider.base_url = format!("http://{}", listener.local_addr().unwrap());
+        cfg.provider.api_style = style.into();
+        cfg.provider.pdf_input = Some(false);
+        cfg.provider
+            .model_pdf_input
+            .insert("native-fallback".into(), true);
+        cfg.provider.fallback_models = vec!["native-fallback".into()];
+        cfg.limits.forecast_confirm_usd = None;
+        cfg.save(&paths).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap()
+        });
+        let original = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+        d.handle(Request::AttachFile {
+            session_id: sid.clone(),
+            name: "admitted.pdf".into(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(original),
+            mime: Some("application/pdf".into()),
+        })
+        .await
+        .unwrap();
+        let path = d
+            .with_reader(|st| {
+                Ok(st.pending_attachments(&sid)?[0]["path"]
+                    .as_str()
+                    .unwrap()
+                    .to_string())
+            })
+            .unwrap();
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "analyze admitted source".into(),
+            ..Default::default()
+        };
+        let (_, run, admission) = d
+            .admit_action(&sid, &cfg, &input, |st| {
+                Daemon::append_user_message_store(st, &sid, &input.draft, None)
+            })
+            .unwrap();
+        let admitted_json =
+            serde_json::to_string(&admission.first.locked().as_ref().unwrap().0).unwrap();
+        assert!(
+            admitted_json.contains("_attachments"),
+            "admission retains canonical markers"
+        );
+        assert!(!admitted_json.contains("data:application/pdf"));
+        let mut changed = original.to_vec();
+        *changed.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &changed).unwrap();
+        d.launch_prepared_run(sid.clone(), run.clone(), admission)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while d.runs.locked().contains_key(&sid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted fixture must settle");
+        assert_eq!(
+            d.with_reader(|st| st.run_status(&run)).unwrap().as_deref(),
+            Some("completed")
+        );
+        let captured = seen.locked();
+        assert_eq!(
+            captured.len(),
+            2,
+            "no extra probe/file/transcription calls: {captured:?}"
+        );
+        assert!(!crate::tokens::has_native_media(&captured[0]));
+        assert!(crate::tokens::has_native_media(&captured[1]));
+        let native = &captured[1];
+        let content = if style == "responses" {
+            &native["input"]
+        } else {
+            &native["messages"]
+        };
+        let file = content
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().into_iter().flatten())
+            .find(|p| matches!(p["type"].as_str(), Some("file" | "input_file" | "document")))
+            .unwrap();
+        let encoded = if style == "anthropic" {
+            file["source"]["data"].as_str().unwrap()
+        } else if style == "responses" {
+            file["file_data"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("data:application/pdf;base64,")
+                .unwrap()
+        } else {
+            file["file"]["file_data"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("data:application/pdf;base64,")
+                .unwrap()
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            original,
+            "dispatch must use admitted bytes, not changed on-disk bytes"
+        );
+        assert_eq!(
+            d.usage_info(None, Some(&run), &cfg).unwrap().cost,
+            None,
+            "native actual cost remains unknown"
+        );
+        drop(captured);
+        assert_eq!(std::fs::read(&path).unwrap(), changed);
+        drop(d);
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}

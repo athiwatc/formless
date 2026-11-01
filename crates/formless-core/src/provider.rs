@@ -185,6 +185,7 @@ pub struct ModelTest {
     pub tested_at: String,
 }
 
+#[derive(Clone)]
 pub struct Provider {
     cfg: ProviderCfg,
     api_key: String,
@@ -192,6 +193,9 @@ pub struct Provider {
     /// an OAuth token expiring during a long Run is refreshed in place.
     credential_paths: Option<Paths>,
     attachment_access: Option<crate::attachment_access::AttachmentAccess>,
+    native_sources: Option<Arc<FrozenAttachments>>,
+    native_projection: Option<Arc<NativeProjection>>,
+    request_policy: Option<RequestPolicy>,
     http: reqwest::Client,
     /// Sent as `prompt_cache_key` so the endpoint routes one Session's
     /// requests to the same cache (see `provider.cache_key`).
@@ -225,6 +229,7 @@ pub(crate) struct UsageAccountingFailure;
 
 /// Lifetime lease acquired before a model request and dropped after accounting.
 pub type RequestLease = Box<dyn std::any::Any + Send>;
+pub(crate) type RequestPolicy = Arc<dyn Fn(&Value) -> Result<()> + Send + Sync>;
 pub type RequestHook = Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RequestLease>> + Send>>
         + Send
@@ -284,6 +289,7 @@ struct RequestAccounting {
     prompt_hook: Option<PromptHook>,
     prompt_key: String,
     prompt_estimate: usize,
+    unknown_cost: bool,
     provider: String,
     model: String,
 }
@@ -295,6 +301,8 @@ struct AttemptUsage<'a> {
     model: String,
     usage: Option<Usage>,
     prompt_estimate: usize,
+    unknown_cost: bool,
+    recorded: bool,
 }
 impl<'a> AttemptUsage<'a> {
     fn new(provider: &'a Provider, model: &str, permit: &BreakerPermit) -> Self {
@@ -303,14 +311,18 @@ impl<'a> AttemptUsage<'a> {
             model: model.to_string(),
             usage: None,
             prompt_estimate: permit.accounting.as_ref().map_or(0, |a| a.prompt_estimate),
+            unknown_cost: permit.accounting.as_ref().is_some_and(|a| a.unknown_cost),
+            recorded: false,
         }
     }
     fn observe(&mut self, usage: Option<Usage>) {
         if let Some(mut usage) = usage {
+            usage.cost_unknown |= self.unknown_cost;
             if let Some(previous) = self.usage {
                 // Usage events are cumulative, and partial updates may omit
                 // counters already reported by message_start/earlier events.
                 usage.reported |= previous.reported;
+                usage.cost_unknown |= previous.cost_unknown;
                 usage.prompt_tokens = usage.prompt_tokens.max(previous.prompt_tokens);
                 usage.completion_tokens = usage.completion_tokens.max(previous.completion_tokens);
                 usage.reasoning_tokens = usage.reasoning_tokens.max(previous.reasoning_tokens);
@@ -322,11 +334,20 @@ impl<'a> AttemptUsage<'a> {
                     (a, b) => a.or(b),
                 };
             }
+            if usage.cost.is_some() {
+                usage.cost_unknown = false;
+            }
             self.usage = Some(usage);
         }
     }
     fn finish(&mut self) -> Result<()> {
-        let usage = self.usage.take();
+        let usage = self.usage.take().or_else(|| {
+            self.unknown_cost.then_some(Usage {
+                cost_unknown: true,
+                ..Default::default()
+            })
+        });
+        self.recorded = true;
         self.provider.report_usage(&self.model, usage.as_ref())?;
         if let Some(u) = usage.filter(|u| u.reported & 1 != 0) {
             self.provider
@@ -337,10 +358,16 @@ impl<'a> AttemptUsage<'a> {
 }
 impl Drop for AttemptUsage<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self
-            .provider
-            .report_usage(&self.model, self.usage.take().as_ref())
-        {
+        if self.recorded {
+            return;
+        }
+        let usage = self.usage.take().or_else(|| {
+            self.unknown_cost.then_some(Usage {
+                cost_unknown: true,
+                ..Default::default()
+            })
+        });
+        if let Err(error) = self.provider.report_usage(&self.model, usage.as_ref()) {
             // The daemon hook fails future admission closed after a failed
             // commit. Preserve the original stream error/cancellation here.
             tracing::warn!("could not commit failed stream usage: {error:#}");
@@ -382,7 +409,19 @@ impl BreakerPermit {
         })
     }
     fn account_usage(&self, usage: Option<Usage>, comparable: bool) -> Result<()> {
-        if let (Some(accounting), Some(usage)) = (&self.accounting, usage) {
+        if let Some(accounting) = &self.accounting {
+            let Some(mut usage) = usage.or_else(|| {
+                accounting.unknown_cost.then_some(Usage {
+                    cost_unknown: true,
+                    ..Default::default()
+                })
+            }) else {
+                return Ok(());
+            };
+            usage.cost_unknown |= accounting.unknown_cost;
+            if usage.cost.is_some() {
+                usage.cost_unknown = false;
+            }
             if let Some(hook) = &accounting.hook {
                 hook(&accounting.provider, &accounting.model, &usage)?;
             }
@@ -504,6 +543,7 @@ async fn completed_json(
             Ok(value)
         }
         Err(error) => {
+            permit.account_usage(None, false)?;
             permit.failure("response body failed", false);
             Err(error).context(context)
         }
@@ -588,6 +628,9 @@ pub struct Usage {
     /// USD the provider billed for the request (OpenRouter's
     /// `usage.cost`); preferred over `provider.prices` when present.
     pub cost: Option<f64>,
+    /// Native media has no reliable generic text-rate cost basis. A provider's
+    /// actual reported cost still takes precedence over this uncertainty.
+    pub cost_unknown: bool,
     /// Coverage bits: 1=input explicitly reported, 2=output explicitly reported.
     /// Cumulative stream snapshots combine these; counter equality ignores it.
     pub reported: u8,
@@ -643,6 +686,7 @@ impl Usage {
                 .max(n(&u["input_tokens_details"]["cache_write_tokens"]))
                 .max(n(&u["cache_creation_input_tokens"])),
             cost: u["cost"].as_f64().filter(|c| c.is_finite() && *c >= 0.0),
+            cost_unknown: false,
             reported: u8::from(
                 u["prompt_tokens"].as_u64().is_some() || u["input_tokens"].as_u64().is_some(),
             ) | (u8::from(
@@ -760,6 +804,7 @@ pub fn responses_input(messages: &[Value]) -> Vec<Value> {
                         }
                         Some(img)
                     }
+                    Some("file") => Some(json!({"type":"input_file","filename":p["file"]["filename"],"file_data":p["file"]["file_data"]})),
                     _ => None,
                 })
                 .collect();
@@ -822,7 +867,7 @@ fn apply_breakpoints(body: &mut Value, on: bool) {
         });
     } else if body["input"].is_array() {
         let mut input = body["input"].take();
-        crate::anthropic::strip_cache_control(&mut input);
+        crate::anthropic::strip_request_cache_control(&mut input);
         if let (true, Some(parts)) = (on, input.as_array_mut()) {
             mark_responses_system(parts);
         }
@@ -867,7 +912,7 @@ fn apply_extra_body(body: &mut Value, cfg: &ProviderCfg, model: &str) {
 
 /// A message whose content is one marked text part, as a plain string.
 fn unmark(mut m: Value) -> Value {
-    crate::anthropic::strip_cache_control(&mut m);
+    crate::anthropic::strip_request_cache_control(&mut m);
     let single = m["content"]
         .as_array()
         .filter(|parts| parts.len() == 1 && parts[0]["type"] == "text")
@@ -1121,6 +1166,9 @@ impl Provider {
             api_key,
             credential_paths: None,
             attachment_access: None,
+            native_sources: None,
+            native_projection: None,
+            request_policy: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1147,6 +1195,9 @@ impl Provider {
             api_key,
             credential_paths: None,
             attachment_access: None,
+            native_sources: None,
+            native_projection: None,
+            request_policy: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1201,6 +1252,9 @@ impl Provider {
             cfg,
             api_key,
             attachment_access: Some(crate::attachment_access::AttachmentAccess::profile(&paths)),
+            native_sources: None,
+            native_projection: None,
+            request_policy: None,
             credential_paths: Some(paths),
             cache_key: None,
             on_retry: None,
@@ -1277,6 +1331,28 @@ impl Provider {
         crate::secrets::redact_known(text, &known)
     }
 
+    fn redact_native_diagnostic(
+        &self,
+        text: &str,
+        credential: &str,
+        body: Option<&Value>,
+    ) -> String {
+        let mut current = PayloadRedactions::default();
+        if let Some(body) = body {
+            current.observe(body);
+        }
+        let echoed = current.recognizes(text)
+            || self
+                .native_projection
+                .as_ref()
+                .is_some_and(|projection| projection.sent_payloads.locked().recognizes(text));
+        if echoed {
+            "[provider diagnostic omitted because it echoed submitted attachment data]".into()
+        } else {
+            self.redacted_error(text, credential)
+        }
+    }
+
     /// Route this provider's requests to a stable prompt cache (e.g. one
     /// per Session); off when `provider.cache_key = "off"`.
     pub fn with_cache_key(mut self, key: &str) -> Self {
@@ -1322,6 +1398,57 @@ impl Provider {
         self.attachment_access =
             crate::attachment_access::AttachmentAccess::snapshot(store, messages)?;
         Ok(self)
+    }
+
+    pub(crate) fn with_request_policy(mut self, policy: RequestPolicy) -> Self {
+        self.request_policy = Some(policy);
+        self
+    }
+    pub(crate) fn with_frozen_attachments(mut self, sources: Arc<FrozenAttachments>) -> Self {
+        self.native_sources = Some(sources);
+        self
+    }
+    fn native_dispatch(&self, messages: &[Value], model: &str) -> Self {
+        let mut dispatch = self.clone();
+        let sources = self
+            .native_sources
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.freeze_attachments(messages, model, true)));
+        dispatch.native_projection = Some(Arc::new(NativeProjection {
+            messages: messages.to_vec(),
+            sources,
+            repairs: std::sync::Mutex::new(NativeRepairs::default()),
+            sent_payloads: std::sync::Mutex::new(PayloadRedactions::default()),
+        }));
+        dispatch
+    }
+    fn project_native_request(&self, body: &mut Value, model: &str) {
+        let Some(projection) = &self.native_projection else {
+            return;
+        };
+        let prepared =
+            self.prepare_attachments_inner(&projection.messages, model, None, &projection.sources);
+        if self.cfg.anthropic() {
+            let projected = crate::anthropic::body(
+                model,
+                &prepared,
+                &[],
+                self.cfg.cache_breakpoints(model),
+                None,
+                false,
+            );
+            body["messages"] = projected["messages"].clone();
+            if projected.get("system").is_some() {
+                body["system"] = projected["system"].clone();
+            } else if let Some(object) = body.as_object_mut() {
+                object.remove("system");
+            }
+        } else if self.cfg.responses() {
+            body["input"] = json!(responses_input(&prepared));
+        } else {
+            body["messages"] = json!(prepared);
+        }
+        projection.repairs.locked().apply(body);
     }
 
     /// Observe only bodies accepted by an actual successful provider response,
@@ -1416,19 +1543,36 @@ impl Provider {
             hook: self.on_usage.clone(),
             prompt_hook: self.on_prompt.clone(),
             prompt_key: crate::tokens::provider_key(&self.name, &self.cfg),
-            prompt_estimate: crate::tokens::request(body),
+            prompt_estimate: if crate::tokens::has_native_media(body) {
+                0
+            } else {
+                crate::tokens::request(body)
+            },
+            unknown_cost: crate::tokens::has_native_media(body),
             provider: self.name.clone(),
             model: model.to_string(),
         }
     }
 
-    fn report_error_usage(&self, text: &str, model: &str) -> Result<()> {
-        if let Ok(value) = serde_json::from_str::<Value>(text) {
-            let usage =
-                Usage::parse(&value["usage"]).or_else(|| Usage::parse(&value["response"]["usage"]));
-            self.report_usage(model, usage.as_ref())?;
+    fn report_error_usage(&self, text: &str, model: &str, unknown_cost: bool) -> Result<()> {
+        let mut usage = serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|v| {
+                Usage::parse(&v["usage"]).or_else(|| Usage::parse(&v["response"]["usage"]))
+            })
+            .or_else(|| {
+                unknown_cost.then_some(Usage {
+                    cost_unknown: true,
+                    ..Default::default()
+                })
+            });
+        if let Some(usage) = &mut usage {
+            usage.cost_unknown |= unknown_cost;
+            if usage.cost.is_some() {
+                usage.cost_unknown = false;
+            }
         }
-        Ok(())
+        self.report_usage(model, usage.as_ref())
     }
 
     async fn request_lease(&self) -> Result<Option<RequestLease>> {
@@ -1673,7 +1817,8 @@ impl Provider {
     }
 
     pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
-        self.prepare_attachments_inner(messages, model, None)
+        let frozen = self.freeze_attachments(messages, model, false);
+        self.prepare_attachments_inner(messages, model, None, &frozen)
     }
 
     /// Only the caller-created draft range may resolve metadata-only previews;
@@ -1684,7 +1829,62 @@ impl Provider {
         model: &str,
         previews: Option<(usize, usize, &[formless_protocol::ForecastAttachment])>,
     ) -> Vec<Value> {
-        self.prepare_attachments_inner(messages, model, previews)
+        let frozen = self.freeze_attachments(messages, model, false);
+        self.prepare_attachments_inner(messages, model, previews, &frozen)
+    }
+
+    pub(crate) fn accepts_attachment(&self, mime: &str, model: &str) -> bool {
+        if crate::daemon::is_raster_image(mime) {
+            self.sends_images(model)
+        } else if mime == "application/pdf" {
+            self.cfg.accepts_pdf_input(model)
+        } else {
+            audio_format(mime).is_some_and(|format| self.cfg.accepts_audio_format(model, format))
+        }
+    }
+
+    pub(crate) fn freeze_attachments(
+        &self,
+        messages: &[Value],
+        model: &str,
+        failover: bool,
+    ) -> FrozenAttachments {
+        let mut frozen = FrozenAttachments::default();
+        let mut remaining = MAX_NATIVE_SOURCE_BYTES;
+        let mut models = vec![self.cfg.resolve_alias(model)];
+        if failover {
+            models.extend(
+                self.cfg
+                    .fallback_models
+                    .iter()
+                    .map(|m| self.cfg.resolve_alias(m)),
+            );
+        }
+        for a in messages
+            .iter()
+            .flat_map(|m| m["_attachments"].as_array().into_iter().flatten())
+            .take(MAX_NATIVE_ATTACHMENTS)
+        {
+            let key = attachment_identity(a);
+            // Even repeated references reserve logical source work. Freezing
+            // each request remains bounded before any native encoding.
+            let result = if models
+                .iter()
+                .any(|model| self.accepts_attachment(a["mime"].as_str().unwrap_or_default(), model))
+            {
+                self.attachment_access
+                    .as_ref()
+                    .ok_or_else(|| "no owned artifact authority is available".to_string())
+                    .and_then(|access| {
+                        access.read_charged(a, crate::daemon::MAX_ATTACHMENT_BYTES, &mut remaining)
+                    })
+                    .map(Arc::new)
+            } else {
+                Err("the configured model/API does not accept this attachment natively; artifact reference retained".into())
+            };
+            frozen.sources.entry(key).or_insert(result);
+        }
+        frozen
     }
 
     fn prepare_attachments_inner(
@@ -1692,6 +1892,7 @@ impl Provider {
         messages: &[Value],
         model: &str,
         previews: Option<(usize, usize, &[formless_protocol::ForecastAttachment])>,
+        frozen: &FrozenAttachments,
     ) -> Vec<Value> {
         let vision = self.sends_images(model);
         let mut budget = AttachmentBudget::default();
@@ -1703,7 +1904,15 @@ impl Provider {
             let mut m = Value::Object(original.as_object().unwrap().iter()
                 .filter(|(key,_)| key.as_str() != "_attachments")
                 .map(|(key,value)|(key.clone(),value.clone())).collect());
-            if !vision { return m; }
+            let image_only=atts.iter().all(|a|crate::daemon::is_raster_image(a["mime"].as_str().unwrap_or_default()));
+            let plural=if image_only {"images"} else {"attachments"};
+            if !vision && image_only {
+                // Snapshot/source capture count all positional native refs.
+                // An unsupported-image message cannot reset the later draft's
+                // metadata-preview/native-attachment attempt budget.
+                budget.attempts=budget.attempts.saturating_add(atts.len()).min(MAX_NATIVE_ATTACHMENTS);
+                return m;
+            }
             let mut parts = vec![json!({"type":"text","text":m["content"]})];
             let mut omitted = 0usize;
             let mut first_failure = None;
@@ -1714,26 +1923,42 @@ impl Provider {
                     if let Some((draft_index, first, descriptors)) = previews {
                         if message_index == draft_index && attachment_index >= first {
                             if let Some(descriptor) = descriptors.get(attachment_index-first) {
-                                return forecast_image(descriptor, self.cfg.image_max_px, &mut budget);
+                                if !self.accepts_attachment(&descriptor.mime,model) {return Err("the selected model/API does not accept this attachment natively; artifact reference retained".into());}
+                                return forecast_part(descriptor,self.cfg.image_max_px,&mut budget);
                             }
                         }
                     }
                     let (Some(path),Some(mime)) = (a["path"].as_str(),a["mime"].as_str()) else {
                         return Err("no verified owned artifact reference".into());
                     };
-                    self.attachment_access.as_ref()
-                        .ok_or_else(|| "no owned artifact authority is available".to_string())
-                        .and_then(|access| access.read_charged(a, crate::daemon::MAX_ATTACHMENT_BYTES, &mut budget.source_remaining))
-                        .and_then(|bytes| encoded_image(path,mime,self.cfg.image_max_px,bytes,&mut budget))
+                    if !self.accepts_attachment(mime,model) {
+                        return Err("the selected model/API does not accept this attachment natively; artifact reference retained".into());
+                    }
+                    let bytes=frozen.sources.get(&attachment_identity(a))
+                        .ok_or_else(||"the request's source-attachment prefix is exhausted".to_string())?
+                        .as_ref().map_err(Clone::clone)?;
+                    if bytes.len()>budget.source_remaining {return Err("the request's attachment source-byte budget is exhausted".into());}
+                    budget.source_remaining-=bytes.len();
+                    if crate::daemon::is_raster_image(mime) {
+                        encoded_image(path,mime,self.cfg.image_max_px,bytes.as_ref().clone(),&mut budget).map(NativePart::Image)
+                    } else {
+                        use base64::Engine;
+                        if bytes.len()>MAX_IMAGE_BYTES {return Err("native audio/PDF exceeds the 8 MiB inline limit; artifact reference retained".into());}
+                        let actual=crate::daemon::sniff_mime(bytes);
+                        let format=audio_format(mime);
+                        let valid=if mime=="application/pdf" {actual==Some("application/pdf")}
+                            else {format.is_some()&&actual.and_then(audio_format)==format};
+                        if !valid {return Err("the attachment bytes do not match the declared native format".into());}
+                        let encoded=bytes.len().div_ceil(3).saturating_mul(4);
+                        budget.encoded(encoded.saturating_add(if mime=="application/pdf" {"data:application/pdf;base64,".len()} else {0}))?;
+                        let data=base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
+                        if mime=="application/pdf" {
+                            Ok(NativePart::Pdf{data,filename:attachment_filename(a)})
+                        } else {Ok(NativePart::Audio{data,format:format.unwrap()})}
+                    }
                 });
                 match encoded {
-                    Ok(url) => {
-                        let mut image = json!({"url":url});
-                        if self.cfg.image_detail != "auto" && !self.cfg.image_detail.is_empty() {
-                            image["detail"] = json!(self.cfg.image_detail);
-                        }
-                        parts.push(json!({"type":"image_url","image_url":image}));
-                    }
+                    Ok(part) => parts.push(part.content(&self.cfg.image_detail)),
                     Err(why) => {
                         omitted += 1;
                         first_failure.get_or_insert((name,why));
@@ -1741,14 +1966,15 @@ impl Provider {
                 }
                 if budget.attempts >= MAX_NATIVE_ATTACHMENTS && attachment_index+1 < atts.len() {
                     omitted += atts.len()-attachment_index-1;
-                    first_failure.get_or_insert(("additional images".into(),"the request's 16 attempted native-attachment limit is reached".into()));
+                    first_failure.get_or_insert((format!("additional {plural}"),"the request's 16 attempted native-attachment limit is reached".into()));
                     break;
                 }
             }
             if let Some((name,why)) = first_failure {
-                let rest = if omitted > 1 {format!("; {} additional images were omitted",omitted-1)} else {String::new()};
-                parts.push(json!({"type":"text","text":format!("[image {name} could not be attached: {why}{rest}]")}));
-                self.note(format!("The image {name} wasn't sent to the model: {why}{rest}."));
+                let rest = if omitted > 1 {format!("; {} additional {plural} were omitted",omitted-1)} else {String::new()};
+                let label=if atts.iter().all(|a|crate::daemon::is_raster_image(a["mime"].as_str().unwrap_or_default())) {"image"} else {"attachment"};
+                parts.push(json!({"type":"text","text":format!("[{label} {name} could not be attached: {why}{rest}]")}));
+                self.note(format!("The {label} {name} wasn't sent to the model: {why}{rest}."));
             }
             m["content"] = json!(parts);
             m
@@ -1787,7 +2013,6 @@ impl Provider {
         effort: Option<&str>,
     ) -> Result<CompletionResult> {
         let messages = crate::provenance::project(messages);
-        let messages = self.prepare_attachments(&messages, model);
         self.complete_with_usage_inner(&messages, model, effort)
             .await
     }
@@ -1798,12 +2023,15 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<CompletionResult> {
-        let (v, served) = if self.cfg.anthropic() {
+        let dispatch = self.native_dispatch(messages, model);
+        let (v, served, unknown_cost) = if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
-            let (resp, _, served, permit) = self.post_provider(&mut body, None, true).await?;
+            let (resp, _, served, permit) = dispatch.post_provider(&mut body, None, true).await?;
+            let unknown = permit.accounting.as_ref().is_some_and(|a| a.unknown_cost);
             (
                 completed_json(resp, permit, "parse Messages response").await?,
                 served,
+                unknown,
             )
         } else {
             let mut body = if self.cfg.responses() {
@@ -1811,9 +2039,12 @@ impl Provider {
             } else {
                 json!({"model": model, "messages": messages, "stream": false})
             };
-            self.post_chat_served(&mut body, effort).await?
+            dispatch.post_chat_served(&mut body, effort).await?
         };
-        let usage = Usage::parse(&v["usage"]);
+        let mut usage = Usage::parse(&v["usage"]);
+        if let Some(usage) = &mut usage {
+            usage.cost_unknown = unknown_cost && usage.cost.is_none();
+        }
         let (text, output_limited) = if self.cfg.anthropic() {
             if let Some(why) = crate::anthropic::unusable_stop(&v) {
                 return Err(anyhow!("provider error: {why}"));
@@ -1849,11 +2080,13 @@ impl Provider {
         &self,
         body: &mut Value,
         effort: Option<&str>,
-    ) -> Result<(Value, String)> {
+    ) -> Result<(Value, String, bool)> {
         let (resp, _, served, permit) = self.post_provider(body, effort, true).await?;
+        let unknown = permit.accounting.as_ref().is_some_and(|a| a.unknown_cost);
         Ok((
             completed_json(resp, permit, "parse chat completion").await?,
             served,
+            unknown,
         ))
     }
 
@@ -1912,19 +2145,9 @@ impl Provider {
             // (#1088), so `sends` just bounds the total.
             let (mut attempt, mut sends) = (0, 0);
             'attempts: while attempt <= self.cfg.max_retries && sends <= attempt + MAX_RESENDS {
-                let lease = self
-                    .request_lease()
-                    .await
-                    .map_err(|error| auth.annotate(error))?;
                 sends += 1;
                 let mut b = body.clone();
                 b["model"] = json!(model);
-                // Breakpoints follow the model actually tried: a fallback
-                // that isn't Claude gets plain content, one that is gets
-                // them, whoever built the body (#769).
-                if !self.cfg.anthropic() && body.get("__no_cache_control").is_none() {
-                    apply_breakpoints(&mut b, self.cfg.cache_breakpoints(model));
-                }
                 if let Some(o) = b.as_object_mut() {
                     o.remove("__no_cache_control");
                 }
@@ -1936,6 +2159,22 @@ impl Provider {
                         b["reasoning_effort"] = json!(effort);
                     }
                 }
+                // Content is projected for the actual model after vendor and
+                // reasoning repairs. Content fields are protected from extra_body.
+                self.project_native_request(&mut b, model);
+                if !self.cfg.anthropic() && body.get("__no_cache_control").is_none() {
+                    apply_breakpoints(&mut b, self.cfg.cache_breakpoints(model));
+                }
+                if let Some(projection) = &self.native_projection {
+                    projection.repairs.locked().apply(&mut b);
+                }
+                if let Some(policy) = &self.request_policy {
+                    policy(&b).map_err(|error| auth.annotate(error))?;
+                }
+                let lease = self
+                    .request_lease()
+                    .await
+                    .map_err(|error| auth.annotate(error))?;
                 let credential = self
                     .credential()
                     .await
@@ -1955,6 +2194,9 @@ impl Provider {
                     &credential,
                 )
                 .json(&b);
+                if let Some(projection) = &self.native_projection {
+                    projection.sent_payloads.locked().observe(&b);
+                }
                 let mut server_wait = None;
                 let reason;
                 match req.send().await {
@@ -1970,9 +2212,13 @@ impl Provider {
                         }
                         server_wait = retry_after(resp.headers());
                         let raw_text = resp.text().await.unwrap_or_default();
-                        self.report_error_usage(&raw_text, model)
-                            .map_err(|error| auth.annotate(error))?;
-                        let text = self.redacted_error(&raw_text, &credential);
+                        self.report_error_usage(
+                            &raw_text,
+                            model,
+                            crate::tokens::has_native_media(&b),
+                        )
+                        .map_err(|error| auth.annotate(error))?;
+                        let text = self.redact_native_diagnostic(&raw_text, &credential, Some(&b));
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
                         last_err = match server_wait {
@@ -2004,21 +2250,27 @@ impl Provider {
                         // cap, cache breakpoints, images): each fixed once,
                         // so a rejected history never bricks the Session.
                         if status.as_u16() == 400 {
-                            let mut repaired = body.clone();
+                            let mut repaired = b.clone();
                             let fix = if self.cfg.anthropic() {
                                 crate::anthropic::recover(&mut repaired, &raw_text)
                             } else if lower.contains("cache_control")
                                 && body.get("__no_cache_control").is_none()
                             {
                                 // Not marked again on later attempts.
-                                crate::anthropic::strip_cache_control(&mut repaired);
-                                repaired["__no_cache_control"] = json!(true);
-                                Some(crate::anthropic::Recovery::CacheControl)
+                                if crate::anthropic::strip_request_cache_control(&mut repaired) {
+                                    repaired["__no_cache_control"] = json!(true);
+                                    Some(crate::anthropic::Recovery::CacheControl)
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             };
                             if let Some(fix) = fix.filter(|f| !applied_fixes.contains(f)) {
                                 *body = repaired;
+                                if let Some(projection) = &self.native_projection {
+                                    projection.repairs.locked().remember(fix, body);
+                                }
                                 applied_fixes.push(fix);
                                 tracing::info!(
                                     "provider rejected the request ({fix:?}); resending"
@@ -2027,6 +2279,18 @@ impl Provider {
                                 recovered.dropped_replayed_thinking |=
                                     fix == crate::anthropic::Recovery::ReplayedThinking;
                                 continue;
+                            }
+                        }
+
+                        if status.as_u16() == 400 {
+                            if let Some(projection) = &self.native_projection {
+                                let mut repairs = projection.repairs.locked();
+                                if let Some(note) = repairs.reject_native(&b, &lower) {
+                                    *body = b;
+                                    repairs.apply(body);
+                                    recovered.notes.push(note.into());
+                                    continue;
+                                }
                             }
                         }
 
@@ -2064,7 +2328,10 @@ impl Provider {
                         };
                     }
                     Err(e) => {
-                        last_err = self.redacted_error(&e.to_string(), &credential);
+                        self.report_error_usage("", model, crate::tokens::has_native_media(&b))
+                            .map_err(|error| auth.annotate(error))?;
+                        last_err =
+                            self.redact_native_diagnostic(&e.to_string(), &credential, Some(&b));
                         reason = "connection failed".to_string();
                     }
                 }
@@ -2128,7 +2395,7 @@ impl Provider {
         cancel: &CancellationToken,
         mut on_delta: F,
     ) -> Result<ChatResult> {
-        let prepared = self.prepare_attachments(messages, model);
+        let prepared = messages.to_vec();
         if self.cfg.anthropic() {
             if !self.cfg.prompt_tools() || tools.is_empty() {
                 return self
@@ -2178,6 +2445,7 @@ impl Provider {
             messages
         };
         let effective_tools: &[Value] = if prompt_mode { &[] } else { tools };
+        let dispatch = self.native_dispatch(messages, model);
         let cache_breakpoints = self.cfg.cache_breakpoints(model);
         let mut body = if self.cfg.responses() {
             let mut input = responses_input(messages);
@@ -2232,7 +2500,7 @@ impl Provider {
             // stuck endpoint must not outlive an interrupt).
             let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                r = self.post_provider_with_auth(&mut body, effort, true, &mut auth) => r?,
+                r = dispatch.post_provider_with_auth(&mut body, effort, true, &mut auth) => r?,
             };
             let mut charged = AttemptUsage::new(self, &model_used, &permit);
             let mut stream = resp.bytes_stream();
@@ -2373,7 +2641,7 @@ impl Provider {
                                             attempt += 1;
                                             continue 'request;
                                         }
-                                        return Err(anyhow!("provider error: {message}"));
+                                        return Err(anyhow!("provider error: {}",dispatch.redact_native_diagnostic(&message,&dispatch.api_key,None)));
                                     }
                                     if self.cfg.responses() {
                                         match v["type"].as_str().unwrap_or_default() {
@@ -2526,6 +2794,7 @@ impl Provider {
                     }
                 }
             }
+            let usage = charged.usage.or(usage);
             charged.finish()?;
             permit.success();
             break (
@@ -2609,6 +2878,7 @@ impl Provider {
         mut on_delta: F,
     ) -> Result<ChatResult> {
         // The same model gate as Chat's breakpoints (`auto` = Claude ids).
+        let dispatch = self.native_dispatch(messages, model);
         let cache = self.cfg.cache_breakpoints(model);
         let mut body = crate::anthropic::body(model, messages, tools, cache, effort, true);
         let mut notes = crate::anthropic::skipped_images(messages);
@@ -2619,7 +2889,7 @@ impl Provider {
         loop {
             let (resp, recovered, model_used, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
-                r = self.post_provider_with_auth(&mut body, None, true, &mut auth) => r?,
+                r = dispatch.post_provider_with_auth(&mut body, None, true, &mut auth) => r?,
             };
             for n in recovered.notes {
                 if !notes.contains(&n) {
@@ -2736,7 +3006,10 @@ impl Provider {
                     attempt += 1;
                     continue;
                 }
-                return Err(anyhow!("provider error: {why}"));
+                return Err(anyhow!(
+                    "provider error: {}",
+                    dispatch.redact_native_diagnostic(&why, &dispatch.api_key, None)
+                ));
             }
             permit.success();
             let tool_calls = f
@@ -2825,7 +3098,7 @@ impl Provider {
             let status = resp.status();
             if !status.is_success() {
                 let raw_text = resp.text().await.unwrap_or_default();
-                self.report_error_usage(&raw_text, model)
+                self.report_error_usage(&raw_text, model, crate::tokens::has_native_media(&body))
                     .map_err(|error| auth.annotate(error))?;
                 let text = self.redacted_error(&raw_text, &credential);
                 if status.as_u16() == 401 && self.recover_unauthorized(&credential, &mut auth).await
@@ -2920,6 +3193,230 @@ pub fn resized_image_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u
     )
 }
 
+/// Retain only small recognizable prefixes of payloads actually attempted on
+/// the wire. Never source these from schemas or untransmitted frozen bytes.
+#[derive(Default)]
+struct PayloadRedactions {
+    prefixes: Vec<String>,
+    data_urls: Vec<String>,
+}
+impl PayloadRedactions {
+    fn observe(&mut self, body: &Value) {
+        fn add(patterns: &mut Vec<String>, pattern: String) {
+            if !pattern.is_empty() && patterns.len() < 64 && !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+        crate::tokens::content_parts(body, |parts| {
+            for part in parts {
+                let kind = part["type"].as_str().unwrap_or_default();
+                let payload = match kind {
+                    "input_audio" => part["input_audio"]["data"].as_str(),
+                    "file" => part["file"]["file_data"].as_str(),
+                    "input_file" => part["file_data"].as_str(),
+                    "document" | "image" if part["source"]["type"] == "base64" => {
+                        part["source"]["data"].as_str()
+                    }
+                    "image_url" => part["image_url"]["url"]
+                        .as_str()
+                        .or_else(|| part["image_url"].as_str()),
+                    "input_image" => part["image_url"].as_str(),
+                    _ => None,
+                };
+                let Some(payload) = payload else {
+                    continue;
+                };
+                let encoded = if payload.starts_with("data:") {
+                    if let Some((header, data)) = payload.split_once(',') {
+                        add(
+                            &mut self.data_urls,
+                            format!("{},", header.chars().take(128).collect::<String>()),
+                        );
+                        data
+                    } else {
+                        payload
+                    }
+                } else {
+                    payload
+                };
+                // Recognize complete shorter payloads and >=32-character prefixes
+                // of larger ones. This deliberately makes no one-character or
+                // arbitrary decoded/obfuscated-output confidentiality claim.
+                if encoded.len() >= 8 {
+                    add(&mut self.prefixes, encoded.chars().take(32).collect());
+                }
+            }
+        });
+    }
+    fn recognizes(&self, text: &str) -> bool {
+        let contains = |value: &str| {
+            self.prefixes
+                .iter()
+                .chain(&self.data_urls)
+                .any(|pattern| value.contains(pattern))
+        };
+        contains(text)
+            || serde_json::from_str::<Value>(text)
+                .ok()
+                .is_some_and(|value| contains(&value.to_string()))
+    }
+}
+
+struct NativeProjection {
+    messages: Vec<Value>,
+    sources: Arc<FrozenAttachments>,
+    repairs: std::sync::Mutex<NativeRepairs>,
+    sent_payloads: std::sync::Mutex<PayloadRedactions>,
+}
+#[derive(Default)]
+struct NativeRepairs {
+    thinking: bool,
+    images: bool,
+    cache: bool,
+    audio: bool,
+    pdf: bool,
+    thinking_disabled: bool,
+    max_tokens: Option<u64>,
+    thinking_budget: Option<u64>,
+}
+impl NativeRepairs {
+    fn remember(&mut self, fix: crate::anthropic::Recovery, body: &Value) {
+        match fix {
+            crate::anthropic::Recovery::ReplayedThinking => self.thinking = true,
+            crate::anthropic::Recovery::Images => self.images = true,
+            crate::anthropic::Recovery::CacheControl => self.cache = true,
+            crate::anthropic::Recovery::Thinking => self.thinking_disabled = true,
+            crate::anthropic::Recovery::MaxTokens | crate::anthropic::Recovery::ThinkingBudget => {
+                self.max_tokens = body["max_tokens"].as_u64();
+                self.thinking_budget = body["thinking"]["budget_tokens"].as_u64();
+                if body.get("thinking").is_none() {
+                    self.thinking_disabled = true;
+                }
+            }
+        }
+    }
+    fn apply(&self, value: &mut Value) {
+        if let Some(object) = value.as_object_mut() {
+            if self.thinking_disabled {
+                object.remove("thinking");
+            }
+            if let Some(max) = self.max_tokens {
+                object.insert("max_tokens".into(), json!(max));
+            }
+            if let Some(budget) = self.thinking_budget {
+                if value["thinking"].is_object() {
+                    value["thinking"]["budget_tokens"] = json!(budget);
+                }
+            }
+        }
+        if self.cache {
+            crate::anthropic::strip_request_cache_control(value);
+        }
+        self.apply_parts(value);
+    }
+    fn apply_parts(&self, value: &mut Value) {
+        crate::tokens::content_parts_mut(value, |parts| {
+            if self.thinking {
+                parts.retain(|part| {
+                    !matches!(
+                        part["type"].as_str(),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                });
+            }
+            for part in parts {
+                let kind = part["type"].as_str().unwrap_or_default();
+                if self.images && matches!(kind, "image" | "image_url" | "input_image")
+                    || self.audio && kind == "input_audio"
+                    || self.pdf && matches!(kind, "file" | "input_file" | "document")
+                {
+                    let text_type = if matches!(kind, "input_file" | "input_image") {
+                        "input_text"
+                    } else {
+                        "text"
+                    };
+                    *part = json!({"type":text_type,"text":"[attachment not sent: the provider rejected this native modality; artifact reference retained]"});
+                }
+            }
+        });
+    }
+    fn reject_native(&mut self, body: &Value, error: &str) -> Option<&'static str> {
+        if !self.audio
+            && error.contains("audio")
+            && crate::tokens::has_content_kind(body, &["input_audio"])
+        {
+            self.audio = true;
+            return Some(
+                "The provider rejected native audio; resent with the artifact reference only.",
+            );
+        }
+        if !self.pdf
+            && (error.contains("pdf")
+                || error.contains("document")
+                || error.contains("file_data")
+                || error.contains("input_file"))
+            && crate::tokens::has_content_kind(body, &["file", "input_file", "document"])
+        {
+            self.pdf = true;
+            return Some(
+                "The provider rejected native PDF input; resent with the artifact reference only.",
+            );
+        }
+        None
+    }
+}
+
+/// Owned source bytes are private request state, never serialized into a wire
+/// request. Keep them canonical so a later physical fallback can re-project.
+#[derive(Clone, Default)]
+pub(crate) struct FrozenAttachments {
+    sources: HashMap<String, std::result::Result<Arc<Vec<u8>>, String>>,
+}
+fn attachment_identity(a: &Value) -> String {
+    use sha2::Digest;
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(a).unwrap_or_default())
+    )
+}
+
+enum NativePart {
+    Image(String),
+    Audio { data: String, format: &'static str },
+    Pdf { data: String, filename: String },
+}
+impl NativePart {
+    fn content(self, detail: &str) -> Value {
+        match self {
+            Self::Image(url) => {
+                let mut image = json!({"url":url});
+                if detail != "auto" && !detail.is_empty() {
+                    image["detail"] = json!(detail);
+                }
+                json!({"type":"image_url","image_url":image})
+            }
+            Self::Audio { data, format } => {
+                json!({"type":"input_audio","input_audio":{"data":data,"format":format}})
+            }
+            Self::Pdf { data, filename } => {
+                json!({"type":"file","file":{"filename":filename,"file_data":format!("data:application/pdf;base64,{data}")}})
+            }
+        }
+    }
+}
+fn attachment_filename(a: &Value) -> String {
+    let name = a["name"].as_str().unwrap_or("document.pdf");
+    let unquoted = serde_json::from_str::<String>(name).unwrap_or_else(|_| name.into());
+    crate::daemon::cap_name(&crate::daemon::attachment_name(&unquoted), 120)
+}
+fn audio_format(mime: &str) -> Option<&'static str> {
+    match mime {
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        _ => None,
+    }
+}
+
 // Request-wide work limits, shared by ordinary projection and offline previews.
 pub(crate) const MAX_NATIVE_ATTACHMENTS: usize = 16;
 pub(crate) const MAX_NATIVE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
@@ -2965,6 +3462,51 @@ impl AttachmentBudget {
         }
         self.encoded_remaining -= bytes;
         Ok(())
+    }
+}
+
+fn forecast_part(
+    descriptor: &formless_protocol::ForecastAttachment,
+    max_px: u32,
+    budget: &mut AttachmentBudget,
+) -> std::result::Result<NativePart, String> {
+    if crate::daemon::is_raster_image(&descriptor.mime) {
+        return forecast_image(descriptor, max_px, budget).map(NativePart::Image);
+    }
+    let bytes = usize::try_from(descriptor.bytes)
+        .map_err(|_| "the source attachment is too large".to_string())?;
+    if bytes > MAX_IMAGE_BYTES {
+        return Err(
+            "native audio/PDF exceeds the 8 MiB inline limit; artifact reference retained".into(),
+        );
+    }
+    if bytes > crate::daemon::MAX_ATTACHMENT_BYTES || bytes > budget.source_remaining {
+        return Err("the request's attachment source-byte budget is exhausted".into());
+    }
+    budget.source_remaining -= bytes;
+    budget.encoded(bytes.div_ceil(3).saturating_mul(4).saturating_add(
+        if descriptor.mime == "application/pdf" {
+            "data:application/pdf;base64,".len()
+        } else {
+            0
+        },
+    ))?;
+    // Estimator-only placeholders carry no document/audio payload. They never
+    // enter the actual-dispatch private frozen-source map.
+    if descriptor.mime == "application/pdf" {
+        Ok(NativePart::Pdf {
+            data: String::new(),
+            filename: crate::daemon::cap_name(
+                &crate::daemon::attachment_name(&descriptor.name),
+                120,
+            ),
+        })
+    } else {
+        Ok(NativePart::Audio {
+            data: String::new(),
+            format: audio_format(&descriptor.mime)
+                .ok_or_else(|| "unsupported audio format".to_string())?,
+        })
     }
 }
 
@@ -3753,7 +4295,92 @@ mod breaker_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_payload_patterns_use_actual_parts_and_recognize_cropped_json_echoes() {
+        let payload = "opaque_attachment_bytes_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let schema = json!({"type":"file","file":{"file_data":payload}});
+        let mut patterns = PayloadRedactions::default();
+        patterns.observe(&json!({"tools":[{"function":{"parameters":{"const":schema}}}],"vendor":schema,"messages":[{"role":"user","content":[{"type":"text","text":payload}]}]}));
+        assert!(
+            !patterns.recognizes(payload),
+            "schemas/text confer no payload authority"
+        );
+        patterns.observe(&json!({"input":[{"role":"user","content":[{"type":"input_file","file_data":format!("data:application/pdf;base64,{payload}")}]}]}));
+        assert!(patterns.recognizes(payload));
+        assert!(patterns.recognizes(&payload[..40]));
+        assert!(patterns.recognizes("cropped data:application/pdf;base64,"));
+        let escaped = payload[..40]
+            .chars()
+            .map(|c| format!("\\u{:04x}", c as u32))
+            .collect::<String>();
+        assert!(patterns.recognizes(&format!("{{\"error\":\"{escaped}\"}}")));
+        assert!(!patterns.recognizes("ordinary invalid_request_error"));
+        // A later content repair cannot remove the retained attempted patterns.
+        patterns.observe(&json!({"messages":[{"role":"user","content":"reference only"}]}));
+        assert!(patterns.recognizes(payload));
+        assert!(patterns.prefixes.iter().all(|p| p.len() <= 32));
+    }
 
+    #[test]
+    fn unsupported_history_images_cannot_reset_native_preview_attempt_prefix() {
+        let p = Provider::new(
+            ProviderCfg {
+                vision: Some(false),
+                audio_input: Some(true),
+                ..Default::default()
+            },
+            String::new(),
+        )
+        .unwrap();
+        let history = json!({"role":"user","content":"old image references","_attachments":vec![json!({"mime":"image/png","name":"old.png"});16]});
+        let draft = json!({"role":"user","content":"new audio","_attachments":[{"mime":"audio/wav","name":"new.wav"}]});
+        let descriptor = formless_protocol::ForecastAttachment {
+            name: "new.wav".into(),
+            mime: "audio/wav".into(),
+            bytes: 48,
+            ..Default::default()
+        };
+        let prepared = p.prepare_forecast_attachments(
+            &[history, draft],
+            "fixture",
+            Some((1, 0, &[descriptor])),
+        );
+        assert!(!crate::tokens::has_native_media(&json!(prepared)));
+        assert!(prepared[1]
+            .to_string()
+            .contains("16 attempted native-attachment limit"));
+    }
+    #[test]
+    fn native_repair_and_detection_are_limited_to_real_content_parts() {
+        let schema = json!({"type":"object","const":{"type":"file","cache_control":{"type":"data"}},"default":{"type":"input_audio"},"examples":[{"type":"thinking"},{"type":"document"},{"type":"input_file"},{"type":"image"}]});
+        for key in ["messages", "input"] {
+            let mut body = json!({"tools":[{"type":"function","function":{"name":"fixture","parameters":schema}}],"guard":{"schema":schema},"response_format":{"json_schema":{"schema":schema}}});
+            body[key] = json!([{"role":"user","content":[{"type":"text","text":"plain"}]}]);
+            let unchanged = body.clone();
+            assert!(!crate::tokens::has_native_media(&body));
+            let repairs = NativeRepairs {
+                thinking: true,
+                images: true,
+                cache: true,
+                audio: true,
+                pdf: true,
+                ..Default::default()
+            };
+            repairs.apply(&mut body);
+            assert_eq!(body, unchanged, "schema values are data");
+            assert!(NativeRepairs::default()
+                .reject_native(&body, "unsupported PDF audio document")
+                .is_none());
+            body[key][0]["content"] = json!([{"type":"text","text":"plain"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"x"}},{"type":"thinking","thinking":"replay"},{"type":"input_audio","input_audio":{"data":"x","format":"wav"}}]);
+            assert!(crate::tokens::has_native_media(&body));
+            repairs.apply(&mut body);
+            assert!(!crate::tokens::has_native_media(&body));
+            assert_eq!(body["tools"], unchanged["tools"]);
+            assert_eq!(body["guard"], unchanged["guard"]);
+            assert_eq!(body["response_format"], unchanged["response_format"]);
+            assert_eq!(body[key][0]["content"].as_array().unwrap().len(), 3);
+        }
+    }
     fn budget_png() -> Vec<u8> {
         let mut bytes = Vec::new();
         image::DynamicImage::new_rgb8(8, 8)

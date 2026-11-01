@@ -1246,3 +1246,160 @@ async fn run_accounting_failure_is_local_but_actual_http_fault_still_counts() {
         teardown(daemon, server).await;
     }
 }
+
+#[tokio::test]
+async fn strict_dollar_limits_refuse_unknown_native_input_before_http_or_admission() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mock = Mock::new(false, false);
+    let (_root, paths, mut cfg, daemon, server) = setup(&env, mock.clone(), Some(1.0), false).await;
+    cfg.provider.pdf_input = Some(true);
+    cfg.save(&paths).unwrap();
+    let sid = daemon
+        .with_store(|st| Ok(st.create_session(None)?.id))
+        .unwrap();
+    daemon
+        .handle(Request::AttachFile {
+            session_id: sid.clone(),
+            name: "private.pdf".into(),
+            data_b64: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"%PDF-1.4\n%%EOF\n",
+            ),
+            mime: Some("application/pdf".into()),
+        })
+        .await
+        .unwrap();
+    let (run, messages) = daemon
+        .with_store(|st| {
+            let run = st.create_run(&sid)?;
+            let held = st.take_pending_attachments(&sid)?;
+            let m = st.append_message_meta(
+                &sid,
+                "user",
+                "analyze",
+                Some(json!({"attachments":held}).to_string()),
+            )?;
+            Ok((run, vec![crate::storage::provider_message(&m)]))
+        })
+        .unwrap();
+    let provider = daemon.provider(&cfg).await.unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        counted(
+            "run",
+            &sid,
+            &run,
+            provider.complete(&messages, "primary", None),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        error.downcast_ref::<RequestFailure>().is_some(),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("cannot be bounded locally"));
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        daemon.budget_admission.entered.load(Ordering::SeqCst),
+        0,
+        "refusal precedes paid-attempt admission/coverage"
+    );
+    assert!(daemon
+        .with_store(|st| st.usage_rows(None, Some(&run)))
+        .unwrap()
+        .0
+        .is_empty());
+    teardown(daemon, server).await;
+}
+
+#[tokio::test]
+async fn unreported_native_cost_stays_unknown_after_price_changes_restart_and_capping() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mock = Mock::new(false, false);
+    let (_root, paths, mut cfg, daemon, server) = setup(&env, mock.clone(), None, false).await;
+    cfg.provider.pdf_input = Some(true);
+    cfg.save(&paths).unwrap();
+    let sid = daemon
+        .with_store(|st| Ok(st.create_session(None)?.id))
+        .unwrap();
+    daemon
+        .handle(Request::AttachFile {
+            session_id: sid.clone(),
+            name: "private.pdf".into(),
+            data_b64: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"%PDF-1.4\n%%EOF\n",
+            ),
+            mime: Some("application/pdf".into()),
+        })
+        .await
+        .unwrap();
+    let (run, messages) = daemon
+        .with_store(|st| {
+            let run = st.create_run(&sid)?;
+            let held = st.take_pending_attachments(&sid)?;
+            let m = st.append_message_meta(
+                &sid,
+                "user",
+                "analyze",
+                Some(json!({"attachments":held}).to_string()),
+            )?;
+            Ok((run, vec![crate::storage::provider_message(&m)]))
+        })
+        .unwrap();
+    let provider = daemon.provider(&cfg).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        counted(
+            "run",
+            &sid,
+            &run,
+            provider.complete_result(&messages, "primary", None),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(result.usage.unwrap().cost_unknown);
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        daemon.usage_info(None, Some(&run), &cfg).unwrap().cost,
+        None,
+        "generic text prices cannot invent native cost"
+    );
+    assert_eq!(
+        daemon
+            .with_store(|st| st.forecast_usage(&run, &cfg))
+            .unwrap()
+            .0,
+        None
+    );
+    drop(provider);
+    drop(daemon);
+    cfg.provider.prices.get_mut("primary").unwrap().input = 1.0;
+    cfg.limits.run_usd = Some(100.0);
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths).unwrap());
+    assert_eq!(
+        daemon.usage_info(None, Some(&run), &cfg).unwrap().cost,
+        None,
+        "unknown basis survives restart and settings changes"
+    );
+    let provider = daemon.provider(&cfg).await.unwrap();
+    let error = counted("run", &sid, &run, provider.complete(&[], "primary", None))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("native media cost is unknown"),
+        "{error:#}"
+    );
+    assert_eq!(
+        mock.posts.load(Ordering::SeqCst),
+        1,
+        "a later text-only request cannot bypass unknown historical strict spend"
+    );
+    drop(provider);
+    teardown(daemon, server).await;
+}

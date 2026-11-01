@@ -75,6 +75,106 @@ fn url_dimensions(url: &str) -> Option<(u32, u32)> {
     )
 }
 
+/// PDF page expansion and audio tokenization cannot be inferred from base64.
+/// Keep their cost explicitly unknown and do not train text-only calibration.
+pub(crate) fn has_content_kind(value: &Value, kinds: &[&str]) -> bool {
+    fn parts(items: &[Value], kinds: &[&str]) -> bool {
+        items.iter().any(|part| {
+            kinds.contains(&part["type"].as_str().unwrap_or_default())
+                || part["type"] == "tool_result"
+                    && part["content"].as_array().is_some_and(|p| parts(p, kinds))
+        })
+    }
+    fn messages(values: &[Value], kinds: &[&str]) -> bool {
+        values.iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|p| parts(p, kinds))
+        })
+    }
+    if let Some(values) = value.as_array() {
+        return messages(values, kinds);
+    }
+    ["messages", "input"]
+        .into_iter()
+        .any(|key| value[key].as_array().is_some_and(|m| messages(m, kinds)))
+}
+pub fn has_native_media(value: &Value) -> bool {
+    has_content_kind(value, &["input_audio", "file", "input_file", "document"])
+}
+
+pub(crate) fn content_parts(value: &Value, mut visit: impl FnMut(&[Value])) {
+    fn parts(items: &[Value], visit: &mut impl FnMut(&[Value])) {
+        visit(items);
+        for part in items {
+            if part["type"] == "tool_result" {
+                if let Some(nested) = part["content"].as_array() {
+                    parts(nested, visit);
+                }
+            }
+        }
+    }
+    fn message(value: &Value, visit: &mut impl FnMut(&[Value])) {
+        if let Some(items) = value["content"].as_array() {
+            parts(items, visit);
+        }
+    }
+    if let Some(messages) = value.as_array() {
+        for value in messages {
+            message(value, &mut visit);
+        }
+        return;
+    }
+    if value.get("role").is_some() {
+        message(value, &mut visit);
+        return;
+    }
+    for key in ["messages", "input"] {
+        if let Some(messages) = value[key].as_array() {
+            for value in messages {
+                message(value, &mut visit);
+            }
+        }
+    }
+}
+
+/// Visit only real API content-part arrays. Schema/default/example objects,
+/// structured tool arguments and vendor fields are data, never control slots.
+pub(crate) fn content_parts_mut(value: &mut Value, mut visit: impl FnMut(&mut Vec<Value>)) {
+    fn parts(items: &mut Vec<Value>, visit: &mut impl FnMut(&mut Vec<Value>)) {
+        for part in items.iter_mut() {
+            if part["type"] == "tool_result" {
+                if let Some(nested) = part.get_mut("content").and_then(Value::as_array_mut) {
+                    parts(nested, visit);
+                }
+            }
+        }
+        visit(items);
+    }
+    fn message(message: &mut Value, visit: &mut impl FnMut(&mut Vec<Value>)) {
+        if let Some(p) = message.get_mut("content").and_then(Value::as_array_mut) {
+            parts(p, visit);
+        }
+    }
+    if let Some(messages) = value.as_array_mut() {
+        for m in messages {
+            message(m, &mut visit);
+        }
+        return;
+    }
+    if value.get("role").is_some() {
+        message(value, &mut visit);
+        return;
+    }
+    for key in ["messages", "input"] {
+        if let Some(messages) = value.get_mut(key).and_then(Value::as_array_mut) {
+            for m in messages {
+                message(m, &mut visit);
+            }
+        }
+    }
+}
+
 /// Replace image payloads with a bounded cost before serializing JSON. All
 /// other keys/values (not just visible content) contribute to the estimate.
 fn scrub_images(value: &Value, images: &mut usize) -> Value {
@@ -110,6 +210,12 @@ fn scrub_images(value: &Value, images: &mut usize) -> Value {
         for (key, value) in obj {
             if key == "_attachments" {
                 for attachment in value.as_array().into_iter().flatten() {
+                    if !attachment["mime"]
+                        .as_str()
+                        .is_some_and(crate::daemon::is_raster_image)
+                    {
+                        continue;
+                    }
                     // Raw metadata (including imported Session metadata) is
                     // never filesystem authority. Final prepared image parts
                     // carry verified dimensions; otherwise use an honest
@@ -144,17 +250,64 @@ pub fn value(value: &Value) -> usize {
 /// Only fields that carry prompt content, after endpoint conversion, repairs
 /// and optional-body changes. Output caps and transport flags are not input.
 pub fn request(body: &Value) -> usize {
+    let mut prepared;
+    let body = if has_native_media(body) {
+        prepared = body.clone();
+        content_parts_mut(&mut prepared, |parts| {
+            for part in parts {
+                if matches!(
+                    part["type"].as_str(),
+                    Some("input_audio" | "file" | "input_file" | "document")
+                ) {
+                    *part = json!({"type":part["type"],"native_tokens":"unknown"});
+                }
+            }
+        });
+        &prepared
+    } else {
+        body
+    };
     ["system", "messages", "input", "tools"]
         .into_iter()
-        .filter_map(|key| body.get(key))
-        .filter(|v| !v.is_null() && !v.as_array().is_some_and(Vec::is_empty))
-        .map(value)
+        .filter_map(|key| body.get(key).map(|value| (key, value)))
+        .filter(|(_, v)| !v.is_null() && !v.as_array().is_some_and(Vec::is_empty))
+        .map(|(key, v)| {
+            if key == "tools" {
+                let mut tools = v.clone();
+                for tool in tools.as_array_mut().into_iter().flatten() {
+                    if let Some(tool) = tool.as_object_mut() {
+                        tool.remove("cache_control");
+                    }
+                }
+                text(&tools.to_string())
+            } else {
+                value(v)
+            }
+        })
         .fold(0usize, usize::saturating_add)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_actual_native_payloads_are_scrubbed_and_schema_bytes_remain_text() {
+        let schema = json!({"type":"object","const":{"type":"input_file","file_data":"a".repeat(10000)},"default":{"type":"input_audio","input_audio":{"data":"b".repeat(10000)}}});
+        let plain = json!({"messages":[{"role":"user","content":"plain"}],"tools":[{"type":"function","function":{"name":"test","parameters":schema}}]});
+        assert!(!has_native_media(&plain));
+        assert!(
+            request(&plain) > 4000,
+            "schema contents contribute as ordinary text"
+        );
+        let mut native = plain.clone();
+        native["messages"][0]["content"] = json!([{"type":"input_audio","input_audio":{"data":"c".repeat(100000),"format":"wav"}}]);
+        assert!(has_native_media(&native));
+        assert!(
+            request(&native) < request(&plain) + 100,
+            "encoded native bytes do not inflate text estimate"
+        );
+    }
+
     #[test]
     fn unicode_json_metadata_and_images_share_one_counter() {
         assert_eq!(text("你好โลก"), "你好โลก".chars().count().div_ceil(4));
