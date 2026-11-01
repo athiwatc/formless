@@ -532,22 +532,48 @@ async fn late_pending_model_input_retains_failed_audit_evidence_until_handle_con
     daemon
         .finish_run(session.clone(), producer.clone(), "completed")
         .await;
-    let entry = daemon.pending.locked().get(&handle).unwrap().clone();
+    let (entry_weak, source_weak) = {
+        let pending = daemon.pending.locked();
+        let entry = pending.get(&handle).unwrap();
+        (Arc::downgrade(entry), Arc::downgrade(&entry.taint_scope))
+    };
     let sql = rusqlite::Connection::open(daemon.paths.db_file()).unwrap();
     // The accepted input's framed-data audit fails; the Tool's separate llm
     // result origin and paid usage remain recordable, so completion is genuine.
     sql.execute_batch("CREATE TRIGGER fail_late_input BEFORE INSERT ON audit WHEN NEW.action='tool.data' AND (NEW.detail LIKE '%framed_data%' OR NEW.detail LIKE '%description_metadata%') BEGIN SELECT RAISE(ABORT,'private late source failure'); END;").unwrap();
     release.notify_one();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        daemon.wait_pending(&entry, None, &cancel),
-    )
+    // No local entry or source lease spans release/the accepted-input callback.
+    // Wait until both worker and NestedOps have exited: only the map's handle
+    // owns the entry and its fallback source state at the point under test.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let completed = {
+                let pending = daemon.pending.locked();
+                let entry = pending.get(&handle).expect("retained pending handle");
+                if entry_weak.strong_count() == 1 && source_weak.strong_count() == 1 {
+                    let result = entry.result.locked().clone();
+                    result
+                } else {
+                    None
+                }
+            };
+            if let Some(result) = completed {
+                break result;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .unwrap()
-    .unwrap();
+    .expect("map-only completed Pending ownership");
     assert!(result.0, "late nested completion: {}", result.1);
     assert!(result.1.contains("late private result"));
-    assert!(entry
+    assert_eq!(entry_weak.strong_count(), 1);
+    assert_eq!(source_weak.strong_count(), 1);
+    assert!(daemon
+        .pending
+        .locked()
+        .get(&handle)
+        .unwrap()
         .taint_scope
         .sources()
         .iter()
@@ -560,9 +586,14 @@ async fn late_pending_model_input_retains_failed_audit_evidence_until_handle_con
             .any(|source| source.kind == "framed_data"),
         "injected audit failure actually occurred"
     );
-    assert!(daemon
-        .capture_pending_data(&session, &consumer, "later-call", &entry)
-        .is_err());
+    {
+        let entry = daemon.pending_get(&handle).unwrap();
+        assert!(daemon
+            .capture_pending_data(&session, &consumer, "later-call", &entry)
+            .is_err());
+    }
+    assert_eq!(entry_weak.strong_count(), 1);
+    assert_eq!(source_weak.strong_count(), 1);
     assert!(
         daemon.pending.locked().contains_key(&handle),
         "failed delivery retains the handle owner"
@@ -583,9 +614,14 @@ async fn late_pending_model_input_retains_failed_audit_evidence_until_handle_con
         "consumer accounting never rewrites producer ledger"
     );
     sql.execute_batch("DROP TRIGGER fail_late_input;").unwrap();
-    daemon
-        .capture_pending_data(&session, &consumer, "later-call", &entry)
-        .unwrap();
+    {
+        let entry = daemon.pending_get(&handle).unwrap();
+        daemon
+            .capture_pending_data(&session, &consumer, "later-call", &entry)
+            .unwrap();
+    }
+    assert_eq!(entry_weak.strong_count(), 1);
+    assert_eq!(source_weak.strong_count(), 1);
     let metadata = daemon
         .with_reader(|st| {
             Daemon::data_meta(
@@ -609,20 +645,12 @@ async fn late_pending_model_input_retains_failed_audit_evidence_until_handle_con
     assert!(frame.contains("late private result"));
     assert!(frame.contains("framed_data"));
     daemon.forget_pending(&handle);
-    drop(entry);
-    // Completion publishes its result just before task teardown. Wait on the
-    // actual last owner, without assuming a scheduler tick or sleep duration.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while daemon
-            .input_taint
-            .locked()
-            .contains_key(&(session.clone(), producer.clone()))
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("last producer owner drops after handle consumption");
+    assert!(entry_weak.upgrade().is_none());
+    assert!(source_weak.upgrade().is_none());
+    assert!(!daemon
+        .input_taint
+        .locked()
+        .contains_key(&(session.clone(), producer.clone())));
     assert!(daemon
         .input_taint
         .locked()
