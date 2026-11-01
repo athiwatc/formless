@@ -4574,7 +4574,8 @@ without `--yes` fail closed when confirmation is required. Forecasts add no step
 token or time caps. Admission persists an immutable per-Run forecast and its
 non-text basis; Metrics shows predictions, actuals, errors and coverage, with
 unfinished/unknown outcomes distinguished from completed observations. Each
-snapshot retains its comparable Run ids and measured non-text observations,
+snapshot retains at most 200 newest comparable Run ids (from the last 2000
+recorded Runs) and measured non-text observations,
 without duplicating prompts. A completed Run counts as a complete observation only
 when every admitted physical request has explicit input and output usage;
 missing/partial usage is unknown, never a fabricated zero-token success. Small N

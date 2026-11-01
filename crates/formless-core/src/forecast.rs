@@ -137,7 +137,7 @@ fn dimension_image(dims: Option<(u32, u32)>) -> String {
 
 pub fn estimate(paths: &Paths, input: &ForecastInput) -> Result<RunForecast> {
     let st = Store::open_forecast_snapshot(paths)?.unwrap_or(Store::open_in_memory()?);
-    // Source SQLite files are never opened by a pager; only the private copy is.
+    // The private snapshot retains its configuration namespace freeze while quoting.
     let cfg = Config::load(paths)?; // Configuration only, never provider_key/auth.
     estimate_store(&st, &cfg, input)
 }
@@ -412,6 +412,8 @@ pub(crate) fn estimate_store_with_window(
     let mut crossings = 0;
     let mut comparables = Vec::new();
     let threshold = window as f64 * cfg.compaction.fraction();
+    // Bound quote size and preview work while retaining the exact sample ids.
+    // recorded_forecasts is newest-first; N always names this selected sample.
     for (id, old) in &recorded {
         let b = &old.basis;
         let same_location = b.session_id.is_some() && b.session_id == basis.session_id
@@ -467,6 +469,9 @@ pub(crate) fn estimate_store_with_window(
         if run.prompt_tokens > 0 {
             caches.push(cached as f64 / run.prompt_tokens as f64);
         }
+        if comparables.len() == 200 {
+            break;
+        }
     }
     let n = steps.len();
     let unpriced = pcfg.price_for(&model).is_none();
@@ -484,7 +489,7 @@ pub(crate) fn estimate_store_with_window(
     let mut warnings = vec![
         "Local calibrated heuristic; empirical ranges are forecasts, not limits or guarantees"
             .into(),
-        "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded".into(),
+        "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded; at most 200 newest comparable observations from the last 2000 recorded Runs".into(),
     ];
     if window_source == "default" {
         warnings.push("Endpoint context window is not cached; compaction risk uses configured/default window and may differ at dispatch".into());
@@ -618,7 +623,17 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
             .as_ref()
             .filter(|_| finished)
             .map(|r| actual >= r.p50 && actual <= r.p90);
-        rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"duration_ms":run.duration_ms},"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished}));
+        let comparison = |range: &Option<ForecastRange>, actual: Option<f64>| match (
+            range,
+            actual.filter(|_| finished),
+        ) {
+            (Some(r), Some(actual)) => {
+                json!({"error":actual-r.p50,"covered_p50_p90":actual>=r.p50 && actual<=r.p90})
+            }
+            _ => json!({"error":null,"covered_p50_p90":null}),
+        };
+        let comparisons = json!({"steps":comparison(&f.steps,Some(run.steps as f64)),"tokens":comparison(&f.tokens,complete.then_some(actual)),"cost_usd":comparison(&f.cost_usd,cost.filter(|_|complete)),"duration_ms":comparison(&f.duration_ms,Some(run.duration_ms as f64))});
+        rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"duration_ms":run.duration_ms},"comparison":comparisons,"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished}));
     }
     Ok(json!(rows))
 }
@@ -737,6 +752,9 @@ mod tests {
             .find(|r| r["run_id"] == id)
             .unwrap();
         assert_eq!(row["token_error"], 100.0);
+        assert_eq!(row["comparison"]["tokens"]["error"], 100.0);
+        assert_eq!(row["comparison"]["steps"]["error"], 1.0);
+        assert_eq!(row["forecast"]["comparables"].as_array().unwrap().len(), 4);
         assert_eq!(row["token_covered_p50_p90"], true);
         let paused = rows
             .as_array()

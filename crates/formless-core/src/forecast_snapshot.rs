@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-pub(super) struct SnapshotDir(PathBuf);
+pub(super) struct SnapshotDir(PathBuf, Option<crate::profile_lock::MaintenanceGuard>);
 impl SnapshotDir {
     fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!("formless-forecast-{}", uuid::Uuid::new_v4()));
@@ -27,7 +27,7 @@ impl SnapshotDir {
             builder.mode(0o700);
         }
         builder.create(&path)?;
-        Ok(Self(path))
+        Ok(Self(path, None))
     }
 }
 impl Drop for SnapshotDir {
@@ -233,7 +233,7 @@ pub(super) fn open_file(paths: &Paths, file: &Path) -> Result<Option<Store>> {
         Err(error) if error.kind()==std::io::ErrorKind::NotFound=>(),
         Err(error)=>return Err(error).context("inspect forecast rollback journal"),
     }
-    let temporary = SnapshotDir::new()?;
+    let mut temporary = SnapshotDir::new()?;
     let copy = temporary.0.join("formless.db");
     native.copy_main(&copy)?;
     let wal = PathBuf::from(format!("{}-wal", source.display()));
@@ -260,9 +260,11 @@ pub(super) fn open_file(paths: &Paths, file: &Path) -> Result<Option<Store>> {
     let mut store = Store::open(&copy)?;
     store.check_integrity(&copy)?;
     store.conn.execute_batch("PRAGMA query_only=ON;")?;
+    // Keep configuration and data namespaces frozen until the caller finishes
+    // reading Config and quoting this coherent private database.
+    temporary.1 = Some(frozen);
     store._forecast_snapshot = Some(temporary);
     drop(native);
-    drop(frozen);
     Ok(Some(store))
 }
 

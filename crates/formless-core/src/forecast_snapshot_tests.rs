@@ -371,3 +371,20 @@ fn external_sqlite_fixture() {
     println!("FORECAST_FIXTURE_DONE");
     std::io::stdout().flush().unwrap();
 }
+
+#[test]
+fn snapshot_retains_configuration_namespace_freeze_until_quote_finishes() {
+    let (_fixture, paths) = Fixture::new();
+    closed_wal(&paths);
+    let snapshot = open(&paths).unwrap().unwrap();
+    assert!(
+        ProfileLock::hierarchy_shared(&paths).is_err(),
+        "configuration writer must not race the snapshot quote"
+    );
+    crate::Config::load(&paths).unwrap();
+    drop(snapshot);
+    assert!(
+        ProfileLock::hierarchy_shared(&paths).is_ok(),
+        "snapshot must release maintenance on drop"
+    );
+}
