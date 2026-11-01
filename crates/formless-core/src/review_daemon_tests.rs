@@ -1391,7 +1391,19 @@ async fn windows_completed_run_releases_capture_pin_but_active_review_suspends_e
         0,
         "a live review token independently retains the full advertised Undo lifetime"
     );
-    s.daemon.hunk_reviews.locked().entries.clear();
+    {
+        let mut state = s.daemon.hunk_reviews.locked();
+        for entry in state.entries.values_mut() {
+            entry.created = std::time::Instant::now()
+                .checked_sub(TTL + std::time::Duration::from_secs(1))
+                .unwrap();
+        }
+    }
+    s.daemon.sweep_retained_before_action();
+    assert!(
+        s.daemon.hunk_reviews.locked().entries.is_empty(),
+        "unrelated lifecycle cleanup releases dismissed expired reviews without another review RPC"
+    );
     assert_eq!(retained.expire(u64::MAX).unwrap(), 1);
     assert_eq!(std::fs::read(&s.path).unwrap(), s.new.as_bytes());
     no_network(&s);

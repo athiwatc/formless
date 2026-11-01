@@ -263,6 +263,14 @@ impl Daemon {
     }
     #[cfg(windows)]
     pub(super) fn sweep_retained_before_action(&self) {
+        // A dismissed review must not pin objects forever merely because no
+        // review RPC runs again. Never wait here: apply/Undo already own this
+        // mutex and their entrypoints prune before obtaining the live entry.
+        match self.hunk_reviews.try_lock() {
+            Ok(mut state) => state.prune(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().prune(),
+            Err(std::sync::TryLockError::WouldBlock) => (),
+        }
         // Always Store -> capture-map. Drop BOTH before native expiry work;
         // fresh capture/review token leases protect objects across this gap.
         {
