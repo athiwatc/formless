@@ -88,14 +88,20 @@ pub struct AuthStatus {
 /// Stable issuer identity. Path case and query remain significant; endpoint
 /// spelling (including a trailing slash) does not create a new login.
 pub fn canonical_token_url(raw: &str) -> Result<String> {
-    validate_endpoint("token_url", raw)?;
-    let mut url = reqwest::Url::parse(raw.trim())?;
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        bail!("OAuth token_url must not contain userinfo or a fragment");
-    }
+    let mut url = transport_token_url(raw)?;
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(if path.is_empty() { "/" } else { &path });
     Ok(url.to_string())
+}
+
+/// A transport destination preserves path/query spelling, unlike slot identity.
+fn transport_token_url(raw: &str) -> Result<reqwest::Url> {
+    validate_endpoint("token_url", raw)?;
+    let url = reqwest::Url::parse(raw.trim())?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("OAuth token_url must not contain userinfo or a fragment");
+    }
+    Ok(url)
 }
 
 fn raw_token_slot(endpoint: &str, client_id: &str) -> String {
@@ -128,17 +134,38 @@ fn legacy_keyring_user(paths: &Paths) -> String {
 
 /// Stored form: the token set plus the endpoint it was issued by.
 fn encode_tokens(auth: &AuthCfg, tokens: &OAuthTokens) -> Result<String> {
+    validate_token_config(auth)?;
     let mut v = serde_json::to_value(tokens).context("encode OAuth tokens")?;
+    v["oauth_record_version"] = Value::from(1);
     v["token_url"] = Value::String(canonical_token_url(&auth.token_url)?);
+    v["token_endpoint"] = Value::String(transport_token_url(&auth.token_url)?.to_string());
+    v["client_id"] = Value::String(auth.client_id.trim().to_string());
     Ok(v.to_string())
 }
 
-/// (tokens, the token endpoint that issued them if recorded).
-fn decode_tokens(text: &str) -> Option<(OAuthTokens, Option<String>)> {
+struct StoredTokens {
+    tokens: OAuthTokens,
+    issuer: Option<String>,
+    endpoint: Option<String>,
+    client_id: Option<String>,
+}
+
+fn decode_tokens(text: &str) -> Option<StoredTokens> {
     let v: Value = serde_json::from_str(text).ok()?;
     let issuer = v["token_url"].as_str().map(str::to_string);
+    let endpoint = (v["oauth_record_version"] == 1)
+        .then(|| v["token_endpoint"].as_str())
+        .flatten()
+        .and_then(|endpoint| transport_token_url(endpoint).ok())
+        .map(|endpoint| endpoint.to_string());
+    let client_id = v["client_id"].as_str().map(str::to_string);
     let tokens: OAuthTokens = serde_json::from_value(v).ok()?;
-    (!tokens.access_token.is_empty()).then_some((tokens, issuer))
+    (!tokens.access_token.is_empty()).then_some(StoredTokens {
+        tokens,
+        issuer,
+        endpoint,
+        client_id,
+    })
 }
 
 /// A secret kept in the keychain and a `0600` file at once (#868). Each
@@ -248,7 +275,7 @@ pub fn save_oauth_tokens(paths: &Paths, auth: &AuthCfg, tokens: &OAuthTokens) ->
     token_store(paths, auth).save(&encode_tokens(auth, tokens)?)
 }
 
-fn read_stored(file: &std::path::Path, user: &str) -> Option<(OAuthTokens, Option<String>)> {
+fn read_stored(file: &std::path::Path, user: &str) -> Option<StoredTokens> {
     let store = DualStore {
         file: file.to_path_buf(),
         user: user.to_string(),
@@ -256,14 +283,30 @@ fn read_stored(file: &std::path::Path, user: &str) -> Option<(OAuthTokens, Optio
     decode_tokens(&store.load()?)
 }
 
-/// Compatibility lookup never assigns an issuer to an unlabelled token.
-/// Old file-backed slots can be discovered by their recorded endpoint and
-/// verified raw slot hash. Keyring-only old hashes cannot be enumerated.
+/// Compatibility lookup locates old stores for diagnostics/logout, and any
+/// versioned records retained under an old name. A raw issuer/hash never
+/// authorizes a credential: old migration could fabricate both from config.
+/// Arbitrary keyring-only old hashes cannot be enumerated.
 fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
     let mut slots = std::collections::BTreeSet::from([
         token_slot(auth),
         raw_token_slot(&auth.token_url, &auth.client_id),
     ]);
+    // A finite compatibility lookup for a slash-only edit to the old raw hash.
+    // This cannot enumerate arbitrary historical scheme/host/port spellings.
+    let raw = auth.token_url.trim();
+    let (path, query) = raw
+        .split_once('?')
+        .map_or((raw, String::new()), |(path, query)| {
+            (path, format!("?{query}"))
+        });
+    if let Some(without_slash) = path.strip_suffix('/') {
+        slots.insert(raw_token_slot(
+            &format!("{without_slash}{query}"),
+            &auth.client_id,
+        ));
+    }
+    slots.insert(raw_token_slot(&format!("{path}/{query}"), &auth.client_id));
     if let Ok(dir) = std::fs::read_dir(&paths.config_dir) {
         for e in dir.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -281,7 +324,7 @@ fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
             else {
                 continue;
             };
-            let Some((_, Some(issuer))) = decode_tokens(&text) else {
+            let Some(issuer) = decode_tokens(&text).and_then(|stored| stored.issuer) else {
                 continue;
             };
             // The old slot proves the client id as well as the recorded issuer.
@@ -302,6 +345,25 @@ fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
         .collect()
 }
 
+/// Only records written by the exact-endpoint codec prove transport. Historical
+/// migration could stamp both issuer and raw slot from the current config,
+/// irrespective of where its profile-wide token set was actually obtained.
+fn proven_stored_tokens(
+    auth: &AuthCfg,
+    stored: StoredTokens,
+) -> Option<(OAuthTokens, Option<String>)> {
+    if !issuer_matches(auth, stored.issuer.as_deref()) {
+        return None;
+    }
+    let endpoint = stored.endpoint?;
+    if stored.client_id.as_deref() != Some(auth.client_id.trim())
+        || canonical_token_url(&endpoint).ok() != canonical_token_url(&auth.token_url).ok()
+    {
+        return None;
+    }
+    Some((stored.tokens, Some(endpoint)))
+}
+
 fn issuer_matches(auth: &AuthCfg, issuer: Option<&str>) -> bool {
     match (
         canonical_token_url(&auth.token_url),
@@ -314,25 +376,24 @@ fn issuer_matches(auth: &AuthCfg, issuer: Option<&str>) -> bool {
 
 fn load_with_issuer(paths: &Paths, auth: &AuthCfg) -> Option<(OAuthTokens, Option<String>)> {
     // Prefer the current slot: a refreshed/rotated login supersedes old aliases.
-    if let Some(found) = token_store(paths, auth)
-        .load()
-        .and_then(|s| decode_tokens(&s))
-    {
-        return issuer_matches(auth, found.1.as_deref()).then_some(found);
+    let current = token_store(paths, auth);
+    if let Some(found) = current.load().and_then(|s| decode_tokens(&s)) {
+        return proven_stored_tokens(auth, found);
     }
     let newest = compatible_token_stores(paths, auth)
         .iter()
-        .filter_map(|store| store.load_versioned())
-        .filter_map(|(at, value)| {
+        .filter_map(|store| {
+            let (at, value) = store.load_versioned()?;
             let found = decode_tokens(&value)?;
-            issuer_matches(auth, found.1.as_deref()).then_some((at, found))
+            proven_stored_tokens(auth, found).map(|found| (at, found))
         })
         .max_by_key(|(at, _)| *at);
     if let Some((_, found)) = newest {
         return Some(found);
     }
-    let found = read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))?;
-    issuer_matches(auth, found.1.as_deref()).then_some(found)
+    // Profile-wide legacy copies do not bind a client or prove an exact
+    // endpoint. Keep them untouched for diagnostics and explicit re-login.
+    None
 }
 
 /// Unlabelled or mismatched legacy credentials are retained for explicit reset,
@@ -345,7 +406,7 @@ pub fn oauth_storage_warning(paths: &Paths, auth: &AuthCfg) -> Option<String> {
     let invalid = compatible_token_stores(paths, auth)
         .iter()
         .any(|s| s.load().is_some());
-    (legacy || invalid).then(|| "Stored OAuth credentials have no proven matching issuer; sign in again. Older keyring-only logins with an unknown endpoint spelling cannot be discovered automatically.".into())
+    (legacy || invalid).then(|| "Stored OAuth credentials have no proven matching issuer and exact token endpoint; sign in again. Legacy issuer labels and raw slot hashes could have been derived from configuration, not a token exchange. Older keyring-only logins with an unknown endpoint spelling cannot be discovered automatically.".into())
 }
 
 /// The token set of the provider with `auth`, only with proven issuer identity.
@@ -419,7 +480,7 @@ pub fn delete_oauth_tokens(paths: &Paths, auth: &AuthCfg) -> Vec<String> {
         let _ = std::fs::remove_file(store.file.with_extension("json.tmp"));
     }
     if read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))
-        .is_some_and(|(_, issuer)| issuer_matches(auth, issuer.as_deref()))
+        .is_some_and(|stored| issuer_matches(auth, stored.issuer.as_deref()))
     {
         left.extend(
             DualStore {
@@ -749,24 +810,72 @@ pub fn parse_token_response(
 fn sanitized_oauth_error(body: &[u8], submitted_secrets: &[&str]) -> String {
     let parsed: Option<Value> = serde_json::from_slice(body).ok();
     let mut parts = Vec::new();
+    let mut classification: Option<&'static str> = None;
     if let Some(value) = parsed {
         if let Some(error) = value["error"].as_str() {
-            parts.push(error.to_string());
+            // Classify raw protocol values before masking free text. A short
+            // submitted value must not corrupt the standard failure category.
+            classification = [
+                "invalid_request",
+                "invalid_client",
+                "invalid_grant",
+                "unauthorized_client",
+                "unsupported_grant_type",
+                "invalid_scope",
+                "access_denied",
+                "temporarily_unavailable",
+                "server_error",
+            ]
+            .into_iter()
+            .find(|known| *known == error);
+            if classification.is_none() {
+                parts.push(error.to_string());
+            }
         }
         if let Some(description) = value["error_description"].as_str() {
             parts.push(description.to_string());
         }
     }
-    let text = if parts.is_empty() {
+    let text = if parts.is_empty() && classification.is_none() {
         String::from_utf8_lossy(body).trim().to_string()
     } else {
         parts.join(": ")
     };
-    crate::secrets::redact_known(&text, submitted_secrets)
+    let prefix = classification
+        .map(|kind| {
+            if text.is_empty() {
+                kind.to_string()
+            } else {
+                format!("{kind}: ")
+            }
+        })
+        .unwrap_or_default();
+    let detail: String = crate::secrets::redact_known(&text, submitted_secrets)
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(300)
-        .collect()
+        .take(300 - prefix.chars().count())
+        .collect();
+    format!("{prefix}{detail}")
+}
+
+fn submitted_query_values(endpoint: &reqwest::Url) -> Vec<String> {
+    let mut values = std::collections::BTreeSet::new();
+    for (_, value) in endpoint
+        .query_pairs()
+        .filter(|(_, value)| !value.is_empty())
+    {
+        values.insert(value.to_string());
+        values.insert(percent_encode(&value));
+    }
+    // Retain the actual wire spelling too (including '+' and percent-hex case).
+    for part in endpoint.query().unwrap_or_default().split('&') {
+        if let Some((_, value)) = part.split_once('=') {
+            if !value.is_empty() {
+                values.insert(value.to_string());
+            }
+        }
+    }
+    values.into_iter().collect()
 }
 
 /// Revoke `token` at an RFC 7009 endpoint (blocking-safe async).
@@ -869,13 +978,16 @@ async fn token_request(
         params.insert(key.to_string(), value.to_string());
     }
     params.insert("client_id".into(), cfg.client_id.trim().to_string());
+    let endpoint = transport_token_url(&cfg.token_url)?;
+    let query_values = submitted_query_values(&endpoint);
 
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build OAuth HTTP client")?;
-    let mut request = client.post(cfg.token_url.trim()).form(&params);
+    let mut request = client.post(endpoint).form(&params);
     let client_secret = std::env::var("FORMLESS_OAUTH_CLIENT_SECRET")
         .ok()
         .filter(|s| !s.is_empty());
@@ -887,11 +999,16 @@ async fn token_request(
         // Confidential-client authentication stays out of config.toml.
         request = request.basic_auth(cfg.client_id.trim(), Some(secret));
     }
-    let response = request.send().await.context("send OAuth token request")?;
+    let response = request
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("send OAuth token request")?;
     let status = response.status();
     let body = response
         .bytes()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("read OAuth token response")?;
     if !status.is_success() {
         let mut known: Vec<&str> = params
@@ -913,6 +1030,7 @@ async fn token_request(
             .collect();
         known.extend(client_secret.as_deref());
         known.extend(basic_credential.as_deref());
+        known.extend(query_values.iter().map(String::as_str));
         let detail = sanitized_oauth_error(&body, &known);
         if detail.is_empty() {
             bail!("OAuth token endpoint returned {status}");
@@ -1102,15 +1220,22 @@ async fn refresh_stored(
             provider_login_command(paths, cfg)
         );
     }
-    let refreshed = refresh_tokens(&cfg.auth, tokens).await.with_context(|| {
-        format!(
-            "OAuth token refresh failed; run `{}` if this persists",
-            provider_login_command(paths, cfg)
-        )
-    })?;
+    let mut captured_auth = cfg.auth.clone();
+    captured_auth.token_url = issuer
+        .context("missing proven OAuth token endpoint")?
+        .to_string();
+    let refreshed = refresh_tokens(&captured_auth, tokens)
+        .await
+        .with_context(|| {
+            format!(
+                "OAuth token refresh failed; run `{}` if this persists",
+                provider_login_command(paths, cfg)
+            )
+        })?;
     // Persist before use so a rotated refresh token cannot be lost after the
     // provider has already invalidated its predecessor.
-    save_oauth_tokens(paths, &cfg.auth, &refreshed).context("persist refreshed OAuth tokens")?;
+    save_oauth_tokens(paths, &captured_auth, &refreshed)
+        .context("persist refreshed OAuth tokens")?;
     Ok(refreshed.access_token)
 }
 
@@ -1319,6 +1444,19 @@ where
 
 #[cfg(test)]
 mod error_redaction_tests {
+    #[test]
+    fn known_protocol_classification_is_not_derived_from_masked_free_text() {
+        let body=serde_json::json!({"error":"invalid_grant","error_description":"query value [grant] refused"}).to_string();
+        assert_eq!(
+            super::sanitized_oauth_error(body.as_bytes(), &["grant"]),
+            "invalid_grant: query value [[REDACTED]] refused"
+        );
+        let unknown = serde_json::json!({"error":"opaque-private-value"}).to_string();
+        assert_eq!(
+            super::sanitized_oauth_error(unknown.as_bytes(), &["opaque-private-value"]),
+            "[REDACTED]"
+        );
+    }
     #[test]
     fn echoed_opaque_credential_is_masked_before_error_truncation() {
         let secret = "opaque-credential-phrase";
