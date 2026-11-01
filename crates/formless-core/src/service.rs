@@ -551,7 +551,15 @@ mod tests {
             "default",
         );
         for os in [ServiceOs::MacOs, ServiceOs::Systemd, ServiceOs::Windows] {
-            let p = plan_for(&paths, &base.join("formless"), &base, os).unwrap();
+            // This matrix checks registration/removal, not cross-platform
+            // executable syntax. A Windows temp path contains backslashes that
+            // systemd must reject; give each target a representable executable.
+            let exe = if os == ServiceOs::Windows {
+                base.join("formless.exe")
+            } else {
+                PathBuf::from("/opt/formless")
+            };
+            let p = plan_for(&paths, &exe, &base, os).unwrap();
             assert!(!p.file.exists());
             let mut called = Vec::new();
             uninstall_with(&p, &mut |args| {
@@ -715,12 +723,19 @@ mod tests {
         assert!(linux.contents.contains(
             r#"Environment="FORMLESS_DATA_DIR=/home/a space \"quotes\" %%n & <node> $TOKEN/data""#
         ));
-        assert!(linux.contents.contains(
-            "StandardOutput=append:/home/a space \"quotes\" %%n & <node> $TOKEN/data/daemon.log\n"
-        ));
-        assert!(linux.contents.contains(
-            "StandardError=append:/home/a space \"quotes\" %%n & <node> $TOKEN/data/daemon.log\n"
-        ));
+        // Paths::log_file derives its final component using the host's path
+        // separator. The Unix formatter must preserve that exact supplied path
+        // literally, including a Windows-host backslash, while doubling %.
+        // Keep independent literal escaping oracles; don't call the formatter's
+        // escape helpers to construct an expected answer.
+        assert!(linux.contents.contains(&format!(
+            "StandardOutput=append:/home/a space \"quotes\" %%n & <node> $TOKEN/data{}daemon.log\n",
+            std::path::MAIN_SEPARATOR
+        )));
+        assert!(linux.contents.contains(&format!(
+            "StandardError=append:/home/a space \"quotes\" %%n & <node> $TOKEN/data{}daemon.log\n",
+            std::path::MAIN_SEPARATOR
+        )));
         let preview = dry_run(&linux);
         assert!(preview.contains(&linux.contents));
         assert!(preview.contains(
@@ -970,28 +985,57 @@ mod tests {
 
     #[test]
     fn the_service_runs_serve_stay_with_this_profiles_dirs() {
-        let base = std::env::temp_dir().join(format!("fl-svc-{}", uuid::Uuid::new_v4()));
+        // Ancestor names deliberately contain the unit prefix: only the exact
+        // service basename distinguishes the default and named registrations.
+        let base = std::env::temp_dir().join(format!("formless-parent-{}", uuid::Uuid::new_v4()));
+        let home = base.join("formless-home-parent");
+        let exe = if cfg!(windows) {
+            base.join("bin/formless.exe")
+        } else {
+            PathBuf::from("/usr/local/bin/formless")
+        };
         let mut paths = Paths::from_dirs(base.join("data/work"), base.join("conf/work")).unwrap();
         paths.profile = "work".into();
-        let p = plan(
-            &paths,
-            Path::new("/usr/local/bin/formless"),
-            Path::new("/home/u"),
-        )
-        .unwrap();
+        let p = plan(&paths, &exe, &home).unwrap();
         assert!(p.contents.contains("serve"), "{}", p.contents);
         assert!(p.contents.contains("--stay"));
         assert!(p.contents.contains(&paths.data_dir.display().to_string()));
         assert!(p.contents.contains(&paths.config_dir.display().to_string()));
-        assert!(
-            p.file.to_string_lossy().contains("formless-work"),
-            "per-profile name: {}",
-            p.file.display()
-        );
+        let (named_basename, default_basename, parent) = match p.manager {
+            "launchd" => (
+                "xyz.athiwat.formless-work.plist",
+                "xyz.athiwat.formless.plist",
+                home.join("Library/LaunchAgents"),
+            ),
+            "systemd" => (
+                "formless-work.service",
+                "formless.service",
+                home.join(".config/systemd/user"),
+            ),
+            "Task Scheduler" => (
+                "formless-work-service.cmd",
+                "formless-service.cmd",
+                paths.data_dir.clone(),
+            ),
+            manager => panic!("unexpected service manager {manager}"),
+        };
+        assert_eq!(p.file, parent.join(named_basename));
+        assert!(!p.file.exists(), "planning writes no service definition");
         assert!(!p.enable.is_empty() && !p.disable.is_empty());
         let default = Paths::from_dirs(base.join("data"), base.join("conf")).unwrap();
-        let d = plan(&default, Path::new("/x/formless"), Path::new("/home/u")).unwrap();
-        assert!(!d.file.to_string_lossy().contains("formless-"));
+        let d = plan(&default, &exe, &home).unwrap();
+        assert_eq!(d.manager, p.manager);
+        assert_eq!(
+            d.file.file_name().unwrap().to_str().unwrap(),
+            default_basename
+        );
+        let default_parent = if d.manager == "Task Scheduler" {
+            &default.data_dir
+        } else {
+            &parent
+        };
+        assert_eq!(d.file, default_parent.join(default_basename));
+        assert!(!d.file.exists(), "planning writes no default definition");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

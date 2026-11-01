@@ -6,6 +6,40 @@ on:
     branches: [main]
 
 jobs:
+  core:
+    # New independent scope: keep 30m provisional until a native green run
+    # supplies duration evidence for #1164 with this exact storage recipe.
+    name: Core library portability
+    timeout-minutes: 30
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Initialize private job directories
+        shell: pwsh
+        run: |
+          $coreTarget = Join-Path $env:RUNNER_TEMP 'windows-core-target'
+          $coreData = Join-Path $env:RUNNER_TEMP 'windows-core-data'
+          $coreConfig = Join-Path $env:RUNNER_TEMP 'windows-core-config'
+          foreach ($directory in @($coreTarget, $coreData, $coreConfig)) {
+            if (Test-Path $directory) { throw "Private core directory already exists: $directory" }
+            New-Item -ItemType Directory -Path $directory | Out-Null
+          }
+          "CARGO_TARGET_DIR=$coreTarget" >> $env:GITHUB_ENV
+          "FORMLESS_DATA_DIR=$coreData" >> $env:GITHUB_ENV
+          "FORMLESS_CONFIG_DIR=$coreConfig" >> $env:GITHUB_ENV
+          "## Windows core library portability`nSHA: $env:GITHUB_SHA`nImage: $env:ImageOS $env:ImageVersion; architecture: $env:RUNNER_ARCH`nRecipe: debug=0, incremental=0, private fresh target/data/config; default test stacks. Thirty-minute bound is provisional pending native green duration." >> $env:GITHUB_STEP_SUMMARY
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Core library tests (native Windows fixtures)
+        run: cargo test -p formless-core --lib --locked
+
   pipe:
     # Historical pipe-only 10m43s run predates debug=0/incremental=0 and CLI
     # coverage. Superseded sizing evidence; retain 22m provisionally until a

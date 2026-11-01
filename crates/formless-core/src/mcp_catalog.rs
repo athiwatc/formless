@@ -217,8 +217,13 @@ pub fn normalize_directory(raw: &str) -> Result<PathBuf> {
 
 fn verified_home(home: Option<&Path>) -> Result<PathBuf> {
     let home = home
-        .filter(|h| h.is_absolute())
-        .context("native home must be an absolute existing directory")?;
+        .filter(|h| {
+            h.is_absolute()
+                && !h
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        })
+        .context("native home must be an absolute existing directory without parent traversal")?;
     let home = home
         .canonicalize()
         .context("native home cannot be resolved canonically")?;
@@ -1063,12 +1068,30 @@ mod tests {
         std::fs::create_dir_all(root.join("folder")).unwrap();
         let folder = root.join("folder").canonicalize().unwrap();
         let missing = root.join("missing/..");
+        let valid_home = root.join("verified-home");
+        std::fs::create_dir_all(valid_home.join("child")).unwrap();
+        let existing_parent = valid_home.join("child/..");
+        assert_eq!(
+            existing_parent.canonicalize().unwrap(),
+            valid_home.canonicalize().unwrap()
+        );
+        // A valid directory still expands normally; rejecting ambiguous home
+        // inputs must not disable explicit native home expansion altogether.
+        assert_eq!(
+            normalize_directory_with_home("~", Some(&valid_home)).unwrap(),
+            valid_home.canonicalize().unwrap()
+        );
+        assert_eq!(
+            normalize_directory_with_home("~/child", Some(&valid_home)).unwrap(),
+            valid_home.join("child").canonicalize().unwrap()
+        );
         let file = root.join("file");
         std::fs::write(&file, "file").unwrap();
         for home in [
             None,
             Some(Path::new("relative-home")),
             Some(missing.as_path()),
+            Some(existing_parent.as_path()),
             Some(file.as_path()),
         ] {
             assert!(normalize_directory_with_home("~", home).is_err());

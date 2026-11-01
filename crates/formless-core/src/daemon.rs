@@ -14658,17 +14658,37 @@ mod path_scope_tests {
         let (widened, _) = widen_paths(&caps, &chosen);
         assert_eq!(widened.fs_write, vec![root_s.clone()]);
         assert_eq!(widened.fs_read, caps.fs_read, "read stays the file");
-        let sibling = Capabilities::parse(&[format!("fs:write:{root_s}/README.md")]).unwrap();
+        // Native joins matter for canonical Windows verbatim paths, where
+        // '/' is a literal component character rather than a separator.
+        let sibling =
+            Capabilities::parse(&[format!("fs:write:{}", root.join("README.md").display())])
+                .unwrap();
         assert!(widened.covers(&sibling));
-        let lookalike = Capabilities::parse(&[format!("fs:write:{root_s}-secrets/x")]).unwrap();
+        let lookalike = root
+            .with_file_name(format!(
+                "{}-secrets",
+                root.file_name().unwrap().to_string_lossy()
+            ))
+            .join("x");
+        let lookalike =
+            Capabilities::parse(&[format!("fs:write:{}", lookalike.display())]).unwrap();
         assert!(!widened.covers(&lookalike));
-        // A folder that doesn't contain the path, or `/`, is ignored.
-        for bad in ["/", "/tmp/elsewhere"] {
-            let chosen =
-                std::collections::BTreeMap::from([(write.capability.clone(), bad.to_string())]);
+        // A folder that doesn't contain the path, or the native volume root,
+        // is ignored on every platform; neither probe is a malformed path.
+        let volume_root = root.ancestors().last().unwrap().to_path_buf();
+        let elsewhere = root.parent().unwrap().join("unrelated-project");
+        for bad in [volume_root, elsewhere] {
+            let chosen = std::collections::BTreeMap::from([(
+                write.capability.clone(),
+                bad.display().to_string(),
+            )]);
             let (kept, refused) = widen_paths(&caps, &chosen);
-            assert_eq!(kept, caps, "{bad}");
-            assert!(!refused.is_empty(), "the refusal is said: {bad}");
+            assert_eq!(kept, caps, "{}", bad.display());
+            assert!(
+                !refused.is_empty(),
+                "the refusal is said: {}",
+                bad.display()
+            );
         }
         let _ = std::fs::remove_dir_all(root);
     }
