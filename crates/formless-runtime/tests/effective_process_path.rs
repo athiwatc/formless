@@ -209,7 +209,7 @@ fn consent_cannot_be_redirected_by_inserting_an_earlier_path_candidate() {
         std::fs::create_dir(&first).unwrap();
         let path = std::env::join_paths([&first, &f.private]).unwrap();
         let mut req = f.request(api, false);
-        req.input["env"]["PATH"] = json!(path);
+        req.input["env"]["PATH"] = json!(path.to_string_lossy());
         let host = Arc::new(AddEarlierProgram {
             sensitive: f.private.clone(),
             source: std::env::current_exe().unwrap(),
@@ -247,7 +247,9 @@ fn inaccessible_earlier_candidate_does_not_hide_later_executable() {
     std::fs::write(&inaccessible, "not executable").unwrap();
     std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o600)).unwrap();
     let mut req = f.request("run", false);
-    req.input["env"]["PATH"] = json!(std::env::join_paths([&first, &f.private]).unwrap());
+    req.input["env"]["PATH"] = json!(std::env::join_paths([&first, &f.private])
+        .unwrap()
+        .to_string_lossy());
     let value = execute(&req, Arc::new(formless_runtime::NoHostOps))
         .unwrap()
         .output;
