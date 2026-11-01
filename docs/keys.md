@@ -118,6 +118,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/revoke TOOL [CAPABILITY] \| all [FAMILY]` | revoke a Tool's granted Capabilities, or every grant (of a family) |
 | `/approvals [FAMILY]` | every approval: Tool, Capability, scope, when, by whom, last used |
 | `/audit [FILTER]` | show the audit log |
+| `/descriptionreviews` | retained description warnings and before/after changes |
 | `/security` | what the daemon can reach: grants, denials, trusted folders, MCP, hooks, relay, web |
 
 ### Settings
