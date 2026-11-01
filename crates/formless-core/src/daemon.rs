@@ -1141,9 +1141,10 @@ impl Daemon {
         messages: &[Value],
         tools: &[Value],
     ) -> Result<usize> {
-        let raw = provider.prompt_tokens(messages, tools, model);
+        let model = provider.settings().resolve_alias(model);
+        let raw = provider.prompt_tokens(messages, tools, &model);
         let key = crate::tokens::provider_key(provider.name(), provider.settings());
-        let ratio = self.with_reader(|st| st.token_ratio(&key, model))?;
+        let ratio = self.with_reader(|st| st.token_ratio(&key, &model))?;
         Ok(crate::tokens::calibrated(raw, ratio))
     }
 
@@ -1162,6 +1163,7 @@ impl Daemon {
         };
         let mut tokens = 0;
         for model in models {
+            let model = provider.settings().resolve_alias(&model);
             tokens = tokens.max(self.calibrated_prompt_tokens(provider, &model, messages, tools)?);
         }
         Ok(crate::routing::is_complex_tokens(
@@ -2337,14 +2339,68 @@ impl Daemon {
             }
             Request::ContextUsage { session_id } => {
                 let cfg = self.config()?;
-                let model = self.session_base_model(&session_id, &cfg);
                 let (requested, _) = self.session_model_effort(&session_id, &cfg);
-                let provider_name = requested
+                // Match dispatch: default aliases may name a role, whose
+                // model aliases belong to its own configured provider.
+                let requested = cfg.provider.resolve_alias(&requested);
+                let role = requested
                     .strip_prefix("role:")
-                    .and_then(|r| cfg.roles.get(r))
-                    .and_then(|r| r.provider.as_deref());
+                    .map(|r| cfg.role(r))
+                    .transpose()?;
+                let provider_name = role.and_then(|r| r.provider.as_deref());
                 let pcfg = cfg.provider_cfg(provider_name)?;
-                let model = pcfg.resolve_alias(&model);
+                let wanted = role.map_or(requested.as_str(), |r| {
+                    if r.model.is_empty() {
+                        pcfg.model.as_str()
+                    } else {
+                        r.model.as_str()
+                    }
+                });
+                let mut model = pcfg.resolve_alias(wanted);
+                if ProviderCfg::is_auto_model(&model) {
+                    let preview_provider =
+                        Provider::with_key(pcfg.clone(), String::new(), self.http.clone())
+                            .with_name(provider_name.unwrap_or(crate::config::DEFAULT_PROVIDER));
+                    let role_name = requested.strip_prefix("role:");
+                    let role = role_name.and_then(|r| cfg.roles.get(r));
+                    if let Some(role) = role.filter(|r| !r.candidates.is_empty()) {
+                        let candidates: Vec<String> = role
+                            .candidates
+                            .iter()
+                            .map(|m| pcfg.resolve_alias(m))
+                            .collect();
+                        let stats = self.with_reader(|st| st.task_stats(role_name.unwrap()))?;
+                        model = crate::routing::select_task_model(
+                            &candidates,
+                            &stats,
+                            cfg.tools.task_min_samples,
+                            cfg.tools.task_quality_bar,
+                            false,
+                        )
+                        .context("no role model candidates for context estimate")?;
+                    } else {
+                        let ctx = self
+                            .session_context(
+                                &session_id,
+                                &preview_provider,
+                                &model,
+                                pcfg.context_for(&model),
+                                cfg.compaction.fraction(),
+                            )?
+                            .0;
+                        let defs = self.with_store(|st| {
+                            toolreg::tool_definitions(st, Some(&session_id), cfg.tools.inline_limit)
+                        })?;
+                        let complex =
+                            self.routing_complex(&preview_provider, &model, &ctx, &defs, &cfg)?;
+                        model = crate::routing::select_model(
+                            &pcfg,
+                            &self.with_reader(|st| st.list_model_stats())?,
+                            complex,
+                        )
+                        .context("no model candidates for context estimate")?;
+                    }
+                }
                 // Keep existing context-window discovery; token estimation itself
                 // is local and never contacts a tokenizer or reads credentials.
                 let provider_result = self.provider_named(&cfg, provider_name).await;
@@ -11498,6 +11554,7 @@ impl Daemon {
         trigger_fraction: f64,
     ) -> Result<crate::storage::BuiltContext> {
         let prompt = self.session_prompt(session_id)?;
+        let inline_limit = self.config()?.tools.inline_limit;
         let mut cache = self
             .contexts
             .lock()
@@ -11506,8 +11563,7 @@ impl Daemon {
             .unwrap_or_default();
         let built = self.with_store(|st| {
             let built = cache.build(st, session_id, &prompt, context_tokens, trigger_fraction)?;
-            let defs =
-                toolreg::tool_definitions(st, Some(session_id), self.config()?.tools.inline_limit)?;
+            let defs = toolreg::tool_definitions(st, Some(session_id), inline_limit)?;
             let key = crate::tokens::provider_key(provider.name(), provider.settings());
             let estimated = crate::tokens::calibrated(
                 provider.prompt_tokens(&built.0, &defs, model),
@@ -11585,11 +11641,9 @@ impl Daemon {
                     .filter(|m| m.seq > prev_up_to && m.seq <= compact_up_to),
             ))
         })?;
-        let cmodel = cfg
-            .compaction
-            .model
-            .clone()
-            .unwrap_or_else(|| model.to_string());
+        let cmodel = provider
+            .settings()
+            .resolve_alias(cfg.compaction.model.as_deref().unwrap_or(model));
         let previous = self.with_store(|st| {
             Ok(st
                 .latest_checkpoint(session_id)?

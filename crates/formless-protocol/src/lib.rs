@@ -1699,7 +1699,7 @@ pub enum Request {
     },
     /// How full a Session's context is (SPEC §10.6): `{model,
     /// context_tokens, used_tokens, measured, breakdown: {system_prompt,
-    /// tool_schemas, history, attachments}}`. `used_tokens` is the last
+    /// tool_schemas, history, attachments}}`. `used_tokens` is the
     /// current rebuilt prompt's locally calibrated estimate (`measured: false`);
     /// breakdown uses the shared Unicode/JSON/image estimator.
     ContextUsage {

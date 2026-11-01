@@ -490,7 +490,7 @@ async fn completed_json(
             permit.success();
             permit.account_usage(
                 Usage::parse(&value["usage"]),
-                value.get("error").is_none() && value["status"] != "failed",
+                value.get("error").is_none_or(Value::is_null) && value["status"] != "failed",
             )?;
             Ok(value)
         }

@@ -82,7 +82,7 @@ async fn each_api_calibrates_the_dispatched_body_and_stream_snapshots_learn_once
                     )
                     .into_response()
                 } else if body.get("input").is_some() {
-                    axum::Json(json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
+                    axum::Json(json!({"status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],
                         "usage":{"input_tokens":prompt,"output_tokens":1}})).into_response()
                 } else {
                     axum::Json(
@@ -161,6 +161,9 @@ async fn fallback_and_named_provider_samples_are_isolated_and_failed_usage_is_no
         let prompt = crate::tokens::request(&body) as u64 * 3;
         if model == "primary" || model == "failed" {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error":{"message":"fixture failure"},"usage":{"prompt_tokens":999999}}))).into_response();
+        }
+        if model == "json-error" {
+            return axum::Json(json!({"error":{"message":"not successful"},"usage":{"prompt_tokens":prompt}})).into_response();
         }
         if model == "stream-error" {
             return format!("data: {}\n\n", json!({"error":{"message":"stream fixture error","type":"server_error"},"usage":{"prompt_tokens":prompt}})).into_response();
@@ -242,7 +245,7 @@ async fn fallback_and_named_provider_samples_are_isolated_and_failed_usage_is_no
             < 1e-9
     );
     let provider = daemon.provider(&cfg).await.unwrap();
-    for model in ["missing", "zero", "failed"] {
+    for model in ["missing", "zero", "failed", "json-error"] {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             provider.complete(&messages, model, None),
@@ -383,4 +386,171 @@ async fn current_context_compaction_and_routing_share_checkpoint_tools_image_and
         "model",
     );
     assert!(provider.prompt_tokens(&ctx, &[], "model") > empty + 85);
+}
+
+#[tokio::test]
+async fn role_auto_context_uses_named_provider_alias_and_calibration() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, mut cfg, daemon, sid) = fixture(&env, "http://127.0.0.1:9", "chat");
+    let mut named = cfg.provider.clone();
+    named.aliases.insert("alias".into(), "model".into());
+    cfg.providers.insert("named".into(), named.clone());
+    cfg.provider
+        .aliases
+        .insert("reader-alias".into(), "role:reader".into());
+    cfg.roles.insert(
+        "reader".into(),
+        crate::config::RoleCfg {
+            provider: Some("named".into()),
+            model: "auto".into(),
+            candidates: vec!["alias".into()],
+            ..Default::default()
+        },
+    );
+    cfg.save(&paths).unwrap();
+    env.set("FORMLESS_API_KEY_NAMED", "fixture");
+    let store = Store::open(&paths.db_file()).unwrap();
+    store
+        .set_session_model(&sid, Some("reader-alias"), None)
+        .unwrap();
+    store.append_message(&sid, "user", "你好 context").unwrap();
+    let key = crate::tokens::provider_key("named", &named);
+    for _ in 0..10 {
+        store
+            .observe_prompt_tokens(&key, "model", 100, 300)
+            .unwrap();
+    }
+    let report = daemon
+        .handle(Request::ContextUsage {
+            session_id: sid.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(report["model"], "model");
+    let provider =
+        Provider::with_key(named, "fixture".into(), daemon.http.clone()).with_name("named");
+    let ctx = daemon
+        .session_context(&sid, &provider, "model", 100_000, 0.5)
+        .unwrap()
+        .0;
+    let defs = daemon
+        .with_store(|st| toolreg::tool_definitions(st, Some(&sid), cfg.tools.inline_limit))
+        .unwrap();
+    let raw = provider.prompt_tokens(&ctx, &defs, "model");
+    assert_eq!(
+        report["used_tokens"],
+        daemon
+            .calibrated_prompt_tokens(&provider, "model", &ctx, &defs)
+            .unwrap() as u64
+    );
+    assert!(report["used_tokens"].as_u64().unwrap() > raw as u64 * 2);
+    assert_eq!(
+        store
+            .token_ratio(
+                &crate::tokens::provider_key("default", &cfg.provider),
+                "model"
+            )
+            .unwrap(),
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn compaction_alias_uses_real_model_ratio_for_condensing_and_chunking() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let captured = seen.clone();
+    let app = axum::Router::new().route("/chat/completions", axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+        let seen = captured.clone();
+        async move {
+            seen.lock().unwrap().push(body.clone());
+            axum::Json(json!({"choices":[{"message":{"content":"short summary"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":crate::tokens::request(&body) * 3,"completion_tokens":2}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = Server(Some(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })));
+    let (_root, paths, mut cfg, daemon, sid) = fixture(&env, &base, "chat");
+    cfg.provider
+        .aliases
+        .insert("summary-alias".into(), "model".into());
+    cfg.compaction.model = Some("summary-alias".into());
+    cfg.compaction.server_side = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let first = store.append_message(&sid, "user", "old task").unwrap();
+    let previous = "p".repeat(1800);
+    store.save_checkpoint(&sid, &previous, first.seq).unwrap();
+    let last = store.append_message(&sid, "user", "continue").unwrap();
+    let key = crate::tokens::provider_key("default", &cfg.provider);
+    for _ in 0..12 {
+        store
+            .observe_prompt_tokens(&key, "model", 100, 300)
+            .unwrap();
+    }
+    assert_eq!(store.token_ratio(&key, "summary-alias").unwrap(), 1.0);
+    let provider = daemon.provider(&cfg).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        daemon.compact(&provider, &cfg, &sid, "model", 2000, last.seq, None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (summary, _) = store.latest_checkpoint(&sid).unwrap().unwrap();
+    assert_eq!(
+        summary, "short summary",
+        "calibrated size condenses rather than appends to the old summary"
+    );
+    let calls = seen.lock().unwrap();
+    assert!(
+        calls.len() >= 3,
+        "calibrated input splits into parts and merges: {}",
+        calls.len()
+    );
+    assert!(calls.iter().all(|body| body["model"] == "model"));
+    assert!(calls
+        .iter()
+        .any(|body| body["messages"].to_string().contains("Previous summary")));
+    drop(calls);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn advisory_calibration_failure_does_not_lose_usage_or_fail_the_completion() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|| async {
+            axum::Json(
+                json!({"choices":[{"message":{"content":"okay"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":123,"completion_tokens":7}}),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = Server(Some(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })));
+    let (_root, paths, cfg, daemon, _) = fixture(&env, &base, "chat");
+    let provider = daemon.provider(&cfg).await.unwrap();
+    rusqlite::Connection::open(paths.db_file())
+        .unwrap()
+        .execute_batch("DROP TABLE token_calibration")
+        .unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.complete(&[json!({"role":"user","content":"hello"})], "model", None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output, "okay");
+    let usage = daemon.with_reader(|st| st.usage_by_model(None)).unwrap();
+    assert_eq!(usage["model"], (123, 7, 0));
+    server.stop().await;
 }
