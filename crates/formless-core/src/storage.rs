@@ -6121,7 +6121,9 @@ impl ContextCache {
             {
                 continue;
             }
-            if let Some(calls) = msg["tool_calls"].as_array_mut() {
+            // A read must not invent `tool_calls: null` on plain user/Tool
+            // messages: preview and persisted projection share the same input.
+            if let Some(calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 calls.retain(|c| {
                     let named = c["function"]["name"]
                         .as_str()
@@ -6611,5 +6613,19 @@ mod forecast_retention_tests {
                 .unwrap(),
             0
         );
+    }
+    #[test]
+    fn context_projection_does_not_invent_null_tool_calls_on_plain_messages() {
+        let st = Store::open_in_memory().unwrap();
+        let sid = st.create_session(None).unwrap().id;
+        let message = st.append_message(&sid, "user", "task").unwrap();
+        let context = build_context(&st, &sid, "system", 100_000, 0.8).unwrap().0;
+        assert_eq!(context.last().unwrap(), &provider_message(&message));
+        assert!(!context
+            .last()
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("tool_calls"));
     }
 }
