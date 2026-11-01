@@ -5422,9 +5422,11 @@ impl Daemon {
         .await?;
 
         if let Some((_, _, checkpoint)) = &first {
-            if self
-                .with_reader(|st| Ok(crate::forecast::hash(&st.latest_checkpoint_record(session_id)?)))?
-                != *checkpoint
+            if self.with_reader(|st| {
+                Ok(crate::forecast::hash(
+                    &st.latest_checkpoint_record(session_id)?,
+                ))
+            })? != *checkpoint
             {
                 first = None;
             }
