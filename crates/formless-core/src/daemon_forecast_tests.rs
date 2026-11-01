@@ -9,6 +9,9 @@ fn setup(env: &crate::credential_env::EnvGuard) -> (Fixture, Paths, Arc<Daemon>,
     env.set("FORMLESS_API_KEY", "forecast-fixture");
     env.remove("FORMLESS_BASE_URL");
     env.remove("FORMLESS_MODEL");
+    env.remove("FORMLESS_SECURE");
+    env.set("NO_PROXY", "*");
+    env.set("no_proxy", "*");
     let root =
         Fixture(std::env::temp_dir().join(format!("fl-forecast-gate-{}", uuid::Uuid::new_v4())));
     let paths = Paths::from_dirs(root.0.join("data"), root.0.join("config")).unwrap();

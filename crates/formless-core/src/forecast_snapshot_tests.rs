@@ -381,7 +381,7 @@ fn snapshot_retains_configuration_namespace_freeze_until_quote_finishes() {
         ProfileLock::hierarchy_shared(&paths).is_err(),
         "configuration writer must not race the snapshot quote"
     );
-    crate::Config::load(&paths).unwrap();
+    crate::Config::load_file_only(&paths).unwrap();
     drop(snapshot);
     assert!(
         ProfileLock::hierarchy_shared(&paths).is_ok(),

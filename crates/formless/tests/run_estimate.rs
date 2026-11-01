@@ -25,6 +25,18 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+struct FixtureThread {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for FixtureThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
 fn command(paths: &formless_core::Paths) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_formless"));
     for (key, _) in std::env::vars_os() {
@@ -100,6 +112,10 @@ fn estimate_json_exits_zero_without_http_auth_upload_run_or_marker() {
             }
         }
     });
+    let counter_thread = FixtureThread {
+        stop,
+        thread: Some(thread),
+    };
     let st = formless_core::Store::open(&paths.db_file()).unwrap();
     let sid = st.create_session(Some("existing".into())).unwrap().id;
     let file = root.0.join("attachment.txt");
@@ -120,8 +136,7 @@ fn estimate_json_exits_zero_without_http_auth_upload_run_or_marker() {
         file.to_str().unwrap(),
     ]);
     let result = output(cmd);
-    stop.store(true, Ordering::SeqCst);
-    thread.join().unwrap();
+    drop(counter_thread);
     assert!(
         result.status.success(),
         "{}",
