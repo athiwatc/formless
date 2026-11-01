@@ -4351,6 +4351,28 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
 
+Network grants name an exact host unless their spec explicitly begins `*.`.
+`net:example.com` no longer authorizes `child.example.com`; existing stored grants
+are narrowed without being silently upgraded. `net:*.example.com` authorizes
+proper subdomains (including deeper labels), excludes the apex, and preserves any
+explicit port restriction. Input-bound URL values always resolve to concrete
+hosts and cannot create wildcard authority. Runtime fetches, every redirect hop
+and grant coverage share these rules. Wildcards never authorize private-address
+exceptions: those still require an exact host and matching port.
+
+Approval metadata identifies the actual localized registry arguments being
+reviewed, with bounded redacted URLs (host/path and query keys), file paths and
+non-GET body byte counts/previews where present. Missing or computed JavaScript
+request details are labelled unresolved, never inferred from capability strings.
+This preview adds visibility; it does not scope-check request paths/bodies or
+change existing Always/Session/hour grant lifetimes. Public-suffix scope warnings
+use a pinned offline full ICANN+PRIVATE PSL snapshot, including wildcard and
+exception rules; no runtime download is allowed. Approvals also show sources of
+untrusted framed content actually supplied to the model in this Run, including
+Skill metadata and results without known physical origins. That banner is
+informational, belongs to the explicit Run/Session, survives reconnect with the
+approval, and cannot be cleared by an empty source list or forged payload text.
+
 Third-party Tool, MCP, Skill and module descriptions share a 1,024-character
 Unicode limit. Intake and legacy projection normalize newlines, terminal/control
 and bidi/format characters to single-line metadata. Deterministic instruction-shaped

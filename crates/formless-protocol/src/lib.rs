@@ -12,6 +12,7 @@
 //!   or meaning, is major: bump [`PROTOCOL_VERSION`], and raise
 //!   [`MIN_PROTOCOL_VERSION`] only when the old shape is no longer served.
 
+pub mod net_scope;
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol this build speaks.
