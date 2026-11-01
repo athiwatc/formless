@@ -1510,10 +1510,16 @@ async fn evaluate_prompt(
 }
 
 fn proposal_output() -> Result<CompletionOptions> {
-    Ok(CompletionOptions::json_schema(json!({"anyOf":[
-        {"type":"object","properties":{"kind":{"const":"none"}},"required":["kind"],"additionalProperties":false},
-        {"type":"object","properties":{"kind":{"const":"prompt"},"content":{"type":"string","minLength":1,"maxLength":800},"rationale":{"type":"string"}},"required":["kind","content","rationale"],"additionalProperties":false}
-    ]}))?)
+    // Provider guides disallow a root union for strict structured output. Use
+    // a plain object even in non-strict mode; conditional business requirements
+    // belong to parse_proposal, without rewriting callers' arbitrary schemas.
+    Ok(CompletionOptions::json_schema(json!({
+        "type":"object","properties":{
+            "kind":{"type":"string","enum":["prompt","none"]},
+            "content":{"type":"string","minLength":1,"maxLength":800},
+            "rationale":{"type":"string"}
+        },"required":["kind"],"additionalProperties":false
+    }))?)
 }
 
 fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
@@ -1521,6 +1527,9 @@ fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
         return Err(anyhow!(
             "no new proposal: the model found nothing new to learn"
         ));
+    }
+    if v["kind"].as_str() != Some("prompt") {
+        return Err(anyhow!("proposal kind must be prompt or none"));
     }
     // Only guidance is generated now; memory lives in the memory store.
     let kind = "prompt".to_string();
@@ -1540,7 +1549,7 @@ fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
     }
     let rationale = v["rationale"]
         .as_str()
-        .unwrap_or_default()
+        .ok_or_else(|| anyhow!("proposal missing rationale"))?
         .trim()
         .to_string();
     Ok((kind, content, rationale))
@@ -1549,6 +1558,49 @@ fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
 #[cfg(test)]
 mod race_tests {
     use super::*;
+
+    #[test]
+    fn proposal_schema_has_a_plain_object_root_and_keeps_kind_specific_validation() {
+        let options = proposal_output().unwrap();
+        let schema = options.output_schema().unwrap();
+        assert_eq!(schema.schema()["type"], "object");
+        assert!(schema.schema().get("anyOf").is_none());
+        assert_eq!(
+            schema.schema()["properties"]["kind"]["enum"],
+            json!(["prompt", "none"])
+        );
+        let none = schema.parse_and_validate(r#"{"kind":"none"}"#).unwrap();
+        assert!(parse_proposal(&none)
+            .unwrap_err()
+            .to_string()
+            .contains("nothing new to learn"));
+        let valid=schema.parse_and_validate(r#"{"kind":"prompt","content":"Stream large inputs.","rationale":"observed failure"}"#).unwrap();
+        assert_eq!(
+            parse_proposal(&valid).unwrap(),
+            (
+                "prompt".into(),
+                "Stream large inputs.".into(),
+                "observed failure".into()
+            )
+        );
+        let missing_content = schema
+            .parse_and_validate(r#"{"kind":"prompt","rationale":"failure"}"#)
+            .unwrap();
+        assert!(parse_proposal(&missing_content)
+            .unwrap_err()
+            .to_string()
+            .contains("missing content"));
+        let missing_rationale = schema
+            .parse_and_validate(r#"{"kind":"prompt","content":"Stream inputs."}"#)
+            .unwrap();
+        assert!(parse_proposal(&missing_rationale)
+            .unwrap_err()
+            .to_string()
+            .contains("missing rationale"));
+        assert!(schema
+            .parse_and_validate(r#"{"kind":"memory","content":"anything","rationale":"anything"}"#)
+            .is_err());
+    }
 
     /// Promotion racing a retirement: retirement wins, the Candidate is
     /// discarded and logged (SPEC §16, #759).
