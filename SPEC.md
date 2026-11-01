@@ -1309,7 +1309,10 @@ pattern (§4.4).
   before grants, checking both configured namespaces and current/captured
   canonical identities. Reads, chunks, metadata, detailed listings, implicit
   prior-content reads and source relocation use the same boundary. Moving or
-  deleting a directory containing the profile is also denied. Default hosts
+  deleting a directory containing the profile is also denied. Renaming a
+  configured sensitive subtree, its ancestor, or contents outside that subtree
+  is refused: a read consent cannot erase the namespace classification.
+  Default hosts
   without interactive consent, smoke tests and optimiser replay fail closed
   for credential reads; dry-run reads still require consent.
   `security.sensitive_paths` adds typed `{kind, value}` rules: `subtree`

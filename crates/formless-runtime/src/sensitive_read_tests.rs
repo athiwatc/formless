@@ -131,3 +131,44 @@ fn smoke_and_replay_never_request_or_return_credential_bytes() {
         assert!(ops.paths.locked().is_empty());
     }
 }
+
+#[test]
+fn configured_namespace_and_its_ancestor_cannot_be_renamed_out_after_consent() {
+    let f = Fixture::new();
+    let parent = f.0.join("ordinary-parent");
+    let private = parent.join("private-subtree");
+    std::fs::create_dir_all(&private).unwrap();
+    let secret = private.join("ordinary-name.txt");
+    std::fs::write(&secret, "fixture-secret").unwrap();
+    let rule = sensitive_paths::SensitivePathRule::Subtree(private.to_str().unwrap().into());
+    let ops = host(PathPolicy::new(vec![], vec![rule]).unwrap(), true);
+    for from in [&secret, &private, &parent] {
+        // Include a successful read before relocation: even an accepted exact
+        // read must not wash the configured subtree's future classification.
+        let mut req = f.request(
+            "function run(i) { fs.read(i.secret); fs.rename(i.path, i.to); return 'laundered'; }",
+            from,
+        );
+        req.input["secret"] = json!(secret);
+        req.caps.fs_read = vec![f.0.to_str().unwrap().into()];
+        assert!(execute(&req, ops.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("configured sensitive namespace"));
+        assert!(from.exists());
+        assert!(!f.0.join("public.txt").exists());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "fixture-secret");
+    }
+    let mut within = f.request(
+        "function run(i) { fs.rename(i.path,i.to); return fs.read(i.to); }",
+        &secret,
+    );
+    let destination = private.join("still-private.txt");
+    within.input["to"] = json!(destination);
+    within.caps.fs_read = vec![private.to_str().unwrap().into()];
+    assert_eq!(
+        execute(&within, ops.clone()).unwrap().output,
+        json!("fixture-secret")
+    );
+    assert!(ops.paths.locked().contains(&destination));
+}

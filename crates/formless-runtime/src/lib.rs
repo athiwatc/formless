@@ -1540,6 +1540,15 @@ impl State {
             "fs_rename" => {
                 let from = self.resolve(a["from"].as_str().unwrap_or_default(), true)?;
                 let to = self.resolve(a["to"].as_str().unwrap_or_default(), true)?;
+                if !self
+                    .ops
+                    .path_policy()
+                    .map_err(denied)?
+                    .relocation_allowed(&from, &to)
+                    .map_err(denied)?
+                {
+                    return Err(denied("rename would remove a configured sensitive namespace; read consent does not authorize this relocation"));
+                }
                 self.guard_read(
                     a["from"].as_str().unwrap_or_default(),
                     &from,

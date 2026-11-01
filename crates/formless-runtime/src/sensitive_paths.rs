@@ -71,6 +71,25 @@ impl PathPolicy {
         Ok(false)
     }
 
+    /// A read consent must not turn a configured private namespace into
+    /// ordinary files through a subsequent rename. Ancestors cannot move the
+    /// namespace either; callers can read it with consent or edit the owner's
+    /// configuration explicitly instead.
+    pub fn relocation_allowed(&self, from: &Path, to: &Path) -> Result<bool, String> {
+        for rule in &self.rules {
+            if let SensitivePathRule::Subtree(configured) = rule {
+                let root = crate::caps::canonical_path(configured)?;
+                if contains(from, &root) {
+                    return Ok(false);
+                }
+                if contains(&root, from) && !contains(&root, to) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub fn classify(&self, raw: &Path, canonical: &Path) -> Result<PathDecision, String> {
         for root in self.protected.iter().chain(&self.frozen) {
             let resolved =
