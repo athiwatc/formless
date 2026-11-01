@@ -54,7 +54,7 @@ impl Peer {
         }
     }
     fn provider(&self, style: &str) -> Provider {
-        Provider::new(
+        let provider = Provider::new(
             ProviderCfg {
                 base_url: self.base.clone(),
                 api_style: style.into(),
@@ -65,7 +65,15 @@ impl Peer {
             },
             "private-structured-key".into(),
         )
-        .unwrap()
+        .unwrap();
+        assert_eq!(provider.settings().base_url, self.base);
+        assert_eq!(
+            reqwest::Url::parse(&provider.settings().base_url)
+                .unwrap()
+                .host_str(),
+            Some("127.0.0.1")
+        );
+        provider
     }
     async fn close(self) {
         self.stop.send(()).unwrap();
@@ -620,6 +628,15 @@ async fn actual_tool_structured_failures_preserve_parent_invocation_and_run_usag
         cfg.skills.auto_create = false;
         cfg.security.secure = false;
         cfg.save(&paths).unwrap();
+        let effective = Config::load(&paths).unwrap();
+        assert_eq!(
+            effective.provider.base_url, peer.base,
+            "actual daemon factory config must remain loopback"
+        );
+        assert_eq!(
+            effective.provider.model, cfg.provider.model,
+            "ambient model selection must not alter fixture routing"
+        );
         let store = Store::open(&paths.db_file()).unwrap();
         let sid = store.create_session(None).unwrap().id;
         let opts = if mode == "legacy" {
