@@ -1626,7 +1626,7 @@ fn only_image_user(body: &Value, key: &str) -> Value {
     }
     let users: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
     assert_eq!(users.len(), 1, "exactly one image-bearing user message");
-    users[0].clone()
+    (*users[0]).clone()
 }
 
 /// Images reach vision models on both APIs, scaled down once, and an
