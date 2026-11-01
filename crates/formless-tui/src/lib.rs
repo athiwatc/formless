@@ -6742,6 +6742,9 @@ impl App {
                 self.save_setting("tui.vim_mode", serde_json::json!(self.vim_mode));
                 self.notes.push(format!("Vim editing {} · Insert Esc enters Normal · /help lists editing keys", if self.vim_mode {"on"} else {"off"}));
             }
+            cmd if cmd.starts_with("vim ") => {
+                self.notes.push("usage: /vim [on|off]".into());
+            }
             "thinking" => {
                 self.show_thinking = !self.show_thinking;
                 self.notes.push(format!(
@@ -24865,6 +24868,29 @@ mod tests {
         app.input.clear();
         app.key(key(KeyCode::Char('w')));
         assert_eq!(app.input, "w", "default readline typing is unchanged");
+    }
+
+    #[test]
+    fn vim_invalid_arguments_stay_local_and_preserve_the_preference() {
+        for enabled in [false, true] {
+            let mut app = test_app();
+            app.vim_mode = enabled;
+            app.input.set("unsent private draft");
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.slash("vim x");
+            assert_eq!(app.vim_mode, enabled);
+            assert_eq!(app.input, "unsent private draft");
+            assert!(app.notes.iter().any(|note| note == "usage: /vim [on|off]"));
+            assert!(!app
+                .notes
+                .iter()
+                .any(|note| note.contains("unknown command")));
+            assert!(
+                sent.try_recv().is_err(),
+                "invalid options must not send requests"
+            );
+        }
     }
 
     #[test]
