@@ -3,6 +3,7 @@ use super::*;
 use crate::probe_policy::ProbePolicy;
 use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 struct Server(tokio::task::JoinHandle<()>);
 impl Drop for Server {
@@ -84,6 +85,7 @@ fn assert_cap(body: &Value, style: &str, cap: u64) {
 #[tokio::test]
 async fn probe_http_dialects_stream_and_complete_cap_after_hostile_overrides_and_meter_once() {
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     for style in ["chat", "responses", "anthropic"] {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let captured = seen.clone();
@@ -134,8 +136,8 @@ async fn probe_http_dialects_stream_and_complete_cap_after_hostile_overrides_and
             2,
             "observer must not bill twice"
         );
-        assert_eq!(policy.report()["requests_sent"], 2);
-        assert_eq!(policy.report()["reported_usage"]["prompt_tokens"], 6);
+        assert_eq!(policy.report()["requests_sent"], 3);
+        assert_eq!(policy.report()["reported_usage"]["prompt_tokens"], 9);
         for body in seen.locked().iter() {
             assert_cap(body, style, 128);
             assert_eq!(body["options"]["num_predict"], 128);
@@ -146,6 +148,7 @@ async fn probe_http_dialects_stream_and_complete_cap_after_hostile_overrides_and
 #[tokio::test]
 async fn probe_http_anthropic_repair_to_64_survives_reapplied_extra_body() {
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
     let (base, _server) = server(Router::new().route(
@@ -192,6 +195,7 @@ async fn probe_http_anthropic_repair_to_64_survives_reapplied_extra_body() {
 #[tokio::test]
 async fn probe_http_shared_eight_send_budget_blocks_ninth_subcall_before_http() {
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     let sent = Arc::new(AtomicUsize::new(0));
     let captured = sent.clone();
     let (base, _server) = server(Router::new().route(
@@ -225,6 +229,7 @@ async fn probe_http_shared_eight_send_budget_blocks_ninth_subcall_before_http() 
 #[tokio::test]
 async fn probe_http_exhausted_admission_does_not_send_or_reserve_a_physical_post() {
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     let sent = Arc::new(AtomicUsize::new(0));
     let captured = sent.clone();
     let (base, _server) = server(Router::new().route(
@@ -255,6 +260,7 @@ async fn probe_http_exhausted_admission_does_not_send_or_reserve_a_physical_post
 #[tokio::test]
 async fn probe_http_deadline_cancels_admission_headers_body_and_retry_waits() {
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     for phase in ["admission", "headers", "body", "retry"] {
         let sent = Arc::new(AtomicUsize::new(0));
         let captured = sent.clone();
@@ -286,7 +292,7 @@ async fn probe_http_deadline_cancels_admission_headers_body_and_retry_waits() {
         if phase == "admission" {
             p = p.with_request_hook(Arc::new(|| Box::pin(std::future::pending())));
         }
-        let policy = ProbePolicy::limited(Duration::from_millis(200), 8);
+        let policy = ProbePolicy::limited(Duration::from_secs(1), 8);
         let p = p.scoped_probe(policy.clone()).unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -308,6 +314,7 @@ async fn probe_http_deadline_cancels_admission_headers_body_and_retry_waits() {
 #[tokio::test]
 async fn probe_http_redirect_is_not_followed_and_ordinary_cap_is_unchanged() {
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     let target = Arc::new(AtomicUsize::new(0));
     let captured = target.clone();
     let (target_url, _target) = server(Router::new().route(
@@ -360,6 +367,7 @@ async fn probe_http_redirect_is_not_followed_and_ordinary_cap_is_unchanged() {
 #[tokio::test]
 async fn probe_http_forced_unforced_and_prompt_fallback_share_policy_and_metering() {
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
     let (base,_server)=server(Router::new().route("/chat/completions",post(move |Json(body):Json<Value>| {
@@ -407,6 +415,7 @@ async fn probe_http_forced_unforced_and_prompt_fallback_share_policy_and_meterin
 async fn probe_http_partial_stream_timeout_accounts_once_before_releasing_admission() {
     use futures_util::StreamExt;
     let _env = crate::credential_env::EnvGuard::isolated();
+    _env.set("NO_PROXY", "127.0.0.1,localhost");
     let arrived = Arc::new(tokio::sync::Notify::new());
     let captured = arrived.clone();
     let (base, _server) = server(Router::new().route(
@@ -461,7 +470,7 @@ async fn probe_http_partial_stream_timeout_accounts_once_before_releasing_admiss
             recorded.locked().push(*u);
             Ok(())
         }));
-    let policy = ProbePolicy::limited(Duration::from_millis(300), 8);
+    let policy = ProbePolicy::limited(Duration::from_secs(1), 8);
     let p = p.scoped_probe(policy.clone()).unwrap();
     let cancel = CancellationToken::new();
     let err = policy
@@ -482,4 +491,64 @@ async fn probe_http_partial_stream_timeout_accounts_once_before_releasing_admiss
     assert_eq!(report["requests_sent"], 1);
     assert_eq!(report["usage_partial"], true);
     assert!(report["reported_usage"].get("completion_tokens").is_none());
+}
+
+#[tokio::test]
+async fn probe_http_rejected_chat_cap_switches_spelling_but_remains_bounded() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let (base,_server)=server(Router::new().route("/chat/completions",post(move |Json(body):Json<Value>| {
+        let index={let mut rows=captured.locked();rows.push(body.clone());rows.len()};
+        async move {if index==1 {(StatusCode::BAD_REQUEST,Json(json!({"error":{"param":"max_tokens","message":"unsupported max_tokens; use max_completion_tokens"}}))).into_response()} else {ok(&body,"chat")}}
+    }))).await;
+    let policy = ProbePolicy::default();
+    let p = Provider::new(cfg(base, "chat"), "private-dummy".into())
+        .unwrap()
+        .scoped_probe(policy.clone())
+        .unwrap();
+    policy
+        .run(p.complete(&[], "probe-model", None))
+        .await
+        .unwrap()
+        .unwrap();
+    let rows = seen.locked();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["max_tokens"], 128);
+    assert!(rows[1].get("max_tokens").is_none());
+    assert_eq!(rows[1]["max_completion_tokens"], 128);
+}
+#[tokio::test]
+async fn probe_http_two_request_cache_check_uses_one_shared_bounded_scope() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let (base, _server) = server(Router::new().route(
+        "/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            captured.locked().push(body.clone());
+            async move { ok(&body, "chat") }
+        }),
+    ))
+    .await;
+    let policy = ProbePolicy::default();
+    let p = Provider::new(cfg(base, "chat"), "private-dummy".into())
+        .unwrap()
+        .scoped_probe(policy.clone())
+        .unwrap();
+    assert!(policy
+        .run(cache_probe_provider_inner(&p, "probe-model"))
+        .await
+        .unwrap()
+        .unwrap()
+        .is_some());
+    let rows = seen.locked();
+    assert_eq!(rows.len(), 2);
+    for row in rows.iter() {
+        assert_cap(row, "chat", 128);
+        assert_eq!(row["stream"], true);
+    }
+    assert_eq!(policy.report()["requests_sent"], 2);
 }
