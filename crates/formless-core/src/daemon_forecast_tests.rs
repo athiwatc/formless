@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 struct Fixture(std::path::PathBuf);
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -556,4 +557,113 @@ async fn racing_attachment_waits_for_admission_and_cannot_enter_the_confirmed_re
         .unwrap_or("")
         .contains("late.txt"));
     cancel_fixture_run(&d, &sid).await;
+}
+
+#[tokio::test]
+async fn preview_makes_zero_requests_and_completed_run_records_exact_wire_usage_coverage() {
+    use axum::response::IntoResponse;
+    struct Server(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            if let Some(t) = &self.0 {
+                t.abort();
+            }
+        }
+    }
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, d, sid, mut cfg) = setup(&env);
+    let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let recorded = seen.clone();
+    let app=axum::Router::new().route("/chat/completions",axum::routing::post(move|axum::Json(body):axum::Json<Value>|{
+        let recorded=recorded.clone();async move{
+            let raw=crate::tokens::request(&body) as u64;
+            recorded.locked().push(body);
+            format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{"content":"The task is complete."}}]}),json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":raw,"completion_tokens":5}})).into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cfg.provider.base_url = format!("http://{}", listener.local_addr().unwrap());
+    cfg.save(&paths).unwrap();
+    let mut server = Server(Some(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    })));
+    let input = ForecastInput {
+        session_id: Some(sid.clone()),
+        draft: "task".into(),
+        ..Default::default()
+    };
+    let preview: RunForecast = serde_json::from_value(
+        CLIENT
+            .scope(
+                (91, "fixture".into()),
+                d.handle(Request::ForecastRun {
+                    input,
+                    for_send: true,
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(seen.locked().is_empty(), "preview called a provider");
+    assert_eq!(
+        preview.comparable_runs, 0,
+        "other endpoint history cannot price this endpoint"
+    );
+    CLIENT
+        .scope(
+            (91, "fixture".into()),
+            d.handle(Request::SendMessage {
+                session_id: sid.clone(),
+                content: "task".into(),
+                mode: SendMode::Send,
+                client_msg_id: Some("actual-wire".into()),
+            }),
+        )
+        .await
+        .unwrap();
+    let run = d.runs.locked().get(&sid).unwrap().run_id.clone();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while d.runs.locked().contains_key(&sid) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("mock Run completion");
+    assert_eq!(seen.locked().len(), 1);
+    assert_eq!(
+        preview.basis.prompt_tokens,
+        crate::tokens::request(&seen.locked()[0])
+    );
+    let st = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(st.last_run(&sid).unwrap().unwrap().1, "completed");
+    assert!(st.forecast_usage_complete(&run).unwrap());
+    let rows = crate::forecast::metrics(&st, &cfg).unwrap();
+    let actual = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["run_id"] == run)
+        .unwrap();
+    assert_eq!(actual["actual"]["tokens"], preview.basis.prompt_tokens + 5);
+    assert_eq!(actual["calibration_eligible"], true);
+    let following = d
+        .with_reader(|st| {
+            d.forecast_estimate(
+                st,
+                &cfg,
+                &ForecastInput {
+                    session_id: Some(sid.clone()),
+                    draft: "task".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(following.comparable_runs, 1);
+    assert_eq!(following.comparables[0].run_id, run);
+    if let Some(task) = server.0.take() {
+        task.abort();
+        let _ = task.await;
+    }
 }
