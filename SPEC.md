@@ -284,14 +284,27 @@ without redesign.
   configure `[provider.auth]` (`mode`, `authorize_url`, `token_url`,
   public `client_id`, optional `scopes`, localhost `redirect_port`, and
   provider-specific extra authorize/token parameters), then run
-  `formless auth login`. Login binds only
+  `formless auth login [--provider NAME]` (default: `[provider]`; named
+  entries come from `[providers.NAME]`). `auth status` and `auth logout`
+  accept the same selector; unknown names fail explicitly. Login binds only
   `http://127.0.0.1:<port>/callback`, uses a fresh `state` and S256 PKCE
   verifier/challenge, exchanges the code at the configured token
   endpoint, and stores tokens via keychain + a `0600`
   `oauth_tokens-<id>.json` fallback, one set per provider (`<id>` is
   derived from its `token_url` and `client_id`, so two OAuth providers
-  never overwrite each other). A profile-wide set from an older version
-  moves to the default provider on first use. Both copies carry the time
+  never overwrite each other). Endpoint identity canonicalizes scheme/host
+  case, default ports and trailing slashes, preserving path case and query.
+  Slot derivation, recorded issuer checks and refresh locks share this identity.
+  Credentials are used only with a proven matching recorded issuer, including
+  unexpired access tokens. Older file-backed raw slots are found using the
+  recorded issuer and verified client-id slot hash. A profile-wide legacy set
+  is usable only if its recorded issuer matches; unlabelled or mismatched sets
+  remain untouched and produce a re-login warning, never a guessed issuer.
+  Read-only lookup does not rewrite stores; login/refresh saves the canonical
+  slot, and logout removes matching evidenced aliases too. Arbitrary old
+  keyring-only hashes cannot be enumerated after an endpoint spelling edit;
+  these require re-login (or restoring the original spelling first).
+  Both copies carry the time
   they were saved and the newer one wins; when only one write succeeds,
   the other store's older copy is removed (or the save fails). `formless
   auth status|logout` inspect or delete those tokens without printing
@@ -299,7 +312,9 @@ without redesign.
   `provider.auth.revocation_url` is set, reports any copy it could not
   delete, and says when an API key or `FORMLESS_OAUTH_ACCESS_TOKEN` stays
   in force. `doctor` reports whether the keychain works or only the
-  files hold secrets. Full reset deletes them too.
+  files hold secrets. `auth status` and `doctor` report credential presence
+  and issuer warnings for every configured OAuth provider without refreshing
+  or printing tokens. Full reset deletes them too.
 - Before every provider construction (main Runs, sub-agents,
   Tool-initiated `llm.complete`, optimiser calls, compaction through the
   already-constructed provider, and `doctor` probes), the daemon/CLI
@@ -315,7 +330,24 @@ without redesign.
   `formless auth login` rather than silently falling back to an API key.
   A refresh token is only sent to the token endpoint that issued it. A
   401 for a token that has not expired by the clock (revoked, or clock
-  skew) forces one refresh and one resend before the request fails.
+  skew) forces at most one refresh for a logical authenticated request:
+  chat/completion across model fallbacks and outer stream-drop resends
+  (including native Messages streams), all pages of a model listing,
+  compaction, and calls made by a managed operational probe. A failed forced
+  refresh retains the original 401 and refresh-error context even when a
+  later fallback returns a hard 400/403 or credential resolution fails, and
+  attempts configured fallback models; it does not replace the error or reset
+  the refresh allowance per model. HTTP rejection and OAuth token error
+  bodies used for diagnostics are masked against exact
+  submitted credentials (including opaque access/refresh tokens, authorization
+  codes/verifiers and confidential client secrets) before truncation or
+  preservation in context. Status and OAuth error codes remain available.
+  Retry classification and request repair inspect the raw response separately;
+  masked text never drives protocol recovery, and probes receive typed rejection
+  classifications without retaining or exposing the raw credential-bearing body.
+  API-key/fixed-token and explicit environment overrides do not redeem
+  a stored refresh token. `doctor` remains read-only, including its fixed-token
+  diagnostic probes; operational probes can use a managed Provider.
   A confidential OAuth client secret, when a provider requires one, is
   read only from `FORMLESS_OAUTH_CLIENT_SECRET` and sent as HTTP Basic
   credentials to the token endpoint; it is never stored in config.
@@ -504,8 +536,11 @@ The user talks to one **primary** model; work can go to others.
     the file `FORMLESS_API_KEY_<NAME>_FILE` names, like
     `FORMLESS_API_KEY_FILE` for the default; a set but unusable file is
     named in the log and `doctor`), and
-    is never in the config file or a listing. Named providers use API
-    keys; OAuth stays with `default`.
+    is never in the config file or a listing. Named providers also support
+    OAuth through their own `[providers.NAME.auth]` and
+    `formless auth login --provider NAME`; daemon routing, Role calls,
+    provider tests and price listing use that provider's managed credentials.
+    Missing-login errors include the provider and exact login command.
   - Requests: `ListProviders` (with `has_key`), `UpsertProvider` (the key
     goes straight to the keychain), `TestProvider` (lists `/models`) and
     `RemoveProvider` (refused while a role uses it).
