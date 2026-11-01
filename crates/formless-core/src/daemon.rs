@@ -16783,3 +16783,7 @@ mod description_daemon_tests;
 #[cfg(test)]
 #[path = "approval_daemon_tests.rs"]
 mod approval_daemon_tests;
+
+#[cfg(test)]
+#[path = "sensitive_read_daemon_tests.rs"]
+mod sensitive_read_daemon_tests;
