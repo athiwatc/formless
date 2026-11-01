@@ -16,11 +16,13 @@ fn retention_removes_old_then_oldest_over_the_cap_and_session_deletes_its_own() 
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("db.sqlite")).unwrap();
     let s = store.create_session(None).unwrap();
+    let owned = dir.join("artifacts");
+    std::fs::create_dir_all(&owned).unwrap();
 
-    let a = file(&dir, "a", 600_000);
-    let b = file(&dir, "b", 600_000);
-    let c = file(&dir, "c", 600_000);
-    let mine = file(&dir, "mine", 10);
+    let a = file(&owned, "a", 600_000);
+    let b = file(&owned, "b", 600_000);
+    let c = file(&owned, "c", 600_000);
+    let mine = file(&owned, "mine", 10);
     for p in [&a, &b, &c] {
         store.save_artifact(None, p, "", 600_000).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));

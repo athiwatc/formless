@@ -1,5 +1,6 @@
 pub mod anthropic;
 mod approval_preview;
+mod artifact_delete;
 pub mod artifacts;
 mod attachment_access;
 pub mod auth;

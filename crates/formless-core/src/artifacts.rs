@@ -4,7 +4,11 @@
 
 use crate::config::ArtifactsCfg;
 use crate::Store;
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+#[cfg(test)]
+#[path = "artifact_delete_tests.rs"]
+mod deletion_tests;
 
 /// What a collection removed.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -13,52 +17,137 @@ pub struct Collected {
     pub bytes: u64,
 }
 
-/// Apply the retention caps: files and rows both go.
+type OwnedRow = (String, String, u64, String);
+struct Inventory {
+    root: Option<crate::artifact_delete::Root>,
+    owned: Vec<OwnedRow>,
+    rejected: Vec<String>,
+}
+fn verified_root(
+    path: Option<&std::path::Path>,
+    open: impl FnOnce(&std::path::Path) -> std::io::Result<crate::artifact_delete::Root>,
+) -> Result<Option<crate::artifact_delete::Root>> {
+    let path = path.context("artifact directory authority unavailable; records retained")?;
+    match open(path) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if crate::artifact_delete::rejection(&error).is_some() => Ok(None),
+        Err(error) => {
+            Err(error).context("artifact directory verification is uncertain; records retained")
+        }
+    }
+}
+fn inspect(
+    root: &Option<crate::artifact_delete::Root>,
+    path: &str,
+) -> Result<Option<crate::artifact_delete::VerifiedMetadata>> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    match root.metadata(std::path::Path::new(path)) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if crate::artifact_delete::rejection(&error).is_some() => Ok(None),
+        Err(error) => {
+            Err(error).context("artifact file verification is uncertain; records retained")
+        }
+    }
+}
+fn remove_verified(root: &Option<crate::artifact_delete::Root>, path: &str) -> Result<bool> {
+    let Some(root) = root else {
+        return Ok(false);
+    };
+    match root.remove(std::path::Path::new(path)) {
+        Ok(()) => Ok(true),
+        Err(error) if crate::artifact_delete::rejection(&error).is_some() => Ok(false),
+        Err(error) => Err(error).context("artifact deletion failed; records retained"),
+    }
+}
+fn inventory(
+    store: &Store,
+    open: impl FnOnce(&std::path::Path) -> std::io::Result<crate::artifact_delete::Root>,
+) -> Result<Inventory> {
+    let rows = store.list_artifacts()?;
+    if rows.is_empty() {
+        return Ok(Inventory {
+            root: None,
+            owned: vec![],
+            rejected: vec![],
+        });
+    }
+    let root = verified_root(store.artifact_root.as_deref(), open)?;
+    let mut owned = Vec::new();
+    let mut rejected = Vec::new();
+    for (id, path, _, created) in rows {
+        match inspect(&root, &path)? {
+            Some(info) => owned.push((id, path, info.len(), created)),
+            None => rejected.push(id),
+        }
+    }
+    Ok(Inventory {
+        root,
+        owned,
+        rejected,
+    })
+}
+/// Apply retention only after the entire inventory is verified. Unknown I/O
+/// is not proof of absence and never commits row/attachment expiry changes.
 pub fn gc(store: &Store, cfg: &ArtifactsCfg) -> Result<Collected> {
-    let all = store.list_artifacts()?;
+    gc_with_open(store, cfg, crate::artifact_delete::Root::open)
+}
+fn gc_with_open(
+    store: &Store,
+    cfg: &ArtifactsCfg,
+    open: impl FnOnce(&std::path::Path) -> std::io::Result<crate::artifact_delete::Root>,
+) -> Result<Collected> {
+    let Inventory {
+        root,
+        owned,
+        rejected,
+    } = inventory(store, open)?;
     let cutoff = (cfg.max_age_days > 0).then(|| {
         (chrono::Utc::now() - chrono::Duration::days(cfg.max_age_days as i64)).to_rfc3339()
     });
     let cap = cfg.max_total_mb.saturating_mul(1_000_000);
-    let mut total: u64 = all.iter().map(|a| a.2.max(0) as u64).sum();
-    let mut doomed = Vec::new();
+    let mut total = owned.iter().fold(0u64, |sum, a| sum.saturating_add(a.2));
+    let mut doomed = rejected;
     let mut out = Collected::default();
-    // Oldest first: past the age limit, or still over the size cap.
-    for (id, path, bytes, created) in all {
-        let too_old = cutoff.as_deref().is_some_and(|c| created.as_str() < c);
-        let over_cap = cap > 0 && total > cap;
-        if !(too_old || over_cap) {
+    for (id, path, bytes, created) in owned {
+        if !(cutoff.as_deref().is_some_and(|c| created.as_str() < c) || (cap > 0 && total > cap)) {
             continue;
         }
-        let bytes = bytes.max(0) as u64;
         total = total.saturating_sub(bytes);
-        let _ = std::fs::remove_file(&path);
-        out.files += 1;
-        out.bytes += bytes;
+        if remove_verified(&root, &path)? {
+            out.files += 1;
+            out.bytes = out.bytes.saturating_add(bytes);
+        }
         doomed.push(id);
     }
-    store.delete_artifact_rows(&doomed)?;
-    // Attachments among them are marked expired where they were sent (#858).
-    store.mark_attachments_expired(&doomed)?;
+    store.transaction(|st| {
+        st.delete_artifact_rows(&doomed)?;
+        st.mark_attachments_expired(&doomed)
+    })?;
     Ok(out)
 }
-
-/// What [`gc`] would remove now: (files, bytes); nothing is touched.
+/// An uncertain inventory returns an error, never a zero-byte estimate.
 pub fn gc_preview(store: &Store, cfg: &ArtifactsCfg) -> Result<(usize, u64)> {
-    let all = store.list_artifacts()?;
+    gc_preview_with_open(store, cfg, crate::artifact_delete::Root::open)
+}
+fn gc_preview_with_open(
+    store: &Store,
+    cfg: &ArtifactsCfg,
+    open: impl FnOnce(&std::path::Path) -> std::io::Result<crate::artifact_delete::Root>,
+) -> Result<(usize, u64)> {
+    let Inventory { owned, .. } = inventory(store, open)?;
     let cutoff = (cfg.max_age_days > 0).then(|| {
         (chrono::Utc::now() - chrono::Duration::days(cfg.max_age_days as i64)).to_rfc3339()
     });
     let cap = cfg.max_total_mb.saturating_mul(1_000_000);
-    let mut total: u64 = all.iter().map(|a| a.2.max(0) as u64).sum();
-    let (mut files, mut bytes) = (0, 0);
-    for (_, _, b, created) in all {
-        let too_old = cutoff.as_deref().is_some_and(|c| created.as_str() < c);
-        if too_old || (cap > 0 && total > cap) {
-            let b = b.max(0) as u64;
-            total = total.saturating_sub(b);
+    let mut total = owned.iter().fold(0u64, |sum, a| sum.saturating_add(a.2));
+    let (mut files, mut bytes) = (0, 0u64);
+    for (_, _, n, created) in owned {
+        if cutoff.as_deref().is_some_and(|c| created.as_str() < c) || (cap > 0 && total > cap) {
+            total = total.saturating_sub(n);
             files += 1;
-            bytes += b;
+            bytes = bytes.saturating_add(n);
         }
     }
     Ok((files, bytes))
@@ -106,15 +195,37 @@ pub fn reconcile(
     grace: std::time::Duration,
 ) -> Result<Reconciled> {
     let rows = store.list_artifacts()?;
-    let known: std::collections::HashSet<std::path::PathBuf> = rows
-        .iter()
-        .map(|(_, p, _, _)| std::path::PathBuf::from(p))
-        .collect();
+    let root = verified_root(Some(dir), crate::artifact_delete::Root::open)?;
+    let mut known = std::collections::HashSet::new();
+    // Protect actual registered files, including valid short/case/hardlink
+    // aliases. Uncertain rows abort before orphan classification/deletion.
+    for (_, path, _, _) in &rows {
+        if let Some(info) = inspect(&root, path)? {
+            known.insert(info.identity);
+        }
+    }
     let mut out = Reconciled::default();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() || known.contains(&path) {
+    fn entries(
+        root: &Option<crate::artifact_delete::Root>,
+        path: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let Some(root) = root else {
+            return Ok(vec![]);
+        };
+        match root.entries(path) {
+            Ok(entries) => Ok(entries),
+            Err(error) if crate::artifact_delete::rejection(&error).is_some() => Ok(vec![]),
+            Err(error) => Err(error).context("artifact enumeration uncertain; records retained"),
+        }
+    }
+    for path in entries(&root, std::path::Path::new(""))? {
+        let text = path
+            .to_str()
+            .context("artifact filename encoding is uncertain; records retained")?;
+        let Some(meta) = inspect(&root, text)? else {
+            continue;
+        };
+        if known.contains(&meta.identity) {
             continue;
         }
         let young = meta
@@ -122,28 +233,29 @@ pub fn reconcile(
             .ok()
             .and_then(|m| m.elapsed().ok())
             .is_none_or(|age| age < grace);
-        if young {
-            continue;
-        }
-        if std::fs::remove_file(&path).is_ok() {
+        if !young && remove_verified(&root, text)? {
             out.orphan_files += 1;
-            out.orphan_bytes += meta.len();
+            out.orphan_bytes = out.orphan_bytes.saturating_add(meta.len());
         }
     }
-    for entry in std::fs::read_dir(emitting_dir(dir))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let Ok(meta) = entry.metadata() else { continue };
+    for path in entries(&root, std::path::Path::new("emitting"))? {
+        let text = path
+            .to_str()
+            .context("artifact filename encoding is uncertain; records retained")?;
+        let Some(meta) = inspect(&root, text)? else {
+            continue;
+        };
+        if known.contains(&meta.identity) {
+            continue;
+        }
         let abandoned = meta
             .modified()
             .ok()
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age > EMIT_ABANDONED.max(grace));
-        if meta.is_file() && abandoned && std::fs::remove_file(entry.path()).is_ok() {
+        if abandoned && remove_verified(&root, text)? {
             out.orphan_files += 1;
-            out.orphan_bytes += meta.len();
+            out.orphan_bytes = out.orphan_bytes.saturating_add(meta.len());
         }
     }
     // A row is only dropped once its file has had time to appear (another
@@ -151,14 +263,14 @@ pub fn reconcile(
     let cutoff = chrono::Duration::from_std(grace)
         .ok()
         .map(|g| (chrono::Utc::now() - g).to_rfc3339());
-    let gone: Vec<String> = rows
-        .into_iter()
-        .filter(|(_, p, _, created)| {
-            !std::path::Path::new(p).exists()
-                && cutoff.as_deref().is_none_or(|c| created.as_str() < c)
-        })
-        .map(|(id, ..)| id)
-        .collect();
+    let mut gone = Vec::new();
+    for (id, path, _, created) in rows {
+        if inspect(&root, &path)?.is_none()
+            && cutoff.as_deref().is_none_or(|c| created.as_str() < c)
+        {
+            gone.push(id);
+        }
+    }
     out.missing_rows = gone.len();
     store.delete_artifact_rows(&gone)?;
     Ok(out)
@@ -166,16 +278,44 @@ pub fn reconcile(
 
 /// Delete a Session's artifact files and rows (call before the Session).
 pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
-    for path in store.session_artifact_paths(session_id)? {
-        let _ = std::fs::remove_file(path);
+    let paths = store.session_artifact_paths(session_id)?;
+    if !paths.is_empty() {
+        let root = verified_root(
+            store.artifact_root.as_deref(),
+            crate::artifact_delete::Root::open,
+        )?;
+        for path in &paths {
+            inspect(&root, path)?;
+        }
+        for path in &paths {
+            remove_verified(&root, path)?;
+        }
     }
     store.delete_session_artifact_rows(session_id)
+}
+
+/// Delete one recorded artifact; metadata from held/imported JSON is never
+/// authority. Unknown verification/deletion errors preserve the durable row.
+pub(crate) fn remove_record(store: &Store, id: &str) -> Result<()> {
+    if let Some((_, path, _)) = store.get_artifact(id)? {
+        let root = verified_root(
+            store.artifact_root.as_deref(),
+            crate::artifact_delete::Root::open,
+        )?;
+        inspect(&root, &path)?;
+        remove_verified(&root, &path)?;
+    }
+    store.delete_artifact_rows(&[id.to_string()])
 }
 
 /// (count, bytes) of stored artifacts.
 pub fn usage(store: &Store) -> Result<(usize, u64)> {
     let all = store.list_artifacts()?;
-    Ok((all.len(), all.iter().map(|a| a.2.max(0) as u64).sum()))
+    Ok((
+        all.len(),
+        all.iter()
+            .fold(0u64, |sum, a| sum.saturating_add(a.2.max(0) as u64)),
+    ))
 }
 
 #[cfg(test)]

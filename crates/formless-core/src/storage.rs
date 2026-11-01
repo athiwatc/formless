@@ -5852,7 +5852,7 @@ impl Store {
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .ok())
+            .optional()?)
     }
 
     /// Paths of a Session's artifacts (to delete with it).
