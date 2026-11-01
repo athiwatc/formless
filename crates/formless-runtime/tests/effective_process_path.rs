@@ -11,6 +11,36 @@ use std::sync::{
 #[test]
 #[ignore = "private executable helper"]
 fn effective_path_helper() {
+    if let Ok(probe) = std::env::var("FL_EFFECTIVE_PATH_PROBE") {
+        let f = Fixture::new();
+        let allowed = f.root.join("allowed");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), allowed.join(&f.program)).unwrap();
+        // This runs only inside a private subprocess, never the parallel test
+        // runner. It supplies a deliberately different parent lookup identity.
+        std::env::set_var("PATH", &allowed);
+        for api in ["run", "spawn"] {
+            let mut req = f.request(api, false);
+            if probe == "scoped" {
+                req.caps = Capabilities::parse(&[
+                    format!("process:{}", allowed.join(&f.program).display()),
+                    "env:PATH".into(),
+                    format!("fs:read:{}", f.root.display()),
+                ])
+                .unwrap();
+                let error = execute(&req, Arc::new(formless_runtime::NoHostOps)).unwrap_err();
+                assert_eq!(error.kind, ExecErrorKind::Denied);
+                assert!(error.message.contains("not in scope"));
+            } else {
+                req.input["env"]["PATH"] = serde_json::Value::Null;
+                let error = execute(&req, Arc::new(formless_runtime::NoHostOps)).unwrap_err();
+                assert!(error.message.contains("not found"));
+            }
+            assert!(!f.root.join("started").exists());
+        }
+        println!("PRIVATE_PARENT_PATH_PROBE_PASSED");
+        std::process::exit(0);
+    }
     let Some(marker) = std::env::var_os("FL_EFFECTIVE_PATH_MARKER") else {
         return;
     };
@@ -230,7 +260,7 @@ fn inaccessible_earlier_candidate_does_not_hide_later_executable() {
 }
 
 #[test]
-fn removed_path_does_not_fall_back_to_a_private_parent_only_program_on_unix() {
+fn removed_path_does_not_use_the_supplied_child_override() {
     // An unknown UUID cannot be found by the platform default lookup. No
     // global PATH mutation is needed to prove removal cannot use this override.
     let f = Fixture::new();
@@ -270,4 +300,32 @@ fn explicit_child_relative_programs_are_guarded_and_bound_without_path_lookup() 
             .output;
         assert_eq!(value["code"], 0);
     }
+}
+
+fn parent_path_probe(probe: &str) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "effective_path_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("FL_EFFECTIVE_PATH_PROBE", probe)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "private parent-PATH fixture failed: {:?}",
+        output.status
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PRIVATE_PARENT_PATH_PROBE_PASSED"));
+}
+#[test]
+fn path_scoped_grant_cannot_authorize_a_different_child_path_program() {
+    parent_path_probe("scoped");
+}
+#[cfg(unix)]
+#[test]
+fn removed_child_path_uses_native_default_instead_of_the_parent_path() {
+    parent_path_probe("removed");
 }
