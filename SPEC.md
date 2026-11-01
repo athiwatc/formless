@@ -434,7 +434,23 @@ an empty listing just asks for one.
   picks by endpoint/model and release their reservation on completion or abort.
   Result merges are serialized and written privately through a synced temporary
   file and atomic replacement; save failures are reported, never silently lost.
-  This setting does not bound provider retries or output by itself.
+  Every logical operational probe (explicit Test, optional background Test,
+  connectivity/tool checks and the two-request cache check) uses one shared
+  30-second deadline, at most eight physical model-endpoint POSTs, and a
+  128-output-token ceiling on every attempt. The deadline includes credential
+  refresh, admission waits, headers, body/stream parsing, backoff and resends.
+  Vendor fields, reasoning settings and typed repairs cannot remove or increase
+  the final cap; probes may switch a rejected Chat cap spelling once. The
+  scoped probe disables unrelated model failover, redirects and transport-level
+  automatic retries, while retaining the normal provider's credentials, request
+  admission and usage hooks. Ordinary Run requests keep their existing behavior.
+  Probe transport uses the configured proxy and normal factory TLS trust.
+  `TestModel.probe_usage` reports physical sends and only provider-reported
+  counters/costs; missing counters remain unknown, with explicit partial-usage
+  and partial-cost flags. Its observer does not commit a second usage charge.
+  Timeout/cancellation drops the current logical request future rather than
+  detaching retries. An already-issued server request may continue or be billed;
+  these are client-side request bounds, not a promise of server cancellation.
 
 ### 4.4 Provider failure handling
 

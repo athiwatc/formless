@@ -8329,9 +8329,10 @@ impl Daemon {
         provider: Option<&str>,
         model: &str,
     ) -> Result<crate::provider::ModelTest> {
-        let p = self.provider_named(cfg, provider).await?;
+        let policy = crate::probe_policy::ProbePolicy::default();
+        let p = policy.run(self.provider_named(cfg, provider)).await??;
         let model = p.settings().resolve_alias(model);
-        let t = p.test_model(&model).await;
+        let t = p.test_model_scoped(&model, policy).await;
         self.remember_model_test(&p.settings().base_url, &t)
             .context("model test completed, but its result could not be saved")?;
         Ok(t)

@@ -183,6 +183,9 @@ pub struct ModelTest {
     pub prompt_fallback: bool,
     pub error: Option<String>,
     pub tested_at: String,
+    /// Reported counters across physical probe attempts; missing is unknown.
+    #[serde(default)]
+    pub probe_usage: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -196,6 +199,7 @@ pub struct Provider {
     native_sources: Option<Arc<FrozenAttachments>>,
     native_projection: Option<Arc<NativeProjection>>,
     request_policy: Option<RequestPolicy>,
+    probe_policy: Option<crate::probe_policy::ProbePolicy>,
     http: reqwest::Client,
     /// Sent as `prompt_cache_key` so the endpoint routes one Session's
     /// requests to the same cache (see `provider.cache_key`).
@@ -1169,6 +1173,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            probe_policy: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1180,6 +1185,32 @@ impl Provider {
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
+    }
+
+    fn scoped_probe(&self, policy: crate::probe_policy::ProbePolicy) -> Result<Self> {
+        let mut scoped = self.clone();
+        // A probe's one send must mean one physical POST. Reqwest otherwise
+        // follows up to ten redirects and retries protocol NACKs internally.
+        let mut client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
+        if !self.cfg.proxy.trim().is_empty() {
+            client =
+                client.proxy(reqwest::Proxy::all(self.cfg.proxy.trim()).context("provider.proxy")?);
+        }
+        scoped.http = client.build()?;
+        scoped.cfg.fallback_models.clear();
+        let prior = scoped.on_usage.clone();
+        let observed = policy.clone();
+        scoped.on_usage = Some(Arc::new(move |provider, model, usage| {
+            observed.observe(usage);
+            if let Some(hook) = &prior {
+                hook(provider, model, usage)?;
+            }
+            Ok(())
+        }));
+        scoped.probe_policy = Some(policy);
+        Ok(scoped)
     }
 
     /// This provider's settings.
@@ -1198,6 +1229,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            probe_policy: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1255,6 +1287,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            probe_policy: None,
             credential_paths: Some(paths),
             cache_key: None,
             on_retry: None,
@@ -1624,6 +1657,32 @@ impl Provider {
     /// A short prompt and a tool call on `model`: latency, streaming,
     /// reasoning and tool support (`TestModel`, the picker's Test).
     pub async fn test_model(&self, model: &str) -> ModelTest {
+        self.test_model_scoped(model, crate::probe_policy::ProbePolicy::default())
+            .await
+    }
+
+    pub(crate) async fn test_model_scoped(
+        &self,
+        model: &str,
+        policy: crate::probe_policy::ProbePolicy,
+    ) -> ModelTest {
+        let started = std::time::Instant::now();
+        let outcome = match self.scoped_probe(policy.clone()) {
+            Ok(scoped) => policy.run(scoped.test_model_inner(model)).await,
+            Err(error) => Err(error),
+        };
+        let mut result = outcome.unwrap_or_else(|error| ModelTest {
+            model: model.to_string(),
+            tested_at: chrono::Utc::now().to_rfc3339(),
+            error: Some(format!("{error:#}")),
+            ..Default::default()
+        });
+        result.total_ms = Some(started.elapsed().as_millis() as u64);
+        result.probe_usage = Some(policy.report());
+        result
+    }
+
+    async fn test_model_inner(&self, model: &str) -> ModelTest {
         let mut t = ModelTest {
             model: model.to_string(),
             tested_at: chrono::Utc::now().to_rfc3339(),
@@ -2145,6 +2204,9 @@ impl Provider {
                 if let Some(projection) = &self.native_projection {
                     projection.repairs.locked().apply(&mut b);
                 }
+                if let Some(policy) = &self.probe_policy {
+                    policy.finalize(&mut b, &self.cfg, model)?;
+                }
                 if let Some(policy) = &self.request_policy {
                     policy(&b).map_err(|error| auth.annotate(error))?;
                 }
@@ -2173,6 +2235,9 @@ impl Provider {
                 .json(&b);
                 let mut server_wait = None;
                 let reason;
+                if let Some(policy) = &self.probe_policy {
+                    policy.before_send()?;
+                }
                 match req.send().await {
                     Ok(resp) => {
                         let status = resp.status();
@@ -2203,6 +2268,14 @@ impl Provider {
                         // masking even a one-character synthetic credential can
                         // remove a keyword or numeric limit from the diagnostic.
                         let lower = raw_text.to_lowercase();
+                        if status.as_u16() == 400
+                            && self
+                                .probe_policy
+                                .as_ref()
+                                .is_some_and(|policy| policy.repair_token_field(&raw_text))
+                        {
+                            continue;
+                        }
                         let rejected = OPTIONAL_PARAMS
                             .iter()
                             .find(|p| body.get(**p).is_some() && lower.contains(**p));
@@ -4051,6 +4124,11 @@ pub async fn probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Result<Prob
 /// Probe through the caller's managed credentials, so OAuth 401 recovery is
 /// available to operational probes as well as ordinary requests.
 pub async fn probe_provider(p: &Provider, model: &str) -> Result<ProbeResult> {
+    let policy = crate::probe_policy::ProbePolicy::default();
+    let scoped = p.scoped_probe(policy.clone())?;
+    policy.run(probe_provider_inner(&scoped, model)).await?
+}
+async fn probe_provider_inner(p: &Provider, model: &str) -> Result<ProbeResult> {
     let cfg = &p.cfg;
     let models = p.list_models().await.unwrap_or_default();
     // One real streamed reply, so `streaming` says what the endpoint did
@@ -4153,6 +4231,13 @@ pub async fn cache_probe(cfg: &ProviderCfg, api_key: &str, model: &str) -> Resul
 }
 
 pub async fn cache_probe_provider(p: &Provider, model: &str) -> Result<Option<Usage>> {
+    let policy = crate::probe_policy::ProbePolicy::default();
+    let scoped = p.scoped_probe(policy.clone())?;
+    policy
+        .run(cache_probe_provider_inner(&scoped, model))
+        .await?
+}
+async fn cache_probe_provider_inner(p: &Provider, model: &str) -> Result<Option<Usage>> {
     // Long enough for providers that cache only prefixes of 1024+ tokens.
     let filler = "Formless prompt-cache probe. ".repeat(300);
     let messages = [
