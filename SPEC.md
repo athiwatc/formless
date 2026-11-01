@@ -683,6 +683,29 @@ task, with quality as a gate**.
   escaping never rewrites stored strings or changes machine `--json` output.
   `formless sessions fork ID [--name NAME] [--up-to-seq N] --json` uses the same
   atomic fork operation as the TUI and other callers; it starts no Run.
+  Branch-summary insertion is an explicit three-step operation: inspect an
+  ordered source/target basis, pay for generation against those exact revisions,
+  then confirm the exact server-owned candidate hash. Revisions hash actual
+  message identities, sequence numbers, roles, content and metadata plus meaningful
+  Session/model selection settings; usage and display counters do not invalidate
+  the generation's own basis. Both Sessions must be live and idle, with unchanged
+  revisions after generation and again inside the atomic append transaction.
+  The source projection contains at most 128 recent whole messages in a 64 KiB
+  data frame. Metadata and attachment bodies are excluded; whole-message and
+  original content-byte omissions are reported, with no claim to summarize an
+  omitted prefix. Known secrets are redacted before inclusion. Source role labels
+  are bounded display data, never provider roles or instructions.
+  Generation uses the target's ordinary provider/role/model selection, admission,
+  credential, breaker and physical-usage hooks, without tools or copied Session
+  instructions. Usage is read from its uniquely tagged physical ledger rows;
+  missing reporting or prices leave total cost unknown. Confirmation appends one
+  attributed `system-note`, marked as untrusted data for every future provider
+  projection, and an atomic durable receipt. It copies no transcript, grants or
+  pending handles and starts no Run. Repeated confirmation returns the same note,
+  including after reconnect/restart, provided that note still matches the receipt.
+  Unconfirmed previews are memory-only (16 previews, 30 minutes, at most two
+  generating operations); restart/expiry requires a new explicit generation.
+  Candidate text is limited to 16 KiB and encoded preview details to 256 KiB.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
   It is hidden at once from lists, search and `GetSession`
   (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it

@@ -242,7 +242,11 @@ impl Store {
         })?;
         for record in records {
             let (run, provider, model, p, c, cache, write, reported, covered) = record?;
-            let assignment = runs.get(&run).copied().flatten();
+            let assignment = if all_owned {
+                Some(true)
+            } else {
+                runs.get(&run).copied().flatten()
+            };
             if assignment == Some(false) {
                 continue;
             }
@@ -275,6 +279,9 @@ impl Store {
                 }
             }
             if assignment == Some(true) {
+                if !runs.contains_key(&run) {
+                    complete = false;
+                }
                 out.requests += 1;
                 add_count(&mut out.recorded_prompt_tokens, p)?;
                 add_count(&mut out.recorded_completion_tokens, c)?;
