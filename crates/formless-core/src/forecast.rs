@@ -1,0 +1,510 @@
+//! Read-only local forecasts. No provider factory, credentials or HTTP requests.
+use crate::{config::ProviderCfg, provider::Provider, storage::Store, Config, Paths};
+use anyhow::{Context, Result};
+use formless_protocol::*;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+pub fn hash(value: &impl serde::Serialize) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).unwrap_or_default())
+    )
+}
+
+/// Shared with live Session snapshots; callers decide whether to persist it.
+pub fn effective_prompt(st: &Store, cfg: &Config) -> Result<String> {
+    let mut prompt = st.effective_system_prompt(crate::provider::SYSTEM_PROMPT)?;
+    let skills: Vec<_> = st
+        .list_skills()?
+        .into_iter()
+        .filter(|s| s.enabled && !s.retired)
+        .map(|s| format!("- {}: {}", s.name, s.description))
+        .collect();
+    if !skills.is_empty() {
+        prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
+        prompt.push_str(&skills.join("\n"));
+    }
+    if !cfg.roles.is_empty() {
+        prompt.push_str("\n\nRoles (pass {role: name} to agents.run or llm.complete from a Tool with the agent/llm Capability):");
+        for (name, r) in &cfg.roles {
+            prompt.push_str(&format!(
+                "\n- {name}: {} [{} · {}]",
+                if r.description.is_empty() {
+                    "(no description)"
+                } else {
+                    &r.description
+                },
+                r.provider
+                    .as_deref()
+                    .unwrap_or(crate::config::DEFAULT_PROVIDER),
+                if r.model.is_empty() {
+                    "provider default"
+                } else {
+                    &r.model
+                }
+            ));
+        }
+    }
+    prompt.push_str(&crate::memory::prompt_block(&st.list_memories()?));
+    Ok(prompt)
+}
+
+pub fn fresh_prompt(
+    st: &Store,
+    cfg: &Config,
+    session: Option<&SessionInfo>,
+    model: &str,
+    cwd: Option<&str>,
+) -> Result<String> {
+    let mut prompt = effective_prompt(st, cfg)?;
+    if let Some(cwd) = cwd {
+        prompt.push_str(&format!("\n\nWorking directory: {cwd}. Paths the user gives without a leading / are relative to it; pass absolute paths to Tools."));
+    }
+    if let Some(extra) = cfg
+        .provider
+        .tool_use_nudge
+        .then(|| crate::provider::model_family_addendum(model))
+        .flatten()
+    {
+        prompt.push_str("\n\n");
+        prompt.push_str(extra);
+    }
+    if let Some(instructions) = session.and_then(|s| s.instructions.as_deref()) {
+        prompt.push_str(&format!(
+            "\n\nStanding instructions for this Session, from the user:\n{instructions}"
+        ));
+    }
+    Ok(prompt)
+}
+
+pub fn attachment(name: String, bytes: &[u8]) -> ForecastAttachment {
+    let name = crate::daemon::attachment_name(&name);
+    let dims = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok());
+    ForecastAttachment {
+        mime: crate::daemon::resolve_mime(None, &crate::daemon::cap_name(&name, 120), bytes),
+        name,
+        bytes: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        width: dims.map(|d| d.0),
+        height: dims.map(|d| d.1),
+    }
+}
+
+/// A tiny local image header carrying dimensions, only for estimator input.
+/// Pixels are never decoded or dispatched: the shared counter reads dimensions.
+fn dimension_image(dims: Option<(u32, u32)>) -> String {
+    use base64::Engine;
+    let Some((w, h)) = dims else {
+        return "data:image/png;base64,".into();
+    };
+    let mut png=base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=").unwrap();
+    png[16..20].copy_from_slice(&w.to_be_bytes());
+    png[20..24].copy_from_slice(&h.to_be_bytes());
+    let mut crc = 0xffff_ffffu32;
+    for b in &png[12..29] {
+        crc ^= *b as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ if crc & 1 != 0 { 0xedb88320 } else { 0 };
+        }
+    }
+    png[29..33].copy_from_slice(&(!crc).to_be_bytes());
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    )
+}
+
+pub fn estimate(paths: &Paths, input: &ForecastInput) -> Result<RunForecast> {
+    let cfg = Config::load(paths)?; // Configuration only, never provider_key/auth.
+    let st = if paths.db_file().exists() {
+        Store::open_forecast_reader(&paths.db_file())?
+    } else {
+        Store::open_in_memory()?
+    };
+    estimate_store(&st, &cfg, input)
+}
+
+fn range(mut values: Vec<f64>) -> Option<ForecastRange> {
+    values.retain(|v| v.is_finite() && *v >= 0.0);
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let q = |p: f64| {
+        values[((values.len() as f64 * p).ceil() as usize)
+            .saturating_sub(1)
+            .min(values.len() - 1)]
+    };
+    Some(ForecastRange {
+        p50: q(0.5),
+        p90: q(0.9),
+    })
+}
+
+pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result<RunForecast> {
+    let session = input
+        .session_id
+        .as_deref()
+        .map(|id| st.get_session(id))
+        .transpose()?
+        .flatten();
+    if input.session_id.is_some() && session.is_none() {
+        anyhow::bail!("no such Session for forecast");
+    }
+    let wanted = input
+        .model
+        .clone()
+        .or_else(|| session.as_ref().and_then(|s| s.model.clone()))
+        .unwrap_or_else(|| cfg.provider.model.clone());
+    let wanted = cfg.provider.resolve_alias(&wanted);
+    let role = wanted.strip_prefix("role:").unwrap_or("main").to_string();
+    let rcfg = if role != "main" {
+        Some(cfg.role(&role)?)
+    } else {
+        None
+    };
+    let name = rcfg
+        .and_then(|r| r.provider.as_deref())
+        .unwrap_or(crate::config::DEFAULT_PROVIDER);
+    let pcfg = cfg.provider_cfg(Some(name))?;
+    let mut model = pcfg.resolve_alias(rcfg.map_or(wanted.as_str(), |r| {
+        if r.model.is_empty() {
+            pcfg.model.as_str()
+        } else {
+            r.model.as_str()
+        }
+    }));
+    if ProviderCfg::is_auto_model(&model) {
+        if let Some(r) = rcfg.filter(|r| !r.candidates.is_empty()) {
+            let candidates: Vec<_> = r.candidates.iter().map(|m| pcfg.resolve_alias(m)).collect();
+            model = crate::routing::select_task_model(
+                &candidates,
+                &st.task_stats(&role)?,
+                cfg.tools.task_min_samples,
+                cfg.tools.task_quality_bar,
+                false,
+            )
+            .context("no model candidates")?;
+        } else {
+            model = crate::routing::select_model(&pcfg, &st.list_model_stats()?, false)
+                .context("no model candidates")?;
+        }
+    }
+    let cwd = input
+        .cwd
+        .as_deref()
+        .or_else(|| session.as_ref().and_then(|s| s.cwd.as_deref()));
+    let defs = crate::tools::preview_tool_definitions(
+        st,
+        input.session_id.as_deref(),
+        cfg.tools.inline_limit,
+    )?;
+    let prompt = match input
+        .session_id
+        .as_deref()
+        .map(|id| st.session_system_prompt(id))
+        .transpose()?
+        .flatten()
+    {
+        Some(p) => p,
+        None => fresh_prompt(st, cfg, session.as_ref(), &model, cwd)?,
+    };
+    let mut ctx = if let Some(id) = input.session_id.as_deref() {
+        crate::storage::build_context(
+            st,
+            id,
+            &prompt,
+            pcfg.context_for(&model),
+            cfg.compaction.fraction(),
+        )?
+        .0
+    } else {
+        vec![json!({"role":"system","content":prompt})]
+    };
+    let context_hash = hash(&ctx);
+    let held = input
+        .session_id
+        .as_deref()
+        .map(|id| st.pending_attachments(id))
+        .transpose()?
+        .unwrap_or_default();
+    let mut logical = Vec::new();
+    let mut normalized = held.clone();
+    for a in &held {
+        let bytes = a["path"].as_str().and_then(|p| std::fs::read(p).ok());
+        let mut descriptor = if let Some(bytes) = bytes {
+            attachment(
+                a["full_name"]
+                    .as_str()
+                    .or_else(|| a["name"].as_str())
+                    .unwrap_or_default()
+                    .into(),
+                &bytes,
+            )
+        } else {
+            ForecastAttachment {
+                name: a["name"].as_str().unwrap_or_default().into(),
+                mime: a["mime"].as_str().unwrap_or_default().into(),
+                bytes: a["bytes"].as_u64().unwrap_or(0),
+                ..Default::default()
+            }
+        };
+        if let Some(mime) = a["mime"].as_str() {
+            descriptor.mime = mime.into();
+        }
+        if a["reference"] == true {
+            descriptor.sha256 = hash(&(a["path"].clone(), a["dir"].clone(), a["bytes"].clone()));
+        }
+        logical.push(descriptor);
+    }
+    logical.extend(input.attachments.clone());
+    for a in &mut normalized {
+        a["id"] = json!("00000000-0000-0000-0000-000000000000");
+    }
+    for a in &input.attachments {
+        normalized.push(json!({"id":"00000000-0000-0000-0000-000000000000","name":a.name,"mime":a.mime,"bytes":a.bytes}));
+    }
+    if !input.draft.is_empty() {
+        let message = MessageInfo {
+            id: "forecast".into(),
+            session_id: input.session_id.clone().unwrap_or_default(),
+            seq: 0,
+            role: "user".into(),
+            content: input.draft.clone(),
+            created_at: String::new(),
+            meta: Some(json!({"attachments":normalized}).to_string()),
+        };
+        ctx.push(crate::storage::provider_message(&message));
+    }
+    // A keyless Provider only formats local context; this engine never calls a
+    // provider factory or sends through its explicitly proxy-free HTTP client.
+    let provider = Provider::with_key(
+        pcfg.clone(),
+        String::new(),
+        reqwest::Client::builder().no_proxy().build()?,
+    )
+    .with_name(name);
+    let key = crate::tokens::provider_key(name, &pcfg);
+    let ratio = st.token_ratio(&key, &model)?;
+    let mut ctx = provider.prepare_attachments(&ctx, &model);
+    if !input.draft.is_empty()
+        && pcfg
+            .vision
+            .unwrap_or_else(|| crate::provider::is_vision_model(&model))
+    {
+        if let Some(message) = ctx.last_mut() {
+            let mut parts = message["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| vec![json!({"type":"text","text":message["content"]})]);
+            for a in input
+                .attachments
+                .iter()
+                .filter(|a| crate::daemon::is_raster_image(&a.mime))
+            {
+                parts.push(json!({"type":"image_url","image_url":{"url":dimension_image(a.width.zip(a.height)),"detail":pcfg.image_detail}}));
+            }
+            message["content"] = json!(parts);
+        }
+    }
+    let prompt_tokens =
+        crate::tokens::calibrated(provider.prompt_tokens(&ctx, &defs, &model), ratio);
+    let basis = ForecastBasis {
+        provider_key: key,
+        model: model.clone(),
+        role: role.clone(),
+        session_id: input.session_id.clone(),
+        cwd_hash: hash(&cwd),
+        tools_hash: hash(&defs),
+        prompt_tokens,
+    };
+    let recorded = st.recorded_forecasts()?;
+    let runs = st.run_metrics(2000)?;
+    let mut steps = Vec::new();
+    let mut tokens = Vec::new();
+    let mut costs = Vec::new();
+    let mut durations = Vec::new();
+    let mut caches = Vec::new();
+    let mut crossings = 0;
+    let threshold = pcfg.context_for(&model) as f64 * cfg.compaction.fraction();
+    for (id, old) in &recorded {
+        let b = &old.basis;
+        let same_location = b.session_id.is_some() && b.session_id == basis.session_id
+            || (basis.cwd_hash != hash(&Option::<String>::None) && b.cwd_hash == basis.cwd_hash);
+        let scale = prompt_tokens as f64 / b.prompt_tokens.max(1) as f64;
+        if b.provider_key != basis.provider_key
+            || b.model != model
+            || b.role != role
+            || b.tools_hash != basis.tools_hash
+            || !same_location
+            || !(0.5..=2.0).contains(&scale)
+        {
+            continue;
+        }
+        let Some(run) = runs
+            .iter()
+            .find(|r| &r.run_id == id && r.status == "completed")
+        else {
+            continue;
+        };
+        let served = st.forecast_models(id)?;
+        if served.is_empty()
+            || served
+                .iter()
+                .any(|(provider, model)| provider != name || model != &basis.model)
+        {
+            continue;
+        }
+        let (cost, peak, cached) = st.forecast_usage(id, cfg)?;
+        if peak == 0 {
+            continue;
+        }
+        steps.push(run.steps as f64);
+        tokens.push((run.prompt_tokens + run.completion_tokens) as f64 * scale);
+        durations.push(run.duration_ms as f64);
+        if let Some(c) = cost {
+            costs.push(c * scale);
+        }
+        if peak as f64 * scale > threshold {
+            crossings += 1;
+        }
+        if run.prompt_tokens > 0 {
+            caches.push(cached as f64 / run.prompt_tokens as f64);
+        }
+    }
+    let n = steps.len();
+    let unpriced = pcfg.price_for(&model).is_none();
+    let cost_usd = if unpriced || costs.len() != n {
+        None
+    } else {
+        range(costs)
+    };
+    let will_compact = prompt_tokens as f64 > threshold;
+    let confirmation_required = cfg
+        .limits
+        .forecast_confirm_usd
+        .zip(cost_usd.as_ref())
+        .is_some_and(|(limit, r)| r.p90 > limit);
+    let mut warnings = vec![
+        "Local calibrated heuristic; empirical ranges are forecasts, not limits or guarantees"
+            .into(),
+        "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded".into(),
+    ];
+    if !input.attachments.is_empty() {
+        warnings.push("Preview attachments are not uploaded; final artifact identifiers and unsupported media may change prompt size".into());
+    }
+    if n == 0 {
+        warnings.push(
+            "Cache behaviour and future compaction risk unknown without comparable history".into(),
+        );
+        warnings.push("No comparable history yet: prompt-size-only estimate".into());
+    }
+    if unpriced {
+        warnings.push("Unpriced model: no dollar forecast".into());
+    } else if n > 0 && cost_usd.is_none() {
+        warnings.push("Incomplete historical prices: no dollar forecast".into());
+    }
+    if ProviderCfg::is_auto_model(&wanted)
+        || rcfg.is_some_and(|r| ProviderCfg::is_auto_model(&r.model))
+    {
+        warnings.push("Auto-model estimate uses local deterministic selection; routing/exploration/fallback may choose differently".into());
+    }
+    let mut f = RunForecast {
+        fingerprint: String::new(),
+        basis,
+        comparable_runs: n,
+        steps: range(steps),
+        tokens: range(tokens),
+        cost_usd,
+        duration_ms: range(durations),
+        will_compact,
+        compaction_probability: if will_compact {
+            Some(1.0)
+        } else if n > 0 {
+            Some(crossings as f64 / n as f64)
+        } else {
+            None
+        },
+        cached_fraction: range(caches),
+        unpriced,
+        warnings,
+        confirmation_required,
+        confirmation_id: None,
+        hint: String::new(),
+    };
+    f.fingerprint = hash(&(
+        context_hash,
+        &input.draft,
+        &logical,
+        &cfg,
+        &pcfg.prices,
+        &pcfg.model_context_tokens,
+        pcfg.context_tokens,
+        pcfg.image_max_px,
+        &pcfg.image_detail,
+        &f.basis.provider_key,
+        &f.basis.model,
+        &f.basis.role,
+        &f.basis.cwd_hash,
+        &f.basis.tools_hash,
+        &recorded,
+    ));
+    f.hint = format!(
+        "{} prompt tokens · {}{}{}",
+        prompt_tokens,
+        match &f.cost_usd {
+            Some(c) => format!("~${:.2}–{:.2} · ", c.p50, c.p90),
+            None => String::new(),
+        },
+        match &f.steps {
+            Some(s) => format!("~{:.0} steps · {n} comparable Runs ({model}/{role})", s.p50),
+            None => format!("no history yet ({model}/{role})"),
+        },
+        if will_compact {
+            " · will compact"
+        } else if unpriced {
+            " · unpriced"
+        } else {
+            ""
+        }
+    );
+    Ok(f)
+}
+
+pub fn describe(f: &RunForecast) -> String {
+    let show = |r: &Option<ForecastRange>, unit: &str| {
+        r.as_ref()
+            .map(|r| format!("p50 {:.2} / p90 {:.2} {unit}", r.p50, r.p90))
+            .unwrap_or_else(|| "unknown (no comparable history or price)".into())
+    };
+    format!("{}\nSteps: {}\nTokens: {}\nCost: {}\nDuration: {}\nCached fraction: {}\nCompaction probability: {}\n{}",f.hint,show(&f.steps,"steps"),show(&f.tokens,"tokens"),show(&f.cost_usd,"USD"),show(&f.duration_ms,"ms"),show(&f.cached_fraction,""),f.compaction_probability.map_or("unknown".into(),|p|format!("{:.0}%",100.0*p)),f.warnings.join("\n"))
+}
+
+pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
+    let runs = st.run_metrics(2000)?;
+    let mut rows = Vec::new();
+    for (id, f) in st.recorded_forecasts()? {
+        let Some(run) = runs.iter().find(|r| r.run_id == id) else {
+            continue;
+        };
+        let (cost, _, _) = st.forecast_usage(&id, cfg)?;
+        let actual = (run.prompt_tokens + run.completion_tokens) as f64;
+        let finished = run.status == "completed";
+        let error = f
+            .tokens
+            .as_ref()
+            .filter(|_| finished)
+            .map(|r| actual - r.p50);
+        let coverage = f
+            .tokens
+            .as_ref()
+            .filter(|_| finished)
+            .map(|r| actual >= r.p50 && actual <= r.p90);
+        rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":actual,"cost_usd":cost,"duration_ms":run.duration_ms},"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished}));
+    }
+    Ok(json!(rows))
+}

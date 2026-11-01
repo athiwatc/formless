@@ -351,7 +351,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 58;
+pub const SCHEMA_VERSION: i64 = 59;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -436,7 +436,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 58] = [
+const MIGRATIONS: [(i64, MigrationStep); 59] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -711,6 +711,9 @@ const MIGRATIONS: [(i64, MigrationStep); 58] = [
                 ratio REAL NOT NULL, samples INTEGER NOT NULL,
                 PRIMARY KEY(provider_key, model));",
         )?)
+    }),
+    (59, |c| {
+        Ok(c.execute_batch("CREATE TABLE run_forecasts (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, forecast TEXT NOT NULL); CREATE TRIGGER immutable_run_forecast BEFORE UPDATE ON run_forecasts BEGIN SELECT RAISE(ABORT, 'Run forecast is immutable'); END;")?)
     }),
 ];
 
@@ -1092,6 +1095,16 @@ impl Store {
 
     /// An extra connection for reads only (the database must already be
     /// migrated). WAL lets it read while the main connection writes.
+    /// Preview-only connection: never creates, migrates or changes journal mode.
+    pub fn open_forecast_reader(file: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.execute_batch("PRAGMA query_only=ON;")?;
+        Ok(Self {
+            conn,
+            rewrites: Default::default(),
+        })
+    }
+
     pub fn open_reader(file: &Path) -> Result<Self> {
         let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
         conn.execute_batch(READER_PRAGMAS)?;
@@ -2585,6 +2598,68 @@ impl Store {
     }
 
     /// Per-Run metrics, newest first.
+    pub fn record_forecast(
+        &self,
+        run_id: &str,
+        forecast: &formless_protocol::RunForecast,
+    ) -> Result<()> {
+        self.ex(
+            "INSERT INTO run_forecasts(run_id,forecast) VALUES(?1,?2)",
+            params![run_id, serde_json::to_string(forecast)?],
+        )?;
+        Ok(())
+    }
+    pub fn recorded_forecasts(&self) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_forecasts')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut stmt =
+            self.ps("SELECT run_id,forecast FROM run_forecasts ORDER BY rowid DESC LIMIT 2000")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|r| {
+            let (id, json) = r?;
+            Ok((id, serde_json::from_str(&json)?))
+        })
+        .collect()
+    }
+    pub fn forecast_models(&self, run_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .ps("SELECT DISTINCT provider,model FROM run_usage WHERE run_id=?1 AND source='run'")?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn forecast_usage(
+        &self,
+        run_id: &str,
+        cfg: &crate::Config,
+    ) -> Result<(Option<f64>, u64, u64)> {
+        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost FROM run_usage WHERE run_id=?1")?;
+        let rows = stmt.query_map(params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<f64>>(6)?,
+            ))
+        })?;
+        let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
+        let mut any = false;
+        for row in rows {
+            let (p, m, input, output, cache, write, reported) = row?;
+            any = true;
+            peak = peak.max(input.max(0) as u64);
+            cached += cache.max(0) as u64;
+            cost = cost
+                .zip(cfg.cost_of(&p, &m, input, output, cache, write, reported))
+                .map(|(a, b)| a + b);
+        }
+        Ok((cost.filter(|_| any), peak, cached))
+    }
+
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         self.run_metrics_for(None, limit, None)
     }

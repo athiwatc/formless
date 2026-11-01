@@ -1136,6 +1136,23 @@ pub fn tool_definitions(
     session_id: Option<&str>,
     inline_limit: usize,
 ) -> Result<Vec<Value>> {
+    definitions(store, session_id, inline_limit, true)
+}
+
+pub fn preview_tool_definitions(
+    store: &Store,
+    session_id: Option<&str>,
+    inline_limit: usize,
+) -> Result<Vec<Value>> {
+    definitions(store, session_id, inline_limit, false)
+}
+
+fn definitions(
+    store: &Store,
+    session_id: Option<&str>,
+    inline_limit: usize,
+    persist: bool,
+) -> Result<Vec<Value>> {
     let tools = agent_tools(store)?;
     // Every Session's listing is frozen at its first step (in small and
     // large registries alike): Tool definitions are part of the cached
@@ -1160,7 +1177,7 @@ pub fn tool_definitions(
                 .filter(|t| t.pinned && !loaded.contains(&t.id))
                 .map(|t| t.id.clone())
                 .collect();
-            if let Some(s) = session_id {
+            if let Some(s) = session_id.filter(|_| persist) {
                 store.load_session_tools(s, &pinned, "pinned")?;
             }
             loaded.extend(pinned);
@@ -1172,7 +1189,7 @@ pub fn tool_definitions(
                 .take(inline_limit.saturating_sub(loaded.len()))
                 .map(|t| t.id.clone())
                 .collect();
-            if let Some(s) = session_id {
+            if let Some(s) = session_id.filter(|_| persist) {
                 store.load_session_tools(s, &filler, "filler")?;
             }
             loaded.extend(filler);
@@ -1206,7 +1223,7 @@ pub fn tool_definitions(
         }
         if let Some((_i, v)) = store.get_tool_current(&info.id)? {
             let def = registry_definition(&info, &v);
-            if let Some(s) = session_id {
+            if let Some(s) = session_id.filter(|_| persist) {
                 store.pin_definition(s, &info.id, v.version, &def.to_string())?;
             }
             defs.push(def);

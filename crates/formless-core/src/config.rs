@@ -203,6 +203,21 @@ pub struct LimitsCfg {
     pub run_usd: Option<f64>,
     /// Model steps of one Run.
     pub run_steps: Option<u64>,
+    /// Ask before sending when a priced historical p90 forecast exceeds this.
+    #[serde(default, deserialize_with = "forecast_threshold")]
+    pub forecast_confirm_usd: Option<f64>,
+}
+
+fn forecast_threshold<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<f64>, D::Error> {
+    let value = Option::<f64>::deserialize(d)?;
+    if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+        return Err(serde::de::Error::custom(
+            "forecast_confirm_usd must be finite and nonnegative",
+        ));
+    }
+    Ok(value)
 }
 
 /// One Role (SPEC §4.5).

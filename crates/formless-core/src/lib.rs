@@ -10,6 +10,7 @@ pub mod docs;
 pub mod dupes;
 pub mod errors;
 pub mod files;
+pub mod forecast;
 pub mod fuzzy;
 pub mod hooks;
 pub mod housekeeping;

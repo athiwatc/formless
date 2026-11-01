@@ -4528,3 +4528,28 @@ and fallback tests use the same lock as setters. Tests pin hostile inherited
 credentials, named-provider/file overrides, unwind restoration and contrasting
 parallel mock keys. A source check rejects bare environment mutation outside the
 shared helper.
+
+### Local pre-Run forecasts (§5.2, §10.6, §12)
+
+`ForecastRun` previews the current draft, held attachments, checkpoint and frozen
+Tool schemas without starting a Run or contacting a provider. The calibrated
+prompt count is approximate. Completed Runs with recorded, comparable provider,
+model/role, folder/Session, Tool snapshot and prompt size supply empirical p50/p90
+steps, tokens, USD and duration. Legacy Runs without those inputs are excluded.
+No history means prompt size only; missing prices mean no dollar range. Cache
+fractions and compaction probabilities describe comparable history, not guarantees.
+A draft already above the local compaction trigger is flagged immediately.
+
+TUI/web composer hints debounce and discard stale results after draft, Session,
+model or attachment changes. `formless run --estimate TASK [--session ID]
+[--model M] [--json]` uses the same Core engine locally, with no Session creation,
+Run, upload, last-Run marker, credential refresh or provider request.
+
+`limits.forecast_confirm_usd` is optional, finite and nonnegative. A priced p90
+above it requires explicit confirmation. `ConfirmForecast` acknowledges a
+short-lived connection-bound preview; the daemon rechecks current inputs before
+appending or consuming attachments. Stale consent fails closed. Headless sends
+without `--yes` fail closed when confirmation is required. Forecasts add no step,
+token or time caps. Admission persists an immutable per-Run forecast and its
+non-text basis; Metrics shows predictions, actuals, errors and coverage, with
+unfinished/unknown outcomes distinguished from completed observations.

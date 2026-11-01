@@ -577,7 +577,7 @@
     S.view = view;
     prefs.set("view", view);
     if (view === "tools") { refreshTools(); refreshModules(); }
-    if (view === "metrics") { refreshTools(); refreshModelStats(); }
+    if (view === "metrics") { refreshTools(); refreshModelStats(); refreshForecastMetrics(); }
     if (view === "proposals") refreshProposals();
     if (view === "approvals") refreshApprovals();
     if (view === "settings") refreshSettings();
@@ -2029,7 +2029,67 @@
       h("button", { class: "btn small", type: "button", "aria-label": "Dismiss", onclick: () => { S.runTools = null; renderRunTools(); } }, "×"));
   }
 
+  let forecastTimer = null;
+  let forecastSequence = 0;
+  let forecastStampLast = "";
+  function forecastStamp(draft = $("input").value) {
+    const session = S.sessions.find((s) => s.id === S.current);
+    return JSON.stringify([S.current, draft, session && session.model, session && session.cwd, S.chips[S.current] || [], S.daemonOnline, S.hello]);
+  }
+  function scheduleForecast() {
+    const stamp = forecastStamp();
+    if (stamp === forecastStampLast) return;
+    forecastStampLast = stamp;
+    const sequence = ++forecastSequence;
+    clearTimeout(forecastTimer);
+    const box = $("forecast-hint");
+    if (box) box.textContent = "";
+    const draft = $("input").value.trim();
+    if (!S.daemonOnline || !S.current || !draft || draft.startsWith("/") || isRunning()) return;
+    const sid = S.current;
+    forecastTimer = setTimeout(async () => {
+      try {
+        const result = await request({type:"forecast_run",input:{session_id:sid,draft}});
+        if (sequence !== forecastSequence || stamp !== forecastStamp()) return;
+        if (box) { box.textContent = result.hint; box.title = (result.warnings || []).join("\n"); }
+      } catch (_) { /* A failed preview never executes or clears a draft. */ }
+    }, 300);
+  }
+  async function confirmForecast(sid, text) {
+    // Use the same live transport for preview, consent and the later send.
+    const stamp = forecastStamp();
+    const sequence = forecastSequence;
+    const forecast = await request({type:"forecast_run",input:{session_id:sid,draft:text}});
+    if (sid !== S.current || stamp !== forecastStamp() || sequence !== forecastSequence || !S.daemonOnline) return false;
+    if (forecast.confirmation_required) {
+      if (!(await ask({title:"Forecast confirmation",text:forecast.hint,body:h("p",null,(forecast.warnings || []).join(" ")),ok:"Confirm send"}))) return false;
+      if (sid !== S.current || stamp !== forecastStamp() || sequence !== forecastSequence || !S.daemonOnline) return false;
+      await request({type:"confirm_forecast",id:forecast.confirmation_id});
+    }
+    return sid === S.current && stamp === forecastStamp() && sequence === forecastSequence && S.daemonOnline;
+  }
+  async function refreshForecastMetrics() {
+    try {
+      const result = await request({type:"run_metrics",limit:200});
+      const box = $("forecast-metrics");
+      if (!box) return;
+      box.replaceChildren(h("h3",null,"Forecast versus actual"));
+      const rows = result.forecasts || [];
+      if (!rows.length) { box.append(h("p",null,"No recorded forecasts yet. Legacy Runs lack comparable frozen inputs.")); return; }
+      const groups = new Map();
+      for (const row of rows) {
+        const key = row.model + "/" + row.role;
+        const group = groups.get(key) || {n:0,error:0,covered:0,unknown:0};
+        if (row.token_error == null) group.unknown++; else {group.n++;group.error+=row.token_error;group.covered+=row.token_covered_p50_p90 ? 1 : 0;}
+        groups.set(key,group);
+      }
+      for (const [key,g] of groups) box.append(h("p",null,key+": "+g.n+" completed comparisons · mean token error "+(g.n ? Math.round(g.error/g.n) : "unknown")+" · p50–p90 coverage "+(g.n ? Math.round(100*g.covered/g.n)+"%" : "unknown")+" · "+g.unknown+" interrupted/unknown/no-history"));
+      for (const row of rows) box.append(h("details",null,h("summary",null,row.model+" · "+row.status+" · "+row.comparable_runs+" comparable Runs · actual "+row.actual.tokens+" tokens · error "+(row.token_error == null ? "unknown" : Math.round(row.token_error))),h("pre",null,JSON.stringify({forecast:row.forecast,actual:row.actual},null,2))));
+    } catch (_) { /* Metrics are read-only and optional on older daemons. */ }
+  }
+
   function renderComposer() {
+    scheduleForecast();
     const running = isRunning();
     $("composer").classList.toggle("running", running);
     $("stop-btn").hidden = !running;
@@ -2917,6 +2977,7 @@
           ["animations", on(c.tui.animations), "tui.animations", "bool"],
           ["on_start (last, new, picker)", c.tui.on_start, "tui.on_start", "text"],
           ["screen_reader", on(c.tui.screen_reader), "tui.screen_reader", "bool"]]),
+        section("Forecast", [["confirm above p90 USD", c.limits && c.limits.forecast_confirm_usd, "limits.forecast_confirm_usd", "number"]]),
         section("Relay", [["enabled", on(c.relay.enabled)], ["url", c.relay.url]]),
         relayDevicesSection(),
         section("Paths", [["config", c.paths.config], ["data", c.paths.data]]));
@@ -4432,13 +4493,30 @@
       note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
       return;
     }
+    if (!isRunning() && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
+      try {
+        if (!(await confirmForecast(sid,text))) {
+          if (S.current === sid && !input.value) input.value=text; else attachmentDrafts[sid]=text;
+          autosize();return;
+        }
+      } catch (error) {
+        if (S.current === sid && !input.value) input.value=text; else attachmentDrafts[sid]=text;
+        autosize();note("Forecast was not confirmed: "+error.message,true);return;
+      }
+    }
     // One key per user action (#891): pressing Send again after a reply
     // was lost reuses it, so the daemon doesn't send the message twice.
     const same = S.unsent && S.unsent.session === sid && S.unsent.text === text;
     const key = same ? S.unsent.key
       : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
     S.unsent = { session: sid, text, key };
-    const r = await act({ type: "send_message", session_id: sid, content: text, mode, client_msg_id: key });
+    let r = null;
+    try { r = await request({ type: "send_message", session_id: sid, content: text, mode, client_msg_id: key }); }
+    catch (error) {
+      if (error.daemonResponse && S.unsent && S.unsent.key === key) S.unsent = null;
+      if (S.current === sid && !input.value) { input.value = text; autosize(); } else attachmentDrafts[sid] = text;
+      toast(error.message,true);note(error.message,true);
+    }
     if (r && S.unsent && S.unsent.key === key) S.unsent = null;
     // The attachments went with it.
     if (r) { delete S.chips[sid]; delete mentionAttached[sid]; renderChips(); }
@@ -5012,6 +5090,7 @@
         // The code (formless_protocol::codes) is what to branch on; the text is for people.
         const err = new Error(msg.error || "daemon error");
         err.code = (msg.result && msg.result.code) || null;
+        err.daemonResponse = true;
         p.reject(err);
       }
     } else if (msg.kind === "event") onEvent(msg);
@@ -5258,7 +5337,7 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", () => { palette.sel = 0; autosize(); updatePalette(); updateMentions(); });
+  $("input").addEventListener("input", () => { palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
     if (paletteKey(e) || mentionKey(e)) return;

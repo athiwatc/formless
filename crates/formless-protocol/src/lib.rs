@@ -773,6 +773,61 @@ pub struct UsageInfo {
     pub memories: i64,
 }
 
+/// A local-only preview attachment. No path is accepted from remote clients.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ForecastAttachment {
+    pub name: String,
+    pub mime: String,
+    pub bytes: u64,
+    #[serde(default)]
+    pub sha256: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ForecastInput {
+    pub session_id: Option<String>,
+    pub draft: String,
+    pub model: Option<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<ForecastAttachment>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ForecastRange {
+    pub p50: f64,
+    pub p90: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ForecastBasis {
+    pub provider_key: String,
+    pub model: String,
+    pub role: String,
+    pub session_id: Option<String>,
+    pub cwd_hash: String,
+    pub tools_hash: String,
+    pub prompt_tokens: usize,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunForecast {
+    pub fingerprint: String,
+    pub basis: ForecastBasis,
+    pub comparable_runs: usize,
+    pub steps: Option<ForecastRange>,
+    pub tokens: Option<ForecastRange>,
+    pub cost_usd: Option<ForecastRange>,
+    pub duration_ms: Option<ForecastRange>,
+    pub will_compact: bool,
+    pub compaction_probability: Option<f64>,
+    pub cached_fraction: Option<ForecastRange>,
+    pub unpriced: bool,
+    pub warnings: Vec<String>,
+    pub confirmation_required: bool,
+    #[serde(default)]
+    pub confirmation_id: Option<String>,
+    pub hint: String,
+}
+
 /// One Run's metrics (SPEC §8.7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunMetricsInfo {
@@ -1286,6 +1341,15 @@ pub enum Request {
         id: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
+    },
+    /// Local-only preview; does not freeze Tools, upload files or start a Run.
+    ForecastRun {
+        input: ForecastInput,
+    },
+    /// Explicit consent for an unexpired preview on this connection. Changed
+    /// input/history/Tools/model/prices/threshold invalidates it before send.
+    ConfirmForecast {
+        id: String,
     },
     SendMessage {
         session_id: String,

@@ -570,6 +570,14 @@ struct SentEntry {
     outcome: tokio::sync::watch::Receiver<Option<SendOutcome>>,
 }
 
+struct ForecastConsent {
+    owner: Option<u64>,
+    input: ForecastInput,
+    fingerprint: String,
+    at: std::time::Instant,
+    approved: bool,
+}
+
 pub struct Daemon {
     pub(crate) paths: Paths,
     pub(crate) store: Arc<StdMutex<Store>>,
@@ -599,6 +607,8 @@ pub struct Daemon {
     budget_warned: StdMutex<std::collections::HashSet<String>>,
     budget_waived: Arc<StdMutex<std::collections::HashSet<String>>>,
     budget_admission: Arc<crate::budget::Admission>,
+    forecast_admission: StdMutex<()>,
+    forecast_consents: StdMutex<HashMap<String, ForecastConsent>>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
     /// or next Run (cleared when it ends).
     step_limits: StdMutex<HashMap<String, u32>>,
@@ -783,6 +793,8 @@ impl Daemon {
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: Arc::new(StdMutex::new(Default::default())),
             budget_admission: Arc::new(Default::default()),
+            forecast_admission: StdMutex::new(()),
+            forecast_consents: StdMutex::new(Default::default()),
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
@@ -1595,6 +1607,61 @@ impl Daemon {
                 }
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
+            }
+            Request::ForecastRun { input } => {
+                let cfg = self.config()?;
+                let mut forecast =
+                    self.with_reader(|st| crate::forecast::estimate_store(st, &cfg, &input))?;
+                if forecast.confirmation_required {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let mut consents = self.forecast_consents.locked();
+                    consents.retain(|_, c| c.at.elapsed().as_secs() < 300);
+                    if consents.len() >= 256 {
+                        consents.clear();
+                    }
+                    consents.insert(
+                        id.clone(),
+                        ForecastConsent {
+                            owner: current_client().map(|(id, _)| id),
+                            input,
+                            fingerprint: forecast.fingerprint.clone(),
+                            at: std::time::Instant::now(),
+                            approved: false,
+                        },
+                    );
+                    forecast.confirmation_id = Some(id);
+                }
+                Ok(serde_json::to_value(forecast)?)
+            }
+            Request::ConfirmForecast { id } => {
+                let _admission = self.forecast_admission.locked();
+                let (input, fingerprint) = {
+                    let consents = self.forecast_consents.locked();
+                    let consent = consents
+                        .get(&id)
+                        .filter(|c| {
+                            c.at.elapsed().as_secs() < 300
+                                && c.owner == current_client().map(|(id, _)| id)
+                        })
+                        .context(RequestFailure::invalid(
+                            "forecast confirmation expired or belongs to another connection",
+                        ))?;
+                    (consent.input.clone(), consent.fingerprint.clone())
+                };
+                let cfg = self.config()?;
+                let current =
+                    self.with_reader(|st| crate::forecast::estimate_store(st, &cfg, &input))?;
+                if current.fingerprint != fingerprint {
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "forecast inputs changed; preview and confirm again",
+                    )));
+                }
+                self.forecast_consents
+                    .locked()
+                    .get_mut(&id)
+                    .context("forecast expired")?
+                    .approved = true;
+                Ok(json!({"confirmed":true}))
             }
             Request::SendMessage {
                 session_id,
@@ -2870,7 +2937,9 @@ impl Daemon {
                     )
                 })?;
                 let summary = crate::runs::summarize(&runs);
-                Ok(json!({"runs": runs, "summary": summary}))
+                let forecasts =
+                    self.with_reader(|st| crate::forecast::metrics(st, &self.config()?))?;
+                Ok(json!({"runs": runs, "summary": summary, "forecasts": forecasts}))
             }
             Request::ListMemories => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_memories())?,
@@ -4192,7 +4261,22 @@ impl Daemon {
     ) -> Result<serde_json::Value> {
         self.with_store(|st| st.get_session(&session_id))?
             .context(RequestFailure::not_found("session not found"))?;
+        let _admission = self.forecast_admission.locked();
         let busy = self.runs.locked().contains_key(&session_id);
+        let forecast = if !busy {
+            let cfg = self.config()?;
+            let input = ForecastInput {
+                session_id: Some(session_id.clone()),
+                draft: content.clone(),
+                ..Default::default()
+            };
+            let forecast =
+                self.with_reader(|st| crate::forecast::estimate_store(st, &cfg, &input))?;
+            self.check_forecast_consent(&forecast)?;
+            Some(forecast)
+        } else {
+            None
+        };
         match (busy, mode) {
             (true, SendMode::Queue) => {
                 // Persisted, so a daemon restart does not lose it.
@@ -4237,7 +4321,7 @@ impl Daemon {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                match self.start_run(session_id.clone()) {
+                match self.start_run_forecast(session_id.clone(), forecast) {
                     Ok(()) => Ok(json!({"started": true})),
                     // Another client's Run started first: the message (already
                     // in the transcript) joins it at its next step (#726).
@@ -4260,6 +4344,51 @@ impl Daemon {
     /// starter (another client's send or edit) gets an "already running"
     /// error naming the Run that won, and that Run's controls stay.
     fn start_run(self: &Arc<Self>, session_id: String) -> Result<()> {
+        let _admission = self.forecast_admission.locked();
+        let cfg = self.config()?;
+        let forecast = self.with_reader(|st| {
+            crate::forecast::estimate_store(
+                st,
+                &cfg,
+                &ForecastInput {
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        self.check_forecast_consent(&forecast)?;
+        self.start_run_forecast(session_id, Some(forecast))
+    }
+
+    fn check_forecast_consent(&self, forecast: &RunForecast) -> Result<()> {
+        if !forecast.confirmation_required {
+            return Ok(());
+        }
+        let owner = current_client().map(|(id, _)| id);
+        let mut consents = self.forecast_consents.locked();
+        let id = consents
+            .iter()
+            .find(|(_, c)| {
+                c.approved
+                    && c.owner == owner
+                    && c.at.elapsed().as_secs() < 300
+                    && c.fingerprint == forecast.fingerprint
+            })
+            .map(|(id, _)| id.clone());
+        let Some(id) = id else {
+            return Err(anyhow::Error::new(RequestFailure::invalid(
+                "forecast confirmation required; preview and confirm current inputs before sending",
+            )));
+        };
+        consents.remove(&id);
+        Ok(())
+    }
+
+    fn start_run_forecast(
+        self: &Arc<Self>,
+        session_id: String,
+        forecast: Option<RunForecast>,
+    ) -> Result<()> {
         if let Some(ctl) = self.runs.locked().get(&session_id) {
             return Err(anyhow::Error::new(RequestFailure::busy(format!(
                 "already running: run {}",
@@ -4267,7 +4396,27 @@ impl Daemon {
             ))));
         }
         self.close_dangling_tool_calls(&session_id)?;
-        let run_id = self.with_store(|st| st.create_run(&session_id))?;
+        let forecast = match forecast {
+            Some(f) => f,
+            None => self.with_reader(|st| {
+                crate::forecast::estimate_store(
+                    st,
+                    &self.config()?,
+                    &ForecastInput {
+                        session_id: Some(session_id.clone()),
+                        ..Default::default()
+                    },
+                )
+            })?,
+        };
+        let run_id = self.with_store(|st| {
+            let id = st.create_run(&session_id)?;
+            if let Err(error) = st.record_forecast(&id, &forecast) {
+                let _ = st.set_run_status(&id, "interrupted");
+                return Err(error);
+            }
+            Ok(id)
+        })?;
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<()>();
@@ -4525,23 +4674,47 @@ impl Daemon {
     }
 
     fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
-        // A stale finisher must not take a newer Run's queued message.
+        let _admission = self.forecast_admission.locked();
         if self.runs.locked().contains_key(&session_id) {
             return;
         }
-        // Queued messages start fresh Runs, in order (SPEC §5.3).
         let next = self
+            .with_reader(|st| Ok(st.queued_items(&session_id)?.into_iter().next()))
+            .ok()
+            .flatten();
+        let Some(next) = next else {
+            return;
+        };
+        let forecast = self.with_reader(|st| {
+            crate::forecast::estimate_store(
+                st,
+                &self.config()?,
+                &ForecastInput {
+                    session_id: Some(session_id.clone()),
+                    draft: next.content.clone(),
+                    ..Default::default()
+                },
+            )
+        });
+        let Ok(forecast) = forecast else {
+            return;
+        };
+        if forecast.confirmation_required {
+            self.broadcast(Event::Note{session_id:Some(session_id),text:"Queued message kept: forecast confirmation is required. Preview and explicitly send it after confirming.".into()});
+            return;
+        }
+        let content = self
             .with_store(|st| st.pop_queued_message(&session_id))
             .ok()
             .flatten();
-        if let Some(content) = next {
+        if let Some(content) = content {
             self.queue_changed(&session_id);
             if let Ok(msg) = self.append_user_message(&session_id, &content) {
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                let _ = self.start_run(session_id);
+                let _ = self.start_run_forecast(session_id, Some(forecast));
             }
         }
     }
@@ -7448,35 +7621,21 @@ impl Daemon {
     /// plus its model family's addendum, if any (stable per Session, so
     /// the cached prefix stays valid).
     fn fresh_session_prompt(&self, session_id: &str) -> String {
-        let mut prompt = self.effective_system_prompt();
-        let session = self
-            .with_reader(|st| st.get_session(session_id))
-            .ok()
-            .flatten();
-        if let Some(cwd) = session.as_ref().and_then(|s| s.cwd.as_deref()) {
-            prompt.push_str(&format!(
-                "\n\nWorking directory: {cwd}. Paths the user gives without a leading / are relative to it; pass absolute paths to Tools."
-            ));
-        }
-        if let Ok(cfg) = self.config() {
-            let model = self.session_base_model(session_id, &cfg);
-            if let Some(extra) = cfg
-                .provider
-                .tool_use_nudge
-                .then(|| crate::provider::model_family_addendum(&model))
-                .flatten()
-            {
-                prompt.push_str("\n\n");
-                prompt.push_str(extra);
-            }
-        }
-        // Last, after the shared prefix, so other Sessions' caches hold.
-        if let Some(text) = session.and_then(|s| s.instructions) {
-            prompt.push_str(&format!(
-                "\n\nStanding instructions for this Session, from the user:\n{text}"
-            ));
-        }
-        prompt
+        let Ok(cfg) = self.config() else {
+            return SYSTEM_PROMPT.into();
+        };
+        let model = self.session_base_model(session_id, &cfg);
+        self.with_reader(|st| {
+            let session = st.get_session(session_id)?;
+            crate::forecast::fresh_prompt(
+                st,
+                &cfg,
+                session.as_ref(),
+                &model,
+                session.as_ref().and_then(|s| s.cwd.as_deref()),
+            )
+        })
+        .unwrap_or_else(|_| SYSTEM_PROMPT.into())
     }
 
     /// A Session's working directory (SPEC §5.1), if set.
@@ -7515,52 +7674,11 @@ impl Daemon {
     }
 
     pub fn effective_system_prompt(&self) -> String {
-        let mut prompt = self
-            .with_store(|st| st.effective_system_prompt(SYSTEM_PROMPT))
-            .unwrap_or_else(|_| SYSTEM_PROMPT.to_string());
-        // The skills index (SPEC §7.10): names and one-line descriptions,
-        // sorted. It is part of the per-Session prompt snapshot, so a new
-        // skill reaches new Sessions (or this one after compaction).
-        let skills: Vec<String> = self
-            .with_store(|st| st.list_skills())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| s.enabled && !s.retired)
-            .map(|s| format!("- {}: {}", s.name, s.description))
-            .collect();
-        if !skills.is_empty() {
-            prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
-            prompt.push_str(&skills.join("\n"));
-        }
-        // Roles (SPEC §4.5): described so the agent picks one for
-        // sub-agents and llm calls by intent.
-        if let Ok(cfg) = self.config() {
-            if !cfg.roles.is_empty() {
-                prompt.push_str("\n\nRoles (pass {role: name} to agents.run or llm.complete from a Tool with the agent/llm Capability):");
-                for (name, r) in &cfg.roles {
-                    let model = if r.model.is_empty() {
-                        "provider default"
-                    } else {
-                        r.model.as_str()
-                    };
-                    prompt.push_str(&format!(
-                        "\n- {name}: {} [{} · {model}]",
-                        if r.description.is_empty() {
-                            "(no description)"
-                        } else {
-                            r.description.as_str()
-                        },
-                        r.provider
-                            .as_deref()
-                            .unwrap_or(crate::config::DEFAULT_PROVIDER)
-                    ));
-                }
-            }
-        }
-        // User memory (SPEC §7.11), also part of the snapshot.
-        let memories = self.with_store(|st| st.list_memories()).unwrap_or_default();
-        prompt.push_str(&crate::memory::prompt_block(&memories));
-        prompt
+        let Ok(cfg) = self.config() else {
+            return SYSTEM_PROMPT.into();
+        };
+        self.with_reader(|st| crate::forecast::effective_prompt(st, &cfg))
+            .unwrap_or_else(|_| SYSTEM_PROMPT.into())
     }
 
     /// Current module code for Invocations: one shared snapshot, re-read

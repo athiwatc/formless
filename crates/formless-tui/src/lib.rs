@@ -144,6 +144,17 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    ForecastHint {
+        generation: String,
+    },
+    ForecastSend {
+        generation: String,
+        queued: bool,
+    },
+    ForecastConfirm {
+        generation: String,
+        queued: bool,
+    },
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
     SendMessage,
@@ -1284,8 +1295,21 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// How long the TUI waits for a request's answer before giving up on it.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 
+#[derive(Default)]
+struct ForecastUi {
+    generation: String,
+    input_cache: std::cell::RefCell<Option<(String, ForecastInput)>>,
+    changed: Option<Instant>,
+    pending: bool,
+    hint: Option<RunForecast>,
+    modal: Option<(String, RunForecast, bool)>,
+    approved: Option<String>,
+    metrics: Vec<serde_json::Value>,
+}
+
 struct App {
     paths: Paths,
+    forecast: ForecastUi,
     view: View,
     wizard: Option<Wizard>,
     client: Option<DaemonClient>,
@@ -1642,6 +1666,7 @@ impl App {
                 None
             },
             paths,
+            forecast: Default::default(),
             view: View::Chat,
             client: None,
             inbox: None,
@@ -1889,6 +1914,7 @@ impl App {
     /// The daemon went away (restart, crash): keep everything on screen,
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
+        self.forecast = ForecastUi::default();
         self.restore_unsent_draft();
         self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
         self.sends.disconnected();
@@ -2391,6 +2417,22 @@ impl App {
                             }
                         }
                     }
+                    if !ok {
+                        if let Some((session, text)) = self
+                            .sends
+                            .message(id)
+                            .map(|(s, t)| (s.to_string(), t.to_string()))
+                        {
+                            if self.current.as_deref() == Some(&session) && self.input.is_empty() {
+                                self.input.set(&text);
+                            } else if self.current.as_deref() != Some(&session) {
+                                let draft = self.drafts.entry(session).or_default();
+                                if draft.input.is_empty() {
+                                    draft.input.set(&text);
+                                }
+                            }
+                        }
+                    }
                     for answered in self.sends.answered(id) {
                         if answered != id {
                             self.pending.remove(&answered);
@@ -2436,6 +2478,29 @@ impl App {
                         continue;
                     };
                     match kind {
+                        Pending::ForecastHint { generation } => {
+                            if generation == self.forecast_generation() {
+                                self.forecast.hint = serde_json::from_value(result).ok();
+                            }
+                        }
+                        Pending::ForecastSend { generation, queued } => {
+                            if generation == self.forecast_generation() && self.offline.is_none() {
+                                if let Ok(f) = serde_json::from_value::<RunForecast>(result) {
+                                    if f.confirmation_required {
+                                        self.forecast.modal = Some((generation, f, queued));
+                                    } else {
+                                        self.forecast.approved = Some(generation);
+                                        self.submit_chat(queued);
+                                    }
+                                }
+                            }
+                        }
+                        Pending::ForecastConfirm { generation, queued } => {
+                            if generation == self.forecast_generation() && self.offline.is_none() {
+                                self.forecast.approved = Some(generation);
+                                self.submit_chat(queued);
+                            }
+                        }
                         Pending::SendMessage => {}
                         Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
@@ -2561,6 +2626,8 @@ impl App {
                             self.builtin_stats = serde_json::from_value(result).unwrap_or_default();
                         }
                         Pending::RunMetrics => {
+                            self.forecast.metrics =
+                                result["forecasts"].as_array().cloned().unwrap_or_default();
                             self.run_summary =
                                 serde_json::from_value(result["summary"].clone()).ok();
                         }
@@ -4983,12 +5050,130 @@ impl App {
         }
     }
 
+    fn forecast_input(&self) -> ForecastInput {
+        let text = self.input.expanded();
+        let buffers: Vec<_> = self
+            .attachments
+            .iter()
+            .map(|(n, b)| (n, b.len(), b.as_ptr() as usize))
+            .collect();
+        let root = self.work_dir();
+        let paths: Vec<_> = formless_core::files::mentions(&text)
+            .iter()
+            .map(|p| {
+                let path = root.join(p);
+                let stamp = path.metadata().ok().map(|m| (m.len(), m.modified().ok()));
+                (path, stamp)
+            })
+            .collect();
+        let key = formless_core::forecast::hash(&(&self.current, &text, &buffers, &paths));
+        if let Some((cached, input)) = &*self.forecast.input_cache.borrow() {
+            if cached == &key {
+                return input.clone();
+            }
+        }
+        let mut attachments: Vec<_> = self
+            .attachments
+            .iter()
+            .map(|(name, bytes)| formless_core::forecast::attachment(name.clone(), bytes))
+            .collect();
+        let root = self.work_dir();
+        for mention in formless_core::files::mentions(&self.input.expanded()) {
+            let Ok(path) = root.join(&mention).canonicalize() else {
+                continue;
+            };
+            if path.is_file()
+                && formless_core::daemon::credential_path(&path).is_none()
+                && path.metadata().is_ok_and(|m| m.len() <= 20 * 1024 * 1024)
+            {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    attachments.push(formless_core::forecast::attachment(
+                        path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        &bytes,
+                    ));
+                }
+            }
+        }
+        let input = ForecastInput {
+            session_id: self.current.clone(),
+            draft: text.trim().to_string(),
+            attachments,
+            ..Default::default()
+        };
+        *self.forecast.input_cache.borrow_mut() = Some((key, input.clone()));
+        input
+    }
+    fn forecast_generation(&self) -> String {
+        let session = self
+            .current
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id));
+        formless_core::forecast::hash(&(self.forecast_input(), session, &self.model_label))
+    }
+    fn forecast_tick(&mut self) {
+        if self.offline.is_some()
+            || self.client.is_none()
+            || self.current.is_none()
+            || self.running()
+            || self.input.is_empty()
+            || self.input.expanded().starts_with('/')
+        {
+            self.forecast.hint = None;
+            self.forecast.generation.clear();
+            return;
+        }
+        let generation = self.forecast_generation();
+        if generation != self.forecast.generation {
+            self.forecast.generation = generation.clone();
+            self.forecast.changed = Some(Instant::now());
+            self.forecast.pending = false;
+            self.forecast.hint = None;
+        }
+        if !self.forecast.pending
+            && self
+                .forecast
+                .changed
+                .is_some_and(|t| t.elapsed() >= Duration::from_millis(300))
+        {
+            self.forecast.pending = true;
+            self.request(
+                Pending::ForecastHint { generation },
+                Request::ForecastRun {
+                    input: self.forecast_input(),
+                },
+            );
+        }
+    }
+
     fn submit_chat(&mut self, queued: bool) {
         if self.offline.is_some() {
             // Nothing can be sent: keep the draft until the daemon is back.
             self.notes
                 .push("not sent — offline; your input is kept as a draft".into());
             return;
+        }
+        let text = self.input.expanded();
+        if !text.trim().is_empty()
+            && !text.starts_with('/')
+            && !self.running()
+            && self.current.is_some()
+            && self.editing_id.is_none()
+            && self.editing_queued.is_none()
+            && Config::load(&self.paths).is_ok_and(|c| c.limits.forecast_confirm_usd.is_some())
+        {
+            let generation = self.forecast_generation();
+            if self.forecast.approved.take().as_deref() != Some(generation.as_str()) {
+                self.request(
+                    Pending::ForecastSend { generation, queued },
+                    Request::ForecastRun {
+                        input: self.forecast_input(),
+                    },
+                );
+                return;
+            }
         }
         self.restored_send = None;
         let text = self.input.take();
@@ -7305,6 +7490,29 @@ impl App {
             self.model_key(key);
             return;
         }
+        if let Some((generation, forecast, queued)) = self.forecast.modal.take() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') if generation == self.forecast_generation() => {
+                    if let Some(id) = forecast.confirmation_id {
+                        self.request(
+                            Pending::ForecastConfirm { generation, queued },
+                            Request::ConfirmForecast { id },
+                        );
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.forecast.modal = Some((generation, forecast, queued)),
+            }
+            return;
+        }
+        if self.view == View::Metrics && key.code == KeyCode::Char('f') {
+            self.pager = Some(code_pager(
+                "Forecast versus actual",
+                &serde_json::to_string_pretty(&self.forecast.metrics).unwrap_or_default(),
+                self.color,
+            ));
+            return;
+        }
         if self.quit_confirm {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Enter => self.should_quit = true,
@@ -9164,6 +9372,19 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.view == View::Chat || app.multi_pane {
         draw_toasts(f, toast_area, app);
     }
+    if let Some((_, forecast, _)) = &app.forecast.modal {
+        let area = f.area();
+        let width = area.width.saturating_sub(6);
+        let height = 7.min(area.height);
+        let rect = Rect::new(
+            area.x + 3,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, rect);
+        f.render_widget(Paragraph::new(format!("{}\n{} comparable Runs; local forecast, not a limit.\n\nEnter/y confirm · Esc/n keep draft",forecast.hint,forecast.comparable_runs)).wrap(Wrap{trim:false}).block(ui::panel(" Forecast confirmation ",app.color,Color::Yellow)),rect);
+    }
     if app.quit_confirm {
         draw_quit_confirm(f, app);
     }
@@ -9849,6 +10070,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         } else {
             title.push_str(&format!("[@{label}] "));
         }
+    }
+    if let Some(forecast) = &app.forecast.hint {
+        title.push_str(&format!(" · {} ", truncate_chars(&forecast.hint, 100)));
     }
     let flashing = app.target_flash.is_some_and(|t| Instant::now() < t);
     let mut block = ui::panel(
@@ -13748,6 +13972,10 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let range = METRIC_RANGES[app.metrics_range % METRIC_RANGES.len()].0;
+    let range = format!(
+        "{range} · f forecast vs actual ({} records)",
+        app.forecast.metrics.len()
+    );
     let title = match app.run_summary.as_ref().filter(|s| s.runs > 0) {
         Some(s) => format!(
             " Metrics · {range} (r) · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
@@ -15328,6 +15556,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         while !app.should_quit {
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
+            app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
             if std::mem::take(&mut app.force_redraw) {
@@ -15521,6 +15750,7 @@ mod tests {
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         App {
             paths,
+            forecast: Default::default(),
             view: View::Chat,
             wizard: None,
             client: None,
