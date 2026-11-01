@@ -163,6 +163,209 @@ async fn create(daemon: &Arc<Daemon>, sid: &str, name: &str, code: &str, caps: &
     assert!(ok && result.contains("\"created\""), "{name}: {result}");
 }
 
+fn seed_mixed_floor(daemon: &Daemon, sid: &str, run: &str, known: Option<f64>) {
+    daemon
+        .with_store(|st| {
+            for (input, output) in [(3, 2), (4, 3)] {
+                st.record_usage_full(
+                    sid,
+                    run,
+                    "default",
+                    "primary",
+                    &crate::provider::Usage {
+                        prompt_tokens: input,
+                        completion_tokens: output,
+                        reported: 3,
+                        ..Default::default()
+                    },
+                    "internal",
+                )?;
+            }
+            if let Some(cost) = known {
+                st.record_usage_full(
+                    sid,
+                    run,
+                    "default",
+                    "primary",
+                    &crate::provider::Usage {
+                        cost: Some(cost),
+                        reported: 3,
+                        ..Default::default()
+                    },
+                    "internal",
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn known_reported_usd_blocks_mixed_unpriced_factory_requests_before_http() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for daily in [false, true] {
+        let mock = Mock::new(false, false);
+        let (_root, _paths, mut cfg, daemon, server) =
+            setup(&env, mock.clone(), Some(1.0), daily).await;
+        cfg.provider.prices.clear();
+        cfg.save(&daemon.paths).unwrap();
+        let effective = daemon.config().unwrap();
+        assert_eq!(effective.provider.base_url, cfg.provider.base_url);
+        assert_eq!(
+            reqwest::Url::parse(&effective.provider.base_url)
+                .unwrap()
+                .host_str(),
+            Some("127.0.0.1")
+        );
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        seed_mixed_floor(&daemon, &sid, "known-floor", Some(2.0));
+        let display = daemon.usage_info(None, Some("known-floor"), &cfg).unwrap();
+        let policy_error = daemon
+            .check_budget(&sid, "known-floor", &cfg)
+            .err()
+            .map(|error| error.to_string());
+        let provider = daemon.provider(&cfg).await.unwrap();
+        assert_eq!(provider.settings().base_url, cfg.provider.base_url);
+        let (result,posted)=tokio::time::timeout(Duration::from_secs(5),async {
+            let messages=[json!({"role":"user","content":"must remain local"})];
+            let request=counted("internal",&sid,"known-floor",provider.complete(&messages,"primary",None));
+            tokio::pin!(request);
+            tokio::select! {
+                result=&mut request=>(result,false),
+                _=mock.arrived.notified()=>(Err(anyhow::anyhow!("private peer observed a request despite known USD floor")),true),
+            }
+        }).await.unwrap();
+        let posts = mock.posts.load(Ordering::SeqCst);
+        drop(provider);
+        teardown(daemon, server).await;
+        assert_eq!(display.cost, None);
+        assert_eq!(display.unpriced, vec!["primary"]);
+        assert!(
+            !posted && posts == 0,
+            "known USD2 plus unpriced7/5 cannot bypass USD1 cap"
+        );
+        assert!(
+            policy_error
+                .as_ref()
+                .is_some_and(|error| error.contains("at least $2.00")),
+            "{policy_error:?}"
+        );
+        assert!(result.unwrap_err().to_string().contains("budget:"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_and_below_limit_floors_keep_compatibility_and_honest_eighty_percent_notes() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for daily in [false, true] {
+        for known in [None, Some(0.25), Some(0.85)] {
+            let mock = Mock::new(false, false);
+            let (_root, _paths, mut cfg, daemon, server) =
+                setup(&env, mock.clone(), Some(1.0), daily).await;
+            cfg.provider.prices.clear();
+            cfg.save(&daemon.paths).unwrap();
+            assert_eq!(
+                daemon.config().unwrap().provider.base_url,
+                cfg.provider.base_url
+            );
+            let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+            seed_mixed_floor(&daemon, &sid, "below-floor", known);
+            let (tx, mut rx) = mpsc::channel(8);
+            daemon.subs.locked().push(Subscriber {
+                conn: 987,
+                tx,
+                filter: Arc::new(StdMutex::new(EventFilter::default())),
+                kick: CancellationToken::new(),
+                gaps: Default::default(),
+            });
+            daemon.check_budget(&sid, "below-floor", &cfg).unwrap();
+            daemon.check_budget(&sid, "below-floor", &cfg).unwrap();
+            let notes = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|message| match message {
+                    ServerMessage::Event(Event::Note { text, .. }) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let provider = daemon.provider(&cfg).await.unwrap();
+            assert_eq!(provider.settings().base_url, cfg.provider.base_url);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                counted(
+                    "internal",
+                    &sid,
+                    "below-floor",
+                    provider.complete(
+                        &[json!({"role":"user","content":"private allowed fixture"})],
+                        "primary",
+                        None,
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+            let display = daemon.usage_info(None, Some("below-floor"), &cfg).unwrap();
+            let posts = mock.posts.load(Ordering::SeqCst);
+            drop(provider);
+            teardown(daemon, server).await;
+            assert_eq!(result.unwrap(), "ok");
+            assert_eq!(posts, 1);
+            assert_eq!(display.cost, None);
+            assert_eq!(display.unpriced, vec!["primary"]);
+            if known == Some(0.85) {
+                assert_eq!(notes.len(), 1);
+                assert!(
+                    notes[0].contains("at least $0.85") && notes[0].contains("80%"),
+                    "{notes:?}"
+                );
+            } else {
+                assert!(notes.is_empty(), "{notes:?}");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_resume_waiver_still_bypasses_a_known_spending_floor() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for daily in [false, true] {
+        let mock = Mock::new(false, false);
+        let (_root, _paths, mut cfg, daemon, server) =
+            setup(&env, mock.clone(), Some(1.0), daily).await;
+        cfg.provider.prices.clear();
+        cfg.save(&daemon.paths).unwrap();
+        assert_eq!(
+            daemon.config().unwrap().provider.base_url,
+            cfg.provider.base_url
+        );
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        seed_mixed_floor(&daemon, &sid, "waived-floor", Some(2.0));
+        daemon.budget_waived.locked().insert(sid.clone());
+        daemon.check_budget(&sid, "waived-floor", &cfg).unwrap();
+        let provider = daemon.provider(&cfg).await.unwrap();
+        assert_eq!(provider.settings().base_url, cfg.provider.base_url);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            counted(
+                "internal",
+                &sid,
+                "waived-floor",
+                provider.complete(
+                    &[json!({"role":"user","content":"explicit waived fixture"})],
+                    "primary",
+                    None,
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        let posts = mock.posts.load(Ordering::SeqCst);
+        drop(provider);
+        teardown(daemon, server).await;
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(posts, 1);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn parallel_nested_tools_reserve_headroom_before_spending() {
     let env = crate::credential_env::EnvGuard::isolated();

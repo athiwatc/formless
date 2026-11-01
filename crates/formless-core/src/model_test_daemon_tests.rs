@@ -13,7 +13,10 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(env: &crate::credential_env::EnvGuard, auto: bool) -> Self {
+        env.remove("FORMLESS_BASE_URL");
+        env.remove("FORMLESS_MODEL");
         env.set("FORMLESS_API_KEY", "private-loopback-key");
+        env.set("NO_PROXY", "127.0.0.1,localhost");
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -43,6 +46,11 @@ impl Fixture {
         cfg.skills.auto_create = false;
         cfg.save(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(paths).unwrap());
+        assert_eq!(
+            daemon.config().unwrap().provider.base_url,
+            base,
+            "fixture must never send to an inherited endpoint"
+        );
         let session = daemon.with_store(|st| st.create_session(None)).unwrap().id;
         Self {
             daemon: Some(daemon),
@@ -97,7 +105,7 @@ async fn default_model_selection_sends_nothing_but_explicit_test_still_runs() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result["ok"], true);
+    assert_eq!(result["ok"], true, "{result}");
     assert_eq!(result["model"], "model");
     assert_eq!(f.count.load(Ordering::SeqCst), 2);
     assert!(f
@@ -336,4 +344,87 @@ async fn chained_alias_uses_the_same_background_reservation_and_result_label() {
     assert_eq!(fresh["model"], "model");
     assert_eq!(fresh["ok"], true);
     assert_eq!(f.count.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn explicit_probe_uses_factory_daily_budget_and_records_known_usage_once() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, false).await;
+    f.release.add_permits(1);
+    let result = f
+        .daemon()
+        .handle(Request::TestModel {
+            model: "model".into(),
+            provider: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["probe_usage"]["reported_usage"]["prompt_tokens"], 7);
+    assert_eq!(
+        result["probe_usage"]["reported_usage"]["completion_tokens"],
+        5
+    );
+    let db = rusqlite::Connection::open(f.daemon().paths.db_file()).unwrap();
+    let (rows,input,output):(i64,i64,i64)=db.query_row("SELECT COUNT(*), SUM(prompt_tokens), SUM(completion_tokens) FROM run_usage WHERE source='internal'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(
+        (rows, input, output),
+        (2, 7, 5),
+        "probe observer must preserve factory usage hooks without duplicate rows"
+    );
+    drop(db);
+    let mut cfg = f.daemon().config().unwrap();
+    cfg.limits.daily_usd = Some(1.0);
+    cfg.provider.prices.insert(
+        "model".into(),
+        crate::config::ModelPrice {
+            input: 1000.0,
+            output: 1000.0,
+            cached_input: None,
+            cache_write_input: None,
+            retrieved_at: None,
+        },
+    );
+    assert_eq!(
+        cfg.cost_of_known("default", "model", 2000, 0, 0, 0, None, false),
+        Some(2.0)
+    );
+    cfg.save(&f.daemon().paths).unwrap();
+    f.daemon()
+        .with_store(|st| {
+            st.record_usage_full(
+                "",
+                "",
+                "default",
+                "model",
+                &crate::provider::Usage {
+                    cost: Some(2.0),
+                    prompt_tokens: 2000,
+                    reported: 3,
+                    ..Default::default()
+                },
+                "internal",
+            )
+        })
+        .unwrap();
+    let count = f.count.load(Ordering::SeqCst);
+    let blocked = f
+        .daemon()
+        .handle(Request::TestModel {
+            model: "model".into(),
+            provider: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(blocked["ok"], false);
+    assert!(
+        blocked["error"].as_str().unwrap().contains("budget"),
+        "{blocked}"
+    );
+    assert_eq!(blocked["probe_usage"]["requests_sent"], 0);
+    assert_eq!(
+        f.count.load(Ordering::SeqCst),
+        count,
+        "exhausted daily budget must prevent every model POST"
+    );
 }

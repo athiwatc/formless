@@ -890,3 +890,155 @@ async fn the_largest_attachment_crosses_the_relay_in_pieces() {
     shutdown.cancel();
     link.await.unwrap().unwrap();
 }
+
+#[test]
+fn daemon_claim_matches_worker_browser_vector_without_exposing_pairing_key_in_url() {
+    use formless_core::relay::{daemon_authorization, daemon_claim};
+    let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let claim = daemon_claim(&key);
+    let claim_hex: String = claim.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        claim_hex,
+        "dd8607ecc7b952bb2c46e93f9387c239f50599aaad3a67036b743df4ab64b061"
+    );
+    assert_eq!(room_id(&key), "c24c18b87313893139ea9647c754be6d");
+    let header = daemon_authorization(&key);
+    assert_eq!(header.to_str().unwrap(), format!("Bearer {claim_hex}"));
+    assert!(header.is_sensitive());
+    assert!(!format!("{header:?}").contains(&claim_hex));
+    let secret = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key);
+    let url = relay_ws_url("wss://relay.invalid", &secret).unwrap();
+    assert!(!url.contains(&claim_hex) && !url.contains(&secret));
+    assert_eq!(
+        url,
+        "wss://relay.invalid/relay/c24c18b87313893139ea9647c754be6d?role=daemon&mux=1"
+    );
+}
+
+/// Worker/Node tests enforce the actual room policy. This private peer enforces
+/// the same fixed commitment and checks the real Rust Upgrade headers, denied
+/// squats and restart transport (no Node installation or hosted relay needed).
+#[tokio::test]
+async fn daemon_upgrade_proof_rejects_squat_and_wrong_claim_and_is_stable_on_restart() {
+    use formless_core::relay::daemon_authorization;
+    use futures_util::SinkExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::{
+        client::IntoClientRequest,
+        handshake::server::{ErrorResponse, Request, Response},
+        protocol::{frame::coding::CloseCode, CloseFrame},
+    };
+    let _env = credential_env::EnvGuard::isolated();
+    let paths = temp_paths("claim-proof");
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let secret = generate_relay_secret();
+    let key = key_from_secret(&secret).unwrap();
+    let expected = daemon_authorization(&key).to_str().unwrap().to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let url = relay_ws_url(&base, &secret).unwrap();
+    let expected_path = format!("/relay/{}", room_id(&key));
+    let (first_ready, ready) = tokio::sync::oneshot::channel();
+    let (restart_ready, restarted) = tokio::sync::oneshot::channel();
+    let (release, finish) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let verify = move |request: &Request,
+                           response: Response|
+              -> std::result::Result<Response, ErrorResponse> {
+            assert_eq!(request.uri().path(), expected_path);
+            assert!(!request.uri().to_string().contains(&expected));
+            if request
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                == Some(expected.as_str())
+            {
+                Ok(response)
+            } else {
+                Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(401)
+                    .body(Some("daemon authentication required".into()))
+                    .unwrap())
+            }
+        };
+        for _ in 0..2 {
+            let (tcp, _) = listener.accept().await.unwrap();
+            assert!(
+                tokio_tungstenite::accept_hdr_async(tcp, verify.clone())
+                    .await
+                    .is_err(),
+                "unauthorized peers must not occupy a slot"
+            );
+        }
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut old = tokio_tungstenite::accept_hdr_async(tcp, verify.clone())
+            .await
+            .unwrap();
+        first_ready.send(()).unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut new = tokio_tungstenite::accept_hdr_async(tcp, verify)
+            .await
+            .unwrap();
+        old.close(Some(CloseFrame {
+            code: CloseCode::Library(4003),
+            reason: "daemon connection replaced".into(),
+        }))
+        .await
+        .unwrap();
+        restart_ready.send(()).unwrap();
+        finish.await.unwrap();
+        new.close(None).await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for authorization in [None, Some("Bearer ".to_owned() + &"00".repeat(32))] {
+            let mut request = url.as_str().into_client_request().unwrap();
+            if let Some(header) = authorization {
+                request
+                    .headers_mut()
+                    .insert("Authorization", header.parse().unwrap());
+            }
+            let error = tokio_tungstenite::connect_async(request).await.unwrap_err();
+            match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => {
+                    assert_eq!(response.status(), 401)
+                }
+                other => panic!("unexpected rejection: {other}"),
+            }
+        }
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let first = tokio::spawn({
+            let (d, s, t, b) = (
+                daemon.clone(),
+                secret.clone(),
+                shutdown.clone(),
+                base.clone(),
+            );
+            async move { formless_core::relay::connect_once(d, &b, &s, &t).await }
+        });
+        ready.await.unwrap();
+        let second_paths = temp_paths("claim-restart");
+        let second_daemon =
+            Arc::new(formless_core::daemon::Daemon::new(second_paths.clone()).unwrap());
+        let second = tokio::spawn({
+            let (d, s, t, b) = (
+                second_daemon.clone(),
+                secret.clone(),
+                shutdown.clone(),
+                base.clone(),
+            );
+            async move { formless_core::relay::connect_once(d, &b, &s, &t).await }
+        });
+        restarted.await.unwrap();
+        first.await.unwrap().unwrap();
+        release.send(()).unwrap();
+        second.await.unwrap().unwrap();
+        peer.await.unwrap();
+        drop(second_daemon);
+        std::fs::remove_dir_all(second_paths.data_dir.parent().unwrap()).unwrap();
+    })
+    .await
+    .expect("bounded claim and restart exchange");
+    drop(daemon);
+    std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).unwrap();
+}

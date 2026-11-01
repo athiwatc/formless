@@ -2970,7 +2970,9 @@ impl Daemon {
                 let (session, path, bytes) = self
                     .with_reader(|st| st.get_artifact(&id))?
                     .with_context(|| RequestFailure::not_found(format!("no artifact '{id}'")))?;
-                let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
+                let source =
+                    crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
+                let text = String::from_utf8_lossy(&source).into_owned();
                 let total = text.chars().count();
                 let offset = offset.unwrap_or(0);
                 let length = length.unwrap_or(200_000).min(1_000_000);
@@ -8418,9 +8420,10 @@ impl Daemon {
         provider: Option<&str>,
         model: &str,
     ) -> Result<crate::provider::ModelTest> {
-        let p = self.provider_named(cfg, provider).await?;
+        let policy = crate::probe_policy::ProbePolicy::default();
+        let p = policy.run(self.provider_named(cfg, provider)).await??;
         let model = p.settings().resolve_alias(model);
-        let t = p.test_model(&model).await;
+        let t = p.test_model_scoped(&model, policy).await;
         self.remember_model_test(&p.settings().base_url, &t)
             .context("model test completed, but its result could not be saved")?;
         Ok(t)
@@ -9724,7 +9727,7 @@ impl Daemon {
 
     /// Opt-in spending limits (SPEC §5.2), checked before each model step:
     /// a note at 80%, and at 100% an error that pauses the Run ("budget:
-    /// …"). Dollar limits apply only while every model used has a price.
+    /// …"). A known spending floor still applies when the full total is unknown.
     fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
         let mut l = cfg.limits.clone();
         // `/limit N` for this Run replaces `limits.run_steps`.
@@ -9738,7 +9741,6 @@ impl Daemon {
         if self.budget_waived.locked().contains(session_id) {
             return Ok(());
         }
-        let run = self.usage_info(None, Some(run_id), cfg)?;
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let mut checks: Vec<(String, f64, f64, String)> = Vec::new();
         if let Some(max) = l.run_steps {
@@ -9754,17 +9756,26 @@ impl Daemon {
                 },
             ));
         }
-        if let (Some(max), Some(cost)) = (l.run_usd, run.cost) {
+        if let Some(max) = l.run_usd.filter(|max| *max > 0.0) {
+            let (rows, _) = self.with_reader(|st| st.usage_rows(None, Some(run_id)))?;
+            let spend: crate::budget::Spend = rows
+                .iter()
+                .map(|(provider, model, p, c, cached, cw, reported, unknown)| {
+                    cfg.cost_of_known(provider, model, *p, *c, *cached, *cw, *reported, *unknown)
+                })
+                .collect();
+            let cost = spend.known;
+            let qualifier = if spend.complete { "" } else { "at least " };
             checks.push((
                 "run_usd".into(),
                 cost,
                 max,
-                format!("this Run spent ${cost:.2} of ${max:.2}"),
+                format!("this Run spent {qualifier}${cost:.2} of ${max:.2}"),
             ));
         }
-        if let Some(max) = l.daily_usd {
+        if let Some(max) = l.daily_usd.filter(|max| *max > 0.0) {
             let rows = self.with_reader(|st| st.usage_grouped(Some(&today), "model"))?;
-            let day: Option<f64> = rows
+            let day: crate::budget::Spend = rows
                 .iter()
                 .map(
                     |(_, provider, model, p, c, cached, cw, reported, unknown)| {
@@ -9773,15 +9784,15 @@ impl Daemon {
                         )
                     },
                 )
-                .sum();
-            if let Some(cost) = day {
-                checks.push((
-                    "daily_usd".into(),
-                    cost,
-                    max,
-                    format!("today's spend is ${cost:.2} of ${max:.2}"),
-                ));
-            }
+                .collect();
+            let cost = day.known;
+            let qualifier = if day.complete { "" } else { "at least " };
+            checks.push((
+                "daily_usd".into(),
+                cost,
+                max,
+                format!("today's spend is {qualifier}${cost:.2} of ${max:.2}"),
+            ));
         }
         for (name, used, max, what) in checks {
             let source = if per_run.is_some() && name == "run_steps" {
@@ -11217,13 +11228,14 @@ impl Daemon {
     /// A slice (or grep) of one of this Session's artifacts (SPEC §9.6).
     fn read_artifact_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let id = args["id"].as_str().context("id required")?;
-        let (_, path, _) = self
+        let (_, path, bytes) = self
             .with_store(|st| st.get_artifact(id))?
             .filter(|(owner, ..)| owner.as_deref() == Some(session_id))
             .with_context(|| {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
-        let text = String::from_utf8_lossy(&std::fs::read(&path)?).into_owned();
+        let source = crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
+        let text = String::from_utf8_lossy(&source).into_owned();
         if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
             let needle = needle.to_lowercase();
             let hits: Vec<Value> = text
@@ -14872,6 +14884,24 @@ impl HostOps for NestedOps {
         system: Option<&str>,
         model: Option<&str>,
     ) -> std::result::Result<String, String> {
+        self.llm_complete_with_options(
+            prompt,
+            system,
+            model,
+            &crate::provider::CompletionOptions::default(),
+        )?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "legacy completion was not text".into())
+    }
+
+    fn llm_complete_with_options(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        model: Option<&str>,
+        options: &crate::provider::CompletionOptions,
+    ) -> std::result::Result<Value, String> {
         if self.cancel.is_cancelled() {
             return Err("interrupted".into());
         }
@@ -14906,11 +14936,11 @@ impl HostOps for NestedOps {
             .daemon
             .resolve_model(&requested, &self.cfg, complex)
             .map_err(|e| e.to_string())?;
-        let result = self.block_cancellable(counted(
+        let (result, terminal) = self.block_cancellable(counted(
             "llm",
             &self.session_id,
             &self.run_id,
-            provider.complete_result(&messages, &model, effort.as_deref()),
+            provider.completion_for_validation(&messages, &model, effort.as_deref(), options),
         ))?;
         self.data_observed("llm", &result.model_used)?;
         let usage = result.usage;
@@ -14933,7 +14963,17 @@ impl HostOps for NestedOps {
                 st.add_invocation_model_use(inv, tokens, cost)
             });
         }
-        Ok(result.text)
+        match options.output_schema() {
+            Some(schema) => {
+                if let Some(error) = terminal {
+                    return Err(error.to_string());
+                }
+                schema
+                    .parse_and_validate(&result.text)
+                    .map_err(|error| error.to_string())
+            }
+            None => Ok(Value::String(result.text)),
+        }
     }
 
     fn call_tool(&self, name: &str, input: Value) -> std::result::Result<Value, String> {
@@ -17077,3 +17117,7 @@ mod model_test_daemon_tests;
 #[cfg(test)]
 #[path = "cli_attach_daemon_tests.rs"]
 mod cli_attach_daemon_tests;
+
+#[cfg(test)]
+#[path = "artifact_read_tests.rs"]
+mod artifact_read_tests;

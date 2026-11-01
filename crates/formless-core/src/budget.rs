@@ -6,6 +6,36 @@ use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Known nonnegative charges remain a spending floor even when another group
+/// has no price. This is not a complete displayed total or another usage write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Spend {
+    pub known: f64,
+    pub complete: bool,
+}
+
+impl FromIterator<Option<f64>> for Spend {
+    fn from_iter<T: IntoIterator<Item = Option<f64>>>(costs: T) -> Self {
+        let mut spend = Self {
+            known: 0.0,
+            complete: true,
+        };
+        for cost in costs {
+            match cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+                Some(cost) => {
+                    let sum = spend.known + cost;
+                    if !sum.is_finite() {
+                        spend.complete = false;
+                    }
+                    spend.known = sum.min(f64::MAX);
+                }
+                None => spend.complete = false,
+            }
+        }
+        spend
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Admission {
     lane: Arc<tokio::sync::Mutex<()>>,
@@ -61,12 +91,12 @@ impl Admission {
             if rows.iter().any(|row| row.7) {
                 return Err(anyhow!("budget: native media cost is unknown for this Run; strict run_usd cannot authorize more spending"));
             }
-            let cost: Option<f64> = rows
+            let cost: Spend = rows
                 .iter()
                 .map(|(provider, model, p, c, cache, write, reported, unknown)| {
                     cfg.cost_of_known(provider, model, *p, *c, *cache, *write, *reported, *unknown)
                 })
-                .sum();
+                .collect();
             refuse("run_usd", cost, max)?;
         }
         if let Some(max) = cfg.limits.daily_usd.filter(|n| *n > 0.0) {
@@ -75,7 +105,7 @@ impl Admission {
             if rows.iter().any(|row| row.8) {
                 return Err(anyhow!("budget: native media cost is unknown today; strict daily_usd cannot authorize more spending"));
             }
-            let cost: Option<f64> = rows
+            let cost: Spend = rows
                 .iter()
                 .map(
                     |(_, provider, model, p, c, cache, write, reported, unknown)| {
@@ -84,16 +114,70 @@ impl Admission {
                         )
                     },
                 )
-                .sum();
+                .collect();
             refuse("daily_usd", cost, max)?;
         }
         Ok(Some(lease))
     }
 }
 
-fn refuse(name: &str, used: Option<f64>, max: f64) -> Result<()> {
-    if used.is_some_and(|used| used >= max) {
+fn refuse(name: &str, used: Spend, max: f64) -> Result<()> {
+    if used.known >= max {
         return Err(anyhow!("budget: limits.{name} reached before model dispatch. The Run is paused: /resume continues, /abandon stops."));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reported_usd_precedes_prices_and_both_known_sources_contribute_to_the_floor() {
+        let mut cfg = Config::default();
+        cfg.provider.prices.insert(
+            "priced".into(),
+            crate::config::ModelPrice {
+                input: 1000.0,
+                output: 1000.0,
+                cached_input: None,
+                cache_write_input: None,
+                retrieved_at: None,
+            },
+        );
+        let priced = cfg.cost_of_known("default", "priced", 2000, 0, 0, 0, None, false);
+        let actual = cfg.cost_of_known(
+            "default",
+            "priced",
+            9_000_000,
+            9_000_000,
+            0,
+            0,
+            Some(0.25),
+            true,
+        );
+        let missing = cfg.cost_of_known("default", "missing", 7, 5, 0, 0, None, false);
+        assert_eq!(priced, Some(2.0));
+        assert_eq!(actual, Some(0.25));
+        assert_eq!(missing, None);
+        let spend: Spend = [priced, actual, missing].into_iter().collect();
+        assert_eq!(spend.known, 2.25);
+        assert!(!spend.complete);
+        assert!(refuse("daily_usd", spend, 2.0).is_err());
+    }
+    #[test]
+    fn unknown_groups_cannot_erase_known_nonnegative_spend() {
+        let spend: Spend = [Some(2.0), None].into_iter().collect();
+        assert_eq!(spend.known, 2.0);
+        assert!(!spend.complete);
+        assert!(refuse("daily_usd", spend, 1.0).is_err());
+        assert!(refuse("run_usd", [None].into_iter().collect(), 1.0).is_ok());
+        assert!(refuse("run_usd", [Some(0.25), None].into_iter().collect(), 1.0).is_ok());
+        let invalid: Spend = [Some(2.0), Some(-100.0), Some(f64::NAN), Some(f64::INFINITY)]
+            .into_iter()
+            .collect();
+        assert_eq!(invalid.known, 2.0);
+        assert!(!invalid.complete);
+        let overflow: Spend = [Some(f64::MAX), Some(f64::MAX), None].into_iter().collect();
+        assert_eq!(overflow.known, f64::MAX);
+    }
 }

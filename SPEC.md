@@ -276,6 +276,42 @@ without redesign.
   parts with `cache_control: {type: ephemeral}`.
 - Sampling params (`temperature`, `max_tokens`) are **not** exposed in v1;
   provider defaults rule.
+- Structured-output validation foundation (#618): immutable call options default
+  to legacy text, or hold an unchanged JSON Schema and an offline validator.
+  `complete_result_with_options`, `complete_with_usage_with_options` and
+  `chat_stream_with_options` accept these options; existing signatures keep
+  their text behavior. `complete_json` also returns the parsed value with its
+  usage/served-model metadata. Schemas are limited to 64 KiB serialized,
+  4096 JSON nodes and depth 48; local JSON-pointer references to recognized schema
+  locations are supported with reference depth 64 and expanded work 16384 nodes.
+  External references, resource IDs, dynamic/anchor and recursive references
+  fail before any request. References inside `const`, `default`, `enum` and
+  `examples` remain ordinary unchanged data. Validation uses bounded regex
+  compilation/backtracking and accepts exactly one whole JSON value (no prose
+  extraction/coercion), at most 1 MiB, 16384 nodes and depth 64. Errors do not echo
+  schema/output values. These limits are not a wall-clock deadline or OS sandbox.
+  Existing Tool input/output schema handling is unchanged.
+  Chat sends `response_format: {type: json_schema, json_schema: ...}`; Responses
+  sends `text.format: {type: json_schema, ...}`. The exact schema is sent with
+  `strict: false` so arbitrary valid schema data is not rewritten into a vendor's
+  restricted strict-schema subset; the local validator remains authoritative.
+  The call owns this format field after vendor extras/native repairs, before
+  request policy, admission and accounting. A 400 explicitly rejecting the mode
+  retries once without that mode; invalid-schema/unrelated errors do not qualify.
+  This state persists across transient retries, model fallback and stream restart,
+  without changing another call or the configured provider. Anthropic uses no
+  invented format field and is validated locally. Schema calls include one fixed
+  JSON-format instruction and the original schema as explicitly framed user data;
+  schema descriptions never become system instructions. This stable guidance
+  remains when the endpoint rejects its API format mode, and is absent for legacy
+  text calls. Schema-aware replies refuse
+  incomplete/refused answers; partial stream deltas remain text until final
+  validation. Every known physical-attempt charge is committed before validation.
+  `llm.complete(prompt, {schema, system, model, role})` returns a parsed JSON value;
+  omitting `schema` still returns text. Invalid schemas fail before model work;
+  smoke stubs schema results without making a request, and replay denies model
+  calls. Both optimiser candidate and guidance-proposal generation use schemas,
+  while syntax, capability/resource checks and promotion approvals still apply.
 - API key storage: OS keychain (macOS Keychain, Windows Credential Manager,
   Linux Secret Service) with a `0600`-permission file fallback. Keys are
   never written to `config.toml` in plaintext, never logged, never sent
@@ -434,7 +470,27 @@ an empty listing just asks for one.
   picks by endpoint/model and release their reservation on completion or abort.
   Result merges are serialized and written privately through a synced temporary
   file and atomic replacement; save failures are reported, never silently lost.
-  This setting does not bound provider retries or output by itself.
+  Every logical operational probe (explicit Test, optional background Test,
+  connectivity/tool checks and the two-request cache check) uses one shared
+  30-second deadline, at most eight physical model-endpoint POSTs, and a
+  128-output-token ceiling and one returned choice on every attempt. Probes
+  override Chat `n` and drop known vendor multi-sample/beam controls at the root
+  and in `options`; ordinary Runs retain their configured sampling. The deadline includes credential
+  refresh, admission waits, headers, body/stream parsing, backoff and resends.
+  Vendor fields, reasoning settings and typed repairs cannot remove or increase
+  the final cap; probes may switch a rejected Chat cap spelling once. The
+  scoped probe disables unrelated model failover, redirects and transport-level
+  automatic retries, while retaining the normal provider's credentials, request
+  admission and usage hooks. Ordinary Run requests keep their existing behavior.
+  Probe transport uses the configured proxy and normal factory TLS trust.
+  `TestModel.probe_usage` reports physical sends and only provider-reported
+  counters/costs; missing counters remain unknown, with explicit partial-usage
+  and partial-cost flags. A deadline marks even interim reported counters/costs
+  as partial, retaining their known values and exposing `deadline_exceeded`.
+  Its observer does not commit a second usage charge.
+  Timeout/cancellation drops the current logical request future rather than
+  detaching retries. An already-issued server request may continue or be billed;
+  these are client-side request bounds, not a promise of server cancellation.
 
 ### 4.4 Provider failure handling
 
@@ -783,8 +839,15 @@ task, with quality as a gate**.
   wall-clock cap on a Run unless the user sets one. The user is the limit.
 - **Opt-in spending limits.** `[limits]` `daily_usd` (all Sessions, per
   UTC day), `run_usd` and `run_steps` (per Run), all unset by default and
-  settable from Settings. Dollar limits count only while every model used
-  has a `provider.prices` entry; a Run on an unpriced model says so when
+  settable from Settings. Full dollar totals remain unknown when usage has no
+  reported cost or `provider.prices` entry. Known nonnegative finite reported USD
+  and priced usage still form a spending floor: an unpriced group cannot erase
+  it, and that floor triggers the same 80% note and 100% pre-dispatch refusal.
+  Notes identify an incomplete total as "at least" that amount; usage displays
+  still show unknown totals and unpriced models. Unknown-only or below-limit
+  floors keep the existing unpriced compatibility behavior, not a promise to
+  bound the unknown charge. Native-media unknown-cost refusal and explicit
+  Resume waivers remain unchanged. A Run on an unpriced model says so when
   it starts, and `doctor` lists such models. Model calls made on the Run's
   behalf (`llm.complete` from a Tool, each sub-agent step) count toward
   them and toward usage, and are checked too, and so do the daemon's own
@@ -2832,6 +2895,13 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   filesystem path, because transcripts also reach remote web clients.
   `GetArtifact {id, offset?, length?}` returns a text slice (200 000
   characters by default) with `total_chars` and `end`, never the path.
+  Both client and agent readers open only regular files beneath this profile's
+  artifact directory using rooted no-follow handles, reject changed recorded
+  sizes, and read at most 32 MiB plus one growth-detection byte before slicing
+  or grep. Larger artifacts return an explicit text-reader limit error.
+  Client ID access remains profile-wide; agent `read_artifact` still requires
+  exact ownership by its current Session. A restored registry path alone cannot
+  authorize a host-file read.
   - TUI: a tool result that references an artifact shows `/open <id>`,
     and `/open` (the newest) or `/open <id-prefix>` shows a full-screen
     pager (↑↓, PgUp/PgDn, g/G, Esc).
@@ -4212,11 +4282,27 @@ during its snapshot fetch, deduplicated by message id.
   ports. The Relay (a Cloudflare Worker + Durable Object room in
   `relay/`) forwards only opaque AES-256-GCM ciphertext: the pairing
   secret (32 random bytes, keychain + `0600` file, never in config) is
-  the key, and the room id is a truncated SHA-256 of it, so the Relay
-  can neither read traffic nor derive the key. The daemon connects with
+  the E2E key. Room identity v3 is the first 16 bytes of SHA-256 of a
+  separate 32-byte HKDF-SHA256 claim (empty salt, info
+  `formless-relay/3 daemon-claim`). The daemon sends this claim as canonical
+  lowercase hex in an `Authorization: Bearer` Upgrade header, never the URL.
+  The room checks its hash commitment before upgrading/admitting a daemon;
+  there is no first-writer verifier registration or unauthenticated fallback.
+  The relay sees this separate daemon-slot capability, not the pairing key or
+  plaintext; the capability cannot decrypt E2E traffic. A valid restart
+  preempts the old slot (close 4003) without rotating the pairing secret.
+  Superseded socket attachments lose control/routing authority before close,
+  including delayed frames and hibernation; browsers receive offline/online
+  in order to start fresh channels. Unauthenticated requests return 401 and
+  cannot claim a slot, push, or disconnect clients. The daemon connects with
   `?mux=1`: the Relay gives every browser a client id, announces
   `client_open`/`client_close`, and routes `{cid, f}` frames, so each
-  browser has its own daemon connection. Frames are version 2: each
+  browser has its own daemon connection. Room v3 requires matching Worker,
+  browser and daemon code: existing pairing fragments/secrets remain valid,
+  but derive a new room. Reload the browser after updating; existing opt-in
+  push subscriptions re-register only after a current authenticated handshake,
+  never by copying old-room state or requesting new notification permission.
+  Hosted deployment is a separate operation. Frames remain version 2: each
   browser connection opens with a handshake (`{"v":2,"hello":<16 random
   bytes>}` from each side) and derives a session key with HKDF-SHA256
   over the pairing key, salted with both nonces. Each side proves it holds
