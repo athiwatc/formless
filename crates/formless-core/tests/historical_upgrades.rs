@@ -297,6 +297,11 @@ fn rehearse(checkpoint: i64) {
     assert_retained(&upgraded, checkpoint);
     assert_integrity(&upgraded);
     let session = store.get_session(SESSION).unwrap().unwrap();
+    assert_eq!(
+        session.forked_from, None,
+        "old histories do not invent parents"
+    );
+    assert_eq!(session.fork_point_seq, None);
     assert_eq!(session.message_count, 3);
     assert_eq!(session.preview.as_deref(), Some(PREVIEW));
     assert_eq!(session.last_run_status.as_deref(), Some("paused"));

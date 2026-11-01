@@ -109,6 +109,12 @@ pub struct TemplateInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionInfo {
     pub id: String,
+    /// Direct parent of a recorded fork; absent for roots/unknown old lineage.
+    #[serde(default)]
+    pub forked_from: Option<String>,
+    /// Last source message copied at fork creation, or 0 for an empty prefix.
+    #[serde(default)]
+    pub fork_point_seq: Option<i64>,
     pub name: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -2949,6 +2955,22 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_session_payloads_have_unknown_lineage_and_new_records_round_trip() {
+        let raw = serde_json::json!({"id":"legacy","name":"Imported or old", "model":null,"reasoning_effort":null,"created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z"});
+        let mut session: super::SessionInfo = serde_json::from_value(raw).unwrap();
+        assert_eq!(session.forked_from, None);
+        assert_eq!(session.fork_point_seq, None);
+        session.forked_from = Some("recorded-parent".into());
+        session.fork_point_seq = Some(0);
+        let encoded = serde_json::to_value(&session).unwrap();
+        assert_eq!(encoded["forked_from"], "recorded-parent");
+        assert_eq!(encoded["fork_point_seq"], 0);
+        assert_eq!(
+            serde_json::from_value::<super::SessionInfo>(encoded).unwrap(),
+            session
+        );
+    }
     use super::*;
 
     #[test]

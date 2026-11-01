@@ -76,6 +76,8 @@ pub fn assert_old_shape(conn: &Connection, checkpoint: i64) {
     assert!(!table(conn, "denials"), "v47 must not already exist");
     assert!(!column(conn, "approvals", "code_hash"));
     assert!(!column(conn, "sessions", "name_source"));
+    assert!(!column(conn, "sessions", "forked_from"));
+    assert!(!column(conn, "sessions", "fork_point_seq"));
 }
 
 #[test]
