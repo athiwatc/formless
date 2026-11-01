@@ -634,3 +634,175 @@ async fn late_pending_model_input_retains_failed_audit_evidence_until_handle_con
     server.abort();
     let _ = server.await;
 }
+
+fn retained_pending_fixture(
+    daemon: &Daemon,
+    session: &str,
+    completed: bool,
+) -> (String, Arc<PendingEntry>) {
+    let handle = uuid::Uuid::new_v4().to_string();
+    let run = uuid::Uuid::new_v4().to_string();
+    let entry = Arc::new(PendingEntry {
+        taint_scope: daemon.taint_scope(session, &run),
+        tool_name: "private_retained_call".into(),
+        run_id: run,
+        started_ms: epoch_ms(),
+        session_id: session.into(),
+        result: StdMutex::new(completed.then(|| (true, "private completed result".into()))),
+        delivered: AtomicBool::new(false),
+        abandoned: AtomicBool::new(false),
+        stalled_noted: AtomicBool::new(false),
+        activity: Arc::new(std::sync::atomic::AtomicU64::new(epoch_ms())),
+        notify: tokio::sync::Notify::new(),
+        cancel: CancellationToken::new(),
+        order: 0,
+    });
+    entry.taint_scope.observe(&[crate::provenance::Origin::new(
+        "private_retained_call",
+        "framed_data",
+        "private known source",
+    )]);
+    daemon
+        .with_store(|st| st.add_pending_handle(&handle, session, &entry.tool_name))
+        .unwrap();
+    daemon
+        .pending
+        .locked()
+        .insert(handle.clone(), entry.clone());
+    (handle, entry)
+}
+
+#[tokio::test]
+async fn abandoning_completed_handles_and_deleting_sessions_release_evidence_owners() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_fixture, daemon) = Fixture::daemon(&env, "http://127.0.0.1:9");
+    let session = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+    let (handle, entry) = retained_pending_fixture(&daemon, &session, true);
+    let owner = Arc::downgrade(&entry.taint_scope);
+    let result = daemon
+        .handle(Request::AbandonInvocation {
+            handle: handle.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["abandoned"], handle);
+    assert!(entry.abandoned.load(Ordering::SeqCst));
+    assert!(daemon.pending_get(&handle).is_none());
+    assert!(daemon
+        .with_reader(|st| st.session_pending_handle(&session, &handle))
+        .unwrap()
+        .is_none());
+    drop(entry);
+    assert!(owner.upgrade().is_none());
+
+    // Agent abandonment reaches the same cleanup, preserving Session scoping.
+    let (handle, entry) = retained_pending_fixture(&daemon, &session, true);
+    let owner = Arc::downgrade(&entry.taint_scope);
+    let call = ToolCall {
+        id: "private-abandon".into(),
+        name: toolreg::ABANDON_INVOCATION.into(),
+        arguments: json!({"invocation_id":handle}).to_string(),
+    };
+    let (result, failed) = daemon
+        .dispatch_call(
+            &session,
+            "private-consumer",
+            &call,
+            &daemon.config().unwrap(),
+            &Arc::new(AtomicBool::new(false)),
+            &CancellationToken::new(),
+            &HashMap::new(),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&result).unwrap()["abandoned"],
+        handle
+    );
+    assert!(daemon.pending_get(&handle).is_none());
+    drop(entry);
+    assert!(owner.upgrade().is_none());
+
+    let (completed_handle, completed) = retained_pending_fixture(&daemon, &session, true);
+    let completed_owner = Arc::downgrade(&completed.taint_scope);
+    let (running_handle, running) = retained_pending_fixture(&daemon, &session, false);
+    let running_owner = Arc::downgrade(&running.taint_scope);
+    let mut cfg = daemon.config().unwrap();
+    cfg.daemon.delete_undo_secs = 0;
+    cfg.save(&daemon.paths).unwrap();
+    let result = daemon
+        .handle(Request::DeleteSession {
+            id: session.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["deleted"], true);
+    assert!(daemon.pending_get(&completed_handle).is_none());
+    assert!(running.abandoned.load(Ordering::SeqCst));
+    assert!(
+        daemon.pending_get(&running_handle).is_some(),
+        "running abandoned work still owns its evidence until exit"
+    );
+    drop(completed);
+    assert!(completed_owner.upgrade().is_none());
+    assert!(running_owner.upgrade().is_some());
+    daemon.complete_pending(
+        &running_handle,
+        &running,
+        false,
+        "interrupted private work".into(),
+    );
+    assert!(daemon.pending_get(&running_handle).is_none());
+    drop(running);
+    assert!(running_owner.upgrade().is_none());
+    assert!(daemon.input_taint.locked().is_empty());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while Arc::strong_count(&daemon) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("immediate-delete task teardown");
+}
+
+#[tokio::test]
+async fn concurrent_pending_completion_and_abandonment_cannot_strand_the_last_owner() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_fixture, daemon) = Fixture::daemon(&env, "http://127.0.0.1:9");
+    let session = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+    for order in [0, 1, 2] {
+        let (handle, entry) = retained_pending_fixture(&daemon, &session, false);
+        let owner = Arc::downgrade(&entry.taint_scope);
+        match order {
+            0 => {
+                daemon.abandon_pending(&handle, &entry);
+                assert!(daemon.pending_get(&handle).is_some());
+                daemon.complete_pending(&handle, &entry, true, "private result".into());
+            }
+            1 => {
+                daemon.complete_pending(&handle, &entry, true, "private result".into());
+                assert!(daemon.pending_get(&handle).is_some());
+                daemon.abandon_pending(&handle, &entry);
+            }
+            _ => {
+                let start = std::sync::Barrier::new(2);
+                std::thread::scope(|threads| {
+                    threads.spawn(|| {
+                        start.wait();
+                        daemon.abandon_pending(&handle, &entry);
+                    });
+                    threads.spawn(|| {
+                        start.wait();
+                        daemon.complete_pending(&handle, &entry, true, "private result".into());
+                    });
+                });
+            }
+        }
+        assert!(entry.abandoned.load(Ordering::SeqCst));
+        assert!(entry.result.locked().is_some());
+        assert!(daemon.pending_get(&handle).is_none(), "ordering {order}");
+        drop(entry);
+        assert!(owner.upgrade().is_none(), "ordering {order}");
+        assert!(daemon.input_taint.locked().is_empty());
+    }
+}

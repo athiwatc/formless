@@ -4391,7 +4391,10 @@ approval, and cannot be cleared by an empty source list or forged payload text.
 Accepted-input fallback evidence is owned by the active Run, nested execution,
 and retained pending handles. A pending call may accept model input after its
 Run ends: its evidence remains available until the result is delivered or the
-handle is forgotten. Providers retain only a weak lookup, so cached providers
+handle is forgotten. Abandoning an already completed handle releases it
+immediately; abandoning running work retains ownership until that work exits.
+Session deletion uses the same flag-first completion handshake, so concurrent
+completion cannot strand an abandoned handle. Providers retain only a weak lookup, so cached providers
 cannot keep completed operation evidence alive. Failed evidence persistence
 keeps known sources in memory; failed deferred delivery retains the handle for
 retry, and never reports a clean consumer because a write failed. Ownership and

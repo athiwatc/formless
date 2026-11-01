@@ -3645,7 +3645,7 @@ impl Daemon {
                     .pending_get(&handle)
                     .context(RequestFailure::not_found("no invocation with that handle"))?;
                 // The agent stops waiting for it; it may still finish.
-                entry.abandoned.store(true, Ordering::SeqCst);
+                self.abandon_pending(&handle, &entry);
                 let _ =
                     self.with_store(|st| st.audit("user", "invocation.abandon", &entry.tool_name));
                 Ok(json!({"abandoned": handle}))
@@ -4488,11 +4488,16 @@ impl Daemon {
             ctl.cancel_flag.store(true, Ordering::SeqCst);
             ctl.cancel.cancel();
         }
-        for entry in self.pending.locked().values() {
-            if entry.session_id == session_id {
-                entry.abandoned.store(true, Ordering::SeqCst);
-                entry.notify.notify_waiters();
-            }
+        let pending: Vec<_> = self
+            .pending
+            .locked()
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(handle, entry)| (handle.clone(), entry.clone()))
+            .collect();
+        for (handle, entry) in pending {
+            self.abandon_pending(&handle, &entry);
+            entry.notify.notify_waiters();
         }
         for _ in 0..100 {
             if !self.runs.locked().contains_key(session_id) {
@@ -5959,7 +5964,7 @@ impl Daemon {
                     }
                     for (handle, _n) in &live {
                         if let Some(entry) = self.pending_get(handle) {
-                            entry.abandoned.store(true, Ordering::SeqCst);
+                            self.abandon_pending(handle, &entry);
                         }
                     }
                 }
@@ -7110,7 +7115,7 @@ impl Daemon {
                     .filter(|entry| entry.session_id == session_id)
                 {
                     Some(entry) => {
-                        entry.abandoned.store(true, Ordering::SeqCst);
+                        self.abandon_pending(handle, &entry);
                         json!({"abandoned": handle}).to_string()
                     }
                     None => self.stale_handle_answer(session_id, handle),
@@ -7537,6 +7542,31 @@ impl Daemon {
         })
     }
 
+    /// Mark first, then inspect completion. Either this side sees the result,
+    /// or the completing worker sees the flag; neither ordering can strand a
+    /// completed owner. Never acquire the pending map while holding result.
+    fn abandon_pending(&self, handle: &str, entry: &PendingEntry) {
+        entry.abandoned.store(true, Ordering::SeqCst);
+        let completed = entry.result.locked().is_some();
+        if completed {
+            self.forget_pending(handle);
+        }
+    }
+
+    fn complete_pending(&self, handle: &str, entry: &PendingEntry, ok: bool, text: String) {
+        *entry.result.locked() = Some((ok, text));
+        entry.notify.notify_waiters();
+        self.broadcast(Event::InvocationCompleted {
+            session_id: entry.session_id.clone(),
+            handle: handle.to_string(),
+            tool_name: entry.tool_name.clone(),
+            ok,
+        });
+        if entry.abandoned.load(Ordering::SeqCst) {
+            self.forget_pending(handle);
+        }
+    }
+
     /// Drop a handle from memory and from the persisted record.
     fn forget_pending(&self, handle: &str) {
         self.pending.locked().remove(handle);
@@ -7676,17 +7706,7 @@ impl Daemon {
                     }
                     Err(e) => (false, format!("error: {e}")),
                 };
-                *entry2.result.locked() = Some((ok, text));
-                entry2.notify.notify_waiters();
-                this.broadcast(Event::InvocationCompleted {
-                    session_id: sid,
-                    handle: handle2.clone(),
-                    tool_name: nm,
-                    ok,
-                });
-                if entry2.abandoned.load(Ordering::SeqCst) {
-                    this.forget_pending(&handle2);
-                }
+                this.complete_pending(&handle2, &entry2, ok, text);
             });
         }
         let threshold = std::time::Duration::from_secs(cfg.tools.pending_threshold_secs);
