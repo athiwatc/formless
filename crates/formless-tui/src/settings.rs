@@ -171,6 +171,13 @@ pub fn rows(
         ),
         Row::new(
             "Interface",
+            "tui.vim_mode",
+            "vim_mode",
+            on(cfg.tui.vim_mode),
+            Bool,
+        ),
+        Row::new(
+            "Interface",
             "tui.multi_pane",
             "multi_pane",
             on(cfg.tui.multi_pane),

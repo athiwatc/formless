@@ -56,6 +56,28 @@ impl Vim {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
+    pub(crate) fn paste(&mut self, line: &mut InputLine, text: &str) {
+        line.modal_expand_pastes();
+        if self.mode == Mode::Normal {
+            self.apply(line, Command::Insert('i'));
+        }
+        for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+            let key = if c == '\n' {
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+            } else {
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+            };
+            insert_key(line, key, Surface::Editor);
+            self.inserting
+                .get_or_insert(Change {
+                    command: Command::Insert('i'),
+                    edits: vec![],
+                })
+                .edits
+                .push(key);
+        }
+    }
+
     pub(crate) fn key(&mut self, line: &mut InputLine, key: KeyEvent, surface: Surface) -> Outcome {
         line.modal_expand_pastes();
         if key.code == KeyCode::Esc {
@@ -88,6 +110,9 @@ impl Vim {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
+            if self.mode == Mode::Insert {
+                self.inserting = None;
+            }
             return Outcome::Pass;
         }
         if self.mode == Mode::Insert {
@@ -139,6 +164,11 @@ impl Vim {
             return Outcome::Handled;
         }
         if self.pending.is_empty() {
+            if c == '/' && surface == Surface::Composer {
+                self.apply(line, Command::Insert('i'));
+                self.paste(line, "/");
+                return Outcome::Handled;
+            }
             if matches!(c, 'i' | 'a' | 'I' | 'A' | 'o' | 'O') {
                 self.apply(line, Command::Insert(c));
                 return Outcome::Handled;
@@ -586,13 +616,27 @@ fn object_range(s: &str, at: usize, motion: &str, count: usize) -> Option<Range<
         while end < s.len() && kind(cluster(s, end), big) == k {
             end = next(s, end)
         }
-        for _ in 1..count {
-            end = word_forward(s, end, big);
-            if end < s.len() {
-                end = next(s, word_end(s, end, big))
+        if around && k == 0 && end < s.len() {
+            let next_kind = kind(cluster(s, end), big);
+            while end < s.len() && kind(cluster(s, end), big) == next_kind {
+                end = next(s, end)
             }
         }
-        if around {
+        for _ in 1..count {
+            if around {
+                while end < s.len() && kind(cluster(s, end), big) == 0 {
+                    end = next(s, end)
+                }
+            }
+            if end == s.len() {
+                break;
+            }
+            let next_kind = kind(cluster(s, end), big);
+            while end < s.len() && kind(cluster(s, end), big) == next_kind {
+                end = next(s, end)
+            }
+        }
+        if around && k != 0 {
             let initial = end;
             while end < s.len() && cluster(s, end) != "\n" && kind(cluster(s, end), big) == 0 {
                 end = next(s, end)

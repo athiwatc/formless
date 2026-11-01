@@ -3037,6 +3037,27 @@ run_tool = "network_policy"     # a registry Tool, or…
   (`ForkSession up_to_seq`) and puts the message in its input. An expanded call shows its input and its result or error,
   pretty-printed and highlighted when JSON (capped at a few hundred lines;
   `/open` shows stored outputs in full).
+- **Vim editing (TUI, #626).** `tui.vim_mode = true` (default false), or
+  `/vim [on|off]`, enables modal editing in the composer and internal Tool,
+  module, schema, description and run-input editors. The setting persists;
+  list-view keys and default readline editing are unchanged. Buffers start in
+  Insert, with `INSERT` / `NORMAL` shown in their border and `?` help in Normal.
+  Insert Esc only enters Normal, preserving text and any active Run. Normal
+  composer Esc retains Run-stop/cancel behavior; editor Esc always keeps text,
+  with Ctrl+S save and explicit Ctrl+Q cancel shown in the footer.
+  Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
+  those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
+  ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
+  operator counts are bounded to 999. Yank stays in an internal register;
+  no OS clipboard is read or written. Dot repeats the last editing command
+  and its unmodified Insert keys/paste; movement and yanks do not replace it.
+  Large collapsed pastes expand before modal editing to preserve their actual
+  contents. No Visual mode, Ex commands, macros, syntax-aware objects or full
+  Vim emulation is promised. Semantics follow the official
+  [motion](https://vimhelp.org/motion.txt.html),
+  [change](https://vimhelp.org/change.txt.html) and
+  [repeat](https://vimhelp.org/repeat.txt.html) help (including cw's trailing
+  whitespace exception and grapheme-safe editing).
 - **Input editor (TUI).** The message box is a multi-line editor with
   readline keys:
   - ←/→ move by character and Alt or Ctrl+←/→ by word. Home/End and
@@ -4360,6 +4381,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `memory.confirm_writes` | `never` | Ask before keeping a note the agent writes: `never`, `sensitive` (personal details) or `always` (§7.11) |
 | `mcp.idle_secs` | 300 | Stop an MCP server process after this long without calls; it restarts on the next one (§7.9) |
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
+| `tui.vim_mode` | false | Normal/Insert editing in composer and internal Tool editor; /vim toggles it persistently, Insert Esc enters Normal, Normal Esc stops a Run and editor Ctrl+Q explicitly cancels (§10.2) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 | `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
 | `tui.animations` | true | Spinners and other moving indicators in the TUI; false (or `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` set to anything but empty, `0`, `false`, `no` or `off`) shows a static `●` and a steady cursor (§10.2) |
