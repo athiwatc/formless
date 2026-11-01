@@ -24357,6 +24357,206 @@ mod tests {
         );
     }
     #[test]
+    fn vim_review_completion_escape_and_navigation_belong_to_the_visible_popup() {
+        let _env = credential_env::EnvGuard::isolated();
+        for mention in [false, true] {
+            let mut app = test_app();
+            app.vim_mode = true;
+            app.current = Some("s1".into());
+            app.running_sessions.insert("s1".into());
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            if mention {
+                app.input.set("@fo");
+                app.mention = Some(MentionPopup {
+                    query: "fo".into(),
+                    files: vec![
+                        formless_core::files::FileEntry {
+                            path: "folder/one.txt".into(),
+                            dir: false,
+                            bytes: 1,
+                        },
+                        formless_core::files::FileEntry {
+                            path: "folder/two.txt".into(),
+                            dir: false,
+                            bytes: 2,
+                        },
+                    ],
+                    sel: 0,
+                    dismissed: false,
+                });
+            } else {
+                app.input.set("/");
+                assert!(app.palette_items().len() > 1);
+            }
+            let original = app.input.expanded();
+            app.key(key(KeyCode::Esc));
+            assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+            assert_eq!(app.input.expanded(), original);
+            assert!(
+                sent.try_recv().is_err(),
+                "first Insert Escape must not stop a Run or refresh a changed mention query"
+            );
+            app.key(key(KeyCode::Down));
+            if mention {
+                assert_eq!(app.mention.as_ref().unwrap().sel, 1);
+                assert_eq!(app.mention.as_ref().unwrap().query, "fo");
+            } else {
+                assert_eq!(app.palette_sel, 1);
+            }
+            app.key(key(KeyCode::Esc));
+            if mention {
+                assert!(app.mention.as_ref().unwrap().dismissed);
+            } else {
+                assert!(app.palette_items().is_empty());
+            }
+            assert!(
+                sent.try_recv().is_err(),
+                "Normal Escape must dismiss the completion before it can stop a Run"
+            );
+            assert_eq!(app.input.expanded(), original);
+            app.key(key(KeyCode::Esc));
+            let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(
+                matches!(request.request,Request::InterruptRun{session_id} if session_id=="s1")
+            );
+            assert!(sent.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn vim_review_pager_switcher_and_approval_keep_their_focus() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("private draft");
+        app.running_sessions.insert("s1".into());
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.pager = Some(Pager {
+            title: "Read-only view".into(),
+            lines: vec!["private data".into()],
+            top: 0,
+            left: 0,
+            styled: vec![],
+        });
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+        assert_eq!(app.input.expanded(), "private draft");
+        assert!(sent.try_recv().is_err());
+        app.switcher = Some((String::new(), 0));
+        app.key(key(KeyCode::Esc));
+        assert!(app.switcher.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+        assert!(sent.try_recv().is_err());
+        app.on_event(reconnect_approval("held-vim-review", "s1"));
+        app.vim_input.mode = vim::Mode::Normal;
+        app.input_focus = false;
+        app.key(key(KeyCode::Char('i')));
+        assert!(
+            app.pager.is_some(),
+            "approval inspector must own i rather than enter Insert"
+        );
+        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+        assert!(sent.try_recv().is_err());
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+        app.key(key(KeyCode::Char('o')));
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(request.request,Request::ApprovalDecision{approval_id,approved:true,scope:ApprovalScope::Once,..} if approval_id=="held-vim-review")
+        );
+        assert_eq!(app.input.expanded(), "private draft");
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn vim_review_readline_changes_do_not_replay_modifier_keys_with_dot() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("one two three");
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Esc));
+        for c in "0dw".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input.expanded(), "two three");
+        app.key(key(KeyCode::Char('i')));
+        app.key(key(KeyCode::Char('X')));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.expanded(), "two three");
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(app.input.expanded(),"three","dot retains the preceding complete dw change; readline modifiers are never replayed as insertion");
+        assert_eq!(app.vim_input.mode, vim::Mode::Normal);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn vim_review_tool_editor_maps_unicode_objects_and_empty_lines_back_to_char_indices() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.vim_mode = true;
+        let text = "👩🏽‍💻 [a\u{301} ไทย]\n\n尾";
+        let mut vim = vim::Vim::default();
+        vim.mode = vim::Mode::Normal;
+        app.editor = Some(EditorState {
+            vim,
+            tool_id: "private".into(),
+            name: "unicode editor".into(),
+            chars: text.chars().collect(),
+            cursor: "👩🏽‍💻 [".chars().count(),
+            mode: EditMode::Code,
+        });
+        for c in "di[".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.text(), "👩🏽‍💻 []\n\n尾");
+        assert_eq!(ed.cursor, "👩🏽‍💻 [".chars().count());
+        assert_eq!(ed.modal_line().cursor_byte(), "👩🏽‍💻 [".len());
+        let blank = "👩🏽‍💻 []\n".chars().count();
+        app.editor.as_mut().unwrap().cursor = blank;
+        for c in "dd".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.text(), "👩🏽‍💻 []\n尾");
+        assert_eq!(ed.cursor, "👩🏽‍💻 []\n".chars().count());
+        assert_eq!(ed.modal_line().cursor_byte(), "👩🏽‍💻 []\n".len());
+        app.key(key(KeyCode::Esc));
+        assert!(
+            app.editor.is_some(),
+            "Normal Escape cannot discard the edited Unicode buffer"
+        );
+    }
+
+    #[test]
+    fn vim_review_insert_digits_are_literal_not_empty_session_example_shortcuts() {
+        let _env = credential_env::EnvGuard::isolated();
+        for c in ['1', '2', '3', '4'] {
+            let mut app = test_app();
+            app.vim_mode = true;
+            app.input.clear();
+            app.messages.clear();
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.key(key(KeyCode::Char(c)));
+            assert_eq!(
+                app.input.expanded(),
+                c.to_string(),
+                "Insert must type the requested digit"
+            );
+            assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+            assert!(sent.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn vim_insert_escape_never_stops_run_and_normal_escape_sends_interrupt() {
         let mut app = test_app();
         app.vim_mode = true;
