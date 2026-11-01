@@ -130,6 +130,24 @@ pub fn version_diff(old: &ToolVersionInfo, new: &ToolVersionInfo) -> String {
         out.push(format!("@@ {name} (v{} → v{})", old.version, new.version));
         out.extend(context_diff(&a, &b));
     }
+    if old.input_schema != new.input_schema || old.output_schema != new.output_schema {
+        let report = crate::tool_compatibility::report(
+            "",
+            old.version,
+            &old.input_schema,
+            &old.output_schema,
+            &new.input_schema,
+            &new.output_schema,
+        );
+        out.push(format!(
+            "@@ schema_compatibility (v{} → v{})",
+            old.version, new.version
+        ));
+        out.push(
+            serde_json::to_string_pretty(&report.compatibility)
+                .unwrap_or_else(|_| "inconclusive".into()),
+        );
+    }
     if out.is_empty() {
         "(no changes)".into()
     } else {

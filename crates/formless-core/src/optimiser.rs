@@ -30,6 +30,53 @@ Fix the actual failures without breaking the recorded successes. ",
     crate::provider::host_api_doc!()
 );
 
+#[derive(Clone, Default)]
+struct PromotionApprovals {
+    schema_context: Option<String>,
+    replay_limited: bool,
+}
+#[derive(Clone)]
+enum PromotionGate {
+    Widening,
+    Schema(String),
+    ReplayLimited,
+}
+/// Private, one-use server state. Candidate JSON, attempt text and audit text
+/// cannot supply an approval. Restart intentionally requires a new approval.
+pub(crate) struct PromotionTicket {
+    attempt_id: String,
+    gate: PromotionGate,
+    approvals: PromotionApprovals,
+}
+impl PromotionTicket {
+    pub(crate) fn widening(attempt_id: String) -> Self {
+        Self {
+            attempt_id,
+            gate: PromotionGate::Widening,
+            approvals: PromotionApprovals::default(),
+        }
+    }
+}
+fn schema_context(
+    attempt_id: &str,
+    candidate: &CandidateData,
+    report: &crate::tool_compatibility::ToolSchemaReport,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"formless-optimiser-schema-approval-v1\0");
+    digest.update(serde_json::to_vec(&json!({"attempt_id":attempt_id,"report":report.context_digest()?,
+        "candidate":{"code":candidate.code,"description":candidate.description,"input_schema":candidate.input_schema,
+        "output_schema":candidate.output_schema,"capabilities":candidate.capabilities,"memory_mb":candidate.memory_mb}}))?);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+enum PromotionCommit {
+    Applied(ToolInfo, i64),
+    SchemaApproval(crate::tool_compatibility::ToolSchemaReport, String),
+    Discarded(String),
+}
+
 impl Daemon {
     pub(crate) fn activity(&self, tool_name: &str, text: String) {
         self.broadcast(Event::OptimiserActivity {
@@ -467,10 +514,14 @@ impl Daemon {
         )
         .await
         {
-            Ok((cand, est_tokens)) => {
-                let attempt_id = match self
-                    .with_store(|st| st.create_attempt(tool_id, ver.version, &cand, est_tokens))
-                {
+            Ok((cand, est_tokens, validation_context)) => {
+                let attempt_id = match self.with_store(|st| {
+                    let id = st.create_attempt(tool_id, ver.version, &cand, est_tokens)?;
+                    if validation_context {
+                        st.mark_attempt_validation_context(&id)?;
+                    }
+                    Ok(id)
+                }) {
                     Ok(id) => id,
                     Err(_) => return,
                 };
@@ -489,10 +540,15 @@ impl Daemon {
                             0,
                         )
                     });
-                    self.request_promotion_approval(&info, &attempt_id, "widening", &cand);
+                    self.request_promotion_ticket(
+                        &info,
+                        PromotionTicket::widening(attempt_id),
+                        &cand,
+                    );
                     return;
                 }
-                self.replay_and_maybe_promote(attempt_id, cfg).await;
+                self.replay_and_maybe_promote(attempt_id, cfg, PromotionApprovals::default())
+                    .await;
             }
             Err(e) => {
                 // Generation failure counts toward give-up (§8.3).
@@ -528,8 +584,11 @@ impl Daemon {
         info: &ToolInfo,
         ver: &ToolVersionInfo,
         cfg: &Config,
-    ) -> Result<(CandidateData, i64)> {
+    ) -> Result<(CandidateData, i64, bool)> {
         let replay = self.with_store(|st| st.replay_set(&info.id))?;
+        let validation_context = replay
+            .iter()
+            .any(|item| !item.recorded_success && item.tag == "validation");
         let failures: Vec<&ReplayItem> = replay
             .iter()
             .filter(|r| !r.recorded_success)
@@ -588,21 +647,31 @@ impl Daemon {
         let raw = result.completion.text;
         let est_tokens = ((prompt.len() + raw.len()) / 4) as i64;
         let cand = parse_candidate(&result.value, ver, cfg)?;
-        Ok((cand, est_tokens))
+        Ok((cand, est_tokens, validation_context))
     }
 
-    fn request_promotion_approval(
+    fn request_promotion_ticket(
         &self,
         info: &ToolInfo,
-        attempt_id: &str,
-        kind: &str,
+        ticket: PromotionTicket,
         cand: &CandidateData,
     ) {
+        let kind = match &ticket.gate {
+            PromotionGate::Widening => "widening".to_owned(),
+            PromotionGate::Schema(_) => self.with_store(|st| st.attempt_schema_report(&ticket.attempt_id))
+                .map(|report| {
+                    let verdict = if report.compatibility.is_breaking() { "Breaking schema" } else { "Unverified schema compatibility" };
+                    let impact = if report.inventory_truncated { "dependent inventory is incomplete".to_owned() }
+                        else { format!("{} live dependents", report.affected_dependents.iter().filter(|dependent| dependent.live).count()) };
+                    format!("{verdict}: {impact}. Review this Tool's optimiser attempt detail for the old/new contract changes and affected Tools/scripts/jobs before approving.")
+                })
+                .unwrap_or_else(|_| "Schema compatibility could not be verified; inspect the attempt detail".into()),
+            PromotionGate::ReplayLimited => "replay_limited".to_owned(),
+        };
         let promotion_id = uuid::Uuid::new_v4().to_string();
-        self.promotions.locked().insert(
-            promotion_id.clone(),
-            (attempt_id.to_string(), kind.to_string()),
-        );
+        self.promotions
+            .locked()
+            .insert(promotion_id.clone(), ticket);
         self.activity(&info.name, format!("awaiting promotion approval ({kind})"));
         self.broadcast(Event::PromotionApprovalRequested {
             promotion_id,
@@ -613,18 +682,21 @@ impl Daemon {
         });
     }
 
-    pub(crate) async fn resume_promotion(
-        self: Arc<Self>,
-        attempt_id: String,
-        kind: String,
-        approved: bool,
-    ) {
+    pub(crate) async fn resume_promotion(self: Arc<Self>, ticket: PromotionTicket, approved: bool) {
+        let PromotionTicket {
+            attempt_id,
+            gate,
+            mut approvals,
+        } = ticket;
         let Ok(cfg) = self.config() else {
             return;
         };
         let Ok(Some(attempt)) = self.with_store(|st| st.get_attempt(&attempt_id)) else {
             return;
         };
+        if matches!(attempt.status.as_str(), "promoted" | "discarded" | "failed") {
+            return;
+        }
         let Ok(Some((info, _ver))) = self.with_store(|st| st.get_tool_current(&attempt.tool_id))
         else {
             return;
@@ -634,7 +706,7 @@ impl Daemon {
                 &info,
                 &attempt_id,
                 "discarded",
-                &format!("user denied promotion approval ({kind})"),
+                "user denied promotion approval",
                 None,
                 None,
                 0,
@@ -643,17 +715,35 @@ impl Daemon {
             );
             return;
         }
-        match kind.as_str() {
-            "widening" => self.replay_and_maybe_promote(attempt_id, &cfg).await,
-            "replay_limited" => self.promote_attempt(&info, &attempt_id, &cfg),
-            _ => {}
+        match gate {
+            PromotionGate::Widening => {
+                self.replay_and_maybe_promote(attempt_id, &cfg, approvals)
+                    .await
+            }
+            PromotionGate::Schema(context) => {
+                approvals.schema_context = Some(context);
+                self.replay_and_maybe_promote(attempt_id, &cfg, approvals)
+                    .await;
+            }
+            PromotionGate::ReplayLimited => {
+                approvals.replay_limited = true;
+                self.promote_attempt(&info, &attempt_id, &cfg, approvals);
+            }
         }
     }
 
-    async fn replay_and_maybe_promote(self: &Arc<Self>, attempt_id: String, cfg: &Config) {
+    async fn replay_and_maybe_promote(
+        self: &Arc<Self>,
+        attempt_id: String,
+        cfg: &Config,
+        approvals: PromotionApprovals,
+    ) {
         let Ok(Some(attempt)) = self.with_store(|st| st.get_attempt(&attempt_id)) else {
             return;
         };
+        if matches!(attempt.status.as_str(), "promoted" | "discarded" | "failed") {
+            return;
+        }
         let Ok(Some((info, ver))) = self.with_store(|st| st.get_tool_current(&attempt.tool_id))
         else {
             return;
@@ -747,7 +837,7 @@ impl Daemon {
             "candidate {cand_pass}/{total} baseline {base_pass}/{total} regressions {regressions}"
         );
         if wins_by_margin && regressions == 0 {
-            if cand_caps.net.is_some() || !cand_caps.mcp.is_empty() {
+            if (cand_caps.net.is_some() || !cand_caps.mcp.is_empty()) && !approvals.replay_limited {
                 // Replay-limited (§8.4): net and MCP tools can only promote
                 // by hand (what a Candidate sends a server isn't checked).
                 let _ = self.with_store(|st| {
@@ -761,13 +851,21 @@ impl Daemon {
                         regressions,
                     )
                 });
-                self.request_promotion_approval(&info, &attempt_id, "replay_limited", cand);
+                self.request_promotion_ticket(
+                    &info,
+                    PromotionTicket {
+                        attempt_id,
+                        gate: PromotionGate::ReplayLimited,
+                        approvals,
+                    },
+                    cand,
+                );
                 return;
             }
             let _ = self.with_store(|st| {
                 st.update_attempt(
                     &attempt_id,
-                    "promoted",
+                    "replay_passed",
                     &detail,
                     Some(cand_score),
                     Some(base_score),
@@ -775,7 +873,7 @@ impl Daemon {
                     regressions,
                 )
             });
-            self.promote_attempt_with(&info, &attempt_id, cand, cfg);
+            self.promote_attempt_with_approvals(&info, &attempt_id, cand, cfg, approvals);
         } else {
             self.fail_attempt(
                 &info,
@@ -791,31 +889,37 @@ impl Daemon {
         }
     }
 
-    fn promote_attempt(self: &Arc<Self>, info: &ToolInfo, attempt_id: &str, cfg: &Config) {
+    fn promote_attempt(
+        self: &Arc<Self>,
+        info: &ToolInfo,
+        attempt_id: &str,
+        cfg: &Config,
+        approvals: PromotionApprovals,
+    ) {
         let Ok(Some(attempt)) = self.with_store(|st| st.get_attempt(attempt_id)) else {
             return;
         };
         // Replay already passed; keep its scores, just flip the status.
         let cand = attempt.candidate.clone();
-        let attempts = self
-            .with_store(|st| st.list_attempts(&info.id, 50))
-            .unwrap_or_default();
-        if let Some(a) = attempts.iter().find(|a| a.id == attempt_id) {
+        if let Ok((detail, candidate_score, baseline_score, replay_total, regressions)) =
+            self.with_store(|st| st.attempt_scores(attempt_id))
+        {
             let _ = self.with_store(|st| {
                 st.update_attempt(
                     attempt_id,
-                    "promoted",
-                    &a.detail,
-                    a.candidate_score,
-                    a.baseline_score,
-                    a.replay_total,
-                    a.regressions,
+                    "replay_passed",
+                    &detail,
+                    candidate_score,
+                    baseline_score,
+                    replay_total,
+                    regressions,
                 )
             });
         }
-        self.promote_attempt_with(info, attempt_id, &cand, cfg);
+        self.promote_attempt_with_approvals(info, attempt_id, &cand, cfg, approvals);
     }
 
+    #[cfg(test)]
     fn promote_attempt_with(
         self: &Arc<Self>,
         info: &ToolInfo,
@@ -823,46 +927,113 @@ impl Daemon {
         cand: &CandidateData,
         cfg: &Config,
     ) {
+        self.promote_attempt_with_approvals(
+            info,
+            attempt_id,
+            cand,
+            cfg,
+            PromotionApprovals::default(),
+        )
+    }
+    fn promote_attempt_with_approvals(
+        self: &Arc<Self>,
+        info: &ToolInfo,
+        attempt_id: &str,
+        cand: &CandidateData,
+        cfg: &Config,
+        approvals: PromotionApprovals,
+    ) {
         let caps = Capabilities::parse(&cand.capabilities).unwrap_or_default();
         match self.with_store(|st| {
-            // Checked under the same store lock as the write: a Tool
-            // retired (or deleted) while the Candidate was measured stays
-            // retired, and the Candidate is discarded and logged (SPEC §16).
-            let live = st
-                .get_tool_current(&info.id)?
-                .is_some_and(|(t, _)| !t.retired);
-            if !live {
-                st.audit(
+            st.transaction(|st| {
+                // Checked under the same store lock as the write: a Tool
+                // retired (or deleted) while the Candidate was measured stays
+                // retired, and the Candidate is discarded and logged (SPEC §16).
+                let live = st.get_tool_current(&info.id)?;
+                if live.as_ref().is_none_or(|(tool, _)| tool.retired) {
+                    st.audit(
+                        "optimiser",
+                        "tool.promote_discarded",
+                        &format!(
+                            "{}: retired before its Candidate could be promoted",
+                            info.name
+                        ),
+                    )?;
+                    let _ = st.update_attempt(
+                        attempt_id,
+                        "discarded",
+                        "the Tool was retired",
+                        None,
+                        None,
+                        0,
+                        0,
+                    );
+                    return Ok(PromotionCommit::Discarded(
+                        "the Tool was retired; Candidate discarded".into(),
+                    ));
+                }
+                let attempt = st
+                    .get_attempt(attempt_id)?
+                    .ok_or_else(|| anyhow!("Attempt no longer exists"))?;
+                if attempt.status == "promoted" {
+                    return Ok(PromotionCommit::Discarded(
+                        "Candidate was already promoted".into(),
+                    ));
+                }
+                let (live, _) = live.expect("checked live Tool");
+                if live.current_version != attempt.base_version {
+                    let (detail, cs, bs, total, regressions) = st.attempt_scores(attempt_id)?;
+                    st.update_attempt(
+                        attempt_id,
+                        "discarded",
+                        &format!("stale: Tool changed after replay; {detail}"),
+                        cs,
+                        bs,
+                        total,
+                        regressions,
+                    )?;
+                    return Ok(PromotionCommit::Discarded(
+                        "Tool changed after replay".into(),
+                    ));
+                }
+                let report = st.attempt_schema_report(attempt_id)?;
+                let context = schema_context(attempt_id, cand, &report)?;
+                if schema_context(attempt_id, &attempt.candidate, &report)? != context {
+                    return Err(anyhow!("Candidate changed after replay; promotion refused"));
+                }
+                let schema_approved = approvals.schema_context.as_ref() == Some(&context);
+                if report.requires_acknowledgement() && !schema_approved {
+                    let (detail, cs, bs, total, regressions) = st.attempt_scores(attempt_id)?;
+                    st.update_attempt(
+                        attempt_id,
+                        "awaiting_approval",
+                        &detail,
+                        cs,
+                        bs,
+                        total,
+                        regressions,
+                    )?;
+                    return Ok(PromotionCommit::SchemaApproval(report, context));
+                }
+                let (tool, version) = st.create_tool_version_with_schema_policy(
+                    &info.name,
+                    &cand.description,
+                    &cand.input_schema,
+                    &cand.output_schema,
+                    &cand.code,
+                    &caps,
+                    cand.memory_mb,
                     "optimiser",
-                    "tool.promote_discarded",
-                    &format!(
-                        "{}: retired before its Candidate could be promoted",
-                        info.name
-                    ),
+                    crate::tool_compatibility::SchemaWritePolicy::Agent {
+                        allow_breaking: schema_approved,
+                    },
                 )?;
-                let _ = st.update_attempt(
-                    attempt_id,
-                    "discarded",
-                    "the Tool was retired",
-                    None,
-                    None,
-                    0,
-                    0,
-                );
-                return Err(anyhow::anyhow!("the Tool was retired; Candidate discarded"));
-            }
-            st.create_tool_version(
-                &info.name,
-                &cand.description,
-                &cand.input_schema,
-                &cand.output_schema,
-                &cand.code,
-                &caps,
-                cand.memory_mb,
-                "optimiser",
-            )
+                let (detail, cs, bs, total, regressions) = st.attempt_scores(attempt_id)?;
+                st.update_attempt(attempt_id, "promoted", &detail, cs, bs, total, regressions)?;
+                Ok(PromotionCommit::Applied(tool, version))
+            })
         }) {
-            Ok((new_info, version)) => {
+            Ok(PromotionCommit::Applied(new_info, version)) => {
                 let _ = self.with_store(|st| {
                     let _ = st.set_consecutive_failures(&info.id, 0);
                     let _ = st.set_needs_attention(&info.id, false);
@@ -875,6 +1046,20 @@ impl Daemon {
                 self.set_cooldown_now(&info.id, cfg);
                 self.activity(&info.name, format!("promoted candidate as v{version}"));
                 self.broadcast(Event::ToolUpdated { tool: new_info });
+            }
+            Ok(PromotionCommit::SchemaApproval(_report, context)) => {
+                self.request_promotion_ticket(
+                    info,
+                    PromotionTicket {
+                        attempt_id: attempt_id.into(),
+                        gate: PromotionGate::Schema(context),
+                        approvals,
+                    },
+                    cand,
+                );
+            }
+            Ok(PromotionCommit::Discarded(reason)) => {
+                self.activity(&info.name, format!("candidate discarded: {reason}"))
             }
             Err(e) => self.activity(&info.name, format!("promotion failed: {e}")),
         }
@@ -1554,6 +1739,10 @@ fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
         .to_string();
     Ok((kind, content, rationale))
 }
+
+#[cfg(test)]
+#[path = "optimiser_schema_tests.rs"]
+mod schema_tests;
 
 #[cfg(test)]
 mod race_tests {

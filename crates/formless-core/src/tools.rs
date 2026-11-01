@@ -209,6 +209,7 @@ pub fn create_tool_definition() -> Value {
                     "output_schema": {"type": "object", "description": "JSON Schema for the return value"},
                     "implementation_js": {"type": "string", "description": "Plain JS defining global function run(input) (may be async). Throw on failure; {error: ...} is data only when output_schema declares an error property."},
                     "capabilities": {"type": "array", "items": {"type": "string"}, "description": "e.g. [\"net\", \"net:$input.url\", \"fs:read:/abs\", \"fs:read:$input.path\", \"fs:write:$input.out\", \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"notify\", \"llm\"]. $input.<field> scopes (fs:read, fs:write, net only) are granted per call for the path(s)/host in that input field."},
+                    "allow_breaking": {"type":"boolean","default":false,"description":"Explicitly acknowledge a breaking or inconclusive schema change with live or possible dependent Tools, scripts, pinned definitions or jobs. Inspect the returned compatibility/dependency report before opting in; this never bypasses capability, validation or smoke gates."},
                     "memory_mb": {"type": "integer", "description": "Optional JS heap cap (default 256)"}
                 },
                 "required": ["name", "description", "input_schema", "output_schema", "implementation_js", "capabilities"]

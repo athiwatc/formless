@@ -722,7 +722,7 @@ pub struct Daemon {
     /// `@`-mention file indexes by root, refreshed after `FILE_INDEX_SECS`.
     file_index: StdMutex<HashMap<std::path::PathBuf, FileIndex>>,
     /// promotion_id -> (attempt_id, kind: "widening" | "replay_limited")
-    pub(crate) promotions: Arc<StdMutex<HashMap<String, (String, String)>>>,
+    pub(crate) promotions: Arc<StdMutex<HashMap<String, crate::optimiser::PromotionTicket>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
     subs: Subs,
     /// One HTTP client (connection pool + TLS sessions) for every provider
@@ -2481,7 +2481,17 @@ impl Daemon {
                     find(to)
                         .with_context(|| RequestFailure::not_found(format!("no version {to}")))?,
                 );
-                Ok(json!({"diff": crate::diff::version_diff(a, b)}))
+                let compatibility = self.with_reader(|st| {
+                    st.schema_change_report_from_version(
+                        &id,
+                        from,
+                        &b.input_schema,
+                        &b.output_schema,
+                    )
+                })?;
+                Ok(
+                    json!({"diff": crate::diff::version_diff(a, b), "schema_compatibility": compatibility}),
+                )
             }
             Request::ListMcpServers => Ok(serde_json::to_value(self.mcp_servers().await?)?),
             Request::PreviewDescription {
@@ -4219,10 +4229,10 @@ impl Daemon {
                     "memory_mb": ver.memory_mb,
                 });
                 let expected = expected_current_version.map(|version| (id, version));
-                let (info, version, _) = self
+                let (info, version, _, compatibility) = self
                     .create_tool_as_expected(&args, &cfg, "user", None, expected)
                     .await?;
-                Ok(json!({"tool": info, "version": version}))
+                Ok(json!({"tool": info, "version": version, "schema_compatibility": compatibility}))
             }
             Request::UpdateToolCode { id, code } => {
                 // In-TUI editor save: a new immutable version with the same
@@ -4233,8 +4243,9 @@ impl Daemon {
                     .context(RequestFailure::not_found("tool not found"))?;
                 let cfg = self.config()?;
                 let args = edit_args(&info, &ver, &code);
-                let (info, version, _) = self.create_tool_as(&args, &cfg, "user", None).await?;
-                Ok(json!({"tool": info, "version": version}))
+                let (info, version, _, compatibility) =
+                    self.create_tool_as(&args, &cfg, "user", None).await?;
+                Ok(json!({"tool": info, "version": version, "schema_compatibility": compatibility}))
             }
             Request::PreviewToolCode { id, code } => {
                 let (info, ver) = self
@@ -4289,7 +4300,12 @@ impl Daemon {
                     .map(|(t, _)| t.name)
                     .collect();
                 d.used_by.sort();
-                Ok(serde_json::to_value(d)?)
+                let compatibility = self.with_reader(|st| {
+                    st.tool_version_schema_report(&d.tool.id, d.tool.current_version)
+                })?;
+                let mut out = serde_json::to_value(d)?;
+                out["schema_compatibility"] = serde_json::to_value(compatibility)?;
+                Ok(out)
             }
             Request::RetireTool { id } => {
                 let t = self
@@ -4395,13 +4411,13 @@ impl Daemon {
                 let pending = self.promotions.locked().remove(&promotion_id);
                 self.remove_attention(&promotion_id);
                 match pending {
-                    Some((attempt_id, kind)) => {
+                    Some(ticket) => {
                         self.broadcast(Event::PromotionApprovalResolved {
                             promotion_id: promotion_id.clone(),
                         });
                         let this = self.clone();
                         tokio::spawn(async move {
-                            this.resume_promotion(attempt_id, kind, approved).await;
+                            this.resume_promotion(ticket, approved).await;
                         });
                         Ok(json!({"resolved": true}))
                     }
@@ -8539,7 +8555,7 @@ impl Daemon {
         }
         let mut args = bundle.clone();
         args["name"] = json!(name);
-        let (info, _v, _) = self.create_tool_as(&args, cfg, "import", None).await?;
+        let (info, _v, _, _) = self.create_tool_as(&args, cfg, "import", None).await?;
         Ok(info)
     }
 
@@ -9474,10 +9490,10 @@ impl Daemon {
         cfg: &Config,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(String, String)> {
-        let (info, version, smoke_note) = self
+        let (info, version, smoke_note, compatibility) = self
             .create_tool_as(args, cfg, "agent", Some(cancel.clone()))
             .await?;
-        let mut out = json!({"created": info.name, "version": version});
+        let mut out = json!({"created": info.name, "version": version, "schema_compatibility": compatibility});
         if let Some(note) = smoke_note {
             out["smoke_test"] = json!(note);
         }
@@ -9537,7 +9553,12 @@ impl Daemon {
         cfg: &Config,
         author: &str,
         cancel: Option<Arc<AtomicBool>>,
-    ) -> Result<(ToolInfo, i64, Option<String>)> {
+    ) -> Result<(
+        ToolInfo,
+        i64,
+        Option<String>,
+        crate::tool_compatibility::ToolSchemaReport,
+    )> {
         self.create_tool_as_expected(args, cfg, author, cancel, None)
             .await
     }
@@ -9549,16 +9570,46 @@ impl Daemon {
         author: &str,
         cancel: Option<Arc<AtomicBool>>,
         expected: Option<(String, i64)>,
-    ) -> Result<(ToolInfo, i64, Option<String>)> {
+    ) -> Result<(
+        ToolInfo,
+        i64,
+        Option<String>,
+        crate::tool_compatibility::ToolSchemaReport,
+    )> {
         let d = ToolDraft::parse(args, cfg, true)?;
+        let allow_breaking = match args.get("allow_breaking") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err(anyhow!("allow_breaking must be a boolean")),
+        };
+        // Origin is selected only by these private server call sites. Agent
+        // JSON's author/actor fields never affect this policy.
+        let policy = if author == "agent" {
+            crate::tool_compatibility::SchemaWritePolicy::Agent { allow_breaking }
+        } else {
+            crate::tool_compatibility::SchemaWritePolicy::User
+        };
+        let preflight = self.with_reader(|st| {
+            st.schema_report_for_name(
+                &d.name,
+                &d.input_schema.to_string(),
+                &d.output_schema.to_string(),
+            )
+        })?;
+        if matches!(
+            policy,
+            crate::tool_compatibility::SchemaWritePolicy::Agent {
+                allow_breaking: false
+            }
+        ) && preflight.requires_acknowledgement()
+        {
+            return Err(crate::tool_compatibility::SchemaChangeBlocked(preflight).into());
+        }
         let smoke_note = self.smoke_gate(&d, cfg, cancel).await?;
-        let before = self
-            .with_reader(|st| st.get_tool_by_name(&d.name))?
-            .map_or(0, |(i, _)| i.current_version);
-        let (info, version) = self
+        let (info, version, compatibility) = self
             .with_store(|st| {
                 let write = |st: &Store| {
-                    st.create_tool_version(
+                    st.create_tool_version_with_schema_report(
                         &d.name,
                         &d.description,
                         &d.input_schema.to_string(),
@@ -9567,6 +9618,7 @@ impl Daemon {
                         &d.caps,
                         d.memory_mb,
                         author,
+                        policy,
                     )
                 };
                 match expected.as_ref() {
@@ -9581,6 +9633,7 @@ impl Daemon {
                     error
                 }
             })?;
+        let before = compatibility.base_version;
         // A new version keeps the Tool's title and tags unless given.
         let info = match tool_title(args) {
             Some(title) => self
@@ -9601,7 +9654,7 @@ impl Daemon {
         let action = if before == 0 { "created" } else { "updated" };
         self.note_registry_change(&info, action, before, author);
         self.broadcast(Event::ToolUpdated { tool: info.clone() });
-        Ok((info, version, smoke_note))
+        Ok((info, version, smoke_note, compatibility))
     }
 
     fn find_tools_impl(&self, session_id: &str, args: &Value) -> Result<String> {
@@ -11949,7 +12002,17 @@ impl Daemon {
         let failures = self.with_store(|st| st.recent_failures(&info.id, 5))?;
         let example = self.with_reader(|st| st.tool_example(&info.id))?;
         let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or(json!(s));
+        let compatibility = self.with_reader(|st| match args["diff_from"].as_i64() {
+            Some(from) => st.schema_change_report_from_version(
+                &info.id,
+                from,
+                &ver.input_schema,
+                &ver.output_schema,
+            ),
+            None => st.tool_version_schema_report(&info.id, ver.version),
+        })?;
         Ok(json!({
+            "schema_compatibility": compatibility,
             "name": info.name,
             "title": info.title,
             "tags": info.tags,
@@ -12061,6 +12124,12 @@ impl Daemon {
             }
         }
         let script_id = uuid::Uuid::new_v4().to_string();
+        let hash = crate::scripts::recurrence_key(source, &uses);
+        self.with_store(|st| {
+            st.record_script(
+                &script_id, session_id, run_id, &hash, source, &uses, "running", "", 0, "",
+            )
+        })?;
         let ops = Arc::new(NestedOps {
             _pipeline: self.pipeline_policies.locked().lookup(&run_id),
             routing_task: crate::routing_task_observation::current(),
@@ -12134,7 +12203,6 @@ impl Daemon {
             });
         done.cancel();
         let elapsed_ms = started.elapsed().as_millis() as i64;
-        let hash = crate::scripts::recurrence_key(source, &uses);
         let record = |status: &str, error: &str, saved: &str| {
             let _ = self.with_store(|st| {
                 st.record_script(
@@ -17924,7 +17992,7 @@ mod live_snapshot_tests {
         });
         daemon.promotions.locked().insert(
             "promo".into(),
-            ("missing-attempt".into(), "widening".into()),
+            crate::optimiser::PromotionTicket::widening("missing-attempt".into()),
         );
         daemon.broadcast(Event::PromotionApprovalRequested {
             promotion_id: "promo".into(),
@@ -18047,3 +18115,7 @@ mod routing_daemon_tests;
 #[cfg(test)]
 #[path = "artifact_cleanup_daemon_tests.rs"]
 mod artifact_cleanup_tests;
+
+#[cfg(test)]
+#[path = "tool_schema_daemon_tests.rs"]
+mod tool_schema_tests;
