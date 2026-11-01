@@ -36,3 +36,42 @@ jobs:
         if: always()
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
+
+  forecast-offline:
+    # Separate from the established pipe job: this new 30m limit is provisional,
+    # not timing evidence for the pipe baseline or a measured #1164 duration.
+    timeout-minutes: 30
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/formless-forecast-target
+      FORMLESS_DATA_DIR: ${{ runner.temp }}/formless-forecast-data
+      FORMLESS_CONFIG_DIR: ${{ runner.temp }}/formless-forecast-config
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Storage before forecast tests
+        shell: bash
+        run: bash scripts/ci-storage-budget.sh snapshot before-forecast-tests
+      - name: Win32 VFS source-preserving offline snapshots
+        run: cargo test -p formless-core --lib forecast_snapshot::tests --locked -- --test-threads=1
+      - name: Local forecast calculation and isolated source-freeze lifetime
+        run: cargo test -p formless-core --lib forecast::tests --locked -- --test-threads=1
+      - name: Forecast admission and immutable actual usage
+        run: cargo test -p formless-core --lib daemon::forecast_tests --locked -- --test-threads=1
+      - name: Forecast request retention
+        run: cargo test -p formless-core --lib forecast_retention_tests --locked -- --test-threads=1
+      - name: Production estimate CLI makes zero provider calls and no profile writes
+        run: cargo test -p formless-bin --test run_estimate --locked -- --test-threads=1
+      - name: Final storage (including failed phases)
+        if: always()
+        shell: bash
+        run: |
+          bash scripts/ci-storage-budget.sh snapshot forecast-job-finished
+          if [[ -d "$CARGO_TARGET_DIR" ]]; then du -sk "$CARGO_TARGET_DIR"; fi
