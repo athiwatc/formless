@@ -242,7 +242,8 @@ impl Store {
             ))
         })?;
         for record in records {
-            let (run, provider, model, p, c, cache, write, reported, covered, unknown) = record?;
+            let (run, provider, model, p, c, cache, write, reported, covered, cost_unknown) =
+                record?;
             let assignment = runs.get(&run).copied().flatten();
             if assignment == Some(false) {
                 continue;
@@ -253,7 +254,7 @@ impl Store {
             let price = reported
                 .or_else(|| {
                     cfg.provider_cfg(Some(&provider)).ok()?;
-                    cfg.cost_of_known(&provider, &model, p, c, cache, write, None, unknown)
+                    cfg.cost_of_known(&provider, &model, p, c, cache, write, None, cost_unknown)
                 })
                 .filter(|value| value.is_finite());
             if reported.is_none() && price.is_some() {
