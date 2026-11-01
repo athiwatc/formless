@@ -871,7 +871,7 @@ pub fn sync_registry(store: &Store, server: &str, tools: &[McpTool]) -> Result<u
                 if info.retired {
                     store.set_tool_retired(&info.id, false)?;
                 }
-                store.create_tool_version(
+                store.create_tool_version_with_schema_policy(
                     &name,
                     &t.description,
                     &schema,
@@ -880,10 +880,11 @@ pub fn sync_registry(store: &Store, server: &str, tools: &[McpTool]) -> Result<u
                     &caps,
                     256,
                     "mcp",
+                    crate::tool_compatibility::SchemaWritePolicy::ExternalDefinition,
                 )?;
             }
             None => {
-                store.create_tool_version(
+                store.create_tool_version_with_schema_policy(
                     &name,
                     &t.description,
                     &schema,
@@ -892,6 +893,7 @@ pub fn sync_registry(store: &Store, server: &str, tools: &[McpTool]) -> Result<u
                     &caps,
                     256,
                     "mcp",
+                    crate::tool_compatibility::SchemaWritePolicy::ExternalDefinition,
                 )?;
             }
         }

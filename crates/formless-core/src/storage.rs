@@ -29,6 +29,9 @@ mod forecast_snapshot;
 #[path = "pipeline_storage.rs"]
 mod pipeline_storage;
 
+#[path = "optimiser_attempt_schema.rs"]
+mod optimiser_attempt_schema;
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
@@ -2007,9 +2010,13 @@ impl Store {
         duration_ms: i64,
         saved_tool: &str,
     ) -> Result<()> {
-        self.ex(
+        let changed = self.ex(
             "INSERT INTO scripts(id,session_id,run_id,hash,source,uses,status,error,duration_ms,saved_tool,created_at) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(id) DO UPDATE SET status=excluded.status,error=excluded.error,duration_ms=excluded.duration_ms,saved_tool=excluded.saved_tool
+             WHERE scripts.session_id IS excluded.session_id AND scripts.run_id IS excluded.run_id
+             AND scripts.hash=excluded.hash AND scripts.source=excluded.source AND scripts.uses=excluded.uses
+             AND scripts.status='running' AND excluded.status<>'running'",
             params![
                 id,
                 session_id,
@@ -2024,6 +2031,11 @@ impl Store {
                 now()
             ],
         )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!(
+                "Script completion does not match its original execution identity"
+            ));
+        }
         Ok(())
     }
 
@@ -3369,6 +3381,7 @@ impl Store {
             "UPDATE subagents SET status='interrupted', updated_at=?1 WHERE status='running'",
             params![now()],
         );
+        self.ex("UPDATE scripts SET status='interrupted',error='the daemon stopped while this script was running' WHERE status='running'", [])?;
         self.ex(
             "UPDATE runs SET status='interrupted', error='the daemon stopped while this Run was going', updated_at=?1 WHERE status='running'",
             params![now()],
@@ -3557,6 +3570,59 @@ impl Store {
         memory_mb: u32,
         author: &str,
     ) -> Result<(ToolInfo, i64)> {
+        self.create_tool_version_with_schema_policy(
+            name,
+            description,
+            input_schema,
+            output_schema,
+            code,
+            caps,
+            memory_mb,
+            author,
+            crate::tool_compatibility::SchemaWritePolicy::Agent {
+                allow_breaking: false,
+            },
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_tool_version_with_schema_policy(
+        &self,
+        name: &str,
+        description: &str,
+        input_schema: &str,
+        output_schema: &str,
+        code: &str,
+        caps: &Capabilities,
+        memory_mb: u32,
+        author: &str,
+        policy: crate::tool_compatibility::SchemaWritePolicy,
+    ) -> Result<(ToolInfo, i64)> {
+        self.create_tool_version_with_schema_report(
+            name,
+            description,
+            input_schema,
+            output_schema,
+            code,
+            caps,
+            memory_mb,
+            author,
+            policy,
+        )
+        .map(|(info, version, _)| (info, version))
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_tool_version_with_schema_report(
+        &self,
+        name: &str,
+        description: &str,
+        input_schema: &str,
+        output_schema: &str,
+        code: &str,
+        caps: &Capabilities,
+        memory_mb: u32,
+        author: &str,
+        policy: crate::tool_compatibility::SchemaWritePolicy,
+    ) -> Result<(ToolInfo, i64, crate::tool_compatibility::ToolSchemaReport)> {
         // Look-up and insert under one write lock: two connections (the
         // daemon and a CLI import) creating one name must serialise into
         // versions of one Tool, not race on the unique name (SPEC §16).
@@ -3570,6 +3636,7 @@ impl Store {
                 caps,
                 memory_mb,
                 author,
+                policy,
             );
         }
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -3582,6 +3649,7 @@ impl Store {
             caps,
             memory_mb,
             author,
+            policy,
         );
         match &out {
             Ok(_) => self.conn.execute_batch("COMMIT")?,
@@ -3603,7 +3671,18 @@ impl Store {
         caps: &Capabilities,
         memory_mb: u32,
         author: &str,
-    ) -> Result<(ToolInfo, i64)> {
+        policy: crate::tool_compatibility::SchemaWritePolicy,
+    ) -> Result<(ToolInfo, i64, crate::tool_compatibility::ToolSchemaReport)> {
+        let mut compatibility = self.schema_report_for_name(name, input_schema, output_schema)?;
+        if matches!(
+            policy,
+            crate::tool_compatibility::SchemaWritePolicy::Agent {
+                allow_breaking: false
+            }
+        ) && compatibility.requires_acknowledgement()
+        {
+            return Err(crate::tool_compatibility::SchemaChangeBlocked(compatibility).into());
+        }
         let before = self
             .get_tool_by_name(name)?
             .map(|(info, _)| info.description);
@@ -3661,7 +3740,12 @@ impl Store {
                 raw_description,
             )?;
         }
-        Ok((self.tool_info(&tool_id)?.context("tool vanished")?, version))
+        compatibility.tool_id = tool_id.clone();
+        Ok((
+            self.tool_info(&tool_id)?.context("tool vanished")?,
+            version,
+            compatibility,
+        ))
     }
 
     pub fn get_tool_by_name(&self, name: &str) -> Result<Option<(ToolInfo, ToolVersionInfo)>> {
@@ -5997,6 +6081,11 @@ impl Store {
             "INSERT INTO optimiser_attempts(id,tool_id,base_version,status,candidate_code,candidate_description,candidate_input_schema,candidate_output_schema,candidate_capabilities,candidate_memory_mb,est_tokens,created_at) VALUES(?1,?2,?3,'generated',?4,?5,?6,?7,?8,?9,?10,?11)",
             params![id, tool_id, base_version, cand.code, cand.description, cand.input_schema, cand.output_schema, serde_json::to_string(&cand.capabilities)?, cand.memory_mb, est_tokens, now()],
         )?;
+        let detail = self.attempt_schema_detail(&id, "generated candidate")?;
+        self.ex(
+            "UPDATE optimiser_attempts SET detail=?2 WHERE id=?1",
+            params![id, detail],
+        )?;
         Ok(id)
     }
 
@@ -6011,6 +6100,7 @@ impl Store {
         replay_total: i64,
         regressions: i64,
     ) -> Result<()> {
+        let detail = self.attempt_schema_detail(id, detail)?;
         self.ex(
             "UPDATE optimiser_attempts SET status=?2, detail=?3, candidate_score=?4, baseline_score=?5, replay_total=?6, regressions=?7 WHERE id=?1",
             params![id, status, detail, candidate_score, baseline_score, replay_total, regressions],
@@ -6049,7 +6139,7 @@ impl Store {
         let mut stmt = self.ps(
             "SELECT id,base_version,status,detail,candidate_score,baseline_score,replay_total,regressions,created_at FROM optimiser_attempts WHERE tool_id=?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params![tool_id, limit], |r| {
                 Ok(formless_protocol::OptimiserAttemptInfo {
                     id: r.get(0)?,
@@ -6064,6 +6154,17 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for attempt in &mut rows {
+            let current = serde_json::from_str::<Value>(&attempt.detail)
+                .ok()
+                .is_some_and(|detail| {
+                    detail.get("format").and_then(Value::as_str)
+                        == Some("optimiser-attempt-schema-v1")
+                });
+            if !current {
+                attempt.detail = self.attempt_schema_detail(&attempt.id, &attempt.detail)?;
+            }
+        }
         Ok(rows)
     }
 
@@ -7228,3 +7329,6 @@ mod native_cost_basis_tests {
 
 #[path = "routing_storage.rs"]
 mod routing_storage;
+
+#[path = "storage_tool_compatibility.rs"]
+mod tool_compatibility_store;

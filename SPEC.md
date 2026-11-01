@@ -1495,7 +1495,7 @@ pattern (§4.4).
 ### 7.1 `create_tool` — the Bootstrap Tool
 
 - Signature (conceptual): `create_tool(name, description, input_schema,
-  output_schema, implementation_js, capabilities[], memory_mb?)`.
+  output_schema, implementation_js, capabilities[], memory_mb?, allow_breaking=false)`.
 - The **agent writes the JavaScript** (plain JS; QuickJS has no TypeScript).
 - **Built-ins (v2.2).** The minimal set the harness needs to grow itself:
   `create_tool`, `create_module`, `retire_tool`,
@@ -1565,6 +1565,46 @@ pattern (§4.4).
   reported as **inconclusive** and the Tool is saved, since the fake data
   rather than the Tool may be at fault. Failures before any stub, and
   denials of undeclared Capabilities, still reject.
+- **Schema compatibility.** Every new Tool version is structurally classified
+  against the currently selected immutable version before persistence. Input
+  changes must continue accepting the old contract: removed/renamed declared
+  properties, new required fields and narrowed types/enums are breaking. Output
+  changes must continue fitting the old output contract (the reverse variance).
+  Nested objects, arrays, enums and optionals follow the same rules. Changed
+  unsupported constraints, unresolved semantics or classifier bounds produce
+  `inconclusive`, never a false compatible verdict; annotation-only edits do not
+  change the contract. Classification is bounded to 4096 schema nodes, depth 32
+  and 128 reported changes.
+  `create_tool` responses, `read_tool`, Tool details and explicit version diffs
+  expose `schema_compatibility` with the comparison base, structural changes and
+  current dependency inventory. Textual schema diffs include the verdict.
+  Default historical reads compare the adjacent earlier version; explicit
+  `diff_from` compares that requested immutable base. Creation compares actual
+  current selection, including after a rollback, not merely version-number order.
+  Dependencies distinguish active caller Tools, declared running scripts,
+  reusable successful script sources, immutable historical executions and prompt
+  definition pins. Nested calls always resolve the current Tool: a Session's
+  pinned definition or caller's own version does not pin the callee's execution.
+  Enabled approved future/active jobs have dynamic prompts and no authoritative
+  Tool binding; they are explicitly **possible** consumers, not claimed exact
+  call edges. A literal code reference is identified when found, but absence of
+  such a spelling never proves arbitrary JavaScript unrelated: other active
+  caller Tools and invocation snapshots are possible dynamic consumers. Bounded
+  or truncated inventories are also reported conservatively. Each inventory class is bounded to 256 entries;
+  unknown remaining consumers require acknowledgement when compatibility cannot
+  be proved. Running script ownership is recorded before execution and its final
+  outcome updates only the same correlated source/uses/Session/Run record.
+  An agent-authored breaking or inconclusive change with live/possible consumers
+  requires explicit `allow_breaking: true` before a version can be saved. The
+  default is false. The live inventory and verdict are recomputed under the same
+  SQLite write transaction as version insertion. Caller-supplied `author` or
+  `actor` fields cannot select trusted-user policy; only server call sites do so.
+  Explicit user saves and externally supplied MCP definitions remain classified;
+  the agent gate never replaces syntax, schema, smoke, Capability or approval
+  checks. Optimiser attempts retain their actual-base report and flag schema
+  breaks even when the candidate claims to fix validation-tag failures. Their
+  trusted user acknowledgement binds candidate content, base and fresh dependency
+  context and composes with existing widening/replay-limited approval gates.
 - **The gate is bounded and cancellable.** The smoke test is a check on
   synthetic input, not user work, so it stops after
   `tools.smoke_timeout_secs` (10) or when the Run is cancelled.
