@@ -4357,6 +4357,13 @@ and bidi/format characters to single-line metadata. Deterministic instruction-sh
 wording checks flag phrases such as “always”, “never”, “ignore” and “first call”
 for human review; these checks do not establish that unflagged text is safe.
 Model-visible descriptions are quoted and labelled as third-party data.
+This projection also covers persisted active and inactive Session Tool definitions
+(`session_tools.pinned_def`) before either forecast or model dispatch. It changes
+only the model-visible top-level description: stored pinned bytes, selected
+version, validation schemas and code-hash inputs stay unchanged. Existing framed
+metadata is reused byte-for-byte only after validating its complete canonical,
+bounded envelope and known warning set; a string prefix alone never establishes
+that it has already been screened.
 A frozen Session containing the exact historical raw Skill-index boundary
 (`Skills (load one with load_skill before a task it covers):` followed by a
 literal newline and `- ` bullet) cannot start, resume, retry, edit-and-run,
