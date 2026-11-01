@@ -1171,6 +1171,10 @@ mod tests {
         }
         let result = child.wait_with_output().unwrap();
         assert!(
+            String::from_utf8_lossy(&result.stdout).contains("running 1 test"),
+            "private release fixture must actually execute"
+        );
+        assert!(
             result.status.success(),
             "{}\n{}",
             String::from_utf8_lossy(&result.stdout),
