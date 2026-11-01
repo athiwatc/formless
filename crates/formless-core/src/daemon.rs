@@ -698,7 +698,7 @@ pub struct Daemon {
     pub(crate) mcp: crate::mcp::Manager,
     /// Parsed config.toml, re-read only when the file changes.
     config: StdMutex<Option<(ConfigStamp, Config)>>,
-    /// Owned only by `with_config_edit`, including cache publication.
+    /// Central configuration serialization, including edits/cache publication and immutable Run admission.
     config_edit: StdMutex<()>,
     mcp_import_candidates:
         StdMutex<HashMap<String, (std::time::Instant, crate::mcp_catalog::Candidate)>>,
@@ -948,8 +948,12 @@ impl Daemon {
     /// The mutation returns whether it needs saving (imports can be no-ops).
     /// All persistence and effective-cache publication stay inside one lock;
     /// callers perform any asynchronous follow-up after this function returns.
+    fn config_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.config_edit.locked()
+    }
+
     fn with_config_edit(&self, edit: impl FnOnce(&mut Config) -> Result<bool>) -> Result<Config> {
-        let _edit = self.config_edit.locked();
+        let _edit = self.config_guard();
         let mut cfg = Config::load_file_only(&self.paths)?;
         if edit(&mut cfg)? {
             cfg.save(&self.paths)?;
@@ -1540,7 +1544,7 @@ impl Daemon {
                 content,
             } => {
                 let _admission = self.forecast_admission.locked();
-                let _settings = self.config_edit.locked();
+                let _settings = self.config_guard();
                 if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "session has an active run; interrupt it before editing",
@@ -1887,7 +1891,7 @@ impl Daemon {
                 keep_original,
             } => {
                 let _admission = self.forecast_admission.locked();
-                let _settings = self.config_edit.locked();
+                let _settings = self.config_guard();
                 if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "session has an active run; interrupt it before retrying",
@@ -1979,7 +1983,7 @@ impl Daemon {
             }
             Request::ResumeRun { session_id } => {
                 let _admission = self.forecast_admission.locked();
-                let _settings = self.config_edit.locked();
+                let _settings = self.config_guard();
                 if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "a run is already active in this session",
@@ -4354,7 +4358,7 @@ impl Daemon {
                 Ok(json!({"steered": true}))
             }
             (false, _) => {
-                let _settings = self.config_edit.locked();
+                let _settings = self.config_guard();
                 let cfg = self.config()?;
                 let input = ForecastInput {
                     session_id: Some(session_id.clone()),
@@ -4394,7 +4398,7 @@ impl Daemon {
     /// error naming the Run that won, and that Run's controls stay.
     fn start_run(self: &Arc<Self>, session_id: String) -> Result<()> {
         let _admission = self.forecast_admission.locked();
-        let _settings = self.config_edit.locked();
+        let _settings = self.config_guard();
         self.start_run_forecast(session_id, None)
     }
 
@@ -4955,7 +4959,7 @@ impl Daemon {
 
     fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
         let _admission = self.forecast_admission.locked();
-        let _settings = self.config_edit.locked();
+        let _settings = self.config_guard();
         if self.runs.locked().contains_key(&session_id) {
             return;
         }
@@ -6009,62 +6013,74 @@ impl Daemon {
                 "compare 2 to 4 models: /compare MODEL_A MODEL_B [prompt]"
             ));
         }
-        let session = self
-            .with_reader(|st| st.get_session(session_id))?
-            .context(RequestFailure::not_found("session not found"))?;
-        // Re-ask the last message (forked before it), or ask `prompt`.
-        let (up_to, text) = match prompt
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-        {
-            Some(p) => (None, p),
-            None => {
-                let msgs = self.with_reader(|st| st.list_messages(session_id))?;
-                let last = msgs
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "user")
-                    .context("nothing to compare: give a prompt, or send a message first")?;
-                (Some(last.seq - 1), last.content.clone())
-            }
-        };
+        let _admission = self.forecast_admission.locked();
+        let _settings = self.config_guard();
+        let cfg = self.config()?;
         let comparison_id = uuid::Uuid::new_v4().to_string();
-        let mut forks = Vec::new();
-        for model in &models {
-            let fork = self
-                .with_store(|st| {
-                    st.fork_session(
-                        session_id,
-                        Some(format!("{} · compare {model}", session.name)),
-                        up_to,
-                    )
-                })?
-                .context(RequestFailure::not_found("session not found"))?;
-            if let Some(info) =
-                self.with_store(|st| st.set_session_model(&fork.id, Some(model.clone()), None))?
-            {
-                self.broadcast(Event::SessionUpdated { session: info });
+        let prepared=self.with_store(|st| {
+            let session=st.get_session(session_id)?.context(RequestFailure::not_found("session not found"))?;
+            let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
+                Some(p)=>(None,p),
+                None=>{
+                    let last=st.list_messages(session_id)?.into_iter().rev().find(|m|m.role=="user").context("nothing to compare: give a prompt, or send a message first")?;
+                    (Some(last.seq-1),last.content)
+                }
+            };
+            let refusal=|f:&RunForecast| anyhow::Error::new(RequestFailure::invalid(format!("Comparison not started: {} requires forecast confirmation. Batch forecast approval is not supported; review and confirm each model in an individual Session before sending. No comparison forks were created.",f.hint)));
+            // Build prospective forks solely in memory BEFORE any source write.
+            // Keep the source mutex/config guard until the real atomic admission.
+            if cfg.limits.forecast_confirm_usd.is_some() {
+                let copy=st.preview_copy()?;
+                for model in &models {
+                    let fork=copy.fork_session(session_id,None,up_to)?.context("session not found")?;
+                    copy.set_session_model(&fork.id,Some(model.clone()),None)?;
+                    copy.append_message(&fork.id,"user",&text)?;
+                    let input=ForecastInput{session_id:Some(fork.id),..Default::default()};
+                    let selected=self.action_model(&copy,&cfg,&input)?;
+                    let f=self.forecast_estimate_selected(&copy,&cfg,&input,Some(&selected))?;
+                    if f.confirmation_required {return Err(refusal(&f));}
+                }
             }
-            let msg = self.with_store(|st| st.append_message(&fork.id, "user", &text))?;
-            self.broadcast(Event::MessageAppended {
-                session_id: fork.id.clone(),
-                message: msg,
-            });
-            forks.push((fork.id.clone(), model.clone()));
-        }
+            st.transaction(|st| {
+                let mut prepared=Vec::new();
+                for model in &models {
+                    let fork=st.fork_session(session_id,Some(format!("{} · compare {model}",session.name)),up_to)?.context("session not found")?;
+                    let fork=st.set_session_model(&fork.id,Some(model.clone()),None)?.context("fork disappeared")?;
+                    let message=st.append_message(&fork.id,"user",&text)?;
+                    let input=ForecastInput{session_id:Some(fork.id.clone()),..Default::default()};
+                    let selected=self.action_model(st,&cfg,&input)?;
+                    let forecast=self.forecast_estimate_selected(st,&cfg,&input,Some(&selected))?;
+                    if forecast.confirmation_required {return Err(refusal(&forecast));}
+                    let admission=self.prepare_run_admission(st,&cfg,&fork.id,&forecast)?;
+                    let run=st.create_run(&fork.id)?;st.record_forecast(&run,&forecast)?;
+                    prepared.push((fork,message,run,admission,model.clone()));
+                }
+                Ok(prepared)
+            })
+        })?;
+        let forks: Vec<_> = prepared
+            .iter()
+            .map(|(fork, _, _, _, model)| (fork.id.clone(), model.clone()))
+            .collect();
         self.comparisons.locked().insert(
             comparison_id.clone(),
             (session_id.to_string(), forks.clone()),
         );
-        for (fork, _) in &forks {
-            if let Err(e) = self.start_run(fork.clone()) {
-                tracing::warn!("compare: could not start a Run in {fork}: {e:#}");
+        for (fork, message, run, admission, _) in prepared {
+            self.broadcast(Event::SessionUpdated {
+                session: fork.clone(),
+            });
+            self.broadcast(Event::MessageAppended {
+                session_id: fork.id.clone(),
+                message,
+            });
+            if let Err(e) = self.launch_prepared_run(fork.id.clone(), run, admission) {
+                tracing::warn!("compare: could not start a Run in {}: {e:#}", fork.id);
             }
         }
-        Ok(json!({
-            "comparison_id": comparison_id,
-            "forks": forks.iter().map(|(s, m)| json!({"session_id": s, "model": m})).collect::<Vec<_>>(),
-        }))
+        Ok(
+            json!({"comparison_id":comparison_id,"forks":forks.iter().map(|(s,m)|json!({"session_id":s,"model":m})).collect::<Vec<_>>()}),
+        )
     }
 
     /// A compared fork finished: once every fork has, report the answers

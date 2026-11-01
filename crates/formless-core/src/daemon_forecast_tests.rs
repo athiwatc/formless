@@ -675,3 +675,79 @@ async fn preview_makes_zero_requests_and_completed_run_records_exact_wire_usage_
         let _ = task.await;
     }
 }
+
+#[tokio::test]
+async fn priced_comparison_refuses_before_real_forks_messages_runs_or_provider_calls() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, d, sid, mut cfg) = setup(&env);
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    endpoint.set_nonblocking(true).unwrap();
+    cfg.provider.base_url = format!("http://{}", endpoint.local_addr().unwrap());
+    cfg.save(&paths).unwrap();
+    let st = Store::open(&paths.db_file()).unwrap();
+    st.set_session_cwd(&sid, Some(paths.data_dir.to_str().unwrap()))
+        .unwrap();
+    st.append_message(&sid, "user", "previous task").unwrap();
+    let basis = crate::forecast::estimate_store(
+        &st,
+        &cfg,
+        &ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "task".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let prior = st.create_run(&sid).unwrap();
+    st.record_forecast(&prior, &basis).unwrap();
+    st.bump_run_steps(&prior).unwrap();
+    st.record_forecast_request(&prior, "run").unwrap();
+    st.record_usage_full(
+        &sid,
+        &prior,
+        "default",
+        "model",
+        &crate::provider::Usage {
+            prompt_tokens: 100,
+            completion_tokens: 100,
+            reported: 3,
+            ..Default::default()
+        },
+        "run",
+    )
+    .unwrap();
+    st.set_run_status(&prior, "completed").unwrap();
+    let sessions = serde_json::to_value(st.list_sessions().unwrap()).unwrap();
+    let messages = serde_json::to_value(st.list_messages(&sid).unwrap()).unwrap();
+    let runs = serde_json::to_value(st.run_metrics(100).unwrap()).unwrap();
+    let recorded = st.recorded_forecasts().unwrap();
+    let error = d
+        .handle(Request::CompareModels {
+            session_id: sid.clone(),
+            models: vec!["model".into(), "another".into()],
+            prompt: Some("task".into()),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Batch forecast approval is not supported")
+            && error.contains("individual Session"),
+        "{error}"
+    );
+    assert_eq!(
+        serde_json::to_value(st.list_sessions().unwrap()).unwrap(),
+        sessions
+    );
+    assert_eq!(
+        serde_json::to_value(st.list_messages(&sid).unwrap()).unwrap(),
+        messages
+    );
+    assert_eq!(
+        serde_json::to_value(st.run_metrics(100).unwrap()).unwrap(),
+        runs
+    );
+    assert_eq!(st.recorded_forecasts().unwrap(), recorded);
+    assert!(d.runs.locked().is_empty() && d.comparisons.locked().is_empty());
+    assert!(matches!(endpoint.accept(),Err(e)if e.kind()==std::io::ErrorKind::WouldBlock));
+}

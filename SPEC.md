@@ -4585,6 +4585,10 @@ after their prospective quote is accepted. Stale consent fails closed. Consent
 belongs to the live connection; reconnects require another review. A cached failed
 send intent remains failed, so a newly approved action allocates a fresh intent.
 Queued messages requiring confirmation stay queued and prompt for composer review.
+Model comparisons build prospective forks privately; if a priced forecast requires
+confirmation, the batch refuses before creating any real fork/message/Run. Batch
+forecast approval is not supported: review and confirm each model in an individual
+Session instead. Ordinary comparisons with no required forecast gate behave as before.
 Headless sends
 without `--yes` fail closed when confirmation is required. Forecasts add no step,
 token or time caps. Admission persists an immutable per-Run forecast and its
