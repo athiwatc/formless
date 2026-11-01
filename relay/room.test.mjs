@@ -13,7 +13,7 @@ function socket(att) {
     close(code, reason) { this.closed = { code, reason }; this.readyState = 3; },
   };
 }
-const daemon = socket({ role: "daemon", mux: true });
+const daemon = socket({ role: "daemon", mux: true, authenticated: 3 });
 const browser = socket({ role: "client", cid: "c1" });
 const tags = { daemon: [daemon], client: [browser], c1: [browser] };
 const room = new RelayRoom({ getWebSockets: (t) => tags[t] || [] }, {});
@@ -33,7 +33,7 @@ await room.webSocketClose(daemon);
 assert.equal(b2.sent.filter((t) => JSON.parse(t).relay === "daemon_offline").length, 1);
 
 // Disconnect codes: 4002 for a broken channel, else 4001.
-const d2 = socket({ role: "daemon", mux: true });
+const d2 = socket({ role: "daemon", mux: true, authenticated: 3 });
 const b3 = socket({ role: "client", cid: "c3" });
 const b4 = socket({ role: "client", cid: "c4" });
 tags.c3 = [b3];
