@@ -89,9 +89,9 @@ fn process_fixture_helper() {
     }
     match mode.as_str() {
         "handshake" => {
-            print!("UTF8:A🦀B\n");
+            println!("UTF8:A🦀B");
             std::io::stdout().flush().unwrap();
-            eprint!("ERR:é🧭\n");
+            eprintln!("ERR:é🧭");
             std::io::stderr().flush().unwrap();
             wait_file(Path::new(&std::env::var_os("FL_ACK_FILE").unwrap()));
             println!("AFTER_ACK");
