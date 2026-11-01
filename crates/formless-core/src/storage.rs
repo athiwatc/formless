@@ -370,7 +370,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 62;
+pub const SCHEMA_VERSION: i64 = 63;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -455,7 +455,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 62] = [
+const MIGRATIONS: [(i64, MigrationStep); 63] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -768,6 +768,7 @@ const MIGRATIONS: [(i64, MigrationStep); 62] = [
             "cost_unknown INTEGER NOT NULL DEFAULT 0 CHECK(cost_unknown IN (0,1))",
         )
     }),
+    (63, |c| add_column(c, "run_files", "before_metadata TEXT")),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2542,9 +2543,24 @@ impl Store {
         existed: bool,
         before: Option<&[u8]>,
     ) -> Result<()> {
+        self.snapshot_run_file_with_metadata(session_id, run_id, path, existed, before, None)
+    }
+
+    /// Bytes and their descriptor-bound metadata are a single immutable first
+    /// snapshot. In particular, a later call must never fill a legacy NULL with
+    /// permissions observed after the original change.
+    pub(crate) fn snapshot_run_file_with_metadata(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        path: &str,
+        existed: bool,
+        before: Option<&[u8]>,
+        metadata: Option<&str>,
+    ) -> Result<()> {
         self.ex(
-            "INSERT OR IGNORE INTO run_files(run_id,session_id,path,existed,kept,before,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT OR IGNORE INTO run_files(run_id,session_id,path,existed,kept,before,created_at,before_metadata)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 run_id,
                 session_id,
@@ -2552,7 +2568,8 @@ impl Store {
                 existed,
                 !existed || before.is_some(),
                 before,
-                now()
+                now(),
+                metadata
             ],
         )?;
         Ok(())
@@ -7015,6 +7032,10 @@ pub(crate) use branch_summary_storage::{
 #[path = "session_comparison_tests.rs"]
 mod session_comparison_tests;
 
+#[path = "review_storage.rs"]
+mod review_storage;
+pub(crate) use review_storage::ReviewFailure;
+
 #[cfg(test)]
 mod native_cost_basis_tests {
     use super::*;
@@ -7056,6 +7077,22 @@ mod native_cost_basis_tests {
             },
         );
         let store = Store::open(&file).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let metadata_columns: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('run_files') WHERE name='before_metadata'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(metadata_columns, 1);
         let legacy = store.usage_rows(None, Some("legacy")).unwrap().0;
         assert_eq!(legacy.len(), 1);
         assert!(!legacy[0].7);

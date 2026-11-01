@@ -1112,6 +1112,93 @@ pub struct RunFileInfo {
     pub diff: Option<String>,
 }
 
+/// Exact text fragments, including punctuation and whitespace. Display clients
+/// must escape terminal controls; these are data, never rendering instructions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewTextSpan {
+    pub text: String,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewLine {
+    /// "context", "removed", or "added".
+    pub kind: String,
+    pub old_line: Option<u64>,
+    pub new_line: Option<u64>,
+    pub text: Vec<ReviewTextSpan>,
+    /// Original line terminator: "\n", "\r\n", or empty at EOF.
+    pub ending: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewHunk {
+    pub id: String,
+    pub old_start: u64,
+    pub old_lines: u64,
+    pub new_start: u64,
+    pub new_lines: u64,
+    /// "pending", "accepted", or "rejected". Accepting does not write a file.
+    pub decision: String,
+    pub lines: Vec<ReviewLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFile {
+    pub id: String,
+    pub path: String,
+    pub status: String,
+    /// Domain-separated hashes distinguish a missing file from an empty file.
+    pub before_hash: String,
+    pub after_hash: String,
+    pub hunks: Vec<ReviewHunk>,
+    /// Listed but never hunk-editable when present.
+    pub exclusion_reason: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewChangeInfo {
+    pub change_id: String,
+    pub file_id: String,
+    pub hunk_id: String,
+    pub description: String,
+    pub undone: bool,
+}
+
+/// A server-owned review. Exactly one of run_id/tool_id is present. Tool
+/// candidates remain drafts; no review action publishes a registry version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HunkReview {
+    pub review_id: String,
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub tool_id: Option<String>,
+    pub base_version: Option<i64>,
+    pub original_candidate_hash: Option<String>,
+    pub candidate_hash: Option<String>,
+    pub draft_code: Option<String>,
+    pub files: Vec<ReviewFile>,
+    pub undo_changes: Vec<ReviewChangeInfo>,
+    pub expires_at: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewDecisionResult {
+    pub review: HunkReview,
+    pub change_id: Option<String>,
+    pub already_applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewCommentResult {
+    pub message: MessageInfo,
+    /// Delivered to an already-running agent; false means saved for a later
+    /// explicit Run. A comment never starts a Run or queues a model request.
+    pub steered: bool,
+}
+
 /// A message waiting to start its own Run after the current one (§5.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuedMessage {
@@ -1702,6 +1789,41 @@ pub enum Request {
         session_id: String,
         #[serde(default)]
         run_id: Option<String>,
+    },
+    /// Inspect the actual latest owned Run; no provider or file writes.
+    InspectRunReview {
+        session_id: String,
+        #[serde(default)]
+        run_id: Option<String>,
+    },
+    /// Upload a draft for review only; base_version must still be current.
+    PrepareToolReview {
+        session_id: String,
+        tool_id: String,
+        base_version: i64,
+        candidate_code: String,
+    },
+    /// Server-owned content-bound hunk decision; no client paths or patch text.
+    DecideReviewHunk {
+        review_id: String,
+        file_id: String,
+        hunk_id: String,
+        expected_hash: String,
+        decision: String,
+    },
+    UndoReviewChange {
+        review_id: String,
+        change_id: String,
+        expected_hash: String,
+    },
+    /// Append explicit user commentary with server-derived quoted path:line.
+    /// Steers an existing Run; never starts one when idle.
+    CommentReviewHunk {
+        review_id: String,
+        file_id: String,
+        hunk_id: String,
+        expected_hash: String,
+        comment: String,
     },
     /// Put files back as they were before a Run changed them (`/rewind`):
     /// one `path`, or all of the Run's revertible files.

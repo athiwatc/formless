@@ -34,8 +34,25 @@ headless with `formless run "…"`.
    change for bugs"`: piped input is attached as `stdin.txt`.
 7. **Fix and verify.** "Rename `parse_cfg` to `parse_config` everywhere and
    run the tests." → `replace_in_files` (`fs:write` on the repo) and
-   `run_tests` (`process:cargo`). `/files` shows what changed; `/rewind`
-   puts it back.
+   `run_tests` (`process:cargo`). `/files` shows what changed; `/review`
+   opens the last Run's text hunks (`/review RUN_ID` selects an older Run).
+   Use `n`/`p` to navigate, `a` to keep a hunk, `r` to reject it and `u`
+   to undo the latest review change. Changed words are underlined; `f`
+   lists every file, including binary and generated files excluded from
+   hunk editing. `c` sends a comment with server-derived path and line
+   context to the active Run, or saves it for the next explicit Run.
+   `/rewind` remains available to put whole files back.
+
+   In a Tool's code editor, Ctrl+D still runs syntax and smoke checks;
+   `h` from that review opens draft hunks. Reject and undo change only the
+   draft, and Ctrl+S still uses the normal checked save. Esc closes review
+   without discarding the draft. Closing a pending Run-file action does
+   not cancel it: reopen `/review` to inspect its recorded result and undo.
+   Reconnect never repeats an action automatically. Historical deleted-file
+   snapshots without their original mode, and Windows files whose full security
+   metadata is unavailable, remain read-only. Securely readable hardlinks and
+   aliased paths retain byte-only whole-file history, but remain read-only in
+   hunk review. Tool draft review is unaffected.
 
 ## Files and conversions
 
