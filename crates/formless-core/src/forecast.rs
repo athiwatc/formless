@@ -804,9 +804,9 @@ mod tests {
             .iter()
             .find(|r| r["run_id"] == id)
             .unwrap();
-        assert_eq!(row["token_error"], 100.0);
-        assert_eq!(row["comparison"]["tokens"]["error"], 100.0);
-        assert_eq!(row["comparison"]["steps"]["error"], 1.0);
+        assert_eq!(row["token_error"].as_f64(), Some(100.0));
+        assert_eq!(row["comparison"]["tokens"]["error"].as_f64(), Some(100.0));
+        assert_eq!(row["comparison"]["steps"]["error"].as_f64(), Some(1.0));
         assert_eq!(row["forecast"]["comparables"].as_array().unwrap().len(), 4);
         assert_eq!(row["token_covered_p50_p90"], true);
         let paused = rows
@@ -1311,7 +1311,7 @@ mod tests {
                 .iter()
                 .find(|r| r["run_id"] == id)
                 .unwrap();
-            assert_eq!(row["actual"]["tokens"], 140);
+            assert_eq!(row["actual"]["tokens"].as_f64(), Some(140.0));
             assert_eq!(
                 row["actual"]["served_main"],
                 json!([{"provider":provider,"model":model}])
@@ -1319,7 +1319,8 @@ mod tests {
             assert_eq!(row["actual"]["basis_match"], false);
             assert_eq!(row["calibration_eligible"], false);
             assert_eq!(
-                row["token_error"], 20.0,
+                row["token_error"].as_f64(),
+                Some(20.0),
                 "forecast errors remain measurable even when dispatch differs"
             );
         }
