@@ -577,7 +577,14 @@ struct RunAdmission {
     requested: String,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
-    first: StdMutex<Option<(Vec<Value>, Vec<Value>, String)>>,
+    first: StdMutex<
+        Option<(
+            Vec<Value>,
+            Vec<Value>,
+            String,
+            Arc<crate::provider::FrozenAttachments>,
+        )>,
+    >,
 }
 
 struct ForecastConsent {
@@ -1016,6 +1023,7 @@ impl Daemon {
                     .with_prompt_hook(self.prompt_hook())
                     .with_input_hook(self.input_hook())
                     .with_request_hook(self.request_hook())
+                    .with_request_policy(self.request_policy())
                     .with_breaker_note_hook(self.provider_breaker_note_hook()),
                 )
             }
@@ -1109,6 +1117,7 @@ impl Daemon {
                 .with_prompt_hook(self.prompt_hook())
                 .with_input_hook(self.input_hook())
                 .with_request_hook(self.request_hook())
+                .with_request_policy(self.request_policy())
                 .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
     }
@@ -1128,6 +1137,31 @@ impl Daemon {
 
     /// Admission applies to every request through either provider factory.
     /// Attribution is resolved in the active task, not at Provider construction.
+    fn request_policy(&self) -> crate::provider::RequestPolicy {
+        let paths = self.paths.clone();
+        let waived = self.budget_waived.clone();
+        Arc::new(move |body| {
+            if !crate::tokens::has_native_media(body) {
+                return Ok(());
+            }
+            let session = USAGE_FOR
+                .try_with(|owner| owner.session_id.clone())
+                .unwrap_or_default();
+            if waived.locked().contains(&session) {
+                return Ok(());
+            }
+            let cfg = Config::load(&paths)?;
+            if [cfg.limits.run_usd, cfg.limits.daily_usd]
+                .into_iter()
+                .flatten()
+                .any(|n| n > 0.0)
+            {
+                return Err(anyhow::Error::new(RequestFailure::budget("native audio/PDF input tokens and media cost cannot be bounded locally under a strict dollar limit; retain the artifact reference or use a model with native input disabled")));
+            }
+            Ok(())
+        })
+    }
+
     fn request_hook(&self) -> crate::provider::RequestHook {
         let admission = self.budget_admission.clone();
         let store = self.store.clone();
@@ -4776,14 +4810,14 @@ impl Daemon {
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
             .with_attachment_snapshot(st, &ctx)?;
-        let ctx = provider.prepare_attachments(&ctx, &forecast.basis.model);
+        let sources = Arc::new(provider.freeze_attachments(&ctx, &forecast.basis.model, true));
         let checkpoint = crate::forecast::hash(&st.latest_checkpoint_record(session_id)?);
         Ok(Arc::new(RunAdmission {
             cfg: fixed,
             requested,
             effort,
             recovery_messages,
-            first: StdMutex::new(Some((ctx, defs, checkpoint))),
+            first: StdMutex::new(Some((ctx, defs, checkpoint, sources))),
         }))
     }
 
@@ -5655,7 +5689,7 @@ impl Daemon {
                 })
         };
         let requested_model = target.model.clone();
-        let route_context = if let Some((ctx, _, _)) = &first {
+        let route_context = if let Some((ctx, _, _, _)) = &first {
             ctx.clone()
         } else {
             self.session_context(
@@ -5667,7 +5701,7 @@ impl Daemon {
             )?
             .0
         };
-        let route_defs = if let Some((_, defs, _)) = &first {
+        let route_defs = if let Some((_, defs, _, _)) = &first {
             defs.clone()
         } else {
             self.with_store(|st| {
@@ -5721,7 +5755,7 @@ impl Daemon {
         )
         .await?;
 
-        if let Some((_, _, checkpoint)) = &first {
+        if let Some((_, _, checkpoint, _)) = &first {
             if self.with_reader(|st| {
                 Ok(crate::forecast::hash(
                     &st.latest_checkpoint_record(session_id)?,
@@ -5749,8 +5783,8 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs) = if let Some((ctx, defs, _)) = first.take() {
-                (ctx, defs)
+            let (ctx, defs, sources) = if let Some((ctx, defs, _, sources)) = first.take() {
+                (ctx, defs, Some(sources))
             } else {
                 let ctx = self
                     .session_context(
@@ -5764,7 +5798,11 @@ impl Daemon {
                 let defs = self.with_store(|st| {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
                 })?;
-                (ctx, defs)
+                (ctx, defs, None)
+            };
+            let call_provider = match sources {
+                Some(sources) => provider.clone().with_frozen_attachments(sources),
+                None => provider.clone(),
             };
             let retry = self
                 .runs
@@ -5787,7 +5825,7 @@ impl Daemon {
                     "run",
                     session_id,
                     run_id,
-                    provider.chat_stream(
+                    call_provider.chat_stream(
                         &ctx,
                         &defs,
                         &model,
