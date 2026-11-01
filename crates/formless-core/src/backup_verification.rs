@@ -52,6 +52,9 @@ fn has_live_wal(source: &Path) -> Result<bool> {
 }
 
 fn fingerprint(file: &Path) -> Result<(String, u64)> {
+    if !std::fs::metadata(file)?.is_file() {
+        bail!("backup is not a regular file");
+    }
     let mut input = std::fs::File::open(file)?;
     let mut hash = Sha256::new();
     let mut bytes = 0;
@@ -239,7 +242,7 @@ pub fn restore_plan(paths: &Paths, source: &Path) -> Value {
     json!({"dry_run":true,"source":source,"destination":paths.db_file(),"scope":"database only; external paths are not rebased",
         "steps":["Stop the daemon and pause any login service; restore refuses reachable endpoints and concurrent owners",
         "Acquire exclusive profile ownership; verify the selected database",
-        "Preserve the displaced database in backups/before-restore-<stamp>.db (seven recovery copies)",
+        "Preserve the displaced database in backups/formless.db.pre-restore-<stamp> (seven recovery copies, including legacy names)",
         "Stage and migrate the selected snapshot; integrity-check and checkpoint it",
         "Atomically replace formless.db with no stale WAL/SHM; release ownership",
         "Start the daemon explicitly when ready; restore never starts providers or jobs"]})

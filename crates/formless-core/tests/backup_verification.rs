@@ -288,3 +288,67 @@ async fn historical_restore_drill_migrates_real_v23_and_reads_known_session() {
     );
     assert!(!Config::default().daemon.backup_restore_drill);
 }
+
+#[test]
+fn new_pre_restore_names_and_legacy_copies_share_one_bound_under_clock_rollback() {
+    let (fixture, paths) = Fixture::new();
+    let store = Store::open(&paths.db_file()).unwrap();
+    store.create_session(Some("original".into())).unwrap();
+    let source = fixture.0.join("restore-source.db");
+    store.backup_into(&source).unwrap();
+    let directory = housekeeping::backup_dir(&paths);
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut legacy = Vec::new();
+    for day in 1..=8 {
+        let old = directory.join(format!("before-restore-9999010{day}T000000Z.db"));
+        store.backup_into(&old).unwrap();
+        legacy.push(old);
+    }
+    drop(store);
+    let saved = housekeeping::restore(&paths, &source).unwrap();
+    assert!(saved
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("formless.db.pre-restore-"));
+    assert!(
+        saved.is_file(),
+        "clock rollback must not delete the displaced database"
+    );
+    let copies = housekeeping::list_restore_backups(&paths);
+    assert_eq!(copies.len(), housekeeping::RESTORE_BACKUPS_KEEP);
+    assert!(copies.contains(&saved));
+    assert!(!legacy[0].exists() && !legacy[1].exists());
+    assert!(legacy[2..].iter().all(|copy| copy.exists()));
+    assert_eq!(
+        housekeeping::list_backups(&paths).len(),
+        0,
+        "recovery names are not daily copies"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nonregular_backup_sources_are_rejected_before_opening_a_fifo() {
+    let (fixture, paths) = Fixture::new();
+    let file = fixture.0.join("fifo.bak");
+    let store = Store::open(&fixture.0.join("source.db")).unwrap();
+    store.backup_into(&file).unwrap();
+    drop(store);
+    checks::verify(&paths, &file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    let result = std::process::Command::new("mkfifo")
+        .arg(&file)
+        .status()
+        .unwrap();
+    assert!(result.success());
+    // No FIFO writer is started: opening this as an ordinary input would block.
+    assert!(
+        format!("{:#}", checks::verify(&paths, &file).unwrap_err()).contains("not a regular file")
+    );
+    assert!(
+        checks::verified(&paths, &file).is_none(),
+        "receipt lookup must reject the replacement FIFO too"
+    );
+}

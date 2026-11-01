@@ -2544,8 +2544,9 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   `backup restore FILE --dry-run` prints the exclusive-ownership, safety-copy,
   staged migration and atomic replacement plan without touching the profile.
   `backup restore FILE` uses the existing stopped-daemon restore path and its
-  seven bounded `backups/before-restore-*` recovery points (the supported
-  equivalent of a `formless.db.pre-restore-*` displaced-file copy).
+  seven bounded `backups/formless.db.pre-restore-*` recovery points.
+  Existing `before-restore-*.db` copies remain recognized and share that bound;
+  no duplicate safety copy is made.
   `doctor --restore-drill` (or `backup drill FILE`) restores a private throwaway
   copy, migrates it, constructs an offline daemon and lists Sessions. It never
   serves, loads live configuration/credentials, starts providers, scheduled jobs,
@@ -2567,7 +2568,7 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   not automatically repair absolute references. `formless
   restore FILE` (daemon stopped) checks the file (SQLite, integrity
   check, has Formless tables, schema not newer than this build), saves
-  the current database as `backups/before-restore-<time>.db`, stages and migrates
+  the current database as `backups/formless.db.pre-restore-<stamp>`, stages and migrates
   the selected snapshot in the same directory, fsyncs it, and atomically replaces
   the canonical database while holding exclusive daemon ownership. Current WAL
   data is checkpointed before old sidecars are removed. Failed staging or migration

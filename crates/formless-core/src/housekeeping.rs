@@ -322,15 +322,30 @@ pub fn backup(paths: &Paths, store: &Store, keep: usize) -> Result<PathBuf> {
 
 /// Daily snapshots, oldest first (independent from restore retention).
 pub fn list_backups(paths: &Paths) -> Vec<PathBuf> {
-    list_copies(paths, "formless-")
+    list_copies(paths, "formless-", ".db")
 }
 
 /// Before-restore recovery points, oldest first.
 pub fn list_restore_backups(paths: &Paths) -> Vec<PathBuf> {
-    list_copies(paths, "before-restore-")
+    let mut copies = list_copies(paths, "before-restore-", ".db");
+    copies.extend(list_copies(paths, "formless.db.pre-restore-", ""));
+    copies.sort_by_cached_key(|path| {
+        let at = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|name| {
+                name.strip_prefix("formless.db.pre-restore-").or_else(|| {
+                    name.strip_prefix("before-restore-")
+                        .and_then(|n| n.strip_suffix(".db"))
+                })
+            })
+            .and_then(parse_backup_stamp);
+        (at, path.clone())
+    });
+    copies
 }
 
-fn list_copies(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
+fn list_copies(paths: &Paths, prefix: &str, suffix: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(backup_dir(paths))
         .into_iter()
         .flatten()
@@ -340,7 +355,7 @@ fn list_copies(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".db"))
+                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
         })
         .collect();
     found.sort_by_cached_key(|p| {
@@ -348,7 +363,7 @@ fn list_copies(paths: &Paths, prefix: &str) -> Vec<PathBuf> {
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_prefix(prefix))
-            .and_then(|n| n.strip_suffix(".db"))
+            .and_then(|n| n.strip_suffix(suffix))
             .and_then(parse_backup_stamp);
         (at, p.clone())
     });
@@ -448,7 +463,7 @@ fn restore_with_check(
     let db = paths.db_file();
     let dir = backup_dir(paths);
     std::fs::create_dir_all(&dir)?;
-    let saved = dir.join(format!("before-restore-{}.db", backup_stamp()));
+    let saved = dir.join(format!("formless.db.pre-restore-{}", backup_stamp()));
     if db.exists() {
         // Never migrate the current file: it may itself need recovery.
         let current =
@@ -468,8 +483,28 @@ fn restore_with_check(
         // delete an open old recovery point. Retention also applies on a failed
         // migration, so repeated failures cannot grow recovery copies forever.
         let all = list_restore_backups(paths);
-        for old in all.iter().rev().skip(RESTORE_BACKUPS_KEEP) {
-            std::fs::remove_file(old)?;
+        // Both naming generations share one bound. Preserve the new displaced
+        // copy across clock rollback, and preserve a selected recovery source.
+        let source = std::fs::canonicalize(file).ok();
+        let protected: Vec<_> = all
+            .iter()
+            .filter(|p| {
+                **p == saved
+                    || source.as_ref().is_some_and(|source| {
+                        std::fs::canonicalize(p).ok().as_ref() == Some(source)
+                    })
+            })
+            .collect();
+        let mut remaining = RESTORE_BACKUPS_KEEP.saturating_sub(protected.len());
+        for old in all.iter().rev() {
+            if protected.contains(&old) {
+                continue;
+            }
+            if remaining > 0 {
+                remaining -= 1;
+                continue;
+            }
+            crate::backup_verification::remove_copy(paths, old)?;
         }
         #[cfg(unix)]
         std::fs::File::open(&dir)?.sync_all()?;
