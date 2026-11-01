@@ -411,7 +411,7 @@ async fn role_auto_context_uses_named_provider_alias_and_calibration() {
     env.set("FORMLESS_API_KEY_NAMED", "fixture");
     let store = Store::open(&paths.db_file()).unwrap();
     store
-        .set_session_model(&sid, Some("reader-alias"), None)
+        .set_session_model(&sid, Some("reader-alias".to_string()), None)
         .unwrap();
     store.append_message(&sid, "user", "你好 context").unwrap();
     let key = crate::tokens::provider_key("named", &named);
